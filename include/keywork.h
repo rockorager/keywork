@@ -1,6 +1,9 @@
 #ifndef KEYWORK_H
 #define KEYWORK_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,6 +14,31 @@ enum keywork_backend {
     KEYWORK_BACKEND_VULKAN = 2,
 };
 
+typedef struct keywork_build keywork_build_t;
+typedef struct keywork_widget keywork_widget_t;
+
+struct keywork_context {
+    const char *input_text;
+    const char *focused_input_id;
+    float window_width;
+    float window_height;
+    const char *color_scheme;
+};
+
+struct keywork_app_vtable {
+    keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
+    int (*click)(void *userdata, const char *id);
+    int (*timer)(void *userdata, uint64_t expirations);
+};
+
+struct keywork_run_options {
+    const char *title;
+    int backend;
+    float width;
+    float height;
+    uint64_t timer_interval_ms;
+};
+
 struct keywork_run_text_options {
     const char *title;
     const char *text;
@@ -19,7 +47,16 @@ struct keywork_run_text_options {
     float height;
 };
 
+int keywork_run_app(const struct keywork_run_options *options, const struct keywork_app_vtable *vtable, void *userdata);
 int keywork_run_text(const struct keywork_run_text_options *options);
+
+keywork_widget_t *keywork_text(keywork_build_t *build, const char *value);
+keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value, uint32_t argb);
+keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder, int focused);
+keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
+keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child);
+keywork_widget_t *keywork_padding(keywork_build_t *build, float inset, keywork_widget_t *child);
+keywork_widget_t *keywork_column(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
 
 #ifdef __cplusplus
 }
