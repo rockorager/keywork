@@ -28,7 +28,7 @@ const NativeApp = struct {
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
         const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
 
-        const button = try widgets.button(allocator, "increment", "Increment", .{ .ptr = self, .call_fn = increment });
+        const button = try widgets.actionButton(allocator, "increment", "Increment", "increment");
         const input = widgets.textInput("native-input", context.input_text, "Type here");
         const children = [_]Widget{
             widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),
@@ -40,7 +40,9 @@ const NativeApp = struct {
             button,
         };
         const column = try widgets.column(allocator, &children, 12);
-        return widgets.padding(allocator, keywork.EdgeInsets.all(24), column);
+        const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = self, .call_fn = increment } }};
+        const actions = try widgets.actions(allocator, &action_bindings, column);
+        return widgets.padding(allocator, keywork.EdgeInsets.all(24), actions);
     }
 
     fn increment(ptr: *anyopaque) !void {

@@ -271,6 +271,7 @@ pub const Widget = union(enum) {
         id: []const u8,
         label: []const u8,
         on_pressed: ?Callback = null,
+        action_id: ?[]const u8 = null,
     };
 
     pub const Box = struct {
@@ -513,6 +514,7 @@ pub const BuildScope = struct {
     allocator: std.mem.Allocator,
     theme: Theme = .default,
     interaction: InteractionState = .{},
+    actions: ?*const ActionScope = null,
 };
 
 pub const widgets = struct {
@@ -539,6 +541,11 @@ pub const widgets = struct {
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
         _ = allocator;
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
+    }
+
+    pub fn actionButton(allocator: std.mem.Allocator, id: []const u8, label: []const u8, action_id: []const u8) !Widget {
+        _ = allocator;
+        return .{ .button = .{ .id = id, .label = label, .action_id = action_id } };
     }
 
     pub fn theme(allocator: std.mem.Allocator, theme_value: Theme, child: Widget) !Widget {
@@ -611,8 +618,15 @@ pub const Element = struct {
     };
 };
 
-fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) !Widget {
-    const enabled = button_widget.on_pressed != null;
+fn buildButtonWidget(
+    allocator: std.mem.Allocator,
+    theme: Theme,
+    interaction: InteractionState,
+    actions: ?*const ActionScope,
+    button_widget: Widget.Button,
+) !Widget {
+    const on_pressed = button_widget.on_pressed orelse if (button_widget.action_id) |action_id| findActionInScope(actions, action_id) else null;
+    const enabled = on_pressed != null;
     const hovered = enabled and interaction.isHovered(button_widget.id);
     const pressed = enabled and interaction.isPressed(button_widget.id);
     const focused = enabled and interaction.isFocused(.named(button_widget.id));
@@ -622,7 +636,7 @@ fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: In
     const surface = try widgets.borderedBox(allocator, padded, background, if (focused) buttonFocusedBorder(theme) else null);
     if (!enabled) return surface;
     const surface_child = try Widget.alloc(allocator, surface);
-    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(button_widget.on_pressed.?) } };
+    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(on_pressed.?) } };
 }
 
 fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
@@ -996,7 +1010,7 @@ pub fn buildElementTreeScoped(
         .button => {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, element_widget.button);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, element_widget.button);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -1010,6 +1024,10 @@ pub fn buildElementTreeScoped(
         .actions => |actions_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
+            const previous_actions = scope.actions;
+            const nested_actions: ActionScope = .{ .bindings = element_widget.actions.bindings, .parent = previous_actions };
+            scope.actions = &nested_actions;
+            defer scope.actions = previous_actions;
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -1253,13 +1271,21 @@ pub fn updateElementTreeScoped(
             _ = button_widget;
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, element_widget.button);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, element_widget.button);
             try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
             destroyElementWidget(allocator, &element.widget);
             element.widget = element_widget;
         },
         .actions => |actions_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, actions_widget.child, constraints);
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const previous_actions = scope.actions;
+            const nested_actions: ActionScope = .{ .bindings = element_widget.actions.bindings, .parent = previous_actions };
+            scope.actions = &nested_actions;
+            defer scope.actions = previous_actions;
+            try updateElementTreeScoped(allocator, scope, &element.children[0], actions_widget.child, constraints);
+            destroyElementWidget(allocator, &element.widget);
+            element.widget = element_widget;
         },
         .shortcuts => |shortcuts_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, shortcuts_widget.child, constraints);
@@ -1589,9 +1615,11 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer allocator.free(id);
             const label = try allocator.dupe(u8, button_widget.label);
             errdefer allocator.free(label);
+            const action_id = if (button_widget.action_id) |action_id_value| try allocator.dupe(u8, action_id_value) else null;
+            errdefer if (action_id) |action_id_value| allocator.free(action_id_value);
             const callback = if (button_widget.on_pressed) |on_pressed| try on_pressed.clone(allocator) else null;
             errdefer if (callback) |on_pressed| on_pressed.destroy(allocator);
-            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback } };
+            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback, .action_id = action_id } };
         },
         .box => |box_widget| .{ .box = box_widget },
         .clickable => |clickable_widget| blk: {
@@ -1653,6 +1681,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (button_widget.on_pressed) |callback| callback.destroy(allocator);
             allocator.free(button_widget.id);
             allocator.free(button_widget.label);
+            if (button_widget.action_id) |action_id| allocator.free(action_id);
         },
         .clickable => |clickable_widget| {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
@@ -2460,6 +2489,36 @@ test "button without action is disabled and skipped by focus traversal" {
     const targets = try collectFocusTargets(retained_allocator, &root);
     defer retained_allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 0), targets.len);
+}
+
+test "action button resolves nearest ambient action" {
+    const Counter = struct {
+        value: usize = 0,
+
+        fn increment(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value += 1;
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var counter: Counter = .{};
+    const button_widget = try widgets.actionButton(build_arena.allocator(), "increment", "Increment", "increment");
+    const bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
+    const actions_widget = try widgets.actions(build_arena.allocator(), &bindings, button_widget);
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &actions_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    try hit.callback.?.call();
+    try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
 
 test "theme widget provides ambient text and input styling" {
