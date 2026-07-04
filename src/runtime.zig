@@ -258,7 +258,10 @@ pub const Runtime = struct {
         const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
         if (self.focusedTargetIs(.text_input)) return false;
         const element_root = if (self.element_root) |*root| root else return false;
-        const callback = keywork.findShortcutAction(element_root, shortcut_key) orelse return false;
+        const callback = if (self.focused_id) |focused_id|
+            keywork.findFocusedShortcutAction(element_root, shortcut_key, focused_id) orelse keywork.findShortcutAction(element_root, shortcut_key) orelse return false
+        else
+            keywork.findShortcutAction(element_root, shortcut_key) orelse return false;
         try callback.call();
         return true;
     }

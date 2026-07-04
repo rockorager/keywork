@@ -65,6 +65,7 @@ pub const hitTestTextInput = core.hitTestTextInput;
 pub const hitTestCursorShape = core.hitTestCursorShape;
 pub const shortcutKeyForInput = core.shortcutKeyForInput;
 pub const findShortcutAction = core.findShortcutAction;
+pub const findFocusedShortcutAction = core.findFocusedShortcutAction;
 pub const collectFocusTargets = core.collectFocusTargets;
 pub const findFocusTarget = core.findFocusTarget;
 

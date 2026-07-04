@@ -1947,9 +1947,18 @@ pub fn findShortcutAction(element: *const Element, key: ShortcutKey) ?Widget.Cal
     return findShortcutActionScoped(element, key, null);
 }
 
+pub fn findFocusedShortcutAction(element: *const Element, key: ShortcutKey, focused_id: []const u8) ?Widget.Callback {
+    return findFocusedShortcutActionScoped(element, key, focused_id, null, null);
+}
+
 const ActionScope = struct {
     bindings: []const Widget.ActionBinding,
     parent: ?*const ActionScope = null,
+};
+
+const ShortcutScope = struct {
+    bindings: []const Widget.ShortcutBinding,
+    parent: ?*const ShortcutScope = null,
 };
 
 fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*const ActionScope) ?Widget.Callback {
@@ -1989,6 +1998,64 @@ fn findActionInScope(scope: ?*const ActionScope, action_id: []const u8) ?Widget.
         cursor = action_scope.parent;
     }
     return null;
+}
+
+fn findFocusedShortcutActionScoped(
+    element: *const Element,
+    key: ShortcutKey,
+    focused_id: []const u8,
+    actions: ?*const ActionScope,
+    shortcuts: ?*const ShortcutScope,
+) ?Widget.Callback {
+    switch (element.widget) {
+        .actions => |actions_widget| {
+            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = actions };
+            return findFocusedShortcutActionInChildren(element, key, focused_id, &nested_actions, shortcuts);
+        },
+        .shortcuts => |shortcuts_widget| {
+            const nested_shortcuts: ShortcutScope = .{ .bindings = shortcuts_widget.bindings, .parent = shortcuts };
+            if (elementIsFocused(element, focused_id)) return findShortcutInScope(&nested_shortcuts, key, actions);
+            return findFocusedShortcutActionInChildren(element, key, focused_id, actions, &nested_shortcuts);
+        },
+        else => {
+            if (elementIsFocused(element, focused_id)) return findShortcutInScope(shortcuts, key, actions);
+            return findFocusedShortcutActionInChildren(element, key, focused_id, actions, shortcuts);
+        },
+    }
+}
+
+fn findFocusedShortcutActionInChildren(
+    element: *const Element,
+    key: ShortcutKey,
+    focused_id: []const u8,
+    actions: ?*const ActionScope,
+    shortcuts: ?*const ShortcutScope,
+) ?Widget.Callback {
+    for (element.children) |*child| {
+        if (findFocusedShortcutActionScoped(child, key, focused_id, actions, shortcuts)) |callback| return callback;
+    }
+    return null;
+}
+
+fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: ?*const ActionScope) ?Widget.Callback {
+    var cursor = scope;
+    while (cursor) |shortcut_scope| {
+        for (shortcut_scope.bindings) |binding| {
+            if (binding.key != key) continue;
+            if (findActionInScope(actions, binding.action_id)) |callback| return callback;
+        }
+        cursor = shortcut_scope.parent;
+    }
+    return null;
+}
+
+fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
+    return switch (element.widget) {
+        .button => |button_widget| std.mem.eql(u8, button_widget.id, focused_id),
+        .clickable => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
+        .text_input => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),
+        else => false,
+    };
 }
 
 fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constraints: Constraints, origin: Point, measurer: TextMeasurer) LayoutError!RenderNode {
@@ -2669,6 +2736,58 @@ test "shortcuts invoke ambient actions" {
     try callback.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
     try std.testing.expectEqual(@as(?Widget.Callback, null), findShortcutAction(&element, .space));
+}
+
+test "focused shortcut resolution prefers nearest shortcut and action scopes" {
+    const Counters = struct {
+        global: usize = 0,
+        local: usize = 0,
+
+        fn incrementGlobal(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.global += 1;
+        }
+
+        fn incrementLocal(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.local += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena.deinit();
+
+    var counters: Counters = .{};
+    const global_button = try widgets.actionButton(build_arena.allocator(), "global-button", "Global", "activate");
+    const local_button = try widgets.actionButton(build_arena.allocator(), "local-button", "Local", "activate");
+    const local_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementLocal } }};
+    const local_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+    const local_subtree = try widgets.actions(
+        build_arena.allocator(),
+        &local_actions,
+        try widgets.shortcuts(build_arena.allocator(), &local_shortcuts, local_button),
+    );
+    const children = [_]Widget{ global_button, local_subtree };
+    const column = try widgets.column(build_arena.allocator(), &children, 4);
+    const global_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementGlobal } }};
+    const global_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+    const root_widget = try widgets.actions(
+        build_arena.allocator(),
+        &global_actions,
+        try widgets.shortcuts(build_arena.allocator(), &global_shortcuts, column),
+    );
+
+    var element = try buildElementTree(allocator, &root_widget, .{ .max_width = 200, .max_height = 120 });
+    defer destroyElementTree(allocator, &element);
+
+    try findFocusedShortcutAction(&element, .space, "local-button").?.call();
+    try std.testing.expectEqual(@as(usize, 0), counters.global);
+    try std.testing.expectEqual(@as(usize, 1), counters.local);
+
+    try findFocusedShortcutAction(&element, .space, "global-button").?.call();
+    try std.testing.expectEqual(@as(usize, 1), counters.global);
+    try std.testing.expectEqual(@as(usize, 1), counters.local);
 }
 
 test "component widget builds into the render tree" {
