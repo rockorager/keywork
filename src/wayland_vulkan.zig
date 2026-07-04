@@ -121,10 +121,14 @@ pub const Backend = struct {
 
     repaint_handler: ?RepaintHandler,
     repaint_context: ?*anyopaque,
+    frame_handler: ?FrameHandler,
+    frame_context: ?*anyopaque,
+    frame_callback: ?*wl.Callback,
 
     pub const ClickHandler = WaylandInput.ClickHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
+    pub const FrameHandler = *const fn (ctx: *anyopaque) void;
 
     pub const Options = struct {
         title: [:0]const u8 = "Keywork Vulkan",
@@ -300,6 +304,9 @@ pub const Backend = struct {
             .in_flight = in_flight,
             .repaint_handler = null,
             .repaint_context = null,
+            .frame_handler = null,
+            .frame_context = null,
+            .frame_callback = null,
         };
 
         wm_base.setListener(*Backend, wmBaseListener, self);
@@ -314,6 +321,7 @@ pub const Backend = struct {
 
     pub fn destroy(self: *Backend) void {
         self.vkd.deviceWaitIdle(self.device) catch {};
+        if (self.frame_callback) |callback| callback.destroy();
         self.destroySwapchain();
         self.text_vertices.deinit(self.allocator);
         self.atlas_slots.deinit(self.allocator);
@@ -365,6 +373,11 @@ pub const Backend = struct {
         self.repaint_handler = handler;
     }
 
+    pub fn setFrameHandler(self: *Backend, context: *anyopaque, handler: FrameHandler) void {
+        self.frame_context = context;
+        self.frame_handler = handler;
+    }
+
     pub fn eventLoopFd(self: *Backend) i32 {
         return self.display.getFd();
     }
@@ -401,7 +414,7 @@ pub const Backend = struct {
         return !self.closed;
     }
 
-    fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !void {
+    fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         while (!self.configured and !self.closed) {
             if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
@@ -414,12 +427,17 @@ pub const Backend = struct {
         const height = try scaledFrameDimension(logical_height, self.scale);
         self.surface.setBufferScale(1);
         if (self.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
-        if (!try self.ensureSwapchain(width, height)) return;
+        if (!try self.ensureSwapchain(width, height)) return false;
+        try self.armFrameCallback();
         const result = try self.renderAndPresent(frame.display_list, self.scale);
         if (result == .stale) {
             self.swapchain_dirty = true;
             log.info("Vulkan swapchain stale; recreating on next repaint", .{});
+            return false;
         }
+        self.surface.commit();
+        _ = self.display.flush();
+        return true;
     }
 
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
@@ -432,6 +450,23 @@ pub const Backend = struct {
             .width = @floatFromInt(self.width),
             .height = @floatFromInt(self.height),
         });
+    }
+
+    fn armFrameCallback(self: *Backend) !void {
+        if (self.frame_callback != null) return;
+        const callback = try self.surface.frame();
+        callback.setListener(*Backend, frameListener, self);
+        self.frame_callback = callback;
+    }
+
+    fn frameListener(callback: *wl.Callback, event: wl.Callback.Event, self: *Backend) void {
+        switch (event) {
+            .done => {
+                if (self.frame_callback == callback) self.frame_callback = null;
+                callback.destroy();
+                if (self.frame_handler) |handler| handler(self.frame_context.?);
+            },
+        }
     }
 
     fn ensureSwapchain(self: *Backend, width: u31, height: u31) !bool {

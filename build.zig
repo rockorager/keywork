@@ -57,6 +57,15 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("luajit_c", luajit_c.createModule());
     root_module.linkSystemLibrary("luajit", .{});
 
+    const dbus_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/dbus_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dbus_c.linkSystemLibrary("dbus-1", .{});
+    root_module.addImport("dbus_c", dbus_c.createModule());
+    root_module.linkSystemLibrary("dbus-1", .{});
+
     const text_c = b.addTranslateC(.{
         .root_source_file = b.path("src/text_c.h"),
         .target = target,

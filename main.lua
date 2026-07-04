@@ -7,6 +7,7 @@ return function(state)
   return ui.padding(24, ui.column({
     ui.text("Keywork MVP"),
     ui.text(size),
+    ui.text("scheme: " .. state.color_scheme),
     ui.text("input: " .. state.input_text),
     ui.text_input("demo-input", "Type here"),
     ui.button("hello", status),

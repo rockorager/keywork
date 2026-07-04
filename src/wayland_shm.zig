@@ -41,10 +41,14 @@ pub const Backend = struct {
 
     repaint_handler: ?RepaintHandler,
     repaint_context: ?*anyopaque,
+    frame_handler: ?FrameHandler,
+    frame_context: ?*anyopaque,
+    frame_callback: ?*wl.Callback,
 
     pub const ClickHandler = WaylandInput.ClickHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
+    pub const FrameHandler = *const fn (ctx: *anyopaque) void;
 
     pub const Options = struct {
         title: [:0]const u8 = "Keywork",
@@ -122,6 +126,9 @@ pub const Backend = struct {
             .scale_changed = false,
             .repaint_handler = null,
             .repaint_context = null,
+            .frame_handler = null,
+            .frame_context = null,
+            .frame_callback = null,
         };
 
         wm_base.setListener(*Backend, wmBaseListener, self);
@@ -135,6 +142,7 @@ pub const Backend = struct {
     }
 
     pub fn destroy(self: *Backend) void {
+        if (self.frame_callback) |callback| callback.destroy();
         for (self.buffers.items) |buffer| buffer.destroy(self.allocator);
         self.buffers.deinit(self.allocator);
         self.text_renderer.deinit();
@@ -179,6 +187,11 @@ pub const Backend = struct {
         self.repaint_handler = handler;
     }
 
+    pub fn setFrameHandler(self: *Backend, context: *anyopaque, handler: FrameHandler) void {
+        self.frame_context = context;
+        self.frame_handler = handler;
+    }
+
     pub fn dispatch(self: *Backend) !bool {
         if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
         return !self.closed;
@@ -220,7 +233,7 @@ pub const Backend = struct {
         return !self.closed;
     }
 
-    fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !void {
+    fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (self.closed) return error.WindowClosed;
 
@@ -236,6 +249,7 @@ pub const Backend = struct {
         const buffer = try self.acquireBuffer(width, height);
         try rasterize(&self.text_renderer, buffer.pixels(), width, height, self.scale, frame.display_list);
 
+        try self.armFrameCallback();
         self.surface.attach(buffer.wl_buffer, 0, 0);
         self.surface.damageBuffer(0, 0, width, height);
         self.surface.setBufferScale(1);
@@ -243,6 +257,7 @@ pub const Backend = struct {
         self.surface.commit();
         buffer.busy = true;
         _ = self.display.flush();
+        return true;
     }
 
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
@@ -255,6 +270,23 @@ pub const Backend = struct {
             .width = @floatFromInt(self.width),
             .height = @floatFromInt(self.height),
         });
+    }
+
+    fn armFrameCallback(self: *Backend) !void {
+        if (self.frame_callback != null) return;
+        const callback = try self.surface.frame();
+        callback.setListener(*Backend, frameListener, self);
+        self.frame_callback = callback;
+    }
+
+    fn frameListener(callback: *wl.Callback, event: wl.Callback.Event, self: *Backend) void {
+        switch (event) {
+            .done => {
+                if (self.frame_callback == callback) self.frame_callback = null;
+                callback.destroy();
+                if (self.frame_handler) |handler| handler(self.frame_context.?);
+            },
+        }
     }
 
     fn acquireBuffer(self: *Backend, width: u31, height: u31) !*Buffer {

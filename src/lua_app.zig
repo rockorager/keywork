@@ -186,7 +186,7 @@ fn setStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, val
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
-    c.lua_createtable(lua_state, 0, 6);
+    c.lua_createtable(lua_state, 0, 7);
     const table = c.lua_gettop(lua_state);
     c.lua_pushboolean(lua_state, if (state.button_pressed) 1 else 0);
     c.lua_setfield(lua_state, table, "button_pressed");
@@ -204,6 +204,8 @@ fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_setfield(lua_state, table, "window_width");
     c.lua_pushnumber(lua_state, state.window_height);
     c.lua_setfield(lua_state, table, "window_height");
+    c.lua_pushlstring(lua_state, state.color_scheme.ptr, state.color_scheme.len);
+    c.lua_setfield(lua_state, table, "color_scheme");
 }
 
 fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_state: State, index: c_int) !keywork.Widget {

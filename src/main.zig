@@ -7,6 +7,7 @@ const uucode = @import("uucode");
 const log = std.log.scoped(.keywork);
 
 pub const event_loop = @import("event_loop.zig");
+pub const desktop_settings = @import("desktop_settings.zig");
 pub const lua_app = @import("lua_app.zig");
 pub const wayland_shm = @import("wayland_shm.zig");
 pub const wayland_vulkan = @import("wayland_vulkan.zig");
@@ -205,7 +206,7 @@ pub const RenderBackend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        present: *const fn (ptr: *anyopaque, frame: Frame) anyerror!void,
+        present: *const fn (ptr: *anyopaque, frame: Frame) anyerror!bool,
         measure_text: *const fn (ptr: *anyopaque, value: []const u8) anyerror!Size,
     };
 
@@ -216,8 +217,8 @@ pub const RenderBackend = struct {
         display_list: []const PaintCommand,
     };
 
-    pub fn present(self: RenderBackend, frame: Frame) !void {
-        try self.vtable.present(self.ptr, frame);
+    pub fn present(self: RenderBackend, frame: Frame) !bool {
+        return self.vtable.present(self.ptr, frame);
     }
 
     pub fn measureText(self: RenderBackend, value: []const u8) !Size {
@@ -244,7 +245,7 @@ pub const LogBackend = struct {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
     }
 
-    fn present(ptr: *anyopaque, frame: RenderBackend.Frame) !void {
+    fn present(ptr: *anyopaque, frame: RenderBackend.Frame) !bool {
         const self: *LogBackend = @ptrCast(@alignCast(ptr));
         try self.writer.print("frame {d}x{d} scale {d} commands {d}\n", .{
             frame.size.width,
@@ -264,6 +265,7 @@ pub const LogBackend = struct {
                 ),
             }
         }
+        return false;
     }
 
     fn measureText(_: *anyopaque, value: []const u8) !Size {
@@ -546,11 +548,16 @@ pub const Runtime = struct {
     constraints: Constraints,
     lua: *lua_app.App,
     widget_arena: std.heap.ArenaAllocator,
+    color_scheme: desktop_settings.ColorScheme,
     state: DemoState = .{},
     input_text: std.ArrayList(u8) = .empty,
     focused_input_id: ?[]u8 = null,
     root: ?RenderNode = null,
     display_list: DisplayList = .{},
+    repaint_pending: bool = false,
+    rebuild_pending: bool = false,
+    frame_pending: bool = false,
+    rendering: bool = false,
 
     pub const State = struct {
         button_pressed: bool = false,
@@ -559,16 +566,24 @@ pub const Runtime = struct {
         focused_input_id: ?[]const u8 = null,
         window_width: f32 = 0,
         window_height: f32 = 0,
+        color_scheme: []const u8 = "no-preference",
     };
     const DemoState = State;
 
-    pub fn init(allocator: std.mem.Allocator, backend: RenderBackend, constraints: Constraints, lua: *lua_app.App) !Runtime {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        backend: RenderBackend,
+        constraints: Constraints,
+        lua: *lua_app.App,
+        color_scheme: desktop_settings.ColorScheme,
+    ) !Runtime {
         var self: Runtime = .{
             .allocator = allocator,
             .backend = backend,
             .constraints = constraints,
             .lua = lua,
             .widget_arena = .init(allocator),
+            .color_scheme = color_scheme,
         };
         errdefer self.deinit();
         try self.rebuild();
@@ -594,6 +609,7 @@ pub const Runtime = struct {
             .focused_input_id = self.focused_input_id,
             .window_width = self.constraints.max_width,
             .window_height = self.constraints.max_height,
+            .color_scheme = self.color_scheme.name(),
         };
     }
 
@@ -602,11 +618,33 @@ pub const Runtime = struct {
     }
 
     pub fn repaint(self: *Runtime) !void {
+        try self.presentFrame();
+    }
+
+    pub fn requestRepaint(self: *Runtime) !void {
+        self.repaint_pending = true;
+        if (!self.frame_pending and !self.rendering) try self.presentFrame();
+    }
+
+    fn presentFrame(self: *Runtime) !void {
+        if (self.rendering) {
+            self.repaint_pending = true;
+            return;
+        }
+
+        self.rendering = true;
+        defer self.rendering = false;
+        self.repaint_pending = false;
+        if (self.rebuild_pending) {
+            try self.rebuild();
+            self.rebuild_pending = false;
+        }
+
         const root = if (self.root) |*root| root else return error.NotBuilt;
         self.display_list.clearRetainingCapacity();
         try paint(self.allocator, root, &self.display_list);
         const frame_size = self.frameSize();
-        try self.backend.present(.{
+        self.frame_pending = try self.backend.present(.{
             .size = frame_size,
             .scale = 1,
             .damage = &.{.{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height }},
@@ -614,12 +652,17 @@ pub const Runtime = struct {
         });
     }
 
+    fn frameDone(self: *Runtime) !void {
+        self.frame_pending = false;
+        if (self.repaint_pending) try self.presentFrame();
+    }
+
     pub fn click(self: *Runtime, point: Point) !void {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         if (hitTestTextInput(root, point)) |id| {
             try self.setFocusedInput(id);
             try self.rebuild();
-            try self.repaint();
+            try self.requestRepaint();
             return;
         }
 
@@ -629,12 +672,12 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, id, "hello")) {
                 self.state.button_pressed = !self.state.button_pressed;
                 try self.rebuild();
-                try self.repaint();
+                try self.requestRepaint();
             }
         } else {
             log.info("clicked empty space at {d},{d}", .{ point.x, point.y });
             try self.rebuild();
-            try self.repaint();
+            try self.requestRepaint();
         }
     }
 
@@ -663,7 +706,7 @@ pub const Runtime = struct {
             .enter => try self.setFocusedInput(null),
         }
         try self.rebuild();
-        try self.repaint();
+        try self.requestRepaint();
     }
 
     pub fn waylandClick(ctx: *anyopaque, point: Point) void {
@@ -678,12 +721,37 @@ pub const Runtime = struct {
         if (size.width > 0 and size.height > 0) {
             self.constraints = .{ .max_width = size.width, .max_height = size.height };
         }
+        if (self.rendering) {
+            self.rebuild_pending = true;
+            self.repaint_pending = true;
+            return;
+        }
         self.rebuild() catch |err| {
             log.err("configure rebuild failed: {}", .{err});
             return;
         };
-        self.repaint() catch |err| {
+        self.requestRepaint() catch |err| {
             log.err("configure repaint failed: {}", .{err});
+        };
+    }
+
+    pub fn waylandFrameDone(ctx: *anyopaque) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.frameDone() catch |err| {
+            log.err("frame repaint failed: {}", .{err});
+        };
+    }
+
+    pub fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorScheme) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        if (self.color_scheme == color_scheme) return;
+        self.color_scheme = color_scheme;
+        self.rebuild() catch |err| {
+            log.err("desktop settings rebuild failed: {}", .{err});
+            return;
+        };
+        self.requestRepaint() catch |err| {
+            log.err("desktop settings repaint failed: {}", .{err});
         };
     }
 
@@ -699,7 +767,7 @@ pub const Runtime = struct {
         if (expirations == 0) return;
         self.state.pulse = !self.state.pulse;
         try self.rebuild();
-        try self.repaint();
+        try self.requestRepaint();
     }
 
     pub fn fileChanged(
@@ -712,7 +780,7 @@ pub const Runtime = struct {
         log.info("reload requested for {s} mask=0x{x}", .{ path, mask });
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         try self.rebuild();
-        try self.repaint();
+        try self.requestRepaint();
     }
 
     fn rebuild(self: *Runtime) !void {
@@ -763,6 +831,12 @@ pub fn main(init: std.process.Init) !void {
     const constraints: Constraints = .{ .max_width = 640, .max_height = 480 };
     var lua = try lua_app.App.init(allocator, "main.lua");
     defer lua.deinit();
+    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
+        log.warn("desktop settings unavailable: {}", .{err});
+        break :blk null;
+    };
+    defer if (settings_client) |*settings| settings.deinit();
+    const initial_color_scheme: desktop_settings.ColorScheme = if (settings_client) |settings| settings.color_scheme else .no_preference;
 
     if (backend_kind == .vulkan) {
         var backend = try wayland_vulkan.Backend.create(allocator, .{
@@ -772,11 +846,16 @@ pub fn main(init: std.process.Init) !void {
         });
         defer backend.destroy();
 
-        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
+        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua, initial_color_scheme);
         defer runtime.deinit();
         backend.setClickHandler(&runtime, Runtime.waylandClick);
         backend.setRepaintHandler(&runtime, Runtime.waylandConfigure);
+        backend.setFrameHandler(&runtime, Runtime.waylandFrameDone);
         backend.setKeyHandler(&runtime, Runtime.waylandKeyInput);
+        if (settings_client) |*settings| {
+            try settings.installSignalFilter();
+            settings.setChangeHandler(&runtime, Runtime.desktopSettingsChanged);
+        }
         try runtime.repaint();
 
         var loop = try event_loop.EventLoop.init(allocator);
@@ -789,6 +868,12 @@ pub fn main(init: std.process.Init) !void {
         });
         try backend.installKeyRepeat(&loop);
         defer backend.uninstallKeyRepeat();
+        if (settings_client) |*settings| try loop.addFd(.{
+            .fd = settings.eventLoopFd(),
+            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+            .ctx = settings,
+            .callback = desktop_settings.Client.eventLoopCallback,
+        });
         try loop.addRepeatingTimer(1000, &runtime, Runtime.timerTick);
         loop.addFileWatch("main.lua", &runtime, Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("main.lua watch not installed: {}", .{err});
@@ -805,11 +890,16 @@ pub fn main(init: std.process.Init) !void {
         });
         defer backend.destroy();
 
-        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
+        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua, initial_color_scheme);
         defer runtime.deinit();
         backend.setClickHandler(&runtime, Runtime.waylandClick);
         backend.setRepaintHandler(&runtime, Runtime.waylandConfigure);
+        backend.setFrameHandler(&runtime, Runtime.waylandFrameDone);
         backend.setKeyHandler(&runtime, Runtime.waylandKeyInput);
+        if (settings_client) |*settings| {
+            try settings.installSignalFilter();
+            settings.setChangeHandler(&runtime, Runtime.desktopSettingsChanged);
+        }
         try runtime.repaint();
 
         var loop = try event_loop.EventLoop.init(allocator);
@@ -822,6 +912,12 @@ pub fn main(init: std.process.Init) !void {
         });
         try backend.installKeyRepeat(&loop);
         defer backend.uninstallKeyRepeat();
+        if (settings_client) |*settings| try loop.addFd(.{
+            .fd = settings.eventLoopFd(),
+            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+            .ctx = settings,
+            .callback = desktop_settings.Client.eventLoopCallback,
+        });
         try loop.addRepeatingTimer(1000, &runtime, Runtime.timerTick);
         loop.addFileWatch("main.lua", &runtime, Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("main.lua watch not installed: {}", .{err});
@@ -835,7 +931,7 @@ pub fn main(init: std.process.Init) !void {
     defer stdout_writer.interface.flush() catch {};
 
     var backend: LogBackend = .{ .writer = &stdout_writer.interface };
-    var runtime = try Runtime.init(allocator, backend.backend(), constraints, &lua);
+    var runtime = try Runtime.init(allocator, backend.backend(), constraints, &lua, initial_color_scheme);
     defer runtime.deinit();
     try runtime.repaint();
 
