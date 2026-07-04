@@ -11,10 +11,13 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 8);
+    scanner.generate("wl_output", 4);
     scanner.generate("xdg_wm_base", 6);
+    scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 1);
@@ -149,6 +152,39 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
+
+    const run_lua_layershell_example_cmd = b.addRunArtifact(exe);
+    run_lua_layershell_example_cmd.step.dependOn(b.getInstallStep());
+    run_lua_layershell_example_cmd.addArgs(&.{
+        "--script=examples/lua/layershell.lua",
+        "--layer-shell",
+        "--anchor=top,left,right",
+        "--height=32",
+        "--exclusive-zone=32",
+    });
+    if (b.args) |args| {
+        run_lua_layershell_example_cmd.addArgs(args);
+    }
+
+    const run_lua_layershell_example_step = b.step("run-lua-layershell-example", "Run the Lua layer-shell example");
+    run_lua_layershell_example_step.dependOn(&run_lua_layershell_example_cmd.step);
+
+    const run_lua_vulkan_layershell_example_cmd = b.addRunArtifact(exe);
+    run_lua_vulkan_layershell_example_cmd.step.dependOn(b.getInstallStep());
+    run_lua_vulkan_layershell_example_cmd.addArgs(&.{
+        "--script=examples/lua/layershell.lua",
+        "--backend=vulkan",
+        "--layer-shell",
+        "--anchor=top,left,right",
+        "--height=32",
+        "--exclusive-zone=32",
+    });
+    if (b.args) |args| {
+        run_lua_vulkan_layershell_example_cmd.addArgs(args);
+    }
+
+    const run_lua_vulkan_layershell_example_step = b.step("run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example");
+    run_lua_vulkan_layershell_example_step.dependOn(&run_lua_vulkan_layershell_example_cmd.step);
 
     const run_native_example_cmd = b.addRunArtifact(native_example);
     run_native_example_cmd.step.dependOn(b.getInstallStep());

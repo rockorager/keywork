@@ -14,6 +14,26 @@ enum keywork_backend {
     KEYWORK_BACKEND_VULKAN = 2,
 };
 
+enum keywork_layer_shell_layer {
+    KEYWORK_LAYER_BACKGROUND = 0,
+    KEYWORK_LAYER_BOTTOM = 1,
+    KEYWORK_LAYER_TOP = 2,
+    KEYWORK_LAYER_OVERLAY = 3,
+};
+
+enum keywork_layer_shell_anchor {
+    KEYWORK_LAYER_ANCHOR_TOP = 1 << 0,
+    KEYWORK_LAYER_ANCHOR_BOTTOM = 1 << 1,
+    KEYWORK_LAYER_ANCHOR_LEFT = 1 << 2,
+    KEYWORK_LAYER_ANCHOR_RIGHT = 1 << 3,
+};
+
+enum keywork_layer_shell_keyboard_interactivity {
+    KEYWORK_LAYER_KEYBOARD_NONE = 0,
+    KEYWORK_LAYER_KEYBOARD_EXCLUSIVE = 1,
+    KEYWORK_LAYER_KEYBOARD_ON_DEMAND = 2,
+};
+
 typedef struct keywork_build keywork_build_t;
 typedef struct keywork_widget keywork_widget_t;
 typedef struct keywork_display_list keywork_display_list_t;
@@ -77,6 +97,16 @@ struct keywork_run_options {
     float width;
     float height;
     uint64_t timer_interval_ms;
+    int layer_shell;
+    const char *layer_namespace;
+    int layer;
+    uint32_t layer_anchors;
+    int32_t layer_exclusive_zone;
+    int32_t layer_margin_top;
+    int32_t layer_margin_right;
+    int32_t layer_margin_bottom;
+    int32_t layer_margin_left;
+    int layer_keyboard_interactivity;
 };
 
 struct keywork_run_text_options {
@@ -85,6 +115,16 @@ struct keywork_run_text_options {
     int backend;
     float width;
     float height;
+    int layer_shell;
+    const char *layer_namespace;
+    int layer;
+    uint32_t layer_anchors;
+    int32_t layer_exclusive_zone;
+    int32_t layer_margin_top;
+    int32_t layer_margin_right;
+    int32_t layer_margin_bottom;
+    int32_t layer_margin_left;
+    int layer_keyboard_interactivity;
 };
 
 int keywork_run_app(const struct keywork_run_options *options, const struct keywork_app_vtable *vtable, void *userdata);

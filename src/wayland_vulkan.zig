@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const wp = wayland.client.wp;
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
+const zwlr = wayland.client.zwlr;
 
 const log = std.log.scoped(.keywork_wayland_vulkan);
 
@@ -63,7 +64,8 @@ pub const Backend = struct {
     display: *wl.Display,
     registry: *wl.Registry,
     compositor: *wl.Compositor,
-    wm_base: *xdg.WmBase,
+    wm_base: ?*xdg.WmBase,
+    layer_shell: ?*zwlr.LayerShellV1,
     viewporter: ?*wp.Viewporter,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1,
@@ -71,8 +73,7 @@ pub const Backend = struct {
     surface: *wl.Surface,
     viewport: ?*wp.Viewport,
     fractional_scale: ?*wp.FractionalScaleV1,
-    xdg_surface: *xdg.Surface,
-    toplevel: *xdg.Toplevel,
+    shell_role: ShellRole,
     text_renderer: TextRenderer,
     configured: bool,
     closed: bool,
@@ -138,11 +139,33 @@ pub const Backend = struct {
         app_id: [:0]const u8 = "dev.keywork.Keywork",
         width: u31 = 640,
         height: u31 = 480,
+        layer_shell: ?keywork.LayerShellOptions = null,
+    };
+
+    const ShellRole = union(enum) {
+        xdg: struct {
+            surface: *xdg.Surface,
+            toplevel: *xdg.Toplevel,
+        },
+        layer: struct {
+            surface: *zwlr.LayerSurfaceV1,
+        },
+
+        fn destroy(self: ShellRole) void {
+            switch (self) {
+                .xdg => |role| {
+                    role.toplevel.destroy();
+                    role.surface.destroy();
+                },
+                .layer => |role| role.surface.destroy(),
+            }
+        }
     };
 
     const Globals = struct {
         compositor: ?*wl.Compositor = null,
         wm_base: ?*xdg.WmBase = null,
+        layer_shell: ?*zwlr.LayerShellV1 = null,
         viewporter: ?*wp.Viewporter = null,
         fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
         cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
@@ -159,18 +182,15 @@ pub const Backend = struct {
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
         const compositor = globals.compositor orelse return error.NoWlCompositor;
-        const wm_base = globals.wm_base orelse return error.NoXdgWmBase;
+        const wm_base = globals.wm_base;
+        const layer_shell = globals.layer_shell;
         const viewporter = globals.viewporter;
         const fractional_scale_manager = globals.fractional_scale_manager;
         const cursor_shape_manager = globals.cursor_shape_manager;
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
-        const xdg_surface = try wm_base.getXdgSurface(surface);
-        errdefer xdg_surface.destroy();
-        const toplevel = try xdg_surface.getToplevel();
-        errdefer toplevel.destroy();
-        toplevel.setAppId(options.app_id);
-        toplevel.setTitle(options.title);
+        const shell_role = try createShellRole(surface, wm_base, layer_shell, options);
+        errdefer shell_role.destroy();
         const viewport = if (viewporter) |manager| try manager.getViewport(surface) else null;
         errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
         const fractional_scale = if (fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
@@ -254,6 +274,7 @@ pub const Backend = struct {
             .registry = registry,
             .compositor = compositor,
             .wm_base = wm_base,
+            .layer_shell = layer_shell,
             .viewporter = viewporter,
             .fractional_scale_manager = fractional_scale_manager,
             .cursor_shape_manager = cursor_shape_manager,
@@ -261,8 +282,7 @@ pub const Backend = struct {
             .surface = surface,
             .viewport = viewport,
             .fractional_scale = fractional_scale,
-            .xdg_surface = xdg_surface,
-            .toplevel = toplevel,
+            .shell_role = shell_role,
             .text_renderer = text_renderer_instance,
             .configured = false,
             .closed = false,
@@ -315,9 +335,14 @@ pub const Backend = struct {
             .frame_callback = null,
         };
 
-        wm_base.setListener(*Backend, wmBaseListener, self);
-        xdg_surface.setListener(*Backend, xdgSurfaceListener, self);
-        toplevel.setListener(*Backend, toplevelListener, self);
+        if (wm_base) |base| base.setListener(*Backend, wmBaseListener, self);
+        switch (self.shell_role) {
+            .xdg => |role| {
+                role.surface.setListener(*Backend, xdgSurfaceListener, self);
+                role.toplevel.setListener(*Backend, toplevelListener, self);
+            },
+            .layer => |role| role.surface.setListener(*Backend, layerSurfaceListener, self),
+        }
         if (fractional_scale) |surface_scale| surface_scale.setListener(*Backend, fractionalScaleListener, self);
         self.input.attachListeners(Backend, self);
         surface.commit();
@@ -342,13 +367,13 @@ pub const Backend = struct {
         self.input.deinit();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
-        self.toplevel.destroy();
-        self.xdg_surface.destroy();
+        self.shell_role.destroy();
         self.surface.destroy();
         if (self.cursor_shape_manager) |manager| manager.destroy();
         if (self.fractional_scale_manager) |manager| manager.destroy();
         if (self.viewporter) |viewporter| viewporter.destroy();
-        self.wm_base.destroy();
+        if (self.layer_shell) |layer_shell| layer_shell.destroy();
+        if (self.wm_base) |wm_base| wm_base.destroy();
         self.compositor.destroy();
         self.registry.destroy();
         self.display.disconnect();
@@ -1192,6 +1217,65 @@ pub const Backend = struct {
         );
     }
 
+    fn createShellRole(
+        surface: *wl.Surface,
+        wm_base: ?*xdg.WmBase,
+        layer_shell: ?*zwlr.LayerShellV1,
+        options: Options,
+    ) !ShellRole {
+        if (options.layer_shell) |layer_options| {
+            const shell = layer_shell orelse return error.NoLayerShell;
+            const layer_surface = try shell.getLayerSurface(surface, null, layer(layer_options.layer), layer_options.namespace);
+            errdefer layer_surface.destroy();
+            layer_surface.setSize(options.width, options.height);
+            layer_surface.setAnchor(anchor(layer_options.anchors));
+            layer_surface.setExclusiveZone(layer_options.exclusive_zone);
+            layer_surface.setMargin(
+                layer_options.margin.top,
+                layer_options.margin.right,
+                layer_options.margin.bottom,
+                layer_options.margin.left,
+            );
+            layer_surface.setKeyboardInteractivity(keyboardInteractivity(layer_options.keyboard_interactivity));
+            return .{ .layer = .{ .surface = layer_surface } };
+        }
+
+        const base = wm_base orelse return error.NoXdgWmBase;
+        const xdg_surface = try base.getXdgSurface(surface);
+        errdefer xdg_surface.destroy();
+        const toplevel = try xdg_surface.getToplevel();
+        errdefer toplevel.destroy();
+        toplevel.setAppId(options.app_id);
+        toplevel.setTitle(options.title);
+        return .{ .xdg = .{ .surface = xdg_surface, .toplevel = toplevel } };
+    }
+
+    fn layer(value: keywork.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
+        return switch (value) {
+            .background => .background,
+            .bottom => .bottom,
+            .top => .top,
+            .overlay => .overlay,
+        };
+    }
+
+    fn anchor(value: keywork.LayerShellOptions.AnchorSet) zwlr.LayerSurfaceV1.Anchor {
+        return .{
+            .top = value.top,
+            .bottom = value.bottom,
+            .left = value.left,
+            .right = value.right,
+        };
+    }
+
+    fn keyboardInteractivity(value: keywork.LayerShellOptions.KeyboardInteractivity) zwlr.LayerSurfaceV1.KeyboardInteractivity {
+        return switch (value) {
+            .none => .none,
+            .exclusive => .exclusive,
+            .on_demand => .on_demand,
+        };
+    }
+
     fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *Globals) void {
         switch (event) {
             .global => |global| {
@@ -1199,6 +1283,8 @@ pub const Backend = struct {
                     globals.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
                     globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
+                } else if (std.mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
+                    globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, @min(global.version, 5)) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
                     globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
@@ -1239,6 +1325,19 @@ pub const Backend = struct {
                 self.configured = true;
                 self.notifyRepaint();
             },
+        }
+    }
+
+    fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *Backend) void {
+        switch (event) {
+            .configure => |configure| {
+                layer_surface.ackConfigure(configure.serial);
+                if (configure.width > 0) self.width = @intCast(configure.width);
+                if (configure.height > 0) self.height = @intCast(configure.height);
+                self.configured = true;
+                self.notifyRepaint();
+            },
+            .closed => self.closed = true,
         }
     }
 

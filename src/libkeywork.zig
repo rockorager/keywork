@@ -45,6 +45,7 @@ pub const ShortcutKey = core.ShortcutKey;
 pub const Intent = core.Intent;
 pub const CursorShape = core.CursorShape;
 pub const PointerButtonState = core.PointerButtonState;
+pub const LayerShellOptions = core.LayerShellOptions;
 pub const ClickHit = core.ClickHit;
 pub const FocusTarget = core.FocusTarget;
 pub const buildRenderTree = core.buildRenderTree;

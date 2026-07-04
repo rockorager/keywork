@@ -21,6 +21,7 @@ pub const Options = struct {
     width: f32 = 640,
     height: f32 = 480,
     backend: BackendKind = .log,
+    layer_shell: ?keywork.LayerShellOptions = null,
     log_writer: ?*std.Io.Writer = null,
     timer_interval_ms: ?u64 = 1000,
     file_watch_path: ?[]const u8 = null,
@@ -78,6 +79,7 @@ fn runWayland(
         .title = options.title,
         .width = try positiveU31(constraints.max_width),
         .height = try positiveU31(constraints.max_height),
+        .layer_shell = options.layer_shell,
     });
     defer backend.destroy();
 

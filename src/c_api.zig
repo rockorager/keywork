@@ -67,6 +67,16 @@ pub const KeyworkRunOptions = extern struct {
     width: f32 = 640,
     height: f32 = 480,
     timer_interval_ms: u64 = 0,
+    layer_shell: c_int = 0,
+    layer_namespace: ?[*:0]const u8 = null,
+    layer: c_int = 2,
+    layer_anchors: u32 = 0,
+    layer_exclusive_zone: i32 = 0,
+    layer_margin_top: i32 = 0,
+    layer_margin_right: i32 = 0,
+    layer_margin_bottom: i32 = 0,
+    layer_margin_left: i32 = 0,
+    layer_keyboard_interactivity: c_int = 0,
 };
 
 pub const KeyworkRunTextOptions = extern struct {
@@ -75,6 +85,16 @@ pub const KeyworkRunTextOptions = extern struct {
     backend: c_int = 0,
     width: f32 = 640,
     height: f32 = 480,
+    layer_shell: c_int = 0,
+    layer_namespace: ?[*:0]const u8 = null,
+    layer: c_int = 2,
+    layer_anchors: u32 = 0,
+    layer_exclusive_zone: i32 = 0,
+    layer_margin_top: i32 = 0,
+    layer_margin_right: i32 = 0,
+    layer_margin_bottom: i32 = 0,
+    layer_margin_left: i32 = 0,
+    layer_keyboard_interactivity: c_int = 0,
 };
 
 const CBuildScope = struct {
@@ -325,6 +345,7 @@ pub export fn keywork_run_app(
         .width = if (opts.width > 0) opts.width else 640,
         .height = if (opts.height > 0) opts.height else 480,
         .backend = backendKind(opts.backend),
+        .layer_shell = layerShellOptionsFromRunOptions(opts),
         .timer_interval_ms = if (opts.timer_interval_ms == 0) null else opts.timer_interval_ms,
     }) catch |err| return errorCode(err);
     return 0;
@@ -342,6 +363,7 @@ pub export fn keywork_run_text(options: ?*const KeyworkRunTextOptions) callconv(
         .width = if (opts.width > 0) opts.width else 640,
         .height = if (opts.height > 0) opts.height else 480,
         .backend = backendKind(opts.backend),
+        .layer_shell = layerShellOptionsFromRunTextOptions(opts),
         .timer_interval_ms = null,
     }) catch |err| return errorCode(err);
     return 0;
@@ -634,6 +656,66 @@ fn backendKind(value: c_int) keywork.BackendKind {
         1 => .wayland_shm,
         2 => .vulkan,
         else => .log,
+    };
+}
+
+fn layerShellOptionsFromRunOptions(options: *const KeyworkRunOptions) ?keywork.LayerShellOptions {
+    if (options.layer_shell == 0) return null;
+    return .{
+        .namespace = cStringZ(options.layer_namespace, "keywork"),
+        .layer = layerShellLayer(options.layer),
+        .anchors = layerShellAnchors(options.layer_anchors),
+        .exclusive_zone = options.layer_exclusive_zone,
+        .margin = .{
+            .top = options.layer_margin_top,
+            .right = options.layer_margin_right,
+            .bottom = options.layer_margin_bottom,
+            .left = options.layer_margin_left,
+        },
+        .keyboard_interactivity = layerShellKeyboardInteractivity(options.layer_keyboard_interactivity),
+    };
+}
+
+fn layerShellOptionsFromRunTextOptions(options: *const KeyworkRunTextOptions) ?keywork.LayerShellOptions {
+    if (options.layer_shell == 0) return null;
+    return .{
+        .namespace = cStringZ(options.layer_namespace, "keywork"),
+        .layer = layerShellLayer(options.layer),
+        .anchors = layerShellAnchors(options.layer_anchors),
+        .exclusive_zone = options.layer_exclusive_zone,
+        .margin = .{
+            .top = options.layer_margin_top,
+            .right = options.layer_margin_right,
+            .bottom = options.layer_margin_bottom,
+            .left = options.layer_margin_left,
+        },
+        .keyboard_interactivity = layerShellKeyboardInteractivity(options.layer_keyboard_interactivity),
+    };
+}
+
+fn layerShellLayer(value: c_int) keywork.LayerShellOptions.Layer {
+    return switch (value) {
+        0 => .background,
+        1 => .bottom,
+        3 => .overlay,
+        else => .top,
+    };
+}
+
+fn layerShellAnchors(value: u32) keywork.LayerShellOptions.AnchorSet {
+    return .{
+        .top = value & (1 << 0) != 0,
+        .bottom = value & (1 << 1) != 0,
+        .left = value & (1 << 2) != 0,
+        .right = value & (1 << 3) != 0,
+    };
+}
+
+fn layerShellKeyboardInteractivity(value: c_int) keywork.LayerShellOptions.KeyboardInteractivity {
+    return switch (value) {
+        1 => .exclusive,
+        2 => .on_demand,
+        else => .none,
     };
 }
 
