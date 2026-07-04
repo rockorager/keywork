@@ -41,6 +41,7 @@ pub const TextMeasurer = core.TextMeasurer;
 pub const LogBackend = core.LogBackend;
 pub const KeyInput = core.KeyInput;
 pub const CursorShape = core.CursorShape;
+pub const PointerButtonState = core.PointerButtonState;
 pub const ClickHit = core.ClickHit;
 pub const buildRenderTree = core.buildRenderTree;
 pub const buildRenderTreeMeasured = core.buildRenderTreeMeasured;

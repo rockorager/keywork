@@ -46,7 +46,7 @@ pub const Backend = struct {
     frame_context: ?*anyopaque,
     frame_callback: ?*wl.Callback,
 
-    pub const ClickHandler = WaylandInput.ClickHandler;
+    pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
     pub const CursorShapeHandler = WaylandInput.CursorShapeHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
@@ -173,8 +173,8 @@ pub const Backend = struct {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
     }
 
-    pub fn setClickHandler(self: *Backend, context: *anyopaque, handler: ClickHandler) void {
-        self.input.setClickHandler(context, handler);
+    pub fn setPointerButtonHandler(self: *Backend, context: *anyopaque, handler: PointerButtonHandler) void {
+        self.input.setPointerButtonHandler(context, handler);
     }
 
     pub fn setPointerMoveHandler(self: *Backend, context: *anyopaque, handler: PointerMoveHandler) void {

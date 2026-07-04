@@ -118,11 +118,22 @@ pub const Theme = struct {
 
 pub const InteractionState = struct {
     hovered_id: ?[]const u8 = null,
+    pressed_id: ?[]const u8 = null,
 
     pub fn isHovered(self: InteractionState, id: []const u8) bool {
         const hovered = self.hovered_id orelse return false;
         return std.mem.eql(u8, hovered, id);
     }
+
+    pub fn isPressed(self: InteractionState, id: []const u8) bool {
+        const pressed = self.pressed_id orelse return false;
+        return std.mem.eql(u8, pressed, id);
+    }
+};
+
+pub const PointerButtonState = enum {
+    pressed,
+    released,
 };
 
 pub const Size = struct {
@@ -537,9 +548,10 @@ pub const Element = struct {
 
 fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) !Widget {
     const hovered = interaction.isHovered(button_widget.id);
+    const pressed = button_widget.pressed or interaction.isPressed(button_widget.id);
     const label = widgets.coloredText(button_widget.label, buttonForeground(theme, hovered));
     const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
-    const background = if (button_widget.pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
+    const background = if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
     const surface = try widgets.box(allocator, padded, background);
     return widgets.clickable(allocator, button_widget.id, surface);
 }
@@ -2026,6 +2038,33 @@ test "button uses ambient hover styling" {
     const text_node = box_node.children[0].children[0];
     try std.testing.expectEqual(colors.black, box_node.background);
     try std.testing.expectEqual(colors.panel, text_node.foreground);
+}
+
+test "button uses ambient pressed styling" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.accent,
+            .pressed_background = colors.ink,
+        },
+    };
+    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", false);
+    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
+    var scope: BuildScope = .{
+        .allocator = build_arena.allocator(),
+        .interaction = .{ .pressed_id = "pressed" },
+    };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const box_node = root.children[0].children[0].children[0];
+    try std.testing.expectEqual(colors.ink, box_node.background);
 }
 
 test "theme widget provides ambient text and input styling" {

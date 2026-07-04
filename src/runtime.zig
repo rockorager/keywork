@@ -15,6 +15,7 @@ const Element = keywork.Element;
 const CursorShape = keywork.CursorShape;
 const KeyInput = keywork.KeyInput;
 const Point = keywork.Point;
+const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const RenderObjectNode = keywork.RenderObjectNode;
@@ -32,6 +33,7 @@ pub const Runtime = struct {
     input_text: std.ArrayList(u8) = .empty,
     focused_input_id: ?[]u8 = null,
     hovered_id: ?[]u8 = null,
+    pressed_id: ?[]u8 = null,
     element_root: ?Element = null,
     render_object_root: ?RenderObjectNode = null,
     root: ?RenderNode = null,
@@ -80,6 +82,7 @@ pub const Runtime = struct {
         self.input_text.deinit(self.allocator);
         if (self.focused_input_id) |id| self.allocator.free(id);
         if (self.hovered_id) |id| self.allocator.free(id);
+        if (self.pressed_id) |id| self.allocator.free(id);
         self.build_arena.deinit();
     }
 
@@ -144,9 +147,22 @@ pub const Runtime = struct {
     }
 
     pub fn click(self: *Runtime, point: Point) !void {
+        try self.pointerButton(point, .pressed);
+        try self.pointerButton(point, .released);
+    }
+
+    pub fn pointerButton(self: *Runtime, point: Point, state: PointerButtonState) !void {
+        switch (state) {
+            .pressed => try self.pointerDown(point),
+            .released => try self.pointerUp(point),
+        }
+    }
+
+    fn pointerDown(self: *Runtime, point: Point) !void {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         if (keywork.hitTestTextInput(root, point)) |id| {
             try self.setFocusedInput(id);
+            _ = try self.setPressedId(null);
             try self.rebuild();
             try self.requestRepaint();
             return;
@@ -154,17 +170,39 @@ pub const Runtime = struct {
 
         try self.setFocusedInput(null);
         if (keywork.hitTestClick(root, point)) |hit| {
-            log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
-            if (hit.callback) |callback| {
-                try callback.call();
-                try self.rebuild();
-                try self.requestRepaint();
-            } else if (try self.app.click(hit.id)) {
+            if (try self.setPressedId(hit.id)) {
                 try self.rebuild();
                 try self.requestRepaint();
             }
         } else {
-            log.info("clicked empty space at {d},{d}", .{ point.x, point.y });
+            log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
+            _ = try self.setPressedId(null);
+            try self.rebuild();
+            try self.requestRepaint();
+        }
+    }
+
+    fn pointerUp(self: *Runtime, point: Point) !void {
+        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const hit = keywork.hitTestClick(root, point);
+        const should_activate = if (self.pressed_id) |pressed_id| blk: {
+            const hit_id = if (hit) |click_hit| click_hit.id else break :blk false;
+            break :blk std.mem.eql(u8, pressed_id, hit_id);
+        } else false;
+
+        var needs_update = try self.setPressedId(null);
+        if (should_activate) {
+            const click_hit = hit.?;
+            log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
+            if (click_hit.callback) |callback| {
+                try callback.call();
+                needs_update = true;
+            } else if (try self.app.click(click_hit.id)) {
+                needs_update = true;
+            }
+        }
+
+        if (needs_update) {
             try self.rebuild();
             try self.requestRepaint();
         }
@@ -230,10 +268,27 @@ pub const Runtime = struct {
         return true;
     }
 
-    pub fn waylandClick(ctx: *anyopaque, point: Point) void {
+    fn setPressedId(self: *Runtime, id: ?[]const u8) !bool {
+        if (self.pressed_id) |old_id| {
+            if (id) |new_id| {
+                if (std.mem.eql(u8, old_id, new_id)) return false;
+            }
+            self.allocator.free(old_id);
+            self.pressed_id = null;
+        } else if (id == null) {
+            return false;
+        }
+
+        if (id) |new_id| {
+            self.pressed_id = try self.allocator.dupe(u8, new_id);
+        }
+        return true;
+    }
+
+    pub fn waylandPointerButton(ctx: *anyopaque, point: Point, state: PointerButtonState) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.click(point) catch |err| {
-            log.err("click handling failed: {}", .{err});
+        self.pointerButton(point, state) catch |err| {
+            log.err("pointer button handling failed: {}", .{err});
         };
     }
 
@@ -327,7 +382,7 @@ pub const Runtime = struct {
         var build_scope: BuildScope = .{
             .allocator = self.build_arena.allocator(),
             .theme = keywork.Theme.fromColorScheme(state.color_scheme),
-            .interaction = .{ .hovered_id = self.hovered_id },
+            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id },
         };
 
         var app_root = try self.app.buildWidget(&build_scope, state);

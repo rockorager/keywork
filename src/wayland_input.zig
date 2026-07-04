@@ -34,8 +34,8 @@ repeat_text_buffer: [64]u8 = undefined,
 key_text_buffer: [64]u8 = undefined,
 repeat_delay_ms: u64 = 0,
 repeat_interval_ms: u64 = 0,
-click_handler: ?ClickHandler = null,
-click_context: ?*anyopaque = null,
+pointer_button_handler: ?PointerButtonHandler = null,
+pointer_button_context: ?*anyopaque = null,
 pointer_move_handler: ?PointerMoveHandler = null,
 pointer_move_context: ?*anyopaque = null,
 cursor_shape_handler: ?CursorShapeHandler = null,
@@ -43,7 +43,7 @@ cursor_shape_context: ?*anyopaque = null,
 key_handler: ?KeyHandler = null,
 key_context: ?*anyopaque = null,
 
-pub const ClickHandler = *const fn (ctx: *anyopaque, point: keywork.Point) void;
+pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
 pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
@@ -84,9 +84,9 @@ pub fn attachListeners(self: *Self, comptime Backend: type, backend: *Backend) v
     if (self.keyboard) |keyboard| keyboard.setListener(*Backend, keyboardListener(Backend), backend);
 }
 
-pub fn setClickHandler(self: *Self, context: *anyopaque, handler: ClickHandler) void {
-    self.click_context = context;
-    self.click_handler = handler;
+pub fn setPointerButtonHandler(self: *Self, context: *anyopaque, handler: PointerButtonHandler) void {
+    self.pointer_button_context = context;
+    self.pointer_button_handler = handler;
 }
 
 pub fn setPointerMoveHandler(self: *Self, context: *anyopaque, handler: PointerMoveHandler) void {
@@ -174,9 +174,13 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                     self.updateCursorShape(self.pointer_position.?);
                 },
                 .button => |button| {
-                    if (button.button == 272 and button.state == .pressed) {
+                    if (button.button == 272) {
                         if (self.pointer_position) |point| {
-                            if (self.click_handler) |handler| handler(self.click_context.?, point);
+                            self.dispatchPointerButton(point, switch (button.state) {
+                                .pressed => .pressed,
+                                .released => .released,
+                                _ => return,
+                            });
                         }
                     }
                 },
@@ -188,6 +192,10 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
 
 fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
     if (self.pointer_move_handler) |handler| handler(self.pointer_move_context.?, point);
+}
+
+fn dispatchPointerButton(self: *Self, point: keywork.Point, state: keywork.PointerButtonState) void {
+    if (self.pointer_button_handler) |handler| handler(self.pointer_button_context.?, point, state);
 }
 
 fn createCursorShapeDevice(self: *Self) void {
