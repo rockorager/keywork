@@ -209,8 +209,8 @@ fn parseWidget(
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const label = try dupeStringField(lua_state, allocator, table, "label");
         const on_pressed = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_pressed");
-        const action_id = try getOptionalStringField(lua_state, allocator, table, "action_id");
-        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed, .action_id = action_id } };
+        const intent = try getOptionalIntentField(lua_state, allocator, table, "action_id");
+        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed, .intent = intent } };
     }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -306,10 +306,10 @@ fn parseShortcutBindings(
     while (c.lua_next(lua_state, bindings_table) != 0) {
         defer pop(lua_state, 1);
         const key_name = try stringFromStack(lua_state, -2);
-        const action_id = try stringFromStack(lua_state, -1);
+        const intent = try intentFromStack(lua_state, allocator, -1);
         try bindings.append(allocator, .{
             .key = try shortcutKeyFromString(key_name),
-            .action_id = try allocator.dupe(u8, action_id),
+            .intent = intent,
         });
     }
     return try bindings.toOwnedSlice(allocator);
@@ -342,11 +342,15 @@ fn dupeStringField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table:
     return try allocator.dupe(u8, value);
 }
 
-fn getOptionalStringField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?[]const u8 {
+fn getOptionalIntentField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?keywork.Intent {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return null;
-    return try allocator.dupe(u8, try stringFromStack(lua_state, -1));
+    return try intentFromStack(lua_state, allocator, -1);
+}
+
+fn intentFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Intent {
+    return .action(try allocator.dupe(u8, try stringFromStack(lua_state, index)));
 }
 
 fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {

@@ -42,6 +42,7 @@ pub const TextMeasurer = core.TextMeasurer;
 pub const LogBackend = core.LogBackend;
 pub const KeyInput = core.KeyInput;
 pub const ShortcutKey = core.ShortcutKey;
+pub const Intent = core.Intent;
 pub const CursorShape = core.CursorShape;
 pub const PointerButtonState = core.PointerButtonState;
 pub const ClickHit = core.ClickHit;

@@ -579,7 +579,7 @@ test "shortcut invokes ambient action outside text input focus" {
             const label = keywork.widgets.text("Shortcut target");
             const children = [_]keywork.Widget{ input, label };
             const column = try keywork.widgets.column(scope.allocator, &children, 4);
-            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
             const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
             const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, column);
             return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);

@@ -151,6 +151,14 @@ pub const ShortcutKey = enum {
     backspace,
 };
 
+pub const Intent = struct {
+    action_id: []const u8,
+
+    pub fn action(action_id: []const u8) Intent {
+        return .{ .action_id = action_id };
+    }
+};
+
 pub const FocusNode = struct {
     id: []const u8,
 
@@ -271,7 +279,7 @@ pub const Widget = union(enum) {
         id: []const u8,
         label: []const u8,
         on_pressed: ?Callback = null,
-        action_id: ?[]const u8 = null,
+        intent: ?Intent = null,
     };
 
     pub const Box = struct {
@@ -293,7 +301,7 @@ pub const Widget = union(enum) {
 
     pub const ShortcutBinding = struct {
         key: ShortcutKey,
-        action_id: []const u8,
+        intent: Intent,
     };
 
     pub const Actions = struct {
@@ -545,7 +553,12 @@ pub const widgets = struct {
 
     pub fn actionButton(allocator: std.mem.Allocator, id: []const u8, label: []const u8, action_id: []const u8) !Widget {
         _ = allocator;
-        return .{ .button = .{ .id = id, .label = label, .action_id = action_id } };
+        return .{ .button = .{ .id = id, .label = label, .intent = .action(action_id) } };
+    }
+
+    pub fn intentButton(allocator: std.mem.Allocator, id: []const u8, label: []const u8, intent: Intent) !Widget {
+        _ = allocator;
+        return .{ .button = .{ .id = id, .label = label, .intent = intent } };
     }
 
     pub fn theme(allocator: std.mem.Allocator, theme_value: Theme, child: Widget) !Widget {
@@ -625,7 +638,7 @@ fn buildButtonWidget(
     actions: ?*const ActionScope,
     button_widget: Widget.Button,
 ) !Widget {
-    const on_pressed = button_widget.on_pressed orelse if (button_widget.action_id) |action_id| findActionInScope(actions, action_id) else null;
+    const on_pressed = button_widget.on_pressed orelse if (button_widget.intent) |intent| findActionForIntent(actions, intent) else null;
     const enabled = on_pressed != null;
     const hovered = enabled and interaction.isHovered(button_widget.id);
     const pressed = enabled and interaction.isPressed(button_widget.id);
@@ -1615,11 +1628,11 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer allocator.free(id);
             const label = try allocator.dupe(u8, button_widget.label);
             errdefer allocator.free(label);
-            const action_id = if (button_widget.action_id) |action_id_value| try allocator.dupe(u8, action_id_value) else null;
-            errdefer if (action_id) |action_id_value| allocator.free(action_id_value);
+            const intent = if (button_widget.intent) |intent_value| try cloneIntent(allocator, intent_value) else null;
+            errdefer if (intent) |intent_value| destroyIntent(allocator, intent_value);
             const callback = if (button_widget.on_pressed) |on_pressed| try on_pressed.clone(allocator) else null;
             errdefer if (callback) |on_pressed| on_pressed.destroy(allocator);
-            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback, .action_id = action_id } };
+            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback, .intent = intent } };
         },
         .box => |box_widget| .{ .box = box_widget },
         .clickable => |clickable_widget| blk: {
@@ -1681,7 +1694,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (button_widget.on_pressed) |callback| callback.destroy(allocator);
             allocator.free(button_widget.id);
             allocator.free(button_widget.label);
-            if (button_widget.action_id) |action_id| allocator.free(action_id);
+            if (button_widget.intent) |intent| destroyIntent(allocator, intent);
         },
         .clickable => |clickable_widget| {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
@@ -1736,19 +1749,27 @@ fn cloneShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.
     const result = try allocator.alloc(Widget.ShortcutBinding, bindings.len);
     var initialized: usize = 0;
     errdefer {
-        for (result[0..initialized]) |binding| allocator.free(binding.action_id);
+        for (result[0..initialized]) |binding| destroyIntent(allocator, binding.intent);
         allocator.free(result);
     }
     for (bindings, 0..) |binding, index| {
-        result[index] = .{ .key = binding.key, .action_id = try allocator.dupe(u8, binding.action_id) };
+        result[index] = .{ .key = binding.key, .intent = try cloneIntent(allocator, binding.intent) };
         initialized += 1;
     }
     return result;
 }
 
 fn destroyShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding) void {
-    for (bindings) |binding| allocator.free(binding.action_id);
+    for (bindings) |binding| destroyIntent(allocator, binding.intent);
     allocator.free(bindings);
+}
+
+fn cloneIntent(allocator: std.mem.Allocator, intent: Intent) !Intent {
+    return .{ .action_id = try allocator.dupe(u8, intent.action_id) };
+}
+
+fn destroyIntent(allocator: std.mem.Allocator, intent: Intent) void {
+    allocator.free(intent.action_id);
 }
 
 fn cloneKey(allocator: std.mem.Allocator, key: Widget.Key) !Widget.Key {
@@ -1977,7 +1998,7 @@ fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*
         .shortcuts => |shortcuts_widget| {
             for (shortcuts_widget.bindings) |binding| {
                 if (binding.key != key) continue;
-                if (findActionInScope(scope, binding.action_id)) |callback| return callback;
+                if (findActionForIntent(scope, binding.intent)) |callback| return callback;
             }
         },
         else => {},
@@ -1989,11 +2010,11 @@ fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*
     return null;
 }
 
-fn findActionInScope(scope: ?*const ActionScope, action_id: []const u8) ?Widget.Callback {
+fn findActionForIntent(scope: ?*const ActionScope, intent: Intent) ?Widget.Callback {
     var cursor = scope;
     while (cursor) |action_scope| {
         for (action_scope.bindings) |binding| {
-            if (std.mem.eql(u8, binding.id, action_id)) return binding.callback;
+            if (std.mem.eql(u8, binding.id, intent.action_id)) return binding.callback;
         }
         cursor = action_scope.parent;
     }
@@ -2042,7 +2063,7 @@ fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: 
     while (cursor) |shortcut_scope| {
         for (shortcut_scope.bindings) |binding| {
             if (binding.key != key) continue;
-            if (findActionInScope(actions, binding.action_id)) |callback| return callback;
+            if (findActionForIntent(actions, binding.intent)) |callback| return callback;
         }
         cursor = shortcut_scope.parent;
     }
@@ -2724,7 +2745,7 @@ test "shortcuts invoke ambient actions" {
 
     var counter: Counter = .{};
     const child = widgets.text("Shortcut child");
-    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .action_id = "increment" }};
+    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .intent = .action("increment") }};
     const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
     const shortcuts_widget = try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, child);
     const actions_widget = try widgets.actions(build_arena.allocator(), &action_bindings, shortcuts_widget);
@@ -2736,6 +2757,42 @@ test "shortcuts invoke ambient actions" {
     try callback.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
     try std.testing.expectEqual(@as(?Widget.Callback, null), findShortcutAction(&element, .space));
+}
+
+test "button and shortcut can share an intent" {
+    const Counter = struct {
+        value: usize = 0,
+
+        fn increment(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena.deinit();
+
+    var counter: Counter = .{};
+    const intent = Intent.action("increment");
+    const button = try widgets.intentButton(build_arena.allocator(), "increment-button", "Increment", intent);
+    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .intent = intent }};
+    const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
+    const root_widget = try widgets.actions(
+        build_arena.allocator(),
+        &action_bindings,
+        try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, button),
+    );
+
+    var element = try buildElementTree(allocator, &root_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(allocator, &element);
+    var root = try buildRenderTreeFromElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(allocator, &root);
+
+    try findShortcutAction(&element, .enter).?.call();
+    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    try hit.callback.?.call();
+    try std.testing.expectEqual(@as(usize, 2), counter.value);
 }
 
 test "focused shortcut resolution prefers nearest shortcut and action scopes" {
@@ -2762,7 +2819,7 @@ test "focused shortcut resolution prefers nearest shortcut and action scopes" {
     const global_button = try widgets.actionButton(build_arena.allocator(), "global-button", "Global", "activate");
     const local_button = try widgets.actionButton(build_arena.allocator(), "local-button", "Local", "activate");
     const local_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementLocal } }};
-    const local_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+    const local_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
     const local_subtree = try widgets.actions(
         build_arena.allocator(),
         &local_actions,
@@ -2771,7 +2828,7 @@ test "focused shortcut resolution prefers nearest shortcut and action scopes" {
     const children = [_]Widget{ global_button, local_subtree };
     const column = try widgets.column(build_arena.allocator(), &children, 4);
     const global_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementGlobal } }};
-    const global_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+    const global_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
     const root_widget = try widgets.actions(
         build_arena.allocator(),
         &global_actions,
