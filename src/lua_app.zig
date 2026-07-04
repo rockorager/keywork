@@ -99,7 +99,7 @@ fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
-    c.lua_createtable(lua_state, 0, 7);
+    c.lua_createtable(lua_state, 0, 6);
     const table = c.lua_gettop(lua_state);
     c.lua_pushboolean(lua_state, if (state.button_pressed) 1 else 0);
     c.lua_setfield(lua_state, table, "button_pressed");
@@ -107,12 +107,6 @@ fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_setfield(lua_state, table, "pulse");
     c.lua_pushlstring(lua_state, state.input_text.ptr, state.input_text.len);
     c.lua_setfield(lua_state, table, "input_text");
-    if (state.focused_input_id) |id| {
-        c.lua_pushlstring(lua_state, id.ptr, id.len);
-    } else {
-        c.lua_pushnil(lua_state);
-    }
-    c.lua_setfield(lua_state, table, "focused_input_id");
     c.lua_pushnumber(lua_state, state.window_width);
     c.lua_setfield(lua_state, table, "window_width");
     c.lua_pushnumber(lua_state, state.window_height);
@@ -168,8 +162,7 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const placeholder = try dupeStringField(lua_state, allocator, table, "placeholder");
         const value = try allocator.dupe(u8, runtime_state.input_text);
-        const focused = if (runtime_state.focused_input_id) |focused_id| std.mem.eql(u8, focused_id, id) else false;
-        return .{ .text_input = .{ .id = id, .value = value, .placeholder = placeholder, .focused = focused } };
+        return keywork.widgets.textInput(id, value, placeholder);
     }
     if (std.mem.eql(u8, kind, "column")) {
         c.lua_getfield(lua_state, table, "children");

@@ -42,7 +42,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
 
     keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
         keywork_button(build, "increment", "Increment", 0));
-    keywork_widget_t *input = keywork_text_input(build, "c-input", context->input_text, "Type here", context->focused_input_id != NULL);
+    keywork_widget_t *input = keywork_text_input(build, "c-input", context->input_text, "Type here");
     keywork_widget_t *labels[] = {
         keywork_text(build, state->pulse ? "timer: tick" : "timer: tock"),
         keywork_text(build, context->color_scheme),

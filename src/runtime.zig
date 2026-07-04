@@ -31,7 +31,7 @@ pub const Runtime = struct {
     build_arena: std.heap.ArenaAllocator,
     color_scheme: desktop_settings.ColorScheme,
     input_text: std.ArrayList(u8) = .empty,
-    focused_input_id: ?[]u8 = null,
+    focused_id: ?[]u8 = null,
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
     element_root: ?Element = null,
@@ -80,7 +80,7 @@ pub const Runtime = struct {
         }
         self.display_list.deinit(self.allocator);
         self.input_text.deinit(self.allocator);
-        if (self.focused_input_id) |id| self.allocator.free(id);
+        if (self.focused_id) |id| self.allocator.free(id);
         if (self.hovered_id) |id| self.allocator.free(id);
         if (self.pressed_id) |id| self.allocator.free(id);
         self.build_arena.deinit();
@@ -89,7 +89,6 @@ pub const Runtime = struct {
     fn currentState(self: *const Runtime) State {
         return .{
             .input_text = self.input_text.items,
-            .focused_input_id = self.focused_input_id,
             .window_width = self.constraints.max_width,
             .window_height = self.constraints.max_height,
             .color_scheme = self.color_scheme.name(),
@@ -161,14 +160,14 @@ pub const Runtime = struct {
     fn pointerDown(self: *Runtime, point: Point) !void {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         if (keywork.hitTestTextInput(root, point)) |id| {
-            try self.setFocusedInput(id);
+            try self.setFocused(id);
             _ = try self.setPressedId(null);
             try self.rebuild();
             try self.requestRepaint();
             return;
         }
 
-        try self.setFocusedInput(null);
+        try self.setFocused(null);
         if (keywork.hitTestClick(root, point)) |hit| {
             if (try self.setPressedId(hit.id)) {
                 try self.rebuild();
@@ -208,29 +207,29 @@ pub const Runtime = struct {
         }
     }
 
-    fn setFocusedInput(self: *Runtime, id: ?[]const u8) !void {
-        if (self.focused_input_id) |old_id| {
+    fn setFocused(self: *Runtime, id: ?[]const u8) !void {
+        if (self.focused_id) |old_id| {
             if (id) |new_id| {
                 if (std.mem.eql(u8, old_id, new_id)) return;
             }
             self.allocator.free(old_id);
-            self.focused_input_id = null;
+            self.focused_id = null;
         }
 
         if (id) |new_id| {
-            self.focused_input_id = try self.allocator.dupe(u8, new_id);
-            log.info("focused text input {s}", .{new_id});
+            self.focused_id = try self.allocator.dupe(u8, new_id);
+            log.info("focused {s}", .{new_id});
         }
     }
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
-        if (self.focused_input_id == null) return;
+        if (self.focused_id == null) return;
         switch (input) {
             .text => |bytes| try self.input_text.appendSlice(self.allocator, bytes),
             .backspace => {
                 popLastGrapheme(&self.input_text);
             },
-            .enter => try self.setFocusedInput(null),
+            .enter => try self.setFocused(null),
         }
         try self.rebuild();
         try self.requestRepaint();
@@ -382,7 +381,7 @@ pub const Runtime = struct {
         var build_scope: BuildScope = .{
             .allocator = self.build_arena.allocator(),
             .theme = keywork.Theme.fromColorScheme(state.color_scheme),
-            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id },
+            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
         };
 
         var app_root = try self.app.buildWidget(&build_scope, state);

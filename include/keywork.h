@@ -37,7 +37,6 @@ struct keywork_constraints {
 
 struct keywork_context {
     const char *input_text;
-    const char *focused_input_id;
     float window_width;
     float window_height;
     const char *color_scheme;
@@ -94,7 +93,7 @@ int keywork_run_text(const struct keywork_run_text_options *options);
 
 keywork_widget_t *keywork_text(keywork_build_t *build, const char *value);
 keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value, uint32_t argb);
-keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder, int focused);
+keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder);
 keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
 keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child);
 keywork_widget_t *keywork_clickable_callback(keywork_build_t *build, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);

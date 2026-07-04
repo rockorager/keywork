@@ -119,6 +119,7 @@ pub const Theme = struct {
 pub const InteractionState = struct {
     hovered_id: ?[]const u8 = null,
     pressed_id: ?[]const u8 = null,
+    focused_id: ?[]const u8 = null,
 
     pub fn isHovered(self: InteractionState, id: []const u8) bool {
         const hovered = self.hovered_id orelse return false;
@@ -129,11 +130,24 @@ pub const InteractionState = struct {
         const pressed = self.pressed_id orelse return false;
         return std.mem.eql(u8, pressed, id);
     }
+
+    pub fn isFocused(self: InteractionState, node: FocusNode) bool {
+        const focused = self.focused_id orelse return false;
+        return std.mem.eql(u8, focused, node.id);
+    }
 };
 
 pub const PointerButtonState = enum {
     pressed,
     released,
+};
+
+pub const FocusNode = struct {
+    id: []const u8,
+
+    pub fn named(id: []const u8) FocusNode {
+        return .{ .id = id };
+    }
 };
 
 pub const Size = struct {
@@ -261,9 +275,9 @@ pub const Widget = union(enum) {
 
     pub const TextInput = struct {
         id: []const u8,
+        focus_node: FocusNode,
         value: []const u8,
         placeholder: []const u8,
-        focused: bool = false,
         foreground: Color = colors.ink,
         background: Color = colors.white,
         border: Color = colors.ink,
@@ -495,8 +509,12 @@ pub const widgets = struct {
         return .{ .theme = .{ .theme = theme_value, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, focused: bool) Widget {
-        return .{ .text_input = .{ .id = id, .value = value, .placeholder = placeholder, .focused = focused } };
+    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8) Widget {
+        return .{ .text_input = .{ .id = id, .focus_node = .named(id), .value = value, .placeholder = placeholder } };
+    }
+
+    pub fn textInputWithFocusNode(id: []const u8, focus_node: FocusNode, value: []const u8, placeholder: []const u8) Widget {
+        return .{ .text_input = .{ .id = id, .focus_node = focus_node, .value = value, .placeholder = placeholder } };
     }
 
     pub fn row(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
@@ -525,6 +543,7 @@ pub const Element = struct {
     widget: Widget,
     key: ?Widget.Key = null,
     state: ?*anyopaque = null,
+    focused: bool = false,
     children: []Element = &.{},
 
     pub const Kind = enum {
@@ -608,6 +627,7 @@ pub const RenderNode = struct {
     clickable_id: ?[]const u8 = null,
     click_callback: ?Widget.Callback = null,
     text_input_id: ?[]const u8 = null,
+    focus_id: ?[]const u8 = null,
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
@@ -769,7 +789,6 @@ pub const AppContext = struct {
     button_pressed: bool = false,
     pulse: bool = false,
     input_text: []const u8 = "",
-    focused_input_id: ?[]const u8 = null,
     window_width: f32 = 0,
     window_height: f32 = 0,
     color_scheme: []const u8 = "no-preference",
@@ -856,7 +875,10 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
         },
         .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
-        .text_input => return .{ .kind = .text_input, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
+        .text_input => {
+            const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme);
+            return .{ .kind = .text_input, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.text_input.focus_node) };
+        },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .box => |box_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1122,7 +1144,11 @@ pub fn updateElementTreeScoped(
             if (element.key) |old_key| destroyKey(allocator, old_key);
             element.key = try cloneKey(allocator, keyed_widget.key);
         },
-        .text, .text_input => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme),
+        .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme),
+        .text_input => {
+            try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme);
+            element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
+        },
         .render_object => try replaceElementWidget(allocator, element, widget.*),
         .box => |box_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
@@ -1479,14 +1505,16 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
+            const focus_node_id = try allocator.dupe(u8, input_widget.focus_node.id);
+            errdefer allocator.free(focus_node_id);
             const value = try allocator.dupe(u8, input_widget.value);
             errdefer allocator.free(value);
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             break :blk .{ .text_input = .{
                 .id = id,
+                .focus_node = .named(focus_node_id),
                 .value = value,
                 .placeholder = placeholder,
-                .focused = input_widget.focused,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .border = input_widget.border,
@@ -1520,6 +1548,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .text_input => |input_widget| {
             allocator.free(input_widget.id);
+            allocator.free(input_widget.focus_node.id);
             allocator.free(input_widget.value);
             allocator.free(input_widget.placeholder);
         },
@@ -1566,6 +1595,7 @@ pub fn destroyRenderTree(allocator: std.mem.Allocator, node: *RenderNode) void {
     if (node.text) |value| allocator.free(value);
     if (node.clickable_id) |id| allocator.free(id);
     if (node.text_input_id) |id| allocator.free(id);
+    if (node.focus_id) |id| allocator.free(id);
     if (node.placeholder) |placeholder| allocator.free(placeholder);
 }
 
@@ -1651,7 +1681,7 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
     }
 
     if (node.kind == .text_input and node.rect.contains(point)) {
-        return node.text_input_id;
+        return node.focus_id;
     }
     return null;
 }
@@ -1721,6 +1751,8 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             errdefer allocator.free(value);
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
+            const focus_id = try allocator.dupe(u8, input_widget.focus_node.id);
+            errdefer allocator.free(focus_id);
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             errdefer allocator.free(placeholder);
             const text_value = if (input_widget.value.len > 0) input_widget.value else input_widget.placeholder;
@@ -1736,13 +1768,14 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = value,
                 .text_input_id = id,
+                .focus_id = focus_id,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .placeholder = placeholder,
                 .border = input_widget.border,
                 .focused_border = input_widget.focused_border,
                 .placeholder_foreground = input_widget.placeholder_foreground,
-                .focused = input_widget.focused,
+                .focused = element.focused,
                 .caret_x = origin.x + input_horizontal_padding + value_size.width,
             };
         },
@@ -2074,7 +2107,7 @@ test "theme widget provides ambient text and input styling" {
 
     const children = [_]Widget{
         widgets.text("plain"),
-        widgets.textInput("input", "", "placeholder", false),
+        widgets.textInput("input", "", "placeholder"),
     };
     const column = try widgets.column(build_arena.allocator(), &children, 4);
     const themed = try widgets.theme(build_arena.allocator(), Theme.dark, column);
@@ -2087,6 +2120,26 @@ test "theme widget provides ambient text and input styling" {
     try std.testing.expectEqual(Theme.dark.color_scheme.surface_variant, input_node.background);
     try std.testing.expectEqual(Theme.dark.color_scheme.outline, input_node.border);
     try std.testing.expectEqual(Theme.dark.input_theme.placeholder.?, input_node.placeholder_foreground);
+}
+
+test "text input derives focus from ambient focus node" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const input = widgets.textInputWithFocusNode("input", .named("field-focus"), "", "placeholder");
+    var scope: BuildScope = .{
+        .allocator = build_arena.allocator(),
+        .interaction = .{ .focused_id = "field-focus" },
+    };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    try std.testing.expect(root.focused);
+    try std.testing.expectEqualStrings("field-focus", root.focus_id.?);
+    try std.testing.expectEqualStrings("field-focus", hitTestTextInput(&root, .{ .x = 1, .y = 1 }).?);
 }
 
 test "center moves descendants" {

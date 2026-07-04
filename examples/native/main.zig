@@ -30,7 +30,7 @@ const NativeApp = struct {
         const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
 
         const button = try widgets.button(allocator, "increment", "Increment", false);
-        const input = widgets.textInput("native-input", context.input_text, "Type here", context.focused_input_id != null);
+        const input = widgets.textInput("native-input", context.input_text, "Type here");
         const children = [_]Widget{
             widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),
             widgets.text(count_label),

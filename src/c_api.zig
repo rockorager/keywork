@@ -8,7 +8,6 @@ pub const KeyworkWidget = opaque {};
 
 pub const KeyworkContext = extern struct {
     input_text: [*:0]const u8,
-    focused_input_id: ?[*:0]const u8,
     window_width: f32,
     window_height: f32,
     color_scheme: [*:0]const u8,
@@ -378,7 +377,6 @@ pub export fn keywork_text_input(
     id: ?[*:0]const u8,
     value: ?[*:0]const u8,
     placeholder: ?[*:0]const u8,
-    focused: c_int,
 ) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const allocator = scope.scope.allocator;
@@ -386,7 +384,6 @@ pub export fn keywork_text_input(
         copyString(allocator, id, "") catch return null,
         copyString(allocator, value, "") catch return null,
         copyString(allocator, placeholder, "") catch return null,
-        focused != 0,
     ));
 }
 
@@ -573,10 +570,8 @@ fn linear(
 fn makeContext(allocator: std.mem.Allocator, context: keywork.AppContext) !KeyworkContext {
     const input_text = try allocator.dupeZ(u8, context.input_text);
     const color_scheme = try allocator.dupeZ(u8, context.color_scheme);
-    const focused_input_id = if (context.focused_input_id) |id| (try allocator.dupeZ(u8, id)).ptr else null;
     return .{
         .input_text = input_text.ptr,
-        .focused_input_id = focused_input_id,
         .window_width = context.window_width,
         .window_height = context.window_height,
         .color_scheme = color_scheme.ptr,
