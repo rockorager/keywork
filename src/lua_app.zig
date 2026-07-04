@@ -23,6 +23,15 @@ const LuaCallback = struct {
         };
     }
 
+    fn keyworkFocusChangeCallback(self: *LuaCallback) keywork.Widget.FocusChangeCallback {
+        return .{
+            .ptr = self,
+            .call_fn = callFocusChange,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
     fn call(ptr: *anyopaque) !void {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
@@ -30,6 +39,19 @@ const LuaCallback = struct {
             var len: usize = 0;
             const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
             if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("callback failed: {s}", .{message[0..len]});
+            pop(self.lua_state, 1);
+            return error.LuaCallbackFailed;
+        }
+    }
+
+    fn callFocusChange(ptr: *anyopaque, focused: bool) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        c.lua_pushboolean(self.lua_state, if (focused) 1 else 0);
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
+            var len: usize = 0;
+            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
+            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("focus callback failed: {s}", .{message[0..len]});
             pop(self.lua_state, 1);
             return error.LuaCallbackFailed;
         }
@@ -213,7 +235,13 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .focus = .{ .node = .named(id), .child = child, .autofocus = getBooleanField(lua_state, table, "autofocus", false) } };
+        const on_focus_change = try getOptionalFocusChangeCallbackField(lua_state, callback_allocator, table, "on_focus_change");
+        return .{ .focus = .{
+            .node = .named(id),
+            .child = child,
+            .autofocus = getBooleanField(lua_state, table, "autofocus", false),
+            .on_focus_change = on_focus_change,
+        } };
     }
     if (std.mem.eql(u8, kind, "focus_scope")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -405,6 +433,18 @@ fn getOptionalCallbackField(
     return try callbackFromStack(lua_state, allocator, -1);
 }
 
+fn getOptionalFocusChangeCallbackField(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    table: c_int,
+    key: [*:0]const u8,
+) !?keywork.Widget.FocusChangeCallback {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    return try focusChangeCallbackFromStack(lua_state, allocator, -1);
+}
+
 fn callbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.Callback {
     if (c.lua_type(lua_state, index) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
 
@@ -414,6 +454,17 @@ fn callbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, inde
     const callback = try allocator.create(LuaCallback);
     callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
     return callback.keyworkCallback();
+}
+
+fn focusChangeCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.FocusChangeCallback {
+    if (c.lua_type(lua_state, index) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+
+    c.lua_pushvalue(lua_state, index);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+    const callback = try allocator.create(LuaCallback);
+    callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
+    return callback.keyworkFocusChangeCallback();
 }
 
 fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {

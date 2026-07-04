@@ -42,6 +42,7 @@ function ui.focus(id, child, options)
     id = id,
     child = child,
     autofocus = options.autofocus or false,
+    on_focus_change = options.on_focus_change,
   }
 end
 

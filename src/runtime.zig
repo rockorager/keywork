@@ -32,6 +32,7 @@ pub const Runtime = struct {
     color_scheme: desktop_settings.ColorScheme,
     input_text: std.ArrayList(u8) = .empty,
     focused_id: ?[]u8 = null,
+    autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
     element_root: ?Element = null,
@@ -167,7 +168,6 @@ pub const Runtime = struct {
             return;
         }
 
-        try self.setFocused(null);
         if (keywork.hitTestClick(root, point)) |hit| {
             try self.setFocused(hit.id);
             if (try self.setPressedId(hit.id)) {
@@ -175,6 +175,8 @@ pub const Runtime = struct {
                 try self.requestRepaint();
             }
         } else {
+            self.autofocus_suppressed = true;
+            try self.setFocused(null);
             log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
             _ = try self.setPressedId(null);
             try self.rebuild();
@@ -203,18 +205,40 @@ pub const Runtime = struct {
         }
     }
 
+    pub fn requestFocus(self: *Runtime, id: []const u8) !void {
+        const root = if (self.root) |*root| root else return error.NotBuilt;
+        if (keywork.findFocusTarget(root, id) == null) return error.FocusTargetNotFound;
+        try self.setFocused(id);
+        try self.rebuild();
+        try self.requestRepaint();
+    }
+
+    pub fn clearFocus(self: *Runtime) !void {
+        self.autofocus_suppressed = true;
+        try self.setFocused(null);
+        try self.rebuild();
+        try self.requestRepaint();
+    }
+
     fn setFocused(self: *Runtime, id: ?[]const u8) !void {
         if (self.focused_id) |old_id| {
             if (id) |new_id| {
                 if (std.mem.eql(u8, old_id, new_id)) return;
+            }
+            if (self.focusedTarget()) |target| {
+                if (target.focus_change_callback) |callback| try callback.call(false);
             }
             self.allocator.free(old_id);
             self.focused_id = null;
         }
 
         if (id) |new_id| {
+            self.autofocus_suppressed = false;
             self.focused_id = try self.allocator.dupe(u8, new_id);
             log.info("focused {s}", .{new_id});
+            if (self.focusedTarget()) |target| {
+                if (target.focus_change_callback) |callback| try callback.call(true);
+            }
         }
     }
 
@@ -246,7 +270,10 @@ pub const Runtime = struct {
             .enter => {
                 const target = self.focusedTarget() orelse return;
                 switch (target.kind) {
-                    .text_input => try self.setFocused(null),
+                    .text_input => {
+                        self.autofocus_suppressed = true;
+                        try self.setFocused(null);
+                    },
                     .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
                     .focus => {},
                 }
@@ -533,11 +560,16 @@ pub const Runtime = struct {
 
         if (self.focused_id) |focused_id| {
             for (targets) |target| {
-                if (std.mem.eql(u8, target.id, focused_id)) return false;
+                if (std.mem.eql(u8, target.id, focused_id)) {
+                    self.autofocus_suppressed = false;
+                    return false;
+                }
             }
         }
 
-        const desired_focus = if (autofocusTarget(targets)) |target| target.id else null;
+        const desired_focus = if (!self.autofocus_suppressed) blk: {
+            break :blk if (autofocusTarget(targets)) |target| target.id else null;
+        } else null;
         if (sameOptionalString(self.focused_id, desired_focus)) return false;
         try self.setFocused(desired_focus);
         return true;
@@ -801,6 +833,10 @@ test "autofocus focus node is selected during initial build" {
 
     try std.testing.expectEqualStrings("initial", runtime.focused_id.?);
     try std.testing.expect(runtime.root.?.focused);
+
+    try runtime.clearFocus();
+    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
+    try std.testing.expect(!runtime.root.?.focused);
 }
 
 test "autofocus replaces focused node removed during rebuild" {
@@ -861,6 +897,98 @@ test "autofocus replaces focused node removed during rebuild" {
     try runtime.rebuild();
     try std.testing.expectEqualStrings("replacement", runtime.focused_id.?);
     try std.testing.expect(runtime.root.?.children[1].focused);
+}
+
+test "runtime requestFocus and clearFocus notify focus widgets" {
+    const TestApp = struct {
+        a_focused: usize = 0,
+        a_blurred: usize = 0,
+        b_focused: usize = 0,
+        b_blurred: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const a = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("a"),
+                keywork.widgets.text("A"),
+                .{ .on_focus_change = .{ .ptr = self, .call_fn = focusA } },
+            );
+            const b = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("b"),
+                keywork.widgets.text("B"),
+                .{ .on_focus_change = .{ .ptr = self, .call_fn = focusB } },
+            );
+            const children = [_]keywork.Widget{ a, b };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+
+        fn focusA(ptr: *anyopaque, focused: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (focused) {
+                self.a_focused += 1;
+            } else {
+                self.a_blurred += 1;
+            }
+        }
+
+        fn focusB(ptr: *anyopaque, focused: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (focused) {
+                self.b_focused += 1;
+            } else {
+                self.b_blurred += 1;
+            }
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
+    try runtime.requestFocus("a");
+    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
+    try std.testing.expect(runtime.root.?.children[0].focused);
+    try std.testing.expectEqual(@as(usize, 1), app.a_focused);
+    try std.testing.expectEqual(@as(usize, 0), app.a_blurred);
+
+    try runtime.requestFocus("b");
+    try std.testing.expectEqualStrings("b", runtime.focused_id.?);
+    try std.testing.expect(runtime.root.?.children[1].focused);
+    try std.testing.expectEqual(@as(usize, 1), app.a_blurred);
+    try std.testing.expectEqual(@as(usize, 1), app.b_focused);
+
+    try runtime.clearFocus();
+    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
+    try std.testing.expectEqual(@as(usize, 1), app.b_blurred);
+    try std.testing.expectError(error.FocusTargetNotFound, runtime.requestFocus("missing"));
 }
 
 test "focus scope contains tab traversal once focus is inside it" {

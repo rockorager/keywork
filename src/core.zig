@@ -300,6 +300,7 @@ pub const Widget = union(enum) {
         node: FocusNode,
         child: *const Widget,
         autofocus: bool = false,
+        on_focus_change: ?FocusChangeCallback = null,
     };
 
     pub const FocusScope = struct {
@@ -379,6 +380,32 @@ pub const Widget = union(enum) {
         }
 
         pub fn destroy(self: Callback, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    pub const FocusChangeCallback = struct {
+        ptr: *anyopaque,
+        call_fn: *const fn (ptr: *anyopaque, focused: bool) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
+
+        pub fn call(self: FocusChangeCallback, focused: bool) !void {
+            try self.call_fn(self.ptr, focused);
+        }
+
+        pub fn clone(self: FocusChangeCallback, allocator: std.mem.Allocator) !FocusChangeCallback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .call_fn = self.call_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: FocusChangeCallback, allocator: std.mem.Allocator) void {
             const destroy_fn = self.destroy_fn orelse return;
             destroy_fn(allocator, self.ptr);
         }
@@ -565,10 +592,16 @@ pub const widgets = struct {
 
     pub const FocusOptions = struct {
         autofocus: bool = false,
+        on_focus_change: ?Widget.FocusChangeCallback = null,
     };
 
     pub fn focusWithOptions(allocator: std.mem.Allocator, node: FocusNode, child: Widget, options: FocusOptions) !Widget {
-        return .{ .focus = .{ .node = node, .child = try Widget.alloc(allocator, child), .autofocus = options.autofocus } };
+        return .{ .focus = .{
+            .node = node,
+            .child = try Widget.alloc(allocator, child),
+            .autofocus = options.autofocus,
+            .on_focus_change = options.on_focus_change,
+        } };
     }
 
     pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
@@ -751,6 +784,7 @@ pub const RenderNode = struct {
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
     autofocus: bool = false,
+    focus_change_callback: ?Widget.FocusChangeCallback = null,
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
@@ -1718,7 +1752,15 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         },
         .focus => |focus_widget| blk: {
             const focus_id = try allocator.dupe(u8, focus_widget.node.id);
-            break :blk .{ .focus = .{ .node = .named(focus_id), .child = focus_widget.child, .autofocus = focus_widget.autofocus } };
+            errdefer allocator.free(focus_id);
+            const focus_change_callback = if (focus_widget.on_focus_change) |callback| try callback.clone(allocator) else null;
+            errdefer if (focus_change_callback) |callback| callback.destroy(allocator);
+            break :blk .{ .focus = .{
+                .node = .named(focus_id),
+                .child = focus_widget.child,
+                .autofocus = focus_widget.autofocus,
+                .on_focus_change = focus_change_callback,
+            } };
         },
         .focus_scope => |focus_scope_widget| blk: {
             const id = try allocator.dupe(u8, focus_scope_widget.id);
@@ -1778,7 +1820,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
         },
-        .focus => |focus_widget| allocator.free(focus_widget.node.id),
+        .focus => |focus_widget| {
+            if (focus_widget.on_focus_change) |callback| callback.destroy(allocator);
+            allocator.free(focus_widget.node.id);
+        },
         .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
         .text_input => |input_widget| {
             allocator.free(input_widget.id);
@@ -1956,6 +2001,7 @@ pub const FocusTarget = struct {
     callback: ?Widget.Callback = null,
     scope_id: ?[]const u8 = null,
     autofocus: bool = false,
+    focus_change_callback: ?Widget.FocusChangeCallback = null,
 
     pub const Kind = enum {
         text_input,
@@ -1975,7 +2021,13 @@ fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(Focu
     const active_scope_id = node.focus_scope_id orelse scope_id;
     switch (node.kind) {
         .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id }),
-        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus, .scope_id = active_scope_id, .autofocus = node.autofocus }),
+        .focus => if (node.focus_id) |id| try targets.append(allocator, .{
+            .id = id,
+            .kind = .focus,
+            .scope_id = active_scope_id,
+            .autofocus = node.autofocus,
+            .focus_change_callback = node.focus_change_callback,
+        }),
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id });
         },
@@ -1997,7 +2049,13 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
             if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id };
         },
         .focus => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus, .scope_id = active_scope_id, .autofocus = node.autofocus };
+            if (std.mem.eql(u8, focus_id, id)) return .{
+                .id = focus_id,
+                .kind = .focus,
+                .scope_id = active_scope_id,
+                .autofocus = node.autofocus,
+                .focus_change_callback = node.focus_change_callback,
+            };
         },
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |clickable_id| {
@@ -2243,6 +2301,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .focus_id = focus_id,
                 .focused = element.focused,
                 .autofocus = focus_widget.autofocus,
+                .focus_change_callback = focus_widget.on_focus_change,
                 .children = children,
             };
         },
