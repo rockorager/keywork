@@ -219,6 +219,12 @@ pub const Runtime = struct {
     }
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
+        if (try self.activateShortcut(input)) {
+            try self.rebuild();
+            try self.requestRepaint();
+            return;
+        }
+
         switch (input) {
             .tab => |tab| try self.focusNext(tab.reverse),
             .text => |bytes| {
@@ -246,6 +252,15 @@ pub const Runtime = struct {
         }
         try self.rebuild();
         try self.requestRepaint();
+    }
+
+    fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
+        const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
+        if (self.focusedTargetIs(.text_input)) return false;
+        const element_root = if (self.element_root) |*root| root else return false;
+        const callback = keywork.findShortcutAction(element_root, shortcut_key) orelse return false;
+        try callback.call();
+        return true;
     }
 
     fn focusedTarget(self: *Runtime) ?keywork.FocusTarget {
@@ -545,4 +560,65 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqualStrings("a ", runtime.input_text.items);
+}
+
+test "shortcut invokes ambient action outside text input focus" {
+    const TestApp = struct {
+        actions: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const input = keywork.widgets.textInput("input", context.input_text, "placeholder");
+            const label = keywork.widgets.text("Shortcut target");
+            const children = [_]keywork.Widget{ input, label };
+            const column = try keywork.widgets.column(scope.allocator, &children, 4);
+            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .action_id = "activate" }};
+            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
+            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, column);
+            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
+        }
+
+        fn activate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.actions += 1;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.keyInput(.space);
+    try std.testing.expectEqual(@as(usize, 1), app.actions);
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+    try runtime.keyInput(.space);
+    try std.testing.expectEqual(@as(usize, 1), app.actions);
+    try std.testing.expectEqualStrings(" ", runtime.input_text.items);
 }

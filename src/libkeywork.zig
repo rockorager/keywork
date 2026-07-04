@@ -41,6 +41,7 @@ pub const RenderBackend = core.RenderBackend;
 pub const TextMeasurer = core.TextMeasurer;
 pub const LogBackend = core.LogBackend;
 pub const KeyInput = core.KeyInput;
+pub const ShortcutKey = core.ShortcutKey;
 pub const CursorShape = core.CursorShape;
 pub const PointerButtonState = core.PointerButtonState;
 pub const ClickHit = core.ClickHit;
@@ -62,6 +63,8 @@ pub const hitTestButton = core.hitTestButton;
 pub const hitTestClick = core.hitTestClick;
 pub const hitTestTextInput = core.hitTestTextInput;
 pub const hitTestCursorShape = core.hitTestCursorShape;
+pub const shortcutKeyForInput = core.shortcutKeyForInput;
+pub const findShortcutAction = core.findShortcutAction;
 pub const collectFocusTargets = core.collectFocusTargets;
 pub const findFocusTarget = core.findFocusTarget;
 

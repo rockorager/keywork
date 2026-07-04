@@ -145,6 +145,12 @@ pub const PointerButtonState = enum {
     released,
 };
 
+pub const ShortcutKey = enum {
+    enter,
+    space,
+    backspace,
+};
+
 pub const FocusNode = struct {
     id: []const u8,
 
@@ -228,6 +234,8 @@ pub const Widget = union(enum) {
     padding: Padding,
     center: Child,
     button: Button,
+    actions: Actions,
+    shortcuts: Shortcuts,
     theme: ThemeWidget,
     component: Component,
     stateful: Stateful,
@@ -275,6 +283,26 @@ pub const Widget = union(enum) {
         id: []const u8,
         child: *const Widget,
         on_click: ?Callback = null,
+    };
+
+    pub const ActionBinding = struct {
+        id: []const u8,
+        callback: Callback,
+    };
+
+    pub const ShortcutBinding = struct {
+        key: ShortcutKey,
+        action_id: []const u8,
+    };
+
+    pub const Actions = struct {
+        bindings: []const ActionBinding,
+        child: *const Widget,
+    };
+
+    pub const Shortcuts = struct {
+        bindings: []const ShortcutBinding,
+        child: *const Widget,
     };
 
     pub const TextInput = struct {
@@ -544,6 +572,14 @@ pub const widgets = struct {
     pub fn keyed(allocator: std.mem.Allocator, key: Widget.Key, child: Widget) !Widget {
         return .{ .keyed = .{ .key = key, .child = try Widget.alloc(allocator, child) } };
     }
+
+    pub fn actions(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding, child: Widget) !Widget {
+        return .{ .actions = .{ .bindings = try allocator.dupe(Widget.ActionBinding, bindings), .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn shortcuts(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding, child: Widget) !Widget {
+        return .{ .shortcuts = .{ .bindings = try allocator.dupe(Widget.ShortcutBinding, bindings), .child = try Widget.alloc(allocator, child) } };
+    }
 };
 
 pub const Element = struct {
@@ -565,6 +601,8 @@ pub const Element = struct {
         padding,
         center,
         button,
+        actions,
+        shortcuts,
         theme,
         component,
         stateful,
@@ -676,6 +714,8 @@ pub const RenderNode = struct {
         padding,
         center,
         button,
+        actions,
+        shortcuts,
         theme,
         component,
         stateful,
@@ -967,6 +1007,32 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .button, .widget = element_widget, .children = children };
         },
+        .actions => |actions_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, actions_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .actions, .widget = element_widget, .children = children };
+        },
+        .shortcuts => |shortcuts_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, shortcuts_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .shortcuts, .widget = element_widget, .children = children };
+        },
         .theme => |theme_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -1192,6 +1258,12 @@ pub fn updateElementTreeScoped(
             destroyElementWidget(allocator, &element.widget);
             element.widget = element_widget;
         },
+        .actions => |actions_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, actions_widget.child, constraints);
+        },
+        .shortcuts => |shortcuts_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, shortcuts_widget.child, constraints);
+        },
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
             scope.theme = theme_widget.theme;
@@ -1239,6 +1311,8 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .padding => .padding,
         .center => .center,
         .button => .button,
+        .actions => .actions,
+        .shortcuts => .shortcuts,
         .theme => .theme,
         .component => .component,
         .stateful => .stateful,
@@ -1555,6 +1629,14 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap } },
         .padding => |padding_widget| .{ .padding = padding_widget },
         .center => |center_widget| .{ .center = center_widget },
+        .actions => |actions_widget| .{ .actions = .{
+            .bindings = try cloneActionBindings(allocator, actions_widget.bindings),
+            .child = actions_widget.child,
+        } },
+        .shortcuts => |shortcuts_widget| .{ .shortcuts = .{
+            .bindings = try cloneShortcutBindings(allocator, shortcuts_widget.bindings),
+            .child = shortcuts_widget.child,
+        } },
         .theme => |theme_widget| .{ .theme = theme_widget },
         .component => |component_widget| .{ .component = component_widget },
         .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
@@ -1585,8 +1667,59 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .stateful => |stateful_widget| stateful_widget.destroy(allocator),
         .render_object => |render_object| render_object.destroy(allocator),
         .element => |custom_element| custom_element.destroy(allocator),
+        .actions => |actions_widget| destroyActionBindings(allocator, actions_widget.bindings),
+        .shortcuts => |shortcuts_widget| destroyShortcutBindings(allocator, shortcuts_widget.bindings),
         .box, .row, .column, .padding, .center, .theme, .component => {},
     }
+}
+
+fn cloneActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding) ![]Widget.ActionBinding {
+    const result = try allocator.alloc(Widget.ActionBinding, bindings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |binding| {
+            allocator.free(binding.id);
+            binding.callback.destroy(allocator);
+        }
+        allocator.free(result);
+    }
+    for (bindings, 0..) |binding, index| {
+        const id = try allocator.dupe(u8, binding.id);
+        const callback = binding.callback.clone(allocator) catch |err| {
+            allocator.free(id);
+            return err;
+        };
+        result[index] = .{ .id = id, .callback = callback };
+        initialized += 1;
+    }
+    return result;
+}
+
+fn destroyActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding) void {
+    for (bindings) |binding| {
+        allocator.free(binding.id);
+        binding.callback.destroy(allocator);
+    }
+    allocator.free(bindings);
+}
+
+fn cloneShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding) ![]Widget.ShortcutBinding {
+    const result = try allocator.alloc(Widget.ShortcutBinding, bindings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |binding| allocator.free(binding.action_id);
+        allocator.free(result);
+    }
+    for (bindings, 0..) |binding, index| {
+        result[index] = .{ .key = binding.key, .action_id = try allocator.dupe(u8, binding.action_id) };
+        initialized += 1;
+    }
+    return result;
+}
+
+fn destroyShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding) void {
+    for (bindings) |binding| allocator.free(binding.action_id);
+    allocator.free(bindings);
 }
 
 fn cloneKey(allocator: std.mem.Allocator, key: Widget.Key) !Widget.Key {
@@ -1772,6 +1905,63 @@ pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
     return .default;
 }
 
+pub fn shortcutKeyForInput(input: KeyInput) ?ShortcutKey {
+    return switch (input) {
+        .enter => .enter,
+        .space => .space,
+        .backspace => .backspace,
+        .text, .tab => null,
+    };
+}
+
+pub fn findShortcutAction(element: *const Element, key: ShortcutKey) ?Widget.Callback {
+    return findShortcutActionScoped(element, key, null);
+}
+
+const ActionScope = struct {
+    bindings: []const Widget.ActionBinding,
+    parent: ?*const ActionScope = null,
+};
+
+fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*const ActionScope) ?Widget.Callback {
+    switch (element.widget) {
+        .actions => |actions_widget| {
+            const nested: ActionScope = .{ .bindings = actions_widget.bindings, .parent = scope };
+            for (element.children) |*child| {
+                if (findShortcutActionScoped(child, key, &nested)) |callback| return callback;
+            }
+            return null;
+        },
+        else => {},
+    }
+
+    switch (element.widget) {
+        .shortcuts => |shortcuts_widget| {
+            for (shortcuts_widget.bindings) |binding| {
+                if (binding.key != key) continue;
+                if (findActionInScope(scope, binding.action_id)) |callback| return callback;
+            }
+        },
+        else => {},
+    }
+
+    for (element.children) |*child| {
+        if (findShortcutActionScoped(child, key, scope)) |callback| return callback;
+    }
+    return null;
+}
+
+fn findActionInScope(scope: ?*const ActionScope, action_id: []const u8) ?Widget.Callback {
+    var cursor = scope;
+    while (cursor) |action_scope| {
+        for (action_scope.bindings) |binding| {
+            if (std.mem.eql(u8, binding.id, action_id)) return binding.callback;
+        }
+        cursor = action_scope.parent;
+    }
+    return null;
+}
+
 fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constraints: Constraints, origin: Point, measurer: TextMeasurer) LayoutError!RenderNode {
     switch (element.widget) {
         .keyed => |keyed_widget| {
@@ -1906,6 +2096,32 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             children[0] = child;
             return .{
                 .kind = .button,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .children = children,
+            };
+        },
+        .actions => |actions_widget| {
+            _ = actions_widget;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .actions,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .children = children,
+            };
+        },
+        .shortcuts => |shortcuts_widget| {
+            _ = shortcuts_widget;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .shortcuts,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .children = children,
             };
@@ -2364,6 +2580,36 @@ test "clickable without callback is inert" {
     const targets = try collectFocusTargets(std.testing.allocator, &root);
     defer std.testing.allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 0), targets.len);
+}
+
+test "shortcuts invoke ambient actions" {
+    const Counter = struct {
+        value: usize = 0,
+
+        fn increment(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena.deinit();
+
+    var counter: Counter = .{};
+    const child = widgets.text("Shortcut child");
+    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .action_id = "increment" }};
+    const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
+    const shortcuts_widget = try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, child);
+    const actions_widget = try widgets.actions(build_arena.allocator(), &action_bindings, shortcuts_widget);
+
+    var element = try buildElementTree(allocator, &actions_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(allocator, &element);
+
+    const callback = findShortcutAction(&element, .enter).?;
+    try callback.call();
+    try std.testing.expectEqual(@as(usize, 1), counter.value);
+    try std.testing.expectEqual(@as(?Widget.Callback, null), findShortcutAction(&element, .space));
 }
 
 test "component widget builds into the render tree" {
