@@ -75,4 +75,29 @@ function ui.button(id, label, on_pressed)
   }
 end
 
+function ui.action_button(id, label, action_id)
+  return {
+    type = "button",
+    id = id,
+    label = label,
+    action_id = action_id,
+  }
+end
+
+function ui.actions(bindings, child)
+  return {
+    type = "actions",
+    bindings = bindings,
+    child = child,
+  }
+end
+
+function ui.shortcuts(bindings, child)
+  return {
+    type = "shortcuts",
+    bindings = bindings,
+    child = child,
+  }
+end
+
 return ui

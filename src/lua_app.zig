@@ -209,7 +209,8 @@ fn parseWidget(
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const label = try dupeStringField(lua_state, allocator, table, "label");
         const on_pressed = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_pressed");
-        return keywork.widgets.button(allocator, id, label, on_pressed);
+        const action_id = try getOptionalStringField(lua_state, allocator, table, "action_id");
+        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed, .action_id = action_id } };
     }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -246,8 +247,79 @@ fn parseWidget(
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .center = .{ .child = child } };
     }
+    if (std.mem.eql(u8, kind, "actions")) {
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        const bindings = try parseActionBindings(lua_state, allocator, callback_allocator, table);
+        return .{ .actions = .{ .bindings = bindings, .child = child } };
+    }
+    if (std.mem.eql(u8, kind, "shortcuts")) {
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        const bindings = try parseShortcutBindings(lua_state, allocator, table);
+        return .{ .shortcuts = .{ .bindings = bindings, .child = child } };
+    }
 
     return error.UnknownWidgetType;
+}
+
+fn parseActionBindings(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    callback_allocator: std.mem.Allocator,
+    table: c_int,
+) ![]keywork.Widget.ActionBinding {
+    c.lua_getfield(lua_state, table, "bindings");
+    defer pop(lua_state, 1);
+    const bindings_table = absoluteIndex(lua_state, -1);
+    try expectType(lua_state, bindings_table, c.LUA_TTABLE);
+
+    var bindings: std.ArrayList(keywork.Widget.ActionBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, bindings_table) != 0) {
+        defer pop(lua_state, 1);
+        const id = try stringFromStack(lua_state, -2);
+        const callback = try callbackFromStack(lua_state, callback_allocator, -1);
+        try bindings.append(allocator, .{ .id = try allocator.dupe(u8, id), .callback = callback });
+    }
+    return try bindings.toOwnedSlice(allocator);
+}
+
+fn parseShortcutBindings(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    table: c_int,
+) ![]keywork.Widget.ShortcutBinding {
+    c.lua_getfield(lua_state, table, "bindings");
+    defer pop(lua_state, 1);
+    const bindings_table = absoluteIndex(lua_state, -1);
+    try expectType(lua_state, bindings_table, c.LUA_TTABLE);
+
+    var bindings: std.ArrayList(keywork.Widget.ShortcutBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, bindings_table) != 0) {
+        defer pop(lua_state, 1);
+        const key_name = try stringFromStack(lua_state, -2);
+        const action_id = try stringFromStack(lua_state, -1);
+        try bindings.append(allocator, .{
+            .key = try shortcutKeyFromString(key_name),
+            .action_id = try allocator.dupe(u8, action_id),
+        });
+    }
+    return try bindings.toOwnedSlice(allocator);
+}
+
+fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
+    if (std.mem.eql(u8, value, "enter")) return .enter;
+    if (std.mem.eql(u8, value, "space")) return .space;
+    if (std.mem.eql(u8, value, "backspace")) return .backspace;
+    return error.UnknownShortcutKey;
 }
 
 fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
@@ -261,15 +333,26 @@ fn expectType(lua_state: *c.lua_State, index: c_int, expected: c_int) !void {
 
 fn getStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
     c.lua_getfield(lua_state, table, key);
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, -1, &len) orelse return error.ExpectedLuaString;
-    return ptr[0..len];
+    return stringFromStack(lua_state, -1);
 }
 
 fn dupeStringField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) ![]const u8 {
     const value = try getStringField(lua_state, table, key);
     defer pop(lua_state, 1);
     return try allocator.dupe(u8, value);
+}
+
+fn getOptionalStringField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?[]const u8 {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    return try allocator.dupe(u8, try stringFromStack(lua_state, -1));
+}
+
+fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
+    return ptr[0..len];
 }
 
 fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: f32) f32 {
@@ -295,9 +378,13 @@ fn getOptionalCallbackField(
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return null;
-    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+    return try callbackFromStack(lua_state, allocator, -1);
+}
 
-    c.lua_pushvalue(lua_state, -1);
+fn callbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.Callback {
+    if (c.lua_type(lua_state, index) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+
+    c.lua_pushvalue(lua_state, index);
     const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
     errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
     const callback = try allocator.create(LuaCallback);
