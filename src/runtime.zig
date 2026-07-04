@@ -280,11 +280,12 @@ pub const Runtime = struct {
     }
 
     fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
+        _ = self;
         if (hit.callback) |callback| {
             try callback.call();
             return true;
         }
-        return try self.app.click(hit.id);
+        return false;
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {

@@ -504,8 +504,8 @@ pub const widgets = struct {
         return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background, .border = border } };
     }
 
-    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
-        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
+        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
     }
 
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
@@ -827,17 +827,11 @@ pub const AppHost = struct {
 
     pub const VTable = struct {
         build_widget: *const fn (ptr: *anyopaque, scope: *BuildScope, context: AppContext) anyerror!Widget,
-        click: ?*const fn (ptr: *anyopaque, id: []const u8) anyerror!bool = null,
         timer: ?*const fn (ptr: *anyopaque, expirations: u64) anyerror!bool = null,
     };
 
     pub fn buildWidget(self: AppHost, scope: *BuildScope, context: AppContext) !Widget {
         return self.vtable.build_widget(self.ptr, scope, context);
-    }
-
-    pub fn click(self: AppHost, id: []const u8) !bool {
-        const click_fn = self.vtable.click orelse return false;
-        return click_fn(self.ptr, id);
     }
 
     pub fn timer(self: AppHost, expirations: u64) !bool {
@@ -1713,7 +1707,9 @@ pub fn collectFocusTargets(allocator: std.mem.Allocator, node: *const RenderNode
 fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode) !void {
     switch (node.kind) {
         .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input }),
-        .clickable => if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = node.click_callback }),
+        .clickable => if (node.click_callback) |callback| {
+            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback });
+        },
         else => {},
     }
     for (node.children) |*child| {
@@ -1726,8 +1722,10 @@ pub fn findFocusTarget(node: *const RenderNode, id: []const u8) ?FocusTarget {
         .text_input => if (node.focus_id) |focus_id| {
             if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input };
         },
-        .clickable => if (node.clickable_id) |clickable_id| {
-            if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = node.click_callback };
+        .clickable => if (node.click_callback) |callback| {
+            if (node.clickable_id) |clickable_id| {
+                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback };
+            }
         },
         else => {},
     }
@@ -1745,7 +1743,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     }
 
     if (node.kind == .clickable and node.rect.contains(point)) {
-        return .{ .id = node.clickable_id orelse return null, .callback = node.click_callback };
+        return .{ .id = node.clickable_id orelse return null, .callback = node.click_callback orelse return null };
     }
     if (node.kind == .render_object) {
         if (node.render_object) |render_object| {
@@ -2062,7 +2060,7 @@ test "layout, paint, and hit test a padded column" {
     const label: Widget = .{ .text = .{ .value = "OK", .color = colors.white } };
     const button_padding: Widget = .{ .padding = .{ .insets = EdgeInsets.all(8), .child = &label } };
     const button_box: Widget = .{ .box = .{ .background = colors.accent, .child = &button_padding } };
-    const button: Widget = .{ .clickable = .{ .id = "ok", .child = &button_box } };
+    const button: Widget = .{ .clickable = .{ .id = "ok", .child = &button_box, .on_click = testCallback() } };
     const children = [_]Widget{ title, button };
     const column: Widget = .{ .column = .{ .children = &children, .gap = 4 } };
     const padded: Widget = .{ .padding = .{ .insets = EdgeInsets.all(10), .child = &column } };
@@ -2317,7 +2315,7 @@ test "center moves descendants" {
     const allocator = std.testing.allocator;
 
     const label: Widget = .{ .text = .{ .value = "Run" } };
-    const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label } };
+    const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label, .on_click = testCallback() } };
     const center: Widget = .{ .center = .{ .child = &button } };
 
     var root = try buildRenderTree(allocator, &center, .{ .max_width = 100, .max_height = 80 });
@@ -2353,6 +2351,19 @@ test "clickable carries opaque callback handles through hit testing" {
     try std.testing.expectEqualStrings("counter", hit.id);
     try hit.callback.?.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
+}
+
+test "clickable without callback is inert" {
+    const label: Widget = .{ .text = .{ .value = "Inert" } };
+    const clickable: Widget = .{ .clickable = .{ .id = "inert", .child = &label } };
+
+    var root = try buildRenderTree(std.testing.allocator, &clickable, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(std.testing.allocator, &root);
+
+    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(&root, .{ .x = 2, .y = 2 }));
+    const targets = try collectFocusTargets(std.testing.allocator, &root);
+    defer std.testing.allocator.free(targets);
+    try std.testing.expectEqual(@as(usize, 0), targets.len);
 }
 
 test "component widget builds into the render tree" {

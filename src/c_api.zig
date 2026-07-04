@@ -15,7 +15,6 @@ pub const KeyworkContext = extern struct {
 
 pub const KeyworkAppVTable = extern struct {
     build: ?*const fn (userdata: ?*anyopaque, build: *KeyworkBuild, context: *const KeyworkContext) callconv(.c) ?*KeyworkWidget = null,
-    click: ?*const fn (userdata: ?*anyopaque, id: [*:0]const u8) callconv(.c) c_int = null,
     timer: ?*const fn (userdata: ?*anyopaque, expirations: u64) callconv(.c) c_int = null,
 };
 
@@ -275,7 +274,6 @@ const CApp = struct {
     fn host(self: *CApp) keywork.AppHost {
         return .{ .ptr = self, .vtable = &.{
             .build_widget = buildWidget,
-            .click = click,
             .timer = timer,
         } };
     }
@@ -287,14 +285,6 @@ const CApp = struct {
         const c_context = try makeContext(scope.allocator, context);
         const handle = build_fn(self.userdata, buildHandle(&c_scope), &c_context) orelse return error.BuildCallbackFailed;
         return widgetFromHandle(handle).*;
-    }
-
-    fn click(ptr: *anyopaque, id: []const u8) !bool {
-        const self: *CApp = @ptrCast(@alignCast(ptr));
-        const click_fn = self.vtable.click orelse return false;
-        const id_z = try std.heap.c_allocator.dupeZ(u8, id);
-        defer std.heap.c_allocator.free(id_z);
-        return click_fn(self.userdata, id_z.ptr) != 0;
     }
 
     fn timer(ptr: *anyopaque, expirations: u64) !bool {
@@ -394,34 +384,26 @@ pub export fn keywork_box(build: ?*KeyworkBuild, child: ?*KeyworkWidget, argb: u
     return makeWidget(scope, keywork.widgets.box(allocator, child_widget.*, colorFromArgb(argb)) catch return null);
 }
 
-pub export fn keywork_clickable(build: ?*KeyworkBuild, id: ?[*:0]const u8, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
-    const scope = buildScope(build) orelse return null;
-    const child_widget = widgetFromMaybeHandle(child) orelse return null;
-    const allocator = scope.scope.allocator;
-    return makeWidget(scope, keywork.widgets.clickable(
-        allocator,
-        copyString(allocator, id, "") catch return null,
-        child_widget.*,
-    ) catch return null);
-}
-
-pub export fn keywork_clickable_callback(
+pub export fn keywork_clickable(
     build: ?*KeyworkBuild,
+    id: ?[*:0]const u8,
     child: ?*KeyworkWidget,
     callback: ?KeyworkClickCallback,
     userdata: ?*anyopaque,
 ) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const child_widget = widgetFromMaybeHandle(child) orelse return null;
-    const callback_fn = callback orelse return null;
     const allocator = scope.scope.allocator;
-    const callback_state = allocator.create(ClickCallback) catch return null;
-    callback_state.* = .{ .callback = callback_fn, .userdata = userdata };
+    const on_click = if (callback) |callback_fn| blk: {
+        const callback_state = allocator.create(ClickCallback) catch return null;
+        callback_state.* = .{ .callback = callback_fn, .userdata = userdata };
+        break :blk callback_state.keyworkCallback();
+    } else null;
     const child_copy = keywork.Widget.alloc(allocator, child_widget.*) catch return null;
     return makeWidget(scope, .{ .clickable = .{
-        .id = "",
+        .id = copyString(allocator, id, "") catch return null,
         .child = child_copy,
-        .on_click = callback_state.keyworkCallback(),
+        .on_click = on_click,
     } });
 }
 

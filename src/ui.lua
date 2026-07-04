@@ -26,11 +26,12 @@ function ui.box(style, child)
   }
 end
 
-function ui.clickable(id, child)
+function ui.clickable(id, child, on_click)
   return {
     type = "clickable",
     id = id,
     child = child,
+    on_click = on_click,
   }
 end
 

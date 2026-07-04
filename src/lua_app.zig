@@ -196,11 +196,14 @@ fn parseWidget(
     }
     if (std.mem.eql(u8, kind, "clickable")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
+        errdefer allocator.free(id);
         const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .clickable = .{ .id = id, .child = child } };
+        const on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_click");
+        return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click } };
     }
     if (std.mem.eql(u8, kind, "button")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
