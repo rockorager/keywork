@@ -240,6 +240,7 @@ pub const Runtime = struct {
                 switch (target.kind) {
                     .text_input => try self.input_text.append(self.allocator, ' '),
                     .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                    .focus => {},
                 }
             },
             .enter => {
@@ -247,6 +248,7 @@ pub const Runtime = struct {
                 switch (target.kind) {
                     .text_input => try self.setFocused(null),
                     .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                    .focus => {},
                 }
             },
         }
@@ -624,4 +626,59 @@ test "shortcut invokes ambient action outside text input focus" {
     try runtime.keyInput(.space);
     try std.testing.expectEqual(@as(usize, 1), app.actions);
     try std.testing.expectEqualStrings(" ", runtime.input_text.items);
+}
+
+test "focus widget participates in traversal and shortcut context" {
+    const TestApp = struct {
+        actions: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const label = keywork.widgets.text("Focusable shortcut target");
+            const focused_label = try keywork.widgets.focus(scope.allocator, .named("label-focus"), label);
+            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
+            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
+            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, focused_label);
+            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
+        }
+
+        fn activate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.actions += 1;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 80 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("label-focus", runtime.focused_id.?);
+    try runtime.keyInput(.space);
+    try std.testing.expectEqual(@as(usize, 1), app.actions);
 }

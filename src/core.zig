@@ -236,6 +236,8 @@ pub const Widget = union(enum) {
     text: Text,
     box: Box,
     clickable: Clickable,
+    focus: Focus,
+    focus_scope: FocusScope,
     text_input: TextInput,
     row: Children,
     column: Children,
@@ -292,6 +294,16 @@ pub const Widget = union(enum) {
         id: []const u8,
         child: *const Widget,
         on_click: ?Callback = null,
+    };
+
+    pub const Focus = struct {
+        node: FocusNode,
+        child: *const Widget,
+    };
+
+    pub const FocusScope = struct {
+        id: []const u8,
+        child: *const Widget,
     };
 
     pub const ActionBinding = struct {
@@ -546,6 +558,14 @@ pub const widgets = struct {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
     }
 
+    pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
+        return .{ .focus = .{ .node = node, .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
+        return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+    }
+
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
         _ = allocator;
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
@@ -615,6 +635,8 @@ pub const Element = struct {
         text,
         box,
         clickable,
+        focus,
+        focus_scope,
         text_input,
         row,
         column,
@@ -735,6 +757,8 @@ pub const RenderNode = struct {
         text,
         box,
         clickable,
+        focus,
+        focus_scope,
         text_input,
         row,
         column,
@@ -993,6 +1017,32 @@ pub fn buildElementTreeScoped(
             children[0] = try buildElementTreeScoped(allocator, scope, clickable_widget.child, constraints);
             initialized = true;
             return .{ .kind = .clickable, .widget = element_widget, .children = children };
+        },
+        .focus => |focus_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, focus_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children };
+        },
+        .focus_scope => |focus_scope_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, focus_scope_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .focus_scope, .widget = element_widget, .children = children };
         },
         .padding => |padding_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1274,6 +1324,13 @@ pub fn updateElementTreeScoped(
         .clickable => |clickable_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, clickable_widget.child, constraints);
         },
+        .focus => |focus_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, focus_widget.child, constraints);
+            element.focused = scope.interaction.isFocused(element.widget.focus.node);
+        },
+        .focus_scope => |focus_scope_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, focus_scope_widget.child, constraints);
+        },
         .padding => |padding_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, padding_widget.child, constraints.inset(padding_widget.insets));
         },
@@ -1344,6 +1401,8 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .text => .text,
         .box => .box,
         .clickable => .clickable,
+        .focus => .focus,
+        .focus_scope => .focus_scope,
         .text_input => .text_input,
         .row => .row,
         .column => .column,
@@ -1646,6 +1705,14 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .on_click = callback,
             } };
         },
+        .focus => |focus_widget| blk: {
+            const focus_id = try allocator.dupe(u8, focus_widget.node.id);
+            break :blk .{ .focus = .{ .node = .named(focus_id), .child = focus_widget.child } };
+        },
+        .focus_scope => |focus_scope_widget| blk: {
+            const id = try allocator.dupe(u8, focus_scope_widget.id);
+            break :blk .{ .focus_scope = .{ .id = id, .child = focus_scope_widget.child } };
+        },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
@@ -1700,6 +1767,8 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
         },
+        .focus => |focus_widget| allocator.free(focus_widget.node.id),
+        .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
         .text_input => |input_widget| {
             allocator.free(input_widget.id);
             allocator.free(input_widget.focus_node.id);
@@ -1877,6 +1946,7 @@ pub const FocusTarget = struct {
     pub const Kind = enum {
         text_input,
         clickable,
+        focus,
     };
 };
 
@@ -1890,6 +1960,7 @@ pub fn collectFocusTargets(allocator: std.mem.Allocator, node: *const RenderNode
 fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode) !void {
     switch (node.kind) {
         .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input }),
+        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus }),
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback });
         },
@@ -1904,6 +1975,9 @@ pub fn findFocusTarget(node: *const RenderNode, id: []const u8) ?FocusTarget {
     switch (node.kind) {
         .text_input => if (node.focus_id) |focus_id| {
             if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input };
+        },
+        .focus => if (node.focus_id) |focus_id| {
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus };
         },
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |clickable_id| {
@@ -2074,6 +2148,7 @@ fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
     return switch (element.widget) {
         .button => |button_widget| std.mem.eql(u8, button_widget.id, focused_id),
         .clickable => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
+        .focus => |focus_widget| std.mem.eql(u8, focus_widget.node.id, focused_id),
         .text_input => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),
         else => false,
     };
@@ -2131,6 +2206,35 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .clickable_id = id,
                 .click_callback = clickable_widget.on_click,
+                .children = children,
+            };
+        },
+        .focus => |focus_widget| {
+            const focus_id = try allocator.dupe(u8, focus_widget.node.id);
+            errdefer allocator.free(focus_id);
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .focus,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .focus_id = focus_id,
+                .focused = element.focused,
+                .children = children,
+            };
+        },
+        .focus_scope => |focus_scope_widget| {
+            _ = focus_scope_widget;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .focus_scope,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .children = children,
             };
         },
@@ -2672,6 +2776,25 @@ test "focus targets are collected in render tree order" {
     try std.testing.expectEqualStrings("button", targets[1].id);
     try std.testing.expectEqual(FocusTarget.Kind.clickable, targets[1].kind);
     try std.testing.expectEqual(FocusTarget.Kind.clickable, findFocusTarget(&root, "button").?.kind);
+}
+
+test "focus widget makes arbitrary subtree focusable" {
+    const allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena.deinit();
+
+    const label = widgets.text("Focusable text");
+    const focus = try widgets.focus(build_arena.allocator(), .named("label-focus"), label);
+
+    var root = try buildRenderTree(allocator, &focus, .{ .max_width = 200, .max_height = 80 });
+    defer destroyRenderTree(allocator, &root);
+
+    const targets = try collectFocusTargets(allocator, &root);
+    defer allocator.free(targets);
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqualStrings("label-focus", targets[0].id);
+    try std.testing.expectEqual(FocusTarget.Kind.focus, targets[0].kind);
+    try std.testing.expectEqual(FocusTarget.Kind.focus, findFocusTarget(&root, "label-focus").?.kind);
 }
 
 test "center moves descendants" {

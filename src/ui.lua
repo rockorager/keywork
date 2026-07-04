@@ -35,6 +35,22 @@ function ui.clickable(id, child, on_click)
   }
 end
 
+function ui.focus(id, child)
+  return {
+    type = "focus",
+    id = id,
+    child = child,
+  }
+end
+
+function ui.focus_scope(id, child)
+  return {
+    type = "focus_scope",
+    id = id,
+    child = child,
+  }
+end
+
 function ui.text_input(id, placeholder)
   return {
     type = "text_input",
