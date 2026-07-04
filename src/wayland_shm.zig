@@ -44,7 +44,7 @@ pub const Backend = struct {
 
     pub const ClickHandler = WaylandInput.ClickHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
-    pub const RepaintHandler = *const fn (ctx: *anyopaque) void;
+    pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
 
     pub const Options = struct {
         title: [:0]const u8 = "Keywork",
@@ -215,7 +215,7 @@ pub const Backend = struct {
         if (self.display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
         if (self.scale_changed) {
             self.scale_changed = false;
-            if (self.repaint_handler) |handler| handler(self.repaint_context.?);
+            self.notifyRepaint();
         }
         return !self.closed;
     }
@@ -248,6 +248,13 @@ pub const Backend = struct {
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         return self.text_renderer.measure(self.scale, value);
+    }
+
+    fn notifyRepaint(self: *Backend) void {
+        if (self.repaint_handler) |handler| handler(self.repaint_context.?, .{
+            .width = @floatFromInt(self.width),
+            .height = @floatFromInt(self.height),
+        });
     }
 
     fn acquireBuffer(self: *Backend, width: u31, height: u31) !*Buffer {
@@ -314,6 +321,7 @@ pub const Backend = struct {
             .configure => |configure| {
                 xdg_surface.ackConfigure(configure.serial);
                 self.configured = true;
+                self.notifyRepaint();
             },
         }
     }

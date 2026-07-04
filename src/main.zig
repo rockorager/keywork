@@ -415,7 +415,7 @@ fn layout(allocator: std.mem.Allocator, widget: *const Widget, constraints: Cons
             const measured = try measurer.measureText(text_value);
             const value_size = try measurer.measureText(input_widget.value);
             const requested = Size{
-                .width = @max(input_min_width, measured.width + input_horizontal_padding * 2),
+                .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, constraints.max_width)),
                 .height = measured.height + input_vertical_padding * 2,
             };
             const size_value = constraints.clamp(requested);
@@ -557,6 +557,8 @@ pub const Runtime = struct {
         pulse: bool = false,
         input_text: []const u8 = "",
         focused_input_id: ?[]const u8 = null,
+        window_width: f32 = 0,
+        window_height: f32 = 0,
     };
     const DemoState = State;
 
@@ -590,11 +592,12 @@ pub const Runtime = struct {
             .pulse = self.state.pulse,
             .input_text = self.input_text.items,
             .focused_input_id = self.focused_input_id,
+            .window_width = self.constraints.max_width,
+            .window_height = self.constraints.max_height,
         };
     }
 
     pub fn frameSize(self: *const Runtime) Size {
-        if (self.root) |root| return root.rect.size();
         return .{ .width = self.constraints.max_width, .height = self.constraints.max_height };
     }
 
@@ -602,10 +605,11 @@ pub const Runtime = struct {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         self.display_list.clearRetainingCapacity();
         try paint(self.allocator, root, &self.display_list);
+        const frame_size = self.frameSize();
         try self.backend.present(.{
-            .size = root.rect.size(),
+            .size = frame_size,
             .scale = 1,
-            .damage = &.{root.rect},
+            .damage = &.{.{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height }},
             .display_list = self.display_list.commands.items,
         });
     }
@@ -669,14 +673,17 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn waylandScaleChanged(ctx: *anyopaque) void {
+    pub fn waylandConfigure(ctx: *anyopaque, size: Size) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
+        if (size.width > 0 and size.height > 0) {
+            self.constraints = .{ .max_width = size.width, .max_height = size.height };
+        }
         self.rebuild() catch |err| {
-            log.err("scale rebuild failed: {}", .{err});
+            log.err("configure rebuild failed: {}", .{err});
             return;
         };
         self.repaint() catch |err| {
-            log.err("scale repaint failed: {}", .{err});
+            log.err("configure repaint failed: {}", .{err});
         };
     }
 
@@ -768,7 +775,7 @@ pub fn main(init: std.process.Init) !void {
         var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
         defer runtime.deinit();
         backend.setClickHandler(&runtime, Runtime.waylandClick);
-        backend.setRepaintHandler(&runtime, Runtime.waylandScaleChanged);
+        backend.setRepaintHandler(&runtime, Runtime.waylandConfigure);
         backend.setKeyHandler(&runtime, Runtime.waylandKeyInput);
         try runtime.repaint();
 
@@ -801,7 +808,7 @@ pub fn main(init: std.process.Init) !void {
         var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
         defer runtime.deinit();
         backend.setClickHandler(&runtime, Runtime.waylandClick);
-        backend.setRepaintHandler(&runtime, Runtime.waylandScaleChanged);
+        backend.setRepaintHandler(&runtime, Runtime.waylandConfigure);
         backend.setKeyHandler(&runtime, Runtime.waylandKeyInput);
         try runtime.repaint();
 
