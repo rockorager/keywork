@@ -20,6 +20,8 @@ pub const KeyworkAppVTable = extern struct {
     timer: ?*const fn (userdata: ?*anyopaque, expirations: u64) callconv(.c) c_int = null,
 };
 
+pub const KeyworkClickCallback = *const fn (userdata: ?*anyopaque) callconv(.c) void;
+
 pub const KeyworkRunOptions = extern struct {
     title: ?[*:0]const u8 = null,
     backend: c_int = 0,
@@ -38,6 +40,20 @@ pub const KeyworkRunTextOptions = extern struct {
 
 const BuildScope = struct {
     allocator: std.mem.Allocator,
+};
+
+const ClickCallback = struct {
+    callback: KeyworkClickCallback,
+    userdata: ?*anyopaque,
+
+    fn keyworkCallback(self: *ClickCallback) keywork.Widget.Callback {
+        return .{ .ptr = self, .call_fn = call };
+    }
+
+    fn call(ptr: *anyopaque) !void {
+        const self: *ClickCallback = @ptrCast(@alignCast(ptr));
+        self.callback(self.userdata);
+    }
 };
 
 const CApp = struct {
@@ -174,10 +190,51 @@ pub export fn keywork_clickable(build: ?*KeyworkBuild, id: ?[*:0]const u8, child
     ) catch return null);
 }
 
+pub export fn keywork_clickable_callback(
+    build: ?*KeyworkBuild,
+    child: ?*KeyworkWidget,
+    callback: ?KeyworkClickCallback,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    const callback_fn = callback orelse return null;
+    const callback_state = scope.allocator.create(ClickCallback) catch return null;
+    callback_state.* = .{ .callback = callback_fn, .userdata = userdata };
+    const child_copy = keywork.Widget.alloc(scope.allocator, child_widget.*) catch return null;
+    return makeWidget(scope, .{ .clickable = .{
+        .id = "",
+        .child = child_copy,
+        .on_click = callback_state.keyworkCallback(),
+    } });
+}
+
 pub export fn keywork_padding(build: ?*KeyworkBuild, inset: f32, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const child_widget = widgetFromMaybeHandle(child) orelse return null;
     return makeWidget(scope, keywork.widgets.padding(scope.allocator, keywork.EdgeInsets.all(inset), child_widget.*) catch return null);
+}
+
+pub export fn keywork_center(build: ?*KeyworkBuild, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    return makeWidget(scope, keywork.widgets.center(scope.allocator, child_widget.*) catch return null);
+}
+
+pub export fn keywork_keyed_string(build: ?*KeyworkBuild, key: ?[*:0]const u8, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    return makeWidget(scope, keywork.widgets.keyed(
+        scope.allocator,
+        .{ .string = copyString(scope.allocator, key, "") catch return null },
+        child_widget.*,
+    ) catch return null);
+}
+
+pub export fn keywork_keyed_int(build: ?*KeyworkBuild, key: u64, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    return makeWidget(scope, keywork.widgets.keyed(scope.allocator, .{ .integer = key }, child_widget.*) catch return null);
 }
 
 pub export fn keywork_column(
@@ -186,6 +243,25 @@ pub export fn keywork_column(
     child_count: usize,
     gap: f32,
 ) callconv(.c) ?*KeyworkWidget {
+    return linear(build, children, child_count, gap, .column);
+}
+
+pub export fn keywork_row(
+    build: ?*KeyworkBuild,
+    children: ?[*]const ?*KeyworkWidget,
+    child_count: usize,
+    gap: f32,
+) callconv(.c) ?*KeyworkWidget {
+    return linear(build, children, child_count, gap, .row);
+}
+
+fn linear(
+    build: ?*KeyworkBuild,
+    children: ?[*]const ?*KeyworkWidget,
+    child_count: usize,
+    gap: f32,
+    comptime direction: enum { row, column },
+) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     if (child_count > 0 and children == null) return null;
 
@@ -195,7 +271,11 @@ pub export fn keywork_column(
         const child_widget = widgetFromMaybeHandle(child) orelse return null;
         child_widgets[index] = child_widget.*;
     }
-    return makeWidget(scope, keywork.widgets.column(scope.allocator, child_widgets, gap) catch return null);
+    const widget = switch (direction) {
+        .row => keywork.widgets.row(scope.allocator, child_widgets, gap),
+        .column => keywork.widgets.column(scope.allocator, child_widgets, gap),
+    } catch return null;
+    return makeWidget(scope, widget);
 }
 
 fn makeContext(allocator: std.mem.Allocator, context: keywork.AppContext) !KeyworkContext {

@@ -31,6 +31,8 @@ struct keywork_app_vtable {
     int (*timer)(void *userdata, uint64_t expirations);
 };
 
+typedef void (*keywork_click_callback_t)(void *userdata);
+
 struct keywork_run_options {
     const char *title;
     int backend;
@@ -55,8 +57,13 @@ keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value
 keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder, int focused);
 keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
 keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child);
+keywork_widget_t *keywork_clickable_callback(keywork_build_t *build, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);
 keywork_widget_t *keywork_padding(keywork_build_t *build, float inset, keywork_widget_t *child);
+keywork_widget_t *keywork_center(keywork_build_t *build, keywork_widget_t *child);
+keywork_widget_t *keywork_keyed_string(keywork_build_t *build, const char *key, keywork_widget_t *child);
+keywork_widget_t *keywork_keyed_int(keywork_build_t *build, uint64_t key, keywork_widget_t *child);
 keywork_widget_t *keywork_column(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
+keywork_widget_t *keywork_row(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
 
 #ifdef __cplusplus
 }
