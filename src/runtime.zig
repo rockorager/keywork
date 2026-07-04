@@ -120,8 +120,14 @@ pub const Runtime = struct {
 
         const root = if (self.root) |*root| root else return error.NotBuilt;
         self.display_list.clearRetainingCapacity();
-        try keywork.paint(self.allocator, root, &self.display_list);
         const frame_size = self.frameSize();
+        try self.display_list.fillRect(self.allocator, .{
+            .x = 0,
+            .y = 0,
+            .width = frame_size.width,
+            .height = frame_size.height,
+        }, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface);
+        try keywork.paint(self.allocator, root, &self.display_list);
         self.frame_pending = try self.backend.present(.{
             .size = frame_size,
             .scale = 1,
@@ -281,9 +287,13 @@ pub const Runtime = struct {
             self.root = null;
         }
         _ = self.build_arena.reset(.retain_capacity);
-        var build_scope: BuildScope = .{ .allocator = self.build_arena.allocator() };
+        const state = self.currentState();
+        var build_scope: BuildScope = .{
+            .allocator = self.build_arena.allocator(),
+            .theme = keywork.Theme.fromColorScheme(state.color_scheme),
+        };
 
-        var app_root = try self.app.buildWidget(&build_scope, self.currentState());
+        var app_root = try self.app.buildWidget(&build_scope, state);
         if (self.element_root) |*element_root| {
             try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
         } else {

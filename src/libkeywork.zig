@@ -13,6 +13,13 @@ const app_runner = @import("app_runner.zig");
 
 pub const Color = core.Color;
 pub const colors = core.colors;
+pub const Theme = core.Theme;
+pub const Brightness = core.Brightness;
+pub const ColorScheme = core.ColorScheme;
+pub const TextStyle = core.TextStyle;
+pub const TextTheme = core.TextTheme;
+pub const ButtonTheme = core.ButtonTheme;
+pub const InputTheme = core.InputTheme;
 pub const widgets = core.widgets;
 pub const Size = core.Size;
 pub const Point = core.Point;

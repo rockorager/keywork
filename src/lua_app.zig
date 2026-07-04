@@ -130,7 +130,7 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
 
     if (std.mem.eql(u8, kind, "text")) {
         const value = try dupeStringField(lua_state, allocator, table, "value");
-        return .{ .text = .{ .value = value, .color = getColorField(lua_state, table, "color", keywork.colors.ink) } };
+        return .{ .text = .{ .value = value, .color = getOptionalColorField(lua_state, table, "color") } };
     }
     if (std.mem.eql(u8, kind, "keyed")) {
         const key = try dupeStringField(lua_state, allocator, table, "key");
@@ -246,6 +246,15 @@ fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, defa
     if (c.lua_isnumber(lua_state, -1) == 0) return default;
     const value = c.lua_tonumber(lua_state, -1);
     if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return default;
+    return @bitCast(@as(u32, @intFromFloat(value)));
+}
+
+fn getOptionalColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?keywork.Color {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) == 0) return null;
+    const value = c.lua_tonumber(lua_state, -1);
+    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return null;
     return @bitCast(@as(u32, @intFromFloat(value)));
 }
 

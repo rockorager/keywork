@@ -22,6 +22,98 @@ pub const colors = struct {
     pub const accent: Color = Color.argb(0xff, 0x6d, 0x4a, 0xff);
 };
 
+pub const Brightness = enum {
+    light,
+    dark,
+};
+
+pub const ColorScheme = struct {
+    brightness: Brightness,
+    primary: Color,
+    on_primary: Color,
+    surface: Color,
+    on_surface: Color,
+    surface_variant: Color,
+    on_surface_variant: Color,
+    outline: Color,
+    error_color: Color,
+    on_error: Color,
+
+    pub const light: ColorScheme = .{
+        .brightness = .light,
+        .primary = colors.accent,
+        .on_primary = colors.white,
+        .surface = colors.panel,
+        .on_surface = colors.ink,
+        .surface_variant = colors.white,
+        .on_surface_variant = colors.ink,
+        .outline = colors.ink,
+        .error_color = Color.argb(0xff, 0xba, 0x1a, 0x1a),
+        .on_error = colors.white,
+    };
+
+    pub const dark: ColorScheme = .{
+        .brightness = .dark,
+        .primary = Color.argb(0xff, 0x9b, 0x86, 0xff),
+        .on_primary = colors.black,
+        .surface = Color.argb(0xff, 0x20, 0x20, 0x24),
+        .on_surface = colors.white,
+        .surface_variant = Color.argb(0xff, 0x2b, 0x2b, 0x30),
+        .on_surface_variant = colors.white,
+        .outline = Color.argb(0xff, 0x9b, 0x86, 0xff),
+        .error_color = Color.argb(0xff, 0xff, 0xb4, 0xab),
+        .on_error = Color.argb(0xff, 0x69, 0x00, 0x05),
+    };
+};
+
+pub const TextStyle = struct {
+    color: ?Color = null,
+};
+
+pub const TextTheme = struct {
+    body: TextStyle = .{},
+    label: TextStyle = .{},
+};
+
+pub const ButtonTheme = struct {
+    background: ?Color = null,
+    foreground: ?Color = null,
+    pressed_background: ?Color = null,
+    padding: f32 = 8,
+};
+
+pub const InputTheme = struct {
+    background: ?Color = null,
+    foreground: ?Color = null,
+    placeholder: ?Color = null,
+    border: ?Color = null,
+    focused_border: ?Color = null,
+};
+
+pub const Theme = struct {
+    color_scheme: ColorScheme,
+    text_theme: TextTheme = .{},
+    button_theme: ButtonTheme = .{},
+    input_theme: InputTheme = .{},
+
+    pub const light: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{ .pressed_background = colors.ink },
+        .input_theme = .{ .placeholder = Color.argb(0xff, 0x77, 0x77, 0x7d) },
+    };
+    pub const dark: Theme = .{
+        .color_scheme = .dark,
+        .button_theme = .{ .pressed_background = Color.argb(0xff, 0xcc, 0xc2, 0xff) },
+        .input_theme = .{ .placeholder = Color.argb(0xff, 0xb7, 0xb3, 0xc1) },
+    };
+    pub const default: Theme = light;
+
+    pub fn fromColorScheme(scheme: []const u8) Theme {
+        if (std.mem.eql(u8, scheme, "dark")) return .dark;
+        return .light;
+    }
+};
+
 pub const Size = struct {
     width: f32,
     height: f32,
@@ -96,6 +188,8 @@ pub const Widget = union(enum) {
     column: Children,
     padding: Padding,
     center: Child,
+    button: Button,
+    theme: ThemeWidget,
     component: Component,
     stateful: Stateful,
     element: CustomElement,
@@ -123,7 +217,13 @@ pub const Widget = union(enum) {
 
     pub const Text = struct {
         value: []const u8,
-        color: Color = colors.ink,
+        color: ?Color = null,
+    };
+
+    pub const Button = struct {
+        id: []const u8,
+        label: []const u8,
+        pressed: bool = false,
     };
 
     pub const Box = struct {
@@ -142,6 +242,11 @@ pub const Widget = union(enum) {
         value: []const u8,
         placeholder: []const u8,
         focused: bool = false,
+        foreground: Color = colors.ink,
+        background: Color = colors.white,
+        border: Color = colors.ink,
+        focused_border: Color = colors.accent,
+        placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
     };
 
     pub const Children = struct {
@@ -155,6 +260,11 @@ pub const Widget = union(enum) {
     };
 
     pub const Child = struct {
+        child: *const Widget,
+    };
+
+    pub const ThemeWidget = struct {
+        theme: Theme,
         child: *const Widget,
     };
 
@@ -186,6 +296,7 @@ pub const Widget = union(enum) {
 
     pub const BuildContext = struct {
         constraints: Constraints,
+        theme: Theme = .default,
     };
 
     pub const Component = struct {
@@ -331,6 +442,7 @@ pub const Widget = union(enum) {
 
 pub const BuildScope = struct {
     allocator: std.mem.Allocator,
+    theme: Theme = .default,
 };
 
 pub const widgets = struct {
@@ -351,11 +463,12 @@ pub const widgets = struct {
     }
 
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, pressed: bool) !Widget {
-        const label_widget = coloredText(label, colors.white);
-        const padded = try padding(allocator, EdgeInsets.all(8), label_widget);
-        const background = if (pressed) colors.ink else colors.accent;
-        const surface = try box(allocator, padded, background);
-        return clickable(allocator, id, surface);
+        _ = allocator;
+        return .{ .button = .{ .id = id, .label = label, .pressed = pressed } };
+    }
+
+    pub fn theme(allocator: std.mem.Allocator, theme_value: Theme, child: Widget) !Widget {
+        return .{ .theme = .{ .theme = theme_value, .child = try Widget.alloc(allocator, child) } };
     }
 
     pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, focused: bool) Widget {
@@ -400,12 +513,58 @@ pub const Element = struct {
         column,
         padding,
         center,
+        button,
+        theme,
         component,
         stateful,
         element,
         render_object,
     };
 };
+
+fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, button_widget: Widget.Button) !Widget {
+    const label = widgets.coloredText(button_widget.label, buttonForeground(theme));
+    const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
+    const background = if (button_widget.pressed) buttonPressedBackground(theme) else buttonBackground(theme);
+    const surface = try widgets.box(allocator, padded, background);
+    return widgets.clickable(allocator, button_widget.id, surface);
+}
+
+fn textColor(theme: Theme) Color {
+    return theme.text_theme.body.color orelse theme.color_scheme.on_surface;
+}
+
+fn buttonBackground(theme: Theme) Color {
+    return theme.button_theme.background orelse theme.color_scheme.primary;
+}
+
+fn buttonForeground(theme: Theme) Color {
+    return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
+}
+
+fn buttonPressedBackground(theme: Theme) Color {
+    return theme.button_theme.pressed_background orelse theme.color_scheme.on_surface;
+}
+
+fn inputForeground(theme: Theme) Color {
+    return theme.input_theme.foreground orelse theme.color_scheme.on_surface_variant;
+}
+
+fn inputBackground(theme: Theme) Color {
+    return theme.input_theme.background orelse theme.color_scheme.surface_variant;
+}
+
+fn inputBorder(theme: Theme) Color {
+    return theme.input_theme.border orelse theme.color_scheme.outline;
+}
+
+fn inputFocusedBorder(theme: Theme) Color {
+    return theme.input_theme.focused_border orelse theme.color_scheme.primary;
+}
+
+fn inputPlaceholder(theme: Theme) Color {
+    return theme.input_theme.placeholder orelse theme.color_scheme.on_surface_variant;
+}
 
 pub const RenderObjectNode = struct {
     kind: Element.Kind,
@@ -425,6 +584,9 @@ pub const RenderNode = struct {
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
     placeholder: ?[]const u8 = null,
+    border: Color = colors.ink,
+    focused_border: Color = colors.accent,
+    placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
     focused: bool = false,
     caret_x: ?f32 = null,
     children: []RenderNode = &.{},
@@ -439,6 +601,8 @@ pub const RenderNode = struct {
         column,
         padding,
         center,
+        button,
+        theme,
         component,
         stateful,
         element,
@@ -663,8 +827,8 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
         },
-        .text => return .{ .kind = .text, .widget = try cloneWidgetForElement(allocator, widget.*) },
-        .text_input => return .{ .kind = .text_input, .widget = try cloneWidgetForElement(allocator, widget.*) },
+        .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
+        .text_input => return .{ .kind = .text_input, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .box => |box_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -718,12 +882,42 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .center, .widget = element_widget, .children = children };
         },
+        .button => |button_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, button_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
+            initialized = true;
+            return .{ .kind = .button, .widget = element_widget, .children = children };
+        },
+        .theme => |theme_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const previous_theme = scope.theme;
+            scope.theme = theme_widget.theme;
+            defer scope.theme = previous_theme;
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, theme_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .theme, .widget = element_widget, .children = children };
+        },
         .row => |row_widget| return buildLinearElementTree(allocator, scope, .row, widget.*, row_widget.children, constraints),
         .column => |column_widget| return buildLinearElementTree(allocator, scope, .column, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try component_widget.build(scope, .{ .constraints = constraints });
+            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -739,7 +933,7 @@ pub fn buildElementTreeScoped(
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try stateful_widget.createState(allocator);
             errdefer stateful_widget.destroyState(state, allocator);
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints });
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -759,7 +953,7 @@ pub fn buildElementTreeScoped(
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints });
+            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme });
             initialized = true;
             return .{ .kind = .element, .widget = element_widget, .children = children };
         },
@@ -900,7 +1094,8 @@ pub fn updateElementTreeScoped(
             if (element.key) |old_key| destroyKey(allocator, old_key);
             element.key = try cloneKey(allocator, keyed_widget.key);
         },
-        .text, .text_input, .render_object => try replaceElementWidget(allocator, element, widget.*),
+        .text, .text_input => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme),
+        .render_object => try replaceElementWidget(allocator, element, widget.*),
         .box => |box_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
         },
@@ -913,20 +1108,30 @@ pub fn updateElementTreeScoped(
         .center => |center_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
         },
+        .button => |button_widget| {
+            const built = try buildButtonWidget(scope.allocator, scope.theme, button_widget);
+            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
+        },
+        .theme => |theme_widget| {
+            const previous_theme = scope.theme;
+            scope.theme = theme_widget.theme;
+            defer scope.theme = previous_theme;
+            try updateSingleChildElement(allocator, scope, element, widget.*, theme_widget.child, constraints);
+        },
         .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
         .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
-            const built = try component_widget.build(scope, .{ .constraints = constraints });
+            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme });
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
-            try stateful_widget.update(state, allocator, .{ .constraints = constraints });
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints });
+            try stateful_widget.update(state, allocator, .{ .constraints = constraints, .theme = scope.theme });
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme });
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .element => |custom_element| {
-            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints });
+            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme });
             errdefer destroyElementTree(allocator, &replacement_child);
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -953,6 +1158,8 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .column => .column,
         .padding => .padding,
         .center => .center,
+        .button => .button,
+        .theme => .theme,
         .component => .component,
         .stateful => .stateful,
         .element => .element,
@@ -1188,6 +1395,31 @@ fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget:
     element.widget = element_widget;
 }
 
+fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme) anyerror!void {
+    var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme);
+    errdefer destroyElementWidget(allocator, &element_widget);
+    destroyElementWidget(allocator, &element.widget);
+    element.widget = element_widget;
+}
+
+fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme) !Widget {
+    var result = try cloneWidgetForElement(allocator, widget);
+    switch (result) {
+        .text => |*text_widget| {
+            if (text_widget.color == null) text_widget.color = textColor(theme);
+        },
+        .text_input => |*input_widget| {
+            input_widget.foreground = inputForeground(theme);
+            input_widget.background = inputBackground(theme);
+            input_widget.border = inputBorder(theme);
+            input_widget.focused_border = inputFocusedBorder(theme);
+            input_widget.placeholder_foreground = inputPlaceholder(theme);
+        },
+        else => {},
+    }
+    return result;
+}
+
 fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
     return switch (widget) {
         .keyed => |keyed_widget| .{ .keyed = .{
@@ -1198,6 +1430,12 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .value = try allocator.dupe(u8, text_widget.value),
             .color = text_widget.color,
         } },
+        .button => |button_widget| blk: {
+            const id = try allocator.dupe(u8, button_widget.id);
+            errdefer allocator.free(id);
+            const label = try allocator.dupe(u8, button_widget.label);
+            break :blk .{ .button = .{ .id = id, .label = label, .pressed = button_widget.pressed } };
+        },
         .box => |box_widget| .{ .box = box_widget },
         .clickable => |clickable_widget| blk: {
             const id = try allocator.dupe(u8, clickable_widget.id);
@@ -1221,12 +1459,18 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .value = value,
                 .placeholder = placeholder,
                 .focused = input_widget.focused,
+                .foreground = input_widget.foreground,
+                .background = input_widget.background,
+                .border = input_widget.border,
+                .focused_border = input_widget.focused_border,
+                .placeholder_foreground = input_widget.placeholder_foreground,
             } };
         },
         .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap } },
         .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap } },
         .padding => |padding_widget| .{ .padding = padding_widget },
         .center => |center_widget| .{ .center = center_widget },
+        .theme => |theme_widget| .{ .theme = theme_widget },
         .component => |component_widget| .{ .component = component_widget },
         .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
         .element => |custom_element| .{ .element = try custom_element.clone(allocator) },
@@ -1238,6 +1482,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
     switch (widget.*) {
         .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
         .text => |text_widget| allocator.free(text_widget.value),
+        .button => |button_widget| {
+            allocator.free(button_widget.id);
+            allocator.free(button_widget.label);
+        },
         .clickable => |clickable_widget| {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
@@ -1250,7 +1498,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .stateful => |stateful_widget| stateful_widget.destroy(allocator),
         .render_object => |render_object| render_object.destroy(allocator),
         .element => |custom_element| custom_element.destroy(allocator),
-        .box, .row, .column, .padding, .center, .component => {},
+        .box, .row, .column, .padding, .center, .theme, .component => {},
     }
 }
 
@@ -1303,11 +1551,11 @@ pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list
             if (node.background.a > 0) try display_list.fillRect(allocator, node.rect, node.background);
         },
         .text_input => {
-            try display_list.fillRect(allocator, node.rect, colors.white);
-            try paintBorder(allocator, display_list, node.rect, if (node.focused) colors.accent else colors.ink);
+            try display_list.fillRect(allocator, node.rect, node.background);
+            try paintBorder(allocator, display_list, node.rect, if (node.focused) node.focused_border else node.border);
             const value = node.text orelse "";
             const visible_text = if (value.len > 0) value else node.placeholder orelse "";
-            const text_color = if (value.len > 0) node.foreground else Color.argb(0xff, 0x77, 0x77, 0x7d);
+            const text_color = if (value.len > 0) node.foreground else node.placeholder_foreground;
             try display_list.text(allocator, .{
                 .x = node.rect.x + input_horizontal_padding,
                 .y = node.rect.y + input_vertical_padding,
@@ -1319,7 +1567,7 @@ pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list
                     .y = node.rect.y + input_vertical_padding,
                     .width = 1,
                     .height = @max(1, node.rect.height - input_vertical_padding * 2),
-                }, colors.ink);
+                }, node.foreground);
             }
         },
         .text => if (node.text) |value| {
@@ -1408,7 +1656,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .kind = .text,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = try allocator.dupe(u8, text_widget.value),
-                .foreground = text_widget.color,
+                .foreground = text_widget.color orelse colors.ink,
             };
         },
         .box => |box_widget| {
@@ -1460,9 +1708,12 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = value,
                 .text_input_id = id,
-                .foreground = colors.ink,
-                .background = colors.white,
+                .foreground = input_widget.foreground,
+                .background = input_widget.background,
                 .placeholder = placeholder,
+                .border = input_widget.border,
+                .focused_border = input_widget.focused_border,
+                .placeholder_foreground = input_widget.placeholder_foreground,
                 .focused = input_widget.focused,
                 .caret_x = origin.x + input_horizontal_padding + value_size.width,
             };
@@ -1501,6 +1752,32 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             return .{
                 .kind = .center,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = constraints.max_width, .height = constraints.max_height },
+                .children = children,
+            };
+        },
+        .button => |button_widget| {
+            _ = button_widget;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .button,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .children = children,
+            };
+        },
+        .theme => |theme_widget| {
+            _ = theme_widget;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .theme,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .children = children,
             };
         },
@@ -1663,12 +1940,67 @@ test "button widget composes styled clickable content" {
     var root = try buildRenderTree(retained_allocator, &button_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyRenderTree(retained_allocator, &root);
 
-    try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.kind);
-    try std.testing.expectEqualStrings("confirm", root.clickable_id.?);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].kind);
-    try std.testing.expectEqual(colors.ink, root.children[0].background);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].kind);
-    try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].text.?);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .button), root.kind);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.children[0].kind);
+    try std.testing.expectEqualStrings("confirm", root.children[0].clickable_id.?);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].children[0].kind);
+    try std.testing.expectEqual(colors.ink, root.children[0].children[0].background);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].children[0].kind);
+    try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].children[0].text.?);
+}
+
+test "theme selects light and dark defaults from color scheme" {
+    try std.testing.expectEqual(Theme.light.color_scheme.primary, Theme.fromColorScheme("light").color_scheme.primary);
+    try std.testing.expectEqual(Theme.dark.color_scheme.primary, Theme.fromColorScheme("dark").color_scheme.primary);
+    try std.testing.expectEqual(Theme.light.color_scheme.primary, Theme.fromColorScheme("no-preference").color_scheme.primary);
+}
+
+test "theme widget provides ambient button styling" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.black,
+            .foreground = colors.white,
+            .pressed_background = colors.panel,
+            .padding = 4,
+        },
+    };
+    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", false);
+    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
+    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const box_node = root.children[0].children[0].children[0];
+    try std.testing.expectEqual(@as(RenderNode.Kind, .theme), root.kind);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
+    try std.testing.expectEqual(colors.black, box_node.background);
+    try std.testing.expectEqual(@as(f32, 56), root.rect.width);
+}
+
+test "theme widget provides ambient text and input styling" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const children = [_]Widget{
+        widgets.text("plain"),
+        widgets.textInput("input", "", "placeholder", false),
+    };
+    const column = try widgets.column(build_arena.allocator(), &children, 4);
+    const themed = try widgets.theme(build_arena.allocator(), Theme.dark, column);
+    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 120 });
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const text_node = root.children[0].children[0].children[0];
+    const input_node = root.children[0].children[0].children[1];
+    try std.testing.expectEqual(Theme.dark.color_scheme.on_surface, text_node.foreground);
+    try std.testing.expectEqual(Theme.dark.color_scheme.surface_variant, input_node.background);
+    try std.testing.expectEqual(Theme.dark.color_scheme.outline, input_node.border);
+    try std.testing.expectEqual(Theme.dark.input_theme.placeholder.?, input_node.placeholder_foreground);
 }
 
 test "center moves descendants" {
