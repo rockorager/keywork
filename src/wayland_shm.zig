@@ -24,6 +24,7 @@ pub const Backend = struct {
     wm_base: *xdg.WmBase,
     viewporter: ?*wp.Viewporter,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
+    cursor_shape_manager: ?*wp.CursorShapeManagerV1,
     input: WaylandInput,
     surface: *wl.Surface,
     viewport: ?*wp.Viewport,
@@ -46,6 +47,7 @@ pub const Backend = struct {
     frame_callback: ?*wl.Callback,
 
     pub const ClickHandler = WaylandInput.ClickHandler;
+    pub const CursorShapeHandler = WaylandInput.CursorShapeHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
     pub const FrameHandler = *const fn (ctx: *anyopaque) void;
@@ -63,6 +65,7 @@ pub const Backend = struct {
         wm_base: ?*xdg.WmBase = null,
         viewporter: ?*wp.Viewporter = null,
         fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
+        cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
         seat: ?*wl.Seat = null,
     };
 
@@ -80,6 +83,7 @@ pub const Backend = struct {
         const wm_base = globals.wm_base orelse return error.NoXdgWmBase;
         const viewporter = globals.viewporter;
         const fractional_scale_manager = globals.fractional_scale_manager;
+        const cursor_shape_manager = globals.cursor_shape_manager;
 
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
@@ -96,7 +100,7 @@ pub const Backend = struct {
 
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
-        var input = try WaylandInput.init(globals.seat);
+        var input = try WaylandInput.init(globals.seat, cursor_shape_manager);
         errdefer input.deinit();
 
         const self = try allocator.create(Backend);
@@ -110,6 +114,7 @@ pub const Backend = struct {
             .wm_base = wm_base,
             .viewporter = viewporter,
             .fractional_scale_manager = fractional_scale_manager,
+            .cursor_shape_manager = cursor_shape_manager,
             .input = input,
             .surface = surface,
             .viewport = viewport,
@@ -152,6 +157,7 @@ pub const Backend = struct {
         self.toplevel.destroy();
         self.xdg_surface.destroy();
         self.surface.destroy();
+        if (self.cursor_shape_manager) |manager| manager.destroy();
         if (self.fractional_scale_manager) |manager| manager.destroy();
         if (self.viewporter) |viewporter| viewporter.destroy();
         self.wm_base.destroy();
@@ -168,6 +174,10 @@ pub const Backend = struct {
 
     pub fn setClickHandler(self: *Backend, context: *anyopaque, handler: ClickHandler) void {
         self.input.setClickHandler(context, handler);
+    }
+
+    pub fn setCursorShapeHandler(self: *Backend, context: *anyopaque, handler: CursorShapeHandler) void {
+        self.input.setCursorShapeHandler(context, handler);
     }
 
     pub fn setKeyHandler(self: *Backend, context: *anyopaque, handler: KeyHandler) void {
@@ -321,6 +331,8 @@ pub const Backend = struct {
                     globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
                     globals.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+                } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
+                    globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                     globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
                 }

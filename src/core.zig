@@ -487,6 +487,12 @@ pub const KeyInput = union(enum) {
     enter,
 };
 
+pub const CursorShape = enum {
+    default,
+    pointer,
+    text,
+};
+
 pub const AppContext = struct {
     button_pressed: bool = false,
     pulse: bool = false,
@@ -1253,6 +1259,12 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
         return node.text_input_id;
     }
     return null;
+}
+
+pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
+    if (hitTestTextInput(node, point) != null) return .text;
+    if (hitTestClick(node, point) != null) return .pointer;
+    return .default;
 }
 
 fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constraints: Constraints, origin: Point, measurer: TextMeasurer) LayoutError!RenderNode {

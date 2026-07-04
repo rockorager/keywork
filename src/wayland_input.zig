@@ -10,17 +10,22 @@ const xkb = @import("xkb_c");
 
 const linux = std.os.linux;
 const posix = std.posix;
+const wp = wayland.client.wp;
 const wl = wayland.client.wl;
 
 const log = std.log.scoped(.keywork_wayland_input);
 
 seat: ?*wl.Seat = null,
 pointer: ?*wl.Pointer = null,
+cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
+cursor_shape_device: ?*wp.CursorShapeDeviceV1 = null,
 keyboard: ?*wl.Keyboard = null,
 xkb_context: ?*xkb.struct_xkb_context = null,
 xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
 pointer_position: ?keywork.Point = null,
+pointer_enter_serial: ?u32 = null,
+cursor_shape: ?keywork.CursorShape = null,
 shift_down: bool = false,
 repeat_timer: ?*event_loop.EventLoop.Timer = null,
 repeat_key: ?u32 = null,
@@ -31,13 +36,16 @@ repeat_delay_ms: u64 = 0,
 repeat_interval_ms: u64 = 0,
 click_handler: ?ClickHandler = null,
 click_context: ?*anyopaque = null,
+cursor_shape_handler: ?CursorShapeHandler = null,
+cursor_shape_context: ?*anyopaque = null,
 key_handler: ?KeyHandler = null,
 key_context: ?*anyopaque = null,
 
 pub const ClickHandler = *const fn (ctx: *anyopaque, point: keywork.Point) void;
+pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
 
-pub fn init(seat: ?*wl.Seat) !Self {
+pub fn init(seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
     const pointer = if (seat) |wl_seat| pointer: {
         break :pointer wl_seat.getPointer() catch null;
     } else null;
@@ -46,17 +54,21 @@ pub fn init(seat: ?*wl.Seat) !Self {
     } else null;
     const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
 
-    return .{
+    var self: Self = .{
         .seat = seat,
         .pointer = pointer,
+        .cursor_shape_manager = cursor_shape_manager,
         .keyboard = keyboard,
         .xkb_context = xkb_context,
     };
+    self.createCursorShapeDevice();
+    return self;
 }
 
 pub fn deinit(self: *Self) void {
     self.clearXkbKeymap();
     if (self.xkb_context) |context| xkb.xkb_context_unref(context);
+    self.destroyCursorShapeDevice();
     if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
@@ -72,6 +84,11 @@ pub fn attachListeners(self: *Self, comptime Backend: type, backend: *Backend) v
 pub fn setClickHandler(self: *Self, context: *anyopaque, handler: ClickHandler) void {
     self.click_context = context;
     self.click_handler = handler;
+}
+
+pub fn setCursorShapeHandler(self: *Self, context: *anyopaque, handler: CursorShapeHandler) void {
+    self.cursor_shape_context = context;
+    self.cursor_shape_handler = handler;
 }
 
 pub fn setKeyHandler(self: *Self, context: *anyopaque, handler: KeyHandler) void {
@@ -98,10 +115,14 @@ fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Bac
                     if (caps.capabilities.pointer and self.pointer == null) {
                         self.pointer = seat.getPointer() catch null;
                         if (self.pointer) |pointer| pointer.setListener(*Backend, pointerListener(Backend), backend);
+                        self.createCursorShapeDevice();
                     } else if (!caps.capabilities.pointer and self.pointer != null) {
+                        self.destroyCursorShapeDevice();
                         self.pointer.?.release();
                         self.pointer = null;
                         self.pointer_position = null;
+                        self.pointer_enter_serial = null;
+                        self.cursor_shape = null;
                     }
                     if (caps.capabilities.keyboard and self.keyboard == null) {
                         self.keyboard = seat.getKeyboard() catch null;
@@ -127,11 +148,19 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
             switch (event) {
                 .enter => |enter| {
                     if (enter.surface != backend.surface) return;
+                    self.pointer_enter_serial = enter.serial;
+                    self.cursor_shape = null;
                     self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
+                    self.updateCursorShape(self.pointer_position.?);
                 },
-                .leave => self.pointer_position = null,
+                .leave => {
+                    self.pointer_position = null;
+                    self.pointer_enter_serial = null;
+                    self.cursor_shape = null;
+                },
                 .motion => |motion| {
                     self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
+                    self.updateCursorShape(self.pointer_position.?);
                 },
                 .button => |button| {
                     if (button.button == 272 and button.state == .pressed) {
@@ -144,6 +173,39 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
             }
         }
     }.callback;
+}
+
+fn createCursorShapeDevice(self: *Self) void {
+    if (self.cursor_shape_device != null) return;
+    const manager = self.cursor_shape_manager orelse return;
+    const pointer = self.pointer orelse return;
+    self.cursor_shape_device = manager.getPointer(pointer) catch |err| blk: {
+        log.warn("failed to create cursor shape device: {}", .{err});
+        break :blk null;
+    };
+}
+
+fn destroyCursorShapeDevice(self: *Self) void {
+    if (self.cursor_shape_device) |device| device.destroy();
+    self.cursor_shape_device = null;
+}
+
+fn updateCursorShape(self: *Self, point: keywork.Point) void {
+    const handler = self.cursor_shape_handler orelse return;
+    const serial = self.pointer_enter_serial orelse return;
+    const device = self.cursor_shape_device orelse return;
+    const shape = handler(self.cursor_shape_context.?, point);
+    if (self.cursor_shape == shape) return;
+    device.setShape(serial, waylandCursorShape(shape));
+    self.cursor_shape = shape;
+}
+
+fn waylandCursorShape(shape: keywork.CursorShape) wp.CursorShapeDeviceV1.Shape {
+    return switch (shape) {
+        .default => .default,
+        .pointer => .pointer,
+        .text => .text,
+    };
 }
 
 fn keyboardListener(comptime Backend: type) *const fn (*wl.Keyboard, wl.Keyboard.Event, *Backend) void {

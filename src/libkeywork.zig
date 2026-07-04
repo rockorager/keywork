@@ -31,6 +31,7 @@ pub const RenderBackend = core.RenderBackend;
 pub const TextMeasurer = core.TextMeasurer;
 pub const LogBackend = core.LogBackend;
 pub const KeyInput = core.KeyInput;
+pub const CursorShape = core.CursorShape;
 pub const ClickHit = core.ClickHit;
 pub const buildRenderTree = core.buildRenderTree;
 pub const buildRenderTreeMeasured = core.buildRenderTreeMeasured;
@@ -46,6 +47,7 @@ pub const paint = core.paint;
 pub const hitTestButton = core.hitTestButton;
 pub const hitTestClick = core.hitTestClick;
 pub const hitTestTextInput = core.hitTestTextInput;
+pub const hitTestCursorShape = core.hitTestCursorShape;
 
 pub const Runtime = @import("runtime.zig").Runtime;
 pub const BackendKind = app_runner.BackendKind;

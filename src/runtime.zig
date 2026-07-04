@@ -11,6 +11,7 @@ const AppHost = keywork.AppHost;
 const Constraints = keywork.Constraints;
 const DisplayList = keywork.DisplayList;
 const Element = keywork.Element;
+const CursorShape = keywork.CursorShape;
 const KeyInput = keywork.KeyInput;
 const Point = keywork.Point;
 const RenderBackend = keywork.RenderBackend;
@@ -188,11 +189,21 @@ pub const Runtime = struct {
         try self.requestRepaint();
     }
 
+    pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
+        const root = if (self.root) |*root| root else return .default;
+        return keywork.hitTestCursorShape(root, point);
+    }
+
     pub fn waylandClick(ctx: *anyopaque, point: Point) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         self.click(point) catch |err| {
             log.err("click handling failed: {}", .{err});
         };
+    }
+
+    pub fn waylandCursorShape(ctx: *anyopaque, point: Point) CursorShape {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        return self.cursorShape(point);
     }
 
     pub fn waylandConfigure(ctx: *anyopaque, size: Size) void {
