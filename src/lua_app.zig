@@ -1,12 +1,12 @@
 //! LuaJIT-backed widget descriptions.
 
 const std = @import("std");
-const keywork = @import("root");
+const keywork = @import("libkeywork");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
 
-const State = keywork.Runtime.State;
+const State = keywork.AppContext;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -40,6 +40,10 @@ pub const App = struct {
         self.allocator.free(self.path);
     }
 
+    pub fn host(self: *App) keywork.AppHost {
+        return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidgetHost } };
+    }
+
     pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
         c.lua_settop(self.state, 0);
         if (c.luaL_loadfile(self.state, self.path.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
@@ -57,6 +61,11 @@ pub const App = struct {
         return try parseWidget(self.state, allocator, runtime_state, -1);
     }
 
+    fn buildWidgetHost(ptr: *anyopaque, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.buildWidget(allocator, runtime_state);
+    }
+
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
         var len: usize = 0;
         const message_ptr = c.lua_tolstring(self.state, -1, &len);
@@ -68,121 +77,24 @@ pub const App = struct {
 };
 
 fn installUi(lua_state: *c.lua_State) void {
+    addPackagePath(lua_state, "src/?.lua");
+}
+
+fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
     const package_table = c.lua_gettop(lua_state);
-    c.lua_getfield(lua_state, package_table, "preload");
-    const preload_table = c.lua_gettop(lua_state);
-    c.lua_pushcclosure(lua_state, luaOpenUi, 0);
-    c.lua_setfield(lua_state, preload_table, "ui");
-    pop(lua_state, 2);
-}
-
-fn luaOpenUi(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    pushUiTable(lua_state);
-    return 1;
-}
-
-fn pushUiTable(lua_state: *c.lua_State) void {
-    c.lua_createtable(lua_state, 0, 6);
-    const table = c.lua_gettop(lua_state);
-    setFunction(lua_state, table, "text", luaText);
-    setFunction(lua_state, table, "button", luaButton);
-    setFunction(lua_state, table, "text_input", luaTextInput);
-    setFunction(lua_state, table, "column", luaColumn);
-    setFunction(lua_state, table, "padding", luaPadding);
-    setFunction(lua_state, table, "center", luaCenter);
-}
-
-fn setFunction(lua_state: *c.lua_State, table: c_int, name: [*:0]const u8, function: c.lua_CFunction) void {
-    c.lua_pushcclosure(lua_state, function, 0);
-    c.lua_setfield(lua_state, table, name);
-}
-
-fn luaText(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
+    c.lua_getfield(lua_state, package_table, "path");
     var len: usize = 0;
-    const value = c.luaL_checklstring(lua_state, 1, &len);
-    c.lua_createtable(lua_state, 0, 2);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "text");
-    c.lua_pushlstring(lua_state, value, len);
-    c.lua_setfield(lua_state, table, "value");
-    return 1;
-}
-
-fn luaButton(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    var id_len: usize = 0;
-    var label_len: usize = 0;
-    const id = c.luaL_checklstring(lua_state, 1, &id_len);
-    const label = c.luaL_checklstring(lua_state, 2, &label_len);
-    c.lua_createtable(lua_state, 0, 3);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "button");
-    c.lua_pushlstring(lua_state, id, id_len);
-    c.lua_setfield(lua_state, table, "id");
-    c.lua_pushlstring(lua_state, label, label_len);
-    c.lua_setfield(lua_state, table, "label");
-    return 1;
-}
-
-fn luaTextInput(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    var id_len: usize = 0;
-    var placeholder_len: usize = 0;
-    const id = c.luaL_checklstring(lua_state, 1, &id_len);
-    const placeholder = c.luaL_checklstring(lua_state, 2, &placeholder_len);
-    c.lua_createtable(lua_state, 0, 3);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "text_input");
-    c.lua_pushlstring(lua_state, id, id_len);
-    c.lua_setfield(lua_state, table, "id");
-    c.lua_pushlstring(lua_state, placeholder, placeholder_len);
-    c.lua_setfield(lua_state, table, "placeholder");
-    return 1;
-}
-
-fn luaColumn(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
-    c.lua_createtable(lua_state, 0, 3);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "column");
-    c.lua_pushvalue(lua_state, 1);
-    c.lua_setfield(lua_state, table, "children");
-    c.lua_pushnumber(lua_state, if (c.lua_isnumber(lua_state, 2) != 0) c.lua_tonumber(lua_state, 2) else 0);
-    c.lua_setfield(lua_state, table, "gap");
-    return 1;
-}
-
-fn luaPadding(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.lua_createtable(lua_state, 0, 3);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "padding");
-    c.lua_pushnumber(lua_state, c.luaL_checknumber(lua_state, 1));
-    c.lua_setfield(lua_state, table, "insets");
-    c.lua_pushvalue(lua_state, 2);
-    c.lua_setfield(lua_state, table, "child");
-    return 1;
-}
-
-fn luaCenter(optional_state: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = optional_state.?;
-    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
-    c.lua_createtable(lua_state, 0, 2);
-    const table = c.lua_gettop(lua_state);
-    setStringField(lua_state, table, "type", "center");
-    c.lua_pushvalue(lua_state, 1);
-    c.lua_setfield(lua_state, table, "child");
-    return 1;
-}
-
-fn setStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, value: [*:0]const u8) void {
-    c.lua_pushstring(lua_state, value);
-    c.lua_setfield(lua_state, table, key);
+    const current = c.lua_tolstring(lua_state, -1, &len) orelse {
+        pop(lua_state, 2);
+        return;
+    };
+    c.lua_pushlstring(lua_state, current, len);
+    c.lua_pushlstring(lua_state, ";", 1);
+    c.lua_pushlstring(lua_state, path.ptr, path.len);
+    c.lua_concat(lua_state, 3);
+    c.lua_setfield(lua_state, package_table, "path");
+    pop(lua_state, 2);
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
@@ -217,12 +129,33 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
 
     if (std.mem.eql(u8, kind, "text")) {
         const value = try dupeStringField(lua_state, allocator, table, "value");
-        return .{ .text = .{ .value = value } };
+        return .{ .text = .{ .value = value, .color = getColorField(lua_state, table, "color", keywork.colors.ink) } };
     }
-    if (std.mem.eql(u8, kind, "button")) {
+    if (std.mem.eql(u8, kind, "keyed")) {
+        const key = try dupeStringField(lua_state, allocator, table, "key");
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        return .{ .keyed = .{ .key = .{ .string = key }, .child = child } };
+    }
+    if (std.mem.eql(u8, kind, "box")) {
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        return .{ .box = .{
+            .child = child,
+            .background = getColorField(lua_state, table, "background", keywork.colors.transparent),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "clickable")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
-        const label = try dupeStringField(lua_state, allocator, table, "label");
-        return .{ .button = .{ .id = id, .label = label } };
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        return .{ .clickable = .{ .id = id, .child = child } };
     }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -291,6 +224,15 @@ fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, def
     defer pop(lua_state, 1);
     if (c.lua_isnumber(lua_state, -1) == 0) return default;
     return @floatCast(c.lua_tonumber(lua_state, -1));
+}
+
+fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) == 0) return default;
+    const value = c.lua_tonumber(lua_state, -1);
+    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return default;
+    return @bitCast(@as(u32, @intFromFloat(value)));
 }
 
 fn pop(lua_state: *c.lua_State, count: c_int) void {

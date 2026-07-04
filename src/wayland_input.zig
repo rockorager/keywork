@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const event_loop = @import("event_loop.zig");
-const keywork = @import("root");
+const keywork = @import("core.zig");
 const wayland = @import("wayland");
 const xkb = @import("xkb_c");
 

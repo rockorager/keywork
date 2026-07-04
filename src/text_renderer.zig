@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const c = @import("text_c");
-const keywork = @import("root");
+const keywork = @import("core.zig");
 
 const log = std.log.scoped(.keywork_text);
 

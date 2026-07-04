@@ -17,27 +17,27 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const libkeywork_module = b.addModule("libkeywork", .{
+        .root_source_file = b.path("src/libkeywork.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    root_module.addImport("wayland", wayland_mod);
-    root_module.linkSystemLibrary("wayland-client", .{});
+    libkeywork_module.addImport("wayland", wayland_mod);
+    libkeywork_module.linkSystemLibrary("wayland-client", .{});
 
     const vulkan_mod = b.dependency("vulkan_zig", .{
         .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
-    root_module.addImport("vulkan", vulkan_mod);
-    root_module.linkSystemLibrary("vulkan", .{});
+    libkeywork_module.addImport("vulkan", vulkan_mod);
+    libkeywork_module.linkSystemLibrary("vulkan", .{});
 
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{"grapheme_break"}),
     });
-    root_module.addImport("uucode", uucode_dep.module("uucode"));
+    libkeywork_module.addImport("uucode", uucode_dep.module("uucode"));
 
     const xkb_c = b.addTranslateC(.{
         .root_source_file = b.path("src/xkb_c.h"),
@@ -45,17 +45,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     xkb_c.linkSystemLibrary("xkbcommon", .{});
-    root_module.addImport("xkb_c", xkb_c.createModule());
-    root_module.linkSystemLibrary("xkbcommon", .{});
-
-    const luajit_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/luajit_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    luajit_c.linkSystemLibrary("luajit", .{});
-    root_module.addImport("luajit_c", luajit_c.createModule());
-    root_module.linkSystemLibrary("luajit", .{});
+    libkeywork_module.addImport("xkb_c", xkb_c.createModule());
+    libkeywork_module.linkSystemLibrary("xkbcommon", .{});
 
     const dbus_c = b.addTranslateC(.{
         .root_source_file = b.path("src/dbus_c.h"),
@@ -63,8 +54,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     dbus_c.linkSystemLibrary("dbus-1", .{});
-    root_module.addImport("dbus_c", dbus_c.createModule());
-    root_module.linkSystemLibrary("dbus-1", .{});
+    libkeywork_module.addImport("dbus_c", dbus_c.createModule());
+    libkeywork_module.linkSystemLibrary("dbus-1", .{});
 
     const text_c = b.addTranslateC(.{
         .root_source_file = b.path("src/text_c.h"),
@@ -74,14 +65,31 @@ pub fn build(b: *std.Build) void {
     text_c.linkSystemLibrary("fontconfig", .{});
     text_c.linkSystemLibrary("freetype", .{});
     text_c.linkSystemLibrary("harfbuzz", .{});
-    root_module.addImport("text_c", text_c.createModule());
-    root_module.linkSystemLibrary("fontconfig", .{});
-    root_module.linkSystemLibrary("freetype", .{});
-    root_module.linkSystemLibrary("harfbuzz", .{});
+    libkeywork_module.addImport("text_c", text_c.createModule());
+    libkeywork_module.linkSystemLibrary("fontconfig", .{});
+    libkeywork_module.linkSystemLibrary("freetype", .{});
+    libkeywork_module.linkSystemLibrary("harfbuzz", .{});
+
+    const app_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    app_module.addImport("libkeywork", libkeywork_module);
+
+    const luajit_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/luajit_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    luajit_c.linkSystemLibrary("luajit", .{});
+    app_module.addImport("luajit_c", luajit_c.createModule());
+    app_module.linkSystemLibrary("luajit", .{});
 
     const exe = b.addExecutable(.{
         .name = "keywork",
-        .root_module = root_module,
+        .root_module = app_module,
     });
 
     b.installArtifact(exe);
@@ -97,7 +105,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
-        .root_module = root_module,
+        .root_module = libkeywork_module,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
