@@ -161,9 +161,26 @@ pub const Widget = union(enum) {
     pub const Callback = struct {
         ptr: *anyopaque,
         call_fn: *const fn (ptr: *anyopaque) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
 
         pub fn call(self: Callback) !void {
             try self.call_fn(self.ptr);
+        }
+
+        pub fn clone(self: Callback, allocator: std.mem.Allocator) !Callback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .call_fn = self.call_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: Callback, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
         }
     };
 
@@ -176,11 +193,11 @@ pub const Widget = union(enum) {
         vtable: *const VTable,
 
         pub const VTable = struct {
-            build: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!Widget,
+            build: *const fn (ptr: *const anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
         };
 
-        pub fn build(self: Component, allocator: std.mem.Allocator, context: BuildContext) !Widget {
-            return self.vtable.build(self.ptr, allocator, context);
+        pub fn build(self: Component, scope: *BuildScope, context: BuildContext) !Widget {
+            return self.vtable.build(self.ptr, scope, context);
         }
     };
 
@@ -191,7 +208,7 @@ pub const Widget = union(enum) {
         pub const VTable = struct {
             create_state: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator) anyerror!*anyopaque,
             update: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!void,
-            build: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!Widget,
+            build: *const fn (ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
             destroy_state: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator) void,
         };
 
@@ -203,8 +220,8 @@ pub const Widget = union(enum) {
             try self.vtable.update(self.ptr, state, allocator, context);
         }
 
-        pub fn build(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) !Widget {
-            return self.vtable.build(self.ptr, state, allocator, context);
+        pub fn build(self: Stateful, state: *anyopaque, scope: *BuildScope, context: BuildContext) !Widget {
+            return self.vtable.build(self.ptr, state, scope, context);
         }
 
         pub fn destroyState(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator) void {
@@ -259,6 +276,10 @@ pub const Widget = union(enum) {
             return hit_test(self.ptr, rect, point);
         }
     };
+};
+
+pub const BuildScope = struct {
+    allocator: std.mem.Allocator,
 };
 
 pub const widgets = struct {
@@ -508,13 +529,13 @@ pub const AppHost = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        build_widget: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, context: AppContext) anyerror!Widget,
+        build_widget: *const fn (ptr: *anyopaque, scope: *BuildScope, context: AppContext) anyerror!Widget,
         click: ?*const fn (ptr: *anyopaque, id: []const u8) anyerror!bool = null,
         timer: ?*const fn (ptr: *anyopaque, expirations: u64) anyerror!bool = null,
     };
 
-    pub fn buildWidget(self: AppHost, allocator: std.mem.Allocator, context: AppContext) !Widget {
-        return self.vtable.build_widget(self.ptr, allocator, context);
+    pub fn buildWidget(self: AppHost, scope: *BuildScope, context: AppContext) !Widget {
+        return self.vtable.build_widget(self.ptr, scope, context);
     }
 
     pub fn click(self: AppHost, id: []const u8) !bool {
@@ -529,7 +550,8 @@ pub const AppHost = struct {
 };
 
 pub fn buildRenderTree(allocator: std.mem.Allocator, widget: *const Widget, constraints: Constraints) !RenderNode {
-    var element = try buildElementTree(allocator, widget, constraints);
+    var scope: BuildScope = .{ .allocator = allocator };
+    var element = try buildElementTreeScoped(allocator, &scope, widget, constraints);
     defer destroyElementTree(allocator, &element);
     return layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
 }
@@ -540,7 +562,8 @@ pub fn buildRenderTreeMeasured(
     constraints: Constraints,
     backend: RenderBackend,
 ) !RenderNode {
-    var element = try buildElementTree(allocator, widget, constraints);
+    var scope: BuildScope = .{ .allocator = allocator };
+    var element = try buildElementTreeScoped(allocator, &scope, widget, constraints);
     defer destroyElementTree(allocator, &element);
     return buildRenderTreeFromElement(allocator, &element, constraints, backend);
 }
@@ -555,6 +578,16 @@ pub fn buildRenderTreeFromElement(
 }
 
 pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, constraints: Constraints) anyerror!Element {
+    var scope: BuildScope = .{ .allocator = allocator };
+    return buildElementTreeScoped(allocator, &scope, widget, constraints);
+}
+
+pub fn buildElementTreeScoped(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    widget: *const Widget,
+    constraints: Constraints,
+) anyerror!Element {
     switch (widget.*) {
         .keyed => |keyed_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -567,7 +600,7 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, keyed_widget.child, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, keyed_widget.child, constraints);
             initialized = true;
             return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
         },
@@ -583,7 +616,7 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, box_widget.child, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, box_widget.child, constraints);
             initialized = true;
             return .{ .kind = .box, .widget = element_widget, .children = children };
         },
@@ -596,7 +629,7 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, clickable_widget.child, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, clickable_widget.child, constraints);
             initialized = true;
             return .{ .kind = .clickable, .widget = element_widget, .children = children };
         },
@@ -609,7 +642,7 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, padding_widget.child, constraints.inset(padding_widget.insets));
+            children[0] = try buildElementTreeScoped(allocator, scope, padding_widget.child, constraints.inset(padding_widget.insets));
             initialized = true;
             return .{ .kind = .padding, .widget = element_widget, .children = children };
         },
@@ -622,23 +655,23 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, center_widget.child, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, center_widget.child, constraints);
             initialized = true;
             return .{ .kind = .center, .widget = element_widget, .children = children };
         },
-        .row => |row_widget| return buildLinearElementTree(allocator, .row, widget.*, row_widget.children, constraints),
-        .column => |column_widget| return buildLinearElementTree(allocator, .column, widget.*, column_widget.children, constraints),
+        .row => |row_widget| return buildLinearElementTree(allocator, scope, .row, widget.*, row_widget.children, constraints),
+        .column => |column_widget| return buildLinearElementTree(allocator, scope, .column, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try component_widget.build(allocator, .{ .constraints = constraints });
+            const built = try component_widget.build(scope, .{ .constraints = constraints });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, &built, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
             initialized = true;
             return .{ .kind = .component, .widget = element_widget, .children = children };
         },
@@ -647,14 +680,14 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try stateful_widget.createState(allocator);
             errdefer stateful_widget.destroyState(state, allocator);
-            const built = try stateful_widget.build(state, allocator, .{ .constraints = constraints });
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try buildElementTree(allocator, &built, constraints);
+            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
             initialized = true;
             return .{ .kind = .stateful, .widget = element_widget, .state = state, .children = children };
         },
@@ -676,6 +709,7 @@ pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, con
 
 fn buildLinearElementTree(
     allocator: std.mem.Allocator,
+    scope: *BuildScope,
     kind: Element.Kind,
     widget: Widget,
     child_widgets: []const Widget,
@@ -693,7 +727,7 @@ fn buildLinearElementTree(
     }
 
     for (child_widgets, 0..) |*child_widget, index| {
-        children[index] = try buildElementTree(allocator, child_widget, constraints);
+        children[index] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
         initialized += 1;
     }
 
@@ -782,8 +816,19 @@ pub fn updateRenderObjectTree(allocator: std.mem.Allocator, node: *RenderObjectN
 }
 
 pub fn updateElementTree(allocator: std.mem.Allocator, element: *Element, widget: *const Widget, constraints: Constraints) anyerror!void {
+    var scope: BuildScope = .{ .allocator = allocator };
+    try updateElementTreeScoped(allocator, &scope, element, widget, constraints);
+}
+
+pub fn updateElementTreeScoped(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    widget: *const Widget,
+    constraints: Constraints,
+) anyerror!void {
     if (!canUpdateElement(element, widget)) {
-        var replacement = try buildElementTree(allocator, widget, constraints);
+        var replacement = try buildElementTreeScoped(allocator, scope, widget, constraints);
         errdefer destroyElementTree(allocator, &replacement);
         destroyElementTree(allocator, element);
         element.* = replacement;
@@ -792,34 +837,34 @@ pub fn updateElementTree(allocator: std.mem.Allocator, element: *Element, widget
 
     switch (widget.*) {
         .keyed => |keyed_widget| {
-            try updateSingleChildElement(allocator, element, widget.*, keyed_widget.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget.*, keyed_widget.child, constraints);
             if (element.key) |old_key| destroyKey(allocator, old_key);
             element.key = try cloneKey(allocator, keyed_widget.key);
         },
         .text, .text_input, .render_object => try replaceElementWidget(allocator, element, widget.*),
         .box => |box_widget| {
-            try updateSingleChildElement(allocator, element, widget.*, box_widget.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
         },
         .clickable => |clickable_widget| {
-            try updateSingleChildElement(allocator, element, widget.*, clickable_widget.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget.*, clickable_widget.child, constraints);
         },
         .padding => |padding_widget| {
-            try updateSingleChildElement(allocator, element, widget.*, padding_widget.child, constraints.inset(padding_widget.insets));
+            try updateSingleChildElement(allocator, scope, element, widget.*, padding_widget.child, constraints.inset(padding_widget.insets));
         },
         .center => |center_widget| {
-            try updateSingleChildElement(allocator, element, widget.*, center_widget.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
         },
-        .row => |row_widget| try updateLinearElement(allocator, element, widget.*, row_widget.children, constraints),
-        .column => |column_widget| try updateLinearElement(allocator, element, widget.*, column_widget.children, constraints),
+        .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
+        .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
-            const built = try component_widget.build(allocator, .{ .constraints = constraints });
-            try updateSingleChildElement(allocator, element, widget.*, &built, constraints);
+            const built = try component_widget.build(scope, .{ .constraints = constraints });
+            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
             try stateful_widget.update(state, allocator, .{ .constraints = constraints });
-            const built = try stateful_widget.build(state, allocator, .{ .constraints = constraints });
-            try updateSingleChildElement(allocator, element, widget.*, &built, constraints);
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints });
+            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .element => |custom_element| {
             var replacement_child = try custom_element.build(allocator, .{ .constraints = constraints });
@@ -858,6 +903,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
 
 fn updateSingleChildElement(
     allocator: std.mem.Allocator,
+    scope: *BuildScope,
     element: *Element,
     widget: Widget,
     child_widget: *const Widget,
@@ -866,25 +912,26 @@ fn updateSingleChildElement(
     std.debug.assert(element.children.len == 1);
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
-    try updateElementTree(allocator, &element.children[0], child_widget, child_constraints);
+    try updateElementTreeScoped(allocator, scope, &element.children[0], child_widget, child_constraints);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
 
 fn updateLinearElement(
     allocator: std.mem.Allocator,
+    scope: *BuildScope,
     element: *Element,
     widget: Widget,
     child_widgets: []const Widget,
     constraints: Constraints,
 ) anyerror!void {
     if (hasKeyedChildren(element.children) or hasKeyedWidgets(child_widgets)) {
-        try updateKeyedLinearElement(allocator, element, widget, child_widgets, constraints);
+        try updateKeyedLinearElement(allocator, scope, element, widget, child_widgets, constraints);
         return;
     }
 
     if (element.children.len != child_widgets.len) {
-        var replacement = try buildElementTree(allocator, &widget, constraints);
+        var replacement = try buildElementTreeScoped(allocator, scope, &widget, constraints);
         errdefer destroyElementTree(allocator, &replacement);
         destroyElementTree(allocator, element);
         element.* = replacement;
@@ -894,7 +941,7 @@ fn updateLinearElement(
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
     for (child_widgets, 0..) |*child_widget, index| {
-        try updateElementTree(allocator, &element.children[index], child_widget, constraints);
+        try updateElementTreeScoped(allocator, scope, &element.children[index], child_widget, constraints);
     }
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
@@ -902,6 +949,7 @@ fn updateLinearElement(
 
 fn updateKeyedLinearElement(
     allocator: std.mem.Allocator,
+    scope: *BuildScope,
     element: *Element,
     widget: Widget,
     child_widgets: []const Widget,
@@ -931,19 +979,19 @@ fn updateKeyedLinearElement(
             if (findElementByKey(old_children, used, key)) |old_index| {
                 used[old_index] = true;
                 new_children[index] = old_children[old_index];
-                try updateElementTree(allocator, &new_children[index], child_widget, constraints);
+                try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
                 initialized += 1;
                 continue;
             }
         } else if (index < old_children.len and !used[index] and old_children[index].key == null) {
             used[index] = true;
             new_children[index] = old_children[index];
-            try updateElementTree(allocator, &new_children[index], child_widget, constraints);
+            try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
             initialized += 1;
             continue;
         }
 
-        new_children[index] = try buildElementTree(allocator, child_widget, constraints);
+        new_children[index] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
         initialized += 1;
     }
 
@@ -1092,11 +1140,17 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .color = text_widget.color,
         } },
         .box => |box_widget| .{ .box = box_widget },
-        .clickable => |clickable_widget| .{ .clickable = .{
-            .id = try allocator.dupe(u8, clickable_widget.id),
-            .child = clickable_widget.child,
-            .on_click = clickable_widget.on_click,
-        } },
+        .clickable => |clickable_widget| blk: {
+            const id = try allocator.dupe(u8, clickable_widget.id);
+            errdefer allocator.free(id);
+            const callback = if (clickable_widget.on_click) |on_click| try on_click.clone(allocator) else null;
+            errdefer if (callback) |on_click| on_click.destroy(allocator);
+            break :blk .{ .clickable = .{
+                .id = id,
+                .child = clickable_widget.child,
+                .on_click = callback,
+            } };
+        },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
@@ -1125,7 +1179,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
     switch (widget.*) {
         .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
         .text => |text_widget| allocator.free(text_widget.value),
-        .clickable => |clickable_widget| allocator.free(clickable_widget.id),
+        .clickable => |clickable_widget| {
+            if (clickable_widget.on_click) |callback| callback.destroy(allocator);
+            allocator.free(clickable_widget.id);
+        },
         .text_input => |input_widget| {
             allocator.free(input_widget.id);
             allocator.free(input_widget.value);
@@ -1587,8 +1644,8 @@ test "component widget builds into the render tree" {
             return .{ .component = .{ .ptr = self, .vtable = &vtable } };
         }
 
-        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !Widget {
-            _ = allocator;
+        fn build(ptr: *const anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
+            _ = scope;
             _ = context;
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return .{ .text = .{ .value = self.value } };
@@ -1604,6 +1661,112 @@ test "component widget builds into the render tree" {
     try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
     try std.testing.expectEqualStrings("Component", root.children[0].text.?);
+}
+
+test "element tree retains cloned callbacks beyond build scope" {
+    const CallbackState = struct {
+        calls: *usize,
+        clones: *usize,
+        destroys: *usize,
+
+        fn callback(self: *@This()) Widget.Callback {
+            return .{
+                .ptr = self,
+                .call_fn = call,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+            };
+        }
+
+        fn call(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls.* += 1;
+        }
+
+        fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clones.* += 1;
+            const result = try allocator.create(@This());
+            result.* = self.*;
+            return result;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroys.* += 1;
+            allocator.destroy(self);
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var calls: usize = 0;
+    var clones: usize = 0;
+    var destroys: usize = 0;
+    const build_allocator = build_arena.allocator();
+    const state = try build_allocator.create(CallbackState);
+    state.* = .{ .calls = &calls, .clones = &clones, .destroys = &destroys };
+    const label_value = try build_allocator.dupe(u8, "arena label");
+    const label: Widget = .{ .text = .{ .value = label_value } };
+    const button: Widget = .{ .clickable = .{
+        .id = try build_allocator.dupe(u8, "arena-button"),
+        .child = &label,
+        .on_click = state.callback(),
+    } };
+    var scope: BuildScope = .{ .allocator = build_allocator };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &button, .{ .max_width = 100, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 1), clones);
+    try std.testing.expectEqual(@as(usize, 0), destroys);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    try element.widget.clickable.on_click.?.call();
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqualStrings("arena-button", element.widget.clickable.id);
+    try std.testing.expectEqualStrings("arena label", element.children[0].widget.text.value);
+
+    destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), destroys);
+}
+
+test "component build products are retained outside the build arena" {
+    const ArenaComponent = struct {
+        value: usize,
+
+        const vtable: Widget.Component.VTable = .{ .build = build };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .component = .{ .ptr = self, .vtable = &vtable } };
+        }
+
+        fn build(ptr: *const anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
+            _ = context;
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const value = try std.fmt.allocPrint(scope.allocator, "component {d}", .{self.value});
+            return .{ .text = .{ .value = value } };
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const component: ArenaComponent = .{ .value = 42 };
+    const widget = component.widget();
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    try std.testing.expectEqualStrings("component 42", element.children[0].widget.text.value);
+
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
+    try std.testing.expectEqualStrings("component 42", root.children[0].text.?);
 }
 
 test "stateful widget creates state once across matching updates" {
@@ -1644,8 +1807,8 @@ test "stateful widget creates state once across matching updates" {
             self.updated.* += 1;
         }
 
-        fn build(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !Widget {
-            _ = allocator;
+        fn build(ptr: *const anyopaque, state_ptr: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
+            _ = scope;
             _ = context;
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             const state: *State = @ptrCast(@alignCast(state_ptr));
@@ -1717,10 +1880,10 @@ test "stateful widget destroys state on element destruction and replacement" {
             _ = context;
         }
 
-        fn build(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !Widget {
+        fn build(ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
             _ = ptr;
             _ = state;
-            _ = allocator;
+            _ = scope;
             _ = context;
             return .{ .text = .{ .value = "stateful" } };
         }

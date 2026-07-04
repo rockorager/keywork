@@ -9,6 +9,7 @@ const log = std.log.scoped(.keywork);
 const AppContext = keywork.AppContext;
 const AppHost = keywork.AppHost;
 const Constraints = keywork.Constraints;
+const BuildScope = keywork.BuildScope;
 const DisplayList = keywork.DisplayList;
 const Element = keywork.Element;
 const CursorShape = keywork.CursorShape;
@@ -280,12 +281,13 @@ pub const Runtime = struct {
             self.root = null;
         }
         _ = self.build_arena.reset(.retain_capacity);
+        var build_scope: BuildScope = .{ .allocator = self.build_arena.allocator() };
 
-        var app_root = try self.app.buildWidget(self.build_arena.allocator(), self.currentState());
+        var app_root = try self.app.buildWidget(&build_scope, self.currentState());
         if (self.element_root) |*element_root| {
-            try keywork.updateElementTree(self.allocator, element_root, &app_root, self.constraints);
+            try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
         } else {
-            self.element_root = try keywork.buildElementTree(self.allocator, &app_root, self.constraints);
+            self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
         }
 
         if (self.render_object_root) |*render_object_root| {

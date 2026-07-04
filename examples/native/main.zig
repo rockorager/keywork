@@ -5,6 +5,7 @@ const keywork = @import("libkeywork");
 
 const AppContext = keywork.AppContext;
 const AppHost = keywork.AppHost;
+const BuildScope = keywork.BuildScope;
 const Widget = keywork.Widget;
 const widgets = keywork.widgets;
 
@@ -20,8 +21,9 @@ const NativeApp = struct {
         } };
     }
 
-    fn buildWidget(ptr: *anyopaque, allocator: std.mem.Allocator, context: AppContext) !Widget {
+    fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !Widget {
         const self: *NativeApp = @ptrCast(@alignCast(ptr));
+        const allocator = scope.allocator;
         const count_label = try std.fmt.allocPrint(allocator, "Count: {d}", .{self.count});
         const pulse_label = if (self.pulse) "timer: tick" else "timer: tock";
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});

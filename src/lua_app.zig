@@ -7,6 +7,7 @@ const c = @import("luajit_c");
 const linux = std.os.linux;
 
 const State = keywork.AppContext;
+const BuildScope = keywork.BuildScope;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -61,9 +62,9 @@ pub const App = struct {
         return try parseWidget(self.state, allocator, runtime_state, -1);
     }
 
-    fn buildWidgetHost(ptr: *anyopaque, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+    fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
         const self: *App = @ptrCast(@alignCast(ptr));
-        return self.buildWidget(allocator, runtime_state);
+        return self.buildWidget(scope.allocator, runtime_state);
     }
 
     fn failWithLuaError(self: *App, err: anyerror) anyerror {

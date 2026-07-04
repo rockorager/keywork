@@ -8,6 +8,7 @@ const log = std.log.scoped(.keywork);
 
 const AppContext = keywork.AppContext;
 const AppHost = keywork.AppHost;
+const BuildScope = keywork.BuildScope;
 const Widget = keywork.Widget;
 
 const DemoApp = struct {
@@ -23,12 +24,12 @@ const DemoApp = struct {
         } };
     }
 
-    fn buildWidget(ptr: *anyopaque, allocator: std.mem.Allocator, context: AppContext) !Widget {
+    fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !Widget {
         const self: *DemoApp = @ptrCast(@alignCast(ptr));
         var app_context = context;
         app_context.button_pressed = self.button_pressed;
         app_context.pulse = self.pulse;
-        return self.lua.buildWidget(allocator, app_context);
+        return self.lua.buildWidget(scope.allocator, app_context);
     }
 
     fn click(ptr: *anyopaque, id: []const u8) !bool {
