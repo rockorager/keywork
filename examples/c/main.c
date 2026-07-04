@@ -8,11 +8,19 @@ struct app_state {
 };
 
 static void increment(void *userdata);
+static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints);
+static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
 
 static keywork_widget_t *build(void *userdata, keywork_build_t *build, const struct keywork_context *context) {
     struct app_state *state = userdata;
     char count_label[64];
     snprintf(count_label, sizeof(count_label), "Count from C: %u", state->count);
+
+    const struct keywork_render_object_vtable progress_vtable = {
+        .layout = progress_layout,
+        .paint = progress_paint,
+    };
+    keywork_widget_t *progress = keywork_render_object(build, &progress_vtable, state);
 
     keywork_widget_t *button_label = keywork_colored_text(build, "Increment", 0xffffffffu);
     keywork_widget_t *button_padding = keywork_padding(build, 8.0f, button_label);
@@ -28,6 +36,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     keywork_widget_t *children[] = {
         keywork_colored_text(build, "C app hosted by libkeywork", 0xff6d4affu),
         keywork_text(build, count_label),
+        progress,
         input,
         status_row,
         keywork_center(build, button),
@@ -39,6 +48,22 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
 static void increment(void *userdata) {
     struct app_state *state = userdata;
     state->count += 1;
+}
+
+static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints) {
+    (void)userdata;
+    struct keywork_size size = { constraints.max_width, 12.0f };
+    if (size.width > 240.0f) size.width = 240.0f;
+    return size;
+}
+
+static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect) {
+    struct app_state *state = userdata;
+    const float fraction = (float)(state->count % 10u) / 9.0f;
+    struct keywork_rect fill = rect;
+    fill.width *= fraction;
+    return keywork_display_list_fill_rect(display_list, rect, 0xffe6e0ffu) &&
+        keywork_display_list_fill_rect(display_list, fill, 0xff6d4affu);
 }
 
 static int timer(void *userdata, uint64_t expirations) {

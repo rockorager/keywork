@@ -16,6 +16,24 @@ enum keywork_backend {
 
 typedef struct keywork_build keywork_build_t;
 typedef struct keywork_widget keywork_widget_t;
+typedef struct keywork_display_list keywork_display_list_t;
+
+struct keywork_size {
+    float width;
+    float height;
+};
+
+struct keywork_rect {
+    float x;
+    float y;
+    float width;
+    float height;
+};
+
+struct keywork_constraints {
+    float max_width;
+    float max_height;
+};
 
 struct keywork_context {
     const char *input_text;
@@ -32,6 +50,12 @@ struct keywork_app_vtable {
 };
 
 typedef void (*keywork_click_callback_t)(void *userdata);
+
+struct keywork_render_object_vtable {
+    struct keywork_size (*layout)(void *userdata, struct keywork_constraints constraints);
+    int (*paint)(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
+    void (*destroy)(void *userdata);
+};
 
 struct keywork_run_options {
     const char *title;
@@ -58,6 +82,8 @@ keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, con
 keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
 keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child);
 keywork_widget_t *keywork_clickable_callback(keywork_build_t *build, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);
+keywork_widget_t *keywork_render_object(keywork_build_t *build, const struct keywork_render_object_vtable *vtable, void *userdata);
+int keywork_display_list_fill_rect(keywork_display_list_t *display_list, struct keywork_rect rect, uint32_t argb);
 keywork_widget_t *keywork_padding(keywork_build_t *build, float inset, keywork_widget_t *child);
 keywork_widget_t *keywork_center(keywork_build_t *build, keywork_widget_t *child);
 keywork_widget_t *keywork_keyed_string(keywork_build_t *build, const char *key, keywork_widget_t *child);

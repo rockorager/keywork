@@ -245,6 +245,8 @@ pub const Widget = union(enum) {
     pub const RenderObject = struct {
         ptr: *const anyopaque,
         vtable: *const VTable,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
 
         pub const LayoutContext = struct {
             constraints: Constraints,
@@ -274,6 +276,21 @@ pub const Widget = union(enum) {
         pub fn hitTest(self: RenderObject, rect: Rect, point: Point) ?[]const u8 {
             const hit_test = self.vtable.hit_test orelse return null;
             return hit_test(self.ptr, rect, point);
+        }
+
+        pub fn clone(self: RenderObject, allocator: std.mem.Allocator) !RenderObject {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .vtable = self.vtable,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: RenderObject, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
         }
     };
 };
@@ -1171,7 +1188,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .component => |component_widget| .{ .component = component_widget },
         .stateful => |stateful_widget| .{ .stateful = stateful_widget },
         .element => |custom_element| .{ .element = custom_element },
-        .render_object => |render_object| .{ .render_object = render_object },
+        .render_object => |render_object| .{ .render_object = try render_object.clone(allocator) },
     };
 }
 
@@ -1188,7 +1205,8 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             allocator.free(input_widget.value);
             allocator.free(input_widget.placeholder);
         },
-        .box, .row, .column, .padding, .center, .component, .stateful, .element, .render_object => {},
+        .render_object => |render_object| render_object.destroy(allocator),
+        .box, .row, .column, .padding, .center, .component, .stateful, .element => {},
     }
 }
 
@@ -1726,6 +1744,80 @@ test "element tree retains cloned callbacks beyond build scope" {
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqualStrings("arena-button", element.widget.clickable.id);
     try std.testing.expectEqualStrings("arena label", element.children[0].widget.text.value);
+
+    destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), destroys);
+}
+
+test "element tree retains cloned render objects beyond build scope" {
+    const RenderState = struct {
+        clones: *usize,
+        destroys: *usize,
+
+        const vtable: Widget.RenderObject.VTable = .{
+            .layout = layout,
+            .paint = paintObject,
+        };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .render_object = .{
+                .ptr = self,
+                .vtable = &vtable,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+            } };
+        }
+
+        fn layout(ptr: *const anyopaque, context: Widget.RenderObject.LayoutContext) !Size {
+            _ = ptr;
+            return context.constraints.clamp(.{ .width = 24, .height = 12 });
+        }
+
+        fn paintObject(ptr: *const anyopaque, context: Widget.RenderObject.PaintContext) !void {
+            _ = ptr;
+            try context.display_list.fillRect(context.allocator, context.rect, colors.accent);
+        }
+
+        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.clones.* += 1;
+            const result = try allocator.create(@This());
+            result.* = self.*;
+            return result;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroys.* += 1;
+            allocator.destroy(@constCast(self));
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var clones: usize = 0;
+    var destroys: usize = 0;
+    const state = try build_arena.allocator().create(RenderState);
+    state.* = .{ .clones = &clones, .destroys = &destroys };
+    const widget = state.widget();
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 1), clones);
+    try std.testing.expectEqual(@as(usize, 0), destroys);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .render_object), root.kind);
+    try std.testing.expectEqual(@as(f32, 24), root.rect.width);
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(retained_allocator);
+    try paint(retained_allocator, &root, &display_list);
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
 
     destroyElementTree(retained_allocator, &element);
     try std.testing.expectEqual(@as(usize, 1), destroys);

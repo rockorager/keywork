@@ -22,6 +22,31 @@ pub const KeyworkAppVTable = extern struct {
 
 pub const KeyworkClickCallback = *const fn (userdata: ?*anyopaque) callconv(.c) void;
 
+pub const KeyworkSize = extern struct {
+    width: f32,
+    height: f32,
+};
+
+pub const KeyworkRect = extern struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+};
+
+pub const KeyworkConstraints = extern struct {
+    max_width: f32,
+    max_height: f32,
+};
+
+pub const KeyworkDisplayList = opaque {};
+
+pub const KeyworkRenderObjectVTable = extern struct {
+    layout: ?*const fn (userdata: ?*anyopaque, constraints: KeyworkConstraints) callconv(.c) KeyworkSize = null,
+    paint: ?*const fn (userdata: ?*anyopaque, display_list: *KeyworkDisplayList, rect: KeyworkRect) callconv(.c) c_int = null,
+    destroy: ?*const fn (userdata: ?*anyopaque) callconv(.c) void = null,
+};
+
 pub const KeyworkRunOptions = extern struct {
     title: ?[*:0]const u8 = null,
     backend: c_int = 0,
@@ -70,6 +95,59 @@ const ClickCallback = struct {
     fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *ClickCallback = @ptrCast(@alignCast(ptr));
         allocator.destroy(self);
+    }
+};
+
+const CDisplayList = struct {
+    allocator: std.mem.Allocator,
+    display_list: *keywork.DisplayList,
+};
+
+const CRenderObject = struct {
+    vtable: KeyworkRenderObjectVTable,
+    userdata: ?*anyopaque,
+
+    const keywork_vtable: keywork.Widget.RenderObject.VTable = .{
+        .layout = layout,
+        .paint = paint,
+    };
+
+    fn keyworkRenderObject(self: *const CRenderObject) keywork.Widget.RenderObject {
+        return .{
+            .ptr = self,
+            .vtable = &keywork_vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn layout(ptr: *const anyopaque, context: keywork.Widget.RenderObject.LayoutContext) !keywork.Size {
+        const self: *const CRenderObject = @ptrCast(@alignCast(ptr));
+        const layout_fn = self.vtable.layout orelse return error.MissingRenderObjectLayout;
+        const result = layout_fn(self.userdata, constraintsToC(context.constraints));
+        return .{ .width = result.width, .height = result.height };
+    }
+
+    fn paint(ptr: *const anyopaque, context: keywork.Widget.RenderObject.PaintContext) !void {
+        const self: *const CRenderObject = @ptrCast(@alignCast(ptr));
+        const paint_fn = self.vtable.paint orelse return error.MissingRenderObjectPaint;
+        var display_list: CDisplayList = .{ .allocator = context.allocator, .display_list = context.display_list };
+        if (paint_fn(self.userdata, displayListHandle(&display_list), rectToC(context.rect)) == 0) {
+            return error.RenderObjectPaintFailed;
+        }
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *const CRenderObject = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(CRenderObject);
+        result.* = self.*;
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *const CRenderObject = @ptrCast(@alignCast(ptr));
+        if (self.vtable.destroy) |destroy_fn| destroy_fn(self.userdata);
+        allocator.destroy(@constCast(self));
     }
 };
 
@@ -232,6 +310,30 @@ pub export fn keywork_clickable_callback(
     } });
 }
 
+pub export fn keywork_render_object(
+    build: ?*KeyworkBuild,
+    vtable: ?*const KeyworkRenderObjectVTable,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const render_vtable = vtable orelse return null;
+    if (render_vtable.layout == null or render_vtable.paint == null) return null;
+    const allocator = scope.scope.allocator;
+    const render_object = allocator.create(CRenderObject) catch return null;
+    render_object.* = .{ .vtable = render_vtable.*, .userdata = userdata };
+    return makeWidget(scope, .{ .render_object = render_object.keyworkRenderObject() });
+}
+
+pub export fn keywork_display_list_fill_rect(
+    display_list: ?*KeyworkDisplayList,
+    rect: KeyworkRect,
+    argb: u32,
+) callconv(.c) c_int {
+    const list = displayListFromHandle(display_list orelse return 0);
+    list.display_list.fillRect(list.allocator, rectFromC(rect), colorFromArgb(argb)) catch return 0;
+    return 1;
+}
+
 pub export fn keywork_padding(build: ?*KeyworkBuild, inset: f32, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const child_widget = widgetFromMaybeHandle(child) orelse return null;
@@ -327,6 +429,14 @@ fn buildScope(handle: ?*KeyworkBuild) ?*CBuildScope {
     return @ptrCast(@alignCast(handle orelse return null));
 }
 
+fn displayListHandle(display_list: *CDisplayList) *KeyworkDisplayList {
+    return @ptrCast(display_list);
+}
+
+fn displayListFromHandle(handle: *KeyworkDisplayList) *CDisplayList {
+    return @ptrCast(@alignCast(handle));
+}
+
 fn widgetHandle(widget: *keywork.Widget) *KeyworkWidget {
     return @ptrCast(widget);
 }
@@ -360,6 +470,18 @@ fn cStringZ(value: ?[*:0]const u8, fallback: [:0]const u8) [:0]const u8 {
 
 fn colorFromArgb(argb: u32) keywork.Color {
     return @bitCast(argb);
+}
+
+fn constraintsToC(constraints: keywork.Constraints) KeyworkConstraints {
+    return .{ .max_width = constraints.max_width, .max_height = constraints.max_height };
+}
+
+fn rectToC(rect: keywork.Rect) KeyworkRect {
+    return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
+}
+
+fn rectFromC(rect: KeyworkRect) keywork.Rect {
+    return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
 }
 
 fn backendKind(value: c_int) keywork.BackendKind {
