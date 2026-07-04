@@ -740,6 +740,7 @@ pub const RenderNode = struct {
     click_callback: ?Widget.Callback = null,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
+    focus_scope_id: ?[]const u8 = null,
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
@@ -1878,6 +1879,7 @@ pub fn destroyRenderTree(allocator: std.mem.Allocator, node: *RenderNode) void {
     if (node.clickable_id) |id| allocator.free(id);
     if (node.text_input_id) |id| allocator.free(id);
     if (node.focus_id) |id| allocator.free(id);
+    if (node.focus_scope_id) |id| allocator.free(id);
     if (node.placeholder) |placeholder| allocator.free(placeholder);
 }
 
@@ -1942,6 +1944,7 @@ pub const FocusTarget = struct {
     id: []const u8,
     kind: Kind,
     callback: ?Widget.Callback = null,
+    scope_id: ?[]const u8 = null,
 
     pub const Kind = enum {
         text_input,
@@ -1953,41 +1956,47 @@ pub const FocusTarget = struct {
 pub fn collectFocusTargets(allocator: std.mem.Allocator, node: *const RenderNode) ![]FocusTarget {
     var targets: std.ArrayList(FocusTarget) = .empty;
     errdefer targets.deinit(allocator);
-    try appendFocusTargets(allocator, &targets, node);
+    try appendFocusTargets(allocator, &targets, node, null);
     return try targets.toOwnedSlice(allocator);
 }
 
-fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode) !void {
+fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode, scope_id: ?[]const u8) !void {
+    const active_scope_id = node.focus_scope_id orelse scope_id;
     switch (node.kind) {
-        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input }),
-        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus }),
+        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id }),
+        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus, .scope_id = active_scope_id }),
         .clickable => if (node.click_callback) |callback| {
-            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback });
+            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id });
         },
         else => {},
     }
     for (node.children) |*child| {
-        try appendFocusTargets(allocator, targets, child);
+        try appendFocusTargets(allocator, targets, child, active_scope_id);
     }
 }
 
 pub fn findFocusTarget(node: *const RenderNode, id: []const u8) ?FocusTarget {
+    return findFocusTargetScoped(node, id, null);
+}
+
+fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]const u8) ?FocusTarget {
+    const active_scope_id = node.focus_scope_id orelse scope_id;
     switch (node.kind) {
         .text_input => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input };
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id };
         },
         .focus => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus };
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus, .scope_id = active_scope_id };
         },
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |clickable_id| {
-                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback };
+                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id };
             }
         },
         else => {},
     }
     for (node.children) |*child| {
-        if (findFocusTarget(child, id)) |target| return target;
+        if (findFocusTargetScoped(child, id, active_scope_id)) |target| return target;
     }
     return null;
 }
@@ -2226,7 +2235,8 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             };
         },
         .focus_scope => |focus_scope_widget| {
-            _ = focus_scope_widget;
+            const scope_id = try allocator.dupe(u8, focus_scope_widget.id);
+            errdefer allocator.free(scope_id);
             var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             errdefer destroyRenderTree(allocator, &child);
 
@@ -2235,6 +2245,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             return .{
                 .kind = .focus_scope,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .focus_scope_id = scope_id,
                 .children = children,
             };
         },

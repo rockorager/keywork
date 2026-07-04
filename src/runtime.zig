@@ -285,18 +285,56 @@ pub const Runtime = struct {
         defer self.allocator.free(targets);
         if (targets.len == 0) return;
 
-        const next_index = if (self.focused_id) |focused_id| blk: {
-            for (targets, 0..) |target, index| {
-                if (!std.mem.eql(u8, target.id, focused_id)) continue;
-                break :blk if (reverse)
-                    if (index == 0) targets.len - 1 else index - 1
-                else
-                    (index + 1) % targets.len;
-            }
-            break :blk if (reverse) targets.len - 1 else 0;
-        } else if (reverse) targets.len - 1 else 0;
+        const current_target = if (self.focused_id) |focused_id| findCollectedFocusTarget(targets, focused_id) else null;
+        const active_scope_id = if (current_target) |target| target.scope_id else null;
+        const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, reverse) orelse return;
 
         try self.setFocused(targets[next_index].id);
+    }
+
+    fn findCollectedFocusTarget(targets: []const keywork.FocusTarget, id: []const u8) ?keywork.FocusTarget {
+        for (targets) |target| {
+            if (std.mem.eql(u8, target.id, id)) return target;
+        }
+        return null;
+    }
+
+    fn nextFocusTargetIndex(targets: []const keywork.FocusTarget, focused_id: ?[]const u8, scope_id: ?[]const u8, reverse: bool) ?usize {
+        var first: ?usize = null;
+        var last: ?usize = null;
+        var previous_matching: ?usize = null;
+        var previous_before_focused: ?usize = null;
+        var focused_seen = focused_id == null;
+        const filter_by_scope = focused_id != null;
+
+        for (targets, 0..) |target, index| {
+            if (filter_by_scope and !sameOptionalString(target.scope_id, scope_id)) continue;
+            if (first == null) first = index;
+            if (focused_id) |focused| {
+                if (std.mem.eql(u8, target.id, focused)) {
+                    focused_seen = true;
+                    previous_before_focused = previous_matching;
+                } else if (focused_seen and !reverse) {
+                    return index;
+                }
+            } else if (!reverse) {
+                return index;
+            }
+            previous_matching = index;
+            last = index;
+        }
+
+        if (focused_id == null and reverse) return last;
+        if (reverse) return previous_before_focused orelse last;
+        return first;
+    }
+
+    fn sameOptionalString(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a) |a_value| {
+            const b_value = b orelse return false;
+            return std.mem.eql(u8, a_value, b_value);
+        }
+        return b == null;
     }
 
     fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
@@ -681,4 +719,63 @@ test "focus widget participates in traversal and shortcut context" {
     try std.testing.expectEqualStrings("label-focus", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqual(@as(usize, 1), app.actions);
+}
+
+test "focus scope contains tab traversal once focus is inside it" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const a1 = try keywork.widgets.focus(scope.allocator, .named("a1"), keywork.widgets.text("A1"));
+            const a2 = try keywork.widgets.focus(scope.allocator, .named("a2"), keywork.widgets.text("A2"));
+            const a_children = [_]keywork.Widget{ a1, a2 };
+            const a_column = try keywork.widgets.column(scope.allocator, &a_children, 4);
+            const scope_a = try keywork.widgets.focusScope(scope.allocator, "scope-a", a_column);
+
+            const b1 = try keywork.widgets.focus(scope.allocator, .named("b1"), keywork.widgets.text("B1"));
+            const b2 = try keywork.widgets.focus(scope.allocator, .named("b2"), keywork.widgets.text("B2"));
+            const b_children = [_]keywork.Widget{ b1, b2 };
+            const b_column = try keywork.widgets.column(scope.allocator, &b_children, 4);
+            const scope_b = try keywork.widgets.focusScope(scope.allocator, "scope-b", b_column);
+
+            const children = [_]keywork.Widget{ scope_a, scope_b };
+            return keywork.widgets.column(scope.allocator, &children, 8);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 160 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("a1", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("a2", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("a1", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
+    try std.testing.expectEqualStrings("a2", runtime.focused_id.?);
 }
