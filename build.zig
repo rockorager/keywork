@@ -26,6 +26,12 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
 
+    const vulkan_mod = b.dependency("vulkan_zig", .{
+        .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
+    }).module("vulkan-zig");
+    root_module.addImport("vulkan", vulkan_mod);
+    root_module.linkSystemLibrary("vulkan", .{});
+
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,

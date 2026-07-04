@@ -9,6 +9,10 @@ const log = std.log.scoped(.keywork);
 pub const event_loop = @import("event_loop.zig");
 pub const lua_app = @import("lua_app.zig");
 pub const wayland_shm = @import("wayland_shm.zig");
+pub const wayland_vulkan = @import("wayland_vulkan.zig");
+
+pub const wl_display = opaque {};
+pub const wl_surface = opaque {};
 
 pub const Color = packed struct(u32) {
     b: u8,
@@ -748,12 +752,41 @@ pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
-    const use_wayland = shouldUseWayland(init);
+    const backend_kind = selectedBackend(init);
     const constraints: Constraints = .{ .max_width = 640, .max_height = 480 };
     var lua = try lua_app.App.init(allocator, "main.lua");
     defer lua.deinit();
 
-    if (use_wayland) {
+    if (backend_kind == .vulkan) {
+        var backend = try wayland_vulkan.Backend.create(allocator, .{
+            .title = "Keywork MVP (Vulkan)",
+            .width = try positiveU31(constraints.max_width),
+            .height = try positiveU31(constraints.max_height),
+        });
+        defer backend.destroy();
+
+        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
+        defer runtime.deinit();
+        backend.setRepaintHandler(&runtime, Runtime.waylandScaleChanged);
+        try runtime.repaint();
+
+        var loop = try event_loop.EventLoop.init(allocator);
+        defer loop.deinit();
+        try loop.setWayland(.{
+            .fd = backend.eventLoopFd(),
+            .ctx = backend,
+            .prepare = wayland_vulkan.Backend.eventLoopPrepare,
+            .finish = wayland_vulkan.Backend.eventLoopFinish,
+        });
+        try loop.addRepeatingTimer(1000, &runtime, Runtime.timerTick);
+        loop.addFileWatch("main.lua", &runtime, Runtime.fileChanged) catch |err| {
+            if (err != error.FileWatchNotFound) log.warn("main.lua watch not installed: {}", .{err});
+        };
+        try loop.run();
+        return;
+    }
+
+    if (backend_kind == .wayland_shm) {
         var backend = try wayland_shm.Backend.create(allocator, .{
             .title = "Keywork MVP",
             .width = try positiveU31(constraints.max_width),
@@ -805,13 +838,17 @@ pub fn main(init: std.process.Init) !void {
     log.debug("frame rendered", .{});
 }
 
-fn shouldUseWayland(init: std.process.Init) bool {
+const BackendKind = enum { log, wayland_shm, vulkan };
+
+fn selectedBackend(init: std.process.Init) BackendKind {
     var args = init.minimal.args.iterate();
     _ = args.skip();
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--wayland")) return true;
+        if (std.mem.eql(u8, arg, "--wayland")) return .wayland_shm;
+        if (std.mem.eql(u8, arg, "--backend=shm")) return .wayland_shm;
+        if (std.mem.eql(u8, arg, "--backend=vulkan")) return .vulkan;
     }
-    return false;
+    return .log;
 }
 
 fn positiveU31(value: f32) !u31 {

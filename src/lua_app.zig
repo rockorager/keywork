@@ -68,6 +68,22 @@ pub const App = struct {
 };
 
 fn installUi(lua_state: *c.lua_State) void {
+    c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
+    const package_table = c.lua_gettop(lua_state);
+    c.lua_getfield(lua_state, package_table, "preload");
+    const preload_table = c.lua_gettop(lua_state);
+    c.lua_pushcclosure(lua_state, luaOpenUi, 0);
+    c.lua_setfield(lua_state, preload_table, "ui");
+    pop(lua_state, 2);
+}
+
+fn luaOpenUi(optional_state: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = optional_state.?;
+    pushUiTable(lua_state);
+    return 1;
+}
+
+fn pushUiTable(lua_state: *c.lua_State) void {
     c.lua_createtable(lua_state, 0, 6);
     const table = c.lua_gettop(lua_state);
     setFunction(lua_state, table, "text", luaText);
@@ -76,7 +92,6 @@ fn installUi(lua_state: *c.lua_State) void {
     setFunction(lua_state, table, "column", luaColumn);
     setFunction(lua_state, table, "padding", luaPadding);
     setFunction(lua_state, table, "center", luaCenter);
-    c.lua_setfield(lua_state, c.LUA_GLOBALSINDEX, "ui");
 }
 
 fn setFunction(lua_state: *c.lua_State, table: c_int, name: [*:0]const u8, function: c.lua_CFunction) void {

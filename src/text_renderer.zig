@@ -92,9 +92,9 @@ const GlyphKey = struct {
     glyph_index: u32,
 };
 
-const GlyphBitmap = struct {
-    width: usize,
-    rows: usize,
+pub const GlyphBitmap = struct {
+    width: u32,
+    rows: u32,
     left: i32,
     top: i32,
     coverage: []u8,
@@ -102,6 +102,18 @@ const GlyphBitmap = struct {
     fn deinit(self: GlyphBitmap, allocator: std.mem.Allocator) void {
         if (self.coverage.len > 0) allocator.free(self.coverage);
     }
+};
+
+pub const PositionedGlyph = struct {
+    font_id: u32,
+    pixel_size: u31,
+    glyph_index: u32,
+    x: f32,
+    y: f32,
+    color: keywork.Color,
+    width: u32,
+    rows: u32,
+    coverage: []const u8,
 };
 
 const FontRun = struct {
@@ -189,6 +201,32 @@ pub fn measure(self: *Self, scale: f32, value: []const u8) !keywork.Size {
     return .{ .width = max_width, .height = @as(f32, @floatFromInt(line_count)) * line_height };
 }
 
+pub fn appendGlyphs(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    scale: f32,
+    text: keywork.PaintCommand.TextRun,
+    out: *std.ArrayList(PositionedGlyph),
+) !void {
+    const pixel_size = try scaledPixelSize(scale);
+    try self.ensureFontPixelSize(primary_font_index, pixel_size);
+
+    const primary = &self.fonts.items[primary_font_index];
+    const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
+    const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const origin_x = text.origin.x * scale;
+    var baseline_y = text.origin.y * scale + ascender;
+
+    var line_start: usize = 0;
+    while (line_start <= text.value.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text.value, line_start, '\n') orelse text.value.len;
+        try self.appendLineGlyphs(allocator, origin_x, baseline_y, text.value[line_start..line_end], text.color, pixel_size, out);
+        if (line_end == text.value.len) break;
+        line_start = line_end + 1;
+        baseline_y += line_height;
+    }
+}
+
 fn loadFont(self: *Self, path: []const u8) !usize {
     for (self.fonts.items, 0..) |font, index| {
         if (std.mem.eql(u8, font.path, path)) return index;
@@ -254,6 +292,46 @@ fn renderLine(
                     pen_y - fromFixed26Dot6(glyph.y_offset),
                     color,
                 );
+            }
+            pen_x += fromFixed26Dot6(glyph.x_advance);
+            pen_y -= fromFixed26Dot6(glyph.y_advance);
+        }
+    }
+}
+
+fn appendLineGlyphs(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    x: f32,
+    baseline_y: f32,
+    value: []const u8,
+    color: keywork.Color,
+    pixel_size: u31,
+    out: *std.ArrayList(PositionedGlyph),
+) !void {
+    if (value.len == 0) return;
+
+    var index: usize = 0;
+    var pen_x = x;
+    var pen_y = baseline_y;
+    while (try self.nextFontRun(value, &index)) |run| {
+        const shaped = try self.shapeRun(run.font_index, pixel_size, run.value);
+        const font = &self.fonts.items[run.font_index];
+        for (shaped.glyphs) |glyph| {
+            if (try self.glyphBitmap(run.font_index, pixel_size, glyph.glyph_index)) |bitmap| {
+                if (bitmap.width > 0 and bitmap.rows > 0) {
+                    try out.append(allocator, .{
+                        .font_id = font.id,
+                        .pixel_size = pixel_size,
+                        .glyph_index = glyph.glyph_index,
+                        .x = pen_x + fromFixed26Dot6(glyph.x_offset) + @as(f32, @floatFromInt(bitmap.left)),
+                        .y = pen_y - fromFixed26Dot6(glyph.y_offset) - @as(f32, @floatFromInt(bitmap.top)),
+                        .color = color,
+                        .width = bitmap.width,
+                        .rows = bitmap.rows,
+                        .coverage = bitmap.coverage,
+                    });
+                }
             }
             pen_x += fromFixed26Dot6(glyph.x_advance);
             pen_y -= fromFixed26Dot6(glyph.y_advance);
@@ -381,8 +459,8 @@ fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32
 }
 
 fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face) !GlyphBitmap {
-    const bitmap_width: usize = @intCast(c.keywork_ft_bitmap_width(face));
-    const bitmap_rows: usize = @intCast(c.keywork_ft_bitmap_rows(face));
+    const bitmap_width: u32 = @intCast(c.keywork_ft_bitmap_width(face));
+    const bitmap_rows: u32 = @intCast(c.keywork_ft_bitmap_rows(face));
     const left = c.keywork_ft_bitmap_left(face);
     const top = c.keywork_ft_bitmap_top(face);
     if (bitmap_width == 0 or bitmap_rows == 0) {
@@ -394,7 +472,7 @@ fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face) !GlyphBitmap {
         return .{ .width = 0, .rows = 0, .left = left, .top = top, .coverage = &.{} };
     }
 
-    const coverage = try self.allocator.alloc(u8, bitmap_width * bitmap_rows);
+    const coverage = try self.allocator.alloc(u8, @as(usize, bitmap_width) * bitmap_rows);
     errdefer self.allocator.free(coverage);
 
     const pitch = c.keywork_ft_bitmap_pitch(face);
@@ -402,8 +480,9 @@ fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face) !GlyphBitmap {
     var row: usize = 0;
     while (row < bitmap_rows) : (row += 1) {
         const src_row = if (pitch >= 0) row else bitmap_rows - 1 - row;
-        const src = bitmap_buffer[src_row * pitch_abs ..][0..bitmap_width];
-        const dst = coverage[row * bitmap_width ..][0..bitmap_width];
+        const width: usize = @intCast(bitmap_width);
+        const src = bitmap_buffer[src_row * pitch_abs ..][0..width];
+        const dst = coverage[row * width ..][0..width];
         @memcpy(dst, src);
     }
 
@@ -437,8 +516,9 @@ fn blitGlyphBitmap(
     var row: usize = 0;
     while (row < bitmap.rows) : (row += 1) {
         var column: usize = 0;
-        while (column < bitmap.width) : (column += 1) {
-            const coverage = bitmap.coverage[row * bitmap.width + column];
+        const bitmap_width: usize = @intCast(bitmap.width);
+        while (column < bitmap_width) : (column += 1) {
+            const coverage = bitmap.coverage[row * bitmap_width + column];
             if (coverage == 0) continue;
             blendPixel(
                 pixels,

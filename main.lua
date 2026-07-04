@@ -1,3 +1,5 @@
+local ui = require("ui")
+
 return function(state)
   local status = state.button_pressed and "button pressed" or "button idle"
 
