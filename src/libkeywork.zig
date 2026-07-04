@@ -20,6 +20,7 @@ pub const TextStyle = core.TextStyle;
 pub const TextTheme = core.TextTheme;
 pub const ButtonTheme = core.ButtonTheme;
 pub const InputTheme = core.InputTheme;
+pub const InteractionState = core.InteractionState;
 pub const widgets = core.widgets;
 pub const Size = core.Size;
 pub const Point = core.Point;

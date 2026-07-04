@@ -78,6 +78,8 @@ pub const TextTheme = struct {
 pub const ButtonTheme = struct {
     background: ?Color = null,
     foreground: ?Color = null,
+    hover_background: ?Color = null,
+    hover_foreground: ?Color = null,
     pressed_background: ?Color = null,
     padding: f32 = 8,
 };
@@ -111,6 +113,15 @@ pub const Theme = struct {
     pub fn fromColorScheme(scheme: []const u8) Theme {
         if (std.mem.eql(u8, scheme, "dark")) return .dark;
         return .light;
+    }
+};
+
+pub const InteractionState = struct {
+    hovered_id: ?[]const u8 = null,
+
+    pub fn isHovered(self: InteractionState, id: []const u8) bool {
+        const hovered = self.hovered_id orelse return false;
+        return std.mem.eql(u8, hovered, id);
     }
 };
 
@@ -297,6 +308,7 @@ pub const Widget = union(enum) {
     pub const BuildContext = struct {
         constraints: Constraints,
         theme: Theme = .default,
+        interaction: InteractionState = .{},
     };
 
     pub const Component = struct {
@@ -443,6 +455,7 @@ pub const Widget = union(enum) {
 pub const BuildScope = struct {
     allocator: std.mem.Allocator,
     theme: Theme = .default,
+    interaction: InteractionState = .{},
 };
 
 pub const widgets = struct {
@@ -522,10 +535,11 @@ pub const Element = struct {
     };
 };
 
-fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, button_widget: Widget.Button) !Widget {
-    const label = widgets.coloredText(button_widget.label, buttonForeground(theme));
+fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) !Widget {
+    const hovered = interaction.isHovered(button_widget.id);
+    const label = widgets.coloredText(button_widget.label, buttonForeground(theme, hovered));
     const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
-    const background = if (button_widget.pressed) buttonPressedBackground(theme) else buttonBackground(theme);
+    const background = if (button_widget.pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
     const surface = try widgets.box(allocator, padded, background);
     return widgets.clickable(allocator, button_widget.id, surface);
 }
@@ -534,11 +548,13 @@ fn textColor(theme: Theme) Color {
     return theme.text_theme.body.color orelse theme.color_scheme.on_surface;
 }
 
-fn buttonBackground(theme: Theme) Color {
+fn buttonBackground(theme: Theme, hovered: bool) Color {
+    if (hovered) return theme.button_theme.hover_background orelse theme.button_theme.background orelse theme.color_scheme.on_surface;
     return theme.button_theme.background orelse theme.color_scheme.primary;
 }
 
-fn buttonForeground(theme: Theme) Color {
+fn buttonForeground(theme: Theme, hovered: bool) Color {
+    if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.surface;
     return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
 }
 
@@ -885,7 +901,7 @@ pub fn buildElementTreeScoped(
         .button => |button_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, button_widget);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, button_widget);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -917,7 +933,7 @@ pub fn buildElementTreeScoped(
         .component => |component_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme });
+            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -933,7 +949,7 @@ pub fn buildElementTreeScoped(
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try stateful_widget.createState(allocator);
             errdefer stateful_widget.destroyState(state, allocator);
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme });
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -953,7 +969,7 @@ pub fn buildElementTreeScoped(
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme });
+            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             initialized = true;
             return .{ .kind = .element, .widget = element_widget, .children = children };
         },
@@ -1109,7 +1125,7 @@ pub fn updateElementTreeScoped(
             try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
         },
         .button => |button_widget| {
-            const built = try buildButtonWidget(scope.allocator, scope.theme, button_widget);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, button_widget);
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .theme => |theme_widget| {
@@ -1121,17 +1137,17 @@ pub fn updateElementTreeScoped(
         .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
         .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
-            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme });
+            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
-            try stateful_widget.update(state, allocator, .{ .constraints = constraints, .theme = scope.theme });
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme });
+            try stateful_widget.update(state, allocator, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .element => |custom_element| {
-            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme });
+            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
             errdefer destroyElementTree(allocator, &replacement_child);
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -1979,6 +1995,37 @@ test "theme widget provides ambient button styling" {
     try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
     try std.testing.expectEqual(colors.black, box_node.background);
     try std.testing.expectEqual(@as(f32, 56), root.rect.width);
+}
+
+test "button uses ambient hover styling" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.accent,
+            .foreground = colors.white,
+            .hover_background = colors.black,
+            .hover_foreground = colors.panel,
+        },
+    };
+    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", false);
+    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
+    var scope: BuildScope = .{
+        .allocator = build_arena.allocator(),
+        .interaction = .{ .hovered_id = "hovered" },
+    };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const box_node = root.children[0].children[0].children[0];
+    const text_node = box_node.children[0].children[0];
+    try std.testing.expectEqual(colors.black, box_node.background);
+    try std.testing.expectEqual(colors.panel, text_node.foreground);
 }
 
 test "theme widget provides ambient text and input styling" {

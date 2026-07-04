@@ -31,6 +31,7 @@ pub const Runtime = struct {
     color_scheme: desktop_settings.ColorScheme,
     input_text: std.ArrayList(u8) = .empty,
     focused_input_id: ?[]u8 = null,
+    hovered_id: ?[]u8 = null,
     element_root: ?Element = null,
     render_object_root: ?RenderObjectNode = null,
     root: ?RenderNode = null,
@@ -78,6 +79,7 @@ pub const Runtime = struct {
         self.display_list.deinit(self.allocator);
         self.input_text.deinit(self.allocator);
         if (self.focused_input_id) |id| self.allocator.free(id);
+        if (self.hovered_id) |id| self.allocator.free(id);
         self.build_arena.deinit();
     }
 
@@ -201,6 +203,33 @@ pub const Runtime = struct {
         return keywork.hitTestCursorShape(root, point);
     }
 
+    pub fn pointerMove(self: *Runtime, point: ?Point) !void {
+        const hit_id = if (point) |position| blk: {
+            const root = if (self.root) |*root| root else return error.NotBuilt;
+            break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
+        } else null;
+        if (!try self.setHoveredId(hit_id)) return;
+        try self.rebuild();
+        try self.requestRepaint();
+    }
+
+    fn setHoveredId(self: *Runtime, id: ?[]const u8) !bool {
+        if (self.hovered_id) |old_id| {
+            if (id) |new_id| {
+                if (std.mem.eql(u8, old_id, new_id)) return false;
+            }
+            self.allocator.free(old_id);
+            self.hovered_id = null;
+        } else if (id == null) {
+            return false;
+        }
+
+        if (id) |new_id| {
+            self.hovered_id = try self.allocator.dupe(u8, new_id);
+        }
+        return true;
+    }
+
     pub fn waylandClick(ctx: *anyopaque, point: Point) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         self.click(point) catch |err| {
@@ -211,6 +240,13 @@ pub const Runtime = struct {
     pub fn waylandCursorShape(ctx: *anyopaque, point: Point) CursorShape {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         return self.cursorShape(point);
+    }
+
+    pub fn waylandPointerMove(ctx: *anyopaque, point: ?Point) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.pointerMove(point) catch |err| {
+            log.err("pointer motion failed: {}", .{err});
+        };
     }
 
     pub fn waylandConfigure(ctx: *anyopaque, size: Size) void {
@@ -291,6 +327,7 @@ pub const Runtime = struct {
         var build_scope: BuildScope = .{
             .allocator = self.build_arena.allocator(),
             .theme = keywork.Theme.fromColorScheme(state.color_scheme),
+            .interaction = .{ .hovered_id = self.hovered_id },
         };
 
         var app_root = try self.app.buildWidget(&build_scope, state);

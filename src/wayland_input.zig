@@ -36,12 +36,15 @@ repeat_delay_ms: u64 = 0,
 repeat_interval_ms: u64 = 0,
 click_handler: ?ClickHandler = null,
 click_context: ?*anyopaque = null,
+pointer_move_handler: ?PointerMoveHandler = null,
+pointer_move_context: ?*anyopaque = null,
 cursor_shape_handler: ?CursorShapeHandler = null,
 cursor_shape_context: ?*anyopaque = null,
 key_handler: ?KeyHandler = null,
 key_context: ?*anyopaque = null,
 
 pub const ClickHandler = *const fn (ctx: *anyopaque, point: keywork.Point) void;
+pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
 
@@ -84,6 +87,11 @@ pub fn attachListeners(self: *Self, comptime Backend: type, backend: *Backend) v
 pub fn setClickHandler(self: *Self, context: *anyopaque, handler: ClickHandler) void {
     self.click_context = context;
     self.click_handler = handler;
+}
+
+pub fn setPointerMoveHandler(self: *Self, context: *anyopaque, handler: PointerMoveHandler) void {
+    self.pointer_move_context = context;
+    self.pointer_move_handler = handler;
 }
 
 pub fn setCursorShapeHandler(self: *Self, context: *anyopaque, handler: CursorShapeHandler) void {
@@ -151,15 +159,18 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                     self.pointer_enter_serial = enter.serial;
                     self.cursor_shape = null;
                     self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
+                    self.dispatchPointerMove(self.pointer_position);
                     self.updateCursorShape(self.pointer_position.?);
                 },
                 .leave => {
                     self.pointer_position = null;
                     self.pointer_enter_serial = null;
                     self.cursor_shape = null;
+                    self.dispatchPointerMove(null);
                 },
                 .motion => |motion| {
                     self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
+                    self.dispatchPointerMove(self.pointer_position);
                     self.updateCursorShape(self.pointer_position.?);
                 },
                 .button => |button| {
@@ -173,6 +184,10 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
             }
         }
     }.callback;
+}
+
+fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
+    if (self.pointer_move_handler) |handler| handler(self.pointer_move_context.?, point);
 }
 
 fn createCursorShapeDevice(self: *Self) void {

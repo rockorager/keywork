@@ -127,6 +127,7 @@ pub const Backend = struct {
     frame_callback: ?*wl.Callback,
 
     pub const ClickHandler = WaylandInput.ClickHandler;
+    pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
     pub const CursorShapeHandler = WaylandInput.CursorShapeHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
@@ -360,6 +361,10 @@ pub const Backend = struct {
 
     pub fn setClickHandler(self: *Backend, context: *anyopaque, handler: ClickHandler) void {
         self.input.setClickHandler(context, handler);
+    }
+
+    pub fn setPointerMoveHandler(self: *Backend, context: *anyopaque, handler: PointerMoveHandler) void {
+        self.input.setPointerMoveHandler(context, handler);
     }
 
     pub fn setCursorShapeHandler(self: *Backend, context: *anyopaque, handler: CursorShapeHandler) void {

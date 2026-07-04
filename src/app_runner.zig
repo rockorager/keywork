@@ -98,6 +98,7 @@ fn runWayland(
     defer runtime.deinit();
 
     backend.setClickHandler(&runtime, @import("runtime.zig").Runtime.waylandClick);
+    backend.setPointerMoveHandler(&runtime, @import("runtime.zig").Runtime.waylandPointerMove);
     backend.setCursorShapeHandler(&runtime, @import("runtime.zig").Runtime.waylandCursorShape);
     backend.setRepaintHandler(&runtime, @import("runtime.zig").Runtime.waylandConfigure);
     backend.setFrameHandler(&runtime, @import("runtime.zig").Runtime.waylandFrameDone);
