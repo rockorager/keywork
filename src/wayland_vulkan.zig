@@ -79,6 +79,7 @@ pub const Backend = struct {
     height: u31,
     scale: f32,
     scale_changed: bool,
+    swapchain_dirty: bool,
 
     vkb: vk.BaseWrapper,
     vki: vk.InstanceWrapper,
@@ -259,6 +260,7 @@ pub const Backend = struct {
             .height = options.height,
             .scale = 1,
             .scale_changed = false,
+            .swapchain_dirty = false,
             .vkb = vkb,
             .vki = vki,
             .vkd = vkd,
@@ -412,8 +414,12 @@ pub const Backend = struct {
         const height = try scaledFrameDimension(logical_height, self.scale);
         self.surface.setBufferScale(1);
         if (self.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
-        try self.ensureSwapchain(width, height);
-        try self.renderAndPresent(frame.display_list, self.scale);
+        if (!try self.ensureSwapchain(width, height)) return;
+        const result = try self.renderAndPresent(frame.display_list, self.scale);
+        if (result == .stale) {
+            self.swapchain_dirty = true;
+            log.info("Vulkan swapchain stale; recreating on next repaint", .{});
+        }
     }
 
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
@@ -421,10 +427,11 @@ pub const Backend = struct {
         return self.text_renderer.measure(self.scale, value);
     }
 
-    fn ensureSwapchain(self: *Backend, width: u31, height: u31) !void {
-        if (self.swapchain != .null_handle and self.swapchain_extent.width == width and self.swapchain_extent.height == height) return;
+    fn ensureSwapchain(self: *Backend, width: u31, height: u31) !bool {
+        if (!self.swapchain_dirty and self.swapchain != .null_handle and self.swapchain_extent.width == width and self.swapchain_extent.height == height) return true;
         try self.vkd.deviceWaitIdle(self.device);
         self.destroySwapchain();
+        self.swapchain_dirty = false;
 
         const caps = try self.vki.getPhysicalDeviceSurfaceCapabilitiesKHR(self.physical_device, self.surface_khr);
         const formats = try self.vki.getPhysicalDeviceSurfaceFormatsAllocKHR(self.physical_device, self.surface_khr, self.allocator);
@@ -438,6 +445,7 @@ pub const Backend = struct {
         const usage: vk.ImageUsageFlags = .{ .transfer_dst_bit = true, .color_attachment_bit = true };
         if (!caps.supported_usage_flags.contains(usage)) return error.UnsupportedSwapchainUsage;
 
+        if (extent.width == 0 or extent.height == 0) return false;
         self.swapchain = try self.vkd.createSwapchainKHR(self.device, &.{
             .surface = self.surface_khr,
             .min_image_count = image_count,
@@ -460,6 +468,7 @@ pub const Backend = struct {
         try self.createRenderTargets();
         try self.createTextResources();
         log.info("Vulkan swapchain {d}x{d} images={d}", .{ extent.width, extent.height, self.swapchain_images.len });
+        return true;
     }
 
     fn destroySwapchain(self: *Backend) void {
@@ -777,11 +786,19 @@ pub const Backend = struct {
         self.text_pipeline = pipeline;
     }
 
-    fn renderAndPresent(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !void {
-        _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
-        try self.vkd.resetFences(self.device, &.{self.in_flight});
+    const PresentResult = enum {
+        presented,
+        stale,
+    };
 
-        const acquired = try self.vkd.acquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.image_available, .null_handle);
+    fn renderAndPresent(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !PresentResult {
+        _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
+
+        const acquired = self.vkd.acquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.image_available, .null_handle) catch |err| switch (err) {
+            error.OutOfDateKHR => return .stale,
+            else => return err,
+        };
+        const suboptimal = acquired.result == .suboptimal_khr;
         const image_index = acquired.image_index;
         try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
         try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
@@ -807,6 +824,7 @@ pub const Backend = struct {
         try self.vkd.endCommandBuffer(self.command_buffer);
 
         const wait_stage: vk.PipelineStageFlags = .{ .color_attachment_output_bit = true };
+        try self.vkd.resetFences(self.device, &.{self.in_flight});
         try self.vkd.queueSubmit(self.queue, &.{.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast(&self.image_available),
@@ -817,13 +835,18 @@ pub const Backend = struct {
             .p_signal_semaphores = @ptrCast(&self.render_finished),
         }}, self.in_flight);
 
-        _ = try self.vkd.queuePresentKHR(self.queue, &.{
+        const present_result = self.vkd.queuePresentKHR(self.queue, &.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast(&self.render_finished),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&self.swapchain),
             .p_image_indices = @ptrCast(&image_index),
-        });
+        }) catch |err| switch (err) {
+            error.OutOfDateKHR => return .stale,
+            else => return err,
+        };
+        if (suboptimal or present_result == .suboptimal_khr) return .stale;
+        return .presented;
     }
 
     fn renderFillRects(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) void {
