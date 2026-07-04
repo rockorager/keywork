@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "keywork.h"
 
@@ -10,6 +11,10 @@ struct app_state {
 static void increment(void *userdata);
 static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints);
 static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
+static void *status_create_state(void *userdata);
+static int status_update(void *userdata, void *state, const struct keywork_build_context *context);
+static keywork_widget_t *status_build(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context);
+static void status_destroy_state(void *userdata, void *state);
 
 static keywork_widget_t *build(void *userdata, keywork_build_t *build, const struct keywork_context *context) {
     struct app_state *state = userdata;
@@ -21,6 +26,13 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
         .paint = progress_paint,
     };
     keywork_widget_t *progress = keywork_render_object(build, &progress_vtable, state);
+    const struct keywork_stateful_vtable status_vtable = {
+        .create_state = status_create_state,
+        .update = status_update,
+        .build = status_build,
+        .destroy_state = status_destroy_state,
+    };
+    keywork_widget_t *status = keywork_stateful(build, &status_vtable, state);
 
     keywork_widget_t *button_label = keywork_colored_text(build, "Increment", 0xffffffffu);
     keywork_widget_t *button_padding = keywork_padding(build, 8.0f, button_label);
@@ -36,6 +48,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     keywork_widget_t *children[] = {
         keywork_colored_text(build, "C app hosted by libkeywork", 0xff6d4affu),
         keywork_text(build, count_label),
+        status,
         progress,
         input,
         status_row,
@@ -64,6 +77,43 @@ static int progress_paint(void *userdata, keywork_display_list_t *display_list, 
     fill.width *= fraction;
     return keywork_display_list_fill_rect(display_list, rect, 0xffe6e0ffu) &&
         keywork_display_list_fill_rect(display_list, fill, 0xff6d4affu);
+}
+
+struct status_state {
+    unsigned builds;
+    unsigned updates;
+};
+
+static void *status_create_state(void *userdata) {
+    (void)userdata;
+    struct status_state *state = malloc(sizeof(*state));
+    if (state == NULL) return NULL;
+    state->builds = 0;
+    state->updates = 0;
+    return state;
+}
+
+static int status_update(void *userdata, void *state, const struct keywork_build_context *context) {
+    (void)userdata;
+    (void)context;
+    struct status_state *status = state;
+    status->updates += 1;
+    return 1;
+}
+
+static keywork_widget_t *status_build(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context) {
+    struct app_state *app = userdata;
+    struct status_state *status = state;
+    (void)context;
+    status->builds += 1;
+    char label[96];
+    snprintf(label, sizeof(label), "stateful C widget: count=%u builds=%u updates=%u", app->count, status->builds, status->updates);
+    return keywork_text(build, label);
+}
+
+static void status_destroy_state(void *userdata, void *state) {
+    (void)userdata;
+    free(state);
 }
 
 static int timer(void *userdata, uint64_t expirations) {

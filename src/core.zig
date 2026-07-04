@@ -204,6 +204,8 @@ pub const Widget = union(enum) {
     pub const Stateful = struct {
         ptr: *const anyopaque,
         vtable: *const VTable,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
 
         pub const VTable = struct {
             create_state: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator) anyerror!*anyopaque,
@@ -226,6 +228,21 @@ pub const Widget = union(enum) {
 
         pub fn destroyState(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator) void {
             self.vtable.destroy_state(self.ptr, state, allocator);
+        }
+
+        pub fn clone(self: Stateful, allocator: std.mem.Allocator) !Stateful {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .vtable = self.vtable,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: Stateful, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
         }
     };
 
@@ -1186,7 +1203,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .padding => |padding_widget| .{ .padding = padding_widget },
         .center => |center_widget| .{ .center = center_widget },
         .component => |component_widget| .{ .component = component_widget },
-        .stateful => |stateful_widget| .{ .stateful = stateful_widget },
+        .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
         .element => |custom_element| .{ .element = custom_element },
         .render_object => |render_object| .{ .render_object = try render_object.clone(allocator) },
     };
@@ -1205,8 +1222,9 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             allocator.free(input_widget.value);
             allocator.free(input_widget.placeholder);
         },
+        .stateful => |stateful_widget| stateful_widget.destroy(allocator),
         .render_object => |render_object| render_object.destroy(allocator),
-        .box, .row, .column, .padding, .center, .component, .stateful, .element => {},
+        .box, .row, .column, .padding, .center, .component, .element => {},
     }
 }
 
@@ -1820,6 +1838,105 @@ test "element tree retains cloned render objects beyond build scope" {
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
 
     destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), destroys);
+}
+
+test "element tree retains cloned stateful widgets beyond build scope" {
+    const StatefulSource = struct {
+        clones: *usize,
+        destroys: *usize,
+        states_created: *usize,
+        states_destroyed: *usize,
+
+        const State = struct {};
+        const vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = build,
+            .destroy_state = destroyState,
+        };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .stateful = .{
+                .ptr = self,
+                .vtable = &vtable,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+            } };
+        }
+
+        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.states_created.* += 1;
+            const state = try allocator.create(State);
+            state.* = .{};
+            return state;
+        }
+
+        fn update(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !void {
+            _ = ptr;
+            _ = state;
+            _ = allocator;
+            _ = context;
+        }
+
+        fn build(ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
+            _ = ptr;
+            _ = state;
+            _ = context;
+            const value = try std.fmt.allocPrint(scope.allocator, "stateful survives", .{});
+            return .{ .text = .{ .value = value } };
+        }
+
+        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.states_destroyed.* += 1;
+            const state: *State = @ptrCast(@alignCast(state_ptr));
+            allocator.destroy(state);
+        }
+
+        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.clones.* += 1;
+            const result = try allocator.create(@This());
+            result.* = self.*;
+            return result;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroys.* += 1;
+            allocator.destroy(@constCast(self));
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var clones: usize = 0;
+    var destroys: usize = 0;
+    var states_created: usize = 0;
+    var states_destroyed: usize = 0;
+    const source = try build_arena.allocator().create(StatefulSource);
+    source.* = .{
+        .clones = &clones,
+        .destroys = &destroys,
+        .states_created = &states_created,
+        .states_destroyed = &states_destroyed,
+    };
+    const widget = source.widget();
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 1), clones);
+    try std.testing.expectEqual(@as(usize, 1), states_created);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    try std.testing.expectEqualStrings("stateful survives", element.children[0].widget.text.value);
+
+    destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), states_destroyed);
     try std.testing.expectEqual(@as(usize, 1), destroys);
 }
 

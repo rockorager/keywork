@@ -47,6 +47,17 @@ pub const KeyworkRenderObjectVTable = extern struct {
     destroy: ?*const fn (userdata: ?*anyopaque) callconv(.c) void = null,
 };
 
+pub const KeyworkBuildContext = extern struct {
+    constraints: KeyworkConstraints,
+};
+
+pub const KeyworkStatefulVTable = extern struct {
+    create_state: ?*const fn (userdata: ?*anyopaque) callconv(.c) ?*anyopaque = null,
+    update: ?*const fn (userdata: ?*anyopaque, state: *anyopaque, context: *const KeyworkBuildContext) callconv(.c) c_int = null,
+    build: ?*const fn (userdata: ?*anyopaque, state: *anyopaque, build: *KeyworkBuild, context: *const KeyworkBuildContext) callconv(.c) ?*KeyworkWidget = null,
+    destroy_state: ?*const fn (userdata: ?*anyopaque, state: *anyopaque) callconv(.c) void = null,
+};
+
 pub const KeyworkRunOptions = extern struct {
     title: ?[*:0]const u8 = null,
     backend: c_int = 0,
@@ -147,6 +158,69 @@ const CRenderObject = struct {
     fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
         const self: *const CRenderObject = @ptrCast(@alignCast(ptr));
         if (self.vtable.destroy) |destroy_fn| destroy_fn(self.userdata);
+        allocator.destroy(@constCast(self));
+    }
+};
+
+const CStateful = struct {
+    vtable: KeyworkStatefulVTable,
+    userdata: ?*anyopaque,
+
+    const keywork_vtable: keywork.Widget.Stateful.VTable = .{
+        .create_state = createState,
+        .update = update,
+        .build = build,
+        .destroy_state = destroyState,
+    };
+
+    fn keyworkStateful(self: *const CStateful) keywork.Widget.Stateful {
+        return .{
+            .ptr = self,
+            .vtable = &keywork_vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+        _ = allocator;
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        const create_fn = self.vtable.create_state orelse return error.MissingStatefulCreateState;
+        return create_fn(self.userdata) orelse error.StatefulCreateStateFailed;
+    }
+
+    fn update(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: keywork.Widget.BuildContext) !void {
+        _ = allocator;
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        const update_fn = self.vtable.update orelse return;
+        const c_context: KeyworkBuildContext = .{ .constraints = constraintsToC(context.constraints) };
+        if (update_fn(self.userdata, state, &c_context) == 0) return error.StatefulUpdateFailed;
+    }
+
+    fn build(ptr: *const anyopaque, state: *anyopaque, scope: *keywork.BuildScope, context: keywork.Widget.BuildContext) !keywork.Widget {
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        const build_fn = self.vtable.build orelse return error.MissingStatefulBuild;
+        var c_scope: CBuildScope = .{ .scope = scope };
+        const c_context: KeyworkBuildContext = .{ .constraints = constraintsToC(context.constraints) };
+        const handle = build_fn(self.userdata, state, buildHandle(&c_scope), &c_context) orelse return error.StatefulBuildFailed;
+        return widgetFromHandle(handle).*;
+    }
+
+    fn destroyState(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        if (self.vtable.destroy_state) |destroy_fn| destroy_fn(self.userdata, state);
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(CStateful);
+        result.* = self.*;
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *const CStateful = @ptrCast(@alignCast(ptr));
         allocator.destroy(@constCast(self));
     }
 };
@@ -332,6 +406,20 @@ pub export fn keywork_display_list_fill_rect(
     const list = displayListFromHandle(display_list orelse return 0);
     list.display_list.fillRect(list.allocator, rectFromC(rect), colorFromArgb(argb)) catch return 0;
     return 1;
+}
+
+pub export fn keywork_stateful(
+    build: ?*KeyworkBuild,
+    vtable: ?*const KeyworkStatefulVTable,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const stateful_vtable = vtable orelse return null;
+    if (stateful_vtable.create_state == null or stateful_vtable.build == null) return null;
+    const allocator = scope.scope.allocator;
+    const stateful = allocator.create(CStateful) catch return null;
+    stateful.* = .{ .vtable = stateful_vtable.*, .userdata = userdata };
+    return makeWidget(scope, .{ .stateful = stateful.keyworkStateful() });
 }
 
 pub export fn keywork_padding(build: ?*KeyworkBuild, inset: f32, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {
