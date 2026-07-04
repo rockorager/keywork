@@ -94,6 +94,49 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const native_example_module = b.createModule(.{
+        .root_source_file = b.path("examples/native/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    native_example_module.addImport("libkeywork", libkeywork_module);
+    const native_example = b.addExecutable(.{
+        .name = "keywork-native-example",
+        .root_module = native_example_module,
+    });
+
+    const c_api_module = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_api_module.addImport("libkeywork", libkeywork_module);
+    const c_library = b.addLibrary(.{
+        .linkage = .static,
+        .name = "keywork",
+        .root_module = c_api_module,
+    });
+    c_library.installHeader(b.path("include/keywork.h"), "keywork.h");
+
+    const c_example_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_example_module.addCSourceFile(.{ .file = b.path("examples/c/main.c") });
+    c_example_module.addIncludePath(b.path("include"));
+    c_example_module.linkLibrary(c_library);
+    const c_example = b.addExecutable(.{
+        .name = "keywork-c-example",
+        .root_module = c_example_module,
+    });
+
+    b.installArtifact(native_example);
+    b.installArtifact(c_library);
+    b.installArtifact(c_example);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -103,6 +146,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
 
+    const run_native_example_cmd = b.addRunArtifact(native_example);
+    run_native_example_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_native_example_cmd.addArgs(args);
+    }
+
+    const run_native_example_step = b.step("run-native-example", "Run the native Zig example");
+    run_native_example_step.dependOn(&run_native_example_cmd.step);
+
+    const run_c_example_cmd = b.addRunArtifact(c_example);
+    run_c_example_cmd.step.dependOn(b.getInstallStep());
+
+    const run_c_example_step = b.step("run-c-example", "Run the C example");
+    run_c_example_step.dependOn(&run_c_example_cmd.step);
+
     const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
         .root_module = libkeywork_module,
@@ -110,7 +168,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "include", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
 }

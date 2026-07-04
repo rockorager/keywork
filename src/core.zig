@@ -101,6 +101,16 @@ pub const Widget = union(enum) {
     element: CustomElement,
     render_object: RenderObject,
 
+    pub fn alloc(allocator: std.mem.Allocator, widget: Widget) !*Widget {
+        const result = try allocator.create(Widget);
+        result.* = widget;
+        return result;
+    }
+
+    pub fn allocSlice(allocator: std.mem.Allocator, items: []const Widget) ![]Widget {
+        return allocator.dupe(Widget, items);
+    }
+
     pub const Key = union(enum) {
         string: []const u8,
         integer: u64,
@@ -249,6 +259,48 @@ pub const Widget = union(enum) {
             return hit_test(self.ptr, rect, point);
         }
     };
+};
+
+pub const widgets = struct {
+    pub fn text(value: []const u8) Widget {
+        return .{ .text = .{ .value = value } };
+    }
+
+    pub fn coloredText(value: []const u8, color: Color) Widget {
+        return .{ .text = .{ .value = value, .color = color } };
+    }
+
+    pub fn box(allocator: std.mem.Allocator, child: Widget, background: Color) !Widget {
+        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background } };
+    }
+
+    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
+        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, focused: bool) Widget {
+        return .{ .text_input = .{ .id = id, .value = value, .placeholder = placeholder, .focused = focused } };
+    }
+
+    pub fn row(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
+        return .{ .row = .{ .children = try Widget.allocSlice(allocator, children), .gap = gap } };
+    }
+
+    pub fn column(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
+        return .{ .column = .{ .children = try Widget.allocSlice(allocator, children), .gap = gap } };
+    }
+
+    pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets, child: Widget) !Widget {
+        return .{ .padding = .{ .insets = insets, .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn center(allocator: std.mem.Allocator, child: Widget) !Widget {
+        return .{ .center = .{ .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn keyed(allocator: std.mem.Allocator, key: Widget.Key, child: Widget) !Widget {
+        return .{ .keyed = .{ .key = key, .child = try Widget.alloc(allocator, child) } };
+    }
 };
 
 pub const Element = struct {
@@ -913,8 +965,8 @@ fn hasKeyedElements(elements: []const Element) bool {
     return false;
 }
 
-fn hasKeyedWidgets(widgets: []const Widget) bool {
-    for (widgets) |widget| if (widgetKey(widget) != null) return true;
+fn hasKeyedWidgets(items: []const Widget) bool {
+    for (items) |widget| if (widgetKey(widget) != null) return true;
     return false;
 }
 

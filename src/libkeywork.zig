@@ -9,9 +9,11 @@ pub const wl_display = opaque {};
 pub const wl_surface = opaque {};
 
 const core = @import("core.zig");
+const app_runner = @import("app_runner.zig");
 
 pub const Color = core.Color;
 pub const colors = core.colors;
+pub const widgets = core.widgets;
 pub const Size = core.Size;
 pub const Point = core.Point;
 pub const Rect = core.Rect;
@@ -46,3 +48,6 @@ pub const hitTestClick = core.hitTestClick;
 pub const hitTestTextInput = core.hitTestTextInput;
 
 pub const Runtime = @import("runtime.zig").Runtime;
+pub const BackendKind = app_runner.BackendKind;
+pub const RunOptions = app_runner.Options;
+pub const run = app_runner.run;

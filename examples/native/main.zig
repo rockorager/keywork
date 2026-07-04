@@ -1,0 +1,91 @@
+//! Native Zig example consuming libkeywork as an application dependency.
+
+const std = @import("std");
+const keywork = @import("libkeywork");
+
+const AppContext = keywork.AppContext;
+const AppHost = keywork.AppHost;
+const Widget = keywork.Widget;
+const widgets = keywork.widgets;
+
+const NativeApp = struct {
+    count: u32 = 0,
+    pulse: bool = false,
+
+    fn host(self: *NativeApp) AppHost {
+        return .{ .ptr = self, .vtable = &.{
+            .build_widget = buildWidget,
+            .click = click,
+            .timer = timer,
+        } };
+    }
+
+    fn buildWidget(ptr: *anyopaque, allocator: std.mem.Allocator, context: AppContext) !Widget {
+        const self: *NativeApp = @ptrCast(@alignCast(ptr));
+        const count_label = try std.fmt.allocPrint(allocator, "Count: {d}", .{self.count});
+        const pulse_label = if (self.pulse) "timer: tick" else "timer: tock";
+        const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
+        const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
+
+        const button_text = widgets.coloredText("Increment", keywork.colors.white);
+        const button_padding = try widgets.padding(allocator, keywork.EdgeInsets.all(8), button_text);
+        const button_box = try widgets.box(allocator, button_padding, keywork.colors.accent);
+        const button = try widgets.clickable(allocator, "increment", button_box);
+        const input = widgets.textInput("native-input", context.input_text, "Type here", context.focused_input_id != null);
+        const children = [_]Widget{
+            widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),
+            widgets.text(count_label),
+            input,
+            widgets.text(input_label),
+            widgets.text(pulse_label),
+            widgets.text(scheme_label),
+            button,
+        };
+        const column = try widgets.column(allocator, &children, 12);
+        return widgets.padding(allocator, keywork.EdgeInsets.all(24), column);
+    }
+
+    fn click(ptr: *anyopaque, id: []const u8) !bool {
+        const self: *NativeApp = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, id, "increment")) return false;
+        self.count += 1;
+        return true;
+    }
+
+    fn timer(ptr: *anyopaque, expirations: u64) !bool {
+        const self: *NativeApp = @ptrCast(@alignCast(ptr));
+        if (expirations == 0) return false;
+        self.pulse = !self.pulse;
+        return true;
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const allocator = debug_allocator.allocator();
+
+    var app: NativeApp = .{};
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    defer stdout_writer.interface.flush() catch {};
+
+    try keywork.run(allocator, app.host(), .{
+        .title = "Keywork native Zig example",
+        .width = 640,
+        .height = 480,
+        .backend = selectedBackend(init),
+        .log_writer = &stdout_writer.interface,
+    });
+}
+
+fn selectedBackend(init: std.process.Init) keywork.BackendKind {
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--wayland")) return .wayland_shm;
+        if (std.mem.eql(u8, arg, "--backend=shm")) return .wayland_shm;
+        if (std.mem.eql(u8, arg, "--backend=vulkan")) return .vulkan;
+    }
+    return .log;
+}
