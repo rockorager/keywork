@@ -308,6 +308,7 @@ pub const Widget = union(enum) {
     pub const FocusScope = struct {
         id: []const u8,
         child: *const Widget,
+        modal: bool = false,
     };
 
     pub const ActionBinding = struct {
@@ -611,7 +612,15 @@ pub const widgets = struct {
     }
 
     pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
-        return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+        return focusScopeWithOptions(allocator, id, child, .{});
+    }
+
+    pub const FocusScopeOptions = struct {
+        modal: bool = false,
+    };
+
+    pub fn focusScopeWithOptions(allocator: std.mem.Allocator, id: []const u8, child: Widget, options: FocusScopeOptions) !Widget {
+        return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child), .modal = options.modal } };
     }
 
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
@@ -789,6 +798,7 @@ pub const RenderNode = struct {
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
+    modal_focus_scope: bool = false,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -1774,7 +1784,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         },
         .focus_scope => |focus_scope_widget| blk: {
             const id = try allocator.dupe(u8, focus_scope_widget.id);
-            break :blk .{ .focus_scope = .{ .id = id, .child = focus_scope_widget.child } };
+            break :blk .{ .focus_scope = .{ .id = id, .child = focus_scope_widget.child, .modal = focus_scope_widget.modal } };
         },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
@@ -2010,6 +2020,7 @@ pub const FocusTarget = struct {
     kind: Kind,
     callback: ?Widget.Callback = null,
     scope_id: ?[]const u8 = null,
+    modal_scope_id: ?[]const u8 = null,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -2025,48 +2036,58 @@ pub const FocusTarget = struct {
 pub fn collectFocusTargets(allocator: std.mem.Allocator, node: *const RenderNode) ![]FocusTarget {
     var targets: std.ArrayList(FocusTarget) = .empty;
     errdefer targets.deinit(allocator);
-    try appendFocusTargets(allocator, &targets, node, null);
+    try appendFocusTargets(allocator, &targets, node, null, null);
     return try targets.toOwnedSlice(allocator);
 }
 
-fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode, scope_id: ?[]const u8) !void {
+fn appendFocusTargets(
+    allocator: std.mem.Allocator,
+    targets: *std.ArrayList(FocusTarget),
+    node: *const RenderNode,
+    scope_id: ?[]const u8,
+    modal_scope_id: ?[]const u8,
+) !void {
     const active_scope_id = node.focus_scope_id orelse scope_id;
+    const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
-        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id }),
+        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id }),
         .focus => if (node.focus_id) |id| try targets.append(allocator, .{
             .id = id,
             .kind = .focus,
             .scope_id = active_scope_id,
+            .modal_scope_id = active_modal_scope_id,
             .autofocus = node.autofocus,
             .skip_traversal = node.skip_traversal,
             .can_request_focus = node.can_request_focus,
             .focus_change_callback = node.focus_change_callback,
         }),
         .clickable => if (node.click_callback) |callback| {
-            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id });
+            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id });
         },
         else => {},
     }
     for (node.children) |*child| {
-        try appendFocusTargets(allocator, targets, child, active_scope_id);
+        try appendFocusTargets(allocator, targets, child, active_scope_id, active_modal_scope_id);
     }
 }
 
 pub fn findFocusTarget(node: *const RenderNode, id: []const u8) ?FocusTarget {
-    return findFocusTargetScoped(node, id, null);
+    return findFocusTargetScoped(node, id, null, null);
 }
 
-fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]const u8) ?FocusTarget {
+fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]const u8, modal_scope_id: ?[]const u8) ?FocusTarget {
     const active_scope_id = node.focus_scope_id orelse scope_id;
+    const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
         .text_input => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id };
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
         },
         .focus => if (node.focus_id) |focus_id| {
             if (std.mem.eql(u8, focus_id, id)) return .{
                 .id = focus_id,
                 .kind = .focus,
                 .scope_id = active_scope_id,
+                .modal_scope_id = active_modal_scope_id,
                 .autofocus = node.autofocus,
                 .skip_traversal = node.skip_traversal,
                 .can_request_focus = node.can_request_focus,
@@ -2075,13 +2096,13 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
         },
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |clickable_id| {
-                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id };
+                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
             }
         },
         else => {},
     }
     for (node.children) |*child| {
-        if (findFocusTargetScoped(child, id, active_scope_id)) |target| return target;
+        if (findFocusTargetScoped(child, id, active_scope_id, active_modal_scope_id)) |target| return target;
     }
     return null;
 }
@@ -2335,6 +2356,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .kind = .focus_scope,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .focus_scope_id = scope_id,
+                .modal_focus_scope = focus_scope_widget.modal,
                 .children = children,
             };
         },

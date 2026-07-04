@@ -48,11 +48,13 @@ function ui.focus(id, child, options)
   }
 end
 
-function ui.focus_scope(id, child)
+function ui.focus_scope(id, child, options)
+  options = options or {}
   return {
     type = "focus_scope",
     id = id,
     child = child,
+    modal = options.modal or false,
   }
 end
 

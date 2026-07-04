@@ -253,7 +253,7 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .focus_scope = .{ .id = id, .child = child } };
+        return .{ .focus_scope = .{ .id = id, .child = child, .modal = getBooleanField(lua_state, table, "modal", false) } };
     }
     if (std.mem.eql(u8, kind, "button")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");

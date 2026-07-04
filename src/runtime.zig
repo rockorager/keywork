@@ -209,6 +209,11 @@ pub const Runtime = struct {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         const target = keywork.findFocusTarget(root, id) orelse return error.FocusTargetNotFound;
         if (!target.can_request_focus) return error.FocusTargetNotFocusable;
+        const targets = try keywork.collectFocusTargets(self.allocator, root);
+        defer self.allocator.free(targets);
+        if (activeModalScopeId(targets)) |modal_scope_id| {
+            if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return error.FocusTargetOutsideModal;
+        }
         try self.setFocused(id);
         try self.rebuild();
         try self.requestRepaint();
@@ -313,9 +318,11 @@ pub const Runtime = struct {
         defer self.allocator.free(targets);
         if (targets.len == 0) return;
 
+        const active_modal_scope_id = activeModalScopeId(targets);
         const current_target = if (self.focused_id) |focused_id| findCollectedFocusTarget(targets, focused_id) else null;
-        const active_scope_id = if (current_target) |target| target.scope_id else null;
-        const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, reverse) orelse return;
+        const current_target_in_modal = if (current_target) |target| active_modal_scope_id == null or sameOptionalString(target.modal_scope_id, active_modal_scope_id) else false;
+        const active_scope_id = if (current_target_in_modal) current_target.?.scope_id else null;
+        const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, active_modal_scope_id, reverse) orelse return;
 
         try self.setFocused(targets[next_index].id);
     }
@@ -327,15 +334,24 @@ pub const Runtime = struct {
         return null;
     }
 
-    fn nextFocusTargetIndex(targets: []const keywork.FocusTarget, focused_id: ?[]const u8, scope_id: ?[]const u8, reverse: bool) ?usize {
+    fn nextFocusTargetIndex(
+        targets: []const keywork.FocusTarget,
+        focused_id: ?[]const u8,
+        scope_id: ?[]const u8,
+        modal_scope_id: ?[]const u8,
+        reverse: bool,
+    ) ?usize {
         var first: ?usize = null;
         var last: ?usize = null;
         var previous_matching: ?usize = null;
         var previous_before_focused: ?usize = null;
         var focused_seen = focused_id == null;
-        const filter_by_scope = focused_id != null;
+        const filter_by_scope = scope_id != null;
 
         for (targets, 0..) |target, index| {
+            if (modal_scope_id) |active_modal_scope_id| {
+                if (!sameOptionalString(target.modal_scope_id, active_modal_scope_id)) continue;
+            }
             if (filter_by_scope and !sameOptionalString(target.scope_id, scope_id)) continue;
             if (focused_id) |focused| {
                 if (std.mem.eql(u8, target.id, focused)) {
@@ -365,6 +381,14 @@ pub const Runtime = struct {
 
     fn isTraversableFocusTarget(target: keywork.FocusTarget) bool {
         return target.can_request_focus and !target.skip_traversal;
+    }
+
+    fn activeModalScopeId(targets: []const keywork.FocusTarget) ?[]const u8 {
+        var result: ?[]const u8 = null;
+        for (targets) |target| {
+            if (target.modal_scope_id) |modal_scope_id| result = modal_scope_id;
+        }
+        return result;
     }
 
     fn sameOptionalString(a: ?[]const u8, b: ?[]const u8) bool {
@@ -568,10 +592,11 @@ pub const Runtime = struct {
         const root = if (self.root) |*root| root else return false;
         const targets = try keywork.collectFocusTargets(self.allocator, root);
         defer self.allocator.free(targets);
+        const active_modal_scope_id = activeModalScopeId(targets);
 
         if (self.focused_id) |focused_id| {
             for (targets) |target| {
-                if (std.mem.eql(u8, target.id, focused_id) and target.can_request_focus) {
+                if (std.mem.eql(u8, target.id, focused_id) and target.can_request_focus and (active_modal_scope_id == null or sameOptionalString(target.modal_scope_id, active_modal_scope_id))) {
                     self.autofocus_suppressed = false;
                     return false;
                 }
@@ -579,15 +604,18 @@ pub const Runtime = struct {
         }
 
         const desired_focus = if (!self.autofocus_suppressed) blk: {
-            break :blk if (autofocusTarget(targets)) |target| target.id else null;
+            break :blk if (autofocusTarget(targets, active_modal_scope_id)) |target| target.id else null;
         } else null;
         if (sameOptionalString(self.focused_id, desired_focus)) return false;
         try self.setFocused(desired_focus);
         return true;
     }
 
-    fn autofocusTarget(targets: []const keywork.FocusTarget) ?keywork.FocusTarget {
+    fn autofocusTarget(targets: []const keywork.FocusTarget, modal_scope_id: ?[]const u8) ?keywork.FocusTarget {
         for (targets) |target| {
+            if (modal_scope_id) |active_modal_scope_id| {
+                if (!sameOptionalString(target.modal_scope_id, active_modal_scope_id)) continue;
+            }
             if (target.autofocus and target.can_request_focus) return target;
         }
         return null;
@@ -1184,4 +1212,76 @@ test "focus scope contains tab traversal once focus is inside it" {
     try std.testing.expectEqualStrings("a1", runtime.focused_id.?);
     try runtime.keyInput(.{ .tab = .{ .reverse = true } });
     try std.testing.expectEqualStrings("a2", runtime.focused_id.?);
+}
+
+test "modal focus scope traps autofocus traversal and focus requests" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const background = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("background"),
+                keywork.widgets.text("Background"),
+                .{ .autofocus = true },
+            );
+
+            const modal_a = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("modal-a"),
+                keywork.widgets.text("Modal A"),
+                .{ .autofocus = true },
+            );
+            const modal_b = try keywork.widgets.focus(scope.allocator, .named("modal-b"), keywork.widgets.text("Modal B"));
+            const modal_children = [_]keywork.Widget{ modal_a, modal_b };
+            const modal_column = try keywork.widgets.column(scope.allocator, &modal_children, 4);
+            const modal = try keywork.widgets.focusScopeWithOptions(scope.allocator, "modal", modal_column, .{ .modal = true });
+
+            const after_modal = try keywork.widgets.focus(scope.allocator, .named("after-modal"), keywork.widgets.text("After modal"));
+            const children = [_]keywork.Widget{ background, modal, after_modal };
+            return keywork.widgets.column(scope.allocator, &children, 8);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 180 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
+    try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("background"));
+    try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("after-modal"));
+
+    try runtime.requestFocus("modal-b");
+    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
+    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
+
+    try runtime.clearFocus();
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
 }
