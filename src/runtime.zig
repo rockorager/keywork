@@ -207,7 +207,8 @@ pub const Runtime = struct {
 
     pub fn requestFocus(self: *Runtime, id: []const u8) !void {
         const root = if (self.root) |*root| root else return error.NotBuilt;
-        if (keywork.findFocusTarget(root, id) == null) return error.FocusTargetNotFound;
+        const target = keywork.findFocusTarget(root, id) orelse return error.FocusTargetNotFound;
+        if (!target.can_request_focus) return error.FocusTargetNotFocusable;
         try self.setFocused(id);
         try self.rebuild();
         try self.requestRepaint();
@@ -336,12 +337,18 @@ pub const Runtime = struct {
 
         for (targets, 0..) |target, index| {
             if (filter_by_scope and !sameOptionalString(target.scope_id, scope_id)) continue;
-            if (first == null) first = index;
             if (focused_id) |focused| {
                 if (std.mem.eql(u8, target.id, focused)) {
                     focused_seen = true;
                     previous_before_focused = previous_matching;
-                } else if (focused_seen and !reverse) {
+                    continue;
+                }
+            }
+
+            if (!isTraversableFocusTarget(target)) continue;
+            if (first == null) first = index;
+            if (focused_id) |_| {
+                if (focused_seen and !reverse) {
                     return index;
                 }
             } else if (!reverse) {
@@ -354,6 +361,10 @@ pub const Runtime = struct {
         if (focused_id == null and reverse) return last;
         if (reverse) return previous_before_focused orelse last;
         return first;
+    }
+
+    fn isTraversableFocusTarget(target: keywork.FocusTarget) bool {
+        return target.can_request_focus and !target.skip_traversal;
     }
 
     fn sameOptionalString(a: ?[]const u8, b: ?[]const u8) bool {
@@ -560,7 +571,7 @@ pub const Runtime = struct {
 
         if (self.focused_id) |focused_id| {
             for (targets) |target| {
-                if (std.mem.eql(u8, target.id, focused_id)) {
+                if (std.mem.eql(u8, target.id, focused_id) and target.can_request_focus) {
                     self.autofocus_suppressed = false;
                     return false;
                 }
@@ -577,7 +588,7 @@ pub const Runtime = struct {
 
     fn autofocusTarget(targets: []const keywork.FocusTarget) ?keywork.FocusTarget {
         for (targets) |target| {
-            if (target.autofocus) return target;
+            if (target.autofocus and target.can_request_focus) return target;
         }
         return null;
     }
@@ -989,6 +1000,131 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
     try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
     try std.testing.expectEqual(@as(usize, 1), app.b_blurred);
     try std.testing.expectError(error.FocusTargetNotFound, runtime.requestFocus("missing"));
+}
+
+test "focus traversal respects request and traversal policy" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const a = try keywork.widgets.focus(scope.allocator, .named("a"), keywork.widgets.text("A"));
+            const skipped = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("skipped"),
+                keywork.widgets.text("Skipped"),
+                .{ .skip_traversal = true },
+            );
+            const blocked = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("blocked"),
+                keywork.widgets.text("Blocked"),
+                .{ .autofocus = true, .can_request_focus = false },
+            );
+            const c = try keywork.widgets.focus(scope.allocator, .named("c"), keywork.widgets.text("C"));
+            const children = [_]keywork.Widget{ a, skipped, blocked, c };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 160 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("c", runtime.focused_id.?);
+
+    try runtime.requestFocus("skipped");
+    try std.testing.expectEqualStrings("skipped", runtime.focused_id.?);
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("c", runtime.focused_id.?);
+    try std.testing.expectError(error.FocusTargetNotFocusable, runtime.requestFocus("blocked"));
+}
+
+test "focused node becoming non-requestable falls back to autofocus" {
+    const TestApp = struct {
+        allow_a_focus: bool = true,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const a = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("a"),
+                keywork.widgets.text("A"),
+                .{ .can_request_focus = self.allow_a_focus },
+            );
+            const replacement = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("replacement"),
+                keywork.widgets.text("Replacement"),
+                .{ .autofocus = true },
+            );
+            const children = [_]keywork.Widget{ a, replacement };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.requestFocus("a");
+    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
+
+    app.allow_a_focus = false;
+    try runtime.rebuild();
+    try std.testing.expectEqualStrings("replacement", runtime.focused_id.?);
+    try std.testing.expect(runtime.root.?.children[1].focused);
 }
 
 test "focus scope contains tab traversal once focus is inside it" {

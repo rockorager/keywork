@@ -300,6 +300,8 @@ pub const Widget = union(enum) {
         node: FocusNode,
         child: *const Widget,
         autofocus: bool = false,
+        skip_traversal: bool = false,
+        can_request_focus: bool = true,
         on_focus_change: ?FocusChangeCallback = null,
     };
 
@@ -592,6 +594,8 @@ pub const widgets = struct {
 
     pub const FocusOptions = struct {
         autofocus: bool = false,
+        skip_traversal: bool = false,
+        can_request_focus: bool = true,
         on_focus_change: ?Widget.FocusChangeCallback = null,
     };
 
@@ -600,6 +604,8 @@ pub const widgets = struct {
             .node = node,
             .child = try Widget.alloc(allocator, child),
             .autofocus = options.autofocus,
+            .skip_traversal = options.skip_traversal,
+            .can_request_focus = options.can_request_focus,
             .on_focus_change = options.on_focus_change,
         } };
     }
@@ -784,6 +790,8 @@ pub const RenderNode = struct {
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
     autofocus: bool = false,
+    skip_traversal: bool = false,
+    can_request_focus: bool = true,
     focus_change_callback: ?Widget.FocusChangeCallback = null,
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
@@ -1759,6 +1767,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .node = .named(focus_id),
                 .child = focus_widget.child,
                 .autofocus = focus_widget.autofocus,
+                .skip_traversal = focus_widget.skip_traversal,
+                .can_request_focus = focus_widget.can_request_focus,
                 .on_focus_change = focus_change_callback,
             } };
         },
@@ -2001,6 +2011,8 @@ pub const FocusTarget = struct {
     callback: ?Widget.Callback = null,
     scope_id: ?[]const u8 = null,
     autofocus: bool = false,
+    skip_traversal: bool = false,
+    can_request_focus: bool = true,
     focus_change_callback: ?Widget.FocusChangeCallback = null,
 
     pub const Kind = enum {
@@ -2026,6 +2038,8 @@ fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(Focu
             .kind = .focus,
             .scope_id = active_scope_id,
             .autofocus = node.autofocus,
+            .skip_traversal = node.skip_traversal,
+            .can_request_focus = node.can_request_focus,
             .focus_change_callback = node.focus_change_callback,
         }),
         .clickable => if (node.click_callback) |callback| {
@@ -2054,6 +2068,8 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
                 .kind = .focus,
                 .scope_id = active_scope_id,
                 .autofocus = node.autofocus,
+                .skip_traversal = node.skip_traversal,
+                .can_request_focus = node.can_request_focus,
                 .focus_change_callback = node.focus_change_callback,
             };
         },
@@ -2301,6 +2317,8 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .focus_id = focus_id,
                 .focused = element.focused,
                 .autofocus = focus_widget.autofocus,
+                .skip_traversal = focus_widget.skip_traversal,
+                .can_request_focus = focus_widget.can_request_focus,
                 .focus_change_callback = focus_widget.on_focus_change,
                 .children = children,
             };

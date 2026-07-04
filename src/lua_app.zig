@@ -240,6 +240,8 @@ fn parseWidget(
             .node = .named(id),
             .child = child,
             .autofocus = getBooleanField(lua_state, table, "autofocus", false),
+            .skip_traversal = getBooleanField(lua_state, table, "skip_traversal", false),
+            .can_request_focus = getBooleanField(lua_state, table, "can_request_focus", true),
             .on_focus_change = on_focus_change,
         } };
     }

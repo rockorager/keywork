@@ -42,6 +42,8 @@ function ui.focus(id, child, options)
     id = id,
     child = child,
     autofocus = options.autofocus or false,
+    skip_traversal = options.skip_traversal or false,
+    can_request_focus = options.can_request_focus ~= false,
     on_focus_change = options.on_focus_change,
   }
 end
