@@ -249,13 +249,30 @@ pub const Widget = union(enum) {
     pub const CustomElement = struct {
         ptr: *const anyopaque,
         vtable: *const VTable,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
 
         pub const VTable = struct {
-            build: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!Element,
+            build: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: BuildContext) anyerror!Element,
         };
 
-        pub fn build(self: CustomElement, allocator: std.mem.Allocator, context: BuildContext) !Element {
-            return self.vtable.build(self.ptr, allocator, context);
+        pub fn build(self: CustomElement, allocator: std.mem.Allocator, scope: *BuildScope, context: BuildContext) !Element {
+            return self.vtable.build(self.ptr, allocator, scope, context);
+        }
+
+        pub fn clone(self: CustomElement, allocator: std.mem.Allocator) !CustomElement {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .vtable = self.vtable,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: CustomElement, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
         }
     };
 
@@ -734,7 +751,7 @@ pub fn buildElementTreeScoped(
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try custom_element.build(allocator, .{ .constraints = constraints });
+            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints });
             initialized = true;
             return .{ .kind = .element, .widget = element_widget, .children = children };
         },
@@ -901,7 +918,7 @@ pub fn updateElementTreeScoped(
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .element => |custom_element| {
-            var replacement_child = try custom_element.build(allocator, .{ .constraints = constraints });
+            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints });
             errdefer destroyElementTree(allocator, &replacement_child);
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -1204,7 +1221,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .center => |center_widget| .{ .center = center_widget },
         .component => |component_widget| .{ .component = component_widget },
         .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
-        .element => |custom_element| .{ .element = custom_element },
+        .element => |custom_element| .{ .element = try custom_element.clone(allocator) },
         .render_object => |render_object| .{ .render_object = try render_object.clone(allocator) },
     };
 }
@@ -1224,7 +1241,8 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .stateful => |stateful_widget| stateful_widget.destroy(allocator),
         .render_object => |render_object| render_object.destroy(allocator),
-        .box, .row, .column, .padding, .center, .component, .element => {},
+        .element => |custom_element| custom_element.destroy(allocator),
+        .box, .row, .column, .padding, .center, .component => {},
     }
 }
 
@@ -1940,6 +1958,66 @@ test "element tree retains cloned stateful widgets beyond build scope" {
     try std.testing.expectEqual(@as(usize, 1), destroys);
 }
 
+test "element tree retains cloned custom elements beyond build scope" {
+    const CustomSource = struct {
+        clones: *usize,
+        destroys: *usize,
+
+        const vtable: Widget.CustomElement.VTable = .{ .build = build };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .element = .{
+                .ptr = self,
+                .vtable = &vtable,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+            } };
+        }
+
+        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: Widget.BuildContext) !Element {
+            _ = ptr;
+            const value = try std.fmt.allocPrint(scope.allocator, "custom element {d}", .{@as(u32, 7)});
+            const label: Widget = .{ .text = .{ .value = value, .color = colors.accent } };
+            return buildElementTreeScoped(allocator, scope, &label, context.constraints);
+        }
+
+        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.clones.* += 1;
+            const result = try allocator.create(@This());
+            result.* = self.*;
+            return result;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroys.* += 1;
+            allocator.destroy(@constCast(self));
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var clones: usize = 0;
+    var destroys: usize = 0;
+    const source = try build_arena.allocator().create(CustomSource);
+    source.* = .{ .clones = &clones, .destroys = &destroys };
+    const widget = source.widget();
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 1), clones);
+    try std.testing.expectEqual(@as(usize, 0), destroys);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    try std.testing.expectEqualStrings("custom element 7", element.children[0].widget.text.value);
+
+    destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), destroys);
+}
+
 test "component build products are retained outside the build arena" {
     const ArenaComponent = struct {
         value: usize,
@@ -2136,10 +2214,10 @@ test "custom element widget builds an element subtree" {
             return .{ .element = .{ .ptr = self, .vtable = &vtable } };
         }
 
-        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !Element {
+        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: Widget.BuildContext) !Element {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             const label: Widget = .{ .text = .{ .value = self.value, .color = colors.accent } };
-            return buildElementTree(allocator, &label, context.constraints);
+            return buildElementTreeScoped(allocator, scope, &label, context.constraints);
         }
     };
 

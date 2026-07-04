@@ -58,6 +58,11 @@ pub const KeyworkStatefulVTable = extern struct {
     destroy_state: ?*const fn (userdata: ?*anyopaque, state: *anyopaque) callconv(.c) void = null,
 };
 
+pub const KeyworkElementVTable = extern struct {
+    build: ?*const fn (userdata: ?*anyopaque, build: *KeyworkBuild, context: *const KeyworkBuildContext) callconv(.c) ?*KeyworkWidget = null,
+    destroy: ?*const fn (userdata: ?*anyopaque) callconv(.c) void = null,
+};
+
 pub const KeyworkRunOptions = extern struct {
     title: ?[*:0]const u8 = null,
     backend: c_int = 0,
@@ -221,6 +226,45 @@ const CStateful = struct {
 
     fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
         const self: *const CStateful = @ptrCast(@alignCast(ptr));
+        allocator.destroy(@constCast(self));
+    }
+};
+
+const CElement = struct {
+    vtable: KeyworkElementVTable,
+    userdata: ?*anyopaque,
+
+    const keywork_vtable: keywork.Widget.CustomElement.VTable = .{ .build = build };
+
+    fn keyworkElement(self: *const CElement) keywork.Widget.CustomElement {
+        return .{
+            .ptr = self,
+            .vtable = &keywork_vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *keywork.BuildScope, context: keywork.Widget.BuildContext) !keywork.Element {
+        const self: *const CElement = @ptrCast(@alignCast(ptr));
+        const build_fn = self.vtable.build orelse return error.MissingElementBuild;
+        var c_scope: CBuildScope = .{ .scope = scope };
+        const c_context: KeyworkBuildContext = .{ .constraints = constraintsToC(context.constraints) };
+        const handle = build_fn(self.userdata, buildHandle(&c_scope), &c_context) orelse return error.ElementBuildFailed;
+        const widget = widgetFromHandle(handle);
+        return keywork.buildElementTreeScoped(allocator, scope, widget, context.constraints);
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *const CElement = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(CElement);
+        result.* = self.*;
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *const CElement = @ptrCast(@alignCast(ptr));
+        if (self.vtable.destroy) |destroy_fn| destroy_fn(self.userdata);
         allocator.destroy(@constCast(self));
     }
 };
@@ -420,6 +464,20 @@ pub export fn keywork_stateful(
     const stateful = allocator.create(CStateful) catch return null;
     stateful.* = .{ .vtable = stateful_vtable.*, .userdata = userdata };
     return makeWidget(scope, .{ .stateful = stateful.keyworkStateful() });
+}
+
+pub export fn keywork_element(
+    build: ?*KeyworkBuild,
+    vtable: ?*const KeyworkElementVTable,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const element_vtable = vtable orelse return null;
+    if (element_vtable.build == null) return null;
+    const allocator = scope.scope.allocator;
+    const element = allocator.create(CElement) catch return null;
+    element.* = .{ .vtable = element_vtable.*, .userdata = userdata };
+    return makeWidget(scope, .{ .element = element.keyworkElement() });
 }
 
 pub export fn keywork_padding(build: ?*KeyworkBuild, inset: f32, child: ?*KeyworkWidget) callconv(.c) ?*KeyworkWidget {

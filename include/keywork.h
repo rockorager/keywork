@@ -68,6 +68,11 @@ struct keywork_stateful_vtable {
     void (*destroy_state)(void *userdata, void *state);
 };
 
+struct keywork_element_vtable {
+    keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_build_context *context);
+    void (*destroy)(void *userdata);
+};
+
 struct keywork_run_options {
     const char *title;
     int backend;
@@ -96,6 +101,7 @@ keywork_widget_t *keywork_clickable_callback(keywork_build_t *build, keywork_wid
 keywork_widget_t *keywork_render_object(keywork_build_t *build, const struct keywork_render_object_vtable *vtable, void *userdata);
 int keywork_display_list_fill_rect(keywork_display_list_t *display_list, struct keywork_rect rect, uint32_t argb);
 keywork_widget_t *keywork_stateful(keywork_build_t *build, const struct keywork_stateful_vtable *vtable, void *userdata);
+keywork_widget_t *keywork_element(keywork_build_t *build, const struct keywork_element_vtable *vtable, void *userdata);
 keywork_widget_t *keywork_padding(keywork_build_t *build, float inset, keywork_widget_t *child);
 keywork_widget_t *keywork_center(keywork_build_t *build, keywork_widget_t *child);
 keywork_widget_t *keywork_keyed_string(keywork_build_t *build, const char *key, keywork_widget_t *child);
