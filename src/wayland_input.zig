@@ -344,6 +344,9 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     switch (keysym) {
         xkb.XKB_KEY_BackSpace => return .backspace,
         xkb.XKB_KEY_Return, xkb.XKB_KEY_KP_Enter => return .enter,
+        xkb.XKB_KEY_space => return .space,
+        xkb.XKB_KEY_Tab => return .{ .tab = .{} },
+        xkb.XKB_KEY_ISO_Left_Tab => return .{ .tab = .{ .reverse = true } },
         else => {},
     }
 
@@ -402,7 +405,7 @@ fn storedRepeatInput(self: *Self, input: keywork.KeyInput) ?keywork.KeyInput {
             return .{ .text = self.repeat_text_buffer[0..bytes.len] };
         },
         .backspace => .backspace,
-        .enter => null,
+        .enter, .space, .tab => null,
     };
 }
 
@@ -425,7 +428,8 @@ fn keyInputFromEvdev(key: u32, shift: bool) ?keywork.KeyInput {
     return switch (key) {
         14 => .backspace,
         28 => .enter,
-        57 => .{ .text = " " },
+        15 => .{ .tab = .{ .reverse = shift } },
+        57 => .space,
         2...11 => .{ .text = digitFromKey(key, shift) },
         16 => .{ .text = if (shift) "Q" else "q" },
         17 => .{ .text = if (shift) "W" else "w" },
@@ -471,7 +475,7 @@ fn keyInputFromEvdev(key: u32, shift: bool) ?keywork.KeyInput {
 fn inputCanRepeat(input: keywork.KeyInput) bool {
     return switch (input) {
         .text, .backspace => true,
-        .enter => false,
+        .enter, .space, .tab => false,
     };
 }
 

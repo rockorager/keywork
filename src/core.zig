@@ -80,6 +80,7 @@ pub const ButtonTheme = struct {
     foreground: ?Color = null,
     hover_background: ?Color = null,
     hover_foreground: ?Color = null,
+    focused_border: ?Color = null,
     pressed_background: ?Color = null,
     padding: f32 = 8,
 };
@@ -265,6 +266,7 @@ pub const Widget = union(enum) {
     pub const Box = struct {
         child: *const Widget,
         background: Color = colors.transparent,
+        border: ?Color = null,
     };
 
     pub const Clickable = struct {
@@ -496,6 +498,10 @@ pub const widgets = struct {
         return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background } };
     }
 
+    pub fn borderedBox(allocator: std.mem.Allocator, child: Widget, background: Color, border: ?Color) !Widget {
+        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background, .border = border } };
+    }
+
     pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
@@ -568,10 +574,11 @@ pub const Element = struct {
 fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) !Widget {
     const hovered = interaction.isHovered(button_widget.id);
     const pressed = button_widget.pressed or interaction.isPressed(button_widget.id);
+    const focused = interaction.isFocused(.named(button_widget.id));
     const label = widgets.coloredText(button_widget.label, buttonForeground(theme, hovered));
     const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
     const background = if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
-    const surface = try widgets.box(allocator, padded, background);
+    const surface = try widgets.borderedBox(allocator, padded, background, if (focused) buttonFocusedBorder(theme) else null);
     return widgets.clickable(allocator, button_widget.id, surface);
 }
 
@@ -591,6 +598,10 @@ fn buttonForeground(theme: Theme, hovered: bool) Color {
 
 fn buttonPressedBackground(theme: Theme) Color {
     return theme.button_theme.pressed_background orelse theme.color_scheme.on_surface;
+}
+
+fn buttonFocusedBorder(theme: Theme) Color {
+    return theme.button_theme.focused_border orelse theme.color_scheme.on_surface;
 }
 
 fn inputForeground(theme: Theme) Color {
@@ -631,6 +642,7 @@ pub const RenderNode = struct {
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
+    box_border: ?Color = null,
     placeholder: ?[]const u8 = null,
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
@@ -777,6 +789,8 @@ pub const KeyInput = union(enum) {
     text: []const u8,
     backspace,
     enter,
+    space,
+    tab: struct { reverse: bool = false },
 };
 
 pub const CursorShape = enum {
@@ -1607,6 +1621,7 @@ pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list
         },
         .box => {
             if (node.background.a > 0) try display_list.fillRect(allocator, node.rect, node.background);
+            if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border);
         },
         .text_input => {
             try display_list.fillRect(allocator, node.rect, node.background);
@@ -1654,6 +1669,51 @@ pub const ClickHit = struct {
     id: []const u8,
     callback: ?Widget.Callback = null,
 };
+
+pub const FocusTarget = struct {
+    id: []const u8,
+    kind: Kind,
+    callback: ?Widget.Callback = null,
+
+    pub const Kind = enum {
+        text_input,
+        clickable,
+    };
+};
+
+pub fn collectFocusTargets(allocator: std.mem.Allocator, node: *const RenderNode) ![]FocusTarget {
+    var targets: std.ArrayList(FocusTarget) = .empty;
+    errdefer targets.deinit(allocator);
+    try appendFocusTargets(allocator, &targets, node);
+    return try targets.toOwnedSlice(allocator);
+}
+
+fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(FocusTarget), node: *const RenderNode) !void {
+    switch (node.kind) {
+        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input }),
+        .clickable => if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = node.click_callback }),
+        else => {},
+    }
+    for (node.children) |*child| {
+        try appendFocusTargets(allocator, targets, child);
+    }
+}
+
+pub fn findFocusTarget(node: *const RenderNode, id: []const u8) ?FocusTarget {
+    switch (node.kind) {
+        .text_input => if (node.focus_id) |focus_id| {
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input };
+        },
+        .clickable => if (node.clickable_id) |clickable_id| {
+            if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = node.click_callback };
+        },
+        else => {},
+    }
+    for (node.children) |*child| {
+        if (findFocusTarget(child, id)) |target| return target;
+    }
+    return null;
+}
 
 pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     var index = node.children.len;
@@ -1727,6 +1787,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .kind = .box,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .background = box_widget.background,
+                .box_border = box_widget.border,
                 .children = children,
             };
         },
@@ -2100,6 +2161,33 @@ test "button uses ambient pressed styling" {
     try std.testing.expectEqual(colors.ink, box_node.background);
 }
 
+test "button uses ambient focused border" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.accent,
+            .focused_border = colors.black,
+        },
+    };
+    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", false);
+    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
+    var scope: BuildScope = .{
+        .allocator = build_arena.allocator(),
+        .interaction = .{ .focused_id = "focused" },
+    };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const box_node = root.children[0].children[0].children[0];
+    try std.testing.expectEqual(colors.black, box_node.box_border.?);
+}
+
 test "theme widget provides ambient text and input styling" {
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
@@ -2140,6 +2228,29 @@ test "text input derives focus from ambient focus node" {
     try std.testing.expect(root.focused);
     try std.testing.expectEqualStrings("field-focus", root.focus_id.?);
     try std.testing.expectEqualStrings("field-focus", hitTestTextInput(&root, .{ .x = 1, .y = 1 }).?);
+}
+
+test "focus targets are collected in render tree order" {
+    const allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena.deinit();
+    const build_allocator = build_arena.allocator();
+
+    const input = widgets.textInput("input", "", "placeholder");
+    const button = try widgets.button(build_allocator, "button", "Button", false);
+    const children = [_]Widget{ input, button };
+    const column = try widgets.column(build_allocator, &children, 4);
+    var root = try buildRenderTree(allocator, &column, .{ .max_width = 200, .max_height = 120 });
+    defer destroyRenderTree(allocator, &root);
+
+    const targets = try collectFocusTargets(allocator, &root);
+    defer allocator.free(targets);
+    try std.testing.expectEqual(@as(usize, 2), targets.len);
+    try std.testing.expectEqualStrings("input", targets[0].id);
+    try std.testing.expectEqual(FocusTarget.Kind.text_input, targets[0].kind);
+    try std.testing.expectEqualStrings("button", targets[1].id);
+    try std.testing.expectEqual(FocusTarget.Kind.clickable, targets[1].kind);
+    try std.testing.expectEqual(FocusTarget.Kind.clickable, findFocusTarget(&root, "button").?.kind);
 }
 
 test "center moves descendants" {

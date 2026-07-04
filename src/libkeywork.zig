@@ -44,6 +44,7 @@ pub const KeyInput = core.KeyInput;
 pub const CursorShape = core.CursorShape;
 pub const PointerButtonState = core.PointerButtonState;
 pub const ClickHit = core.ClickHit;
+pub const FocusTarget = core.FocusTarget;
 pub const buildRenderTree = core.buildRenderTree;
 pub const buildRenderTreeMeasured = core.buildRenderTreeMeasured;
 pub const buildRenderTreeFromElement = core.buildRenderTreeFromElement;
@@ -61,6 +62,8 @@ pub const hitTestButton = core.hitTestButton;
 pub const hitTestClick = core.hitTestClick;
 pub const hitTestTextInput = core.hitTestTextInput;
 pub const hitTestCursorShape = core.hitTestCursorShape;
+pub const collectFocusTargets = core.collectFocusTargets;
+pub const findFocusTarget = core.findFocusTarget;
 
 pub const Runtime = @import("runtime.zig").Runtime;
 pub const BackendKind = app_runner.BackendKind;

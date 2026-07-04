@@ -169,6 +169,7 @@ pub const Runtime = struct {
 
         try self.setFocused(null);
         if (keywork.hitTestClick(root, point)) |hit| {
+            try self.setFocused(hit.id);
             if (try self.setPressedId(hit.id)) {
                 try self.rebuild();
                 try self.requestRepaint();
@@ -193,12 +194,7 @@ pub const Runtime = struct {
         if (should_activate) {
             const click_hit = hit.?;
             log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
-            if (click_hit.callback) |callback| {
-                try callback.call();
-                needs_update = true;
-            } else if (try self.app.click(click_hit.id)) {
-                needs_update = true;
-            }
+            if (try self.activateClick(click_hit)) needs_update = true;
         }
 
         if (needs_update) {
@@ -223,16 +219,72 @@ pub const Runtime = struct {
     }
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
-        if (self.focused_id == null) return;
         switch (input) {
-            .text => |bytes| try self.input_text.appendSlice(self.allocator, bytes),
+            .tab => |tab| try self.focusNext(tab.reverse),
+            .text => |bytes| {
+                if (!self.focusedTargetIs(.text_input)) return;
+                try self.input_text.appendSlice(self.allocator, bytes);
+            },
             .backspace => {
+                if (!self.focusedTargetIs(.text_input)) return;
                 popLastGrapheme(&self.input_text);
             },
-            .enter => try self.setFocused(null),
+            .space => {
+                const target = self.focusedTarget() orelse return;
+                switch (target.kind) {
+                    .text_input => try self.input_text.append(self.allocator, ' '),
+                    .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                }
+            },
+            .enter => {
+                const target = self.focusedTarget() orelse return;
+                switch (target.kind) {
+                    .text_input => try self.setFocused(null),
+                    .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                }
+            },
         }
         try self.rebuild();
         try self.requestRepaint();
+    }
+
+    fn focusedTarget(self: *Runtime) ?keywork.FocusTarget {
+        const focused_id = self.focused_id orelse return null;
+        const root = if (self.root) |*root| root else return null;
+        return keywork.findFocusTarget(root, focused_id);
+    }
+
+    fn focusedTargetIs(self: *Runtime, kind: keywork.FocusTarget.Kind) bool {
+        const target = self.focusedTarget() orelse return false;
+        return target.kind == kind;
+    }
+
+    fn focusNext(self: *Runtime, reverse: bool) !void {
+        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const targets = try keywork.collectFocusTargets(self.allocator, root);
+        defer self.allocator.free(targets);
+        if (targets.len == 0) return;
+
+        const next_index = if (self.focused_id) |focused_id| blk: {
+            for (targets, 0..) |target, index| {
+                if (!std.mem.eql(u8, target.id, focused_id)) continue;
+                break :blk if (reverse)
+                    if (index == 0) targets.len - 1 else index - 1
+                else
+                    (index + 1) % targets.len;
+            }
+            break :blk if (reverse) targets.len - 1 else 0;
+        } else if (reverse) targets.len - 1 else 0;
+
+        try self.setFocused(targets[next_index].id);
+    }
+
+    fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
+        if (hit.callback) |callback| {
+            try callback.call();
+            return true;
+        }
+        return try self.app.click(hit.id);
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
@@ -427,4 +479,71 @@ test "popLastGrapheme removes one extended grapheme cluster" {
     try std.testing.expectEqualStrings("a", bytes.items);
     popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("", bytes.items);
+}
+
+test "tab traversal focuses widgets and enter activates focused clickable" {
+    const TestApp = struct {
+        clicks: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget, .click = click } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !keywork.Widget {
+            _ = ptr;
+            const input = keywork.widgets.textInput("input", context.input_text, "placeholder");
+            const button = try keywork.widgets.button(scope.allocator, "button", "Button", false);
+            const children = [_]keywork.Widget{ input, button };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+
+        fn click(ptr: *anyopaque, id: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, id, "button")) return false;
+            self.clicks += 1;
+            return true;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+    try runtime.keyInput(.{ .text = "a" });
+    try std.testing.expectEqualStrings("a", runtime.input_text.items);
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("button", runtime.focused_id.?);
+    try runtime.keyInput(.enter);
+    try std.testing.expectEqual(@as(usize, 1), app.clicks);
+    try runtime.keyInput(.space);
+    try std.testing.expectEqual(@as(usize, 2), app.clicks);
+
+    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+    try runtime.keyInput(.space);
+    try std.testing.expectEqualStrings("a ", runtime.input_text.items);
 }
