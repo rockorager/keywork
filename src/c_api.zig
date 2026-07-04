@@ -429,15 +429,21 @@ pub export fn keywork_button(
     build: ?*KeyworkBuild,
     id: ?[*:0]const u8,
     label: ?[*:0]const u8,
-    pressed: c_int,
+    callback: ?KeyworkClickCallback,
+    userdata: ?*anyopaque,
 ) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const allocator = scope.scope.allocator;
+    const on_pressed = if (callback) |callback_fn| blk: {
+        const callback_state = allocator.create(ClickCallback) catch return null;
+        callback_state.* = .{ .callback = callback_fn, .userdata = userdata };
+        break :blk callback_state.keyworkCallback();
+    } else null;
     return makeWidget(scope, keywork.widgets.button(
         allocator,
         copyString(allocator, id, "") catch return null,
         copyString(allocator, label, "") catch return null,
-        pressed != 0,
+        on_pressed,
     ) catch return null);
 }
 

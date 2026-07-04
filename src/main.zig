@@ -13,13 +13,11 @@ const Widget = keywork.Widget;
 
 const DemoApp = struct {
     lua: *lua_app.App,
-    button_pressed: bool = false,
     pulse: bool = false,
 
     pub fn host(self: *DemoApp) AppHost {
         return .{ .ptr = self, .vtable = &.{
             .build_widget = buildWidget,
-            .click = click,
             .timer = timer,
         } };
     }
@@ -27,16 +25,8 @@ const DemoApp = struct {
     fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !Widget {
         const self: *DemoApp = @ptrCast(@alignCast(ptr));
         var app_context = context;
-        app_context.button_pressed = self.button_pressed;
         app_context.pulse = self.pulse;
         return self.lua.buildWidget(scope.allocator, app_context);
-    }
-
-    fn click(ptr: *anyopaque, id: []const u8) !bool {
-        const self: *DemoApp = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, id, "hello")) return false;
-        self.button_pressed = !self.button_pressed;
-        return true;
     }
 
     fn timer(ptr: *anyopaque, expirations: u64) !bool {

@@ -16,7 +16,6 @@ const NativeApp = struct {
     fn host(self: *NativeApp) AppHost {
         return .{ .ptr = self, .vtable = &.{
             .build_widget = buildWidget,
-            .click = click,
             .timer = timer,
         } };
     }
@@ -29,7 +28,7 @@ const NativeApp = struct {
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
         const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
 
-        const button = try widgets.button(allocator, "increment", "Increment", false);
+        const button = try widgets.button(allocator, "increment", "Increment", .{ .ptr = self, .call_fn = increment });
         const input = widgets.textInput("native-input", context.input_text, "Type here");
         const children = [_]Widget{
             widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),
@@ -44,11 +43,9 @@ const NativeApp = struct {
         return widgets.padding(allocator, keywork.EdgeInsets.all(24), column);
     }
 
-    fn click(ptr: *anyopaque, id: []const u8) !bool {
+    fn increment(ptr: *anyopaque) !void {
         const self: *NativeApp = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, id, "increment")) return false;
         self.count += 1;
-        return true;
     }
 
     fn timer(ptr: *anyopaque, expirations: u64) !bool {

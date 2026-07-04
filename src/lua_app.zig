@@ -9,6 +9,52 @@ const linux = std.os.linux;
 const State = keywork.AppContext;
 const BuildScope = keywork.BuildScope;
 
+const LuaCallback = struct {
+    allocator: std.mem.Allocator,
+    lua_state: *c.lua_State,
+    ref: c_int,
+
+    fn keyworkCallback(self: *LuaCallback) keywork.Widget.Callback {
+        return .{
+            .ptr = self,
+            .call_fn = call,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn call(ptr: *anyopaque) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        if (c.lua_pcall(self.lua_state, 0, 0, 0) != 0) {
+            var len: usize = 0;
+            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
+            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("callback failed: {s}", .{message[0..len]});
+            pop(self.lua_state, 1);
+            return error.LuaCallbackFailed;
+        }
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        const ref = c.luaL_ref(self.lua_state, c.LUA_REGISTRYINDEX);
+        errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, ref);
+        c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        self.ref = -2;
+        const result = try allocator.create(LuaCallback);
+        result.* = .{ .allocator = allocator, .lua_state = self.lua_state, .ref = ref };
+        return result;
+    }
+
+    fn destroy(_: std.mem.Allocator, ptr: *anyopaque) void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        if (self.ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
@@ -59,7 +105,7 @@ pub const App = struct {
             else => return error.ScriptReturnedInvalidValue,
         }
 
-        return try parseWidget(self.state, allocator, runtime_state, -1);
+        return try parseWidget(self.state, allocator, allocator, runtime_state, -1);
     }
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
@@ -99,10 +145,8 @@ fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
-    c.lua_createtable(lua_state, 0, 6);
+    c.lua_createtable(lua_state, 0, 5);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushboolean(lua_state, if (state.button_pressed) 1 else 0);
-    c.lua_setfield(lua_state, table, "button_pressed");
     c.lua_pushboolean(lua_state, if (state.pulse) 1 else 0);
     c.lua_setfield(lua_state, table, "pulse");
     c.lua_pushlstring(lua_state, state.input_text.ptr, state.input_text.len);
@@ -115,7 +159,13 @@ fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_setfield(lua_state, table, "color_scheme");
 }
 
-fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_state: State, index: c_int) !keywork.Widget {
+fn parseWidget(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    callback_allocator: std.mem.Allocator,
+    runtime_state: State,
+    index: c_int,
+) !keywork.Widget {
     const table = absoluteIndex(lua_state, index);
     try expectType(lua_state, table, c.LUA_TTABLE);
 
@@ -131,14 +181,14 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .keyed = .{ .key = .{ .string = key }, .child = child } };
     }
     if (std.mem.eql(u8, kind, "box")) {
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .box = .{
             .child = child,
             .background = getColorField(lua_state, table, "background", keywork.colors.transparent),
@@ -149,14 +199,14 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .clickable = .{ .id = id, .child = child } };
     }
     if (std.mem.eql(u8, kind, "button")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const label = try dupeStringField(lua_state, allocator, table, "label");
-        const pressed = getBooleanField(lua_state, table, "pressed", false);
-        return keywork.widgets.button(allocator, id, label, pressed);
+        const on_pressed = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_pressed");
+        return keywork.widgets.button(allocator, id, label, on_pressed);
     }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -174,7 +224,7 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         for (children, 0..) |*child, child_index| {
             c.lua_rawgeti(lua_state, children_table, @intCast(child_index + 1));
             defer pop(lua_state, 1);
-            child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+            child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         }
         return .{ .column = .{ .children = children, .gap = getNumberField(lua_state, table, "gap", 0) } };
     }
@@ -182,7 +232,7 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         const inset = getNumberField(lua_state, table, "insets", 0);
         return .{ .padding = .{ .insets = keywork.EdgeInsets.all(inset), .child = child } };
     }
@@ -190,7 +240,7 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .center = .{ .child = child } };
     }
 
@@ -231,6 +281,25 @@ fn getBooleanField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, de
     defer pop(lua_state, 1);
     if (!c.lua_isboolean(lua_state, -1)) return default;
     return c.lua_toboolean(lua_state, -1) != 0;
+}
+
+fn getOptionalCallbackField(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    table: c_int,
+    key: [*:0]const u8,
+) !?keywork.Widget.Callback {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+
+    c.lua_pushvalue(lua_state, -1);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+    const callback = try allocator.create(LuaCallback);
+    callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
+    return callback.keyworkCallback();
 }
 
 fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {

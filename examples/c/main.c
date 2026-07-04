@@ -9,7 +9,7 @@ struct app_state {
     int pulse;
 };
 
-static int click(void *userdata, const char *id);
+static void increment(void *userdata);
 static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints);
 static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
 static void *status_create_state(void *userdata);
@@ -41,7 +41,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     keywork_widget_t *panel = keywork_element(build, &panel_vtable, state);
 
     keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
-        keywork_button(build, "increment", "Increment", 0));
+        keywork_button(build, "increment", "Increment", increment, state));
     keywork_widget_t *input = keywork_text_input(build, "c-input", context->input_text, "Type here");
     keywork_widget_t *labels[] = {
         keywork_text(build, state->pulse ? "timer: tick" : "timer: tock"),
@@ -62,11 +62,9 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     return keywork_padding(build, 24.0f, column);
 }
 
-static int click(void *userdata, const char *id) {
+static void increment(void *userdata) {
     struct app_state *state = userdata;
-    if (id == NULL || strcmp(id, "increment") != 0) return 0;
     state->count += 1;
-    return 1;
 }
 
 static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints) {
@@ -142,7 +140,6 @@ int main(void) {
     struct app_state state = {0};
     const struct keywork_app_vtable app = {
         .build = build,
-        .click = click,
         .timer = timer,
     };
     const struct keywork_run_options options = {

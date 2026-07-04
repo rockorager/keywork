@@ -97,7 +97,7 @@ keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, con
 keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
 keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child);
 keywork_widget_t *keywork_clickable_callback(keywork_build_t *build, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);
-keywork_widget_t *keywork_button(keywork_build_t *build, const char *id, const char *label, int pressed);
+keywork_widget_t *keywork_button(keywork_build_t *build, const char *id, const char *label, keywork_click_callback_t callback, void *userdata);
 keywork_widget_t *keywork_render_object(keywork_build_t *build, const struct keywork_render_object_vtable *vtable, void *userdata);
 int keywork_display_list_fill_rect(keywork_display_list_t *display_list, struct keywork_rect rect, uint32_t argb);
 keywork_widget_t *keywork_stateful(keywork_build_t *build, const struct keywork_stateful_vtable *vtable, void *userdata);

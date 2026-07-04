@@ -486,22 +486,20 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
         clicks: usize = 0,
 
         fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget, .click = click } };
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
         }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !keywork.Widget {
-            _ = ptr;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             const input = keywork.widgets.textInput("input", context.input_text, "placeholder");
-            const button = try keywork.widgets.button(scope.allocator, "button", "Button", false);
+            const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = increment });
             const children = [_]keywork.Widget{ input, button };
             return keywork.widgets.column(scope.allocator, &children, 4);
         }
 
-        fn click(ptr: *anyopaque, id: []const u8) !bool {
+        fn increment(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!std.mem.eql(u8, id, "button")) return false;
             self.clicks += 1;
-            return true;
         }
     };
 

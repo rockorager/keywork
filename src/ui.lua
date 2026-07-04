@@ -65,12 +65,12 @@ function ui.center(child)
   }
 end
 
-function ui.button(id, label, pressed)
+function ui.button(id, label, on_pressed)
   return {
     type = "button",
     id = id,
     label = label,
-    pressed = pressed or false,
+    on_pressed = on_pressed,
   }
 end
 

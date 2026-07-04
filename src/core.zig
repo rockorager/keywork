@@ -82,6 +82,8 @@ pub const ButtonTheme = struct {
     hover_foreground: ?Color = null,
     focused_border: ?Color = null,
     pressed_background: ?Color = null,
+    disabled_background: ?Color = null,
+    disabled_foreground: ?Color = null,
     padding: f32 = 8,
 };
 
@@ -260,7 +262,7 @@ pub const Widget = union(enum) {
     pub const Button = struct {
         id: []const u8,
         label: []const u8,
-        pressed: bool = false,
+        on_pressed: ?Callback = null,
     };
 
     pub const Box = struct {
@@ -506,9 +508,9 @@ pub const widgets = struct {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, pressed: bool) !Widget {
+    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
         _ = allocator;
-        return .{ .button = .{ .id = id, .label = label, .pressed = pressed } };
+        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
     }
 
     pub fn theme(allocator: std.mem.Allocator, theme_value: Theme, child: Widget) !Widget {
@@ -572,14 +574,21 @@ pub const Element = struct {
 };
 
 fn buildButtonWidget(allocator: std.mem.Allocator, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) !Widget {
-    const hovered = interaction.isHovered(button_widget.id);
-    const pressed = button_widget.pressed or interaction.isPressed(button_widget.id);
-    const focused = interaction.isFocused(.named(button_widget.id));
-    const label = widgets.coloredText(button_widget.label, buttonForeground(theme, hovered));
+    const enabled = button_widget.on_pressed != null;
+    const hovered = enabled and interaction.isHovered(button_widget.id);
+    const pressed = enabled and interaction.isPressed(button_widget.id);
+    const focused = enabled and interaction.isFocused(.named(button_widget.id));
+    const label = widgets.coloredText(button_widget.label, buttonForeground(theme, enabled, hovered));
     const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
-    const background = if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
+    const background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
     const surface = try widgets.borderedBox(allocator, padded, background, if (focused) buttonFocusedBorder(theme) else null);
-    return widgets.clickable(allocator, button_widget.id, surface);
+    if (!enabled) return surface;
+    const surface_child = try Widget.alloc(allocator, surface);
+    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(button_widget.on_pressed.?) } };
+}
+
+fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
+    return .{ .ptr = callback.ptr, .call_fn = callback.call_fn };
 }
 
 fn textColor(theme: Theme) Color {
@@ -591,13 +600,18 @@ fn buttonBackground(theme: Theme, hovered: bool) Color {
     return theme.button_theme.background orelse theme.color_scheme.primary;
 }
 
-fn buttonForeground(theme: Theme, hovered: bool) Color {
+fn buttonForeground(theme: Theme, enabled: bool, hovered: bool) Color {
+    if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.on_surface_variant;
     if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.surface;
     return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
 }
 
 fn buttonPressedBackground(theme: Theme) Color {
     return theme.button_theme.pressed_background orelse theme.color_scheme.on_surface;
+}
+
+fn buttonDisabledBackground(theme: Theme) Color {
+    return theme.button_theme.disabled_background orelse theme.color_scheme.surface_variant;
 }
 
 fn buttonFocusedBorder(theme: Theme) Color {
@@ -800,7 +814,6 @@ pub const CursorShape = enum {
 };
 
 pub const AppContext = struct {
-    button_pressed: bool = false,
     pulse: bool = false,
     input_text: []const u8 = "",
     window_width: f32 = 0,
@@ -946,10 +959,10 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .center, .widget = element_widget, .children = children };
         },
-        .button => |button_widget| {
+        .button => {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, button_widget);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, element_widget.button);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -1177,8 +1190,13 @@ pub fn updateElementTreeScoped(
             try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
         },
         .button => |button_widget| {
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, button_widget);
-            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
+            _ = button_widget;
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, element_widget.button);
+            try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
+            destroyElementWidget(allocator, &element.widget);
+            element.widget = element_widget;
         },
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -1502,7 +1520,10 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const id = try allocator.dupe(u8, button_widget.id);
             errdefer allocator.free(id);
             const label = try allocator.dupe(u8, button_widget.label);
-            break :blk .{ .button = .{ .id = id, .label = label, .pressed = button_widget.pressed } };
+            errdefer allocator.free(label);
+            const callback = if (button_widget.on_pressed) |on_pressed| try on_pressed.clone(allocator) else null;
+            errdefer if (callback) |on_pressed| on_pressed.destroy(allocator);
+            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback } };
         },
         .box => |box_widget| .{ .box = box_widget },
         .clickable => |clickable_widget| blk: {
@@ -1553,6 +1574,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
         .text => |text_widget| allocator.free(text_widget.value),
         .button => |button_widget| {
+            if (button_widget.on_pressed) |callback| callback.destroy(allocator);
             allocator.free(button_widget.id);
             allocator.free(button_widget.label);
         },
@@ -2025,6 +2047,14 @@ fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
     }
 }
 
+var test_callback_state: u8 = 0;
+
+fn testCallback() Widget.Callback {
+    return .{ .ptr = &test_callback_state, .call_fn = testCallbackCall };
+}
+
+fn testCallbackCall(_: *anyopaque) !void {}
+
 test "layout, paint, and hit test a padded column" {
     const allocator = std.testing.allocator;
 
@@ -2058,8 +2088,11 @@ test "button widget composes styled clickable content" {
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
 
-    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", true);
-    var root = try buildRenderTree(retained_allocator, &button_widget, .{ .max_width = 200, .max_height = 80 });
+    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", testCallback());
+    var scope: BuildScope = .{ .allocator = build_arena.allocator(), .interaction = .{ .pressed_id = "confirm" } };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &button_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .button), root.kind);
@@ -2091,7 +2124,7 @@ test "theme widget provides ambient button styling" {
             .padding = 4,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", false);
+    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyRenderTree(retained_allocator, &root);
@@ -2117,7 +2150,7 @@ test "button uses ambient hover styling" {
             .hover_foreground = colors.panel,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", false);
+    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", testCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -2146,7 +2179,7 @@ test "button uses ambient pressed styling" {
             .pressed_background = colors.ink,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", false);
+    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", testCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -2173,7 +2206,7 @@ test "button uses ambient focused border" {
             .focused_border = colors.black,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", false);
+    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", testCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -2186,6 +2219,33 @@ test "button uses ambient focused border" {
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(colors.black, box_node.box_border.?);
+}
+
+test "button without action is disabled and skipped by focus traversal" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .disabled_background = colors.panel,
+            .disabled_foreground = colors.ink,
+        },
+    };
+    const button_widget = try widgets.button(build_arena.allocator(), "disabled", "Disabled", null);
+    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
+    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyRenderTree(retained_allocator, &root);
+
+    const box_node = root.children[0].children[0];
+    try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
+    try std.testing.expectEqual(colors.panel, box_node.background);
+    try std.testing.expectEqual(colors.ink, box_node.children[0].children[0].foreground);
+
+    const targets = try collectFocusTargets(retained_allocator, &root);
+    defer retained_allocator.free(targets);
+    try std.testing.expectEqual(@as(usize, 0), targets.len);
 }
 
 test "theme widget provides ambient text and input styling" {
@@ -2237,7 +2297,7 @@ test "focus targets are collected in render tree order" {
     const build_allocator = build_arena.allocator();
 
     const input = widgets.textInput("input", "", "placeholder");
-    const button = try widgets.button(build_allocator, "button", "Button", false);
+    const button = try widgets.button(build_allocator, "button", "Button", testCallback());
     const children = [_]Widget{ input, button };
     const column = try widgets.column(build_allocator, &children, 4);
     var root = try buildRenderTree(allocator, &column, .{ .max_width = 200, .max_height = 120 });
@@ -2387,6 +2447,65 @@ test "element tree retains cloned callbacks beyond build scope" {
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqualStrings("arena-button", element.widget.clickable.id);
     try std.testing.expectEqualStrings("arena label", element.children[0].widget.text.value);
+
+    destroyElementTree(retained_allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), destroys);
+}
+
+test "button composed clickable borrows retained action callback" {
+    const CallbackState = struct {
+        calls: *usize,
+        clones: *usize,
+        destroys: *usize,
+
+        fn callback(self: *@This()) Widget.Callback {
+            return .{
+                .ptr = self,
+                .call_fn = call,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+            };
+        }
+
+        fn call(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls.* += 1;
+        }
+
+        fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clones.* += 1;
+            const result = try allocator.create(@This());
+            result.* = self.*;
+            return result;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroys.* += 1;
+            allocator.destroy(self);
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var calls: usize = 0;
+    var clones: usize = 0;
+    var destroys: usize = 0;
+    const state = try build_arena.allocator().create(CallbackState);
+    state.* = .{ .calls = &calls, .clones = &clones, .destroys = &destroys };
+    const button = try widgets.button(build_arena.allocator(), "action", "Action", state.callback());
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &button, .{ .max_width = 120, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 1), clones);
+    try std.testing.expectEqual(element.widget.button.on_pressed.?.ptr, element.children[0].widget.clickable.on_click.?.ptr);
+
+    try std.testing.expect(build_arena.reset(.free_all));
+    try element.children[0].widget.clickable.on_click.?.call();
+    try std.testing.expectEqual(@as(usize, 1), calls);
 
     destroyElementTree(retained_allocator, &element);
     try std.testing.expectEqual(@as(usize, 1), destroys);
