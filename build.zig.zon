@@ -1,0 +1,17 @@
+.{
+    .name = .keywork,
+    .version = "0.0.0",
+    .fingerprint = 0xca2c6caa434d7af2,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
+            .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
