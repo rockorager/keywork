@@ -213,7 +213,7 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .focus = .{ .node = .named(id), .child = child } };
+        return .{ .focus = .{ .node = .named(id), .child = child, .autofocus = getBooleanField(lua_state, table, "autofocus", false) } };
     }
     if (std.mem.eql(u8, kind, "focus_scope")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");

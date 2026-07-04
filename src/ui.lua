@@ -35,11 +35,13 @@ function ui.clickable(id, child, on_click)
   }
 end
 
-function ui.focus(id, child)
+function ui.focus(id, child, options)
+  options = options or {}
   return {
     type = "focus",
     id = id,
     child = child,
+    autofocus = options.autofocus or false,
   }
 end
 

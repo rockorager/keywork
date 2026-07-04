@@ -487,30 +487,67 @@ pub const Runtime = struct {
             keywork.destroyRenderTree(self.allocator, old_root);
             self.root = null;
         }
-        _ = self.build_arena.reset(.retain_capacity);
-        const state = self.currentState();
-        var build_scope: BuildScope = .{
-            .allocator = self.build_arena.allocator(),
-            .theme = keywork.Theme.fromColorScheme(state.color_scheme),
-            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
-        };
 
-        var app_root = try self.app.buildWidget(&build_scope, state);
-        if (self.element_root) |*element_root| {
-            try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
-        } else {
-            self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
+        const max_focus_rebuild_passes = 4;
+        var pass: usize = 0;
+        while (true) : (pass += 1) {
+            _ = self.build_arena.reset(.retain_capacity);
+            const state = self.currentState();
+            var build_scope: BuildScope = .{
+                .allocator = self.build_arena.allocator(),
+                .theme = keywork.Theme.fromColorScheme(state.color_scheme),
+                .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
+            };
+
+            var app_root = try self.app.buildWidget(&build_scope, state);
+            if (self.element_root) |*element_root| {
+                try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
+            } else {
+                self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
+            }
+
+            if (self.render_object_root) |*render_object_root| {
+                try keywork.updateRenderObjectTree(self.allocator, render_object_root, &self.element_root.?);
+            } else {
+                self.render_object_root = try keywork.buildRenderObjectTree(self.allocator, &self.element_root.?);
+            }
+
+            var new_root = try keywork.buildRenderTreeFromElement(self.allocator, &self.element_root.?, self.constraints, self.backend);
+            errdefer keywork.destroyRenderTree(self.allocator, &new_root);
+            self.root = new_root;
+            errdefer self.root = null;
+
+            if (!try self.reconcileFocusAfterRebuild()) break;
+            if (pass + 1 >= max_focus_rebuild_passes) return error.FocusDidNotStabilize;
+            if (self.root) |*focused_with_old_tree| {
+                keywork.destroyRenderTree(self.allocator, focused_with_old_tree);
+                self.root = null;
+            }
+        }
+    }
+
+    fn reconcileFocusAfterRebuild(self: *Runtime) !bool {
+        const root = if (self.root) |*root| root else return false;
+        const targets = try keywork.collectFocusTargets(self.allocator, root);
+        defer self.allocator.free(targets);
+
+        if (self.focused_id) |focused_id| {
+            for (targets) |target| {
+                if (std.mem.eql(u8, target.id, focused_id)) return false;
+            }
         }
 
-        if (self.render_object_root) |*render_object_root| {
-            try keywork.updateRenderObjectTree(self.allocator, render_object_root, &self.element_root.?);
-        } else {
-            self.render_object_root = try keywork.buildRenderObjectTree(self.allocator, &self.element_root.?);
-        }
+        const desired_focus = if (autofocusTarget(targets)) |target| target.id else null;
+        if (sameOptionalString(self.focused_id, desired_focus)) return false;
+        try self.setFocused(desired_focus);
+        return true;
+    }
 
-        var new_root = try keywork.buildRenderTreeFromElement(self.allocator, &self.element_root.?, self.constraints, self.backend);
-        errdefer keywork.destroyRenderTree(self.allocator, &new_root);
-        self.root = new_root;
+    fn autofocusTarget(targets: []const keywork.FocusTarget) ?keywork.FocusTarget {
+        for (targets) |target| {
+            if (target.autofocus) return target;
+        }
+        return null;
     }
 };
 
@@ -719,6 +756,111 @@ test "focus widget participates in traversal and shortcut context" {
     try std.testing.expectEqualStrings("label-focus", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqual(@as(usize, 1), app.actions);
+}
+
+test "autofocus focus node is selected during initial build" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            return keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("initial"),
+                keywork.widgets.text("Initial focus"),
+                .{ .autofocus = true },
+            );
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 80 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("initial", runtime.focused_id.?);
+    try std.testing.expect(runtime.root.?.focused);
+}
+
+test "autofocus replaces focused node removed during rebuild" {
+    const TestApp = struct {
+        show_old_focus: bool = true,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const first = if (self.show_old_focus)
+                try keywork.widgets.focus(scope.allocator, .named("old"), keywork.widgets.text("Old"))
+            else
+                keywork.widgets.text("Removed");
+            const replacement = try keywork.widgets.focusWithOptions(
+                scope.allocator,
+                .named("replacement"),
+                keywork.widgets.text("Replacement"),
+                .{ .autofocus = true },
+            );
+            const children = [_]keywork.Widget{ first, replacement };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8) !Size {
+            return keywork.TextMeasurer.fixed.measureText(value);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 240, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.setFocused("old");
+    try runtime.rebuild();
+    try std.testing.expectEqualStrings("old", runtime.focused_id.?);
+
+    app.show_old_focus = false;
+    try runtime.rebuild();
+    try std.testing.expectEqualStrings("replacement", runtime.focused_id.?);
+    try std.testing.expect(runtime.root.?.children[1].focused);
 }
 
 test "focus scope contains tab traversal once focus is inside it" {

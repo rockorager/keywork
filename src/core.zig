@@ -299,6 +299,7 @@ pub const Widget = union(enum) {
     pub const Focus = struct {
         node: FocusNode,
         child: *const Widget,
+        autofocus: bool = false,
     };
 
     pub const FocusScope = struct {
@@ -559,7 +560,15 @@ pub const widgets = struct {
     }
 
     pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
-        return .{ .focus = .{ .node = node, .child = try Widget.alloc(allocator, child) } };
+        return focusWithOptions(allocator, node, child, .{});
+    }
+
+    pub const FocusOptions = struct {
+        autofocus: bool = false,
+    };
+
+    pub fn focusWithOptions(allocator: std.mem.Allocator, node: FocusNode, child: Widget, options: FocusOptions) !Widget {
+        return .{ .focus = .{ .node = node, .child = try Widget.alloc(allocator, child), .autofocus = options.autofocus } };
     }
 
     pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
@@ -741,6 +750,7 @@ pub const RenderNode = struct {
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
+    autofocus: bool = false,
     render_object: ?Widget.RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
@@ -1708,7 +1718,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         },
         .focus => |focus_widget| blk: {
             const focus_id = try allocator.dupe(u8, focus_widget.node.id);
-            break :blk .{ .focus = .{ .node = .named(focus_id), .child = focus_widget.child } };
+            break :blk .{ .focus = .{ .node = .named(focus_id), .child = focus_widget.child, .autofocus = focus_widget.autofocus } };
         },
         .focus_scope => |focus_scope_widget| blk: {
             const id = try allocator.dupe(u8, focus_scope_widget.id);
@@ -1945,6 +1955,7 @@ pub const FocusTarget = struct {
     kind: Kind,
     callback: ?Widget.Callback = null,
     scope_id: ?[]const u8 = null,
+    autofocus: bool = false,
 
     pub const Kind = enum {
         text_input,
@@ -1964,7 +1975,7 @@ fn appendFocusTargets(allocator: std.mem.Allocator, targets: *std.ArrayList(Focu
     const active_scope_id = node.focus_scope_id orelse scope_id;
     switch (node.kind) {
         .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id }),
-        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus, .scope_id = active_scope_id }),
+        .focus => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .focus, .scope_id = active_scope_id, .autofocus = node.autofocus }),
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id });
         },
@@ -1986,7 +1997,7 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
             if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id };
         },
         .focus => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus, .scope_id = active_scope_id };
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .focus, .scope_id = active_scope_id, .autofocus = node.autofocus };
         },
         .clickable => if (node.click_callback) |callback| {
             if (node.clickable_id) |clickable_id| {
@@ -2231,6 +2242,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .focus_id = focus_id,
                 .focused = element.focused,
+                .autofocus = focus_widget.autofocus,
                 .children = children,
             };
         },
