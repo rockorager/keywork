@@ -26,6 +26,22 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
 
+    const uucode_dep = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{"grapheme_break"}),
+    });
+    root_module.addImport("uucode", uucode_dep.module("uucode"));
+
+    const xkb_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/xkb_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xkb_c.linkSystemLibrary("xkbcommon", .{});
+    root_module.addImport("xkb_c", xkb_c.createModule());
+    root_module.linkSystemLibrary("xkbcommon", .{});
+
     const luajit_c = b.addTranslateC(.{
         .root_source_file = b.path("src/luajit_c.h"),
         .target = target,

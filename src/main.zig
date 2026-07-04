@@ -2,6 +2,7 @@
 //! backend boundary that can start on CPU and grow a GPU implementation later.
 
 const std = @import("std");
+const uucode = @import("uucode");
 
 const log = std.log.scoped(.keywork);
 
@@ -276,7 +277,7 @@ const input_min_width = 220;
 const LayoutError = anyerror;
 
 pub const KeyInput = union(enum) {
-    text: u8,
+    text: []const u8,
     backspace,
     enter,
 };
@@ -539,7 +540,7 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     backend: RenderBackend,
     constraints: Constraints,
-    lua: ?*lua_app.App,
+    lua: *lua_app.App,
     widget_arena: std.heap.ArenaAllocator,
     state: DemoState = .{},
     input_text: std.ArrayList(u8) = .empty,
@@ -555,7 +556,7 @@ pub const Runtime = struct {
     };
     const DemoState = State;
 
-    pub fn init(allocator: std.mem.Allocator, backend: RenderBackend, constraints: Constraints, lua: ?*lua_app.App) !Runtime {
+    pub fn init(allocator: std.mem.Allocator, backend: RenderBackend, constraints: Constraints, lua: *lua_app.App) !Runtime {
         var self: Runtime = .{
             .allocator = allocator,
             .backend = backend,
@@ -647,9 +648,9 @@ pub const Runtime = struct {
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
         if (self.focused_input_id == null) return;
         switch (input) {
-            .text => |byte| try self.input_text.append(self.allocator, byte),
+            .text => |bytes| try self.input_text.appendSlice(self.allocator, bytes),
             .backspace => {
-                if (self.input_text.items.len > 0) _ = self.input_text.pop();
+                popLastGrapheme(&self.input_text);
             },
             .enter => try self.setFocusedInput(null),
         }
@@ -710,44 +711,38 @@ pub const Runtime = struct {
         }
         _ = self.widget_arena.reset(.retain_capacity);
 
-        if (self.lua) |lua| {
-            var lua_root = lua.buildWidget(self.widget_arena.allocator(), self.currentState()) catch |err| {
-                log.warn("Lua rebuild failed: {}; falling back to Zig demo", .{err});
-                try self.rebuildFallback();
-                return;
-            };
-            self.root = try buildRenderTreeMeasured(self.allocator, &lua_root, self.constraints, self.backend);
-            return;
-        }
-
-        try self.rebuildFallback();
-    }
-
-    fn rebuildFallback(self: *Runtime) !void {
-        const title: Widget = .{ .text = .{
-            .value = "Keywork MVP",
-            .color = if (self.state.pulse) colors.accent else colors.ink,
-        } };
-        const button: Widget = .{ .button = .{
-            .id = "hello",
-            .label = "Hello Wayland",
-            .background = if (self.state.button_pressed) colors.ink else colors.accent,
-        } };
-        const input: Widget = .{ .text_input = .{
-            .id = "demo-input",
-            .value = self.input_text.items,
-            .placeholder = "Type here",
-            .focused = if (self.focused_input_id) |id| std.mem.eql(u8, id, "demo-input") else false,
-        } };
-        const children = [_]Widget{ title, input, button };
-        const column: Widget = .{ .column = .{ .children = &children, .gap = 12 } };
-        const padded: Widget = .{ .padding = .{ .insets = EdgeInsets.all(24), .child = &column } };
-
-        var new_root = try buildRenderTreeMeasured(self.allocator, &padded, self.constraints, self.backend);
+        var lua_root = try self.lua.buildWidget(self.widget_arena.allocator(), self.currentState());
+        var new_root = try buildRenderTreeMeasured(self.allocator, &lua_root, self.constraints, self.backend);
         errdefer destroyRenderTree(self.allocator, &new_root);
         self.root = new_root;
     }
 };
+
+fn popLastGrapheme(bytes: *std.ArrayList(u8)) void {
+    if (bytes.items.len == 0) return;
+
+    var it = uucode.grapheme.utf8Iterator(bytes.items);
+    var start: usize = 0;
+    while (it.nextGrapheme()) |grapheme| {
+        start = grapheme.start;
+    }
+    bytes.shrinkRetainingCapacity(start);
+}
+
+test "popLastGrapheme removes one extended grapheme cluster" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+
+    try bytes.appendSlice(std.testing.allocator, "aé🇺🇸👩🏽‍🚀");
+    popLastGrapheme(&bytes);
+    try std.testing.expectEqualStrings("aé🇺🇸", bytes.items);
+    popLastGrapheme(&bytes);
+    try std.testing.expectEqualStrings("aé", bytes.items);
+    popLastGrapheme(&bytes);
+    try std.testing.expectEqualStrings("a", bytes.items);
+    popLastGrapheme(&bytes);
+    try std.testing.expectEqualStrings("", bytes.items);
+}
 
 pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -755,11 +750,8 @@ pub fn main(init: std.process.Init) !void {
     const allocator = debug_allocator.allocator();
     const use_wayland = shouldUseWayland(init);
     const constraints: Constraints = .{ .max_width = 640, .max_height = 480 };
-    var lua = lua_app.App.init(allocator, "main.lua") catch |err| lua: {
-        if (err != error.ScriptNotFound) log.warn("LuaJIT app disabled: {}", .{err});
-        break :lua null;
-    };
-    defer if (lua) |*app| app.deinit();
+    var lua = try lua_app.App.init(allocator, "main.lua");
+    defer lua.deinit();
 
     if (use_wayland) {
         var backend = try wayland_shm.Backend.create(allocator, .{
@@ -769,7 +761,7 @@ pub fn main(init: std.process.Init) !void {
         });
         defer backend.destroy();
 
-        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, if (lua) |*app| app else null);
+        var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
         defer runtime.deinit();
         backend.setClickHandler(&runtime, Runtime.waylandClick);
         backend.setRepaintHandler(&runtime, Runtime.waylandScaleChanged);
@@ -785,6 +777,7 @@ pub fn main(init: std.process.Init) !void {
             .finish = wayland_shm.Backend.eventLoopFinish,
         });
         try backend.installKeyRepeat(&loop);
+        defer backend.uninstallKeyRepeat();
         try loop.addRepeatingTimer(1000, &runtime, Runtime.timerTick);
         loop.addFileWatch("main.lua", &runtime, Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("main.lua watch not installed: {}", .{err});
@@ -798,18 +791,18 @@ pub fn main(init: std.process.Init) !void {
     defer stdout_writer.interface.flush() catch {};
 
     var backend: LogBackend = .{ .writer = &stdout_writer.interface };
-    var runtime = try Runtime.init(allocator, backend.backend(), constraints, if (lua) |*app| app else null);
+    var runtime = try Runtime.init(allocator, backend.backend(), constraints, &lua);
     defer runtime.deinit();
     try runtime.repaint();
 
     const root = if (runtime.root) |*root| root else return error.NotBuilt;
-    if (hitTestButton(root, .{ .x = 40, .y = 110 })) |id| {
+    if (hitTestButton(root, .{ .x = 40, .y = 140 })) |id| {
         try stdout_writer.interface.print("hit button {s}\n", .{id});
     } else {
         try stdout_writer.interface.print("hit nothing\n", .{});
     }
 
-    log.debug("demo frame rendered", .{});
+    log.debug("frame rendered", .{});
 }
 
 fn shouldUseWayland(init: std.process.Init) bool {
