@@ -158,6 +158,12 @@ fn parseWidget(lua_state: *c.lua_State, allocator: std.mem.Allocator, runtime_st
         child.* = try parseWidget(lua_state, allocator, runtime_state, -1);
         return .{ .clickable = .{ .id = id, .child = child } };
     }
+    if (std.mem.eql(u8, kind, "button")) {
+        const id = try dupeStringField(lua_state, allocator, table, "id");
+        const label = try dupeStringField(lua_state, allocator, table, "label");
+        const pressed = getBooleanField(lua_state, table, "pressed", false);
+        return keywork.widgets.button(allocator, id, label, pressed);
+    }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const placeholder = try dupeStringField(lua_state, allocator, table, "placeholder");
@@ -225,6 +231,13 @@ fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, def
     defer pop(lua_state, 1);
     if (c.lua_isnumber(lua_state, -1) == 0) return default;
     return @floatCast(c.lua_tonumber(lua_state, -1));
+}
+
+fn getBooleanField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: bool) bool {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (!c.lua_isboolean(lua_state, -1)) return default;
+    return c.lua_toboolean(lua_state, -1) != 0;
 }
 
 fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {

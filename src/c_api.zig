@@ -428,6 +428,22 @@ pub export fn keywork_clickable_callback(
     } });
 }
 
+pub export fn keywork_button(
+    build: ?*KeyworkBuild,
+    id: ?[*:0]const u8,
+    label: ?[*:0]const u8,
+    pressed: c_int,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const allocator = scope.scope.allocator;
+    return makeWidget(scope, keywork.widgets.button(
+        allocator,
+        copyString(allocator, id, "") catch return null,
+        copyString(allocator, label, "") catch return null,
+        pressed != 0,
+    ) catch return null);
+}
+
 pub export fn keywork_render_object(
     build: ?*KeyworkBuild,
     vtable: ?*const KeyworkRenderObjectVTable,

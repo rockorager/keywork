@@ -29,10 +29,7 @@ const NativeApp = struct {
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
         const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
 
-        const button_text = widgets.coloredText("Increment", keywork.colors.white);
-        const button_padding = try widgets.padding(allocator, keywork.EdgeInsets.all(8), button_text);
-        const button_box = try widgets.box(allocator, button_padding, keywork.colors.accent);
-        const button = try widgets.clickable(allocator, "increment", button_box);
+        const button = try widgets.button(allocator, "increment", "Increment", false);
         const input = widgets.textInput("native-input", context.input_text, "Type here", context.focused_input_id != null);
         const children = [_]Widget{
             widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),

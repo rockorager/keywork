@@ -65,9 +65,13 @@ function ui.center(child)
   }
 end
 
-function ui.button(id, label)
-  return ui.clickable(id, ui.box({ background = 0xff6d4aff },
-    ui.padding(8, ui.text(label, { color = 0xffffffff }))))
+function ui.button(id, label, pressed)
+  return {
+    type = "button",
+    id = id,
+    label = label,
+    pressed = pressed or false,
+  }
 end
 
 return ui

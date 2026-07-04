@@ -350,6 +350,14 @@ pub const widgets = struct {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
 
+    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, pressed: bool) !Widget {
+        const label_widget = coloredText(label, colors.white);
+        const padded = try padding(allocator, EdgeInsets.all(8), label_widget);
+        const background = if (pressed) colors.ink else colors.accent;
+        const surface = try box(allocator, padded, background);
+        return clickable(allocator, id, surface);
+    }
+
     pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, focused: bool) Widget {
         return .{ .text_input = .{ .id = id, .value = value, .placeholder = placeholder, .focused = focused } };
     }
@@ -1644,6 +1652,23 @@ test "layout, paint, and hit test a padded column" {
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
     try std.testing.expectEqualStrings("ok", hitTestButton(&root, .{ .x = 25, .y = 35 }).?);
     try std.testing.expect(hitTestButton(&root, .{ .x = 2, .y = 2 }) == null);
+}
+
+test "button widget composes styled clickable content" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", true);
+    var root = try buildRenderTree(retained_allocator, &button_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyRenderTree(retained_allocator, &root);
+
+    try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.kind);
+    try std.testing.expectEqualStrings("confirm", root.clickable_id.?);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].kind);
+    try std.testing.expectEqual(colors.ink, root.children[0].background);
+    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].kind);
+    try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].text.?);
 }
 
 test "center moves descendants" {

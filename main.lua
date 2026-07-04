@@ -10,6 +10,6 @@ return function(state)
     ui.text("scheme: " .. state.color_scheme),
     ui.text("input: " .. state.input_text),
     ui.text_input("demo-input", "Type here"),
-    ui.button("hello", status),
+    ui.button("hello", status, state.button_pressed),
   }, 12))
 end
