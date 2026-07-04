@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("event_loop.zig");
 const keywork = @import("root");
 const TextRenderer = @import("text_renderer.zig");
+const WaylandInput = @import("wayland_input.zig");
 const wayland = @import("wayland");
 const vk = @import("vulkan");
 
@@ -65,6 +66,7 @@ pub const Backend = struct {
     wm_base: *xdg.WmBase,
     viewporter: ?*wp.Viewporter,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
+    input: WaylandInput,
     surface: *wl.Surface,
     viewport: ?*wp.Viewport,
     fractional_scale: ?*wp.FractionalScaleV1,
@@ -119,6 +121,8 @@ pub const Backend = struct {
     repaint_handler: ?RepaintHandler,
     repaint_context: ?*anyopaque,
 
+    pub const ClickHandler = WaylandInput.ClickHandler;
+    pub const KeyHandler = WaylandInput.KeyHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque) void;
 
     pub const Options = struct {
@@ -133,6 +137,7 @@ pub const Backend = struct {
         wm_base: ?*xdg.WmBase = null,
         viewporter: ?*wp.Viewporter = null,
         fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
+        seat: ?*wl.Seat = null,
     };
 
     pub fn create(allocator: std.mem.Allocator, options: Options) !*Backend {
@@ -163,6 +168,8 @@ pub const Backend = struct {
 
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
+        var input = try WaylandInput.init(globals.seat);
+        errdefer input.deinit();
 
         const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
         const instance_extensions = [_][*:0]const u8{
@@ -239,6 +246,7 @@ pub const Backend = struct {
             .wm_base = wm_base,
             .viewporter = viewporter,
             .fractional_scale_manager = fractional_scale_manager,
+            .input = input,
             .surface = surface,
             .viewport = viewport,
             .fractional_scale = fractional_scale,
@@ -296,6 +304,7 @@ pub const Backend = struct {
         xdg_surface.setListener(*Backend, xdgSurfaceListener, self);
         toplevel.setListener(*Backend, toplevelListener, self);
         if (fractional_scale) |surface_scale| surface_scale.setListener(*Backend, fractionalScaleListener, self);
+        self.input.attachListeners(Backend, self);
         surface.commit();
 
         return self;
@@ -314,6 +323,7 @@ pub const Backend = struct {
         self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
         self.text_renderer.deinit();
+        self.input.deinit();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
         self.toplevel.destroy();
@@ -330,6 +340,22 @@ pub const Backend = struct {
 
     pub fn renderBackend(self: *Backend) keywork.RenderBackend {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+    }
+
+    pub fn setClickHandler(self: *Backend, context: *anyopaque, handler: ClickHandler) void {
+        self.input.setClickHandler(context, handler);
+    }
+
+    pub fn setKeyHandler(self: *Backend, context: *anyopaque, handler: KeyHandler) void {
+        self.input.setKeyHandler(context, handler);
+    }
+
+    pub fn installKeyRepeat(self: *Backend, loop: *event_loop.EventLoop) !void {
+        try self.input.installKeyRepeat(loop);
+    }
+
+    pub fn uninstallKeyRepeat(self: *Backend) void {
+        self.input.uninstallKeyRepeat();
     }
 
     pub fn setRepaintHandler(self: *Backend, context: *anyopaque, handler: RepaintHandler) void {
@@ -1097,6 +1123,8 @@ pub const Backend = struct {
                     globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
                     globals.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+                } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
+                    globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
                 }
             },
             .global_remove => {},

@@ -767,7 +767,9 @@ pub fn main(init: std.process.Init) !void {
 
         var runtime = try Runtime.init(allocator, backend.renderBackend(), constraints, &lua);
         defer runtime.deinit();
+        backend.setClickHandler(&runtime, Runtime.waylandClick);
         backend.setRepaintHandler(&runtime, Runtime.waylandScaleChanged);
+        backend.setKeyHandler(&runtime, Runtime.waylandKeyInput);
         try runtime.repaint();
 
         var loop = try event_loop.EventLoop.init(allocator);
@@ -778,6 +780,8 @@ pub fn main(init: std.process.Init) !void {
             .prepare = wayland_vulkan.Backend.eventLoopPrepare,
             .finish = wayland_vulkan.Backend.eventLoopFinish,
         });
+        try backend.installKeyRepeat(&loop);
+        defer backend.uninstallKeyRepeat();
         try loop.addRepeatingTimer(1000, &runtime, Runtime.timerTick);
         loop.addFileWatch("main.lua", &runtime, Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("main.lua watch not installed: {}", .{err});
