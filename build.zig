@@ -24,66 +24,74 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_tablet_manager_v2", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
-    const libkeywork_module = b.addModule("libkeywork", .{
-        .root_source_file = b.path("src/libkeywork.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    libkeywork_module.addImport("wayland", wayland_mod);
-    libkeywork_module.linkSystemLibrary("wayland-client", .{});
-
     const image_c = b.addTranslateC(.{
         .root_source_file = b.path("src/image_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    libkeywork_module.addImport("image_c", image_c.createModule());
-    libkeywork_module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
+    const image_c_module = image_c.createModule();
 
     const vulkan_mod = b.dependency("vulkan_zig", .{
         .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
-    libkeywork_module.addImport("vulkan", vulkan_mod);
-    libkeywork_module.linkSystemLibrary("vulkan", .{});
 
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{"grapheme_break"}),
     });
-    libkeywork_module.addImport("uucode", uucode_dep.module("uucode"));
+    const uucode_module = uucode_dep.module("uucode");
 
     const xkb_c = b.addTranslateC(.{
         .root_source_file = b.path("src/xkb_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    xkb_c.linkSystemLibrary("xkbcommon", .{});
-    libkeywork_module.addImport("xkb_c", xkb_c.createModule());
-    libkeywork_module.linkSystemLibrary("xkbcommon", .{});
+    addPkgConfigIncludePaths(b, xkb_c, &.{"xkbcommon"});
+    const xkb_c_module = xkb_c.createModule();
 
     const dbus_c = b.addTranslateC(.{
         .root_source_file = b.path("src/dbus_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    dbus_c.linkSystemLibrary("dbus-1", .{});
-    libkeywork_module.addImport("dbus_c", dbus_c.createModule());
-    libkeywork_module.linkSystemLibrary("dbus-1", .{});
+    addPkgConfigIncludePaths(b, dbus_c, &.{"dbus-1"});
+    const dbus_c_module = dbus_c.createModule();
 
     const text_c = b.addTranslateC(.{
         .root_source_file = b.path("src/text_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    text_c.linkSystemLibrary("fontconfig", .{});
-    text_c.linkSystemLibrary("freetype", .{});
-    text_c.linkSystemLibrary("harfbuzz", .{});
-    libkeywork_module.addImport("text_c", text_c.createModule());
-    libkeywork_module.linkSystemLibrary("fontconfig", .{});
-    libkeywork_module.linkSystemLibrary("freetype", .{});
-    libkeywork_module.linkSystemLibrary("harfbuzz", .{});
+    addPkgConfigIncludePaths(b, text_c, &.{ "fontconfig", "freetype2", "harfbuzz" });
+    const text_c_module = text_c.createModule();
+
+    const libkeywork_imports: LibkeyworkImports = .{
+        .wayland = wayland_mod,
+        .image_c = image_c_module,
+        .vulkan = vulkan_mod,
+        .uucode = uucode_module,
+        .xkb_c = xkb_c_module,
+        .dbus_c = dbus_c_module,
+        .text_c = text_c_module,
+    };
+
+    const libkeywork_module = b.addModule("libkeywork", .{
+        .root_source_file = b.path("src/libkeywork.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addLibkeyworkImports(b, libkeywork_module, libkeywork_imports);
+    linkKeyworkSystemLibraries(libkeywork_module);
+
+    const libkeywork_static_module = b.createModule(.{
+        .root_source_file = b.path("src/libkeywork.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addLibkeyworkImports(b, libkeywork_static_module, libkeywork_imports);
 
     const app_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -127,7 +135,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    c_api_module.addImport("libkeywork", libkeywork_module);
+    c_api_module.addImport("libkeywork", libkeywork_static_module);
     const c_library = b.addLibrary(.{
         .linkage = .static,
         .name = "keywork",
@@ -143,6 +151,7 @@ pub fn build(b: *std.Build) void {
     c_example_module.addCSourceFile(.{ .file = b.path("examples/c/main.c") });
     c_example_module.addIncludePath(b.path("include"));
     c_example_module.linkLibrary(c_library);
+    linkKeyworkSystemLibraries(c_example_module);
     const c_example = b.addExecutable(.{
         .name = "keywork-c-example",
         .root_module = c_example_module,
@@ -254,4 +263,54 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "include", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
+}
+
+const LibkeyworkImports = struct {
+    wayland: *std.Build.Module,
+    image_c: *std.Build.Module,
+    vulkan: *std.Build.Module,
+    uucode: *std.Build.Module,
+    xkb_c: *std.Build.Module,
+    dbus_c: *std.Build.Module,
+    text_c: *std.Build.Module,
+};
+
+fn addLibkeyworkImports(b: *std.Build, module: *std.Build.Module, imports: LibkeyworkImports) void {
+    module.addImport("wayland", imports.wayland);
+    module.addImport("image_c", imports.image_c);
+    module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
+    module.addImport("vulkan", imports.vulkan);
+    module.addImport("uucode", imports.uucode);
+    module.addImport("xkb_c", imports.xkb_c);
+    module.addImport("dbus_c", imports.dbus_c);
+    module.addImport("text_c", imports.text_c);
+}
+
+fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
+    module.linkSystemLibrary("wayland-client", .{});
+    module.linkSystemLibrary("vulkan", .{});
+    module.linkSystemLibrary("xkbcommon", .{});
+    module.linkSystemLibrary("dbus-1", .{});
+    module.linkSystemLibrary("fontconfig", .{});
+    module.linkSystemLibrary("freetype", .{});
+    module.linkSystemLibrary("harfbuzz", .{});
+}
+
+fn addPkgConfigIncludePaths(b: *std.Build, translate_c: *std.Build.Step.TranslateC, packages: []const []const u8) void {
+    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(b.allocator);
+
+    argv.append(b.allocator, pkg_config) catch @panic("OOM");
+    argv.append(b.allocator, "--cflags-only-I") catch @panic("OOM");
+    for (packages) |package| argv.append(b.allocator, package) catch @panic("OOM");
+
+    const cflags = b.run(argv.items);
+    var it = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
+    while (it.next()) |flag| {
+        if (!std.mem.startsWith(u8, flag, "-I")) continue;
+        if (flag.len == 2) continue;
+        const include_path = b.allocator.dupe(u8, flag[2..]) catch @panic("OOM");
+        translate_c.addSystemIncludePath(.{ .cwd_relative = include_path });
+    }
 }
