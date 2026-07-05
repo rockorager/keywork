@@ -82,6 +82,13 @@ function ui.box(style, child)
     type = "box",
     background = style.background,
     border = style.border,
+    border_width = style.border_width,
+    radius = style.radius,
+    min_width = style.min_width,
+    min_height = style.min_height,
+    align = style.align,
+    horizontal_align = style.horizontal_align,
+    vertical_align = style.vertical_align,
     child = child,
   }
 end
@@ -97,6 +104,13 @@ function ui.container(options, child)
   return ui.box({
     background = options.background,
     border = options.border,
+    border_width = options.border_width,
+    radius = options.radius,
+    min_width = options.min_width,
+    min_height = options.min_height,
+    align = options.align,
+    horizontal_align = options.horizontal_align,
+    vertical_align = options.vertical_align,
   }, child)
 end
 
@@ -159,26 +173,49 @@ function ui.text_input(id, placeholder)
 end
 
 function ui.column(children, gap)
+  local cross_align
   if children.children then
     gap = children.gap
+    cross_align = children.cross_align or children.align
     children = children.children
   end
   return {
     type = "column",
     children = children,
     gap = gap or 0,
+    cross_align = cross_align,
   }
 end
 
 function ui.row(children, gap)
+  local cross_align
   if children.children then
     gap = children.gap
+    cross_align = children.cross_align or children.align
     children = children.children
   end
   return {
     type = "row",
     children = children,
     gap = gap or 0,
+    cross_align = cross_align,
+  }
+end
+
+function ui.sized(options, child)
+  options = options or {}
+  if options.child then
+    child = options.child
+  end
+  return {
+    type = "sized",
+    child = child,
+    width = options.width,
+    height = options.height,
+    min_width = options.min_width,
+    min_height = options.min_height,
+    max_width = options.max_width,
+    max_height = options.max_height,
   }
 end
 
@@ -213,7 +250,7 @@ function ui.icon_label(icon_name, text, options)
   if text and text ~= "" then
     table.insert(children, ui.label(text, { color = options.color }))
   end
-  return ui.row({ gap = options.gap or 6, children = children })
+  return ui.row({ gap = options.gap or 6, align = options.align or "center", children = children })
 end
 
 function ui.chip(options)
@@ -234,6 +271,13 @@ function ui.chip(options)
     child = ui.container({
       background = options.background,
       border = options.border,
+      border_width = options.border_width,
+      radius = options.radius,
+      min_width = options.min_width,
+      min_height = options.min_height,
+      align = options.align,
+      horizontal_align = options.horizontal_align,
+      vertical_align = options.vertical_align,
       padding = options.padding or { x = 8, y = 4 },
     }, child),
     on_tap = options.on_tap or options.on_pressed,

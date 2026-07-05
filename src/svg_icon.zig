@@ -4,6 +4,8 @@ const std = @import("std");
 const keywork = @import("core.zig");
 const c = @import("image_c");
 
+const icon_supersample = 4;
+
 const SvgIcon = struct {
     path: []const u8,
     size: f32,
@@ -45,21 +47,23 @@ const SvgIcon = struct {
         const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
         const width = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.width * render_scale))));
         const height = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.height * render_scale))));
-        const pixels = try context.allocator.alloc(u8, width * height * 4);
+        const raster_width = width * icon_supersample;
+        const raster_height = height * icon_supersample;
+        const pixels = try context.allocator.alloc(u8, raster_width * raster_height * 4);
         defer context.allocator.free(pixels);
         @memset(pixels, 0);
 
         const image_width = if (image.*.width > 0) image.*.width else context.rect.width;
         const image_height = if (image.*.height > 0) image.*.height else context.rect.height;
-        const scale = @min(@as(f32, @floatFromInt(width)) / image_width, @as(f32, @floatFromInt(height)) / image_height);
+        const scale = @min(@as(f32, @floatFromInt(raster_width)) / image_width, @as(f32, @floatFromInt(raster_height)) / image_height);
         const scaled_width = image_width * scale;
         const scaled_height = image_height * scale;
-        const tx = (@as(f32, @floatFromInt(width)) - scaled_width) / 2;
-        const ty = (@as(f32, @floatFromInt(height)) - scaled_height) / 2;
-        c.nsvgRasterize(rasterizer, image, tx, ty, scale, pixels.ptr, @intCast(width), @intCast(height), @intCast(width * 4));
+        const tx = (@as(f32, @floatFromInt(raster_width)) - scaled_width) / 2;
+        const ty = (@as(f32, @floatFromInt(raster_height)) - scaled_height) / 2;
+        c.nsvgRasterize(rasterizer, image, tx, ty, scale, pixels.ptr, @intCast(raster_width), @intCast(raster_height), @intCast(raster_width * 4));
 
         const alpha = try context.allocator.alloc(u8, width * height);
-        for (alpha, 0..) |*value, index| value.* = pixels[index * 4 + 3];
+        downsampleAlpha(alpha, pixels, width, height, icon_supersample);
         try context.display_list.alphaImage(
             context.allocator,
             context.rect,
@@ -67,15 +71,16 @@ const SvgIcon = struct {
             @intCast(height),
             alpha,
             self.color,
-            cacheKey(self.path, width, height),
+            cacheKey(self.path, width, height, icon_supersample),
         );
     }
 
-    fn cacheKey(path: []const u8, width: usize, height: usize) u64 {
+    fn cacheKey(path: []const u8, width: usize, height: usize, supersample: usize) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(path);
         hasher.update(std.mem.asBytes(&width));
         hasher.update(std.mem.asBytes(&height));
+        hasher.update(std.mem.asBytes(&supersample));
         return hasher.final();
     }
 
@@ -97,6 +102,24 @@ const SvgIcon = struct {
         allocator.destroy(self);
     }
 };
+
+fn downsampleAlpha(dst: []u8, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
+    const raster_width = width * supersample;
+    const samples = supersample * supersample;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            var sum: usize = 0;
+            for (0..supersample) |sy| {
+                for (0..supersample) |sx| {
+                    const src_x = x * supersample + sx;
+                    const src_y = y * supersample + sy;
+                    sum += src_rgba[(src_y * raster_width + src_x) * 4 + 3];
+                }
+            }
+            dst[y * width + x] = @intCast((sum + samples / 2) / samples);
+        }
+    }
+}
 
 pub fn icon(allocator: std.mem.Allocator, path: []const u8, size: f32, color: keywork.Color) !keywork.Widget {
     const icon_size = @max(1, size);

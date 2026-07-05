@@ -185,14 +185,15 @@ pub fn measure(self: *Self, scale: f32, value: []const u8) !keywork.Size {
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
 
     const primary = &self.fonts.items[primary_font_index];
-    const line_height = @as(f32, @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)))) / scale;
+    const line_height_pixels: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const line_height = line_height_pixels / scale;
     var max_width: f32 = 0;
     var line_count: usize = 0;
 
     var line_start: usize = 0;
     while (line_start <= value.len) {
         const line_end = std.mem.indexOfScalarPos(u8, value, line_start, '\n') orelse value.len;
-        max_width = @max(max_width, try self.measureLine(value[line_start..line_end], scale, pixel_size));
+        max_width = @max(max_width, try self.measureLine(value[line_start..line_end], pixel_size) / scale);
         line_count += 1;
         if (line_end == value.len) break;
         line_start = line_end + 1;
@@ -251,16 +252,18 @@ fn ensureFontPixelSize(self: *Self, font_index: usize, pixel_size: u31) !void {
     font.pixel_size = pixel_size;
 }
 
-fn measureLine(self: *Self, value: []const u8, scale: f32, pixel_size: u31) !f32 {
+fn measureLine(self: *Self, value: []const u8, pixel_size: u31) !f32 {
     if (value.len == 0) return 0;
 
     var index: usize = 0;
-    var advance: f32 = 0;
+    var pen_x: f32 = 0;
     while (try self.nextFontRun(value, &index)) |run| {
         const shaped = try self.shapeRun(run.font_index, pixel_size, run.value);
-        advance += shaped.advance;
+        for (shaped.glyphs) |glyph| {
+            pen_x += fromFixed26Dot6(glyph.x_advance);
+        }
     }
-    return advance / scale;
+    return pen_x;
 }
 
 fn renderLine(

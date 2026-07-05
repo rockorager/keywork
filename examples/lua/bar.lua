@@ -231,14 +231,19 @@ local function label(value, color)
   return ui.label(value, { color = color or colors.foreground })
 end
 
-local function status_pill(id, icon_name, text, color)
+local function status_pill(id, icon_name, text, color, options)
+  options = options or {}
   return ui.chip({
     id = id,
     icon = icon_name,
     label = text,
+    icon_size = options.icon_size or 16,
     color = color,
     background = colors.surface,
-    padding = { x = 7, y = 5 },
+    radius = 10,
+    min_height = 30,
+    align = "center",
+    padding = { x = 7 },
     on_tap = function()
       print("clicked " .. id)
     end,
@@ -263,7 +268,10 @@ local function workspaces()
       label = name,
       color = fg,
       background = bg,
-      padding = { x = 8, y = 7 },
+      radius = 9,
+      min_height = 30,
+      align = "center",
+      padding = { x = 8 },
       on_tap_down = function()
         if sway.connected then
           sway_send(sway, IPC_COMMAND, 'workspace "' .. json_string(name) .. '"')
@@ -340,7 +348,7 @@ end
 local function battery_status()
   local battery = command_output("sh -c 'ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1'")
   if battery == "" then
-    return status_pill("battery", "battery-level-0", "", colors.muted)
+    return status_pill("battery", "battery-level-0", "", colors.muted, { icon_size = 14 })
   end
   local capacity = tonumber(read_file(battery .. "/capacity")) or 0
   local status = read_file(battery .. "/status") or "Unknown"
@@ -367,7 +375,7 @@ local function battery_status()
       color = colors.yellow
     end
   end
-  return status_pill("battery", name, tostring(capacity) .. "%", color)
+  return status_pill("battery", name, tostring(capacity) .. "%", color, { icon_size = 14 })
 end
 
 local StatusItems = ui.stateful({
@@ -386,6 +394,7 @@ local StatusItems = ui.stateful({
 
     return ui.row({
       gap = 8,
+      align = "center",
       children = {
         self.volume,
         self.network,
@@ -400,10 +409,12 @@ return function(state)
   local theme = ui.theme_for(state)
   local left = ui.row({
     gap = 10,
+    align = "center",
     children = {
       workspaces(),
       ui.row({
         gap = 6,
+        align = "center",
         children = {
           ui.svg_icon("examples/lua/icons/bolt.svg", 16, colors.magenta),
           label("Keywork", colors.foreground),
@@ -415,6 +426,7 @@ return function(state)
   return ui.theme(theme, ui.container({ background = colors.background, padding = { all = 4 } },
     ui.row({
       gap = 12,
+      align = "center",
       children = {
         left,
         ui.spacer(),

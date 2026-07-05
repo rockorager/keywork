@@ -278,6 +278,7 @@ pub const Widget = union(enum) {
     row: Children,
     column: Children,
     spacer: Spacer,
+    sized: Sized,
     padding: Padding,
     center: Child,
     button: Button,
@@ -325,6 +326,12 @@ pub const Widget = union(enum) {
         child: *const Widget,
         background: Color = colors.transparent,
         border: ?Color = null,
+        border_width: f32 = 1,
+        radius: f32 = 0,
+        min_width: f32 = 0,
+        min_height: f32 = 0,
+        horizontal_align: Alignment = .start,
+        vertical_align: Alignment = .start,
     };
 
     pub const Clickable = struct {
@@ -392,6 +399,30 @@ pub const Widget = union(enum) {
     pub const Children = struct {
         children: []const Widget,
         gap: f32 = 0,
+        cross_align: CrossAxisAlignment = .start,
+    };
+
+    pub const CrossAxisAlignment = enum {
+        start,
+        center,
+        end,
+        stretch,
+    };
+
+    pub const Alignment = enum {
+        start,
+        center,
+        end,
+    };
+
+    pub const Sized = struct {
+        child: *const Widget,
+        width: ?f32 = null,
+        height: ?f32 = null,
+        min_width: f32 = 0,
+        min_height: f32 = 0,
+        max_width: ?f32 = null,
+        max_height: ?f32 = null,
     };
 
     pub const Spacer = struct {
@@ -731,6 +762,10 @@ pub const widgets = struct {
         return .{ .spacer = .{ .flex = @max(0, flex) } };
     }
 
+    pub fn sized(allocator: std.mem.Allocator, child: Widget, width: ?f32, height: ?f32) !Widget {
+        return .{ .sized = .{ .child = try Widget.alloc(allocator, child), .width = width, .height = height } };
+    }
+
     pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets, child: Widget) !Widget {
         return .{ .padding = .{ .insets = insets, .child = try Widget.alloc(allocator, child) } };
     }
@@ -771,6 +806,7 @@ pub const Element = struct {
         row,
         column,
         spacer,
+        sized,
         padding,
         center,
         button,
@@ -885,6 +921,8 @@ pub const RenderNode = struct {
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
     box_border: ?Color = null,
+    box_border_width: f32 = 1,
+    box_radius: f32 = 0,
     placeholder: ?[]const u8 = null,
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
@@ -904,6 +942,7 @@ pub const RenderNode = struct {
         row,
         column,
         spacer,
+        sized,
         padding,
         center,
         button,
@@ -1183,6 +1222,19 @@ pub fn buildElementTreeScoped(
         },
         .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
         .spacer => return .{ .kind = .spacer, .widget = try cloneWidgetForElement(allocator, widget.*) },
+        .sized => |sized_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, sized_widget.child, constrainSized(constraints, sized_widget));
+            initialized = true;
+            return .{ .kind = .sized, .widget = element_widget, .children = children };
+        },
         .text_input => {
             const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme);
             return .{ .kind = .text_input, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.text_input.focus_node) };
@@ -1521,6 +1573,9 @@ pub fn updateElementTreeScoped(
         },
         .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme),
         .spacer => try replaceElementWidget(allocator, element, widget.*),
+        .sized => |sized_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, sized_widget.child, constrainSized(constraints, sized_widget));
+        },
         .text_input => {
             try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme);
             element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
@@ -1615,6 +1670,7 @@ pub fn rebuildDirtyElementTreeScoped(
 
         .keyed,
         .box,
+        .sized,
         .clickable,
         .focus,
         .focus_scope,
@@ -1691,6 +1747,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .row => .row,
         .column => .column,
         .spacer => .spacer,
+        .sized => .sized,
         .padding => .padding,
         .center => .center,
         .button => .button,
@@ -1968,6 +2025,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .color = text_widget.color,
         } },
         .spacer => |spacer_widget| .{ .spacer = spacer_widget },
+        .sized => |sized_widget| .{ .sized = sized_widget },
         .button => |button_widget| blk: {
             const id = try allocator.dupe(u8, button_widget.id);
             errdefer allocator.free(id);
@@ -2039,8 +2097,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .placeholder_foreground = input_widget.placeholder_foreground,
             } };
         },
-        .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap } },
-        .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap } },
+        .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align } },
+        .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap, .cross_align = column_widget.cross_align } },
         .padding => |padding_widget| .{ .padding = padding_widget },
         .center => |center_widget| .{ .center = center_widget },
         .actions => |actions_widget| .{ .actions = .{
@@ -2064,6 +2122,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
         .text => |text_widget| allocator.free(text_widget.value),
         .spacer => {},
+        .sized => {},
         .button => |button_widget| {
             if (button_widget.on_pressed) |callback| callback.destroy(allocator);
             allocator.free(button_widget.id);
@@ -2206,12 +2265,16 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list });
         },
         .box => {
-            if (node.background.a > 0) try display_list.fillRect(allocator, node.rect, node.background);
-            if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border);
+            if (node.box_radius > 0) {
+                try paintRoundedBox(allocator, display_list, node.rect, node.background, node.box_border, node.box_border_width, node.box_radius, scale);
+            } else {
+                if (node.background.a > 0) try display_list.fillRect(allocator, node.rect, node.background);
+                if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border, node.box_border_width);
+            }
         },
         .text_input => {
             try display_list.fillRect(allocator, node.rect, node.background);
-            try paintBorder(allocator, display_list, node.rect, if (node.focused) node.focused_border else node.border);
+            try paintBorder(allocator, display_list, node.rect, if (node.focused) node.focused_border else node.border, 1);
             const value = node.text orelse "";
             const visible_text = if (value.len > 0) value else node.placeholder orelse "";
             const text_color = if (value.len > 0) node.foreground else node.placeholder_foreground;
@@ -2240,11 +2303,93 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
     }
 }
 
-fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: Rect, color: Color) !void {
-    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = 1 }, color);
-    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y + rect.height - 1, .width = rect.width, .height = 1 }, color);
-    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y, .width = 1, .height = rect.height }, color);
-    try display_list.fillRect(allocator, .{ .x = rect.x + rect.width - 1, .y = rect.y, .width = 1, .height = rect.height }, color);
+fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: Rect, color: Color, width: f32) !void {
+    const clamped_width = @min(@max(0, width), @min(rect.width, rect.height) / 2);
+    if (clamped_width <= 0) return;
+    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = clamped_width }, color);
+    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y + rect.height - clamped_width, .width = rect.width, .height = clamped_width }, color);
+    try display_list.fillRect(allocator, .{ .x = rect.x, .y = rect.y + clamped_width, .width = clamped_width, .height = @max(0, rect.height - clamped_width * 2) }, color);
+    try display_list.fillRect(allocator, .{ .x = rect.x + rect.width - clamped_width, .y = rect.y + clamped_width, .width = clamped_width, .height = @max(0, rect.height - clamped_width * 2) }, color);
+}
+
+fn paintRoundedBox(
+    allocator: std.mem.Allocator,
+    display_list: *DisplayList,
+    rect: Rect,
+    background: Color,
+    border: ?Color,
+    border_width: f32,
+    radius: f32,
+    scale: f32,
+) !void {
+    if (rect.width <= 0 or rect.height <= 0) return;
+
+    const render_scale = if (std.math.isFinite(scale) and scale > 0) scale else 1;
+    const width = @max(1, @as(usize, @intFromFloat(@ceil(rect.width * render_scale))));
+    const height = @max(1, @as(usize, @intFromFloat(@ceil(rect.height * render_scale))));
+    const scaled_radius = @max(0, radius * render_scale);
+
+    if (background.a > 0) {
+        const alpha = try roundedRectAlpha(allocator, width, height, scaled_radius, null);
+        try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, background, roundedRectCacheKey(width, height, scaled_radius, null));
+    }
+
+    if (border) |border_color| {
+        const stroke_width = @min(@max(0, border_width * render_scale), @min(@as(f32, @floatFromInt(width)), @as(f32, @floatFromInt(height))) / 2);
+        if (stroke_width > 0) {
+            const alpha = try roundedRectAlpha(allocator, width, height, scaled_radius, stroke_width);
+            try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, border_color, roundedRectCacheKey(width, height, scaled_radius, stroke_width));
+        }
+    }
+}
+
+fn roundedRectAlpha(allocator: std.mem.Allocator, width: usize, height: usize, radius: f32, stroke_width: ?f32) ![]u8 {
+    const alpha = try allocator.alloc(u8, width * height);
+    const sample_count = 4;
+    const sample_total = sample_count * sample_count;
+    const w = @as(f32, @floatFromInt(width));
+    const h = @as(f32, @floatFromInt(height));
+    const inner_width = stroke_width orelse 0;
+
+    for (alpha, 0..) |*value, index| {
+        const x = @as(f32, @floatFromInt(index % width));
+        const y = @as(f32, @floatFromInt(index / width));
+        var covered: usize = 0;
+        for (0..sample_count) |sy| {
+            for (0..sample_count) |sx| {
+                const px = x + (@as(f32, @floatFromInt(sx)) + 0.5) / sample_count;
+                const py = y + (@as(f32, @floatFromInt(sy)) + 0.5) / sample_count;
+                const outer = pointInRoundedRect(px, py, w, h, radius);
+                const inner = if (stroke_width) |_| pointInRoundedRect(px - inner_width, py - inner_width, w - inner_width * 2, h - inner_width * 2, @max(0, radius - inner_width)) else false;
+                if (outer and !inner) covered += 1;
+            }
+        }
+        value.* = @intCast((covered * 255 + sample_total / 2) / sample_total);
+    }
+    return alpha;
+}
+
+fn pointInRoundedRect(x: f32, y: f32, width: f32, height: f32, radius: f32) bool {
+    if (width <= 0 or height <= 0) return false;
+    if (x < 0 or y < 0 or x >= width or y >= height) return false;
+    const r = @min(radius, @min(width, height) / 2);
+    if (r <= 0) return true;
+
+    const cx = if (x < r) r else if (x >= width - r) width - r else x;
+    const cy = if (y < r) r else if (y >= height - r) height - r else y;
+    const dx = x - cx;
+    const dy = y - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+fn roundedRectCacheKey(width: usize, height: usize, radius: f32, stroke_width: ?f32) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("rounded-rect");
+    hasher.update(std.mem.asBytes(&width));
+    hasher.update(std.mem.asBytes(&height));
+    hasher.update(std.mem.asBytes(&radius));
+    if (stroke_width) |value| hasher.update(std.mem.asBytes(&value));
+    return hasher.final();
 }
 
 pub fn hitTestButton(node: *const RenderNode, point: Point) ?[]const u8 {
@@ -2577,17 +2722,50 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             .kind = .spacer,
             .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
         },
+        .sized => |sized_widget| {
+            const child_constraints = constrainSized(constraints, sized_widget);
+            var child = try layoutElement(allocator, &element.children[0], child_constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const width = @min(constraints.max_width, @max(sized_widget.min_width, sized_widget.width orelse child.rect.width));
+            const height = @min(constraints.max_height, @max(sized_widget.min_height, sized_widget.height orelse child.rect.height));
+            const dx = origin.x - child.rect.x;
+            const dy = origin.y - child.rect.y;
+            child.rect.x = origin.x;
+            child.rect.y = origin.y;
+            translateChildren(&child, dx, dy);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .sized,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
+                .children = children,
+            };
+        },
         .box => |box_widget| {
             var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             errdefer destroyRenderTree(allocator, &child);
+
+            const width = @min(constraints.max_width, @max(box_widget.min_width, child.rect.width));
+            const height = @min(constraints.max_height, @max(box_widget.min_height, child.rect.height));
+            const child_x = origin.x + alignedOffset(box_widget.horizontal_align, width, child.rect.width);
+            const child_y = origin.y + alignedOffset(box_widget.vertical_align, height, child.rect.height);
+            const dx = child_x - child.rect.x;
+            const dy = child_y - child.rect.y;
+            child.rect.x = child_x;
+            child.rect.y = child_y;
+            translateChildren(&child, dx, dy);
 
             const children = try allocator.alloc(RenderNode, 1);
             children[0] = child;
             return .{
                 .kind = .box,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
                 .background = box_widget.background,
                 .box_border = box_widget.border,
+                .box_border_width = box_widget.border_width,
+                .box_radius = box_widget.radius,
                 .children = children,
             };
         },
@@ -2769,8 +2947,8 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .children = children,
             };
         },
-        .column => |column_widget| return layoutLinearElements(allocator, .column, element.children, column_widget.gap, constraints, origin, measurer),
-        .row => |row_widget| return layoutLinearElements(allocator, .row, element.children, row_widget.gap, constraints, origin, measurer),
+        .column => |column_widget| return layoutLinearElements(allocator, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
+        .row => |row_widget| return layoutLinearElements(allocator, .row, element.children, row_widget.gap, row_widget.cross_align, constraints, origin, measurer),
         .component => |component_widget| {
             _ = component_widget;
             var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
@@ -2827,6 +3005,7 @@ fn layoutLinearElements(
     comptime kind: RenderNode.Kind,
     elements: []const Element,
     gap: f32,
+    cross_align: Widget.CrossAxisAlignment,
     constraints: Constraints,
     origin: Point,
     measurer: TextMeasurer,
@@ -2858,11 +3037,7 @@ fn layoutLinearElements(
             continue;
         }
 
-        const remaining = switch (kind) {
-            .row => Constraints{ .max_width = constraints.max_width, .max_height = constraints.max_height },
-            .column => Constraints{ .max_width = constraints.max_width, .max_height = constraints.max_height },
-            else => unreachable,
-        };
+        const remaining = constraints;
         children[index] = try layoutElement(allocator, child_element, remaining, origin, measurer);
         initialized += 1;
 
@@ -2896,10 +3071,26 @@ fn layoutLinearElements(
                 else => unreachable,
             };
         } else {
-            const dx = cursor.x - children[index].rect.x;
-            const dy = cursor.y - children[index].rect.y;
-            children[index].rect.x = cursor.x;
-            children[index].rect.y = cursor.y;
+            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, children[index]);
+            const new_x = switch (kind) {
+                .row => cursor.x,
+                .column => origin.x + aligned_cross,
+                else => unreachable,
+            };
+            const new_y = switch (kind) {
+                .row => origin.y + aligned_cross,
+                .column => cursor.y,
+                else => unreachable,
+            };
+            const dx = new_x - children[index].rect.x;
+            const dy = new_y - children[index].rect.y;
+            children[index].rect.x = new_x;
+            children[index].rect.y = new_y;
+            if (cross_align == .stretch) switch (kind) {
+                .row => children[index].rect.height = cross,
+                .column => children[index].rect.width = cross,
+                else => unreachable,
+            };
             translateChildren(&children[index], dx, dy);
         }
 
@@ -2930,6 +3121,36 @@ fn layoutLinearElements(
             else => unreachable,
         },
         .children = children,
+    };
+}
+
+fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constraints {
+    const max_width = sized_widget.width orelse sized_widget.max_width orelse parent.max_width;
+    const max_height = sized_widget.height orelse sized_widget.max_height orelse parent.max_height;
+    return .{
+        .max_width = @max(0, @min(parent.max_width, @max(sized_widget.min_width, max_width))),
+        .max_height = @max(0, @min(parent.max_height, @max(sized_widget.min_height, max_height))),
+    };
+}
+
+fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: RenderNode) f32 {
+    const child_cross = switch (kind) {
+        .row => child.rect.height,
+        .column => child.rect.width,
+        else => unreachable,
+    };
+    return switch (alignment) {
+        .start, .stretch => 0,
+        .center => @max(0, cross - child_cross) / 2,
+        .end => @max(0, cross - child_cross),
+    };
+}
+
+fn alignedOffset(alignment: Widget.Alignment, outer: f32, inner: f32) f32 {
+    return switch (alignment) {
+        .start => 0,
+        .center => @max(0, outer - inner) / 2,
+        .end => @max(0, outer - inner),
     };
 }
 
@@ -3020,6 +3241,80 @@ test "row spacer takes remaining main-axis space" {
     try std.testing.expectEqual(@as(f32, 100), root.rect.width);
     try std.testing.expectEqual(@as(f32, 84), root.children[1].rect.width);
     try std.testing.expectEqual(@as(f32, 92), root.children[2].rect.x);
+}
+
+test "row centers children on the cross axis" {
+    const allocator = std.testing.allocator;
+
+    const short = widgets.text("A");
+    const tall = try widgets.sized(allocator, widgets.text("B"), null, 40);
+    defer allocator.destroy(tall.sized.child);
+    const children = [_]Widget{ short, tall };
+    const row: Widget = .{ .row = .{ .children = &children, .gap = 0, .cross_align = .center } };
+
+    var root = try buildRenderTree(allocator, &row, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(allocator, &root);
+
+    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
+}
+
+test "linear element clone preserves cross-axis alignment" {
+    const allocator = std.testing.allocator;
+
+    const child = widgets.text("A");
+    const children = [_]Widget{child};
+    const row: Widget = .{ .row = .{ .children = &children, .cross_align = .center } };
+    const column: Widget = .{ .column = .{ .children = &children, .cross_align = .end } };
+
+    var row_element = try buildElementTree(allocator, &row, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &row_element);
+    var column_element = try buildElementTree(allocator, &column, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &column_element);
+
+    try std.testing.expectEqual(Widget.CrossAxisAlignment.center, row_element.widget.row.cross_align);
+    try std.testing.expectEqual(Widget.CrossAxisAlignment.end, column_element.widget.column.cross_align);
+}
+
+test "rounded box paints alpha images for fill and border" {
+    const allocator = std.testing.allocator;
+
+    const child = widgets.text("A");
+    const box: Widget = .{ .box = .{ .child = &child, .background = colors.panel, .border = colors.accent, .border_width = 2, .radius = 5 } };
+
+    var root = try buildRenderTree(allocator, &box, .{ .max_width = 100, .max_height = 40 });
+    defer destroyRenderTree(allocator, &root);
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(allocator);
+    try paintScaled(allocator, &root, &display_list, 1.5);
+
+    try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
+    try std.testing.expect(display_list.commands.items[0] == .alpha_image);
+    try std.testing.expect(display_list.commands.items[1] == .alpha_image);
+    try std.testing.expect(display_list.commands.items[2] == .text);
+}
+
+test "box aligns child inside its minimum size" {
+    const allocator = std.testing.allocator;
+
+    const child = widgets.text("A");
+    const box: Widget = .{ .box = .{
+        .child = &child,
+        .min_width = 40,
+        .min_height = 40,
+        .horizontal_align = .center,
+        .vertical_align = .center,
+    } };
+
+    var root = try buildRenderTree(allocator, &box, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(allocator, &root);
+
+    try std.testing.expectEqual(@as(f32, 40), root.rect.width);
+    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 16), root.children[0].rect.x);
+    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
 }
 
 test "theme selects light and dark defaults from color scheme" {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const keywork = @import("libkeywork");
+const lua_codec = @import("lua_codec.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -10,6 +11,72 @@ const State = keywork.AppContext;
 const BuildScope = keywork.BuildScope;
 
 const app_registry_key = "keywork.app";
+
+const TextOptions = struct {
+    color: ?keywork.Color = null,
+};
+
+const BoxOptions = struct {
+    background: keywork.Color = keywork.colors.transparent,
+    border: ?keywork.Color = null,
+    border_width: f32 = 1,
+    radius: f32 = 0,
+    min_width: f32 = 0,
+    min_height: f32 = 0,
+    @"align": ?keywork.Widget.Alignment = null,
+    horizontal_align: ?keywork.Widget.Alignment = null,
+    vertical_align: ?keywork.Widget.Alignment = null,
+
+    fn horizontalAlign(self: BoxOptions) keywork.Widget.Alignment {
+        return self.horizontal_align orelse self.@"align" orelse .start;
+    }
+
+    fn verticalAlign(self: BoxOptions) keywork.Widget.Alignment {
+        return self.vertical_align orelse self.@"align" orelse .start;
+    }
+};
+
+const FocusOptions = struct {
+    autofocus: bool = false,
+    skip_traversal: bool = false,
+    can_request_focus: bool = true,
+};
+
+const FocusScopeOptions = struct {
+    modal: bool = false,
+};
+
+const SizedOptions = struct {
+    width: ?f32 = null,
+    height: ?f32 = null,
+    min_width: f32 = 0,
+    min_height: f32 = 0,
+    max_width: ?f32 = null,
+    max_height: ?f32 = null,
+};
+
+const IconOptions = struct {
+    size: f32 = 16,
+    color: keywork.Color = keywork.colors.ink,
+};
+
+const LinearOptions = struct {
+    gap: f32 = 0,
+    @"align": ?keywork.Widget.CrossAxisAlignment = null,
+    cross_align: ?keywork.Widget.CrossAxisAlignment = null,
+
+    fn crossAlign(self: LinearOptions) keywork.Widget.CrossAxisAlignment {
+        return self.cross_align orelse self.@"align" orelse .start;
+    }
+};
+
+const PaddingOptions = struct {
+    insets: keywork.EdgeInsets = .{},
+};
+
+const SpacerOptions = struct {
+    flex: f32 = 1,
+};
 
 const LuaCallback = struct {
     allocator: std.mem.Allocator,
@@ -512,7 +579,8 @@ fn parseWidget(
 
     if (std.mem.eql(u8, kind, "text")) {
         const value = try dupeStringField(lua_state, allocator, table, "value");
-        return .{ .text = .{ .value = value, .color = getOptionalColorField(lua_state, table, "color") } };
+        const options = try lua_codec.decode(TextOptions, lua_state, table, allocator);
+        return .{ .text = .{ .value = value, .color = options.color } };
     }
     if (std.mem.eql(u8, kind, "keyed")) {
         const key = try dupeStringField(lua_state, allocator, table, "key");
@@ -548,14 +616,22 @@ fn parseWidget(
         return .{ .theme = .{ .theme = parseThemeField(lua_state, table, "theme"), .child = child } };
     }
     if (std.mem.eql(u8, kind, "box")) {
+        const options = try lua_codec.decode(BoxOptions, lua_state, table, allocator);
         const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .box = .{
             .child = child,
-            .background = getColorField(lua_state, table, "background", keywork.colors.transparent),
-            .border = getOptionalColorField(lua_state, table, "border"),
+            .background = options.background,
+            .border = options.border,
+            .border_width = options.border_width,
+            .radius = options.radius,
+            .min_width = options.min_width,
+            .min_height = options.min_height,
+            .horizontal_align = options.horizontalAlign(),
+            .vertical_align = options.verticalAlign(),
         } };
     }
     if (std.mem.eql(u8, kind, "clickable")) {
@@ -587,6 +663,7 @@ fn parseWidget(
         } };
     }
     if (std.mem.eql(u8, kind, "focus")) {
+        const options = try lua_codec.decode(FocusOptions, lua_state, table, allocator);
         const id = try dupeStringField(lua_state, allocator, table, "id");
         errdefer allocator.free(id);
         const child = try allocator.create(keywork.Widget);
@@ -598,13 +675,14 @@ fn parseWidget(
         return .{ .focus = .{
             .node = .named(id),
             .child = child,
-            .autofocus = getBooleanField(lua_state, table, "autofocus", false),
-            .skip_traversal = getBooleanField(lua_state, table, "skip_traversal", false),
-            .can_request_focus = getBooleanField(lua_state, table, "can_request_focus", true),
+            .autofocus = options.autofocus,
+            .skip_traversal = options.skip_traversal,
+            .can_request_focus = options.can_request_focus,
             .on_focus_change = on_focus_change,
         } };
     }
     if (std.mem.eql(u8, kind, "focus_scope")) {
+        const options = try lua_codec.decode(FocusScopeOptions, lua_state, table, allocator);
         const id = try dupeStringField(lua_state, allocator, table, "id");
         errdefer allocator.free(id);
         const child = try allocator.create(keywork.Widget);
@@ -612,7 +690,7 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .focus_scope = .{ .id = id, .child = child, .modal = getBooleanField(lua_state, table, "modal", false) } };
+        return .{ .focus_scope = .{ .id = id, .child = child, .modal = options.modal } };
     }
     if (std.mem.eql(u8, kind, "button")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -628,43 +706,66 @@ fn parseWidget(
         return keywork.widgets.textInput(id, value, placeholder);
     }
     if (std.mem.eql(u8, kind, "spacer")) {
-        return keywork.widgets.spacer(getNumberField(lua_state, table, "flex", 1));
+        const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
+        return keywork.widgets.spacer(options.flex);
+    }
+    if (std.mem.eql(u8, kind, "sized")) {
+        const options = try lua_codec.decode(SizedOptions, lua_state, table, allocator);
+        const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        return .{ .sized = .{
+            .child = child,
+            .width = options.width,
+            .height = options.height,
+            .min_width = options.min_width,
+            .min_height = options.min_height,
+            .max_width = options.max_width,
+            .max_height = options.max_height,
+        } };
     }
     if (std.mem.eql(u8, kind, "svg_icon")) {
+        const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const path = try stringField(lua_state, table, "path");
         return keywork.svg_icon.icon(
             allocator,
             path,
-            getNumberField(lua_state, table, "size", 16),
-            getColorField(lua_state, table, "color", keywork.colors.ink),
+            options.size,
+            options.color,
         );
     }
     if (std.mem.eql(u8, kind, "icon")) {
+        const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const name = try stringField(lua_state, table, "name");
-        const size = getNumberField(lua_state, table, "size", 16);
-        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, size) orelse return missingIconWidget(allocator, name, getColorField(lua_state, table, "color", keywork.colors.ink));
+        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, options.size) orelse return missingIconWidget(allocator, name, options.color);
         defer allocator.free(path);
         return keywork.svg_icon.icon(
             allocator,
             path,
-            size,
-            getColorField(lua_state, table, "color", keywork.colors.ink),
+            options.size,
+            options.color,
         );
     }
     if (std.mem.eql(u8, kind, "row")) {
+        const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
-        return .{ .row = .{ .children = children, .gap = getNumberField(lua_state, table, "gap", 0) } };
+        return .{ .row = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "column")) {
+        const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
-        return .{ .column = .{ .children = children, .gap = getNumberField(lua_state, table, "gap", 0) } };
+        return .{ .column = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "padding")) {
+        const options = try lua_codec.decode(PaddingOptions, lua_state, table, allocator);
         const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        return .{ .padding = .{ .insets = getInsetsField(lua_state, table, "insets"), .child = child } };
+        return .{ .padding = .{ .insets = options.insets, .child = child } };
     }
     if (std.mem.eql(u8, kind, "center")) {
         const child = try allocator.create(keywork.Widget);
@@ -873,24 +974,6 @@ fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, def
     return @floatCast(c.lua_tonumber(lua_state, -1));
 }
 
-fn getInsetsField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) keywork.EdgeInsets {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    if (c.lua_isnumber(lua_state, -1) != 0) return keywork.EdgeInsets.all(@floatCast(c.lua_tonumber(lua_state, -1)));
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return .{};
-
-    const inset_table = c.lua_gettop(lua_state);
-    const all = getNumberField(lua_state, inset_table, "all", 0);
-    const x = getNumberField(lua_state, inset_table, "x", all);
-    const y = getNumberField(lua_state, inset_table, "y", all);
-    return .{
-        .left = getNumberField(lua_state, inset_table, "left", x),
-        .top = getNumberField(lua_state, inset_table, "top", y),
-        .right = getNumberField(lua_state, inset_table, "right", x),
-        .bottom = getNumberField(lua_state, inset_table, "bottom", y),
-    };
-}
-
 fn parseThemeField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) keywork.Theme {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
@@ -965,13 +1048,6 @@ fn parseInputTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.In
     result.border = getOptionalColorField(lua_state, input_table, "border") orelse result.border;
     result.focused_border = getOptionalColorField(lua_state, input_table, "focused_border") orelse result.focused_border;
     return result;
-}
-
-fn getBooleanField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: bool) bool {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    if (!c.lua_isboolean(lua_state, -1)) return default;
-    return c.lua_toboolean(lua_state, -1) != 0;
 }
 
 fn getOptionalCallbackField(
