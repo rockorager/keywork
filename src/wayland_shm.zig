@@ -570,20 +570,28 @@ fn rasterize(
     commands: []const keywork.PaintCommand,
 ) !void {
     @memset(pixels, @as(u32, @bitCast(keywork.colors.panel)));
+    var clip: ?TextRenderer.PixelClip = null;
     for (commands) |command| {
         switch (command) {
-            .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color),
-            .text => |text| try renderer.render(pixels, width, height, scale, text),
-            .alpha_image => |image| alphaImage(pixels, width, height, scale, image),
+            .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color, clip),
+            .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
+            .alpha_image => |image| alphaImage(pixels, width, height, scale, image, clip),
+            .set_clip => |rect| clip = if (rect) |value| TextRenderer.PixelClip.fromRect(value, scale) else null,
         }
     }
 }
 
-fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Rect, color: keywork.Color) void {
-    const x0 = clampPixel(@floor(rect.x * scale), width);
-    const y0 = clampPixel(@floor(rect.y * scale), height);
-    const x1 = clampPixel(@ceil((rect.x + rect.width) * scale), width);
-    const y1 = clampPixel(@ceil((rect.y + rect.height) * scale), height);
+fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Rect, color: keywork.Color, clip: ?TextRenderer.PixelClip) void {
+    var x0 = clampPixel(@floor(rect.x * scale), width);
+    var y0 = clampPixel(@floor(rect.y * scale), height);
+    var x1 = clampPixel(@ceil((rect.x + rect.width) * scale), width);
+    var y1 = clampPixel(@ceil((rect.y + rect.height) * scale), height);
+    if (clip) |c| {
+        x0 = @max(x0, clampClip(c.x0, width));
+        y0 = @max(y0, clampClip(c.y0, height));
+        x1 = @min(x1, clampClip(c.x1, width));
+        y1 = @min(y1, clampClip(c.y1, height));
+    }
     if (x0 >= x1 or y0 >= y1) return;
 
     const value: u32 = @bitCast(color);
@@ -600,25 +608,41 @@ fn alphaImage(
     height: u31,
     scale: f32,
     image: keywork.PaintCommand.AlphaImage,
+    clip: ?TextRenderer.PixelClip,
 ) void {
     if (image.width == 0 or image.height == 0) return;
     const image_width: usize = @intCast(image.width);
     const image_height: usize = @intCast(image.height);
     const dst_x0 = clampPixel(@floor(image.rect.x * scale), width);
     const dst_y0 = clampPixel(@floor(image.rect.y * scale), height);
-    const dst_x1 = @min(dst_x0 + image_width, width);
-    const dst_y1 = @min(dst_y0 + image_height, height);
-    if (dst_x0 >= dst_x1 or dst_y0 >= dst_y1) return;
+    var start_x = dst_x0;
+    var start_y = dst_y0;
+    var dst_x1 = @min(dst_x0 + image_width, width);
+    var dst_y1 = @min(dst_y0 + image_height, height);
+    if (clip) |c| {
+        start_x = @max(start_x, clampClip(c.x0, width));
+        start_y = @max(start_y, clampClip(c.y0, height));
+        dst_x1 = @min(dst_x1, clampClip(c.x1, width));
+        dst_y1 = @min(dst_y1, clampClip(c.y1, height));
+    }
+    if (start_x >= dst_x1 or start_y >= dst_y1) return;
 
-    var row: usize = 0;
-    while (dst_y0 + row < dst_y1) : (row += 1) {
-        var column: usize = 0;
-        while (dst_x0 + column < dst_x1) : (column += 1) {
+    var y = start_y;
+    while (y < dst_y1) : (y += 1) {
+        const row = y - dst_y0;
+        var x = start_x;
+        while (x < dst_x1) : (x += 1) {
+            const column = x - dst_x0;
             const coverage = image.alpha[row * image_width + column];
             if (coverage == 0) continue;
-            blendPixel(pixels, width, dst_x0 + column, dst_y0 + row, image.color, coverage);
+            blendPixel(pixels, width, x, y, image.color, coverage);
         }
     }
+}
+
+fn clampClip(value: i32, max_value: u31) usize {
+    if (value <= 0) return 0;
+    return @min(@as(usize, @intCast(value)), max_value);
 }
 
 fn blendPixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Color, coverage: u8) void {

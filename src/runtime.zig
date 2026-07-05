@@ -18,7 +18,6 @@ const Point = keywork.Point;
 const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
-const RenderObjectNode = keywork.RenderObjectNode;
 const Size = keywork.Size;
 const desktop_settings = @import("desktop_settings.zig");
 const event_loop = @import("event_loop.zig");
@@ -36,7 +35,6 @@ pub const Runtime = struct {
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
     element_root: ?Element = null,
-    render_object_root: ?RenderObjectNode = null,
     root: ?RenderNode = null,
     display_list: DisplayList = .{},
     app_context: State = .{},
@@ -72,10 +70,6 @@ pub const Runtime = struct {
         if (self.root) |*root| {
             keywork.destroyRenderTree(self.allocator, root);
             self.root = null;
-        }
-        if (self.render_object_root) |*render_object_root| {
-            keywork.destroyRenderObjectTree(self.allocator, render_object_root);
-            self.render_object_root = null;
         }
         if (self.element_root) |*element_root| {
             keywork.destroyElementTree(self.allocator, element_root);
@@ -129,15 +123,23 @@ pub const Runtime = struct {
 
         self.rendering = true;
         defer self.rendering = false;
-        self.repaint_pending = false;
-        if (self.rebuild_pending) {
-            try self.rebuild();
+        // Consume pending flags before rebuilding so invalidations raised by
+        // callbacks during the rebuild are observed on the next pass instead
+        // of being cleared and dropped.
+        const max_rebuild_passes = 8;
+        var pass: usize = 0;
+        while (self.rebuild_pending or self.state_rebuild_pending) : (pass += 1) {
+            if (pass >= max_rebuild_passes) return error.RebuildDidNotStabilize;
+            const full_rebuild = self.rebuild_pending;
             self.rebuild_pending = false;
             self.state_rebuild_pending = false;
-        } else if (self.state_rebuild_pending) {
-            try self.rebuildDirtyState();
-            self.state_rebuild_pending = false;
+            if (full_rebuild) {
+                try self.rebuild();
+            } else {
+                try self.rebuildDirtyState();
+            }
         }
+        self.repaint_pending = false;
 
         const root = if (self.root) |*root| root else return error.NotBuilt;
         self.display_list.clearRetainingCapacity(self.allocator);
@@ -180,8 +182,7 @@ pub const Runtime = struct {
         if (keywork.hitTestTextInput(root, point)) |id| {
             try self.setFocused(id);
             _ = try self.setPressedId(null);
-            try self.rebuild();
-            try self.requestRepaint();
+            try self.invalidate();
             return;
         }
 
@@ -197,16 +198,14 @@ pub const Runtime = struct {
                 if (try self.activateClick(hit)) needs_update = true;
             }
             if (needs_update) {
-                try self.rebuild();
-                try self.requestRepaint();
+                try self.invalidate();
             }
         } else {
             self.autofocus_suppressed = true;
             try self.setFocused(null);
             log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
             _ = try self.setPressedId(null);
-            try self.rebuild();
-            try self.requestRepaint();
+            try self.invalidate();
         }
     }
 
@@ -238,8 +237,7 @@ pub const Runtime = struct {
         }
 
         if (needs_update) {
-            try self.rebuild();
-            try self.requestRepaint();
+            try self.invalidate();
         }
     }
 
@@ -253,15 +251,13 @@ pub const Runtime = struct {
             if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return error.FocusTargetOutsideModal;
         }
         try self.setFocused(id);
-        try self.rebuild();
-        try self.requestRepaint();
+        try self.invalidate();
     }
 
     pub fn clearFocus(self: *Runtime) !void {
         self.autofocus_suppressed = true;
         try self.setFocused(null);
-        try self.rebuild();
-        try self.requestRepaint();
+        try self.invalidate();
     }
 
     fn setFocused(self: *Runtime, id: ?[]const u8) !void {
@@ -288,8 +284,7 @@ pub const Runtime = struct {
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
         if (try self.activateShortcut(input)) {
-            try self.rebuild();
-            try self.requestRepaint();
+            try self.invalidate();
             return;
         }
 
@@ -323,8 +318,7 @@ pub const Runtime = struct {
                 }
             },
         }
-        try self.rebuild();
-        try self.requestRepaint();
+        try self.invalidate();
     }
 
     fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
@@ -457,8 +451,7 @@ pub const Runtime = struct {
             break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
         } else null;
         if (!try self.setHoveredId(hit_id)) return;
-        try self.rebuild();
-        try self.requestRepaint();
+        try self.invalidate();
     }
 
     fn setHoveredId(self: *Runtime, id: ?[]const u8) !bool {
@@ -519,17 +512,8 @@ pub const Runtime = struct {
         if (size.width > 0 and size.height > 0) {
             self.constraints = .{ .max_width = size.width, .max_height = size.height };
         }
-        if (self.rendering) {
-            self.rebuild_pending = true;
-            self.repaint_pending = true;
-            return;
-        }
-        self.rebuild() catch |err| {
-            log.err("configure rebuild failed: {}", .{err});
-            return;
-        };
-        self.requestRepaint() catch |err| {
-            log.err("configure repaint failed: {}", .{err});
+        self.invalidate() catch |err| {
+            log.err("configure invalidate failed: {}", .{err});
         };
     }
 
@@ -544,12 +528,8 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         if (self.color_scheme == color_scheme) return;
         self.color_scheme = color_scheme;
-        self.rebuild() catch |err| {
-            log.err("desktop settings rebuild failed: {}", .{err});
-            return;
-        };
-        self.requestRepaint() catch |err| {
-            log.err("desktop settings repaint failed: {}", .{err});
+        self.invalidate() catch |err| {
+            log.err("desktop settings invalidate failed: {}", .{err});
         };
     }
 
@@ -569,8 +549,7 @@ pub const Runtime = struct {
     ) !void {
         log.info("reload requested for {s} mask=0x{x}", .{ path, mask });
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        try self.rebuild();
-        try self.requestRepaint();
+        try self.invalidate();
     }
 
     fn rebuild(self: *Runtime) !void {
@@ -641,16 +620,30 @@ pub const Runtime = struct {
 
     fn rebuildRetainedTrees(self: *Runtime) !void {
         const element_root = if (self.element_root) |*element_root| element_root else return error.NotBuilt;
-        if (self.render_object_root) |*render_object_root| {
-            try keywork.updateRenderObjectTree(self.allocator, render_object_root, element_root);
-        } else {
-            self.render_object_root = try keywork.buildRenderObjectTree(self.allocator, element_root);
-        }
-
         var new_root = try keywork.buildRenderTreeFromElement(self.allocator, element_root, self.constraints, self.backend);
         errdefer keywork.destroyRenderTree(self.allocator, &new_root);
         self.root = new_root;
         errdefer self.root = null;
+        self.reconcileInteractionAfterRebuild();
+    }
+
+    /// Drops hovered/pressed ids whose widgets no longer exist so they
+    /// cannot leak stale interaction styling into later builds. Focus has
+    /// its own reconciliation with autofocus fallback.
+    fn reconcileInteractionAfterRebuild(self: *Runtime) void {
+        const root = if (self.root) |*root| root else return;
+        if (self.hovered_id) |id| {
+            if (keywork.findClickHitById(root, id) == null) {
+                self.allocator.free(id);
+                self.hovered_id = null;
+            }
+        }
+        if (self.pressed_id) |id| {
+            if (keywork.findClickHitById(root, id) == null) {
+                self.allocator.free(id);
+                self.pressed_id = null;
+            }
+        }
     }
 
     fn reconcileFocusAfterRebuild(self: *Runtime) !bool {
@@ -713,6 +706,113 @@ test "popLastGrapheme removes one extended grapheme cluster" {
     try std.testing.expectEqualStrings("", bytes.items);
 }
 
+test "invalidation raised during rebuild is not dropped" {
+    const TestApp = struct {
+        builds: usize = 0,
+        runtime: ?*Runtime = null,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            // Re-invalidate exactly once from inside a rebuild pass.
+            if (self.builds == 2) {
+                if (self.runtime) |runtime| try runtime.invalidate();
+            }
+            return keywork.widgets.text("hello");
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.runtime = &runtime;
+
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+    try runtime.invalidate();
+    try std.testing.expectEqual(@as(usize, 3), app.builds);
+    try std.testing.expect(!runtime.rebuild_pending);
+    try std.testing.expect(!runtime.state_rebuild_pending);
+}
+
+test "rebuild passes that never stabilize return an error" {
+    const TestApp = struct {
+        runtime: ?*Runtime = null,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.runtime) |runtime| try runtime.invalidate();
+            return keywork.widgets.text("hello");
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.runtime = &runtime;
+
+    try std.testing.expectError(error.RebuildDidNotStabilize, runtime.invalidate());
+}
+
 test "tab traversal focuses widgets and enter activates focused clickable" {
     const TestApp = struct {
         clicks: usize = 0,
@@ -737,15 +837,20 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -806,15 +911,20 @@ test "shortcut invokes ambient action outside text input focus" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -865,15 +975,20 @@ test "focus widget participates in traversal and shortcut context" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -912,15 +1027,20 @@ test "autofocus focus node is selected during initial build" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -970,15 +1090,20 @@ test "autofocus replaces focused node removed during rebuild" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -1053,15 +1178,20 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -1123,15 +1253,20 @@ test "focus traversal respects request and traversal policy" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -1188,15 +1323,20 @@ test "focused node becoming non-requestable falls back to autofocus" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -1246,15 +1386,20 @@ test "focus scope contains tab traversal once focus is inside it" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 
@@ -1312,15 +1457,20 @@ test "modal focus scope traps autofocus traversal and focus requests" {
 
     const TestBackend = struct {
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
         }
 
         fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
             return false;
         }
 
-        fn measureText(_: *anyopaque, value: []const u8) !Size {
-            return keywork.TextMeasurer.fixed.measureText(value);
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
         }
     };
 

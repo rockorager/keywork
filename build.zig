@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
     });
     const uucode_module = uucode_dep.module("uucode");
 
+    const z2d_dep = b.dependency("z2d", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const z2d_module = z2d_dep.module("z2d");
+
     const xkb_c = b.addTranslateC(.{
         .root_source_file = b.path("src/xkb_c.h"),
         .target = target,
@@ -71,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .image_c = image_c_module,
         .vulkan = vulkan_mod,
         .uucode = uucode_module,
+        .z2d = z2d_module,
         .xkb_c = xkb_c_module,
         .dbus_c = dbus_c_module,
         .text_c = text_c_module,
@@ -271,6 +278,7 @@ const LibkeyworkImports = struct {
     image_c: *std.Build.Module,
     vulkan: *std.Build.Module,
     uucode: *std.Build.Module,
+    z2d: *std.Build.Module,
     xkb_c: *std.Build.Module,
     dbus_c: *std.Build.Module,
     text_c: *std.Build.Module,
@@ -282,6 +290,7 @@ fn addLibkeyworkImports(b: *std.Build, module: *std.Build.Module, imports: Libke
     module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
     module.addImport("vulkan", imports.vulkan);
     module.addImport("uucode", imports.uucode);
+    module.addImport("z2d", imports.z2d);
     module.addImport("xkb_c", imports.xkb_c);
     module.addImport("dbus_c", imports.dbus_c);
     module.addImport("text_c", imports.text_c);

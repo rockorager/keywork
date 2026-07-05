@@ -1,6 +1,7 @@
 //! Core Keywork framework types, element/render trees, layout, painting, and hit testing.
 
 const std = @import("std");
+const z2d = @import("z2d");
 
 pub const Color = packed struct(u32) {
     b: u8,
@@ -239,6 +240,18 @@ pub const Rect = struct {
 
     pub fn size(self: Rect) Size {
         return .{ .width = self.width, .height = self.height };
+    }
+
+    pub fn intersect(self: Rect, other: Rect) Rect {
+        const x0 = @max(self.x, other.x);
+        const y0 = @max(self.y, other.y);
+        const x1 = @min(self.x + self.width, other.x + other.width);
+        const y1 = @min(self.y + self.height, other.y + other.height);
+        return .{ .x = x0, .y = y0, .width = @max(0, x1 - x0), .height = @max(0, y1 - y0) };
+    }
+
+    pub fn isEmpty(self: Rect) bool {
+        return self.width <= 0 or self.height <= 0;
     }
 };
 
@@ -943,13 +956,6 @@ fn inputPlaceholder(theme: Theme) Color {
     return theme.input_theme.placeholder orelse theme.color_scheme.on_surface_variant;
 }
 
-pub const RenderObjectNode = struct {
-    kind: Element.Kind,
-    key: ?Widget.Key = null,
-    render_object: ?Widget.RenderObject = null,
-    children: []RenderObjectNode = &.{},
-};
-
 pub const RenderNode = struct {
     kind: Kind,
     rect: Rect,
@@ -1013,6 +1019,10 @@ pub const PaintCommand = union(enum) {
     fill_rect: FillRect,
     text: TextRun,
     alpha_image: AlphaImage,
+    /// Clips subsequent commands to the given rect (logical coordinates)
+    /// until the next set_clip; null removes clipping. The rect is already
+    /// resolved against enclosing clips, so backends need no stack.
+    set_clip: ?Rect,
 
     pub const FillRect = struct {
         rect: Rect,
@@ -1038,6 +1048,7 @@ pub const PaintCommand = union(enum) {
 pub const DisplayList = struct {
     commands: std.ArrayList(PaintCommand) = .empty,
     alpha_cache: std.AutoHashMapUnmanaged(u64, AlphaCacheEntry) = .empty,
+    clip_stack: std.ArrayList(Rect) = .empty,
 
     const AlphaCacheEntry = struct {
         width: u32,
@@ -1049,10 +1060,33 @@ pub const DisplayList = struct {
         self.commands.deinit(allocator);
         self.clearAlphaCache(allocator);
         self.alpha_cache.deinit(allocator);
+        self.clip_stack.deinit(allocator);
     }
 
     pub fn clearRetainingCapacity(self: *DisplayList, _: std.mem.Allocator) void {
         self.commands.clearRetainingCapacity();
+        self.clip_stack.clearRetainingCapacity();
+    }
+
+    /// Clips subsequent commands to rect intersected with any enclosing
+    /// clips. Every pushClip must be matched by a popClip.
+    pub fn pushClip(self: *DisplayList, allocator: std.mem.Allocator, rect: Rect) !void {
+        const resolved = if (self.clip_stack.items.len > 0)
+            self.clip_stack.items[self.clip_stack.items.len - 1].intersect(rect)
+        else
+            rect;
+        try self.clip_stack.append(allocator, resolved);
+        try self.commands.append(allocator, .{ .set_clip = resolved });
+    }
+
+    pub fn popClip(self: *DisplayList, allocator: std.mem.Allocator) !void {
+        std.debug.assert(self.clip_stack.items.len > 0);
+        _ = self.clip_stack.pop();
+        const restored: ?Rect = if (self.clip_stack.items.len > 0)
+            self.clip_stack.items[self.clip_stack.items.len - 1]
+        else
+            null;
+        try self.commands.append(allocator, .{ .set_clip = restored });
     }
 
     fn clearAlphaCache(self: *DisplayList, allocator: std.mem.Allocator) void {
@@ -1185,6 +1219,14 @@ pub const LogBackend = struct {
                     "alpha_image x={d} y={d} w={d} h={d} pixels={d}x{d} color=#{x:0>8}\n",
                     .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height, @as(u32, @bitCast(image.color)) },
                 ),
+                .set_clip => |clip| if (clip) |rect| {
+                    try self.writer.print(
+                        "set_clip x={d} y={d} w={d} h={d}\n",
+                        .{ rect.x, rect.y, rect.width, rect.height },
+                    );
+                } else {
+                    try self.writer.print("set_clip none\n", .{});
+                },
             }
         }
         return false;
@@ -1571,71 +1613,6 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
     destroyElementWidget(allocator, &element.widget);
 }
 
-pub fn buildRenderObjectTree(allocator: std.mem.Allocator, element: *const Element) anyerror!RenderObjectNode {
-    const children = try allocator.alloc(RenderObjectNode, element.children.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (children[0..initialized]) |*child| destroyRenderObjectTree(allocator, child);
-        allocator.free(children);
-    }
-
-    for (element.children, 0..) |*element_child, index| {
-        children[index] = try buildRenderObjectTree(allocator, element_child);
-        initialized += 1;
-    }
-
-    return .{
-        .kind = element.kind,
-        .key = if (element.key) |key| try cloneKey(allocator, key) else null,
-        .render_object = renderObjectForElement(element),
-        .children = children,
-    };
-}
-
-pub fn destroyRenderObjectTree(allocator: std.mem.Allocator, node: *RenderObjectNode) void {
-    for (node.children) |*child| destroyRenderObjectTree(allocator, child);
-    allocator.free(node.children);
-    node.children = &.{};
-    if (node.key) |key| {
-        destroyKey(allocator, key);
-        node.key = null;
-    }
-    node.render_object = null;
-}
-
-pub fn updateRenderObjectTree(allocator: std.mem.Allocator, node: *RenderObjectNode, element: *const Element) anyerror!void {
-    if (!canUpdateRenderObjectNode(node, element)) {
-        var replacement = try buildRenderObjectTree(allocator, element);
-        errdefer destroyRenderObjectTree(allocator, &replacement);
-        destroyRenderObjectTree(allocator, node);
-        node.* = replacement;
-        return;
-    }
-
-    if (element.key) |key| {
-        if (node.key) |old_key| destroyKey(allocator, old_key);
-        node.key = try cloneKey(allocator, key);
-    } else if (node.key) |old_key| {
-        destroyKey(allocator, old_key);
-        node.key = null;
-    }
-    node.render_object = renderObjectForElement(element);
-
-    if (hasKeyedRenderObjectChildren(node.children) or hasKeyedElements(element.children)) {
-        try updateKeyedRenderObjectChildren(allocator, node, element.children);
-    } else if (node.children.len == element.children.len) {
-        for (element.children, 0..) |*element_child, index| {
-            try updateRenderObjectTree(allocator, &node.children[index], element_child);
-        }
-    } else {
-        const old_children = node.children;
-        const new_children = try buildRenderObjectChildren(allocator, element.children);
-        for (old_children) |*child| destroyRenderObjectTree(allocator, child);
-        allocator.free(old_children);
-        node.children = new_children;
-    }
-}
-
 pub fn updateElementTree(allocator: std.mem.Allocator, element: *Element, widget: *const Widget, constraints: Constraints) anyerror!void {
     var scope: BuildScope = .{ .allocator = allocator };
     try updateElementTreeScoped(allocator, &scope, element, widget, constraints);
@@ -1973,11 +1950,6 @@ fn hasKeyedChildren(children: []const Element) bool {
     return false;
 }
 
-fn hasKeyedRenderObjectChildren(children: []const RenderObjectNode) bool {
-    for (children) |child| if (child.key != null) return true;
-    return false;
-}
-
 fn hasKeyedElements(elements: []const Element) bool {
     for (elements) |element| if (element.key != null) return true;
     return false;
@@ -1988,65 +1960,6 @@ fn hasKeyedWidgets(items: []const Widget) bool {
     return false;
 }
 
-fn buildRenderObjectChildren(allocator: std.mem.Allocator, elements: []const Element) ![]RenderObjectNode {
-    const children = try allocator.alloc(RenderObjectNode, elements.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (children[0..initialized]) |*child| destroyRenderObjectTree(allocator, child);
-        allocator.free(children);
-    }
-    for (elements, 0..) |*element, index| {
-        children[index] = try buildRenderObjectTree(allocator, element);
-        initialized += 1;
-    }
-    return children;
-}
-
-fn updateKeyedRenderObjectChildren(allocator: std.mem.Allocator, node: *RenderObjectNode, elements: []const Element) !void {
-    const old_children = node.children;
-    const used = try allocator.alloc(bool, old_children.len);
-    defer allocator.free(used);
-    @memset(used, false);
-
-    const new_children = try allocator.alloc(RenderObjectNode, elements.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (new_children[0..initialized]) |*child| destroyRenderObjectTree(allocator, child);
-        allocator.free(new_children);
-        for (old_children, 0..) |*old_child, index| {
-            if (!used[index]) destroyRenderObjectTree(allocator, old_child);
-        }
-        allocator.free(old_children);
-    }
-
-    for (elements, 0..) |*element, index| {
-        if (element.key) |key| {
-            if (findRenderObjectNodeByKey(old_children, used, key)) |old_index| {
-                used[old_index] = true;
-                new_children[index] = old_children[old_index];
-                try updateRenderObjectTree(allocator, &new_children[index], element);
-                initialized += 1;
-                continue;
-            }
-        } else if (index < old_children.len and !used[index] and old_children[index].key == null) {
-            used[index] = true;
-            new_children[index] = old_children[index];
-            try updateRenderObjectTree(allocator, &new_children[index], element);
-            initialized += 1;
-            continue;
-        }
-
-        new_children[index] = try buildRenderObjectTree(allocator, element);
-        initialized += 1;
-    }
-
-    for (old_children, 0..) |*old_child, index| {
-        if (!used[index]) destroyRenderObjectTree(allocator, old_child);
-    }
-    allocator.free(old_children);
-    node.children = new_children;
-}
-
 fn findElementByKey(children: []const Element, used: []const bool, key: Widget.Key) ?usize {
     for (children, 0..) |child, index| {
         if (used[index]) continue;
@@ -2054,29 +1967,6 @@ fn findElementByKey(children: []const Element, used: []const bool, key: Widget.K
         if (keysEqual(child_key, key)) return index;
     }
     return null;
-}
-
-fn findRenderObjectNodeByKey(children: []const RenderObjectNode, used: []const bool, key: Widget.Key) ?usize {
-    for (children, 0..) |child, index| {
-        if (used[index]) continue;
-        const child_key = child.key orelse continue;
-        if (keysEqual(child_key, key)) return index;
-    }
-    return null;
-}
-
-fn canUpdateRenderObjectNode(node: *const RenderObjectNode, element: *const Element) bool {
-    if (node.kind != element.kind) return false;
-    if (node.key) |node_key| {
-        const element_key = element.key orelse return false;
-        return keysEqual(node_key, element_key);
-    }
-    return element.key == null;
-}
-
-fn renderObjectForElement(element: *const Element) ?Widget.RenderObject {
-    if (element.kind != .render_object) return null;
-    return element.widget.render_object;
 }
 
 fn widgetKey(widget: Widget) ?Widget.Key {
@@ -2387,6 +2277,8 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             const value = node.text orelse "";
             const visible_text = if (value.len > 0) value else node.placeholder orelse "";
             const text_color = if (value.len > 0) node.foreground else node.placeholder_foreground;
+            // Overflowing text and caret must not paint outside the field.
+            try display_list.pushClip(allocator, node.rect);
             try display_list.text(allocator, .{
                 .x = node.rect.x + input_horizontal_padding,
                 .y = node.rect.y + input_vertical_padding,
@@ -2400,6 +2292,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
                     .height = @max(1, node.rect.height - input_vertical_padding * 2),
                 }, node.foreground);
             }
+            try display_list.popClip(allocator);
         },
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
@@ -2460,43 +2353,59 @@ fn paintRoundedBox(
     }
 }
 
+/// Rasterizes an antialiased rounded-rect coverage mask with z2d. A fill
+/// covers the whole shape; with stroke_width set, only the border band
+/// between the outer rect and an inset inner rect is covered (even-odd fill
+/// of two nested subpaths).
 fn roundedRectAlpha(allocator: std.mem.Allocator, width: usize, height: usize, radius: f32, stroke_width: ?f32) ![]u8 {
-    const alpha = try allocator.alloc(u8, width * height);
-    const sample_count = 4;
-    const sample_total = sample_count * sample_count;
-    const w = @as(f32, @floatFromInt(width));
-    const h = @as(f32, @floatFromInt(height));
-    const inner_width = stroke_width orelse 0;
+    std.debug.assert(width > 0 and height > 0);
+    const w: f64 = @floatFromInt(width);
+    const h: f64 = @floatFromInt(height);
 
-    for (alpha, 0..) |*value, index| {
-        const x = @as(f32, @floatFromInt(index % width));
-        const y = @as(f32, @floatFromInt(index / width));
-        var covered: usize = 0;
-        for (0..sample_count) |sy| {
-            for (0..sample_count) |sx| {
-                const px = x + (@as(f32, @floatFromInt(sx)) + 0.5) / sample_count;
-                const py = y + (@as(f32, @floatFromInt(sy)) + 0.5) / sample_count;
-                const outer = pointInRoundedRect(px, py, w, h, radius);
-                const inner = if (stroke_width) |_| pointInRoundedRect(px - inner_width, py - inner_width, w - inner_width * 2, h - inner_width * 2, @max(0, radius - inner_width)) else false;
-                if (outer and !inner) covered += 1;
-            }
+    var surface = try z2d.Surface.init(.image_surface_alpha8, allocator, @intCast(width), @intCast(height));
+    defer surface.deinit(allocator);
+
+    var path: z2d.Path = .empty;
+    defer path.deinit(allocator);
+
+    try appendRoundedRectPath(&path, allocator, 0, 0, w, h, radius);
+    if (stroke_width) |stroke| {
+        const inset: f64 = stroke;
+        const inner_width = w - inset * 2;
+        const inner_height = h - inset * 2;
+        if (inner_width > 0 and inner_height > 0) {
+            try appendRoundedRectPath(&path, allocator, inset, inset, inner_width, inner_height, @max(0, radius - stroke));
         }
-        value.* = @intCast((covered * 255 + sample_total / 2) / sample_total);
     }
+
+    const pattern: z2d.Pattern = .{ .opaque_pattern = .{ .pixel = .{ .alpha8 = .{ .a = 255 } } } };
+    try z2d.painter.fill(allocator, &surface, &pattern, path.nodes.items, .{ .fill_rule = .even_odd });
+
+    const alpha = try allocator.alloc(u8, width * height);
+    for (surface.image_surface_alpha8.buf, alpha) |pixel, *value| value.* = pixel.a;
     return alpha;
 }
 
-fn pointInRoundedRect(x: f32, y: f32, width: f32, height: f32, radius: f32) bool {
-    if (width <= 0 or height <= 0) return false;
-    if (x < 0 or y < 0 or x >= width or y >= height) return false;
-    const r = @min(radius, @min(width, height) / 2);
-    if (r <= 0) return true;
+fn appendRoundedRectPath(path: *z2d.Path, allocator: std.mem.Allocator, x: f64, y: f64, width: f64, height: f64, radius: f32) !void {
+    const r = @min(@as(f64, radius), @min(width, height) / 2);
+    if (r <= 0) {
+        try path.moveTo(allocator, x, y);
+        try path.lineTo(allocator, x + width, y);
+        try path.lineTo(allocator, x + width, y + height);
+        try path.lineTo(allocator, x, y + height);
+        try path.close(allocator);
+        return;
+    }
 
-    const cx = if (x < r) r else if (x >= width - r) width - r else x;
-    const cy = if (y < r) r else if (y >= height - r) height - r else y;
-    const dx = x - cx;
-    const dy = y - cy;
-    return dx * dx + dy * dy <= r * r;
+    const half_pi = std.math.pi / 2.0;
+    // The moveTo starts a fresh subpath; each arc connects to the previous
+    // one with the straight edge segment.
+    try path.moveTo(allocator, x + r, y);
+    try path.arc(allocator, x + width - r, y + r, r, -half_pi, 0);
+    try path.arc(allocator, x + width - r, y + height - r, r, 0, half_pi);
+    try path.arc(allocator, x + r, y + height - r, r, half_pi, std.math.pi);
+    try path.arc(allocator, x + r, y + r, r, std.math.pi, 3 * half_pi);
+    try path.close(allocator);
 }
 
 fn roundedRectCacheKey(width: usize, height: usize, radius: f32, stroke_width: ?f32) u64 {
@@ -3308,6 +3217,8 @@ fn testCallback() Widget.Callback {
 
 fn testCallbackCall(_: *anyopaque) !void {}
 
+const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
+
 test "display list reuses cached alpha image data" {
     const allocator = std.testing.allocator;
 
@@ -3324,6 +3235,81 @@ test "display list reuses cached alpha image data" {
     try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, second_alpha, colors.black, 42);
     try std.testing.expectEqual(cached_ptr, display_list.commands.items[0].alpha_image.alpha.ptr);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, display_list.commands.items[0].alpha_image.alpha);
+}
+
+test "rounded rect alpha covers fill and hollow border band" {
+    const allocator = std.testing.allocator;
+    const size = 16;
+
+    const fill = try roundedRectAlpha(allocator, size, size, 4, null);
+    defer allocator.free(fill);
+    // Center is fully covered, the rounded-off corner is empty.
+    try std.testing.expectEqual(@as(u8, 255), fill[8 * size + 8]);
+    try std.testing.expectEqual(@as(u8, 0), fill[0]);
+
+    const stroke = try roundedRectAlpha(allocator, size, size, 4, 2);
+    defer allocator.free(stroke);
+    // The band covers the edge but leaves the interior hollow.
+    try std.testing.expectEqual(@as(u8, 255), stroke[1 * size + 8]);
+    try std.testing.expectEqual(@as(u8, 0), stroke[8 * size + 8]);
+    try std.testing.expectEqual(@as(u8, 0), stroke[0]);
+}
+
+test "display list clip stack resolves nested intersections" {
+    const allocator = std.testing.allocator;
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(allocator);
+
+    try display_list.pushClip(allocator, .{ .x = 10, .y = 10, .width = 100, .height = 50 });
+    try display_list.pushClip(allocator, .{ .x = 0, .y = 0, .width = 40, .height = 200 });
+    try display_list.popClip(allocator);
+    try display_list.popClip(allocator);
+
+    const commands = display_list.commands.items;
+    try std.testing.expectEqual(@as(usize, 4), commands.len);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 100, .height = 50 }, commands[0].set_clip.?);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 30, .height = 50 }, commands[1].set_clip.?);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 100, .height = 50 }, commands[2].set_clip.?);
+    try std.testing.expectEqual(@as(?Rect, null), commands[3].set_clip);
+
+    display_list.clearRetainingCapacity(allocator);
+    try std.testing.expectEqual(@as(usize, 0), display_list.clip_stack.items.len);
+}
+
+test "text input paint clips its content" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const input = widgets.textInput("input", "overflowing value", "placeholder");
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 60, .max_height = 40 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 60, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
+    defer destroyRenderTree(retained_allocator, &root);
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(retained_allocator);
+    try paintScaled(retained_allocator, &root, &display_list, 1);
+
+    var clip_active = false;
+    var text_clipped = false;
+    var last_clip: ?Rect = .{ .x = -1, .y = -1, .width = 0, .height = 0 };
+    for (display_list.commands.items) |command| {
+        switch (command) {
+            .set_clip => |clip| {
+                clip_active = clip != null;
+                last_clip = clip;
+            },
+            .text => if (clip_active) {
+                text_clipped = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(text_clipped);
+    try std.testing.expectEqual(@as(?Rect, null), last_clip);
 }
 
 test "layout, paint, and hit test a padded column" {
@@ -3363,7 +3349,7 @@ test "button widget composes styled clickable content" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator(), .interaction = .{ .pressed_id = "confirm" } };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &button_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .button), root.kind);
@@ -3443,14 +3429,14 @@ test "default text style overrides descendant text defaults" {
     const allocator = std.testing.allocator;
 
     const label = widgets.text("Inherited");
-    const inherited = try widgets.defaultTextStyle(allocator, .{ .color = colors.red, .font_size = 18 }, label);
+    const inherited = try widgets.defaultTextStyle(allocator, .{ .color = test_red, .font_size = 18 }, label);
     defer allocator.destroy(inherited.default_text_style.child);
 
     var root = try buildRenderTree(allocator, &inherited, .{ .max_width = 200, .max_height = 80 });
     defer destroyRenderTree(allocator, &root);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .default_text_style), root.kind);
-    try std.testing.expectEqual(colors.red, root.children[0].text_style.color);
+    try std.testing.expectEqual(test_red, root.children[0].text_style.color);
     try std.testing.expectEqual(@as(f32, 18), root.children[0].text_style.font_size);
 }
 
@@ -3533,14 +3519,19 @@ test "theme widget provides ambient button styling" {
     };
     const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 80 });
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(@as(RenderNode.Kind, .theme), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
     try std.testing.expectEqual(colors.black, box_node.background);
-    try std.testing.expectEqual(@as(f32, 56), root.rect.width);
+    // "Themed" is 6 chars at half the 14px font size, plus 4px padding on
+    // both sides: 6 * 7 + 8.
+    try std.testing.expectEqual(@as(f32, 50), root.rect.width);
 }
 
 test "button uses ambient hover styling" {
@@ -3565,7 +3556,7 @@ test "button uses ambient hover styling" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const box_node = root.children[0].children[0].children[0];
@@ -3594,7 +3585,7 @@ test "button uses ambient pressed styling" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const box_node = root.children[0].children[0].children[0];
@@ -3621,7 +3612,7 @@ test "button uses ambient focused border" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const box_node = root.children[0].children[0].children[0];
@@ -3642,7 +3633,10 @@ test "button without action is disabled and skipped by focus traversal" {
     };
     const button_widget = try widgets.button(build_arena.allocator(), "disabled", "Disabled", null);
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 80 });
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const box_node = root.children[0].children[0];
@@ -3677,7 +3671,7 @@ test "action button resolves nearest ambient action" {
 
     var element = try buildElementTreeScoped(retained_allocator, &scope, &actions_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
@@ -3696,11 +3690,14 @@ test "theme widget provides ambient text and input styling" {
     };
     const column = try widgets.column(build_arena.allocator(), &children, 4);
     const themed = try widgets.theme(build_arena.allocator(), Theme.dark, column);
-    var root = try buildRenderTree(retained_allocator, &themed, .{ .max_width = 200, .max_height = 120 });
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 120 });
+    defer destroyElementTree(retained_allocator, &element);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
-    const text_node = root.children[0].children[0].children[0];
-    const input_node = root.children[0].children[0].children[1];
+    const text_node = root.children[0].children[0];
+    const input_node = root.children[0].children[1];
     try std.testing.expectEqual(Theme.dark.color_scheme.on_surface, text_node.foreground);
     try std.testing.expectEqual(Theme.dark.color_scheme.surface_variant, input_node.background);
     try std.testing.expectEqual(Theme.dark.color_scheme.outline, input_node.border);
@@ -3719,7 +3716,7 @@ test "text input derives focus from ambient focus node" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try buildRenderTreeFromElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(retained_allocator, &root);
 
     try std.testing.expect(root.focused);
@@ -3737,7 +3734,10 @@ test "focus targets are collected in render tree order" {
     const button = try widgets.button(build_allocator, "button", "Button", testCallback());
     const children = [_]Widget{ input, button };
     const column = try widgets.column(build_allocator, &children, 4);
-    var root = try buildRenderTree(allocator, &column, .{ .max_width = 200, .max_height = 120 });
+    var scope: BuildScope = .{ .allocator = build_allocator };
+    var element = try buildElementTreeScoped(allocator, &scope, &column, .{ .max_width = 200, .max_height = 120 });
+    defer destroyElementTree(allocator, &element);
+    var root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(allocator, &root);
 
     const targets = try collectFocusTargets(allocator, &root);
@@ -3914,9 +3914,10 @@ test "button and shortcut can share an intent" {
         try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, button),
     );
 
-    var element = try buildElementTree(allocator, &root_widget, .{ .max_width = 200, .max_height = 80 });
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(allocator, &scope, &root_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(allocator, &element);
-    var root = try buildRenderTreeFromElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .fixed);
+    var root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     defer destroyRenderTree(allocator, &root);
 
     try findShortcutAction(&element, .enter).?.call();
@@ -3965,7 +3966,8 @@ test "focused shortcut resolution prefers nearest shortcut and action scopes" {
         try widgets.shortcuts(build_arena.allocator(), &global_shortcuts, column),
     );
 
-    var element = try buildElementTree(allocator, &root_widget, .{ .max_width = 200, .max_height = 120 });
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(allocator, &scope, &root_widget, .{ .max_width = 200, .max_height = 120 });
     defer destroyElementTree(allocator, &element);
 
     try findFocusedShortcutAction(&element, .space, "local-button").?.call();
@@ -4657,60 +4659,6 @@ test "keyed linear update matches children by key" {
     try std.testing.expectEqualStrings("C", element.children[1].children[0].widget.text.value);
     try std.testing.expectEqualStrings("a", element.children[2].key.?.string);
     try std.testing.expectEqualStrings("A2", element.children[2].children[0].widget.text.value);
-}
-
-test "render object tree update reuses keyed render object nodes across reorder" {
-    const TestRenderObject = struct {
-        id: u8,
-
-        const vtable: Widget.RenderObject.VTable = .{ .layout = layout, .paint = paintObject };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .render_object = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn layout(ptr: *const anyopaque, context: Widget.RenderObject.LayoutContext) !Size {
-            _ = ptr;
-            _ = context;
-            return .{ .width = 1, .height = 1 };
-        }
-
-        fn paintObject(ptr: *const anyopaque, context: Widget.RenderObject.PaintContext) !void {
-            _ = ptr;
-            _ = context;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    const a: TestRenderObject = .{ .id = 'a' };
-    const b: TestRenderObject = .{ .id = 'b' };
-    const a_widget = a.widget();
-    const b_widget = b.widget();
-    const first_children = [_]Widget{
-        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &a_widget } },
-        .{ .keyed = .{ .key = .{ .string = "b" }, .child = &b_widget } },
-    };
-    const first: Widget = .{ .column = .{ .children = &first_children } };
-    var element = try buildElementTree(allocator, &first, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &element);
-
-    var render_objects = try buildRenderObjectTree(allocator, &element);
-    defer destroyRenderObjectTree(allocator, &render_objects);
-
-    const old_b_child_nodes = render_objects.children[1].children.ptr;
-    try std.testing.expectEqual(@as(?*const anyopaque, &b), render_objects.children[1].children[0].render_object.?.ptr);
-
-    const second_children = [_]Widget{
-        .{ .keyed = .{ .key = .{ .string = "b" }, .child = &b_widget } },
-        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &a_widget } },
-    };
-    const second: Widget = .{ .column = .{ .children = &second_children } };
-    try updateElementTree(allocator, &element, &second, .{ .max_width = 200, .max_height = 80 });
-    try updateRenderObjectTree(allocator, &render_objects, &element);
-
-    try std.testing.expectEqual(old_b_child_nodes, render_objects.children[0].children.ptr);
-    try std.testing.expectEqualStrings("b", render_objects.children[0].key.?.string);
-    try std.testing.expectEqual(@as(?*const anyopaque, &b), render_objects.children[0].children[0].render_object.?.ptr);
 }
 
 test "render object widget owns custom layout paint and hit testing" {

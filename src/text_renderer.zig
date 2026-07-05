@@ -18,6 +18,23 @@ glyph_cache: GlyphCache = .empty,
 
 const default_text_size = 16;
 const primary_font_index = 0;
+
+/// Inclusive-exclusive pixel-space clip bounds for CPU rasterization.
+pub const PixelClip = struct {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+
+    pub fn fromRect(rect: keywork.Rect, scale: f32) PixelClip {
+        return .{
+            .x0 = @intFromFloat(@floor(rect.x * scale)),
+            .y0 = @intFromFloat(@floor(rect.y * scale)),
+            .x1 = @intFromFloat(@ceil((rect.x + rect.width) * scale)),
+            .y1 = @intFromFloat(@ceil((rect.y + rect.height) * scale)),
+        };
+    }
+};
 const max_shape_cache_entries = 512;
 const ShapeCache = std.HashMapUnmanaged(ShapeKey, ShapedRun, ShapeContext, std.hash_map.default_max_load_percentage);
 const GlyphCache = std.AutoHashMapUnmanaged(GlyphKey, GlyphBitmap);
@@ -161,6 +178,7 @@ pub fn render(
     height: u31,
     scale: f32,
     text: keywork.PaintCommand.TextRun,
+    clip: ?PixelClip,
 ) !void {
     const pixel_size = try scaledPixelSize(scale, text.style.font_size);
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
@@ -174,7 +192,7 @@ pub fn render(
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
         const line_end = std.mem.indexOfScalarPos(u8, text.value, line_start, '\n') orelse text.value.len;
-        try self.renderLine(pixels, width, height, origin_x, baseline_y, text.value[line_start..line_end], text.style.color, pixel_size);
+        try self.renderLine(pixels, width, height, origin_x, baseline_y, text.value[line_start..line_end], text.style.color, pixel_size, clip);
         if (line_end == text.value.len) break;
         line_start = line_end + 1;
         baseline_y += line_height;
@@ -277,6 +295,7 @@ fn renderLine(
     value: []const u8,
     color: keywork.Color,
     pixel_size: u31,
+    clip: ?PixelClip,
 ) !void {
     if (value.len == 0) return;
 
@@ -295,6 +314,7 @@ fn renderLine(
                     pen_x + fromFixed26Dot6(glyph.x_offset),
                     pen_y - fromFixed26Dot6(glyph.y_offset),
                     color,
+                    clip,
                 );
             }
             pen_x += fromFixed26Dot6(glyph.x_advance);
@@ -510,6 +530,7 @@ fn blitGlyphBitmap(
     glyph_origin_x: f32,
     glyph_baseline_y: f32,
     color: keywork.Color,
+    clip: ?PixelClip,
 ) void {
     if (bitmap.width == 0 or bitmap.rows == 0) return;
 
@@ -518,11 +539,22 @@ fn blitGlyphBitmap(
     const dst_x0: i32 = @intFromFloat(@floor(glyph_origin_x + left));
     const dst_y0: i32 = @intFromFloat(@floor(glyph_baseline_y - top));
 
-    var row: usize = 0;
-    while (row < bitmap.rows) : (row += 1) {
-        var column: usize = 0;
-        const bitmap_width: usize = @intCast(bitmap.width);
-        while (column < bitmap_width) : (column += 1) {
+    const bitmap_width: usize = @intCast(bitmap.width);
+    var row_start: usize = 0;
+    var row_end: usize = bitmap.rows;
+    var col_start: usize = 0;
+    var col_end: usize = bitmap_width;
+    if (clip) |bounds| {
+        col_start = clampSpan(bounds.x0 - dst_x0, bitmap_width);
+        col_end = clampSpan(bounds.x1 - dst_x0, bitmap_width);
+        row_start = clampSpan(bounds.y0 - dst_y0, bitmap.rows);
+        row_end = clampSpan(bounds.y1 - dst_y0, bitmap.rows);
+    }
+
+    var row = row_start;
+    while (row < row_end) : (row += 1) {
+        var column = col_start;
+        while (column < col_end) : (column += 1) {
             const coverage = bitmap.coverage[row * bitmap_width + column];
             if (coverage == 0) continue;
             blendPixel(
@@ -536,6 +568,11 @@ fn blitGlyphBitmap(
             );
         }
     }
+}
+
+fn clampSpan(value: i32, limit: usize) usize {
+    if (value <= 0) return 0;
+    return @min(@as(usize, @intCast(value)), limit);
 }
 
 fn blendPixel(pixels: []u32, width: u31, height: u31, x: i32, y: i32, color: keywork.Color, coverage: u8) void {

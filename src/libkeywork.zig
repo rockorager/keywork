@@ -37,7 +37,6 @@ pub const BuildScope = core.BuildScope;
 pub const AppContext = core.AppContext;
 pub const AppHost = core.AppHost;
 pub const Element = core.Element;
-pub const RenderObjectNode = core.RenderObjectNode;
 pub const RenderNode = core.RenderNode;
 pub const PaintCommand = core.PaintCommand;
 pub const DisplayList = core.DisplayList;
@@ -60,9 +59,6 @@ pub const buildElementTreeScoped = core.buildElementTreeScoped;
 pub const updateElementTree = core.updateElementTree;
 pub const updateElementTreeScoped = core.updateElementTreeScoped;
 pub const destroyElementTree = core.destroyElementTree;
-pub const buildRenderObjectTree = core.buildRenderObjectTree;
-pub const updateRenderObjectTree = core.updateRenderObjectTree;
-pub const destroyRenderObjectTree = core.destroyRenderObjectTree;
 pub const destroyRenderTree = core.destroyRenderTree;
 pub const paint = core.paint;
 pub const paintScaled = core.paintScaled;
@@ -81,3 +77,14 @@ pub const BackendKind = app_runner.BackendKind;
 pub const EventSourceInstaller = app_runner.EventSourceInstaller;
 pub const RunOptions = app_runner.Options;
 pub const run = app_runner.run;
+
+test {
+    _ = @import("core.zig");
+    _ = @import("desktop_settings.zig");
+    _ = @import("event_loop.zig");
+    _ = @import("icon_theme.zig");
+    _ = @import("runtime.zig");
+    _ = @import("text_renderer.zig");
+    _ = @import("wayland_shm.zig");
+    _ = @import("wayland_vulkan.zig");
+}

@@ -20,6 +20,10 @@
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#8d6039a455a7ecc7d2a592ff97f62db4e59b70bf",
             .hash = "N-V-__8AAPdJewI-Ti5p45KnTAAngGBG3aURyXJXXTKmPvKW",
         },
+        .z2d = .{
+            .url = "git+https://github.com/vancluever/z2d?ref=v0.11.0#5184a79622dce6b885c45ef6666f8c92385bed10",
+            .hash = "z2d-0.11.0-j5P_HtLzDwBGyQt49DrT0v4BuVqI_SRs6CXsuj7eBVhR",
+        },
     },
     .paths = .{
         "build.zig",

@@ -18,10 +18,11 @@ const log = std.log.scoped(.keywork_wayland_vulkan);
 
 extern fn vkGetInstanceProcAddr(instance: vk.Instance, p_name: [*:0]const u8) vk.PfnVoidFunction;
 
-const atlas_width = 1024;
-const atlas_height = 1024;
+const initial_atlas_size = 1024;
+const max_atlas_size_cap = 8192;
 const atlas_padding = 1;
-const initial_staging_capacity = atlas_width * atlas_height;
+const initial_staging_capacity = initial_atlas_size * initial_atlas_size;
+const max_prepare_attempts = 8;
 
 const GpuBuffer = struct {
     buffer: vk.Buffer = .null_handle,
@@ -40,6 +41,7 @@ const GpuImage = struct {
 const AtlasKey = union(enum) {
     glyph: Glyph,
     image: u64,
+    solid,
 
     const Glyph = struct {
         font_id: u32,
@@ -48,12 +50,73 @@ const AtlasKey = union(enum) {
     };
 };
 
+/// Side length of the fully-opaque atlas block used to render solid
+/// rectangles through the textured-quad pipeline.
+const solid_block_size = 2;
+
 const AtlasSlot = struct {
     x: u32,
     y: u32,
     width: u32,
     height: u32,
 };
+
+/// Axis-aligned quad in pixel space with its atlas UV window.
+const QuadBounds = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    uv_left: f32,
+    uv_top: f32,
+    uv_right: f32,
+    uv_bottom: f32,
+};
+
+/// Pixel-space clip bounds: x0/y0 inclusive, x1/y1 exclusive.
+const ClipBounds = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+
+    fn fromRect(rect: keywork.Rect, scale: f32) ClipBounds {
+        return .{
+            .x0 = rect.x * scale,
+            .y0 = rect.y * scale,
+            .x1 = (rect.x + rect.width) * scale,
+            .y1 = (rect.y + rect.height) * scale,
+        };
+    }
+};
+
+/// Intersects the quad with the clip and remaps its UV window
+/// proportionally, so clipping happens at vertex generation and the whole
+/// display list stays a single ordered draw. Returns null when fully
+/// clipped.
+fn clipQuad(quad: QuadBounds, clip: ?ClipBounds) ?QuadBounds {
+    const c = clip orelse return quad;
+    const x0 = @max(quad.x0, c.x0);
+    const y0 = @max(quad.y0, c.y0);
+    const x1 = @min(quad.x1, c.x1);
+    const y1 = @min(quad.y1, c.y1);
+    if (x1 <= x0 or y1 <= y0) return null;
+
+    const width = quad.x1 - quad.x0;
+    const height = quad.y1 - quad.y0;
+    const du = quad.uv_right - quad.uv_left;
+    const dv = quad.uv_bottom - quad.uv_top;
+    return .{
+        .x0 = x0,
+        .y0 = y0,
+        .x1 = x1,
+        .y1 = y1,
+        .uv_left = quad.uv_left + (x0 - quad.x0) / width * du,
+        .uv_top = quad.uv_top + (y0 - quad.y0) / height * dv,
+        .uv_right = quad.uv_right - (quad.x1 - x1) / width * du,
+        .uv_bottom = quad.uv_bottom - (quad.y1 - y1) / height * dv,
+    };
+}
 
 const TextVertex = extern struct {
     pos: [2]f32,
@@ -112,7 +175,10 @@ pub const Backend = struct {
     text_pipeline_layout: vk.PipelineLayout,
     text_pipeline: vk.Pipeline,
     atlas: GpuImage,
+    atlas_size: u32,
+    max_atlas_size: u32,
     atlas_sampler: vk.Sampler,
+    text_pipeline_format: vk.Format,
     atlas_slots: std.AutoHashMapUnmanaged(AtlasKey, AtlasSlot),
     atlas_pen_x: u32,
     atlas_pen_y: u32,
@@ -236,6 +302,7 @@ pub const Backend = struct {
 
         const selection = try selectPhysicalDevice(allocator, vki, instance, surface_khr);
         const memory_properties = vki.getPhysicalDeviceMemoryProperties(selection.physical_device);
+        const device_limits = vki.getPhysicalDeviceProperties(selection.physical_device).limits;
         const device_extension_names = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
         const queue_priority: f32 = 1.0;
         const queue_create_info: vk.DeviceQueueCreateInfo = .{
@@ -323,6 +390,9 @@ pub const Backend = struct {
             .atlas = .{},
             .atlas_sampler = .null_handle,
             .atlas_slots = .{},
+            .atlas_size = initial_atlas_size,
+            .max_atlas_size = @min(max_atlas_size_cap, device_limits.max_image_dimension_2d),
+            .text_pipeline_format = .undefined,
             .atlas_pen_x = atlas_padding,
             .atlas_pen_y = atlas_padding,
             .atlas_row_height = 0,
@@ -361,6 +431,7 @@ pub const Backend = struct {
     pub fn destroy(self: *Backend) void {
         self.vkd.deviceWaitIdle(self.device) catch {};
         if (self.frame_callback) |callback| callback.destroy();
+        self.destroyTextResources();
         self.destroySwapchain();
         self.text_vertices.deinit(self.allocator);
         self.atlas_slots.deinit(self.allocator);
@@ -568,13 +639,13 @@ pub const Backend = struct {
         self.swapchain_extent = extent;
         self.swapchain_format = surface_format.format;
         try self.createRenderTargets();
-        try self.createTextResources();
+        try self.ensureTextResources();
+        try self.ensureTextPipeline();
         log.info("Vulkan swapchain {d}x{d} images={d}", .{ extent.width, extent.height, self.swapchain_images.len });
         return true;
     }
 
     fn destroySwapchain(self: *Backend) void {
-        self.destroyTextResources();
         for (self.framebuffers) |framebuffer| self.vkd.destroyFramebuffer(self.device, framebuffer, null);
         if (self.framebuffers.len > 0) self.allocator.free(self.framebuffers);
         if (self.render_pass != .null_handle) self.vkd.destroyRenderPass(self.device, self.render_pass, null);
@@ -669,7 +740,8 @@ pub const Backend = struct {
         }
     }
 
-    fn createTextResources(self: *Backend) !void {
+    fn ensureTextResources(self: *Backend) !void {
+        if (self.text_descriptor_set_layout != .null_handle) return;
         const binding: vk.DescriptorSetLayoutBinding = .{
             .binding = 0,
             .descriptor_type = .combined_image_sampler,
@@ -693,20 +765,7 @@ pub const Backend = struct {
             .p_push_constant_ranges = @ptrCast(&push_range),
         }, null);
 
-        self.atlas = try self.createImage(
-            .r8_unorm,
-            atlas_width,
-            atlas_height,
-            .{ .transfer_dst_bit = true, .sampled_bit = true },
-            .{ .device_local_bit = true },
-        );
-        self.atlas.view = try self.vkd.createImageView(self.device, &.{
-            .image = self.atlas.image,
-            .view_type = .@"2d",
-            .format = .r8_unorm,
-            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
-            .subresource_range = colorSubresourceRange(),
-        }, null);
+        try self.createAtlasImage();
         self.atlas_sampler = try self.vkd.createSampler(self.device, &.{
             .mag_filter = .nearest,
             .min_filter = .nearest,
@@ -737,6 +796,34 @@ pub const Backend = struct {
             .p_set_layouts = @ptrCast(&self.text_descriptor_set_layout),
         }, @ptrCast(&self.text_descriptor_set));
 
+        self.updateAtlasDescriptor();
+
+        self.staging_buffer = try self.createBuffer(
+            initial_staging_capacity,
+            .{ .transfer_src_bit = true },
+            .{ .host_visible_bit = true, .host_coherent_bit = true },
+        );
+    }
+
+    fn createAtlasImage(self: *Backend) !void {
+        self.atlas = try self.createImage(
+            .r8_unorm,
+            self.atlas_size,
+            self.atlas_size,
+            .{ .transfer_dst_bit = true, .sampled_bit = true },
+            .{ .device_local_bit = true },
+        );
+        self.atlas.view = try self.vkd.createImageView(self.device, &.{
+            .image = self.atlas.image,
+            .view_type = .@"2d",
+            .format = .r8_unorm,
+            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+            .subresource_range = colorSubresourceRange(),
+        }, null);
+        if (self.text_descriptor_set != .null_handle) self.updateAtlasDescriptor();
+    }
+
+    fn updateAtlasDescriptor(self: *Backend) void {
         const image_info: vk.DescriptorImageInfo = .{
             .sampler = self.atlas_sampler,
             .image_view = self.atlas.view,
@@ -752,13 +839,52 @@ pub const Backend = struct {
             .p_buffer_info = undefined,
             .p_texel_buffer_view = undefined,
         }}, null);
+    }
 
+    fn ensureTextPipeline(self: *Backend) !void {
+        if (self.text_pipeline != .null_handle and self.text_pipeline_format == self.swapchain_format) return;
+        if (self.text_pipeline != .null_handle) {
+            self.vkd.destroyPipeline(self.device, self.text_pipeline, null);
+            self.text_pipeline = .null_handle;
+        }
+        try self.createTextPipeline();
+        self.text_pipeline_format = self.swapchain_format;
+    }
+
+    fn resetAtlasPacking(self: *Backend) void {
+        self.atlas_slots.clearRetainingCapacity();
+        self.atlas_pen_x = atlas_padding;
+        self.atlas_pen_y = atlas_padding;
+        self.atlas_row_height = 0;
+    }
+
+    /// Doubles the atlas. Safe mid-frame because the previous submission's
+    /// fence was already waited on and the aborted command buffer that
+    /// referenced the old image is reset before re-recording.
+    fn growAtlas(self: *Backend) !void {
+        if (self.atlas_size * 2 > self.max_atlas_size) return error.GlyphAtlasFull;
+        self.atlas_size *= 2;
+        self.destroyImage(&self.atlas);
+        try self.createAtlasImage();
+        self.resetAtlasPacking();
+        log.info("glyph atlas grown to {d}x{d}", .{ self.atlas_size, self.atlas_size });
+    }
+
+    /// Doubles the staging buffer after an upload overflow. The atlas image
+    /// survives, but slots recorded by the aborted attempt were never
+    /// uploaded, so packing restarts and the tracked layout is restored to
+    /// the last value the GPU actually saw.
+    fn growStaging(self: *Backend, atlas_layout_before: vk.ImageLayout) !void {
+        const new_size = self.staging_buffer.size * 2;
+        self.destroyBuffer(&self.staging_buffer);
         self.staging_buffer = try self.createBuffer(
-            initial_staging_capacity,
+            new_size,
             .{ .transfer_src_bit = true },
             .{ .host_visible_bit = true, .host_coherent_bit = true },
         );
-        try self.createTextPipeline();
+        self.resetAtlasPacking();
+        self.atlas.layout = atlas_layout_before;
+        log.info("glyph staging buffer grown to {d} bytes", .{new_size});
     }
 
     fn destroyTextResources(self: *Backend) void {
@@ -776,10 +902,8 @@ pub const Backend = struct {
         self.text_descriptor_set_layout = .null_handle;
         self.text_descriptor_set = .null_handle;
         self.atlas_sampler = .null_handle;
-        self.atlas_slots.clearRetainingCapacity();
-        self.atlas_pen_x = atlas_padding;
-        self.atlas_pen_y = atlas_padding;
-        self.atlas_row_height = 0;
+        self.text_pipeline_format = .undefined;
+        self.resetAtlasPacking();
         self.staging_used = 0;
         self.text_vertices.clearRetainingCapacity();
     }
@@ -814,23 +938,16 @@ pub const Backend = struct {
             .topology = .triangle_list,
             .primitive_restart_enable = .false,
         };
-        const viewport: vk.Viewport = .{
-            .x = 0,
-            .y = 0,
-            .width = @floatFromInt(self.swapchain_extent.width),
-            .height = @floatFromInt(self.swapchain_extent.height),
-            .min_depth = 0,
-            .max_depth = 1,
-        };
-        const scissor: vk.Rect2D = .{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = self.swapchain_extent,
+        // Dynamic viewport/scissor keep the pipeline independent of the
+        // swapchain extent, so resize never recreates it.
+        const dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
+        const dynamic_state: vk.PipelineDynamicStateCreateInfo = .{
+            .dynamic_state_count = dynamic_states.len,
+            .p_dynamic_states = &dynamic_states,
         };
         const viewport_state: vk.PipelineViewportStateCreateInfo = .{
             .viewport_count = 1,
-            .p_viewports = @ptrCast(&viewport),
             .scissor_count = 1,
-            .p_scissors = @ptrCast(&scissor),
         };
         const rasterization: vk.PipelineRasterizationStateCreateInfo = .{
             .depth_clamp_enable = .false,
@@ -879,6 +996,7 @@ pub const Backend = struct {
             .p_rasterization_state = &rasterization,
             .p_multisample_state = &multisample,
             .p_color_blend_state = &color_blend,
+            .p_dynamic_state = &dynamic_state,
             .layout = self.text_pipeline_layout,
             .render_pass = self.render_pass,
             .subpass = 0,
@@ -902,10 +1020,27 @@ pub const Backend = struct {
         };
         const suboptimal = acquired.result == .suboptimal_khr;
         const image_index = acquired.image_index;
-        try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
-        try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            const atlas_layout_before = self.atlas.layout;
+            try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
+            try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
 
-        try self.prepareText(display_list, scale);
+            self.prepareQuads(display_list, scale) catch |err| switch (err) {
+                error.GlyphAtlasFull => {
+                    if (attempts >= max_prepare_attempts) return err;
+                    try self.growAtlas();
+                    continue;
+                },
+                error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
+                    if (attempts >= max_prepare_attempts) return err;
+                    try self.growStaging(atlas_layout_before);
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
 
         const clear_value: vk.ClearValue = .{ .color = colorClearValue(self.swapchain_format, keywork.colors.panel) };
         self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
@@ -919,8 +1054,7 @@ pub const Backend = struct {
             .p_clear_values = @ptrCast(&clear_value),
         }, .@"inline");
 
-        self.renderFillRects(display_list, scale);
-        self.drawText();
+        self.drawQuads();
 
         self.vkd.cmdEndRenderPass(self.command_buffer);
         try self.vkd.endCommandBuffer(self.command_buffer);
@@ -951,43 +1085,17 @@ pub const Backend = struct {
         return .presented;
     }
 
-    fn renderFillRects(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) void {
-        for (display_list) |command| {
-            switch (command) {
-                .fill_rect => |fill| {
-                    const x0 = clampPixel(@floor(fill.rect.x * scale), self.swapchain_extent.width);
-                    const y0 = clampPixel(@floor(fill.rect.y * scale), self.swapchain_extent.height);
-                    const x1 = clampPixel(@ceil((fill.rect.x + fill.rect.width) * scale), self.swapchain_extent.width);
-                    const y1 = clampPixel(@ceil((fill.rect.y + fill.rect.height) * scale), self.swapchain_extent.height);
-                    if (x0 >= x1 or y0 >= y1) continue;
-
-                    const attachment: vk.ClearAttachment = .{
-                        .aspect_mask = .{ .color_bit = true },
-                        .color_attachment = 0,
-                        .clear_value = .{ .color = colorClearValue(self.swapchain_format, fill.color) },
-                    };
-                    const rect: vk.ClearRect = .{
-                        .rect = .{
-                            .offset = .{ .x = @intCast(x0), .y = @intCast(y0) },
-                            .extent = .{ .width = x1 - x0, .height = y1 - y0 },
-                        },
-                        .base_array_layer = 0,
-                        .layer_count = 1,
-                    };
-                    self.vkd.cmdClearAttachments(self.command_buffer, &.{attachment}, &.{rect});
-                },
-                .text, .alpha_image => {},
-            }
-        }
-    }
-
-    fn prepareText(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !void {
+    /// Batches the display list into one ordered quad stream so painter's
+    /// order is preserved: rasterization order guarantees per-pixel blending
+    /// follows primitive order within a single draw.
+    fn prepareQuads(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !void {
         self.text_vertices.clearRetainingCapacity();
         self.staging_used = 0;
 
         var glyphs: std.ArrayList(TextRenderer.PositionedGlyph) = .empty;
         defer glyphs.deinit(self.allocator);
 
+        var clip: ?ClipBounds = null;
         for (display_list) |command| {
             switch (command) {
                 .text => |text| {
@@ -995,14 +1103,18 @@ pub const Backend = struct {
                     try self.text_renderer.appendGlyphs(self.allocator, scale, text, &glyphs);
                     for (glyphs.items) |glyph| {
                         const slot = try self.ensureAtlasGlyph(glyph);
-                        try self.appendGlyphVertices(glyph, slot);
+                        try self.appendGlyphVertices(glyph, slot, clip);
                     }
                 },
                 .alpha_image => |image| {
                     const slot = try self.ensureAtlasImage(image);
-                    try self.appendImageVertices(image, slot, scale);
+                    try self.appendImageVertices(image, slot, scale, clip);
                 },
-                .fill_rect => {},
+                .fill_rect => |fill| {
+                    const slot = try self.ensureSolidSlot();
+                    try self.appendRectVertices(fill, slot, scale, clip);
+                },
+                .set_clip => |rect| clip = if (rect) |value| ClipBounds.fromRect(value, scale) else null,
             }
         }
 
@@ -1091,19 +1203,55 @@ pub const Backend = struct {
         return slot;
     }
 
-    fn allocateAtlasSlot(self: *Backend, width: u32, height: u32) !AtlasSlot {
-        if (width == 0 or height == 0) return error.EmptyGlyph;
-        if (width + atlas_padding * 2 > atlas_width or height + atlas_padding * 2 > atlas_height) {
-            log.err("glyph bitmap {d}x{d} exceeds atlas {d}x{d}", .{ width, height, atlas_width, atlas_height });
-            return error.GlyphTooLarge;
+    fn ensureSolidSlot(self: *Backend) !AtlasSlot {
+        const key: AtlasKey = .solid;
+        if (self.atlas_slots.get(key)) |slot| return slot;
+
+        const slot = try self.allocateAtlasSlot(solid_block_size, solid_block_size);
+        errdefer _ = self.atlas_slots.remove(key);
+        try self.atlas_slots.put(self.allocator, key, slot);
+
+        if (self.atlas.layout != .transfer_dst_optimal) {
+            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
+            self.atlas.layout = .transfer_dst_optimal;
         }
 
-        if (self.atlas_pen_x + width + atlas_padding > atlas_width) {
+        const coverage = [_]u8{0xff} ** (solid_block_size * solid_block_size);
+        if (self.staging_used + coverage.len > self.staging_buffer.size) return error.ImageUploadTooLarge;
+        try self.writeBuffer(self.staging_buffer, self.staging_used, &coverage);
+
+        const copy: vk.BufferImageCopy = .{
+            .buffer_offset = self.staging_used,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
+            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
+        };
+        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
+        self.staging_used += coverage.len;
+        return slot;
+    }
+
+    fn allocateAtlasSlot(self: *Backend, width: u32, height: u32) !AtlasSlot {
+        if (width == 0 or height == 0) return error.EmptyGlyph;
+        if (width + atlas_padding * 2 > self.max_atlas_size or height + atlas_padding * 2 > self.max_atlas_size) {
+            log.err("glyph bitmap {d}x{d} exceeds max atlas {d}x{d}", .{ width, height, self.max_atlas_size, self.max_atlas_size });
+            return error.GlyphTooLarge;
+        }
+        if (width + atlas_padding * 2 > self.atlas_size or height + atlas_padding * 2 > self.atlas_size) return error.GlyphAtlasFull;
+
+        if (self.atlas_pen_x + width + atlas_padding > self.atlas_size) {
             self.atlas_pen_x = atlas_padding;
             self.atlas_pen_y += self.atlas_row_height + atlas_padding;
             self.atlas_row_height = 0;
         }
-        if (self.atlas_pen_y + height + atlas_padding > atlas_height) return error.GlyphAtlasFull;
+        if (self.atlas_pen_y + height + atlas_padding > self.atlas_size) return error.GlyphAtlasFull;
 
         const slot: AtlasSlot = .{
             .x = self.atlas_pen_x,
@@ -1116,45 +1264,62 @@ pub const Backend = struct {
         return slot;
     }
 
-    fn appendGlyphVertices(self: *Backend, glyph: TextRenderer.PositionedGlyph, slot: AtlasSlot) !void {
-        const x0 = glyph.x;
-        const y0 = glyph.y;
-        const x1 = x0 + @as(f32, @floatFromInt(slot.width));
-        const y1 = y0 + @as(f32, @floatFromInt(slot.height));
-        const uv_left = @as(f32, @floatFromInt(slot.x)) / atlas_width;
-        const uv_top = @as(f32, @floatFromInt(slot.y)) / atlas_height;
-        const uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / atlas_width;
-        const uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / atlas_height;
-        const color = colorFloats(self.swapchain_format, glyph.color);
-
-        try self.text_vertices.appendSlice(self.allocator, &.{
-            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
-            .{ .pos = .{ x1, y0 }, .uv = .{ uv_right, uv_top }, .color = color },
-            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
-            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
-            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
-            .{ .pos = .{ x0, y1 }, .uv = .{ uv_left, uv_bottom }, .color = color },
-        });
+    fn appendGlyphVertices(self: *Backend, glyph: TextRenderer.PositionedGlyph, slot: AtlasSlot, clip: ?ClipBounds) !void {
+        try self.appendQuad(.{
+            .x0 = glyph.x,
+            .y0 = glyph.y,
+            .x1 = glyph.x + @as(f32, @floatFromInt(slot.width)),
+            .y1 = glyph.y + @as(f32, @floatFromInt(slot.height)),
+            .uv_left = @as(f32, @floatFromInt(slot.x)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / @as(f32, @floatFromInt(self.atlas_size)),
+        }, colorFloats(self.swapchain_format, glyph.color), clip);
     }
 
-    fn appendImageVertices(self: *Backend, image: keywork.PaintCommand.AlphaImage, slot: AtlasSlot, scale: f32) !void {
+    fn appendImageVertices(self: *Backend, image: keywork.PaintCommand.AlphaImage, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {
         const x0 = image.rect.x * scale;
         const y0 = image.rect.y * scale;
-        const x1 = x0 + @as(f32, @floatFromInt(slot.width));
-        const y1 = y0 + @as(f32, @floatFromInt(slot.height));
-        const uv_left = @as(f32, @floatFromInt(slot.x)) / atlas_width;
-        const uv_top = @as(f32, @floatFromInt(slot.y)) / atlas_height;
-        const uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / atlas_width;
-        const uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / atlas_height;
-        const color = colorFloats(self.swapchain_format, image.color);
+        try self.appendQuad(.{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = x0 + @as(f32, @floatFromInt(slot.width)),
+            .y1 = y0 + @as(f32, @floatFromInt(slot.height)),
+            .uv_left = @as(f32, @floatFromInt(slot.x)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / @as(f32, @floatFromInt(self.atlas_size)),
+        }, colorFloats(self.swapchain_format, image.color), clip);
+    }
+
+    fn appendRectVertices(self: *Backend, fill: keywork.PaintCommand.FillRect, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {
+        // Sample the center of the opaque block so no neighboring atlas
+        // texel can bleed into the fill.
+        const u = (@as(f32, @floatFromInt(slot.x)) + @as(f32, @floatFromInt(slot.width)) / 2) / @as(f32, @floatFromInt(self.atlas_size));
+        const v = (@as(f32, @floatFromInt(slot.y)) + @as(f32, @floatFromInt(slot.height)) / 2) / @as(f32, @floatFromInt(self.atlas_size));
+        try self.appendQuad(.{
+            .x0 = fill.rect.x * scale,
+            .y0 = fill.rect.y * scale,
+            .x1 = (fill.rect.x + fill.rect.width) * scale,
+            .y1 = (fill.rect.y + fill.rect.height) * scale,
+            .uv_left = u,
+            .uv_top = v,
+            .uv_right = u,
+            .uv_bottom = v,
+        }, colorFloats(self.swapchain_format, fill.color), clip);
+    }
+
+    fn appendQuad(self: *Backend, bounds: QuadBounds, color: [4]f32, clip: ?ClipBounds) !void {
+        if (bounds.x1 <= bounds.x0 or bounds.y1 <= bounds.y0) return;
+        const quad = clipQuad(bounds, clip) orelse return;
 
         try self.text_vertices.appendSlice(self.allocator, &.{
-            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
-            .{ .pos = .{ x1, y0 }, .uv = .{ uv_right, uv_top }, .color = color },
-            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
-            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
-            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
-            .{ .pos = .{ x0, y1 }, .uv = .{ uv_left, uv_bottom }, .color = color },
+            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = color },
+            .{ .pos = .{ quad.x1, quad.y0 }, .uv = .{ quad.uv_right, quad.uv_top }, .color = color },
+            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = color },
+            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = color },
+            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = color },
+            .{ .pos = .{ quad.x0, quad.y1 }, .uv = .{ quad.uv_left, quad.uv_bottom }, .color = color },
         });
     }
 
@@ -1171,7 +1336,7 @@ pub const Backend = struct {
         try self.writeBuffer(self.vertex_buffer, 0, bytes);
     }
 
-    fn drawText(self: *Backend) void {
+    fn drawQuads(self: *Backend) void {
         if (self.text_vertices.items.len == 0) return;
 
         const push: PushConstants = .{ .viewport = .{
@@ -1179,6 +1344,18 @@ pub const Backend = struct {
             @floatFromInt(self.swapchain_extent.height),
         } };
         self.vkd.cmdBindPipeline(self.command_buffer, .graphics, self.text_pipeline);
+        self.vkd.cmdSetViewport(self.command_buffer, 0, &.{.{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(self.swapchain_extent.width),
+            .height = @floatFromInt(self.swapchain_extent.height),
+            .min_depth = 0,
+            .max_depth = 1,
+        }});
+        self.vkd.cmdSetScissor(self.command_buffer, 0, &.{.{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = self.swapchain_extent,
+        }});
         self.vkd.cmdBindDescriptorSets(self.command_buffer, .graphics, self.text_pipeline_layout, 0, &.{self.text_descriptor_set}, null);
         self.vkd.cmdPushConstants(self.command_buffer, self.text_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(PushConstants), &push);
         self.vkd.cmdBindVertexBuffers(self.command_buffer, 0, &.{self.vertex_buffer.buffer}, &.{0});
@@ -1504,13 +1681,6 @@ fn positiveU31(value: f32) !u31 {
     return @intFromFloat(rounded);
 }
 
-fn clampPixel(value: f32, limit: u32) u32 {
-    if (!std.math.isFinite(value) or value <= 0) return 0;
-    const max: f32 = @floatFromInt(limit);
-    if (value >= max) return limit;
-    return @intFromFloat(value);
-}
-
 fn colorClearValue(format: vk.Format, color: keywork.Color) vk.ClearColorValue {
     const values = colorFloats(format, color);
     return .{ .float_32 = values };
@@ -1572,4 +1742,55 @@ fn stageMaskForLayout(layout: vk.ImageLayout) vk.PipelineStageFlags {
         .shader_read_only_optimal => .{ .fragment_shader_bit = true },
         else => .{ .top_of_pipe_bit = true },
     };
+}
+
+test "clipQuad intersects bounds and remaps uv window" {
+    const quad: QuadBounds = .{
+        .x0 = 0,
+        .y0 = 0,
+        .x1 = 10,
+        .y1 = 10,
+        .uv_left = 0,
+        .uv_top = 0,
+        .uv_right = 1,
+        .uv_bottom = 1,
+    };
+
+    const clipped = clipQuad(quad, .{ .x0 = 5, .y0 = 2.5, .x1 = 20, .y1 = 7.5 }).?;
+    try std.testing.expectEqual(@as(f32, 5), clipped.x0);
+    try std.testing.expectEqual(@as(f32, 2.5), clipped.y0);
+    try std.testing.expectEqual(@as(f32, 10), clipped.x1);
+    try std.testing.expectEqual(@as(f32, 7.5), clipped.y1);
+    try std.testing.expectEqual(@as(f32, 0.5), clipped.uv_left);
+    try std.testing.expectEqual(@as(f32, 0.25), clipped.uv_top);
+    try std.testing.expectEqual(@as(f32, 1), clipped.uv_right);
+    try std.testing.expectEqual(@as(f32, 0.75), clipped.uv_bottom);
+}
+
+test "clipQuad returns quad unchanged without clip" {
+    const quad: QuadBounds = .{
+        .x0 = 1,
+        .y0 = 2,
+        .x1 = 3,
+        .y1 = 4,
+        .uv_left = 0.1,
+        .uv_top = 0.2,
+        .uv_right = 0.3,
+        .uv_bottom = 0.4,
+    };
+    try std.testing.expectEqual(quad, clipQuad(quad, null).?);
+}
+
+test "clipQuad culls quads fully outside the clip" {
+    const quad: QuadBounds = .{
+        .x0 = 0,
+        .y0 = 0,
+        .x1 = 10,
+        .y1 = 10,
+        .uv_left = 0,
+        .uv_top = 0,
+        .uv_right = 1,
+        .uv_bottom = 1,
+    };
+    try std.testing.expectEqual(@as(?QuadBounds, null), clipQuad(quad, .{ .x0 = 10, .y0 = 0, .x1 = 20, .y1 = 10 }));
 }
