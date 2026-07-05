@@ -1,34 +1,9 @@
 local ui = require("ui")
 local keywork = require("keywork")
-local ffi = require("ffi")
 local bit = require("bit")
 
-if not rawget(_G, "keywork_bar_ffi_loaded") then
-  ffi.cdef([[
-typedef unsigned int socklen_t;
-typedef long ssize_t;
-typedef unsigned short sa_family_t;
-struct sockaddr { sa_family_t sa_family; char sa_data[14]; };
-struct sockaddr_un { sa_family_t sun_family; char sun_path[108]; };
-int socket(int domain, int type, int protocol);
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-ssize_t read(int fd, void *buf, size_t count);
-ssize_t recv(int sockfd, void *buf, size_t len, int flags);
-ssize_t write(int fd, const void *buf, size_t count);
-int close(int fd);
-int fcntl(int fd, int cmd, ...);
-]])
-  _G.keywork_bar_ffi_loaded = true
-end
+local has_unix_socket, unix_socket = pcall(require, "socket.unix")
 
-local AF_UNIX = 1
-local SOCK_STREAM = 1
-local F_GETFL = 3
-local F_SETFL = 4
-local O_NONBLOCK = 2048
-local MSG_DONTWAIT = 64
-local EAGAIN = 11
-local EWOULDBLOCK = 11
 local EPOLLIN = 1
 local EPOLLERR = 8
 local EPOLLHUP = 16
@@ -71,21 +46,24 @@ local function read_le32(value, offset)
   return b1 + bit.lshift(b2, 8) + bit.lshift(b3, 16) + bit.lshift(b4, 24)
 end
 
-local function write_all(fd, data)
-  local written = 0
-  while written < #data do
-    local rc = ffi.C.write(fd, data:sub(written + 1), #data - written)
-    if rc <= 0 then
+local function write_all(socket, data)
+  local sent = 0
+  while sent < #data do
+    local index, err, partial = socket:send(data, sent + 1)
+    if index then
+      sent = index
+    elseif err == "timeout" and partial and partial > sent then
+      sent = partial
+    else
       return false
     end
-    written = written + tonumber(rc)
   end
   return true
 end
 
 local function sway_send(client, message_type, payload)
   payload = payload or ""
-  return write_all(client.fd, "i3-ipc" .. le32(#payload) .. le32(message_type) .. payload)
+  return write_all(client.socket, "i3-ipc" .. le32(#payload) .. le32(message_type) .. payload)
 end
 
 local function json_string(value)
@@ -121,20 +99,20 @@ end
 
 local function drain_sway(client)
   local changed = false
-  local buffer = ffi.new("uint8_t[4096]")
   while true do
-    local count = ffi.C.recv(client.fd, buffer, ffi.sizeof(buffer), MSG_DONTWAIT)
-    if count > 0 then
-      client.buffer = client.buffer .. ffi.string(buffer, tonumber(count))
-    elseif count == 0 then
-      client.connected = false
-      return changed
+    local data, err, partial = client.socket:receive(4096)
+    local chunk = data or partial
+    if chunk and #chunk > 0 then
+      client.buffer = client.buffer .. chunk
+    end
+    if data then
+      -- A full 4096-byte read may have left more data queued; keep draining.
+    elseif err == "timeout" then
+      break
     else
-      local err = ffi.errno()
-      if err == EAGAIN or err == EWOULDBLOCK then
-        break
+      if err == "closed" then
+        client.connected = false
       end
-      client.connected = false
       return changed
     end
   end
@@ -158,30 +136,24 @@ end
 
 local function connect_sway()
   local path = os.getenv("SWAYSOCK")
-  if not path or path == "" or #path >= 108 then
+  if not has_unix_socket or not path or path == "" then
     return nil
   end
 
-  local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM, 0)
-  if fd < 0 then
+  local socket = unix_socket()
+  if not socket then
     return nil
   end
 
-  local addr = ffi.new("struct sockaddr_un")
-  addr.sun_family = AF_UNIX
-  ffi.copy(addr.sun_path, path, #path)
-  if ffi.C.connect(fd, ffi.cast("const struct sockaddr *", addr), ffi.sizeof(addr)) ~= 0 then
-    ffi.C.close(fd)
+  if not socket:connect(path) then
+    socket:close()
     return nil
   end
-
-  local flags = ffi.C.fcntl(fd, F_GETFL, 0)
-  if flags >= 0 then
-    ffi.C.fcntl(fd, F_SETFL, bit.bor(flags, O_NONBLOCK))
-  end
+  socket:settimeout(0)
 
   local client = {
-    fd = tonumber(fd),
+    socket = socket,
+    fd = socket:getfd(),
     buffer = "",
     workspaces = {},
     connected = true,
