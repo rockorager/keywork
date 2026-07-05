@@ -132,6 +132,7 @@ pub const Backend = struct {
     frame_handler: ?FrameHandler,
     frame_context: ?*anyopaque,
     frame_callback: ?*wl.Callback,
+    frame_done_pending: bool,
 
     pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -339,6 +340,7 @@ pub const Backend = struct {
             .frame_handler = null,
             .frame_context = null,
             .frame_callback = null,
+            .frame_done_pending = false,
         };
 
         if (wm_base) |base| base.setListener(*Backend, wmBaseListener, self);
@@ -457,6 +459,7 @@ pub const Backend = struct {
             self.scale_changed = false;
             self.notifyRepaint();
         }
+        self.dispatchFrameDone();
         return !self.closed;
     }
 
@@ -515,9 +518,15 @@ pub const Backend = struct {
             .done => {
                 if (self.frame_callback == callback) self.frame_callback = null;
                 callback.destroy();
-                if (self.frame_handler) |handler| handler(self.frame_context.?);
+                self.frame_done_pending = true;
             },
         }
+    }
+
+    fn dispatchFrameDone(self: *Backend) void {
+        if (!self.frame_done_pending) return;
+        self.frame_done_pending = false;
+        if (self.frame_handler) |handler| handler(self.frame_context.?);
     }
 
     fn ensureSwapchain(self: *Backend, width: u31, height: u31) !bool {
@@ -1207,17 +1216,12 @@ pub const Backend = struct {
     }
 
     fn writeBuffer(self: *Backend, buffer: GpuBuffer, offset: vk.DeviceSize, bytes: []const u8) !void {
+        _ = self;
         if (offset + bytes.len > buffer.size) return error.BufferOverflow;
-        if (buffer.mapped) |mapped| {
-            const start: usize = @intCast(offset);
-            const dst: [*]u8 = @ptrCast(mapped);
-            @memcpy(dst[start..][0..bytes.len], bytes);
-            return;
-        }
-        const mapped = (try self.vkd.mapMemory(self.device, buffer.memory, offset, bytes.len, .{})) orelse return error.MapFailed;
-        defer self.vkd.unmapMemory(self.device, buffer.memory);
+        const mapped = buffer.mapped orelse return error.BufferNotMapped;
+        const start: usize = @intCast(offset);
         const dst: [*]u8 = @ptrCast(mapped);
-        @memcpy(dst[0..bytes.len], bytes);
+        @memcpy(dst[start..][0..bytes.len], bytes);
     }
 
     fn createImage(
