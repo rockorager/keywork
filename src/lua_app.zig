@@ -445,7 +445,11 @@ pub const App = struct {
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{}, -1);
         c.lua_settop(self.state, 0);
-        _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
+        // A bounded incremental step keeps garbage from widget-table churn
+        // paced across builds; a full collection here would stall every
+        // rebuild for time proportional to the entire Lua heap. Full
+        // collections still happen on script reload.
+        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;
     }
 
