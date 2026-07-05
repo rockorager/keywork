@@ -233,12 +233,14 @@ end
 
 local function status_pill(id, icon_name, text, color, options)
   options = options or {}
+  local child = ui.icon_theme({ color = color, size = options.icon_size or 16 },
+    ui.default_text_style({ color = color },
+      ui.icon_label(icon_name, text, { size = options.icon_size or 16 })
+    )
+  )
   return ui.chip({
     id = id,
-    icon = icon_name,
-    label = text,
-    icon_size = options.icon_size or 16,
-    color = color,
+    child = child,
     background = colors.surface,
     radius = 10,
     min_height = 30,
@@ -265,8 +267,7 @@ local function workspaces()
     end
     table.insert(items, ui.chip({
       id = "workspace-" .. name,
-      label = name,
-      color = fg,
+      child = ui.default_text_style({ color = fg }, ui.label(name)),
       background = bg,
       radius = 9,
       min_height = 30,

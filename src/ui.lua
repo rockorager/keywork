@@ -79,6 +79,27 @@ function ui.theme(data, child)
   }
 end
 
+function ui.default_text_style(style, child)
+  style = style or {}
+  return {
+    type = "default_text_style",
+    color = style.color,
+    size = style.size,
+    font_size = style.font_size,
+    child = child,
+  }
+end
+
+function ui.icon_theme(style, child)
+  style = style or {}
+  return {
+    type = "icon_theme",
+    color = style.color,
+    size = style.size,
+    child = child,
+  }
+end
+
 function ui.box(style, child)
   style = style or {}
   return {
@@ -233,7 +254,7 @@ function ui.svg_icon(path, size, color)
   return {
     type = "svg_icon",
     path = path,
-    size = size or 16,
+    size = size,
     color = color,
   }
 end
@@ -242,7 +263,7 @@ function ui.icon(name, size, color)
   return {
     type = "icon",
     name = name,
-    size = size or 16,
+    size = size,
     color = color,
   }
 end

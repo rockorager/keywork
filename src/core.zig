@@ -298,6 +298,7 @@ pub const Widget = union(enum) {
     actions: Actions,
     shortcuts: Shortcuts,
     theme: ThemeWidget,
+    default_text_style: DefaultTextStyle,
     component: Component,
     stateful: Stateful,
     element: CustomElement,
@@ -458,6 +459,11 @@ pub const Widget = union(enum) {
         child: *const Widget,
     };
 
+    pub const DefaultTextStyle = struct {
+        style: TextStyle,
+        child: *const Widget,
+    };
+
     pub const Callback = struct {
         ptr: *anyopaque,
         call_fn: *const fn (ptr: *anyopaque) anyerror!void,
@@ -513,6 +519,7 @@ pub const Widget = union(enum) {
     pub const BuildContext = struct {
         constraints: Constraints,
         theme: Theme = .default,
+        default_text_style: TextStyle = .{},
         interaction: InteractionState = .{},
         app_context: AppContext = .{},
     };
@@ -674,6 +681,7 @@ pub const Widget = union(enum) {
 pub const BuildScope = struct {
     allocator: std.mem.Allocator,
     theme: Theme = .default,
+    default_text_style: TextStyle = .{},
     interaction: InteractionState = .{},
     actions: ?*const ActionScope = null,
     app_context: AppContext = .{},
@@ -757,6 +765,10 @@ pub const widgets = struct {
         return .{ .theme = .{ .theme = theme_value, .child = try Widget.alloc(allocator, child) } };
     }
 
+    pub fn defaultTextStyle(allocator: std.mem.Allocator, style: TextStyle, child: Widget) !Widget {
+        return .{ .default_text_style = .{ .style = style, .child = try Widget.alloc(allocator, child) } };
+    }
+
     pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8) Widget {
         return .{ .text_input = .{ .id = id, .focus_node = .named(id), .value = value, .placeholder = placeholder } };
     }
@@ -828,6 +840,7 @@ pub const Element = struct {
         actions,
         shortcuts,
         theme,
+        default_text_style,
         component,
         stateful,
         element,
@@ -872,11 +885,18 @@ fn roleTextStyle(theme: Theme, role: TextRole) TextStyle {
     };
 }
 
-fn resolveTextStyle(theme: Theme, text_widget: Widget.Text) ResolvedTextStyle {
+fn mergeTextStyle(base: TextStyle, overlay: TextStyle) TextStyle {
+    return .{
+        .color = overlay.color orelse base.color,
+        .font_size = overlay.font_size orelse base.font_size,
+    };
+}
+
+fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widget.Text) ResolvedTextStyle {
     const role_style = roleTextStyle(theme, text_widget.role);
     return .{
-        .color = text_widget.color orelse role_style.color orelse theme.color_scheme.on_surface,
-        .font_size = text_widget.font_size orelse role_style.font_size orelse 16,
+        .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.on_surface,
+        .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse 16,
     };
 }
 
@@ -981,6 +1001,7 @@ pub const RenderNode = struct {
         actions,
         shortcuts,
         theme,
+        default_text_style,
         component,
         stateful,
         element,
@@ -1251,7 +1272,7 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
         },
-        .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme) },
+        .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) },
         .spacer => return .{ .kind = .spacer, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .sized => |sized_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1267,7 +1288,7 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .sized, .widget = element_widget, .children = children };
         },
         .text_input => {
-            const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme);
+            const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             return .{ .kind = .text_input, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.text_input.focus_node) };
         },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
@@ -1409,6 +1430,22 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .theme, .widget = element_widget, .children = children };
         },
+        .default_text_style => |default_text_style| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const previous_style = scope.default_text_style;
+            scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
+            defer scope.default_text_style = previous_style;
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, default_text_style.child, constraints);
+            initialized = true;
+            return .{ .kind = .default_text_style, .widget = element_widget, .children = children };
+        },
         .row => |row_widget| return buildLinearElementTree(allocator, scope, .row, widget.*, row_widget.children, constraints),
         .column => |column_widget| return buildLinearElementTree(allocator, scope, .column, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
@@ -1463,6 +1500,7 @@ fn buildContext(scope: *const BuildScope, constraints: Constraints) Widget.Build
     return .{
         .constraints = constraints,
         .theme = scope.theme,
+        .default_text_style = scope.default_text_style,
         .interaction = scope.interaction,
         .app_context = scope.app_context,
     };
@@ -1602,13 +1640,13 @@ pub fn updateElementTreeScoped(
             if (element.key) |old_key| destroyKey(allocator, old_key);
             element.key = try cloneKey(allocator, keyed_widget.key);
         },
-        .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme),
+        .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
         .spacer => try replaceElementWidget(allocator, element, widget.*),
         .sized => |sized_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, sized_widget.child, constrainSized(constraints, sized_widget));
         },
         .text_input => {
-            try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme);
+            try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style);
             element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
         },
         .render_object => try replaceElementWidget(allocator, element, widget.*),
@@ -1659,6 +1697,12 @@ pub fn updateElementTreeScoped(
             scope.theme = theme_widget.theme;
             defer scope.theme = previous_theme;
             try updateSingleChildElement(allocator, scope, element, widget.*, theme_widget.child, constraints);
+        },
+        .default_text_style => |default_text_style| {
+            const previous_style = scope.default_text_style;
+            scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
+            defer scope.default_text_style = previous_style;
+            try updateSingleChildElement(allocator, scope, element, widget.*, default_text_style.child, constraints);
         },
         .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
         .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
@@ -1716,6 +1760,12 @@ pub fn rebuildDirtyElementTreeScoped(
             const previous_theme = scope.theme;
             scope.theme = theme_widget.theme;
             defer scope.theme = previous_theme;
+            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
+        },
+        .default_text_style => |default_text_style| {
+            const previous_style = scope.default_text_style;
+            scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
+            defer scope.default_text_style = previous_style;
             return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
         .actions => |actions_widget| {
@@ -1785,6 +1835,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .actions => .actions,
         .shortcuts => .shortcuts,
         .theme => .theme,
+        .default_text_style => .default_text_style,
         .component => .component,
         .stateful => .stateful,
         .element => .element,
@@ -2020,18 +2071,18 @@ fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget:
     element.widget = element_widget;
 }
 
-fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme) anyerror!void {
-    var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme);
+fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme, inherited_style: TextStyle) anyerror!void {
+    var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme, inherited_style);
     errdefer destroyElementWidget(allocator, &element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
 
-fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme) !Widget {
+fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme, inherited_style: TextStyle) !Widget {
     var result = try cloneWidgetForElement(allocator, widget);
     switch (result) {
         .text => |*text_widget| {
-            const style = resolveTextStyle(theme, text_widget.*);
+            const style = resolveTextStyle(theme, inherited_style, text_widget.*);
             text_widget.color = style.color;
             text_widget.font_size = style.font_size;
         },
@@ -2145,6 +2196,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .child = shortcuts_widget.child,
         } },
         .theme => |theme_widget| .{ .theme = theme_widget },
+        .default_text_style => |default_text_style| .{ .default_text_style = default_text_style },
         .component => |component_widget| .{ .component = component_widget },
         .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
         .element => |custom_element| .{ .element = try custom_element.clone(allocator) },
@@ -2187,7 +2239,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .element => |custom_element| custom_element.destroy(allocator),
         .actions => |actions_widget| destroyActionBindings(allocator, actions_widget.bindings),
         .shortcuts => |shortcuts_widget| destroyShortcutBindings(allocator, shortcuts_widget.bindings),
-        .box, .row, .column, .padding, .center, .theme, .component => {},
+        .box, .row, .column, .padding, .center, .theme, .default_text_style, .component => {},
     }
 }
 
@@ -2986,6 +3038,19 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .children = children,
             };
         },
+        .default_text_style => |default_text_style| {
+            _ = default_text_style;
+            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            errdefer destroyRenderTree(allocator, &child);
+
+            const children = try allocator.alloc(RenderNode, 1);
+            children[0] = child;
+            return .{
+                .kind = .default_text_style,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+                .children = children,
+            };
+        },
         .column => |column_widget| return layoutLinearElements(allocator, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
         .row => |row_widget| return layoutLinearElements(allocator, .row, element.children, row_widget.gap, row_widget.cross_align, constraints, origin, measurer),
         .component => |component_widget| {
@@ -3324,6 +3389,21 @@ test "text role resolves themed font size for layout and paint" {
     try std.testing.expect(display_list.commands.items[0] == .text);
     try std.testing.expectEqual(@as(f32, 22), display_list.commands.items[0].text.style.font_size);
     try std.testing.expectEqual(colors.accent, display_list.commands.items[0].text.style.color);
+}
+
+test "default text style overrides descendant text defaults" {
+    const allocator = std.testing.allocator;
+
+    const label = widgets.text("Inherited");
+    const inherited = try widgets.defaultTextStyle(allocator, .{ .color = colors.red, .font_size = 18 }, label);
+    defer allocator.destroy(inherited.default_text_style.child);
+
+    var root = try buildRenderTree(allocator, &inherited, .{ .max_width = 200, .max_height = 80 });
+    defer destroyRenderTree(allocator, &root);
+
+    try std.testing.expectEqual(@as(RenderNode.Kind, .default_text_style), root.kind);
+    try std.testing.expectEqual(colors.red, root.children[0].text_style.color);
+    try std.testing.expectEqual(@as(f32, 18), root.children[0].text_style.font_size);
 }
 
 test "linear element clone preserves cross-axis alignment" {

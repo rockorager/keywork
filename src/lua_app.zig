@@ -63,8 +63,26 @@ const SizedOptions = struct {
 };
 
 const IconOptions = struct {
-    size: f32 = 16,
-    color: keywork.Color = keywork.colors.ink,
+    size: ?f32 = null,
+    color: ?keywork.Color = null,
+};
+
+const ParseContext = struct {
+    icon: IconOptions = .{},
+
+    fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: keywork.Color } {
+        return .{
+            .size = options.size orelse self.icon.size orelse 16,
+            .color = options.color orelse self.icon.color orelse keywork.colors.ink,
+        };
+    }
+
+    fn mergeIcon(self: ParseContext, options: IconOptions) ParseContext {
+        return .{ .icon = .{
+            .size = options.size orelse self.icon.size,
+            .color = options.color orelse self.icon.color,
+        } };
+    }
 };
 
 const LinearOptions = struct {
@@ -159,6 +177,7 @@ const LuaStatefulWidget = struct {
     lua_state: *c.lua_State,
     spec_ref: c_int,
     props_ref: c_int,
+    parse_context: ParseContext,
 
     const vtable: keywork.Widget.Stateful.VTable = .{
         .create_state = createState,
@@ -243,7 +262,7 @@ const LuaStatefulWidget = struct {
         pushRuntimeState(self.lua_state, context.app_context);
         if (c.lua_pcall(self.lua_state, 2, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful build failed");
         defer pop(self.lua_state, 1);
-        return try parseWidget(self.lua_state, scope.allocator, scope.allocator, context.app_context, -1);
+        return try parseWidget(self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
     }
 
     fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -296,6 +315,7 @@ const LuaStatefulWidget = struct {
             .lua_state = self.lua_state,
             .spec_ref = spec_ref,
             .props_ref = props_ref,
+            .parse_context = self.parse_context,
         };
         return result;
     }
@@ -376,7 +396,7 @@ pub const App = struct {
             else => return error.ScriptReturnedInvalidValue,
         }
 
-        return try parseWidget(self.state, allocator, allocator, runtime_state, -1);
+        return try parseWidget(self.state, allocator, allocator, runtime_state, .{}, -1);
     }
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
@@ -576,6 +596,7 @@ fn parseWidget(
     allocator: std.mem.Allocator,
     callback_allocator: std.mem.Allocator,
     runtime_state: State,
+    parse_context: ParseContext,
     index: c_int,
 ) !keywork.Widget {
     const table = absoluteIndex(lua_state, index);
@@ -594,7 +615,7 @@ fn parseWidget(
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .keyed = .{ .key = .{ .string = key }, .child = child } };
     }
     if (std.mem.eql(u8, kind, "stateful")) {
@@ -611,6 +632,7 @@ fn parseWidget(
             .lua_state = lua_state,
             .spec_ref = spec_ref,
             .props_ref = props_ref,
+            .parse_context = parse_context,
         };
         return stateful.widget();
     }
@@ -619,8 +641,28 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .theme = .{ .theme = parseThemeField(lua_state, table, "theme"), .child = child } };
+    }
+    if (std.mem.eql(u8, kind, "default_text_style")) {
+        const options = try lua_codec.decode(TextOptions, lua_state, table, allocator);
+        const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
+        return .{ .default_text_style = .{ .style = .{ .color = options.color, .font_size = options.resolvedFontSize() }, .child = child } };
+    }
+    if (std.mem.eql(u8, kind, "icon_theme")) {
+        const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
+        const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context.mergeIcon(options), -1);
+        const result = child.*;
+        allocator.destroy(child);
+        return result;
     }
     if (std.mem.eql(u8, kind, "box")) {
         const options = try lua_codec.decode(BoxOptions, lua_state, table, allocator);
@@ -628,7 +670,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .box = .{
             .child = child,
             .background = options.background,
@@ -648,7 +690,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         const on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_click");
         return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click, .activation = getActivationField(lua_state, table) } };
     }
@@ -659,7 +701,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .clickable = .{
             .id = id,
             .child = child,
@@ -677,7 +719,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         const on_focus_change = try getOptionalFocusChangeCallbackField(lua_state, callback_allocator, table, "on_focus_change");
         return .{ .focus = .{
             .node = .named(id),
@@ -696,7 +738,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .focus_scope = .{ .id = id, .child = child, .modal = options.modal } };
     }
     if (std.mem.eql(u8, kind, "button")) {
@@ -722,7 +764,7 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .sized = .{
             .child = child,
             .width = options.width,
@@ -735,34 +777,36 @@ fn parseWidget(
     }
     if (std.mem.eql(u8, kind, "svg_icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
+        const icon = parse_context.resolveIcon(options);
         const path = try stringField(lua_state, table, "path");
         return keywork.svg_icon.icon(
             allocator,
             path,
-            options.size,
-            options.color,
+            icon.size,
+            icon.color,
         );
     }
     if (std.mem.eql(u8, kind, "icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
+        const icon = parse_context.resolveIcon(options);
         const name = try stringField(lua_state, table, "name");
-        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, options.size) orelse return missingIconWidget(allocator, name, options.color);
+        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, icon.size) orelse return missingIconWidget(allocator, name, icon.color);
         defer allocator.free(path);
         return keywork.svg_icon.icon(
             allocator,
             path,
-            options.size,
-            options.color,
+            icon.size,
+            icon.color,
         );
     }
     if (std.mem.eql(u8, kind, "row")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
-        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
+        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
         return .{ .row = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "column")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
-        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
+        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
         return .{ .column = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "padding")) {
@@ -771,21 +815,21 @@ fn parseWidget(
         errdefer allocator.destroy(child);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .padding = .{ .insets = options.insets, .child = child } };
     }
     if (std.mem.eql(u8, kind, "center")) {
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .center = .{ .child = child } };
     }
     if (std.mem.eql(u8, kind, "actions")) {
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         const bindings = try parseActionBindings(lua_state, allocator, callback_allocator, table);
         return .{ .actions = .{ .bindings = bindings, .child = child } };
     }
@@ -793,7 +837,7 @@ fn parseWidget(
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         const bindings = try parseShortcutBindings(lua_state, allocator, table);
         return .{ .shortcuts = .{ .bindings = bindings, .child = child } };
     }
@@ -811,6 +855,7 @@ fn parseChildren(
     allocator: std.mem.Allocator,
     callback_allocator: std.mem.Allocator,
     runtime_state: State,
+    parse_context: ParseContext,
     table: c_int,
 ) anyerror![]keywork.Widget {
     c.lua_getfield(lua_state, table, "children");
@@ -822,7 +867,7 @@ fn parseChildren(
     for (children, 0..) |*child, child_index| {
         c.lua_rawgeti(lua_state, children_table, @intCast(child_index + 1));
         defer pop(lua_state, 1);
-        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
     }
     return children;
 }
