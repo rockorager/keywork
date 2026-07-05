@@ -167,8 +167,8 @@ pub fn render(
     const primary = &self.fonts.items[primary_font_index];
     const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
     const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
-    const origin_x = text.origin.x * scale;
-    var baseline_y = text.origin.y * scale + ascender;
+    const origin_x = snapToPixel(text.origin.x * scale);
+    var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
 
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
@@ -215,8 +215,8 @@ pub fn appendGlyphs(
     const primary = &self.fonts.items[primary_font_index];
     const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
     const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
-    const origin_x = text.origin.x * scale;
-    var baseline_y = text.origin.y * scale + ascender;
+    const origin_x = snapToPixel(text.origin.x * scale);
+    var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
 
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
@@ -561,6 +561,10 @@ fn scaledPixelSize(scale: f32) !u31 {
     const rounded = @round(base_text_size * scale);
     if (rounded < 1 or rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidScale;
     return @intFromFloat(rounded);
+}
+
+fn snapToPixel(value: f32) f32 {
+    return @round(value);
 }
 
 fn fromFixed26Dot6(value: i32) f32 {
