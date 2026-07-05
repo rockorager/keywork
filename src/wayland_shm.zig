@@ -46,6 +46,7 @@ pub const Backend = struct {
     frame_handler: ?FrameHandler,
     frame_context: ?*anyopaque,
     frame_callback: ?*wl.Callback,
+    frame_done_pending: bool,
 
     pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -155,6 +156,7 @@ pub const Backend = struct {
             .frame_handler = null,
             .frame_context = null,
             .frame_callback = null,
+            .frame_done_pending = false,
         };
 
         if (wm_base) |base| base.setListener(*Backend, wmBaseListener, self);
@@ -270,6 +272,7 @@ pub const Backend = struct {
             self.scale_changed = false;
             self.notifyRepaint();
         }
+        self.dispatchFrameDone();
         return !self.closed;
     }
 
@@ -329,9 +332,15 @@ pub const Backend = struct {
             .done => {
                 if (self.frame_callback == callback) self.frame_callback = null;
                 callback.destroy();
-                if (self.frame_handler) |handler| handler(self.frame_context.?);
+                self.frame_done_pending = true;
             },
         }
+    }
+
+    fn dispatchFrameDone(self: *Backend) void {
+        if (!self.frame_done_pending) return;
+        self.frame_done_pending = false;
+        if (self.frame_handler) |handler| handler(self.frame_context.?);
     }
 
     fn acquireBuffer(self: *Backend, width: u31, height: u31) !*Buffer {

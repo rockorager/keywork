@@ -363,7 +363,11 @@ local function battery_status()
 
   local name = "battery-level-" .. tostring(level)
   if status == "Charging" then
-    name = name .. "-charging"
+    if level == 100 then
+      name = "battery-full-charging"
+    else
+      name = name .. "-charging"
+    end
   elseif status == "Full" then
     name = "battery-level-100-charged"
   end
