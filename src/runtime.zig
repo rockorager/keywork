@@ -591,7 +591,7 @@ pub const Runtime = struct {
         const max_focus_rebuild_passes = 4;
         var pass: usize = 0;
         while (true) : (pass += 1) {
-            _ = self.build_arena.reset(.retain_capacity);
+            _ = self.build_arena.reset(.free_all);
             const state = self.currentState();
             var build_scope = self.buildScope(state);
 
@@ -625,7 +625,7 @@ pub const Runtime = struct {
             return;
         };
 
-        _ = self.build_arena.reset(.retain_capacity);
+        _ = self.build_arena.reset(.free_all);
         var build_scope = self.buildScope(self.app_context);
         const rebuilt = try keywork.rebuildDirtyElementTreeScoped(self.allocator, &build_scope, element_root, self.constraints);
         if (!rebuilt) {

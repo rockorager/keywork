@@ -18,6 +18,7 @@ glyph_cache: GlyphCache = .empty,
 
 const default_text_size = 16;
 const primary_font_index = 0;
+const max_shape_cache_entries = 512;
 const ShapeCache = std.HashMapUnmanaged(ShapeKey, ShapedRun, ShapeContext, std.hash_map.default_max_load_percentage);
 const GlyphCache = std.AutoHashMapUnmanaged(GlyphKey, GlyphBitmap);
 
@@ -401,6 +402,7 @@ fn shapeRun(self: *Self, font_index: usize, pixel_size: u31, value: []const u8) 
     const font = &self.fonts.items[font_index];
     const lookup_key: ShapeKey = .{ .font_id = font.id, .pixel_size = pixel_size, .value = value };
     if (self.shape_cache.getPtrContext(lookup_key, .{})) |run| return run;
+    if (self.shape_cache.count() >= max_shape_cache_entries) self.clearShapeCache();
 
     const scratch_glyphs = try self.allocator.alloc(c.KeyworkGlyph, @max(value.len, 1));
     defer self.allocator.free(scratch_glyphs);

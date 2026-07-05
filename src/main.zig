@@ -1,6 +1,7 @@
 //! Keywork demo application consuming libkeywork.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const keywork = @import("libkeywork");
 const lua_app = @import("lua_app.zig");
 
@@ -99,8 +100,10 @@ const DemoApp = struct {
 
 pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
+    defer if (use_debug_allocator) {
+        _ = debug_allocator.deinit();
+    };
+    const allocator = if (use_debug_allocator) debug_allocator.allocator() else std.heap.smp_allocator;
     const run_options = selectedRunOptions(init);
     var lua = try lua_app.App.init(allocator, run_options.script_path);
     defer lua.deinit();
@@ -118,13 +121,17 @@ pub fn main(init: std.process.Init) !void {
         .layer_shell = run_options.layer_shell,
         .log_writer = &stdout_writer.interface,
         .timer_interval_ms = 1000,
-        .file_watch_path = run_options.script_path,
         .event_source_context = &demo_app,
         .install_event_sources = DemoApp.installEventSources,
     });
 
     log.debug("frame rendered", .{});
 }
+
+const use_debug_allocator = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
+};
 
 const SelectedRunOptions = struct {
     backend: keywork.BackendKind = .log,

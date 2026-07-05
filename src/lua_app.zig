@@ -338,6 +338,8 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
     state: *c.lua_State,
+    script_ref: c_int = -1,
+    script_dirty: bool = true,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
     event_loop: ?*keywork.event_loop.EventLoop = null,
     runtime: ?*keywork.Runtime = null,
@@ -367,6 +369,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (self.fd_watches.items) |watch| watch.destroy(self.allocator, self.state);
         self.fd_watches.deinit(self.allocator);
+        if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_close(self.state);
         self.allocator.free(self.path);
     }
@@ -374,6 +377,9 @@ pub const App = struct {
     pub fn installEventSources(self: *App, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
         self.event_loop = loop;
         self.runtime = runtime;
+        loop.addFileWatch(self.path, self, scriptChanged) catch |err| {
+            if (err != error.FileWatchNotFound) std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ self.path, err });
+        };
         for (self.fd_watches.items) |watch| try self.registerFdWatch(watch);
     }
 
@@ -382,21 +388,29 @@ pub const App = struct {
     }
 
     pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+        if (self.script_dirty or self.script_ref < 0) try self.reloadScript();
+
+        c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{}, -1);
+        c.lua_settop(self.state, 0);
+        _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
+        return widget;
+    }
+
+    fn reloadScript(self: *App) !void {
         c.lua_settop(self.state, 0);
         installKeyworkModule(self.state, self);
         if (c.luaL_loadfile(self.state, self.path.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
         if (c.lua_pcall(self.state, 0, 1, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
+        errdefer c.lua_settop(self.state, 0);
 
-        switch (c.lua_type(self.state, -1)) {
-            c.LUA_TFUNCTION => {
-                pushRuntimeState(self.state, runtime_state);
-                if (c.lua_pcall(self.state, 1, 1, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
-            },
-            c.LUA_TTABLE => {},
-            else => return error.ScriptReturnedInvalidValue,
-        }
-
-        return try parseWidget(self.state, allocator, allocator, runtime_state, .{}, -1);
+        if (c.lua_type(self.state, -1) != c.LUA_TTABLE or !isWidgetTable(self.state, c.lua_gettop(self.state))) return error.ScriptReturnedInvalidValue;
+        const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+        if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        self.script_ref = script_ref;
+        self.script_dirty = false;
+        _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
     }
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
@@ -437,6 +451,14 @@ pub const App = struct {
         try fdWatchCallback(watch, loop, linux.EPOLL.IN);
     }
 };
+
+fn scriptChanged(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    std.log.scoped(.keywork_luajit).info("reload requested for {s} mask=0x{x}", .{ path, mask });
+    app.script_dirty = true;
+    const runtime = app.runtime orelse return;
+    try runtime.invalidate();
+}
 
 const FdWatch = struct {
     app: *App,
@@ -845,6 +867,12 @@ fn parseWidget(
     return error.UnknownWidgetType;
 }
 
+fn isWidgetTable(lua_state: *c.lua_State, table: c_int) bool {
+    c.lua_getfield(lua_state, table, "type");
+    defer pop(lua_state, 1);
+    return !c.lua_isnil(lua_state, -1);
+}
+
 fn missingIconWidget(allocator: std.mem.Allocator, name: []const u8, color: keywork.Color) !keywork.Widget {
     std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
     return .{ .text = .{ .value = try allocator.dupe(u8, "□"), .color = color } };
@@ -1209,9 +1237,12 @@ test "lua stateful widget set_state rebuilds retained subtree" {
         \\    end)
         \\  end,
         \\})
-        \\return function(state)
-        \\  return Counter({ key = "counter" })
-        \\end
+        \\local App = ui.stateful({
+        \\  build = function(self, state)
+        \\    return Counter({ key = "counter" })
+        \\  end,
+        \\})
+        \\return App({ key = "app" })
         \\
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stateful.lua", .data = script });

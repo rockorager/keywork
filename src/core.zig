@@ -1037,22 +1037,34 @@ pub const PaintCommand = union(enum) {
 
 pub const DisplayList = struct {
     commands: std.ArrayList(PaintCommand) = .empty,
+    alpha_cache: std.AutoHashMapUnmanaged(u64, AlphaCacheEntry) = .empty,
+
+    const AlphaCacheEntry = struct {
+        width: u32,
+        height: u32,
+        alpha: []u8,
+    };
 
     pub fn deinit(self: *DisplayList, allocator: std.mem.Allocator) void {
-        self.freeOwnedCommandData(allocator);
         self.commands.deinit(allocator);
+        self.clearAlphaCache(allocator);
+        self.alpha_cache.deinit(allocator);
     }
 
-    pub fn clearRetainingCapacity(self: *DisplayList, allocator: std.mem.Allocator) void {
-        self.freeOwnedCommandData(allocator);
+    pub fn clearRetainingCapacity(self: *DisplayList, _: std.mem.Allocator) void {
         self.commands.clearRetainingCapacity();
     }
 
-    fn freeOwnedCommandData(self: *DisplayList, allocator: std.mem.Allocator) void {
-        for (self.commands.items) |command| switch (command) {
-            .alpha_image => |image| allocator.free(image.alpha),
-            .fill_rect, .text => {},
-        };
+    fn clearAlphaCache(self: *DisplayList, allocator: std.mem.Allocator) void {
+        var values = self.alpha_cache.valueIterator();
+        while (values.next()) |entry| allocator.free(entry.alpha);
+        self.alpha_cache.clearRetainingCapacity();
+    }
+
+    pub fn cachedAlphaImage(self: *const DisplayList, cache_key: u64, width: u32, height: u32) ?[]const u8 {
+        const entry = self.alpha_cache.get(cache_key) orelse return null;
+        if (entry.width != width or entry.height != height) return null;
+        return entry.alpha;
     }
 
     pub fn fillRect(self: *DisplayList, allocator: std.mem.Allocator, rect: Rect, color: Color) !void {
@@ -1073,12 +1085,29 @@ pub const DisplayList = struct {
         color: Color,
         cache_key: u64,
     ) !void {
-        errdefer allocator.free(alpha);
+        var alpha_owned = true;
+        errdefer if (alpha_owned) allocator.free(alpha);
+        const result = try self.alpha_cache.getOrPut(allocator, cache_key);
+        const cached_alpha = if (result.found_existing) blk: {
+            if (result.value_ptr.width == width and result.value_ptr.height == height) {
+                if (alpha.ptr != result.value_ptr.alpha.ptr) allocator.free(alpha);
+                alpha_owned = false;
+                break :blk result.value_ptr.alpha;
+            }
+            allocator.free(result.value_ptr.alpha);
+            result.value_ptr.* = .{ .width = width, .height = height, .alpha = alpha };
+            alpha_owned = false;
+            break :blk alpha;
+        } else blk: {
+            result.value_ptr.* = .{ .width = width, .height = height, .alpha = alpha };
+            alpha_owned = false;
+            break :blk alpha;
+        };
         try self.commands.append(allocator, .{ .alpha_image = .{
             .rect = rect,
             .width = width,
             .height = height,
-            .alpha = alpha,
+            .alpha = cached_alpha,
             .color = color,
             .cache_key = cache_key,
         } });
@@ -2417,15 +2446,23 @@ fn paintRoundedBox(
     const scaled_radius = @max(0, radius * render_scale);
 
     if (background.a > 0) {
-        const alpha = try roundedRectAlpha(allocator, width, height, scaled_radius, null);
-        try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, background, roundedRectCacheKey(width, height, scaled_radius, null));
+        const cache_key = roundedRectCacheKey(width, height, scaled_radius, null);
+        const alpha = if (display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
+            cached
+        else
+            try roundedRectAlpha(allocator, width, height, scaled_radius, null);
+        try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), @constCast(alpha), background, cache_key);
     }
 
     if (border) |border_color| {
         const stroke_width = @min(@max(0, border_width * render_scale), @min(@as(f32, @floatFromInt(width)), @as(f32, @floatFromInt(height))) / 2);
         if (stroke_width > 0) {
-            const alpha = try roundedRectAlpha(allocator, width, height, scaled_radius, stroke_width);
-            try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, border_color, roundedRectCacheKey(width, height, scaled_radius, stroke_width));
+            const cache_key = roundedRectCacheKey(width, height, scaled_radius, stroke_width);
+            const alpha = if (display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
+                cached
+            else
+                try roundedRectAlpha(allocator, width, height, scaled_radius, stroke_width);
+            try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), @constCast(alpha), border_color, cache_key);
         }
     }
 }
@@ -3277,6 +3314,24 @@ fn testCallback() Widget.Callback {
 }
 
 fn testCallbackCall(_: *anyopaque) !void {}
+
+test "display list reuses cached alpha image data" {
+    const allocator = std.testing.allocator;
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(allocator);
+
+    const first_alpha = try allocator.dupe(u8, &.{ 1, 2, 3, 4 });
+    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, first_alpha, colors.white, 42);
+    const cached_ptr = display_list.commands.items[0].alpha_image.alpha.ptr;
+
+    display_list.clearRetainingCapacity(allocator);
+
+    const second_alpha = try allocator.dupe(u8, &.{ 5, 6, 7, 8 });
+    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, second_alpha, colors.black, 42);
+    try std.testing.expectEqual(cached_ptr, display_list.commands.items[0].alpha_image.alpha.ptr);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, display_list.commands.items[0].alpha_image.alpha);
+}
 
 test "layout, paint, and hit test a padded column" {
     const allocator = std.testing.allocator;

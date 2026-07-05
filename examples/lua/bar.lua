@@ -406,33 +406,37 @@ local StatusItems = ui.stateful({
   end,
 })
 
-return function(state)
-  local theme = ui.theme_for(state)
-  local left = ui.row({
-    gap = 10,
-    align = "center",
-    children = {
-      workspaces(),
-      ui.row({
-        gap = 6,
-        align = "center",
-        children = {
-          ui.svg_icon("examples/lua/icons/bolt.svg", 16, colors.magenta),
-          label("Keywork", colors.foreground),
-        },
-      }),
-    },
-  })
-
-  return ui.theme(theme, ui.container({ background = colors.background, padding = { all = 4 } },
-    ui.row({
-      gap = 12,
+local App = ui.stateful({
+  build = function(self, state)
+    local theme = ui.theme_for(state)
+    local left = ui.row({
+      gap = 10,
       align = "center",
       children = {
-        left,
-        ui.spacer(),
-        StatusItems({ key = "status" }),
+        workspaces(),
+        ui.row({
+          gap = 6,
+          align = "center",
+          children = {
+            ui.svg_icon("examples/lua/icons/bolt.svg", 16, colors.magenta),
+            label("Keywork", colors.foreground),
+          },
+        }),
       },
     })
-  ))
-end
+
+    return ui.theme(theme, ui.container({ background = colors.background, padding = { all = 4 } },
+      ui.row({
+        gap = 12,
+        align = "center",
+        children = {
+          left,
+          ui.spacer(),
+          StatusItems({ key = "status" }),
+        },
+      })
+    ))
+  end,
+})
+
+return App({ key = "app" })

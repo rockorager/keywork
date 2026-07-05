@@ -37,6 +37,23 @@ const SvgIcon = struct {
         const self: *const SvgIcon = @ptrCast(@alignCast(ptr));
         if (context.rect.width <= 0 or context.rect.height <= 0) return;
 
+        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
+        const width = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.width * render_scale))));
+        const height = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.height * render_scale))));
+        const alpha_cache_key = cacheKey(self.path, width, height, icon_supersample);
+        if (context.display_list.cachedAlphaImage(alpha_cache_key, @intCast(width), @intCast(height))) |alpha| {
+            try context.display_list.alphaImage(
+                context.allocator,
+                context.rect,
+                @intCast(width),
+                @intCast(height),
+                @constCast(alpha),
+                self.color,
+                alpha_cache_key,
+            );
+            return;
+        }
+
         const path_z = try context.allocator.dupeZ(u8, self.path);
         defer context.allocator.free(path_z);
         const image = c.nsvgParseFromFile(path_z.ptr, "px", 96) orelse return error.InvalidSvg;
@@ -44,9 +61,6 @@ const SvgIcon = struct {
         const rasterizer = c.nsvgCreateRasterizer() orelse return error.OutOfMemory;
         defer c.nsvgDeleteRasterizer(rasterizer);
 
-        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
-        const width = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.width * render_scale))));
-        const height = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.height * render_scale))));
         const raster_width = width * icon_supersample;
         const raster_height = height * icon_supersample;
         const pixels = try context.allocator.alloc(u8, raster_width * raster_height * 4);
@@ -71,7 +85,7 @@ const SvgIcon = struct {
             @intCast(height),
             alpha,
             self.color,
-            cacheKey(self.path, width, height, icon_supersample),
+            alpha_cache_key,
         );
     }
 
