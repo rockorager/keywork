@@ -56,6 +56,18 @@ function ui.pressable(id, child, on_press)
   return ui.clickable(id, child, on_press, { activation = "press" })
 end
 
+function ui.gesture(options)
+  return {
+    type = "gesture",
+    id = options.id,
+    child = options.child,
+    on_tap = options.on_tap,
+    on_tap_down = options.on_tap_down,
+    on_tap_up = options.on_tap_up,
+    on_tap_cancel = options.on_tap_cancel,
+  }
+end
+
 function ui.focus(id, child, options)
   options = options or {}
   return {
@@ -88,6 +100,10 @@ function ui.text_input(id, placeholder)
 end
 
 function ui.column(children, gap)
+  if children.children then
+    gap = children.gap
+    children = children.children
+  end
   return {
     type = "column",
     children = children,
@@ -96,6 +112,10 @@ function ui.column(children, gap)
 end
 
 function ui.row(children, gap)
+  if children.children then
+    gap = children.gap
+    children = children.children
+  end
   return {
     type = "row",
     children = children,

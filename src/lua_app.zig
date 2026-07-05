@@ -560,6 +560,23 @@ fn parseWidget(
         const on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_click");
         return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click, .activation = getActivationField(lua_state, table) } };
     }
+    if (std.mem.eql(u8, kind, "gesture")) {
+        const id = try dupeStringField(lua_state, allocator, table, "id");
+        errdefer allocator.free(id);
+        const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+        return .{ .clickable = .{
+            .id = id,
+            .child = child,
+            .on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap"),
+            .on_tap_down = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_down"),
+            .on_tap_up = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_up"),
+            .on_tap_cancel = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_cancel"),
+        } };
+    }
     if (std.mem.eql(u8, kind, "focus")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
         errdefer allocator.free(id);
@@ -638,8 +655,7 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        const inset = getNumberField(lua_state, table, "insets", 0);
-        return .{ .padding = .{ .insets = keywork.EdgeInsets.all(inset), .child = child } };
+        return .{ .padding = .{ .insets = getInsetsField(lua_state, table, "insets"), .child = child } };
     }
     if (std.mem.eql(u8, kind, "center")) {
         const child = try allocator.create(keywork.Widget);
@@ -841,6 +857,24 @@ fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, def
     defer pop(lua_state, 1);
     if (c.lua_isnumber(lua_state, -1) == 0) return default;
     return @floatCast(c.lua_tonumber(lua_state, -1));
+}
+
+fn getInsetsField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) keywork.EdgeInsets {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) != 0) return keywork.EdgeInsets.all(@floatCast(c.lua_tonumber(lua_state, -1)));
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return .{};
+
+    const inset_table = c.lua_gettop(lua_state);
+    const all = getNumberField(lua_state, inset_table, "all", 0);
+    const x = getNumberField(lua_state, inset_table, "x", all);
+    const y = getNumberField(lua_state, inset_table, "y", all);
+    return .{
+        .left = getNumberField(lua_state, inset_table, "left", x),
+        .top = getNumberField(lua_state, inset_table, "top", y),
+        .right = getNumberField(lua_state, inset_table, "right", x),
+        .bottom = getNumberField(lua_state, inset_table, "bottom", y),
+    };
 }
 
 fn getBooleanField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: bool) bool {

@@ -331,6 +331,9 @@ pub const Widget = union(enum) {
         id: []const u8,
         child: *const Widget,
         on_click: ?Callback = null,
+        on_tap_down: ?Callback = null,
+        on_tap_up: ?Callback = null,
+        on_tap_cancel: ?Callback = null,
         activation: ClickActivation = .release,
     };
 
@@ -866,6 +869,9 @@ pub const RenderNode = struct {
     text: ?[]const u8 = null,
     clickable_id: ?[]const u8 = null,
     click_callback: ?Widget.Callback = null,
+    tap_down_callback: ?Widget.Callback = null,
+    tap_up_callback: ?Widget.Callback = null,
+    tap_cancel_callback: ?Widget.Callback = null,
     click_activation: Widget.ClickActivation = .release,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
@@ -1979,10 +1985,19 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer allocator.free(id);
             const callback = if (clickable_widget.on_click) |on_click| try on_click.clone(allocator) else null;
             errdefer if (callback) |on_click| on_click.destroy(allocator);
+            const tap_down = if (clickable_widget.on_tap_down) |on_tap_down| try on_tap_down.clone(allocator) else null;
+            errdefer if (tap_down) |on_tap_down| on_tap_down.destroy(allocator);
+            const tap_up = if (clickable_widget.on_tap_up) |on_tap_up| try on_tap_up.clone(allocator) else null;
+            errdefer if (tap_up) |on_tap_up| on_tap_up.destroy(allocator);
+            const tap_cancel = if (clickable_widget.on_tap_cancel) |on_tap_cancel| try on_tap_cancel.clone(allocator) else null;
+            errdefer if (tap_cancel) |on_tap_cancel| on_tap_cancel.destroy(allocator);
             break :blk .{ .clickable = .{
                 .id = id,
                 .child = clickable_widget.child,
                 .on_click = callback,
+                .on_tap_down = tap_down,
+                .on_tap_up = tap_up,
+                .on_tap_cancel = tap_cancel,
                 .activation = clickable_widget.activation,
             } };
         },
@@ -2057,6 +2072,9 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .clickable => |clickable_widget| {
             if (clickable_widget.on_click) |callback| callback.destroy(allocator);
+            if (clickable_widget.on_tap_down) |callback| callback.destroy(allocator);
+            if (clickable_widget.on_tap_up) |callback| callback.destroy(allocator);
+            if (clickable_widget.on_tap_cancel) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
         },
         .focus => |focus_widget| {
@@ -2236,6 +2254,9 @@ pub fn hitTestButton(node: *const RenderNode, point: Point) ?[]const u8 {
 pub const ClickHit = struct {
     id: []const u8,
     callback: ?Widget.Callback = null,
+    tap_down: ?Widget.Callback = null,
+    tap_up: ?Widget.Callback = null,
+    tap_cancel: ?Widget.Callback = null,
     activation: Widget.ClickActivation = .release,
 };
 
@@ -2339,9 +2360,13 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     }
 
     if (node.kind == .clickable and node.rect.contains(point)) {
+        if (!nodeHasTapCallback(node)) return null;
         return .{
             .id = node.clickable_id orelse return null,
-            .callback = node.click_callback orelse return null,
+            .callback = node.click_callback,
+            .tap_down = node.tap_down_callback,
+            .tap_up = node.tap_up_callback,
+            .tap_cancel = node.tap_cancel_callback,
             .activation = node.click_activation,
         };
     }
@@ -2351,6 +2376,32 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
         }
     }
     return null;
+}
+
+pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
+    if (node.kind == .clickable) {
+        if (node.clickable_id) |clickable_id| {
+            if (std.mem.eql(u8, clickable_id, id) and nodeHasTapCallback(node)) return .{
+                .id = clickable_id,
+                .callback = node.click_callback,
+                .tap_down = node.tap_down_callback,
+                .tap_up = node.tap_up_callback,
+                .tap_cancel = node.tap_cancel_callback,
+                .activation = node.click_activation,
+            };
+        }
+    }
+    for (node.children) |*child| {
+        if (findClickHitById(child, id)) |hit| return hit;
+    }
+    return null;
+}
+
+fn nodeHasTapCallback(node: *const RenderNode) bool {
+    return node.click_callback != null or
+        node.tap_down_callback != null or
+        node.tap_up_callback != null or
+        node.tap_cancel_callback != null;
 }
 
 pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
@@ -2553,6 +2604,9 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .clickable_id = id,
                 .click_callback = clickable_widget.on_click,
+                .tap_down_callback = clickable_widget.on_tap_down,
+                .tap_up_callback = clickable_widget.on_tap_up,
+                .tap_cancel_callback = clickable_widget.on_tap_cancel,
                 .click_activation = clickable_widget.activation,
                 .children = children,
             };
@@ -3282,6 +3336,25 @@ test "clickable hit testing carries activation mode" {
 
     const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
     try std.testing.expectEqual(Widget.ClickActivation.press, hit.activation);
+}
+
+test "clickable hit testing carries gesture callbacks" {
+    const label: Widget = .{ .text = .{ .value = "Gesture" } };
+    const button: Widget = .{ .clickable = .{
+        .id = "gesture",
+        .child = &label,
+        .on_tap_down = testCallback(),
+        .on_tap_up = testCallback(),
+        .on_tap_cancel = testCallback(),
+    } };
+
+    var root = try buildRenderTree(std.testing.allocator, &button, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(std.testing.allocator, &root);
+
+    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    try std.testing.expect(hit.tap_down != null);
+    try std.testing.expect(hit.tap_up != null);
+    try std.testing.expect(hit.tap_cancel != null);
 }
 
 test "clickable without callback is inert" {

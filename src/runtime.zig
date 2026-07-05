@@ -188,6 +188,10 @@ pub const Runtime = struct {
         if (keywork.hitTestClick(root, point)) |hit| {
             try self.setFocused(hit.id);
             var needs_update = try self.setPressedId(hit.id);
+            if (hit.tap_down) |callback| {
+                try callback.call();
+                needs_update = true;
+            }
             if (hit.activation == .press) {
                 log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
                 if (try self.activateClick(hit)) needs_update = true;
@@ -209,16 +213,28 @@ pub const Runtime = struct {
     fn pointerUp(self: *Runtime, point: Point) !void {
         const root = if (self.root) |*root| root else return error.NotBuilt;
         const hit = keywork.hitTestClick(root, point);
+        const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
         const should_activate = if (self.pressed_id) |pressed_id| blk: {
             const hit_id = if (hit) |click_hit| click_hit.id else break :blk false;
             break :blk std.mem.eql(u8, pressed_id, hit_id);
         } else false;
 
         var needs_update = try self.setPressedId(null);
-        if (should_activate and hit.?.activation == .release) {
+        if (should_activate) {
             const click_hit = hit.?;
-            log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
-            if (try self.activateClick(click_hit)) needs_update = true;
+            if (click_hit.tap_up) |callback| {
+                try callback.call();
+                needs_update = true;
+            }
+            if (click_hit.activation == .release) {
+                log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
+                if (try self.activateClick(click_hit)) needs_update = true;
+            }
+        } else if (pressed_hit) |cancel_hit| {
+            if (cancel_hit.tap_cancel) |callback| {
+                try callback.call();
+                needs_update = true;
+            }
         }
 
         if (needs_update) {

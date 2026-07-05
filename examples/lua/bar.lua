@@ -236,14 +236,15 @@ local function icon(name, size, color)
 end
 
 local function pill(id, child, background)
-  return ui.clickable(id,
-    ui.box({ background = background or colors.surface },
-      ui.padding(5, child)
+  return ui.gesture({
+    id = id,
+    child = ui.box({ background = background or colors.surface },
+      ui.padding({ x = 7, y = 5 }, child)
     ),
-    function()
+    on_tap = function()
       print("clicked " .. id)
-    end
-  )
+    end,
+  })
 end
 
 local function status_pill(id, icon_name, text, color)
@@ -267,16 +268,17 @@ local function workspaces()
       fg = colors.background
       bg = colors.blue
     end
-    table.insert(items, ui.pressable("workspace-" .. name,
-      ui.box({ background = bg },
-        ui.padding(7, label(name, fg))
+    table.insert(items, ui.gesture({
+      id = "workspace-" .. name,
+      child = ui.box({ background = bg },
+        ui.padding({ x = 8, y = 7 }, label(name, fg))
       ),
-      function()
+      on_tap_down = function()
         if sway.connected then
           sway_send(sway, IPC_COMMAND, 'workspace "' .. json_string(name) .. '"')
         end
-      end
-    ))
+      end,
+    }))
   end
 
   if #items == 0 then
@@ -392,30 +394,42 @@ local StatusItems = ui.stateful({
     end
 
     return ui.row({
-      self.volume,
-      self.network,
-      self.battery,
-      label(self.time, colors.foreground),
-    }, 8)
+      gap = 8,
+      children = {
+        self.volume,
+        self.network,
+        self.battery,
+        label(self.time, colors.foreground),
+      },
+    })
   end,
 })
 
 return function(state)
   local left = ui.row({
-    workspaces(),
-    ui.row({
-      ui.svg_icon("examples/lua/icons/bolt.svg", 16, colors.magenta),
-      label("Keywork", colors.foreground),
-    }, 6),
-  }, 10)
+    gap = 10,
+    children = {
+      workspaces(),
+      ui.row({
+        gap = 6,
+        children = {
+          ui.svg_icon("examples/lua/icons/bolt.svg", 16, colors.magenta),
+          label("Keywork", colors.foreground),
+        },
+      }),
+    },
+  })
 
   return ui.box({ background = colors.background },
-    ui.padding(4,
+    ui.padding({ all = 4 },
       ui.row({
-        left,
-        ui.spacer(),
-        StatusItems({ key = "status" }),
-      }, 12)
+        gap = 12,
+        children = {
+          left,
+          ui.spacer(),
+          StatusItems({ key = "status" }),
+        },
+      })
     )
   )
 end
