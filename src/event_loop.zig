@@ -8,15 +8,42 @@ pub const EventLoop = struct {
     allocator: std.mem.Allocator,
     epoll_fd: i32,
     wake_fd: i32,
-    sources: std.ArrayList(Source) = .empty,
+    sources: std.ArrayList(Slot) = .empty,
+    free_slots: std.ArrayList(u32) = .empty,
+    pending_destroy: std.ArrayList(PendingDestroy) = .empty,
     timers: std.ArrayList(*Timer) = .empty,
     file_watches: std.ArrayList(*FileWatch) = .empty,
     wayland: ?WaylandSource = null,
     running: bool = true,
+    dispatching: bool = false,
 
     const wake_token = std.math.maxInt(u64);
     const wayland_token = wake_token - 1;
     const max_events = 16;
+
+    /// A reusable source slot. Epoll tokens pack the slot index with its
+    /// generation, so events queued for a removed (or removed-and-reused)
+    /// slot are recognized as stale and dropped instead of dispatching to
+    /// the wrong source.
+    const Slot = struct {
+        generation: u32 = 0,
+        source: ?Source = null,
+    };
+
+    /// Destruction deferred until the current dispatch batch completes, so
+    /// a callback removing a source (including itself) never frees memory
+    /// that this batch still touches.
+    const PendingDestroy = union(enum) {
+        source_ctx: struct {
+            ctx: *anyopaque,
+            destroy: *const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void,
+        },
+        file_watch: *FileWatch,
+    };
+
+    fn sourceToken(index: u32, generation: u32) u64 {
+        return (@as(u64, generation) << 32) | index;
+    }
 
     pub const SourceCallback = *const fn (ctx: *anyopaque, loop: *EventLoop, events: u32) anyerror!void;
     pub const TimerCallback = *const fn (ctx: *anyopaque, loop: *EventLoop, expirations: u64) anyerror!void;
@@ -33,7 +60,6 @@ pub const EventLoop = struct {
         events: u32,
         ctx: *anyopaque,
         callback: SourceCallback,
-        active: bool = true,
         destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
     };
 
@@ -96,12 +122,8 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
-        for (self.file_watches.items) |watch| {
-            _ = linux.inotify_rm_watch(watch.fd, watch.wd);
-            _ = linux.close(watch.fd);
-            self.allocator.free(watch.path);
-            self.allocator.destroy(watch);
-        }
+        self.flushPendingDestroy();
+        for (self.file_watches.items) |watch| self.destroyFileWatch(watch);
         self.file_watches.deinit(self.allocator);
         for (self.timers.items) |timer| {
             _ = linux.close(timer.fd);
@@ -109,31 +131,81 @@ pub const EventLoop = struct {
             self.allocator.destroy(timer);
         }
         self.timers.deinit(self.allocator);
-        for (self.sources.items) |source| {
+        for (self.sources.items) |slot| {
+            const source = slot.source orelse continue;
             if (source.destroy_ctx) |destroy| destroy(self.allocator, source.ctx);
         }
         self.sources.deinit(self.allocator);
+        self.free_slots.deinit(self.allocator);
+        self.pending_destroy.deinit(self.allocator);
         _ = linux.close(self.wake_fd);
         _ = linux.close(self.epoll_fd);
     }
 
     pub fn addFd(self: *EventLoop, source: Source) !void {
-        const index = self.sources.items.len;
-        try self.sources.append(self.allocator, source);
-        errdefer _ = self.sources.pop();
+        const index: u32 = if (self.free_slots.pop()) |free_index| free_index else blk: {
+            const new_index: u32 = @intCast(self.sources.items.len);
+            try self.sources.append(self.allocator, .{});
+            break :blk new_index;
+        };
+        const slot = &self.sources.items[index];
+        std.debug.assert(slot.source == null);
+        slot.source = source;
+        errdefer {
+            slot.source = null;
+            self.free_slots.append(self.allocator, index) catch {};
+        }
 
         var event: linux.epoll_event = .{
             .events = source.events,
-            .data = .{ .u64 = @intCast(index) },
+            .data = .{ .u64 = sourceToken(index, slot.generation) },
         };
         try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, source.fd, &event));
     }
 
     pub fn removeFd(self: *EventLoop, fd: i32) void {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
-        for (self.sources.items) |*source| {
-            if (source.fd == fd) source.active = false;
+        for (self.sources.items, 0..) |*slot, index| {
+            const source = slot.source orelse continue;
+            if (source.fd != fd) continue;
+            // The generation bump invalidates any events already queued for
+            // this slot in the current dispatch batch.
+            slot.generation +%= 1;
+            slot.source = null;
+            self.free_slots.append(self.allocator, @intCast(index)) catch {};
+            if (source.destroy_ctx) |destroy| self.deferDestroy(.{ .source_ctx = .{ .ctx = source.ctx, .destroy = destroy } });
         }
+    }
+
+    fn deferDestroy(self: *EventLoop, pending: PendingDestroy) void {
+        if (self.dispatching) {
+            self.pending_destroy.append(self.allocator, pending) catch {
+                // Allocation failure: destroying immediately risks a stale
+                // reference within this batch, but leaking is worse.
+                self.destroyPending(pending);
+            };
+            return;
+        }
+        self.destroyPending(pending);
+    }
+
+    fn destroyPending(self: *EventLoop, pending: PendingDestroy) void {
+        switch (pending) {
+            .source_ctx => |entry| entry.destroy(self.allocator, entry.ctx),
+            .file_watch => |watch| self.destroyFileWatch(watch),
+        }
+    }
+
+    fn flushPendingDestroy(self: *EventLoop) void {
+        for (self.pending_destroy.items) |pending| self.destroyPending(pending);
+        self.pending_destroy.clearRetainingCapacity();
+    }
+
+    fn destroyFileWatch(self: *EventLoop, watch: *FileWatch) void {
+        _ = linux.inotify_rm_watch(watch.fd, watch.wd);
+        _ = linux.close(watch.fd);
+        self.allocator.free(watch.path);
+        self.allocator.destroy(watch);
     }
 
     pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
@@ -193,7 +265,7 @@ pub const EventLoop = struct {
             .ctx = watch,
             .callback = fileWatchSourceCallback,
         });
-        errdefer _ = self.sources.pop();
+        errdefer self.removeFd(fd);
 
         try self.file_watches.append(self.allocator, watch);
         return watch;
@@ -201,16 +273,15 @@ pub const EventLoop = struct {
 
     pub fn removeFileWatch(self: *EventLoop, watch: *FileWatch) void {
         self.removeFd(watch.fd);
-        _ = linux.inotify_rm_watch(watch.fd, watch.wd);
-        _ = linux.close(watch.fd);
         for (self.file_watches.items, 0..) |item, index| {
             if (item == watch) {
                 _ = self.file_watches.swapRemove(index);
                 break;
             }
         }
-        self.allocator.free(watch.path);
-        self.allocator.destroy(watch);
+        // Deferred while dispatching: fileWatchSourceCallback may still be
+        // draining this watch's fd further up the stack.
+        self.deferDestroy(.{ .file_watch = watch });
     }
 
     pub fn setWayland(self: *EventLoop, source: WaylandSource) !void {
@@ -266,15 +337,26 @@ pub const EventLoop = struct {
                 }
             }
 
+            self.dispatching = true;
+            defer {
+                self.dispatching = false;
+                self.flushPendingDestroy();
+            }
+
             if (self.wayland) |wayland| {
                 if (!try wayland.finish(wayland.ctx, wayland_events)) self.running = false;
             }
 
             for (source_events[0..source_count]) |event| {
-                const index: usize = @intCast(event.data.u64);
-                if (index >= self.sources.items.len) return error.InvalidEventSource;
-                const source = self.sources.items[index];
-                if (!source.active) continue;
+                const token = event.data.u64;
+                const index: usize = @intCast(@as(u32, @truncate(token)));
+                const generation: u32 = @truncate(token >> 32);
+                if (index >= self.sources.items.len) continue;
+                // Re-read the slot per event: an earlier callback in this
+                // batch may have removed or replaced this source.
+                const slot = self.sources.items[index];
+                if (slot.generation != generation) continue;
+                const source = slot.source orelse continue;
                 try source.callback(source.ctx, self, event.events);
             }
         }
@@ -442,6 +524,120 @@ test "file watch fires and can quit the loop" {
 
     var context: FileWatchTest = .{};
     _ = try loop.addFileWatch(watched_path, &context, FileWatchTest.callback);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.lua", .data = "return 2\n" });
+    try loop.run();
+
+    try std.testing.expect(context.fired);
+}
+
+test "source removed during dispatch does not fire stale events" {
+    const PipeTest = struct {
+        loop: *EventLoop,
+        fired: usize = 0,
+        other_fd: i32 = -1,
+        self_fd: i32 = -1,
+
+        fn callback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+            // Remove both sources mid-batch; the sibling's queued event
+            // must be dropped via the generation check.
+            loop.removeFd(self.self_fd);
+            loop.removeFd(self.other_fd);
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var fds_a: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_a, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_a) |fd| {
+        _ = linux.close(fd);
+    };
+    var fds_b: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_b, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_b) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var context_a: PipeTest = .{ .loop = &loop, .self_fd = fds_a[0], .other_fd = fds_b[0] };
+    var context_b: PipeTest = .{ .loop = &loop, .self_fd = fds_b[0], .other_fd = fds_a[0] };
+    try loop.addFd(.{ .fd = fds_a[0], .events = linux.EPOLL.IN, .ctx = &context_a, .callback = PipeTest.callback });
+    try loop.addFd(.{ .fd = fds_b[0], .events = linux.EPOLL.IN, .ctx = &context_b, .callback = PipeTest.callback });
+
+    // Make both pipes readable so both events arrive in one epoll batch.
+    _ = linux.write(fds_a[1], "x", 1);
+    _ = linux.write(fds_b[1], "x", 1);
+    try loop.run();
+
+    try std.testing.expectEqual(@as(usize, 1), context_a.fired + context_b.fired);
+}
+
+test "removed slot is reused with a fresh generation" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u32) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var fds: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var ctx: u8 = 0;
+    try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
+    try std.testing.expectEqual(@as(usize, 1), loop.sources.items.len);
+    loop.removeFd(fds[0]);
+    try std.testing.expectEqual(@as(usize, 1), loop.free_slots.items.len);
+
+    try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
+    try std.testing.expectEqual(@as(usize, 1), loop.sources.items.len);
+    try std.testing.expectEqual(@as(u32, 1), loop.sources.items[0].generation);
+}
+
+test "file watch can remove itself from its own callback" {
+    const SelfRemove = struct {
+        watch: ?*EventLoop.FileWatch = null,
+        fired: bool = false,
+
+        fn callback(
+            ctx: *anyopaque,
+            loop: *EventLoop,
+            path: []const u8,
+            mask: u32,
+            name: ?[]const u8,
+        ) !void {
+            _ = path;
+            _ = name;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (mask & (linux.IN.MODIFY | linux.IN.CLOSE_WRITE) != 0 and !self.fired) {
+                self.fired = true;
+                // Removal defers destruction: the dispatch code above this
+                // frame still drains the watch fd after we return.
+                if (self.watch) |watch| loop.removeFileWatch(watch);
+                self.watch = null;
+                loop.quit();
+            }
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.lua", .data = "return 1\n" });
+
+    const watched_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "watched.lua" });
+    defer std.testing.allocator.free(watched_path);
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var context: SelfRemove = .{};
+    context.watch = try loop.addFileWatch(watched_path, &context, SelfRemove.callback);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.lua", .data = "return 2\n" });
     try loop.run();
 
