@@ -26,6 +26,7 @@ const initial_staging_capacity = atlas_width * atlas_height;
 const GpuBuffer = struct {
     buffer: vk.Buffer = .null_handle,
     memory: vk.DeviceMemory = .null_handle,
+    mapped: ?*anyopaque = null,
     size: vk.DeviceSize = 0,
 };
 
@@ -1191,10 +1192,15 @@ pub const Backend = struct {
         errdefer self.vkd.freeMemory(self.device, memory, null);
 
         try self.vkd.bindBufferMemory(self.device, buffer, memory, 0);
-        return .{ .buffer = buffer, .memory = memory, .size = size };
+        const mapped = if (properties.host_visible_bit)
+            (try self.vkd.mapMemory(self.device, memory, 0, size, .{})) orelse return error.MapFailed
+        else
+            null;
+        return .{ .buffer = buffer, .memory = memory, .mapped = mapped, .size = size };
     }
 
     fn destroyBuffer(self: *Backend, buffer: *GpuBuffer) void {
+        if (buffer.mapped != null) self.vkd.unmapMemory(self.device, buffer.memory);
         if (buffer.buffer != .null_handle) self.vkd.destroyBuffer(self.device, buffer.buffer, null);
         if (buffer.memory != .null_handle) self.vkd.freeMemory(self.device, buffer.memory, null);
         buffer.* = .{};
@@ -1202,6 +1208,12 @@ pub const Backend = struct {
 
     fn writeBuffer(self: *Backend, buffer: GpuBuffer, offset: vk.DeviceSize, bytes: []const u8) !void {
         if (offset + bytes.len > buffer.size) return error.BufferOverflow;
+        if (buffer.mapped) |mapped| {
+            const start: usize = @intCast(offset);
+            const dst: [*]u8 = @ptrCast(mapped);
+            @memcpy(dst[start..][0..bytes.len], bytes);
+            return;
+        }
         const mapped = (try self.vkd.mapMemory(self.device, buffer.memory, offset, bytes.len, .{})) orelse return error.MapFailed;
         defer self.vkd.unmapMemory(self.device, buffer.memory);
         const dst: [*]u8 = @ptrCast(mapped);
