@@ -139,7 +139,7 @@ fn runWayland(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     if (options.file_watch_path) |path| {
-        loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
+        _ = loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
         };
     }

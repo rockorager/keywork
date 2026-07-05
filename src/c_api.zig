@@ -3,8 +3,13 @@
 const std = @import("std");
 const keywork = @import("libkeywork");
 
+const linux = std.os.linux;
+
 pub const KeyworkBuild = opaque {};
 pub const KeyworkWidget = opaque {};
+pub const KeyworkEventLoop = opaque {};
+pub const KeyworkRuntime = opaque {};
+pub const KeyworkTimer = opaque {};
 
 pub const KeyworkContext = extern struct {
     input_text: [*:0]const u8,
@@ -15,9 +20,12 @@ pub const KeyworkContext = extern struct {
 
 pub const KeyworkAppVTable = extern struct {
     build: ?*const fn (userdata: ?*anyopaque, build: *KeyworkBuild, context: *const KeyworkContext) callconv(.c) ?*KeyworkWidget = null,
+    install_event_sources: ?*const fn (userdata: ?*anyopaque, loop: *KeyworkEventLoop, runtime: *KeyworkRuntime) callconv(.c) c_int = null,
 };
 
 pub const KeyworkClickCallback = *const fn (userdata: ?*anyopaque) callconv(.c) void;
+pub const KeyworkFdCallback = *const fn (userdata: ?*anyopaque, loop: *KeyworkEventLoop, events: u32) callconv(.c) c_int;
+pub const KeyworkTimerCallback = *const fn (userdata: ?*anyopaque, loop: *KeyworkEventLoop, expirations: u64) callconv(.c) c_int;
 
 pub const KeyworkSize = extern struct {
     width: f32,
@@ -285,6 +293,36 @@ const CElement = struct {
     }
 };
 
+const CFdSource = struct {
+    callback: KeyworkFdCallback,
+    userdata: ?*anyopaque,
+
+    fn eventLoopCallback(ctx: *anyopaque, loop: *keywork.event_loop.EventLoop, events: u32) !void {
+        const self: *CFdSource = @ptrCast(@alignCast(ctx));
+        if (self.callback(self.userdata, eventLoopHandle(loop), eventsToC(events)) == 0) return error.CFdCallbackFailed;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ctx: *anyopaque) void {
+        const self: *CFdSource = @ptrCast(@alignCast(ctx));
+        allocator.destroy(self);
+    }
+};
+
+const CTimerSource = struct {
+    callback: KeyworkTimerCallback,
+    userdata: ?*anyopaque,
+
+    fn eventLoopCallback(ctx: *anyopaque, loop: *keywork.event_loop.EventLoop, expirations: u64) !void {
+        const self: *CTimerSource = @ptrCast(@alignCast(ctx));
+        if (self.callback(self.userdata, eventLoopHandle(loop), expirations) == 0) return error.CTimerCallbackFailed;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ctx: *anyopaque) void {
+        const self: *CTimerSource = @ptrCast(@alignCast(ctx));
+        allocator.destroy(self);
+    }
+};
+
 const CApp = struct {
     vtable: KeyworkAppVTable,
     userdata: ?*anyopaque,
@@ -300,6 +338,12 @@ const CApp = struct {
         const c_context = try makeContext(scope.allocator, context);
         const handle = build_fn(self.userdata, buildHandle(&c_scope), &c_context) orelse return error.BuildCallbackFailed;
         return widgetFromHandle(handle).*;
+    }
+
+    fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+        const self: *CApp = @ptrCast(@alignCast(ctx orelse return));
+        const install_fn = self.vtable.install_event_sources orelse return;
+        if (install_fn(self.userdata, eventLoopHandle(loop), runtimeHandle(runtime)) == 0) return error.EventSourceInstallFailed;
     }
 };
 
@@ -335,6 +379,8 @@ pub export fn keywork_run_app(
         .height = if (opts.height > 0) opts.height else 480,
         .backend = backendKind(opts.backend),
         .layer_shell = layerShellOptionsFromRunOptions(opts),
+        .event_source_context = &app,
+        .install_event_sources = if (app.vtable.install_event_sources != null) CApp.installEventSources else null,
     }) catch |err| return errorCode(err);
     return 0;
 }
@@ -354,6 +400,81 @@ pub export fn keywork_run_text(options: ?*const KeyworkRunTextOptions) callconv(
         .layer_shell = layerShellOptionsFromRunTextOptions(opts),
     }) catch |err| return errorCode(err);
     return 0;
+}
+
+pub export fn keywork_loop_add_fd(
+    loop_handle: ?*KeyworkEventLoop,
+    fd: c_int,
+    events: u32,
+    callback: ?KeyworkFdCallback,
+    userdata: ?*anyopaque,
+) callconv(.c) c_int {
+    const loop = eventLoopFromHandle(loop_handle orelse return 0);
+    const callback_fn = callback orelse return 0;
+    const linux_events = eventsFromC(events) orelse return 0;
+    const source = loop.allocator.create(CFdSource) catch return 0;
+    source.* = .{ .callback = callback_fn, .userdata = userdata };
+    loop.addFd(.{
+        .fd = fd,
+        .events = linux_events,
+        .ctx = source,
+        .callback = CFdSource.eventLoopCallback,
+        .destroy_ctx = CFdSource.destroy,
+    }) catch {
+        loop.allocator.destroy(source);
+        return 0;
+    };
+    return 1;
+}
+
+pub export fn keywork_loop_remove_fd(loop_handle: ?*KeyworkEventLoop, fd: c_int) callconv(.c) void {
+    const loop = eventLoopFromHandle(loop_handle orelse return);
+    loop.removeFd(fd);
+}
+
+pub export fn keywork_loop_add_timer(
+    loop_handle: ?*KeyworkEventLoop,
+    callback: ?KeyworkTimerCallback,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkTimer {
+    const loop = eventLoopFromHandle(loop_handle orelse return null);
+    const callback_fn = callback orelse return null;
+    const source = loop.allocator.create(CTimerSource) catch return null;
+    source.* = .{ .callback = callback_fn, .userdata = userdata };
+    const timer = loop.addTimer(source, CTimerSource.eventLoopCallback) catch {
+        loop.allocator.destroy(source);
+        return null;
+    };
+    timer.destroy_ctx = CTimerSource.destroy;
+    return timerHandle(timer);
+}
+
+pub export fn keywork_timer_arm(timer_handle: ?*KeyworkTimer, delay_ms: u64, interval_ms: u64) callconv(.c) c_int {
+    const timer = timerFromHandle(timer_handle orelse return 0);
+    timer.arm(delay_ms, interval_ms) catch return 0;
+    return 1;
+}
+
+pub export fn keywork_timer_disarm(timer_handle: ?*KeyworkTimer) callconv(.c) void {
+    const timer = timerFromHandle(timer_handle orelse return);
+    timer.disarm();
+}
+
+pub export fn keywork_runtime_invalidate(runtime_handle: ?*KeyworkRuntime) callconv(.c) c_int {
+    const runtime = runtimeFromHandle(runtime_handle orelse return 0);
+    runtime.invalidate() catch return 0;
+    return 1;
+}
+
+pub export fn keywork_runtime_invalidate_state(runtime_handle: ?*KeyworkRuntime) callconv(.c) c_int {
+    const runtime = runtimeFromHandle(runtime_handle orelse return 0);
+    runtime.invalidateState() catch return 0;
+    return 1;
+}
+
+pub export fn keywork_loop_quit(loop_handle: ?*KeyworkEventLoop) callconv(.c) void {
+    const loop = eventLoopFromHandle(loop_handle orelse return);
+    loop.quit();
 }
 
 pub export fn keywork_text(build: ?*KeyworkBuild, value: ?[*:0]const u8) callconv(.c) ?*KeyworkWidget {
@@ -591,6 +712,30 @@ fn displayListFromHandle(handle: *KeyworkDisplayList) *CDisplayList {
     return @ptrCast(@alignCast(handle));
 }
 
+fn eventLoopHandle(loop: *keywork.event_loop.EventLoop) *KeyworkEventLoop {
+    return @ptrCast(loop);
+}
+
+fn eventLoopFromHandle(handle: *KeyworkEventLoop) *keywork.event_loop.EventLoop {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn runtimeHandle(runtime: *keywork.Runtime) *KeyworkRuntime {
+    return @ptrCast(runtime);
+}
+
+fn runtimeFromHandle(handle: *KeyworkRuntime) *keywork.Runtime {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn timerHandle(timer: *keywork.event_loop.EventLoop.Timer) *KeyworkTimer {
+    return @ptrCast(timer);
+}
+
+fn timerFromHandle(handle: *KeyworkTimer) *keywork.event_loop.EventLoop.Timer {
+    return @ptrCast(@alignCast(handle));
+}
+
 fn widgetHandle(widget: *keywork.Widget) *KeyworkWidget {
     return @ptrCast(widget);
 }
@@ -624,6 +769,23 @@ fn cStringZ(value: ?[*:0]const u8, fallback: [:0]const u8) [:0]const u8 {
 
 fn colorFromArgb(argb: u32) keywork.Color {
     return @bitCast(argb);
+}
+
+fn eventsFromC(events: u32) ?u32 {
+    var result: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
+    if (events & (1 << 0) != 0) result |= linux.EPOLL.IN;
+    if (events & (1 << 1) != 0) result |= linux.EPOLL.OUT;
+    if (result == (linux.EPOLL.HUP | linux.EPOLL.ERR)) return null;
+    return result;
+}
+
+fn eventsToC(events: u32) u32 {
+    var result: u32 = 0;
+    if (events & linux.EPOLL.IN != 0) result |= 1 << 0;
+    if (events & linux.EPOLL.OUT != 0) result |= 1 << 1;
+    if (events & linux.EPOLL.HUP != 0) result |= 1 << 2;
+    if (events & linux.EPOLL.ERR != 0) result |= 1 << 3;
+    return result;
 }
 
 fn constraintsToC(constraints: keywork.Constraints) KeyworkConstraints {

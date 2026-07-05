@@ -4,6 +4,7 @@ const std = @import("std");
 const keywork = @import("libkeywork");
 const lua_codec = @import("lua_codec.zig");
 const c = @import("luajit_c");
+const dbus_c = @import("dbus_c");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -374,8 +375,10 @@ pub const App = struct {
     script_ref: c_int = -1,
     script_dirty: bool = true,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
+    fs_events: std.ArrayList(*FsEvent) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
+    dbus_buses: std.ArrayList(*DbusBus) = .empty,
     event_loop: ?*keywork.event_loop.EventLoop = null,
     runtime: ?*keywork.Runtime = null,
 
@@ -404,10 +407,14 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (self.fd_watches.items) |watch| watch.destroy(self.allocator, self.state);
         self.fd_watches.deinit(self.allocator);
+        for (self.fs_events.items) |fs_event| fs_event.destroy(self.allocator, self.state);
+        self.fs_events.deinit(self.allocator);
         for (self.timers.items) |timer| timer.destroy(self.allocator, self.state);
         self.timers.deinit(self.allocator);
         for (self.processes.items) |process| process.destroy(self.allocator, self.state);
         self.processes.deinit(self.allocator);
+        for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
+        self.dbus_buses.deinit(self.allocator);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_close(self.state);
         self.allocator.free(self.path);
@@ -417,12 +424,14 @@ pub const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx.?));
         self.event_loop = loop;
         self.runtime = runtime;
-        loop.addFileWatch(self.path, self, scriptChanged) catch |err| {
+        _ = loop.addFileWatch(self.path, self, scriptChanged) catch |err| {
             if (err != error.FileWatchNotFound) std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ self.path, err });
         };
         for (self.fd_watches.items) |watch| try self.registerFdWatch(watch);
+        for (self.fs_events.items) |fs_event| try self.registerFsEvent(fs_event);
         for (self.timers.items) |timer| try self.registerTimer(timer);
         for (self.processes.items) |process| try self.registerProcess(process);
+        for (self.dbus_buses.items) |bus| try self.registerDbusBus(bus);
     }
 
     pub fn host(self: *App) keywork.AppHost {
@@ -492,6 +501,30 @@ pub const App = struct {
         });
         watch.registered = true;
         try fdWatchCallback(watch, loop, linux.EPOLL.IN);
+    }
+
+    fn addFsEvent(self: *App, path: []const u8, ref: c_int) !*FsEvent {
+        const fs_event = try self.allocator.create(FsEvent);
+        errdefer self.allocator.destroy(fs_event);
+        fs_event.* = .{
+            .app = self,
+            .path = try self.allocator.dupe(u8, path),
+            .ref = ref,
+        };
+        errdefer self.allocator.free(fs_event.path);
+        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+
+        try self.fs_events.append(self.allocator, fs_event);
+        errdefer _ = self.fs_events.pop();
+        try self.registerFsEvent(fs_event);
+        return fs_event;
+    }
+
+    fn registerFsEvent(self: *App, fs_event: *FsEvent) !void {
+        if (fs_event.registered or fs_event.canceled) return;
+        const loop = self.event_loop orelse return;
+        fs_event.watch = try loop.addFileWatch(fs_event.path, fs_event, fsEventCallback);
+        fs_event.registered = true;
     }
 
     fn addTimerWithDelay(self: *App, delay_ms: u64, interval_ms: u64, ref: c_int) !*LuaTimer {
@@ -569,6 +602,31 @@ pub const App = struct {
             }
         }
     }
+
+    fn addDbusBus(self: *App, kind: DbusBus.Kind) !*DbusBus {
+        const bus = try self.allocator.create(DbusBus);
+        errdefer self.allocator.destroy(bus);
+        bus.* = try DbusBus.init(self, kind);
+        errdefer bus.deinit(self.allocator, self.state);
+        try bus.installFilter();
+
+        try self.dbus_buses.append(self.allocator, bus);
+        errdefer _ = self.dbus_buses.pop();
+        try self.registerDbusBus(bus);
+        return bus;
+    }
+
+    fn registerDbusBus(self: *App, bus: *DbusBus) !void {
+        if (bus.registered or bus.closed) return;
+        const loop = self.event_loop orelse return;
+        try loop.addFd(.{
+            .fd = bus.fd,
+            .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR,
+            .ctx = bus,
+            .callback = dbusBusCallback,
+        });
+        bus.registered = true;
+    }
 };
 
 fn scriptChanged(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
@@ -602,6 +660,35 @@ const FdWatch = struct {
 
     fn destroy(self: *FdWatch, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        allocator.destroy(self);
+    }
+};
+
+const FsEvent = struct {
+    app: *App,
+    path: []const u8,
+    ref: c_int,
+    watch: ?*keywork.event_loop.EventLoop.FileWatch = null,
+    registered: bool = false,
+    canceled: bool = false,
+
+    fn cancel(self: *FsEvent, lua_state: *c.lua_State) void {
+        if (self.canceled) return;
+        self.canceled = true;
+        if (self.registered) {
+            if (self.app.event_loop) |loop| if (self.watch) |watch| loop.removeFileWatch(watch);
+            self.registered = false;
+            self.watch = null;
+        }
+        if (self.ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+            self.ref = -1;
+        }
+    }
+
+    fn destroy(self: *FsEvent, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        allocator.free(self.path);
         allocator.destroy(self);
     }
 };
@@ -856,6 +943,301 @@ const LuaProcess = struct {
     }
 };
 
+const DbusSubscription = struct {
+    bus: *DbusBus,
+    ref: c_int,
+    match_rule: ?[:0]const u8 = null,
+    sender: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    path_namespace: ?[]const u8 = null,
+    interface: ?[]const u8 = null,
+    member: ?[]const u8 = null,
+    canceled: bool = false,
+
+    fn cancel(self: *DbusSubscription, lua_state: *c.lua_State) void {
+        if (self.canceled) return;
+        self.canceled = true;
+        if (self.match_rule) |rule| dbus_c.dbus_bus_remove_match(self.bus.connection, rule.ptr, null);
+        if (self.ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+            self.ref = -1;
+        }
+    }
+
+    fn deinit(self: *DbusSubscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        if (self.match_rule) |rule| allocator.free(rule);
+        if (self.sender) |value| allocator.free(value);
+        if (self.path) |value| allocator.free(value);
+        if (self.path_namespace) |value| allocator.free(value);
+        if (self.interface) |value| allocator.free(value);
+        if (self.member) |value| allocator.free(value);
+    }
+
+    fn destroy(self: *DbusSubscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.deinit(allocator, lua_state);
+        allocator.destroy(self);
+    }
+
+    fn matches(self: *const DbusSubscription, message: *dbus_c.DBusMessage) bool {
+        if (self.canceled or self.ref < 0) return false;
+        if (self.sender) |expected| {
+            const actual = dbus_c.dbus_message_get_sender(message) orelse return false;
+            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
+        }
+        if (self.interface) |expected| {
+            const actual = dbus_c.dbus_message_get_interface(message) orelse return false;
+            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
+        }
+        if (self.member) |expected| {
+            const actual = dbus_c.dbus_message_get_member(message) orelse return false;
+            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
+        }
+        if (self.path) |expected| {
+            const actual = dbus_c.dbus_message_get_path(message) orelse return false;
+            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
+        }
+        if (self.path_namespace) |expected| {
+            const actual = dbus_c.dbus_message_get_path(message) orelse return false;
+            if (!std.mem.startsWith(u8, std.mem.span(actual), expected)) return false;
+        }
+        return true;
+    }
+};
+
+const DbusCall = struct {
+    bus: *DbusBus,
+    ref: c_int = -1,
+    pending: ?*dbus_c.DBusPendingCall = null,
+    completed: bool = false,
+
+    fn complete(self: *DbusCall) !void {
+        if (self.completed) return;
+        self.completed = true;
+
+        const lua_state = self.bus.app.state;
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+
+        const reply = if (self.pending) |pending| dbus_c.dbus_pending_call_steal_reply(pending) else null;
+        if (reply) |message| {
+            defer dbus_c.dbus_message_unref(message);
+            if (dbus_c.dbus_message_get_type(message) == dbus_c.DBUS_MESSAGE_TYPE_ERROR) {
+                c.lua_pushnil(lua_state);
+                pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_error_name(message));
+                if (c.lua_pcall(lua_state, 2, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+            } else {
+                pushDbusReply(lua_state, message);
+                if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+            }
+        } else {
+            c.lua_pushnil(lua_state);
+            c.lua_pushliteral(lua_state, "dbus call failed");
+            if (c.lua_pcall(lua_state, 2, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+        }
+    }
+
+    fn deinit(self: *DbusCall, lua_state: *c.lua_State) void {
+        if (!self.completed) {
+            if (self.pending) |pending| dbus_c.dbus_pending_call_cancel(pending);
+        }
+        if (self.pending) |pending| dbus_c.dbus_pending_call_unref(pending);
+        self.pending = null;
+        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        self.ref = -1;
+    }
+
+    fn destroy(self: *DbusCall, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.deinit(lua_state);
+        allocator.destroy(self);
+    }
+};
+
+const DbusBus = struct {
+    app: *App,
+    kind: Kind,
+    connection: *dbus_c.DBusConnection,
+    fd: i32,
+    subscriptions: std.ArrayList(*DbusSubscription) = .empty,
+    pending_calls: std.ArrayList(*DbusCall) = .empty,
+    registered: bool = false,
+    closed: bool = false,
+    filter_installed: bool = false,
+
+    const Kind = enum {
+        session,
+        system,
+
+        fn busType(self: Kind) dbus_c.DBusBusType {
+            return switch (self) {
+                .session => dbus_c.DBUS_BUS_SESSION,
+                .system => dbus_c.DBUS_BUS_SYSTEM,
+            };
+        }
+    };
+
+    fn init(app: *App, kind: Kind) !DbusBus {
+        const connection = dbus_c.dbus_bus_get_private(kind.busType(), null) orelse return error.DBusUnavailable;
+        errdefer {
+            dbus_c.dbus_connection_close(connection);
+            dbus_c.dbus_connection_unref(connection);
+        }
+        dbus_c.dbus_connection_set_exit_on_disconnect(connection, 0);
+        var fd: c_int = -1;
+        if (dbus_c.dbus_connection_get_unix_fd(connection, &fd) == 0 or fd < 0) return error.DBusUnavailable;
+        const self: DbusBus = .{
+            .app = app,
+            .kind = kind,
+            .connection = connection,
+            .fd = @intCast(fd),
+        };
+        return self;
+    }
+
+    fn installFilter(self: *DbusBus) !void {
+        if (self.filter_installed) return;
+        if (dbus_c.dbus_connection_add_filter(self.connection, dbusFilter, self, null) == 0) return error.OutOfMemory;
+        self.filter_installed = true;
+    }
+
+    fn close(self: *DbusBus) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.registered) {
+            if (self.app.event_loop) |loop| loop.removeFd(self.fd);
+            self.registered = false;
+        }
+        if (self.filter_installed) {
+            dbus_c.dbus_connection_remove_filter(self.connection, dbusFilter, self);
+            self.filter_installed = false;
+        }
+        dbus_c.dbus_connection_close(self.connection);
+        dbus_c.dbus_connection_unref(self.connection);
+        self.fd = invalid_fd;
+    }
+
+    fn deinit(self: *DbusBus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        for (self.subscriptions.items) |subscription| subscription.destroy(allocator, lua_state);
+        self.subscriptions.deinit(allocator);
+        for (self.pending_calls.items) |pending_call| pending_call.destroy(allocator, lua_state);
+        self.pending_calls.deinit(allocator);
+        self.close();
+    }
+
+    fn destroy(self: *DbusBus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.deinit(allocator, lua_state);
+        allocator.destroy(self);
+    }
+
+    fn subscribe(self: *DbusBus, lua_state: *c.lua_State, options_index: c_int, callback_index: c_int) !*DbusSubscription {
+        const subscription = try self.app.allocator.create(DbusSubscription);
+        errdefer self.app.allocator.destroy(subscription);
+
+        subscription.* = .{
+            .bus = self,
+            .ref = -1,
+            .sender = try optionalStringFieldDupe(lua_state, self.app.allocator, options_index, "sender"),
+            .path = try optionalStringFieldDupe(lua_state, self.app.allocator, options_index, "path"),
+            .path_namespace = try optionalStringFieldDupe(lua_state, self.app.allocator, options_index, "path_namespace"),
+            .interface = try optionalStringFieldDupe(lua_state, self.app.allocator, options_index, "interface"),
+            .member = try optionalStringFieldDupe(lua_state, self.app.allocator, options_index, "member"),
+        };
+        errdefer subscription.deinit(self.app.allocator, lua_state);
+        subscription.match_rule = try buildDbusMatchRule(self.app.allocator, subscription);
+        dbus_c.dbus_bus_add_match(self.connection, subscription.match_rule.?.ptr, null);
+
+        c.lua_pushvalue(lua_state, callback_index);
+        subscription.ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+
+        try self.subscriptions.append(self.app.allocator, subscription);
+        return subscription;
+    }
+
+    fn call(self: *DbusBus, lua_state: *c.lua_State, options_index: c_int, callback_index: c_int) !void {
+        const destination = try stringField(lua_state, options_index, "destination");
+        const path = try stringField(lua_state, options_index, "path");
+        const interface = try stringField(lua_state, options_index, "interface");
+        const member = try stringField(lua_state, options_index, "member");
+        const message = dbus_c.dbus_message_new_method_call(destination.ptr, path.ptr, interface.ptr, member.ptr) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(message);
+
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(message, &iter);
+        try appendDbusLuaArgs(lua_state, options_index, &iter);
+
+        const timeout_ms = getIntegerField(lua_state, options_index, "timeout_ms", 1000);
+        const call_state = try self.app.allocator.create(DbusCall);
+        errdefer self.app.allocator.destroy(call_state);
+        c.lua_pushvalue(lua_state, callback_index);
+        call_state.* = .{
+            .bus = self,
+            .ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX),
+        };
+        errdefer call_state.deinit(lua_state);
+
+        var pending: ?*dbus_c.DBusPendingCall = null;
+        if (dbus_c.dbus_connection_send_with_reply(self.connection, message, &pending, @intCast(timeout_ms)) == 0) return error.OutOfMemory;
+        call_state.pending = pending orelse return error.DBusCallFailed;
+
+        try self.pending_calls.append(self.app.allocator, call_state);
+        errdefer _ = self.removePendingCall(call_state);
+        if (dbus_c.dbus_pending_call_set_notify(call_state.pending, dbusCallNotify, call_state, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    fn removePendingCall(self: *DbusBus, pending_call: *DbusCall) bool {
+        for (self.pending_calls.items, 0..) |item, index| {
+            if (item == pending_call) {
+                _ = self.pending_calls.swapRemove(index);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn dispatch(self: *DbusBus) void {
+        _ = dbus_c.dbus_connection_read_write(self.connection, 0);
+        while (dbus_c.dbus_connection_dispatch(self.connection) == dbus_c.DBUS_DISPATCH_DATA_REMAINS) {}
+    }
+
+    fn handleSignal(self: *DbusBus, message: *dbus_c.DBusMessage) !void {
+        const lua_state = self.app.state;
+        for (self.subscriptions.items) |subscription| {
+            if (!subscription.matches(message)) continue;
+            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, subscription.ref);
+            pushDbusSignal(lua_state, message);
+            if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
+                failLuaCall(lua_state, "dbus signal callback failed") catch {};
+                return error.LuaCallbackFailed;
+            }
+        }
+    }
+};
+
+fn dbusCallNotify(_: ?*dbus_c.DBusPendingCall, user_data: ?*anyopaque) callconv(.c) void {
+    const call: *DbusCall = @ptrCast(@alignCast(user_data orelse return));
+    call.complete() catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus call callback failed: {}", .{err});
+    };
+    _ = call.bus.removePendingCall(call);
+    call.destroy(call.bus.app.allocator, call.bus.app.state);
+}
+
+fn dbusBusCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+    const bus: *DbusBus = @ptrCast(@alignCast(ctx));
+    if (bus.closed) return;
+    bus.dispatch();
+}
+
+fn dbusFilter(_: ?*dbus_c.DBusConnection, message: ?*dbus_c.DBusMessage, user_data: ?*anyopaque) callconv(.c) dbus_c.DBusHandlerResult {
+    const bus: *DbusBus = @ptrCast(@alignCast(user_data orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
+    const msg = message orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    if (dbus_c.dbus_message_get_type(msg) != dbus_c.DBUS_MESSAGE_TYPE_SIGNAL) return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    bus.handleSignal(msg) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus signal dispatch failed: {}", .{err});
+    };
+    return dbus_c.DBUS_HANDLER_RESULT_HANDLED;
+}
+
 fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u32) !void {
     const watch: *FdWatch = @ptrCast(@alignCast(ctx));
     if (watch.canceled or watch.ref < 0) return;
@@ -867,6 +1249,27 @@ fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u3
         var len: usize = 0;
         const message_ptr = c.lua_tolstring(app.state, -1, &len);
         if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fd callback failed: {s}", .{message[0..len]});
+        pop(app.state, 1);
+        return error.LuaCallbackFailed;
+    }
+    const should_invalidate = c.lua_toboolean(app.state, -1) != 0;
+    pop(app.state, 1);
+    if (should_invalidate) {
+        const runtime = app.runtime orelse return;
+        try runtime.invalidate();
+    }
+}
+
+fn fsEventCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []const u8, mask: u32, name: ?[]const u8) !void {
+    const fs_event: *FsEvent = @ptrCast(@alignCast(ctx));
+    if (fs_event.canceled or fs_event.ref < 0) return;
+    const app = fs_event.app;
+    c.lua_rawgeti(app.state, c.LUA_REGISTRYINDEX, fs_event.ref);
+    pushFsEvent(app.state, path, mask, name);
+    if (c.lua_pcall(app.state, 1, 1, 0) != 0) {
+        var len: usize = 0;
+        const message_ptr = c.lua_tolstring(app.state, -1, &len);
+        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fs_event callback failed: {s}", .{message[0..len]});
         pop(app.state, 1);
         return error.LuaCallbackFailed;
     }
@@ -993,10 +1396,10 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 5);
     const table = c.lua_gettop(lua_state);
 
-    c.lua_createtable(lua_state, 0, 3);
+    c.lua_createtable(lua_state, 0, 4);
     const loop_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaLoopTimer, 1);
@@ -1005,14 +1408,89 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushcclosure(lua_state, luaWatchFd, 1);
     c.lua_setfield(lua_state, loop_table, "fd");
     c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaFsEvent, 1);
+    c.lua_setfield(lua_state, loop_table, "fs_event");
+    c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaSpawn, 1);
     c.lua_setfield(lua_state, loop_table, "spawn");
     c.lua_setfield(lua_state, table, "loop");
+
+    c.lua_createtable(lua_state, 0, 2);
+    const dbus_table = c.lua_gettop(lua_state);
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaDbusSession, 1);
+    c.lua_setfield(lua_state, dbus_table, "session");
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaDbusSystem, 1);
+    c.lua_setfield(lua_state, dbus_table, "system");
+    c.lua_setfield(lua_state, table, "dbus");
+
+    c.lua_createtable(lua_state, 0, 4);
+    const log_table = c.lua_gettop(lua_state);
+    c.lua_pushcclosure(lua_state, luaLogDebug, 0);
+    c.lua_setfield(lua_state, log_table, "debug");
+    c.lua_pushcclosure(lua_state, luaLogInfo, 0);
+    c.lua_setfield(lua_state, log_table, "info");
+    c.lua_pushcclosure(lua_state, luaLogWarn, 0);
+    c.lua_setfield(lua_state, log_table, "warn");
+    c.lua_pushcclosure(lua_state, luaLogErr, 0);
+    c.lua_setfield(lua_state, log_table, "err");
+    c.lua_setfield(lua_state, table, "log");
 
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaInvalidate, 1);
     c.lua_setfield(lua_state, table, "invalidate");
     return 1;
+}
+
+fn luaLogDebug(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaLog(lua_state_optional, .debug);
+}
+
+fn luaLogInfo(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaLog(lua_state_optional, .info);
+}
+
+fn luaLogWarn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaLog(lua_state_optional, .warn);
+}
+
+fn luaLogErr(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaLog(lua_state_optional, .err);
+}
+
+fn luaLog(lua_state_optional: ?*c.lua_State, comptime level: std.log.Level) c_int {
+    const lua_state = lua_state_optional.?;
+    var writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer writer.deinit();
+
+    const count = c.lua_gettop(lua_state);
+    var index: c_int = 1;
+    while (index <= count) : (index += 1) {
+        if (index > 1) writer.writer.writeByte(' ') catch return c.luaL_error(lua_state, "log failed");
+        tryLuaToString(lua_state, index, &writer.writer) catch return c.luaL_error(lua_state, "log failed");
+    }
+
+    const message = writer.written();
+    switch (level) {
+        .debug => std.log.scoped(.keywork_lua).debug("{s}", .{message}),
+        .info => std.log.scoped(.keywork_lua).info("{s}", .{message}),
+        .warn => std.log.scoped(.keywork_lua).warn("{s}", .{message}),
+        .err => std.log.scoped(.keywork_lua).err("{s}", .{message}),
+    }
+    return 0;
+}
+
+fn tryLuaToString(lua_state: *c.lua_State, index: c_int, writer: *std.Io.Writer) !void {
+    c.lua_getglobal(lua_state, "tostring");
+    c.lua_pushvalue(lua_state, index);
+    if (c.lua_pcall(lua_state, 1, 1, 0) != 0) {
+        pop(lua_state, 1);
+        return error.LuaToStringFailed;
+    }
+    defer pop(lua_state, 1);
+    const value = stringFromStack(lua_state, -1) catch "<unprintable>";
+    try writer.writeAll(value);
 }
 
 fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -1060,6 +1538,80 @@ fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const path = fsEventPath(lua_state, 1) catch return c.luaL_error(lua_state, "fs_event requires a path");
+    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
+
+    c.lua_pushvalue(lua_state, 2);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    const fs_event = app.addFsEvent(path, ref) catch |err| {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        std.log.scoped(.keywork_luajit).warn("loop.fs_event failed: {}", .{err});
+        return c.luaL_error(lua_state, "loop.fs_event failed");
+    };
+    pushFsEventHandle(lua_state, fs_event);
+    return 1;
+}
+
+fn luaDbusSession(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaDbusBus(lua_state_optional, .session);
+}
+
+fn luaDbusSystem(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return luaDbusBus(lua_state_optional, .system);
+}
+
+fn luaDbusBus(lua_state_optional: ?*c.lua_State, kind: DbusBus.Kind) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const bus = app.addDbusBus(kind) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus bus failed");
+    };
+    pushDbusBusHandle(lua_state, bus);
+    return 1;
+}
+
+fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
+    const options_index: c_int = if (c.lua_type(lua_state, 3) == c.LUA_TFUNCTION) 2 else 1;
+    const callback_index: c_int = options_index + 1;
+    c.luaL_checktype(lua_state, options_index, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, callback_index, c.LUA_TFUNCTION);
+    const subscription = bus.subscribe(lua_state, options_index, callback_index) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus subscribe failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus subscribe failed");
+    };
+    pushDbusSubscriptionHandle(lua_state, subscription);
+    return 1;
+}
+
+fn luaDbusCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
+    const options_index: c_int = if (c.lua_type(lua_state, 3) == c.LUA_TFUNCTION) 2 else 1;
+    const callback_index: c_int = options_index + 1;
+    c.luaL_checktype(lua_state, options_index, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, callback_index, c.LUA_TFUNCTION);
+    bus.call(lua_state, options_index, callback_index) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus call failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus call failed");
+    };
+    return 0;
+}
+
+fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    bus.close();
+    return 0;
+}
+
 fn pushTimerHandle(lua_state: *c.lua_State, timer: *LuaTimer) void {
     c.lua_createtable(lua_state, 0, 1);
     c.lua_pushlightuserdata(lua_state, timer);
@@ -1071,6 +1623,33 @@ fn pushFdWatchHandle(lua_state: *c.lua_State, watch: *FdWatch) void {
     c.lua_createtable(lua_state, 0, 1);
     c.lua_pushlightuserdata(lua_state, watch);
     c.lua_pushcclosure(lua_state, luaCancelFdWatch, 1);
+    c.lua_setfield(lua_state, -2, "cancel");
+}
+
+fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, fs_event);
+    c.lua_pushcclosure(lua_state, luaCancelFsEvent, 1);
+    c.lua_setfield(lua_state, -2, "cancel");
+}
+
+fn pushDbusBusHandle(lua_state: *c.lua_State, bus: *DbusBus) void {
+    c.lua_createtable(lua_state, 0, 3);
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusSubscribe, 1);
+    c.lua_setfield(lua_state, -2, "subscribe");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusCall, 1);
+    c.lua_setfield(lua_state, -2, "call");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusClose, 1);
+    c.lua_setfield(lua_state, -2, "close");
+}
+
+fn pushDbusSubscriptionHandle(lua_state: *c.lua_State, subscription: *DbusSubscription) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, subscription);
+    c.lua_pushcclosure(lua_state, luaCancelDbusSubscription, 1);
     c.lua_setfield(lua_state, -2, "cancel");
 }
 
@@ -1094,6 +1673,20 @@ fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const watch: *FdWatch = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     watch.cancel(lua_state);
+    return 0;
+}
+
+fn luaCancelFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const fs_event: *FsEvent = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    fs_event.cancel(lua_state);
+    return 0;
+}
+
+fn luaCancelDbusSubscription(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const subscription: *DbusSubscription = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    subscription.cancel(lua_state);
     return 0;
 }
 
@@ -1569,9 +2162,85 @@ fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]con
     return value;
 }
 
+fn optionalStringFieldDupe(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?[]const u8 {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    const value = try stringFromStack(lua_state, -1);
+    return try allocator.dupe(u8, value);
+}
+
+fn getIntegerField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: c_int) c_int {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) == 0) return default;
+    return @intCast(c.lua_tointeger(lua_state, -1));
+}
+
+fn appendDbusLuaArgs(lua_state: *c.lua_State, options_index: c_int, iter: *dbus_c.DBusMessageIter) !void {
+    c.lua_getfield(lua_state, options_index, "args");
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return;
+    try expectType(lua_state, -1, c.LUA_TTABLE);
+
+    const args_index = absoluteIndex(lua_state, -1);
+    var index: c_int = 1;
+    while (true) : (index += 1) {
+        c.lua_rawgeti(lua_state, args_index, index);
+        if (c.lua_isnil(lua_state, -1)) {
+            pop(lua_state, 1);
+            return;
+        }
+        const arg_type = c.lua_type(lua_state, -1);
+        switch (arg_type) {
+            c.LUA_TSTRING => {
+                var len: usize = 0;
+                var value = c.lua_tolstring(lua_state, -1, &len).?;
+                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_STRING, &value);
+            },
+            c.LUA_TBOOLEAN => {
+                var value: dbus_c.dbus_bool_t = if (c.lua_toboolean(lua_state, -1) != 0) 1 else 0;
+                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BOOLEAN, &value);
+            },
+            c.LUA_TNUMBER => {
+                var value: f64 = c.lua_tonumber(lua_state, -1);
+                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_DOUBLE, &value);
+            },
+            else => {
+                pop(lua_state, 1);
+                return error.UnsupportedDbusArgument;
+            },
+        }
+        pop(lua_state, 1);
+    }
+}
+
+fn appendDbusBasic(iter: *dbus_c.DBusMessageIter, type_: c_int, value: anytype) !void {
+    const opaque_value: *const anyopaque = @ptrCast(value);
+    if (dbus_c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
+}
+
 fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
     const value = try stringFromStack(lua_state, index);
     return try allocator.dupe(u8, value);
+}
+
+fn buildDbusMatchRule(allocator: std.mem.Allocator, subscription: *const DbusSubscription) ![:0]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll("type='signal'");
+    try appendDbusMatchField(&writer.writer, "sender", subscription.sender);
+    try appendDbusMatchField(&writer.writer, "path", subscription.path);
+    try appendDbusMatchField(&writer.writer, "path_namespace", subscription.path_namespace);
+    try appendDbusMatchField(&writer.writer, "interface", subscription.interface);
+    try appendDbusMatchField(&writer.writer, "member", subscription.member);
+    return try writer.toOwnedSliceSentinel(0);
+}
+
+fn appendDbusMatchField(writer: *std.Io.Writer, name: []const u8, value: ?[]const u8) !void {
+    const field = value orelse return;
+    if (std.mem.indexOfAny(u8, field, "',") != null) return error.InvalidDbusMatchField;
+    try writer.print(",{s}='{s}'", .{ name, field });
 }
 
 fn boolField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) bool {
@@ -1586,6 +2255,14 @@ fn optionalSecondsField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u
     if (c.lua_isnil(lua_state, -1)) return null;
     if (c.lua_isnumber(lua_state, -1) == 0) return null;
     return c.lua_tonumber(lua_state, -1);
+}
+
+fn fsEventPath(lua_state: *c.lua_State, index: c_int) ![]const u8 {
+    const absolute = absoluteIndex(lua_state, index);
+    if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) {
+        return try stringField(lua_state, absolute, "path");
+    }
+    return try stringFromStack(lua_state, absolute);
 }
 
 fn secondsToMilliseconds(seconds: f64) !u64 {
@@ -1701,6 +2378,165 @@ fn dupTo(old: i32, new: i32) !void {
 fn setNonblocking(fd: i32) !void {
     const flags = try linuxFd(linux.fcntl(fd, linux.F.GETFL, 0));
     try linuxVoid(linux.fcntl(fd, linux.F.SETFL, @as(usize, @intCast(flags)) | linux.SOCK.NONBLOCK));
+}
+
+fn pushFsEvent(lua_state: *c.lua_State, path: []const u8, mask: u32, name: ?[]const u8) void {
+    c.lua_createtable(lua_state, 0, 7);
+    const table = c.lua_gettop(lua_state);
+    c.lua_pushlstring(lua_state, path.ptr, path.len);
+    c.lua_setfield(lua_state, table, "path");
+    if (name) |event_name| {
+        c.lua_pushlstring(lua_state, event_name.ptr, event_name.len);
+    } else {
+        c.lua_pushnil(lua_state);
+    }
+    c.lua_setfield(lua_state, table, "name");
+    c.lua_pushinteger(lua_state, @intCast(mask));
+    c.lua_setfield(lua_state, table, "mask");
+    c.lua_pushboolean(lua_state, if (mask & (linux.IN.MODIFY | linux.IN.CLOSE_WRITE | linux.IN.ATTRIB) != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "change");
+    c.lua_pushboolean(lua_state, if (mask & (linux.IN.MOVED_TO | linux.IN.MOVE_SELF | linux.IN.DELETE_SELF) != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "rename");
+    c.lua_pushboolean(lua_state, if (mask & linux.IN.DELETE_SELF != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "delete_self");
+    c.lua_pushboolean(lua_state, if (mask & linux.IN.MOVE_SELF != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "move_self");
+}
+
+fn pushDbusSignal(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+    c.lua_createtable(lua_state, 0, 6);
+    const table = c.lua_gettop(lua_state);
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_sender(message));
+    c.lua_setfield(lua_state, table, "sender");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_path(message));
+    c.lua_setfield(lua_state, table, "path");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_interface(message));
+    c.lua_setfield(lua_state, table, "interface");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_member(message));
+    c.lua_setfield(lua_state, table, "member");
+
+    const signature = dbus_c.dbus_message_get_signature(message);
+    if (signature) |sig| {
+        c.lua_pushstring(lua_state, sig);
+    } else {
+        c.lua_pushnil(lua_state);
+    }
+    c.lua_setfield(lua_state, table, "signature");
+
+    pushDbusArgsTable(lua_state, message);
+    c.lua_setfield(lua_state, table, "args");
+}
+
+fn pushDbusReply(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+    c.lua_createtable(lua_state, 0, 2);
+    const table = c.lua_gettop(lua_state);
+    const signature = dbus_c.dbus_message_get_signature(message);
+    if (signature) |sig| {
+        c.lua_pushstring(lua_state, sig);
+    } else {
+        c.lua_pushnil(lua_state);
+    }
+    c.lua_setfield(lua_state, table, "signature");
+
+    pushDbusArgsTable(lua_state, message);
+    c.lua_setfield(lua_state, table, "args");
+}
+
+fn pushDbusArgsTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+    c.lua_createtable(lua_state, 0, 0);
+    const args_table = c.lua_gettop(lua_state);
+    var iter: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_init(message, &iter) != 0) {
+        var arg_index: c_int = 1;
+        while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) : (arg_index += 1) {
+            pushDbusIterValue(lua_state, &iter);
+            c.lua_rawseti(lua_state, args_table, arg_index);
+            if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
+        }
+    }
+}
+
+fn pushOptionalDbusString(lua_state: *c.lua_State, value: ?[*:0]const u8) void {
+    if (value) |ptr| {
+        c.lua_pushstring(lua_state, ptr);
+    } else {
+        c.lua_pushnil(lua_state);
+    }
+}
+
+fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+    switch (dbus_c.dbus_message_iter_get_arg_type(iter)) {
+        dbus_c.DBUS_TYPE_STRING, dbus_c.DBUS_TYPE_OBJECT_PATH, dbus_c.DBUS_TYPE_SIGNATURE => {
+            var value: [*:0]const u8 = undefined;
+            dbus_c.dbus_message_iter_get_basic(iter, @ptrCast(&value));
+            c.lua_pushstring(lua_state, value);
+        },
+        dbus_c.DBUS_TYPE_BOOLEAN => {
+            var value: dbus_c.dbus_bool_t = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushboolean(lua_state, if (value != 0) 1 else 0);
+        },
+        dbus_c.DBUS_TYPE_BYTE => {
+            var value: u8 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_INT16 => {
+            var value: i16 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_UINT16 => {
+            var value: u16 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_INT32 => {
+            var value: i32 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_UINT32 => {
+            var value: u32 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_INT64 => {
+            var value: i64 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_UINT64 => {
+            var value: u64 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, @floatFromInt(value));
+        },
+        dbus_c.DBUS_TYPE_DOUBLE => {
+            var value: f64 = 0;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            c.lua_pushnumber(lua_state, value);
+        },
+        dbus_c.DBUS_TYPE_VARIANT => {
+            var child: dbus_c.DBusMessageIter = undefined;
+            dbus_c.dbus_message_iter_recurse(iter, &child);
+            pushDbusIterValue(lua_state, &child);
+        },
+        dbus_c.DBUS_TYPE_ARRAY, dbus_c.DBUS_TYPE_STRUCT, dbus_c.DBUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, iter),
+        else => c.lua_pushnil(lua_state),
+    }
+}
+
+fn pushDbusIterSequence(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+    c.lua_createtable(lua_state, 0, 0);
+    const table = c.lua_gettop(lua_state);
+    var child: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_recurse(iter, &child);
+    var index: c_int = 1;
+    while (dbus_c.dbus_message_iter_get_arg_type(&child) != dbus_c.DBUS_TYPE_INVALID) : (index += 1) {
+        pushDbusIterValue(lua_state, &child);
+        c.lua_rawseti(lua_state, table, index);
+        if (dbus_c.dbus_message_iter_next(&child) == 0) break;
+    }
 }
 
 fn pushProcessResult(lua_state: *c.lua_State, status: u32) void {
@@ -1981,11 +2817,11 @@ test "lua stateful widget set_state rebuilds retained subtree" {
         \\    self.count = 0
         \\  end,
         \\  build = function(self, state)
-        \\    return ui.clickable("counter", ui.text(tostring(self.count)), function()
+        \\    return ui.gesture({ id = "counter", child = ui.text(tostring(self.count)), on_tap = function()
         \\      self:set_state(function(s)
         \\        s.count = s.count + 1
         \\      end)
-        \\    end)
+        \\    end })
         \\  end,
         \\})
         \\local App = ui.stateful({
@@ -2036,7 +2872,7 @@ test "lua stateful widget dispose runs when removed" {
         \\    disposed = true
         \\  end,
         \\  build = function(self, state)
-        \\    return ui.clickable("remove", ui.text("remove"), self.props.on_remove)
+        \\    return ui.gesture({ id = "remove", child = ui.text("remove"), on_tap = self.props.on_remove })
         \\  end,
         \\})
         \\local App = ui.stateful({
@@ -2095,7 +2931,7 @@ test "lua stateful build context includes theme" {
         \\local ui = require("ui")
         \\local App = ui.stateful({
         \\  build = function(self, context)
-        \\    return ui.theme(context.theme, ui.label(context.theme.color_scheme))
+        \\    return ui.theme({ data = context.theme, child = ui.label(context.theme.color_scheme) })
         \\  end,
         \\})
         \\return App({ key = "app" })
@@ -2122,6 +2958,90 @@ test "lua stateful build context includes theme" {
 
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"dark\"") != null);
+}
+
+test "lua loop fs_event observes file changes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.txt", .data = "before\n" });
+    const watched_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "watched.txt" });
+    defer allocator.free(watched_path);
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\local ui = require("ui")
+        \\local keywork = require("keywork")
+        \\fs_event_seen = false
+        \\fs_event_path = ""
+        \\local App = ui.stateful({{
+        \\  init = function(self)
+        \\    self.watch = keywork.loop.fs_event({{ path = "{s}" }}, function(event)
+        \\      fs_event_seen = event.change
+        \\      fs_event_path = event.path
+        \\    end)
+        \\  end,
+        \\  dispose = function(self)
+        \\    if self.watch then
+        \\      self.watch:cancel()
+        \\    end
+        \\  end,
+        \\  build = function(self, state)
+        \\    return ui.text("fs_event")
+        \\  end,
+        \\}})
+        \\return App({{ key = "app" }})
+        \\
+    , .{watched_path});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try App.installEventSources(&app, &loop, &runtime);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.txt", .data = "after\n" });
+
+    const FsEventTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop: *keywork.event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "fs_event_seen");
+            const seen = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (seen or self.ticks > 1000) event_loop.quit();
+        }
+    };
+    var context: FsEventTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, FsEventTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "fs_event_seen");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    c.lua_getglobal(app.state, "fs_event_path");
+    defer pop(app.state, 1);
+    const path = try stringFromStack(app.state, -1);
+    try std.testing.expectEqualStrings(watched_path, path);
 }
 
 test "lua loop spawn captures stdout and exit" {

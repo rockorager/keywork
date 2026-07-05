@@ -100,6 +100,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     app_module.addImport("libkeywork", libkeywork_module);
+    app_module.addImport("dbus_c", dbus_c_module);
 
     const luajit_c = b.addTranslateC(.{
         .root_source_file = b.path("src/luajit_c.h"),

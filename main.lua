@@ -11,20 +11,26 @@ local App = ui.stateful({
         ui.text(size),
         ui.text("scheme: " .. state.color_scheme),
         ui.text("input: " .. state.input_text),
-        ui.text_input("demo-input", "Type here"),
-        ui.action_button("hello", "Press me", "hello"),
+        ui.text_input({ id = "demo-input", placeholder = "Type here" }),
+        ui.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
       },
     })
 
     return ui.padding({
       all = 24,
       child = ui.actions({
-        hello = function()
-          print("hello from Lua")
-        end,
-      }, ui.shortcuts({
-        enter = "hello",
-      }, content)),
+        bindings = {
+          hello = function()
+            print("hello from Lua")
+          end,
+        },
+        child = ui.shortcuts({
+          bindings = {
+            enter = "hello",
+          },
+          child = content,
+        }),
+      }),
     })
   end,
 })

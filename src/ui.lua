@@ -24,11 +24,49 @@ local dark_colors = {
   on_error = 0xff690005,
 }
 
-function ui.theme_for(state)
-  if state and state.color_scheme == "dark" then
-    return { color_scheme = "dark", colors = dark_colors, spacing = { xs = 4, sm = 8, md = 12, lg = 16 } }
+local default_spacing = { xs = 4, sm = 8, md = 12, lg = 16 }
+
+local function copy_table(value)
+  local result = {}
+  for key, child in pairs(value or {}) do
+    if type(child) == "table" then
+      result[key] = copy_table(child)
+    else
+      result[key] = child
+    end
   end
-  return { color_scheme = "light", colors = light_colors, spacing = { xs = 4, sm = 8, md = 12, lg = 16 } }
+  return result
+end
+
+local function merge_table(base, overrides)
+  local result = copy_table(base)
+  for key, value in pairs(overrides or {}) do
+    if type(value) == "table" and type(result[key]) == "table" then
+      result[key] = merge_table(result[key], value)
+    else
+      result[key] = value
+    end
+  end
+  return result
+end
+
+function ui.theme_data(options)
+  options = options or {}
+  local color_scheme = options.color_scheme or "light"
+  local base_colors = color_scheme == "dark" and dark_colors or light_colors
+  return {
+    color_scheme = color_scheme,
+    colors = merge_table(base_colors, options.colors),
+    text = merge_table({}, options.text),
+    button = merge_table({}, options.button),
+    input = merge_table({}, options.input),
+    spacing = merge_table(default_spacing, options.spacing),
+  }
+end
+
+function ui.theme_for(state)
+  local color_scheme = state and state.color_scheme or "light"
+  return ui.theme_data({ color_scheme = color_scheme })
 end
 
 function ui.text(value, style)
@@ -82,32 +120,33 @@ function ui.stateful(spec)
   end
 end
 
-function ui.theme(data, child)
+function ui.theme(options)
+  options = options or {}
   return {
     type = "theme",
-    theme = data,
-    child = child,
+    theme = options.data or options.theme,
+    child = options.child,
   }
 end
 
-function ui.default_text_style(style, child)
-  style = style or {}
+function ui.default_text_style(options)
+  options = options or {}
   return {
     type = "default_text_style",
-    color = style.color,
-    size = style.size,
-    font_size = style.font_size,
-    child = child,
+    color = options.color,
+    size = options.size,
+    font_size = options.font_size,
+    child = options.child,
   }
 end
 
-function ui.icon_theme(style, child)
-  style = style or {}
+function ui.icon_theme(options)
+  options = options or {}
   return {
     type = "icon_theme",
-    color = style.color,
-    size = style.size,
-    child = child,
+    color = options.color,
+    size = options.size,
+    child = options.child,
   }
 end
 
@@ -149,21 +188,6 @@ function ui.container(options, child)
   }, child)
 end
 
-function ui.clickable(id, child, on_click, options)
-  options = options or {}
-  return {
-    type = "clickable",
-    id = id,
-    child = child,
-    on_click = on_click,
-    activation = options.activation,
-  }
-end
-
-function ui.pressable(id, child, on_press)
-  return ui.clickable(id, child, on_press, { activation = "press" })
-end
-
 function ui.gesture(options)
   return {
     type = "gesture",
@@ -176,12 +200,12 @@ function ui.gesture(options)
   }
 end
 
-function ui.focus(id, child, options)
+function ui.focus(options)
   options = options or {}
   return {
     type = "focus",
-    id = id,
-    child = child,
+    id = options.id,
+    child = options.child,
     autofocus = options.autofocus or false,
     skip_traversal = options.skip_traversal or false,
     can_request_focus = options.can_request_focus ~= false,
@@ -189,21 +213,22 @@ function ui.focus(id, child, options)
   }
 end
 
-function ui.focus_scope(id, child, options)
+function ui.focus_scope(options)
   options = options or {}
   return {
     type = "focus_scope",
-    id = id,
-    child = child,
+    id = options.id,
+    child = options.child,
     modal = options.modal or false,
   }
 end
 
-function ui.text_input(id, placeholder)
+function ui.text_input(options)
+  options = options or {}
   return {
     type = "text_input",
-    id = id,
-    placeholder = placeholder,
+    id = options.id,
+    placeholder = options.placeholder,
   }
 end
 
@@ -251,27 +276,29 @@ function ui.spacer(flex)
   }
 end
 
-function ui.svg_icon(path, size, color)
+function ui.svg_icon(options)
+  options = options or {}
   return {
     type = "svg_icon",
-    path = path,
-    size = size,
-    color = color,
+    path = options.path,
+    size = options.size,
+    color = options.color,
   }
 end
 
-function ui.icon(name, size, color)
+function ui.icon(options)
+  options = options or {}
   return {
     type = "icon",
-    name = name,
-    size = size,
-    color = color,
+    name = options.name,
+    size = options.size,
+    color = options.color,
   }
 end
 
 function ui.icon_label(icon_name, text, options)
   options = options or {}
-  local children = { ui.icon(icon_name, options.size or 18, options.color) }
+  local children = { ui.icon({ name = icon_name, size = options.size or 18, color = options.color }) }
   if text and text ~= "" then
     table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
   end
@@ -308,7 +335,7 @@ function ui.chip(options)
       vertical_align = options.vertical_align,
       padding = options.padding or { x = 8, y = 4 },
     }, child),
-    on_tap = options.on_tap or options.on_pressed,
+    on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
     on_tap_cancel = options.on_tap_cancel,
@@ -324,7 +351,7 @@ function ui.icon_button(options)
     background = options.background,
     border = options.border,
     padding = options.padding or { all = 6 },
-    on_tap = options.on_tap or options.on_pressed,
+    on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
     on_tap_cancel = options.on_tap_cancel,
@@ -347,37 +374,41 @@ function ui.center(child)
   }
 end
 
-function ui.button(id, label, on_pressed)
+function ui.button(options)
+  options = options or {}
   return {
     type = "button",
-    id = id,
-    label = label,
-    on_pressed = on_pressed,
+    id = options.id,
+    label = options.label,
+    on_pressed = options.on_pressed,
   }
 end
 
-function ui.action_button(id, label, action_id)
+function ui.action_button(options)
+  options = options or {}
   return {
     type = "button",
-    id = id,
-    label = label,
-    action_id = action_id,
+    id = options.id,
+    label = options.label,
+    action_id = options.action_id,
   }
 end
 
-function ui.actions(bindings, child)
+function ui.actions(options)
+  options = options or {}
   return {
     type = "actions",
-    bindings = bindings,
-    child = child,
+    bindings = options.bindings,
+    child = options.child,
   }
 end
 
-function ui.shortcuts(bindings, child)
+function ui.shortcuts(options)
+  options = options or {}
   return {
     type = "shortcuts",
-    bindings = bindings,
-    child = child,
+    bindings = options.bindings,
+    child = options.child,
   }
 end
 

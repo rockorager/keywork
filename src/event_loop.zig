@@ -34,6 +34,7 @@ pub const EventLoop = struct {
         ctx: *anyopaque,
         callback: SourceCallback,
         active: bool = true,
+        destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
     };
 
     pub const WaylandSource = struct {
@@ -47,6 +48,7 @@ pub const EventLoop = struct {
         fd: i32,
         ctx: *anyopaque,
         callback: TimerCallback,
+        destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
 
         pub fn arm(self: *Timer, delay_ms: u64, interval_ms: u64) !void {
             const spec: linux.itimerspec = .{
@@ -63,7 +65,7 @@ pub const EventLoop = struct {
         }
     };
 
-    const FileWatch = struct {
+    pub const FileWatch = struct {
         fd: i32,
         wd: i32,
         path: [:0]u8,
@@ -103,9 +105,13 @@ pub const EventLoop = struct {
         self.file_watches.deinit(self.allocator);
         for (self.timers.items) |timer| {
             _ = linux.close(timer.fd);
+            if (timer.destroy_ctx) |destroy| destroy(self.allocator, timer.ctx);
             self.allocator.destroy(timer);
         }
         self.timers.deinit(self.allocator);
+        for (self.sources.items) |source| {
+            if (source.destroy_ctx) |destroy| destroy(self.allocator, source.ctx);
+        }
         self.sources.deinit(self.allocator);
         _ = linux.close(self.wake_fd);
         _ = linux.close(self.epoll_fd);
@@ -156,7 +162,7 @@ pub const EventLoop = struct {
         try timer.arm(interval_ms, interval_ms);
     }
 
-    pub fn addFileWatch(self: *EventLoop, path: []const u8, ctx: *anyopaque, callback: FileWatchCallback) !void {
+    pub fn addFileWatch(self: *EventLoop, path: []const u8, ctx: *anyopaque, callback: FileWatchCallback) !*FileWatch {
         const path_z = try self.allocator.dupeZ(u8, path);
         errdefer self.allocator.free(path_z);
 
@@ -190,6 +196,21 @@ pub const EventLoop = struct {
         errdefer _ = self.sources.pop();
 
         try self.file_watches.append(self.allocator, watch);
+        return watch;
+    }
+
+    pub fn removeFileWatch(self: *EventLoop, watch: *FileWatch) void {
+        self.removeFd(watch.fd);
+        _ = linux.inotify_rm_watch(watch.fd, watch.wd);
+        _ = linux.close(watch.fd);
+        for (self.file_watches.items, 0..) |item, index| {
+            if (item == watch) {
+                _ = self.file_watches.swapRemove(index);
+                break;
+            }
+        }
+        self.allocator.free(watch.path);
+        self.allocator.destroy(watch);
     }
 
     pub fn setWayland(self: *EventLoop, source: WaylandSource) !void {
@@ -420,7 +441,7 @@ test "file watch fires and can quit the loop" {
     defer loop.deinit();
 
     var context: FileWatchTest = .{};
-    try loop.addFileWatch(watched_path, &context, FileWatchTest.callback);
+    _ = try loop.addFileWatch(watched_path, &context, FileWatchTest.callback);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.lua", .data = "return 2\n" });
     try loop.run();
 

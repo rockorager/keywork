@@ -6,9 +6,12 @@
 
 struct app_state {
     unsigned count;
+    keywork_runtime_t *runtime;
 };
 
 static void increment(void *userdata);
+static int install_event_sources(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime);
+static int tick(void *userdata, keywork_event_loop_t *loop, uint64_t expirations);
 static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints);
 static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
 static void *status_create_state(void *userdata);
@@ -60,6 +63,22 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
 static void increment(void *userdata) {
     struct app_state *state = userdata;
     state->count += 1;
+    if (state->runtime != NULL) keywork_runtime_invalidate_state(state->runtime);
+}
+
+static int install_event_sources(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime) {
+    struct app_state *state = userdata;
+    state->runtime = runtime;
+    keywork_timer_t *timer = keywork_loop_add_timer(loop, tick, state);
+    if (timer == NULL) return 0;
+    return keywork_timer_arm(timer, 1000, 1000);
+}
+
+static int tick(void *userdata, keywork_event_loop_t *loop, uint64_t expirations) {
+    (void)loop;
+    struct app_state *state = userdata;
+    state->count += (unsigned)expirations;
+    return keywork_runtime_invalidate_state(state->runtime);
 }
 
 static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints) {
@@ -125,9 +144,10 @@ static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, con
 }
 
 int main(void) {
-    struct app_state state = {0};
+    struct app_state state = {0, NULL};
     const struct keywork_app_vtable app = {
         .build = build,
+        .install_event_sources = install_event_sources,
     };
     const struct keywork_run_options options = {
         .title = "Keywork C app example",

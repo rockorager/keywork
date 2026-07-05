@@ -37,6 +37,16 @@ enum keywork_layer_shell_keyboard_interactivity {
 typedef struct keywork_build keywork_build_t;
 typedef struct keywork_widget keywork_widget_t;
 typedef struct keywork_display_list keywork_display_list_t;
+typedef struct keywork_event_loop keywork_event_loop_t;
+typedef struct keywork_runtime keywork_runtime_t;
+typedef struct keywork_timer keywork_timer_t;
+
+enum keywork_loop_event {
+    KEYWORK_LOOP_READ = 1 << 0,
+    KEYWORK_LOOP_WRITE = 1 << 1,
+    KEYWORK_LOOP_HANGUP = 1 << 2,
+    KEYWORK_LOOP_ERROR = 1 << 3,
+};
 
 struct keywork_size {
     float width;
@@ -62,11 +72,15 @@ struct keywork_context {
     const char *color_scheme;
 };
 
+typedef void (*keywork_click_callback_t)(void *userdata);
+typedef int (*keywork_install_event_sources_callback_t)(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime);
+typedef int (*keywork_fd_callback_t)(void *userdata, keywork_event_loop_t *loop, uint32_t events);
+typedef int (*keywork_timer_callback_t)(void *userdata, keywork_event_loop_t *loop, uint64_t expirations);
+
 struct keywork_app_vtable {
     keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
+    keywork_install_event_sources_callback_t install_event_sources;
 };
-
-typedef void (*keywork_click_callback_t)(void *userdata);
 
 struct keywork_render_object_vtable {
     struct keywork_size (*layout)(void *userdata, struct keywork_constraints constraints);
@@ -127,6 +141,15 @@ struct keywork_run_text_options {
 
 int keywork_run_app(const struct keywork_run_options *options, const struct keywork_app_vtable *vtable, void *userdata);
 int keywork_run_text(const struct keywork_run_text_options *options);
+
+int keywork_loop_add_fd(keywork_event_loop_t *loop, int fd, uint32_t events, keywork_fd_callback_t callback, void *userdata);
+void keywork_loop_remove_fd(keywork_event_loop_t *loop, int fd);
+keywork_timer_t *keywork_loop_add_timer(keywork_event_loop_t *loop, keywork_timer_callback_t callback, void *userdata);
+int keywork_timer_arm(keywork_timer_t *timer, uint64_t delay_ms, uint64_t interval_ms);
+void keywork_timer_disarm(keywork_timer_t *timer);
+int keywork_runtime_invalidate(keywork_runtime_t *runtime);
+int keywork_runtime_invalidate_state(keywork_runtime_t *runtime);
+void keywork_loop_quit(keywork_event_loop_t *loop);
 
 keywork_widget_t *keywork_text(keywork_build_t *build, const char *value);
 keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value, uint32_t argb);

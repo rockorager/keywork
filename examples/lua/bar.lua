@@ -33,6 +33,11 @@ local function trim(value)
   return trimmed
 end
 
+local function seconds_until_next_minute()
+  local now = os.date("*t")
+  return 60 - now.sec
+end
+
 local function le32(value)
   return string.char(
     bit.band(value, 0xff),
@@ -206,11 +211,14 @@ end
 
 local function status_pill(palette, id, icon_name, text, color, options)
   options = options or {}
-  local child = ui.icon_theme({ color = color, size = options.icon_size or 16 },
-    ui.default_text_style({ color = color },
-      ui.icon_label(icon_name, text, { size = options.icon_size or 16 })
-    )
-  )
+  local child = ui.icon_theme({
+    color = color,
+    size = options.icon_size or 16,
+    child = ui.default_text_style({
+      color = color,
+      child = ui.icon_label(icon_name, text, { size = options.icon_size or 16 }),
+    }),
+  })
   return ui.chip({
     id = id,
     child = child,
@@ -240,7 +248,7 @@ local function workspaces(palette, sway)
     end
     table.insert(items, ui.chip({
       id = "workspace-" .. name,
-      child = ui.default_text_style({ color = fg }, ui.label(name)),
+      child = ui.default_text_style({ color = fg, child = ui.label(name) }),
       background = bg,
       radius = 9,
       min_height = 30,
@@ -278,10 +286,17 @@ local function volume_status_from_output(palette, output)
 end
 
 local function network_status_from_output(palette, output)
-  local operstate, essid, quality = output:match("^([^\n]*)\n([^\n]*)\n([^\n]*)")
-  operstate = trim(operstate or "down")
-  essid = trim(essid or "")
-  local percent = math.max(0, math.min(100, tonumber(quality) or 0))
+  local lines = {}
+  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+    table.insert(lines, line)
+  end
+  local operstate = trim(lines[1] or "down")
+  local essid = trim(lines[2] or "")
+  local percent = tonumber(lines[3])
+  if not percent and operstate == "up" then
+    percent = essid ~= "" and 70 or 50
+  end
+  percent = math.max(0, math.min(100, percent or 0))
   local name = "network-wireless-offline"
   local color = palette.error
   if operstate == "up" then
@@ -301,13 +316,44 @@ local function network_status_from_output(palette, output)
   return status_pill(palette, "network", name, nil, color)
 end
 
-local function battery_status_from_output(palette, output)
-  local capacity_text, status = output:match("^([^\n]*)\n([^\n]*)")
-  if not capacity_text then
+local UPOWER = "org.freedesktop.UPower"
+local UPOWER_DEVICE = "org.freedesktop.UPower.Device"
+local DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
+
+local function dbus_entries_to_table(entries)
+  local result = {}
+  for _, entry in ipairs(entries or {}) do
+    if type(entry) == "table" and entry[1] ~= nil then
+      result[entry[1]] = entry[2]
+    end
+  end
+  return result
+end
+
+local function upower_state_name(state)
+  if state == 1 then
+    return "Charging"
+  elseif state == 2 then
+    return "Discharging"
+  elseif state == 4 then
+    return "Full"
+  elseif state == 5 then
+    return "Pending charge"
+  elseif state == 6 then
+    return "Pending discharge"
+  end
+  return "Unknown"
+end
+
+local function battery_status_from_values(palette, percentage, state, line_power_online)
+  if not percentage then
     return status_pill(palette, "battery", "battery-level-0", "", palette.muted, { icon_size = 14 })
   end
-  local capacity = tonumber(trim(capacity_text)) or 0
-  status = trim(status or "Unknown")
+  local capacity = math.max(0, math.min(100, math.floor(percentage + 0.5)))
+  local status = upower_state_name(state)
+  if line_power_online and status ~= "Full" then
+    status = "Charging"
+  end
   local level = math.floor(capacity / 10) * 10
   if capacity > 0 and level == 0 then
     level = 10
@@ -344,11 +390,16 @@ local StatusItems = ui.stateful({
     self.volume = status_pill(palette, "volume", "audio-volume-muted", nil, palette.muted)
     self.network = status_pill(palette, "network", "network-wireless-offline", nil, palette.error)
     self.battery = status_pill(palette, "battery", "battery-level-0", "", palette.muted, { icon_size = 14 })
-    self.time = os.date("%a %b %d  %I:%M %p")
-    self:update_status()
-    self.timer = keywork.loop.timer({ interval = 1.0 }, function()
+    self:update_time()
+    self:update_volume()
+    self:update_network()
+    self:watch_volume()
+    self:watch_network()
+    self:watch_battery()
+    self:update_battery()
+    self.timer = keywork.loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
       self:set_state(function(state)
-        state:update_status()
+        state:update_time()
       end)
     end)
   end,
@@ -360,18 +411,33 @@ local StatusItems = ui.stateful({
     if self.volume_proc then
       self.volume_proc:cancel()
     end
+    if self.volume_sub then
+      self.volume_sub:cancel()
+    end
     if self.network_proc then
       self.network_proc:cancel()
     end
-    if self.battery_proc then
-      self.battery_proc:cancel()
+    if self.network_sub then
+      self.network_sub:cancel()
+    end
+    if self.network_bus then
+      self.network_bus:close()
+    end
+    if self.battery_sub then
+      self.battery_sub:cancel()
+    end
+    if self.battery_bus then
+      self.battery_bus:close()
     end
   end,
 
-  update_status = function(self)
+  update_time = function(self)
+    self.time = os.date("%a %b %d  %I:%M %p")
+  end,
+
+  update_volume = function(self)
     local palette = self.props.colors
     self.colors = palette
-    self.time = os.date("%a %b %d  %I:%M %p")
 
     if not self.volume_proc then
       self.volume_proc = capture({ "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@" }, function(result)
@@ -381,9 +447,56 @@ local StatusItems = ui.stateful({
             state.volume = volume_status_from_output(state.props.colors, result.stdout)
           end)
         end
+        if self.volume_dirty then
+          self.volume_dirty = false
+          self:update_volume()
+        end
       end)
     end
 
+  end,
+
+  watch_volume = function(self)
+    if self.volume_sub then
+      return
+    end
+
+    local buffer = ""
+    self.volume_sub = keywork.loop.spawn({
+      argv = { "pactl", "subscribe" },
+      stdout = "pipe",
+      stderr = "pipe",
+    }, {
+      stdout = function(chunk)
+        buffer = buffer .. chunk
+        while true do
+          local newline = buffer:find("\n", 1, true)
+          if not newline then
+            break
+          end
+          local line = buffer:sub(1, newline - 1)
+          buffer = buffer:sub(newline + 1)
+          if line:find("sink", 1, true) or line:find("server", 1, true) then
+            self:set_state(function(state)
+              if state.volume_proc then
+                state.volume_dirty = true
+              else
+                state:update_volume()
+              end
+            end)
+          end
+        end
+      end,
+      exit = function(result)
+        self.volume_sub = nil
+        if not result.ok then
+          keywork.log.warn("volume subscribe exited")
+        end
+      end,
+    })
+  end,
+
+  update_network = function(self)
     if not self.network_proc then
       self.network_proc = capture({ "sh", "-c", [[
 iface=$(ls /sys/class/net 2>/dev/null | grep -E '^wl|^wlan' | head -n1)
@@ -391,9 +504,10 @@ if [ -z "$iface" ]; then
   printf 'down\n\n0\n'
   exit 0
 fi
-cat "/sys/class/net/$iface/operstate" 2>/dev/null
-iwgetid -r 2>/dev/null
-awk -v iface="$iface:" '$1 == iface { printf "%d\n", ($3 * 100 / 70 + 0.5) }' /proc/net/wireless 2>/dev/null
+operstate=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || printf 'down')
+essid=$(iwgetid -r 2>/dev/null || true)
+quality=$(awk -v iface="$iface:" '$1 == iface { printf "%d", ($3 * 100 / 70 + 0.5) }' /proc/net/wireless 2>/dev/null)
+printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
 ]] }, function(result)
         self.network_proc = nil
         if result.ok then
@@ -403,28 +517,149 @@ awk -v iface="$iface:" '$1 == iface { printf "%d\n", ($3 * 100 / 70 + 0.5) }' /p
         end
       end)
     end
+  end,
 
-    if not self.battery_proc then
-      self.battery_proc = capture({ "sh", "-c", [[
-battery=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1)
-if [ -n "$battery" ]; then
-  cat "$battery/capacity" 2>/dev/null
-  cat "$battery/status" 2>/dev/null
-fi
-]] }, function(result)
-        self.battery_proc = nil
-        if result.ok then
-          self:set_state(function(state)
-            state.battery = battery_status_from_output(state.props.colors, result.stdout)
-          end)
-        end
+  watch_network = function(self)
+    if self.network_bus or self.network_sub then
+      return
+    end
+    local ok, bus = pcall(function()
+      return keywork.dbus.system()
+    end)
+    if not ok or not bus then
+      return
+    end
+    self.network_bus = bus
+    self.network_sub = bus:subscribe({
+      path_namespace = "/org/freedesktop/NetworkManager",
+    }, function(signal)
+      if signal.member == "PropertiesChanged"
+        or signal.member == "StateChanged"
+        or signal.member == "DeviceAdded"
+        or signal.member == "DeviceRemoved" then
+        self:set_state(function(state)
+          state:update_network()
+        end)
+      end
+    end)
+  end,
+
+  read_upower_properties = function(self, path)
+    self.battery_bus:call({
+      destination = UPOWER,
+      path = path,
+      interface = DBUS_PROPERTIES,
+      member = "GetAll",
+      args = { UPOWER_DEVICE },
+      timeout_ms = 1000,
+    }, function(reply, err)
+      if not reply then
+        keywork.log.warn("battery dbus properties failed", err or path)
+        return
+      end
+      self:set_state(function(state)
+        state:apply_battery_properties(path, dbus_entries_to_table((reply.args or {})[1]))
+        state:update_battery_widget()
       end)
+    end)
+  end,
+
+  apply_battery_properties = function(self, path, props)
+    local is_battery = path == "/org/freedesktop/UPower/devices/DisplayDevice"
+      or tostring(path):find("/battery_", 1, true) ~= nil
+      or props.Type == 2
+    local is_line_power = props.Type == 1 or props.Online ~= nil
+
+    if is_line_power and props.Online ~= nil then
+      self.line_power_online = props.Online
+    end
+    if is_battery then
+      if props.Percentage ~= nil then
+        self.battery_percentage = props.Percentage
+      end
+      if props.State ~= nil then
+        self.battery_state = props.State
+      end
+    end
+  end,
+
+  update_battery_widget = function(self)
+    self.battery = battery_status_from_values(
+      self.props.colors,
+      self.battery_percentage,
+      self.battery_state,
+      self.line_power_online
+    )
+  end,
+
+  update_battery = function(self)
+    if not self.battery_bus then
+      return
+    end
+    self:read_upower_properties("/org/freedesktop/UPower/devices/DisplayDevice")
+    self.battery_bus:call({
+      destination = UPOWER,
+      path = "/org/freedesktop/UPower",
+      interface = UPOWER,
+      member = "EnumerateDevices",
+      timeout_ms = 1000,
+    }, function(reply, err)
+      if not reply then
+        keywork.log.warn("battery dbus enumerate failed", err or "unknown")
+        return
+      end
+      for _, path in ipairs((reply.args or {})[1] or {}) do
+        self:read_upower_properties(path)
+      end
+    end)
+  end,
+
+  apply_battery_signal = function(self, signal)
+    if signal.member == "PropertiesChanged" and (signal.args or {})[1] == UPOWER_DEVICE then
+      self:apply_battery_properties(signal.path or "", dbus_entries_to_table(signal.args[2]))
+      self:update_battery_widget()
+    elseif signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" or signal.member == "Changed" then
+      self:update_battery()
+    end
+  end,
+
+  watch_battery = function(self)
+    if self.battery_bus or self.battery_sub then
+      return
+    end
+    local ok, bus = pcall(function()
+      return keywork.dbus.system()
+    end)
+    if ok and bus then
+      self.battery_bus = bus
+      local sub_ok, sub = pcall(function()
+        return bus:subscribe({
+          path_namespace = "/org/freedesktop/UPower",
+        }, function(signal)
+          if signal.member == "PropertiesChanged" or signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" or signal.member == "Changed" then
+            self:set_state(function(state)
+              state:apply_battery_signal(signal)
+            end)
+          end
+        end)
+      end)
+      if sub_ok then
+        self.battery_sub = sub
+      else
+        keywork.log.warn("battery dbus subscribe failed")
+        self.battery_bus:close()
+        self.battery_bus = nil
+      end
+    else
+      keywork.log.warn("battery dbus unavailable")
     end
   end,
 
   update = function(self)
     if self.colors ~= self.props.colors then
-      self:update_status()
+      self:update_volume()
+      self:update_network()
+      self:update_battery_widget()
     end
   end,
 
@@ -477,24 +712,27 @@ local App = ui.stateful({
           spacing = 6,
           align = "center",
           children = {
-            ui.svg_icon("examples/lua/icons/bolt.svg", 16, palette.accent),
+            ui.svg_icon({ path = "examples/lua/icons/bolt.svg", size = 16, color = palette.accent }),
             label("Keywork", palette),
           },
         }),
       },
     })
 
-    return ui.theme(theme, ui.container({ background = palette.background, padding = { all = 4 } },
-      ui.row({
-        spacing = 12,
-        align = "center",
-        children = {
-          left,
-          ui.spacer(),
-          StatusItems({ key = "status", colors = palette }),
-        },
-      })
-    ))
+    return ui.theme({
+      data = theme,
+      child = ui.container({ background = palette.background, padding = { all = 4 } },
+        ui.row({
+          spacing = 12,
+          align = "center",
+          children = {
+            left,
+            ui.spacer(),
+            StatusItems({ key = "status", colors = palette }),
+          },
+        })
+      ),
+    })
   end,
 })
 
