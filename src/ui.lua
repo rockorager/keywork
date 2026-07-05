@@ -37,12 +37,15 @@ function ui.text(value, style)
     type = "text",
     value = value,
     color = style.color,
+    size = style.size,
+    font_size = style.font_size,
+    role = style.role,
   }
 end
 
 function ui.label(value, options)
   options = options or {}
-  return ui.text(value, { color = options.color })
+  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, role = options.role or "label" })
 end
 
 function ui.keyed(key, child)
@@ -248,7 +251,7 @@ function ui.icon_label(icon_name, text, options)
   options = options or {}
   local children = { ui.icon(icon_name, options.size or 18, options.color) }
   if text and text ~= "" then
-    table.insert(children, ui.label(text, { color = options.color }))
+    table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
   end
   return ui.row({ gap = options.gap or 6, align = options.align or "center", children = children })
 end
@@ -260,10 +263,13 @@ function ui.chip(options)
       child = ui.icon_label(options.icon, options.label, {
         size = options.icon_size or options.size,
         color = options.color,
+        label_size = options.label_size,
+        font_size = options.font_size,
+        role = options.role,
         gap = options.gap,
       })
     else
-      child = ui.label(options.label or "", { color = options.color })
+      child = ui.label(options.label or "", { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role })
     end
   end
   return ui.gesture({

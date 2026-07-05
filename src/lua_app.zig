@@ -14,6 +14,13 @@ const app_registry_key = "keywork.app";
 
 const TextOptions = struct {
     color: ?keywork.Color = null,
+    size: ?f32 = null,
+    font_size: ?f32 = null,
+    role: ?keywork.TextRole = null,
+
+    fn resolvedFontSize(self: TextOptions) ?f32 {
+        return self.font_size orelse self.size;
+    }
 };
 
 const BoxOptions = struct {
@@ -580,7 +587,7 @@ fn parseWidget(
     if (std.mem.eql(u8, kind, "text")) {
         const value = try dupeStringField(lua_state, allocator, table, "value");
         const options = try lua_codec.decode(TextOptions, lua_state, table, allocator);
-        return .{ .text = .{ .value = value, .color = options.color } };
+        return .{ .text = .{ .value = value, .color = options.color, .font_size = options.resolvedFontSize(), .role = options.role orelse .body } };
     }
     if (std.mem.eql(u8, kind, "keyed")) {
         const key = try dupeStringField(lua_state, allocator, table, "key");
@@ -1013,9 +1020,28 @@ fn parseTextTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.Tex
     if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
     const text_table = c.lua_gettop(lua_state);
     var result = base;
-    result.body.color = getOptionalColorField(lua_state, text_table, "body") orelse result.body.color;
-    result.label.color = getOptionalColorField(lua_state, text_table, "label") orelse result.label.color;
+    result.body = parseTextStyleField(lua_state, text_table, "body", result.body);
+    result.label = parseTextStyleField(lua_state, text_table, "label", result.label);
+    result.title = parseTextStyleField(lua_state, text_table, "title", result.title);
     return result;
+}
+
+fn parseTextStyleField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, base: keywork.TextStyle) keywork.TextStyle {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return base;
+    if (c.lua_isnumber(lua_state, -1) != 0) {
+        var result = base;
+        result.color = colorFromStack(lua_state, -1) catch result.color;
+        return result;
+    }
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+
+    const options = lua_codec.decode(TextOptions, lua_state, -1, std.heap.page_allocator) catch return base;
+    return .{
+        .color = options.color orelse base.color,
+        .font_size = options.resolvedFontSize() orelse base.font_size,
+    };
 }
 
 fn parseButtonTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.ButtonTheme) keywork.ButtonTheme {
@@ -1099,18 +1125,19 @@ fn focusChangeCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allo
 fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
-    if (c.lua_isnumber(lua_state, -1) == 0) return default;
-    const value = c.lua_tonumber(lua_state, -1);
-    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return default;
-    return @bitCast(@as(u32, @intFromFloat(value)));
+    return colorFromStack(lua_state, -1) catch default;
 }
 
 fn getOptionalColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?keywork.Color {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
-    if (c.lua_isnumber(lua_state, -1) == 0) return null;
-    const value = c.lua_tonumber(lua_state, -1);
-    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return null;
+    return colorFromStack(lua_state, -1) catch null;
+}
+
+fn colorFromStack(lua_state: *c.lua_State, index: c_int) !keywork.Color {
+    if (c.lua_isnumber(lua_state, index) == 0) return error.ExpectedLuaNumber;
+    const value = c.lua_tonumber(lua_state, index);
+    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidLuaColor;
     return @bitCast(@as(u32, @intFromFloat(value)));
 }
 

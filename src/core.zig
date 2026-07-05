@@ -68,11 +68,24 @@ pub const ColorScheme = struct {
 
 pub const TextStyle = struct {
     color: ?Color = null,
+    font_size: ?f32 = null,
+};
+
+pub const ResolvedTextStyle = struct {
+    color: Color,
+    font_size: f32,
+};
+
+pub const TextRole = enum {
+    body,
+    label,
+    title,
 };
 
 pub const TextTheme = struct {
-    body: TextStyle = .{},
-    label: TextStyle = .{},
+    body: TextStyle = .{ .font_size = 16 },
+    label: TextStyle = .{ .font_size = 14 },
+    title: TextStyle = .{ .font_size = 20 },
 };
 
 pub const ButtonTheme = struct {
@@ -313,6 +326,8 @@ pub const Widget = union(enum) {
     pub const Text = struct {
         value: []const u8,
         color: ?Color = null,
+        font_size: ?f32 = null,
+        role: TextRole = .body,
     };
 
     pub const Button = struct {
@@ -832,7 +847,7 @@ fn buildButtonWidget(
     const hovered = enabled and interaction.isHovered(button_widget.id);
     const pressed = enabled and interaction.isPressed(button_widget.id);
     const focused = enabled and interaction.isFocused(.named(button_widget.id));
-    const label = widgets.coloredText(button_widget.label, buttonForeground(theme, enabled, hovered));
+    const label: Widget = .{ .text = .{ .value = button_widget.label, .color = buttonForeground(theme, enabled, hovered), .role = .label } };
     const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
     const background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
     const surface = try widgets.borderedBox(allocator, padded, background, if (focused) buttonFocusedBorder(theme) else null);
@@ -845,8 +860,24 @@ fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
     return .{ .ptr = callback.ptr, .call_fn = callback.call_fn };
 }
 
-fn textColor(theme: Theme) Color {
-    return theme.text_theme.body.color orelse theme.color_scheme.on_surface;
+fn defaultResolvedTextStyle() ResolvedTextStyle {
+    return .{ .color = colors.ink, .font_size = 16 };
+}
+
+fn roleTextStyle(theme: Theme, role: TextRole) TextStyle {
+    return switch (role) {
+        .body => theme.text_theme.body,
+        .label => theme.text_theme.label,
+        .title => theme.text_theme.title,
+    };
+}
+
+fn resolveTextStyle(theme: Theme, text_widget: Widget.Text) ResolvedTextStyle {
+    const role_style = roleTextStyle(theme, text_widget.role);
+    return .{
+        .color = text_widget.color orelse role_style.color orelse theme.color_scheme.on_surface,
+        .font_size = text_widget.font_size orelse role_style.font_size orelse 16,
+    };
 }
 
 fn buttonBackground(theme: Theme, hovered: bool) Color {
@@ -903,6 +934,7 @@ pub const RenderNode = struct {
     kind: Kind,
     rect: Rect,
     text: ?[]const u8 = null,
+    text_style: ResolvedTextStyle = defaultResolvedTextStyle(),
     clickable_id: ?[]const u8 = null,
     click_callback: ?Widget.Callback = null,
     tap_down_callback: ?Widget.Callback = null,
@@ -969,7 +1001,7 @@ pub const PaintCommand = union(enum) {
     pub const TextRun = struct {
         origin: Point,
         value: []const u8,
-        color: Color,
+        style: ResolvedTextStyle,
     };
 
     pub const AlphaImage = struct {
@@ -1006,8 +1038,8 @@ pub const DisplayList = struct {
         try self.commands.append(allocator, .{ .fill_rect = .{ .rect = rect, .color = color } });
     }
 
-    pub fn text(self: *DisplayList, allocator: std.mem.Allocator, origin: Point, value: []const u8, color: Color) !void {
-        try self.commands.append(allocator, .{ .text = .{ .origin = origin, .value = value, .color = color } });
+    pub fn text(self: *DisplayList, allocator: std.mem.Allocator, origin: Point, value: []const u8, style: ResolvedTextStyle) !void {
+        try self.commands.append(allocator, .{ .text = .{ .origin = origin, .value = value, .style = style } });
     }
 
     pub fn alphaImage(
@@ -1038,7 +1070,7 @@ pub const RenderBackend = struct {
 
     pub const VTable = struct {
         present: *const fn (ptr: *anyopaque, frame: Frame) anyerror!bool,
-        measure_text: *const fn (ptr: *anyopaque, value: []const u8) anyerror!Size,
+        measure_text: *const fn (ptr: *anyopaque, value: []const u8, style: ResolvedTextStyle) anyerror!Size,
         scale: *const fn (ptr: *anyopaque) f32,
     };
 
@@ -1053,8 +1085,8 @@ pub const RenderBackend = struct {
         return self.vtable.present(self.ptr, frame);
     }
 
-    pub fn measureText(self: RenderBackend, value: []const u8) !Size {
-        return self.vtable.measure_text(self.ptr, value);
+    pub fn measureText(self: RenderBackend, value: []const u8, style: ResolvedTextStyle) !Size {
+        return self.vtable.measure_text(self.ptr, value, style);
     }
 
     pub fn scale(self: RenderBackend) f32 {
@@ -1066,10 +1098,10 @@ pub const TextMeasurer = union(enum) {
     fixed,
     backend: RenderBackend,
 
-    pub fn measureText(self: TextMeasurer, value: []const u8) !Size {
+    pub fn measureText(self: TextMeasurer, value: []const u8, style: ResolvedTextStyle) !Size {
         return switch (self) {
-            .fixed => fixedMeasureText(value),
-            .backend => |backend| backend.measureText(value),
+            .fixed => fixedMeasureText(value, style),
+            .backend => |backend| backend.measureText(value, style),
         };
     }
 };
@@ -1096,8 +1128,8 @@ pub const LogBackend = struct {
                     .{ fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height, @as(u32, @bitCast(fill.color)) },
                 ),
                 .text => |run| try self.writer.print(
-                    "text x={d} y={d} value=\"{s}\" color=#{x:0>8}\n",
-                    .{ run.origin.x, run.origin.y, run.value, @as(u32, @bitCast(run.color)) },
+                    "text x={d} y={d} value=\"{s}\" color=#{x:0>8} size={d}\n",
+                    .{ run.origin.x, run.origin.y, run.value, @as(u32, @bitCast(run.style.color)), run.style.font_size },
                 ),
                 .alpha_image => |image| try self.writer.print(
                     "alpha_image x={d} y={d} w={d} h={d} pixels={d}x{d} color=#{x:0>8}\n",
@@ -1108,8 +1140,8 @@ pub const LogBackend = struct {
         return false;
     }
 
-    fn measureText(_: *anyopaque, value: []const u8) !Size {
-        return fixedMeasureText(value);
+    fn measureText(_: *anyopaque, value: []const u8, style: ResolvedTextStyle) !Size {
+        return fixedMeasureText(value, style);
     }
 
     fn scale(_: *anyopaque) f32 {
@@ -1117,8 +1149,7 @@ pub const LogBackend = struct {
     }
 };
 
-const text_height = 16;
-const text_width = 8;
+const text_width_ratio = 0.5;
 const input_horizontal_padding = 10;
 const input_vertical_padding = 8;
 const input_min_width = 220;
@@ -2000,7 +2031,9 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
     var result = try cloneWidgetForElement(allocator, widget);
     switch (result) {
         .text => |*text_widget| {
-            if (text_widget.color == null) text_widget.color = textColor(theme);
+            const style = resolveTextStyle(theme, text_widget.*);
+            text_widget.color = style.color;
+            text_widget.font_size = style.font_size;
         },
         .text_input => |*input_widget| {
             input_widget.foreground = inputForeground(theme);
@@ -2023,6 +2056,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .text => |text_widget| .{ .text = .{
             .value = try allocator.dupe(u8, text_widget.value),
             .color = text_widget.color,
+            .font_size = text_widget.font_size,
+            .role = text_widget.role,
         } },
         .spacer => |spacer_widget| .{ .spacer = spacer_widget },
         .sized => |sized_widget| .{ .sized = sized_widget },
@@ -2281,7 +2316,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             try display_list.text(allocator, .{
                 .x = node.rect.x + input_horizontal_padding,
                 .y = node.rect.y + input_vertical_padding,
-            }, visible_text, text_color);
+            }, visible_text, .{ .color = text_color, .font_size = node.text_style.font_size });
             if (node.focused) {
                 const caret_x = node.caret_x orelse node.rect.x + input_horizontal_padding;
                 try display_list.fillRect(allocator, .{
@@ -2293,7 +2328,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             }
         },
         .text => if (node.text) |value| {
-            try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.foreground);
+            try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
         else => {},
     }
@@ -2709,13 +2744,15 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             };
         },
         .text => |text_widget| {
-            const measured = try measurer.measureText(text_widget.value);
+            const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
+            const measured = try measurer.measureText(text_widget.value, style);
             const size_value = constraints.clamp(measured);
             return .{
                 .kind = .text,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = try allocator.dupe(u8, text_widget.value),
-                .foreground = text_widget.color orelse colors.ink,
+                .text_style = style,
+                .foreground = style.color,
             };
         },
         .spacer => return .{
@@ -2835,8 +2872,9 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             errdefer allocator.free(placeholder);
             const text_value = if (input_widget.value.len > 0) input_widget.value else input_widget.placeholder;
-            const measured = try measurer.measureText(text_value);
-            const value_size = try measurer.measureText(input_widget.value);
+            const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
+            const measured = try measurer.measureText(text_value, style);
+            const value_size = try measurer.measureText(input_widget.value, style);
             const requested = Size{
                 .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, constraints.max_width)),
                 .height = measured.height + input_vertical_padding * 2,
@@ -2848,6 +2886,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .text = value,
                 .text_input_id = id,
                 .focus_id = focus_id,
+                .text_style = style,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .placeholder = placeholder,
@@ -3154,8 +3193,8 @@ fn alignedOffset(alignment: Widget.Alignment, outer: f32, inner: f32) f32 {
     };
 }
 
-fn fixedMeasureText(value: []const u8) Size {
-    return .{ .width = @as(f32, @floatFromInt(value.len)) * text_width, .height = text_height };
+fn fixedMeasureText(value: []const u8, style: ResolvedTextStyle) Size {
+    return .{ .width = @as(f32, @floatFromInt(value.len)) * style.font_size * text_width_ratio, .height = style.font_size };
 }
 
 fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
@@ -3258,6 +3297,33 @@ test "row centers children on the cross axis" {
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
     try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
+}
+
+test "text role resolves themed font size for layout and paint" {
+    const allocator = std.testing.allocator;
+
+    const label: Widget = .{ .text = .{ .value = "Hi", .role = .label } };
+    const themed: Widget = .{ .theme = .{
+        .theme = .{ .color_scheme = .light, .text_theme = .{ .label = .{ .color = colors.accent, .font_size = 22 } } },
+        .child = &label,
+    } };
+
+    var root = try buildRenderTree(allocator, &themed, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(allocator, &root);
+
+    const text_node = root.children[0];
+    try std.testing.expectEqual(@as(f32, 22), text_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 22), text_node.text_style.font_size);
+    try std.testing.expectEqual(colors.accent, text_node.text_style.color);
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(allocator);
+    try paint(allocator, &root, &display_list);
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    try std.testing.expect(display_list.commands.items[0] == .text);
+    try std.testing.expectEqual(@as(f32, 22), display_list.commands.items[0].text.style.font_size);
+    try std.testing.expectEqual(colors.accent, display_list.commands.items[0].text.style.color);
 }
 
 test "linear element clone preserves cross-axis alignment" {

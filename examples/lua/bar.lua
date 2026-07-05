@@ -271,7 +271,7 @@ local function workspaces()
       radius = 9,
       min_height = 30,
       align = "center",
-      padding = { x = 8 },
+      padding = { x = 12 },
       on_tap_down = function()
         if sway.connected then
           sway_send(sway, IPC_COMMAND, 'workspace "' .. json_string(name) .. '"')

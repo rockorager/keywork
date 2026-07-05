@@ -16,7 +16,7 @@ fallback_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
 shape_cache: ShapeCache = .empty,
 glyph_cache: GlyphCache = .empty,
 
-const base_text_size = 16;
+const default_text_size = 16;
 const primary_font_index = 0;
 const ShapeCache = std.HashMapUnmanaged(ShapeKey, ShapedRun, ShapeContext, std.hash_map.default_max_load_percentage);
 const GlyphCache = std.AutoHashMapUnmanaged(GlyphKey, GlyphBitmap);
@@ -33,7 +33,7 @@ const FontFace = struct {
         if (c.FT_New_Face(library, path.ptr, 0, &face) != 0) return error.FontLoadFailed;
         errdefer _ = c.FT_Done_Face(face);
 
-        if (c.keywork_ft_set_pixel_size(face, base_text_size) == 0) return error.FontSizeFailed;
+        if (c.keywork_ft_set_pixel_size(face, default_text_size) == 0) return error.FontSizeFailed;
 
         const hb_font = c.keywork_hb_font_create(face) orelse return error.HarfBuzzFailed;
         errdefer c.hb_font_destroy(hb_font);
@@ -46,7 +46,7 @@ const FontFace = struct {
             .path = owned_path,
             .face = face,
             .hb_font = hb_font,
-            .pixel_size = base_text_size,
+            .pixel_size = default_text_size,
         };
     }
 
@@ -161,7 +161,7 @@ pub fn render(
     scale: f32,
     text: keywork.PaintCommand.TextRun,
 ) !void {
-    const pixel_size = try scaledPixelSize(scale);
+    const pixel_size = try scaledPixelSize(scale, text.style.font_size);
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
 
     const primary = &self.fonts.items[primary_font_index];
@@ -173,15 +173,15 @@ pub fn render(
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
         const line_end = std.mem.indexOfScalarPos(u8, text.value, line_start, '\n') orelse text.value.len;
-        try self.renderLine(pixels, width, height, origin_x, baseline_y, text.value[line_start..line_end], text.color, pixel_size);
+        try self.renderLine(pixels, width, height, origin_x, baseline_y, text.value[line_start..line_end], text.style.color, pixel_size);
         if (line_end == text.value.len) break;
         line_start = line_end + 1;
         baseline_y += line_height;
     }
 }
 
-pub fn measure(self: *Self, scale: f32, value: []const u8) !keywork.Size {
-    const pixel_size = try scaledPixelSize(scale);
+pub fn measure(self: *Self, scale: f32, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
+    const pixel_size = try scaledPixelSize(scale, style.font_size);
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
 
     const primary = &self.fonts.items[primary_font_index];
@@ -209,7 +209,7 @@ pub fn appendGlyphs(
     text: keywork.PaintCommand.TextRun,
     out: *std.ArrayList(PositionedGlyph),
 ) !void {
-    const pixel_size = try scaledPixelSize(scale);
+    const pixel_size = try scaledPixelSize(scale, text.style.font_size);
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
 
     const primary = &self.fonts.items[primary_font_index];
@@ -221,7 +221,7 @@ pub fn appendGlyphs(
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
         const line_end = std.mem.indexOfScalarPos(u8, text.value, line_start, '\n') orelse text.value.len;
-        try self.appendLineGlyphs(allocator, origin_x, baseline_y, text.value[line_start..line_end], text.color, pixel_size, out);
+        try self.appendLineGlyphs(allocator, origin_x, baseline_y, text.value[line_start..line_end], text.style.color, pixel_size, out);
         if (line_end == text.value.len) break;
         line_start = line_end + 1;
         baseline_y += line_height;
@@ -556,9 +556,9 @@ fn blendPixel(pixels: []u32, width: u31, height: u31, x: i32, y: i32, color: key
     pixels[index] = @bitCast(out);
 }
 
-fn scaledPixelSize(scale: f32) !u31 {
-    if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidScale;
-    const rounded = @round(base_text_size * scale);
+fn scaledPixelSize(scale: f32, font_size: f32) !u31 {
+    if (!std.math.isFinite(scale) or scale <= 0 or !std.math.isFinite(font_size) or font_size <= 0) return error.InvalidScale;
+    const rounded = @round(font_size * scale);
     if (rounded < 1 or rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidScale;
     return @intFromFloat(rounded);
 }

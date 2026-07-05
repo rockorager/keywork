@@ -168,9 +168,9 @@ const DiscardBackend = struct {
         return false;
     }
 
-    fn measureText(_: *anyopaque, value: []const u8) !keywork.Size {
+    fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
         const measurer: keywork.TextMeasurer = .fixed;
-        return try measurer.measureText(value);
+        return try measurer.measureText(value, style);
     }
 
     fn scale(_: *anyopaque) f32 {

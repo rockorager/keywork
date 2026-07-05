@@ -300,9 +300,9 @@ pub const Backend = struct {
         return true;
     }
 
-    fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
+    fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
         const self: *Backend = @ptrCast(@alignCast(ptr));
-        return self.text_renderer.measure(self.scale, value);
+        return self.text_renderer.measure(self.scale, value, style);
     }
 
     fn renderScale(ptr: *anyopaque) f32 {
