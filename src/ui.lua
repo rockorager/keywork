@@ -74,6 +74,39 @@ function ui.column(children, gap)
   }
 end
 
+function ui.row(children, gap)
+  return {
+    type = "row",
+    children = children,
+    gap = gap or 0,
+  }
+end
+
+function ui.spacer(flex)
+  return {
+    type = "spacer",
+    flex = flex or 1,
+  }
+end
+
+function ui.svg_icon(path, size, color)
+  return {
+    type = "svg_icon",
+    path = path,
+    size = size or 16,
+    color = color,
+  }
+end
+
+function ui.icon(name, size, color)
+  return {
+    type = "icon",
+    name = name,
+    size = size or 16,
+    color = color,
+  }
+end
+
 function ui.padding(insets, child)
   return {
     type = "padding",

@@ -268,18 +268,36 @@ fn parseWidget(
         const value = try allocator.dupe(u8, runtime_state.input_text);
         return keywork.widgets.textInput(id, value, placeholder);
     }
+    if (std.mem.eql(u8, kind, "spacer")) {
+        return keywork.widgets.spacer(getNumberField(lua_state, table, "flex", 1));
+    }
+    if (std.mem.eql(u8, kind, "svg_icon")) {
+        const path = try stringField(lua_state, table, "path");
+        return keywork.svg_icon.icon(
+            allocator,
+            path,
+            getNumberField(lua_state, table, "size", 16),
+            getColorField(lua_state, table, "color", keywork.colors.ink),
+        );
+    }
+    if (std.mem.eql(u8, kind, "icon")) {
+        const name = try stringField(lua_state, table, "name");
+        const size = getNumberField(lua_state, table, "size", 16);
+        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, size) orelse return error.IconNotFound;
+        defer allocator.free(path);
+        return keywork.svg_icon.icon(
+            allocator,
+            path,
+            size,
+            getColorField(lua_state, table, "color", keywork.colors.ink),
+        );
+    }
+    if (std.mem.eql(u8, kind, "row")) {
+        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
+        return .{ .row = .{ .children = children, .gap = getNumberField(lua_state, table, "gap", 0) } };
+    }
     if (std.mem.eql(u8, kind, "column")) {
-        c.lua_getfield(lua_state, table, "children");
-        defer pop(lua_state, 1);
-        const children_table = absoluteIndex(lua_state, -1);
-        try expectType(lua_state, children_table, c.LUA_TTABLE);
-        const count: usize = @intCast(c.lua_objlen(lua_state, children_table));
-        const children = try allocator.alloc(keywork.Widget, count);
-        for (children, 0..) |*child, child_index| {
-            c.lua_rawgeti(lua_state, children_table, @intCast(child_index + 1));
-            defer pop(lua_state, 1);
-            child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
-        }
+        const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, table);
         return .{ .column = .{ .children = children, .gap = getNumberField(lua_state, table, "gap", 0) } };
     }
     if (std.mem.eql(u8, kind, "padding")) {
@@ -315,6 +333,27 @@ fn parseWidget(
     }
 
     return error.UnknownWidgetType;
+}
+
+fn parseChildren(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    callback_allocator: std.mem.Allocator,
+    runtime_state: State,
+    table: c_int,
+) anyerror![]keywork.Widget {
+    c.lua_getfield(lua_state, table, "children");
+    defer pop(lua_state, 1);
+    const children_table = absoluteIndex(lua_state, -1);
+    try expectType(lua_state, children_table, c.LUA_TTABLE);
+    const count: usize = @intCast(c.lua_objlen(lua_state, children_table));
+    const children = try allocator.alloc(keywork.Widget, count);
+    for (children, 0..) |*child, child_index| {
+        c.lua_rawgeti(lua_state, children_table, @intCast(child_index + 1));
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
+    }
+    return children;
 }
 
 fn parseActionBindings(
@@ -387,9 +426,14 @@ fn getStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]
 }
 
 fn dupeStringField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) ![]const u8 {
+    const value = try stringField(lua_state, table, key);
+    return try allocator.dupe(u8, value);
+}
+
+fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
     const value = try getStringField(lua_state, table, key);
     defer pop(lua_state, 1);
-    return try allocator.dupe(u8, value);
+    return value;
 }
 
 fn getOptionalIntentField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?keywork.Intent {

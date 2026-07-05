@@ -2,6 +2,8 @@
 
 pub const event_loop = @import("event_loop.zig");
 pub const desktop_settings = @import("desktop_settings.zig");
+pub const icon_theme = @import("icon_theme.zig");
+pub const svg_icon = @import("svg_icon.zig");
 pub const wayland_shm = @import("wayland_shm.zig");
 pub const wayland_vulkan = @import("wayland_vulkan.zig");
 
@@ -61,6 +63,7 @@ pub const updateRenderObjectTree = core.updateRenderObjectTree;
 pub const destroyRenderObjectTree = core.destroyRenderObjectTree;
 pub const destroyRenderTree = core.destroyRenderTree;
 pub const paint = core.paint;
+pub const paintScaled = core.paintScaled;
 pub const hitTestButton = core.hitTestButton;
 pub const hitTestClick = core.hitTestClick;
 pub const hitTestTextInput = core.hitTestTextInput;

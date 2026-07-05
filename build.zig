@@ -33,6 +33,14 @@ pub fn build(b: *std.Build) void {
     libkeywork_module.addImport("wayland", wayland_mod);
     libkeywork_module.linkSystemLibrary("wayland-client", .{});
 
+    const image_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/image_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    libkeywork_module.addImport("image_c", image_c.createModule());
+    libkeywork_module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
+
     const vulkan_mod = b.dependency("vulkan_zig", .{
         .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
@@ -185,6 +193,39 @@ pub fn build(b: *std.Build) void {
 
     const run_lua_vulkan_layershell_example_step = b.step("run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example");
     run_lua_vulkan_layershell_example_step.dependOn(&run_lua_vulkan_layershell_example_cmd.step);
+
+    const run_lua_bar_example_cmd = b.addRunArtifact(exe);
+    run_lua_bar_example_cmd.step.dependOn(b.getInstallStep());
+    run_lua_bar_example_cmd.addArgs(&.{
+        "--script=examples/lua/bar.lua",
+        "--layer-shell",
+        "--anchor=top,left,right",
+        "--height=32",
+        "--exclusive-zone=32",
+    });
+    if (b.args) |args| {
+        run_lua_bar_example_cmd.addArgs(args);
+    }
+
+    const run_lua_bar_example_step = b.step("run-lua-bar-example", "Run the Lua desktop bar example");
+    run_lua_bar_example_step.dependOn(&run_lua_bar_example_cmd.step);
+
+    const run_lua_vulkan_bar_example_cmd = b.addRunArtifact(exe);
+    run_lua_vulkan_bar_example_cmd.step.dependOn(b.getInstallStep());
+    run_lua_vulkan_bar_example_cmd.addArgs(&.{
+        "--script=examples/lua/bar.lua",
+        "--backend=vulkan",
+        "--layer-shell",
+        "--anchor=top,left,right",
+        "--height=32",
+        "--exclusive-zone=32",
+    });
+    if (b.args) |args| {
+        run_lua_vulkan_bar_example_cmd.addArgs(args);
+    }
+
+    const run_lua_vulkan_bar_example_step = b.step("run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example");
+    run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
 
     const run_native_example_cmd = b.addRunArtifact(native_example);
     run_native_example_cmd.step.dependOn(b.getInstallStep());

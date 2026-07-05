@@ -24,7 +24,11 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "examples",
+        "include",
         "main.lua",
+        "protocols",
         "src",
+        "third_party",
     },
 }

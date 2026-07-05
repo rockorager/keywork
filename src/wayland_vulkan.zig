@@ -36,10 +36,15 @@ const GpuImage = struct {
     layout: vk.ImageLayout = .undefined,
 };
 
-const AtlasKey = struct {
-    font_id: u32,
-    pixel_size: u31,
-    glyph_index: u32,
+const AtlasKey = union(enum) {
+    glyph: Glyph,
+    image: u64,
+
+    const Glyph = struct {
+        font_id: u32,
+        pixel_size: u31,
+        glyph_index: u32,
+    };
 };
 
 const AtlasSlot = struct {
@@ -381,7 +386,7 @@ pub const Backend = struct {
     }
 
     pub fn renderBackend(self: *Backend) keywork.RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
     }
 
     pub fn setPointerButtonHandler(self: *Backend, context: *anyopaque, handler: PointerButtonHandler) void {
@@ -483,6 +488,11 @@ pub const Backend = struct {
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         return self.text_renderer.measure(self.scale, value);
+    }
+
+    fn renderScale(ptr: *anyopaque) f32 {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        return self.scale;
     }
 
     fn notifyRepaint(self: *Backend) void {
@@ -956,7 +966,7 @@ pub const Backend = struct {
                     };
                     self.vkd.cmdClearAttachments(self.command_buffer, &.{attachment}, &.{rect});
                 },
-                .text => {},
+                .text, .alpha_image => {},
             }
         }
     }
@@ -978,6 +988,10 @@ pub const Backend = struct {
                         try self.appendGlyphVertices(glyph, slot);
                     }
                 },
+                .alpha_image => |image| {
+                    const slot = try self.ensureAtlasImage(image);
+                    try self.appendImageVertices(image, slot, scale);
+                },
                 .fill_rect => {},
             }
         }
@@ -991,11 +1005,11 @@ pub const Backend = struct {
     }
 
     fn ensureAtlasGlyph(self: *Backend, glyph: TextRenderer.PositionedGlyph) !AtlasSlot {
-        const key: AtlasKey = .{
+        const key: AtlasKey = .{ .glyph = .{
             .font_id = glyph.font_id,
             .pixel_size = glyph.pixel_size,
             .glyph_index = glyph.glyph_index,
-        };
+        } };
         if (self.atlas_slots.get(key)) |slot| return slot;
 
         const slot = try self.allocateAtlasSlot(glyph.width, glyph.rows);
@@ -1026,6 +1040,44 @@ pub const Backend = struct {
         };
         self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
         self.staging_used += coverage_size;
+        return slot;
+    }
+
+    fn ensureAtlasImage(self: *Backend, image: keywork.PaintCommand.AlphaImage) !AtlasSlot {
+        if (image.width == 0 or image.height == 0) return error.EmptyImage;
+        if (image.alpha.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
+
+        const key: AtlasKey = .{ .image = image.cache_key };
+        if (self.atlas_slots.get(key)) |slot| return slot;
+
+        const slot = try self.allocateAtlasSlot(image.width, image.height);
+        errdefer _ = self.atlas_slots.remove(key);
+        try self.atlas_slots.put(self.allocator, key, slot);
+
+        if (self.atlas.layout != .transfer_dst_optimal) {
+            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
+            self.atlas.layout = .transfer_dst_optimal;
+        }
+
+        const image_size: vk.DeviceSize = @intCast(image.alpha.len);
+        if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
+        try self.writeBuffer(self.staging_buffer, self.staging_used, image.alpha);
+
+        const copy: vk.BufferImageCopy = .{
+            .buffer_offset = self.staging_used,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
+            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
+        };
+        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
+        self.staging_used += image_size;
         return slot;
     }
 
@@ -1064,6 +1116,27 @@ pub const Backend = struct {
         const uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / atlas_width;
         const uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / atlas_height;
         const color = colorFloats(self.swapchain_format, glyph.color);
+
+        try self.text_vertices.appendSlice(self.allocator, &.{
+            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
+            .{ .pos = .{ x1, y0 }, .uv = .{ uv_right, uv_top }, .color = color },
+            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
+            .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },
+            .{ .pos = .{ x1, y1 }, .uv = .{ uv_right, uv_bottom }, .color = color },
+            .{ .pos = .{ x0, y1 }, .uv = .{ uv_left, uv_bottom }, .color = color },
+        });
+    }
+
+    fn appendImageVertices(self: *Backend, image: keywork.PaintCommand.AlphaImage, slot: AtlasSlot, scale: f32) !void {
+        const x0 = image.rect.x * scale;
+        const y0 = image.rect.y * scale;
+        const x1 = x0 + @as(f32, @floatFromInt(slot.width));
+        const y1 = y0 + @as(f32, @floatFromInt(slot.height));
+        const uv_left = @as(f32, @floatFromInt(slot.x)) / atlas_width;
+        const uv_top = @as(f32, @floatFromInt(slot.y)) / atlas_height;
+        const uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / atlas_width;
+        const uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / atlas_height;
+        const color = colorFloats(self.swapchain_format, image.color);
 
         try self.text_vertices.appendSlice(self.allocator, &.{
             .{ .pos = .{ x0, y0 }, .uv = .{ uv_left, uv_top }, .color = color },

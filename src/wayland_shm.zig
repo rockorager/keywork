@@ -195,7 +195,7 @@ pub const Backend = struct {
     }
 
     pub fn renderBackend(self: *Backend) keywork.RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
     }
 
     pub fn setPointerButtonHandler(self: *Backend, context: *anyopaque, handler: PointerButtonHandler) void {
@@ -303,6 +303,11 @@ pub const Backend = struct {
     fn measureText(ptr: *anyopaque, value: []const u8) !keywork.Size {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         return self.text_renderer.measure(self.scale, value);
+    }
+
+    fn renderScale(ptr: *anyopaque) f32 {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        return self.scale;
     }
 
     fn notifyRepaint(self: *Backend) void {
@@ -560,6 +565,7 @@ fn rasterize(
         switch (command) {
             .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color),
             .text => |text| try renderer.render(pixels, width, height, scale, text),
+            .alpha_image => |image| alphaImage(pixels, width, height, scale, image),
         }
     }
 }
@@ -577,6 +583,48 @@ fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Re
         const row = pixels[y * width ..][0..width];
         @memset(row[x0..x1], value);
     }
+}
+
+fn alphaImage(
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    scale: f32,
+    image: keywork.PaintCommand.AlphaImage,
+) void {
+    if (image.width == 0 or image.height == 0) return;
+    const image_width: usize = @intCast(image.width);
+    const image_height: usize = @intCast(image.height);
+    const dst_x0 = clampPixel(@floor(image.rect.x * scale), width);
+    const dst_y0 = clampPixel(@floor(image.rect.y * scale), height);
+    const dst_x1 = @min(dst_x0 + image_width, width);
+    const dst_y1 = @min(dst_y0 + image_height, height);
+    if (dst_x0 >= dst_x1 or dst_y0 >= dst_y1) return;
+
+    var row: usize = 0;
+    while (dst_y0 + row < dst_y1) : (row += 1) {
+        var column: usize = 0;
+        while (dst_x0 + column < dst_x1) : (column += 1) {
+            const coverage = image.alpha[row * image_width + column];
+            if (coverage == 0) continue;
+            blendPixel(pixels, width, dst_x0 + column, dst_y0 + row, image.color, coverage);
+        }
+    }
+}
+
+fn blendPixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Color, coverage: u8) void {
+    const index = y * width + x;
+    const dst: keywork.Color = @bitCast(pixels[index]);
+    const src_a = (@as(u32, color.a) * coverage + 127) / 255;
+    const inv_a = 255 - src_a;
+
+    const out: keywork.Color = .{
+        .a = @intCast(src_a + (@as(u32, dst.a) * inv_a + 127) / 255),
+        .r = @intCast((@as(u32, color.r) * src_a + @as(u32, dst.r) * inv_a + 127) / 255),
+        .g = @intCast((@as(u32, color.g) * src_a + @as(u32, dst.g) * inv_a + 127) / 255),
+        .b = @intCast((@as(u32, color.b) * src_a + @as(u32, dst.b) * inv_a + 127) / 255),
+    };
+    pixels[index] = @bitCast(out);
 }
 
 fn clampPixel(value: f32, max_value: u31) usize {

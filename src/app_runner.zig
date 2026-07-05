@@ -147,7 +147,7 @@ fn positiveU31(value: f32) !u31 {
 
 const DiscardBackend = struct {
     fn backend(self: *DiscardBackend) keywork.RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText } };
+        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
     }
 
     fn present(_: *anyopaque, _: keywork.RenderBackend.Frame) !bool {
@@ -157,5 +157,9 @@ const DiscardBackend = struct {
     fn measureText(_: *anyopaque, value: []const u8) !keywork.Size {
         const measurer: keywork.TextMeasurer = .fixed;
         return try measurer.measureText(value);
+    }
+
+    fn scale(_: *anyopaque) f32 {
+        return 1;
     }
 };

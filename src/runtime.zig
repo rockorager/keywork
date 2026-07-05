@@ -124,7 +124,7 @@ pub const Runtime = struct {
         }
 
         const root = if (self.root) |*root| root else return error.NotBuilt;
-        self.display_list.clearRetainingCapacity();
+        self.display_list.clearRetainingCapacity(self.allocator);
         const frame_size = self.frameSize();
         try self.display_list.fillRect(self.allocator, .{
             .x = 0,
@@ -132,10 +132,11 @@ pub const Runtime = struct {
             .width = frame_size.width,
             .height = frame_size.height,
         }, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface);
-        try keywork.paint(self.allocator, root, &self.display_list);
+        const render_scale = self.backend.scale();
+        try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
         self.frame_pending = try self.backend.present(.{
             .size = frame_size,
-            .scale = 1,
+            .scale = render_scale,
             .damage = &.{.{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height }},
             .display_list = self.display_list.commands.items,
         });
