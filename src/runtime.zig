@@ -39,8 +39,10 @@ pub const Runtime = struct {
     render_object_root: ?RenderObjectNode = null,
     root: ?RenderNode = null,
     display_list: DisplayList = .{},
+    app_context: State = .{},
     repaint_pending: bool = false,
     rebuild_pending: bool = false,
+    state_rebuild_pending: bool = false,
     frame_pending: bool = false,
     rendering: bool = false,
 
@@ -109,6 +111,16 @@ pub const Runtime = struct {
         if (!self.frame_pending and !self.rendering) try self.presentFrame();
     }
 
+    pub fn invalidate(self: *Runtime) !void {
+        self.rebuild_pending = true;
+        try self.requestRepaint();
+    }
+
+    pub fn invalidateState(self: *Runtime) !void {
+        self.state_rebuild_pending = true;
+        try self.requestRepaint();
+    }
+
     fn presentFrame(self: *Runtime) !void {
         if (self.rendering) {
             self.repaint_pending = true;
@@ -121,6 +133,10 @@ pub const Runtime = struct {
         if (self.rebuild_pending) {
             try self.rebuild();
             self.rebuild_pending = false;
+            self.state_rebuild_pending = false;
+        } else if (self.state_rebuild_pending) {
+            try self.rebuildDirtyState();
+            self.state_rebuild_pending = false;
         }
 
         const root = if (self.root) |*root| root else return error.NotBuilt;
@@ -171,7 +187,12 @@ pub const Runtime = struct {
 
         if (keywork.hitTestClick(root, point)) |hit| {
             try self.setFocused(hit.id);
-            if (try self.setPressedId(hit.id)) {
+            var needs_update = try self.setPressedId(hit.id);
+            if (hit.activation == .press) {
+                log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
+                if (try self.activateClick(hit)) needs_update = true;
+            }
+            if (needs_update) {
                 try self.rebuild();
                 try self.requestRepaint();
             }
@@ -194,7 +215,7 @@ pub const Runtime = struct {
         } else false;
 
         var needs_update = try self.setPressedId(null);
-        if (should_activate) {
+        if (should_activate and hit.?.activation == .release) {
             const click_hit = hit.?;
             log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
             if (try self.activateClick(click_hit)) needs_update = true;
@@ -556,29 +577,17 @@ pub const Runtime = struct {
         while (true) : (pass += 1) {
             _ = self.build_arena.reset(.retain_capacity);
             const state = self.currentState();
-            var build_scope: BuildScope = .{
-                .allocator = self.build_arena.allocator(),
-                .theme = keywork.Theme.fromColorScheme(state.color_scheme),
-                .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
-            };
+            var build_scope = self.buildScope(state);
 
             var app_root = try self.app.buildWidget(&build_scope, state);
+            self.app_context = build_scope.app_context;
             if (self.element_root) |*element_root| {
                 try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
             } else {
                 self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
             }
 
-            if (self.render_object_root) |*render_object_root| {
-                try keywork.updateRenderObjectTree(self.allocator, render_object_root, &self.element_root.?);
-            } else {
-                self.render_object_root = try keywork.buildRenderObjectTree(self.allocator, &self.element_root.?);
-            }
-
-            var new_root = try keywork.buildRenderTreeFromElement(self.allocator, &self.element_root.?, self.constraints, self.backend);
-            errdefer keywork.destroyRenderTree(self.allocator, &new_root);
-            self.root = new_root;
-            errdefer self.root = null;
+            try self.rebuildRetainedTrees();
 
             if (!try self.reconcileFocusAfterRebuild()) break;
             if (pass + 1 >= max_focus_rebuild_passes) return error.FocusDidNotStabilize;
@@ -587,6 +596,54 @@ pub const Runtime = struct {
                 self.root = null;
             }
         }
+    }
+
+    fn rebuildDirtyState(self: *Runtime) !void {
+        if (self.root) |*old_root| {
+            keywork.destroyRenderTree(self.allocator, old_root);
+            self.root = null;
+        }
+
+        const element_root = if (self.element_root) |*element_root| element_root else {
+            try self.rebuild();
+            return;
+        };
+
+        _ = self.build_arena.reset(.retain_capacity);
+        var build_scope = self.buildScope(self.app_context);
+        const rebuilt = try keywork.rebuildDirtyElementTreeScoped(self.allocator, &build_scope, element_root, self.constraints);
+        if (!rebuilt) {
+            try self.rebuildRetainedTrees();
+            return;
+        }
+
+        try self.rebuildRetainedTrees();
+        if (try self.reconcileFocusAfterRebuild()) {
+            try self.rebuild();
+        }
+    }
+
+    fn buildScope(self: *Runtime, state: State) BuildScope {
+        return .{
+            .allocator = self.build_arena.allocator(),
+            .theme = keywork.Theme.fromColorScheme(state.color_scheme),
+            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
+            .app_context = state,
+        };
+    }
+
+    fn rebuildRetainedTrees(self: *Runtime) !void {
+        const element_root = if (self.element_root) |*element_root| element_root else return error.NotBuilt;
+        if (self.render_object_root) |*render_object_root| {
+            try keywork.updateRenderObjectTree(self.allocator, render_object_root, element_root);
+        } else {
+            self.render_object_root = try keywork.buildRenderObjectTree(self.allocator, element_root);
+        }
+
+        var new_root = try keywork.buildRenderTreeFromElement(self.allocator, element_root, self.constraints, self.backend);
+        errdefer keywork.destroyRenderTree(self.allocator, &new_root);
+        self.root = new_root;
+        errdefer self.root = null;
     }
 
     fn reconcileFocusAfterRebuild(self: *Runtime) !bool {

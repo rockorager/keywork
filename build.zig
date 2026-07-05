@@ -200,6 +200,7 @@ pub fn build(b: *std.Build) void {
         "--script=examples/lua/bar.lua",
         "--layer-shell",
         "--anchor=top,left,right",
+        "--width=0",
         "--height=32",
         "--exclusive-zone=32",
     });
@@ -217,6 +218,7 @@ pub fn build(b: *std.Build) void {
         "--backend=vulkan",
         "--layer-shell",
         "--anchor=top,left,right",
+        "--width=0",
         "--height=32",
         "--exclusive-zone=32",
     });

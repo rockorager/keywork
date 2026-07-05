@@ -9,6 +9,8 @@ const linux = std.os.linux;
 const State = keywork.AppContext;
 const BuildScope = keywork.BuildScope;
 
+const app_registry_key = "keywork.app";
+
 const LuaCallback = struct {
     allocator: std.mem.Allocator,
     lua_state: *c.lua_State,
@@ -77,10 +79,174 @@ const LuaCallback = struct {
     }
 };
 
+const LuaStatefulWidget = struct {
+    allocator: std.mem.Allocator,
+    app: *App,
+    lua_state: *c.lua_State,
+    spec_ref: c_int,
+    props_ref: c_int,
+
+    const vtable: keywork.Widget.Stateful.VTable = .{
+        .create_state = createState,
+        .update = update,
+        .build = build,
+        .destroy_state = destroyState,
+        .needs_rebuild = needsRebuild,
+        .clear_rebuild = clearRebuild,
+    };
+
+    fn widget(self: *LuaStatefulWidget) keywork.Widget {
+        return .{ .stateful = .{
+            .ptr = self,
+            .vtable = &vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        } };
+    }
+
+    fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+        const self: *const LuaStatefulWidget = @ptrCast(@alignCast(ptr));
+        const state = try allocator.create(LuaStatefulState);
+        errdefer allocator.destroy(state);
+        state.* = .{ .lua_state = self.lua_state, .state_ref = -1 };
+
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        const spec = c.lua_gettop(self.lua_state);
+        defer pop(self.lua_state, 1);
+
+        c.lua_getfield(self.lua_state, spec, "init");
+        if (c.lua_isnil(self.lua_state, -1)) {
+            pop(self.lua_state, 1);
+            c.lua_createtable(self.lua_state, 0, 0);
+        } else {
+            c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+            if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful init failed");
+            if (c.lua_type(self.lua_state, -1) != c.LUA_TTABLE) return error.StatefulInitReturnedInvalidValue;
+        }
+        errdefer pop(self.lua_state, 1);
+
+        installStateMethods(self.lua_state, self.app, state, c.lua_gettop(self.lua_state));
+        setStateProps(self.lua_state, c.lua_gettop(self.lua_state), self.props_ref);
+        state.state_ref = c.luaL_ref(self.lua_state, c.LUA_REGISTRYINDEX);
+        return state;
+    }
+
+    fn update(ptr: *const anyopaque, state_ptr: *anyopaque, _: std.mem.Allocator, _: keywork.Widget.BuildContext) !void {
+        const self: *const LuaStatefulWidget = @ptrCast(@alignCast(ptr));
+        const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
+        const state_table = c.lua_gettop(self.lua_state);
+        defer pop(self.lua_state, 1);
+
+        setStateProps(self.lua_state, state_table, self.props_ref);
+
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        const spec = c.lua_gettop(self.lua_state);
+        defer pop(self.lua_state, 1);
+        c.lua_getfield(self.lua_state, spec, "update");
+        if (c.lua_isnil(self.lua_state, -1)) {
+            pop(self.lua_state, 1);
+            return;
+        }
+        c.lua_pushvalue(self.lua_state, state_table);
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+        if (c.lua_pcall(self.lua_state, 2, 0, 0) != 0) return failLuaCall(self.lua_state, "stateful update failed");
+    }
+
+    fn build(ptr: *const anyopaque, state_ptr: *anyopaque, scope: *BuildScope, context: keywork.Widget.BuildContext) !keywork.Widget {
+        const self: *const LuaStatefulWidget = @ptrCast(@alignCast(ptr));
+        const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
+
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        const spec = c.lua_gettop(self.lua_state);
+        defer pop(self.lua_state, 1);
+        c.lua_getfield(self.lua_state, spec, "build");
+        if (c.lua_isnil(self.lua_state, -1)) {
+            pop(self.lua_state, 1);
+            return error.StatefulBuildMissing;
+        }
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
+        pushRuntimeState(self.lua_state, context.app_context);
+        if (c.lua_pcall(self.lua_state, 2, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful build failed");
+        defer pop(self.lua_state, 1);
+        return try parseWidget(self.lua_state, scope.allocator, scope.allocator, context.app_context, -1);
+    }
+
+    fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *const LuaStatefulWidget = @ptrCast(@alignCast(ptr));
+        const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
+
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        const spec = c.lua_gettop(self.lua_state);
+        c.lua_getfield(self.lua_state, spec, "destroy");
+        if (c.lua_isnil(self.lua_state, -1)) {
+            pop(self.lua_state, 2);
+        } else {
+            c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
+            if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
+                failLuaCall(self.lua_state, "stateful destroy failed") catch {};
+            }
+            pop(self.lua_state, 1);
+        }
+
+        if (state.state_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
+        allocator.destroy(state);
+    }
+
+    fn needsRebuild(_: *const anyopaque, state_ptr: *anyopaque) bool {
+        const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
+        return state.dirty;
+    }
+
+    fn clearRebuild(_: *const anyopaque, state_ptr: *anyopaque) void {
+        const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
+        state.dirty = false;
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *LuaStatefulWidget = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.spec_ref < 0 or self.props_ref < 0) return error.LuaStatefulWidgetAlreadyMoved;
+        const spec_ref = try cloneRegistryRef(self.lua_state, self.spec_ref);
+        errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, spec_ref);
+        const props_ref = try cloneRegistryRef(self.lua_state, self.props_ref);
+        errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, props_ref);
+        c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+        self.spec_ref = -2;
+        self.props_ref = -2;
+
+        const result = try allocator.create(LuaStatefulWidget);
+        result.* = .{
+            .allocator = allocator,
+            .app = self.app,
+            .lua_state = self.lua_state,
+            .spec_ref = spec_ref,
+            .props_ref = props_ref,
+        };
+        return result;
+    }
+
+    fn destroy(_: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *LuaStatefulWidget = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.spec_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
+        if (self.props_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+        self.allocator.destroy(self);
+    }
+};
+
+const LuaStatefulState = struct {
+    lua_state: *c.lua_State,
+    state_ref: c_int,
+    dirty: bool = false,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
     state: *c.lua_State,
+    fd_watches: std.ArrayList(*FdWatch) = .empty,
+    event_loop: ?*keywork.event_loop.EventLoop = null,
+    runtime: ?*keywork.Runtime = null,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
@@ -105,8 +271,16 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        for (self.fd_watches.items) |watch| watch.destroy(self.allocator, self.state);
+        self.fd_watches.deinit(self.allocator);
         c.lua_close(self.state);
         self.allocator.free(self.path);
+    }
+
+    pub fn installEventSources(self: *App, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+        self.event_loop = loop;
+        self.runtime = runtime;
+        for (self.fd_watches.items) |watch| try self.registerFdWatch(watch);
     }
 
     pub fn host(self: *App) keywork.AppHost {
@@ -115,6 +289,7 @@ pub const App = struct {
 
     pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
         c.lua_settop(self.state, 0);
+        installKeyworkModule(self.state, self);
         if (c.luaL_loadfile(self.state, self.path.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
         if (c.lua_pcall(self.state, 0, 1, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
 
@@ -143,10 +318,151 @@ pub const App = struct {
         }
         return err;
     }
+
+    fn addFdWatch(self: *App, fd: i32, events: u32, ref: c_int) !void {
+        const watch = try self.allocator.create(FdWatch);
+        errdefer self.allocator.destroy(watch);
+        watch.* = .{ .app = self, .fd = fd, .events = events, .ref = ref };
+        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+
+        try self.fd_watches.append(self.allocator, watch);
+        errdefer _ = self.fd_watches.pop();
+        try self.registerFdWatch(watch);
+    }
+
+    fn registerFdWatch(self: *App, watch: *FdWatch) !void {
+        if (watch.registered) return;
+        const loop = self.event_loop orelse return;
+        try loop.addFd(.{
+            .fd = watch.fd,
+            .events = watch.events,
+            .ctx = watch,
+            .callback = fdWatchCallback,
+        });
+        watch.registered = true;
+        try fdWatchCallback(watch, loop, linux.EPOLL.IN);
+    }
 };
+
+const FdWatch = struct {
+    app: *App,
+    fd: i32,
+    events: u32,
+    ref: c_int,
+    registered: bool = false,
+
+    fn destroy(self: *FdWatch, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        allocator.destroy(self);
+    }
+};
+
+fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u32) !void {
+    const watch: *FdWatch = @ptrCast(@alignCast(ctx));
+    const app = watch.app;
+    c.lua_rawgeti(app.state, c.LUA_REGISTRYINDEX, watch.ref);
+    c.lua_pushinteger(app.state, watch.fd);
+    c.lua_pushinteger(app.state, @intCast(events));
+    if (c.lua_pcall(app.state, 2, 1, 0) != 0) {
+        var len: usize = 0;
+        const message_ptr = c.lua_tolstring(app.state, -1, &len);
+        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fd callback failed: {s}", .{message[0..len]});
+        pop(app.state, 1);
+        return error.LuaCallbackFailed;
+    }
+    const should_invalidate = c.lua_toboolean(app.state, -1) != 0;
+    pop(app.state, 1);
+    if (should_invalidate) {
+        const runtime = app.runtime orelse return;
+        try runtime.invalidate();
+    }
+}
 
 fn installUi(lua_state: *c.lua_State) void {
     addPackagePath(lua_state, "src/?.lua");
+}
+
+fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_setfield(lua_state, c.LUA_REGISTRYINDEX, app_registry_key);
+
+    c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
+    const package_table = c.lua_gettop(lua_state);
+    c.lua_getfield(lua_state, package_table, "preload");
+    const preload_table = c.lua_gettop(lua_state);
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, keyworkModuleLoader, 1);
+    c.lua_setfield(lua_state, preload_table, "keywork");
+    pop(lua_state, 2);
+}
+
+fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_createtable(lua_state, 0, 2);
+    const table = c.lua_gettop(lua_state);
+
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaWatchFd, 1);
+    c.lua_setfield(lua_state, table, "watch_fd");
+
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaInvalidate, 1);
+    c.lua_setfield(lua_state, table, "invalidate");
+    return 1;
+}
+
+fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const fd_int = c.luaL_checkinteger(lua_state, 1);
+    if (fd_int < 0 or fd_int > std.math.maxInt(i32)) return c.luaL_error(lua_state, "invalid fd");
+    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
+    const events: u32 = if (c.lua_isnumber(lua_state, 3) != 0)
+        @intCast(c.lua_tointeger(lua_state, 3))
+    else
+        linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR;
+
+    c.lua_pushvalue(lua_state, 2);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    app.addFdWatch(@intCast(fd_int), events, ref) catch |err| {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        std.log.scoped(.keywork_luajit).warn("watch_fd failed: {}", .{err});
+        return c.luaL_error(lua_state, "watch_fd failed");
+    };
+    return 0;
+}
+
+fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const runtime = app.runtime orelse return 0;
+    runtime.invalidate() catch |err| {
+        std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});
+        return c.luaL_error(lua_state, "invalidate failed");
+    };
+    return 0;
+}
+
+fn luaSetState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const state: *LuaStatefulState = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(2)).?));
+    if (c.lua_type(lua_state, 2) == c.LUA_TFUNCTION) {
+        c.lua_pushvalue(lua_state, 2);
+        c.lua_pushvalue(lua_state, 1);
+        if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
+            failLuaCall(lua_state, "set_state callback failed") catch {};
+            return c.luaL_error(lua_state, "set_state callback failed");
+        }
+    }
+    state.dirty = true;
+    const runtime = app.runtime orelse return 0;
+    runtime.invalidateState() catch |err| {
+        std.log.scoped(.keywork_luajit).warn("set_state invalidate failed: {}", .{err});
+        return c.luaL_error(lua_state, "set_state invalidate failed");
+    };
+    return 0;
 }
 
 fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
@@ -206,6 +522,23 @@ fn parseWidget(
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         return .{ .keyed = .{ .key = .{ .string = key }, .child = child } };
     }
+    if (std.mem.eql(u8, kind, "stateful")) {
+        const app = appFromRegistry(lua_state) orelse return error.MissingLuaApp;
+        const stateful = try allocator.create(LuaStatefulWidget);
+        errdefer allocator.destroy(stateful);
+        const spec_ref = try tableRefField(lua_state, table, "spec");
+        errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
+        const props_ref = try tableRefField(lua_state, table, "props");
+        errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, props_ref);
+        stateful.* = .{
+            .allocator = allocator,
+            .app = app,
+            .lua_state = lua_state,
+            .spec_ref = spec_ref,
+            .props_ref = props_ref,
+        };
+        return stateful.widget();
+    }
     if (std.mem.eql(u8, kind, "box")) {
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
@@ -225,7 +558,7 @@ fn parseWidget(
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, -1);
         const on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_click");
-        return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click } };
+        return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click, .activation = getActivationField(lua_state, table) } };
     }
     if (std.mem.eql(u8, kind, "focus")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -436,6 +769,56 @@ fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]con
     return value;
 }
 
+fn tableRefField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_int {
+    c.lua_getfield(lua_state, table, key);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+        pop(lua_state, 1);
+        return error.ExpectedLuaTable;
+    }
+    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+fn cloneRegistryRef(lua_state: *c.lua_State, ref: c_int) !c_int {
+    if (ref < 0) return error.InvalidLuaRegistryRef;
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
+    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+fn appFromRegistry(lua_state: *c.lua_State) ?*App {
+    c.lua_getfield(lua_state, c.LUA_REGISTRYINDEX, app_registry_key);
+    defer pop(lua_state, 1);
+    return @ptrCast(@alignCast(c.lua_touserdata(lua_state, -1) orelse return null));
+}
+
+fn installStateMethods(lua_state: *c.lua_State, app: *App, state: *LuaStatefulState, state_table: c_int) void {
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushlightuserdata(lua_state, state);
+    c.lua_pushcclosure(lua_state, luaSetState, 2);
+    c.lua_setfield(lua_state, state_table, "set_state");
+}
+
+fn setStateProps(lua_state: *c.lua_State, state_table: c_int, props_ref: c_int) void {
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, props_ref);
+    c.lua_setfield(lua_state, state_table, "props");
+}
+
+fn failLuaCall(lua_state: *c.lua_State, err: []const u8) anyerror {
+    var len: usize = 0;
+    const message_ptr = c.lua_tolstring(lua_state, -1, &len);
+    if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s}: {s}", .{ err, message[0..len] });
+    pop(lua_state, 1);
+    return error.LuaCallbackFailed;
+}
+
+fn getActivationField(lua_state: *c.lua_State, table: c_int) keywork.Widget.ClickActivation {
+    c.lua_getfield(lua_state, table, "activation");
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return .release;
+    const value = stringFromStack(lua_state, -1) catch return .release;
+    if (std.mem.eql(u8, value, "press")) return .press;
+    return .release;
+}
+
 fn getOptionalIntentField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?keywork.Intent {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
@@ -533,4 +916,55 @@ fn getOptionalColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const 
 
 fn pop(lua_state: *c.lua_State, count: c_int) void {
     c.lua_settop(lua_state, -count - 1);
+}
+
+test "lua stateful widget set_state rebuilds retained subtree" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local ui = require("ui")
+        \\local Counter = ui.stateful({
+        \\  init = function()
+        \\    return { count = 0 }
+        \\  end,
+        \\  build = function(self, state)
+        \\    return ui.clickable("counter", ui.text(tostring(self.count)), function()
+        \\      self:set_state(function(s)
+        \\        s.count = s.count + 1
+        \\      end)
+        \\    end)
+        \\  end,
+        \\})
+        \\return function(state)
+        \\  return Counter({ key = "counter" })
+        \\end
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stateful.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stateful.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.runtime = &runtime;
+
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"0\"") != null);
+
+    try runtime.click(.{ .x = 2, .y = 2 });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"1\"") != null);
 }

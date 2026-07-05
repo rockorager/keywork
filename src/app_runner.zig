@@ -5,6 +5,7 @@ const keywork = @import("core.zig");
 
 const desktop_settings = @import("desktop_settings.zig");
 const event_loop = @import("event_loop.zig");
+const runtime_mod = @import("runtime.zig");
 const wayland_shm = @import("wayland_shm.zig");
 const wayland_vulkan = @import("wayland_vulkan.zig");
 
@@ -16,6 +17,12 @@ pub const BackendKind = enum {
     vulkan,
 };
 
+pub const EventSourceInstaller = *const fn (
+    ctx: ?*anyopaque,
+    loop: *event_loop.EventLoop,
+    runtime: *runtime_mod.Runtime,
+) anyerror!void;
+
 pub const Options = struct {
     title: [:0]const u8 = "Keywork",
     width: f32 = 640,
@@ -25,10 +32,13 @@ pub const Options = struct {
     log_writer: ?*std.Io.Writer = null,
     timer_interval_ms: ?u64 = 1000,
     file_watch_path: ?[]const u8 = null,
+    event_source_context: ?*anyopaque = null,
+    install_event_sources: ?EventSourceInstaller = null,
 };
 
 pub fn run(allocator: std.mem.Allocator, app: keywork.AppHost, options: Options) !void {
-    const constraints: keywork.Constraints = .{ .max_width = options.width, .max_height = options.height };
+    const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
+    const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = options.height };
     return switch (options.backend) {
         .log => runLog(allocator, app, constraints, options),
         .wayland_shm => runWayland(allocator, app, constraints, options, wayland_shm.Backend),
@@ -57,7 +67,7 @@ fn runHeadlessRuntime(
     constraints: keywork.Constraints,
     backend: keywork.RenderBackend,
 ) !void {
-    var runtime = try @import("runtime.zig").Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         backend,
         constraints,
@@ -75,9 +85,10 @@ fn runWayland(
     options: Options,
     comptime Backend: type,
 ) !void {
+    const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator, .{
         .title = options.title,
-        .width = try positiveU31(constraints.max_width),
+        .width = backend_width,
         .height = try positiveU31(constraints.max_height),
         .layer_shell = options.layer_shell,
     });
@@ -90,7 +101,7 @@ fn runWayland(
     defer if (settings_client) |*settings| settings.deinit();
     const initial_color_scheme: desktop_settings.ColorScheme = if (settings_client) |settings| settings.color_scheme else .no_preference;
 
-    var runtime = try @import("runtime.zig").Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         backend.renderBackend(),
         constraints,
@@ -99,15 +110,15 @@ fn runWayland(
     );
     defer runtime.deinit();
 
-    backend.setPointerButtonHandler(&runtime, @import("runtime.zig").Runtime.waylandPointerButton);
-    backend.setPointerMoveHandler(&runtime, @import("runtime.zig").Runtime.waylandPointerMove);
-    backend.setCursorShapeHandler(&runtime, @import("runtime.zig").Runtime.waylandCursorShape);
-    backend.setRepaintHandler(&runtime, @import("runtime.zig").Runtime.waylandConfigure);
-    backend.setFrameHandler(&runtime, @import("runtime.zig").Runtime.waylandFrameDone);
-    backend.setKeyHandler(&runtime, @import("runtime.zig").Runtime.waylandKeyInput);
+    backend.setPointerButtonHandler(&runtime, runtime_mod.Runtime.waylandPointerButton);
+    backend.setPointerMoveHandler(&runtime, runtime_mod.Runtime.waylandPointerMove);
+    backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
+    backend.setRepaintHandler(&runtime, runtime_mod.Runtime.waylandConfigure);
+    backend.setFrameHandler(&runtime, runtime_mod.Runtime.waylandFrameDone);
+    backend.setKeyHandler(&runtime, runtime_mod.Runtime.waylandKeyInput);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
-        settings.setChangeHandler(&runtime, @import("runtime.zig").Runtime.desktopSettingsChanged);
+        settings.setChangeHandler(&runtime, runtime_mod.Runtime.desktopSettingsChanged);
     }
     try runtime.repaint();
 
@@ -128,12 +139,15 @@ fn runWayland(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     if (options.timer_interval_ms) |interval_ms| {
-        try loop.addRepeatingTimer(interval_ms, &runtime, @import("runtime.zig").Runtime.timerTick);
+        try loop.addRepeatingTimer(interval_ms, &runtime, runtime_mod.Runtime.timerTick);
     }
     if (options.file_watch_path) |path| {
-        loop.addFileWatch(path, &runtime, @import("runtime.zig").Runtime.fileChanged) catch |err| {
+        loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
         };
+    }
+    if (options.install_event_sources) |install| {
+        try install(options.event_source_context, &loop, &runtime);
     }
     try loop.run();
 }

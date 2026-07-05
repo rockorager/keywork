@@ -17,6 +17,21 @@ function ui.keyed(key, child)
   }
 end
 
+function ui.stateful(spec)
+  return function(props)
+    props = props or {}
+    local widget = {
+      type = "stateful",
+      spec = spec,
+      props = props,
+    }
+    if props.key then
+      return ui.keyed(props.key, widget)
+    end
+    return widget
+  end
+end
+
 function ui.box(style, child)
   style = style or {}
   return {
@@ -26,13 +41,19 @@ function ui.box(style, child)
   }
 end
 
-function ui.clickable(id, child, on_click)
+function ui.clickable(id, child, on_click, options)
+  options = options or {}
   return {
     type = "clickable",
     id = id,
     child = child,
     on_click = on_click,
+    activation = options.activation,
   }
+end
+
+function ui.pressable(id, child, on_press)
+  return ui.clickable(id, child, on_press, { activation = "press" })
 end
 
 function ui.focus(id, child, options)

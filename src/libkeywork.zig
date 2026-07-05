@@ -76,5 +76,6 @@ pub const findFocusTarget = core.findFocusTarget;
 
 pub const Runtime = @import("runtime.zig").Runtime;
 pub const BackendKind = app_runner.BackendKind;
+pub const EventSourceInstaller = app_runner.EventSourceInstaller;
 pub const RunOptions = app_runner.Options;
 pub const run = app_runner.run;

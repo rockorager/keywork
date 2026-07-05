@@ -4,12 +4,66 @@ const std = @import("std");
 const keywork = @import("libkeywork");
 const lua_app = @import("lua_app.zig");
 
+pub const std_options: std.Options = .{
+    .logFn = logWithTimestamp,
+};
+
 const log = std.log.scoped(.keywork);
 
 const AppContext = keywork.AppContext;
 const AppHost = keywork.AppHost;
 const BuildScope = keywork.BuildScope;
 const Widget = keywork.Widget;
+
+fn logWithTimestamp(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const io = std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+
+    var buffer: [256]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer).terminal();
+    defer std.debug.unlockStderr();
+    logWithTimestampTerminal(level, scope, format, args, stderr) catch {};
+}
+
+fn logWithTimestampTerminal(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+    terminal: std.Io.Terminal,
+) std.Io.Writer.Error!void {
+    const unix_ms = std.Io.Clock.now(.real, std.Options.debug_io).toMilliseconds();
+    const seconds = @divTrunc(unix_ms, std.time.ms_per_s);
+    const milliseconds = @mod(unix_ms, std.time.ms_per_s);
+
+    terminal.setColor(.dim) catch {};
+    try terminal.writer.print("{d}.", .{seconds});
+    if (milliseconds < 100) try terminal.writer.writeByte('0');
+    if (milliseconds < 10) try terminal.writer.writeByte('0');
+    try terminal.writer.print("{d} ", .{milliseconds});
+
+    terminal.setColor(switch (level) {
+        .err => .red,
+        .warn => .yellow,
+        .info => .green,
+        .debug => .magenta,
+    }) catch {};
+    terminal.setColor(.bold) catch {};
+    try terminal.writer.writeAll(level.asText());
+    terminal.setColor(.reset) catch {};
+    terminal.setColor(.dim) catch {};
+    terminal.setColor(.bold) catch {};
+    if (scope != .default) try terminal.writer.print("({t})", .{scope});
+    try terminal.writer.writeAll(": ");
+    terminal.setColor(.reset) catch {};
+    try terminal.writer.print(format ++ "\n", args);
+}
 
 const DemoApp = struct {
     lua: *lua_app.App,
@@ -26,6 +80,7 @@ const DemoApp = struct {
         const self: *DemoApp = @ptrCast(@alignCast(ptr));
         var app_context = context;
         app_context.pulse = self.pulse;
+        scope.app_context = app_context;
         return self.lua.buildWidget(scope.allocator, app_context);
     }
 
@@ -34,6 +89,11 @@ const DemoApp = struct {
         if (expirations == 0) return false;
         self.pulse = !self.pulse;
         return true;
+    }
+
+    fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+        const self: *DemoApp = @ptrCast(@alignCast(ctx.?));
+        try self.lua.installEventSources(loop, runtime);
     }
 };
 
@@ -59,6 +119,8 @@ pub fn main(init: std.process.Init) !void {
         .log_writer = &stdout_writer.interface,
         .timer_interval_ms = 1000,
         .file_watch_path = run_options.script_path,
+        .event_source_context = &demo_app,
+        .install_event_sources = DemoApp.installEventSources,
     });
 
     log.debug("frame rendered", .{});

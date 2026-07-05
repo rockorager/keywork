@@ -331,6 +331,12 @@ pub const Widget = union(enum) {
         id: []const u8,
         child: *const Widget,
         on_click: ?Callback = null,
+        activation: ClickActivation = .release,
+    };
+
+    pub const ClickActivation = enum {
+        release,
+        press,
     };
 
     pub const Focus = struct {
@@ -459,6 +465,7 @@ pub const Widget = union(enum) {
         constraints: Constraints,
         theme: Theme = .default,
         interaction: InteractionState = .{},
+        app_context: AppContext = .{},
     };
 
     pub const Component = struct {
@@ -485,6 +492,8 @@ pub const Widget = union(enum) {
             update: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!void,
             build: *const fn (ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
             destroy_state: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator) void,
+            needs_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) bool = null,
+            clear_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) void = null,
         };
 
         pub fn createState(self: Stateful, allocator: std.mem.Allocator) !*anyopaque {
@@ -501,6 +510,16 @@ pub const Widget = union(enum) {
 
         pub fn destroyState(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator) void {
             self.vtable.destroy_state(self.ptr, state, allocator);
+        }
+
+        pub fn needsRebuild(self: Stateful, state: *anyopaque) bool {
+            const needs_rebuild = self.vtable.needs_rebuild orelse return false;
+            return needs_rebuild(self.ptr, state);
+        }
+
+        pub fn clearRebuild(self: Stateful, state: *anyopaque) void {
+            const clear_rebuild = self.vtable.clear_rebuild orelse return;
+            clear_rebuild(self.ptr, state);
         }
 
         pub fn clone(self: Stateful, allocator: std.mem.Allocator) !Stateful {
@@ -608,6 +627,7 @@ pub const BuildScope = struct {
     theme: Theme = .default,
     interaction: InteractionState = .{},
     actions: ?*const ActionScope = null,
+    app_context: AppContext = .{},
 };
 
 pub const widgets = struct {
@@ -629,6 +649,10 @@ pub const widgets = struct {
 
     pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
+    }
+
+    pub fn pressClickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
+        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click, .activation = .press } };
     }
 
     pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
@@ -842,6 +866,7 @@ pub const RenderNode = struct {
     text: ?[]const u8 = null,
     clickable_id: ?[]const u8 = null,
     click_callback: ?Widget.Callback = null,
+    click_activation: Widget.ClickActivation = .release,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
@@ -1300,7 +1325,7 @@ pub fn buildElementTreeScoped(
         .component => |component_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            const built = try component_widget.build(scope, buildContext(scope, constraints));
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -1312,11 +1337,13 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .component, .widget = element_widget, .children = children };
         },
         .stateful => |stateful_widget| {
+            _ = stateful_widget;
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
-            const state = try stateful_widget.createState(allocator);
-            errdefer stateful_widget.destroyState(state, allocator);
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            const retained_stateful = element_widget.stateful;
+            const state = try retained_stateful.createState(allocator);
+            errdefer retained_stateful.destroyState(state, allocator);
+            const built = try retained_stateful.build(state, scope, buildContext(scope, constraints));
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
@@ -1336,11 +1363,20 @@ pub fn buildElementTreeScoped(
                 if (initialized) destroyElementTree(allocator, &children[0]);
                 allocator.free(children);
             }
-            children[0] = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            children[0] = try custom_element.build(allocator, scope, buildContext(scope, constraints));
             initialized = true;
             return .{ .kind = .element, .widget = element_widget, .children = children };
         },
     }
+}
+
+fn buildContext(scope: *const BuildScope, constraints: Constraints) Widget.BuildContext {
+    return .{
+        .constraints = constraints,
+        .theme = scope.theme,
+        .interaction = scope.interaction,
+        .app_context = scope.app_context,
+    };
 }
 
 fn buildLinearElementTree(
@@ -1535,17 +1571,17 @@ pub fn updateElementTreeScoped(
         .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
         .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
         .component => |component_widget| {
-            const built = try component_widget.build(scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            const built = try component_widget.build(scope, buildContext(scope, constraints));
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
-            try stateful_widget.update(state, allocator, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
-            const built = try stateful_widget.build(state, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            try stateful_widget.update(state, allocator, buildContext(scope, constraints));
+            const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
         },
         .element => |custom_element| {
-            var replacement_child = try custom_element.build(allocator, scope, .{ .constraints = constraints, .theme = scope.theme, .interaction = scope.interaction });
+            var replacement_child = try custom_element.build(allocator, scope, buildContext(scope, constraints));
             errdefer destroyElementTree(allocator, &replacement_child);
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -1555,6 +1591,82 @@ pub fn updateElementTreeScoped(
             element.widget = element_widget;
         },
     }
+}
+
+pub fn rebuildDirtyElementTreeScoped(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    constraints: Constraints,
+) anyerror!bool {
+    switch (element.widget) {
+        .text,
+        .spacer,
+        .text_input,
+        .render_object,
+        .button,
+        => return false,
+
+        .keyed,
+        .box,
+        .clickable,
+        .focus,
+        .focus_scope,
+        .center,
+        .component,
+        .element,
+        .shortcuts,
+        => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
+
+        .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
+        .theme => |theme_widget| {
+            const previous_theme = scope.theme;
+            scope.theme = theme_widget.theme;
+            defer scope.theme = previous_theme;
+            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
+        },
+        .actions => |actions_widget| {
+            const previous_actions = scope.actions;
+            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = previous_actions };
+            scope.actions = &nested_actions;
+            defer scope.actions = previous_actions;
+            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
+        },
+        .row, .column => return try rebuildDirtyChildren(allocator, scope, element.children, constraints),
+        .stateful => |stateful_widget| {
+            const state = element.state orelse return error.MissingState;
+            if (stateful_widget.needsRebuild(state)) {
+                const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
+                try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
+                stateful_widget.clearRebuild(state);
+                return true;
+            }
+            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
+        },
+    }
+}
+
+fn rebuildDirtySingleChildElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    constraints: Constraints,
+) !bool {
+    std.debug.assert(element.children.len == 1);
+    return rebuildDirtyElementTreeScoped(allocator, scope, &element.children[0], constraints);
+}
+
+fn rebuildDirtyChildren(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    children: []Element,
+    constraints: Constraints,
+) !bool {
+    var rebuilt = false;
+    for (children) |*child| {
+        if (try rebuildDirtyElementTreeScoped(allocator, scope, child, constraints)) rebuilt = true;
+    }
+    return rebuilt;
 }
 
 fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
@@ -1871,6 +1983,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .id = id,
                 .child = clickable_widget.child,
                 .on_click = callback,
+                .activation = clickable_widget.activation,
             } };
         },
         .focus => |focus_widget| blk: {
@@ -2123,6 +2236,7 @@ pub fn hitTestButton(node: *const RenderNode, point: Point) ?[]const u8 {
 pub const ClickHit = struct {
     id: []const u8,
     callback: ?Widget.Callback = null,
+    activation: Widget.ClickActivation = .release,
 };
 
 pub const FocusTarget = struct {
@@ -2225,7 +2339,11 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     }
 
     if (node.kind == .clickable and node.rect.contains(point)) {
-        return .{ .id = node.clickable_id orelse return null, .callback = node.click_callback orelse return null };
+        return .{
+            .id = node.clickable_id orelse return null,
+            .callback = node.click_callback orelse return null,
+            .activation = node.click_activation,
+        };
     }
     if (node.kind == .render_object) {
         if (node.render_object) |render_object| {
@@ -2435,6 +2553,7 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .clickable_id = id,
                 .click_callback = clickable_widget.on_click,
+                .click_activation = clickable_widget.activation,
                 .children = children,
             };
         },
@@ -3147,6 +3266,22 @@ test "clickable carries opaque callback handles through hit testing" {
     try std.testing.expectEqualStrings("counter", hit.id);
     try hit.callback.?.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
+}
+
+test "clickable hit testing carries activation mode" {
+    const label: Widget = .{ .text = .{ .value = "Press" } };
+    const button: Widget = .{ .clickable = .{
+        .id = "pressable",
+        .child = &label,
+        .on_click = testCallback(),
+        .activation = .press,
+    } };
+
+    var root = try buildRenderTree(std.testing.allocator, &button, .{ .max_width = 100, .max_height = 80 });
+    defer destroyRenderTree(std.testing.allocator, &root);
+
+    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    try std.testing.expectEqual(Widget.ClickActivation.press, hit.activation);
 }
 
 test "clickable without callback is inert" {
