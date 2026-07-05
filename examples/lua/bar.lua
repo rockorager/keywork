@@ -228,31 +228,21 @@ local function read_file(path)
 end
 
 local function label(value, color)
-  return ui.text(value, { color = color or colors.foreground })
+  return ui.label(value, { color = color or colors.foreground })
 end
 
-local function icon(name, size, color)
-  return ui.icon(name, size or 18, color or colors.foreground)
-end
-
-local function pill(id, child, background)
-  return ui.gesture({
+local function status_pill(id, icon_name, text, color)
+  return ui.chip({
     id = id,
-    child = ui.box({ background = background or colors.surface },
-      ui.padding({ x = 7, y = 5 }, child)
-    ),
+    icon = icon_name,
+    label = text,
+    color = color,
+    background = colors.surface,
+    padding = { x = 7, y = 5 },
     on_tap = function()
       print("clicked " .. id)
     end,
   })
-end
-
-local function status_pill(id, icon_name, text, color)
-  local children = { icon(icon_name, 18, color) }
-  if text and text ~= "" then
-    table.insert(children, label(text, color))
-  end
-  return pill(id, ui.row(children, 6))
 end
 
 local function workspaces()
@@ -268,11 +258,12 @@ local function workspaces()
       fg = colors.background
       bg = colors.blue
     end
-    table.insert(items, ui.gesture({
+    table.insert(items, ui.chip({
       id = "workspace-" .. name,
-      child = ui.box({ background = bg },
-        ui.padding({ x = 8, y = 7 }, label(name, fg))
-      ),
+      label = name,
+      color = fg,
+      background = bg,
+      padding = { x = 8, y = 7 },
       on_tap_down = function()
         if sway.connected then
           sway_send(sway, IPC_COMMAND, 'workspace "' .. json_string(name) .. '"')
@@ -406,6 +397,7 @@ local StatusItems = ui.stateful({
 })
 
 return function(state)
+  local theme = ui.theme_for(state)
   local left = ui.row({
     gap = 10,
     children = {
@@ -420,16 +412,14 @@ return function(state)
     },
   })
 
-  return ui.box({ background = colors.background },
-    ui.padding({ all = 4 },
-      ui.row({
-        gap = 12,
-        children = {
-          left,
-          ui.spacer(),
-          StatusItems({ key = "status" }),
-        },
-      })
-    )
-  )
+  return ui.theme(theme, ui.container({ background = colors.background, padding = { all = 4 } },
+    ui.row({
+      gap = 12,
+      children = {
+        left,
+        ui.spacer(),
+        StatusItems({ key = "status" }),
+      },
+    })
+  ))
 end

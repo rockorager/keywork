@@ -1,5 +1,36 @@
 local ui = {}
 
+local light_colors = {
+  primary = 0xff6d4aff,
+  on_primary = 0xffffffff,
+  surface = 0xfff5f3ef,
+  on_surface = 0xff1b1b1f,
+  surface_variant = 0xffffffff,
+  on_surface_variant = 0xff1b1b1f,
+  outline = 0xff1b1b1f,
+  error = 0xffba1a1a,
+  on_error = 0xffffffff,
+}
+
+local dark_colors = {
+  primary = 0xff9b86ff,
+  on_primary = 0xff000000,
+  surface = 0xff202024,
+  on_surface = 0xffffffff,
+  surface_variant = 0xff2b2b30,
+  on_surface_variant = 0xffffffff,
+  outline = 0xff9b86ff,
+  error = 0xffffb4ab,
+  on_error = 0xff690005,
+}
+
+function ui.theme_for(state)
+  if state and state.color_scheme == "dark" then
+    return { color_scheme = "dark", colors = dark_colors, spacing = { xs = 4, sm = 8, md = 12, lg = 16 } }
+  end
+  return { color_scheme = "light", colors = light_colors, spacing = { xs = 4, sm = 8, md = 12, lg = 16 } }
+end
+
 function ui.text(value, style)
   style = style or {}
   return {
@@ -7,6 +38,11 @@ function ui.text(value, style)
     value = value,
     color = style.color,
   }
+end
+
+function ui.label(value, options)
+  options = options or {}
+  return ui.text(value, { color = options.color })
 end
 
 function ui.keyed(key, child)
@@ -32,13 +68,36 @@ function ui.stateful(spec)
   end
 end
 
+function ui.theme(data, child)
+  return {
+    type = "theme",
+    theme = data,
+    child = child,
+  }
+end
+
 function ui.box(style, child)
   style = style or {}
   return {
     type = "box",
     background = style.background,
+    border = style.border,
     child = child,
   }
+end
+
+function ui.container(options, child)
+  options = options or {}
+  if options.child then
+    child = options.child
+  end
+  if options.padding then
+    child = ui.padding(options.padding, child)
+  end
+  return ui.box({
+    background = options.background,
+    border = options.border,
+  }, child)
 end
 
 function ui.clickable(id, child, on_click, options)
@@ -146,6 +205,58 @@ function ui.icon(name, size, color)
     size = size or 16,
     color = color,
   }
+end
+
+function ui.icon_label(icon_name, text, options)
+  options = options or {}
+  local children = { ui.icon(icon_name, options.size or 18, options.color) }
+  if text and text ~= "" then
+    table.insert(children, ui.label(text, { color = options.color }))
+  end
+  return ui.row({ gap = options.gap or 6, children = children })
+end
+
+function ui.chip(options)
+  local child = options.child
+  if not child then
+    if options.icon then
+      child = ui.icon_label(options.icon, options.label, {
+        size = options.icon_size or options.size,
+        color = options.color,
+        gap = options.gap,
+      })
+    else
+      child = ui.label(options.label or "", { color = options.color })
+    end
+  end
+  return ui.gesture({
+    id = options.id,
+    child = ui.container({
+      background = options.background,
+      border = options.border,
+      padding = options.padding or { x = 8, y = 4 },
+    }, child),
+    on_tap = options.on_tap or options.on_pressed,
+    on_tap_down = options.on_tap_down,
+    on_tap_up = options.on_tap_up,
+    on_tap_cancel = options.on_tap_cancel,
+  })
+end
+
+function ui.icon_button(options)
+  return ui.chip({
+    id = options.id,
+    icon = options.icon,
+    icon_size = options.size,
+    color = options.color,
+    background = options.background,
+    border = options.border,
+    padding = options.padding or { all = 6 },
+    on_tap = options.on_tap or options.on_pressed,
+    on_tap_down = options.on_tap_down,
+    on_tap_up = options.on_tap_up,
+    on_tap_cancel = options.on_tap_cancel,
+  })
 end
 
 function ui.padding(insets, child)
