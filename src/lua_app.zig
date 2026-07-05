@@ -6,11 +6,13 @@ const lua_codec = @import("lua_codec.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
+const posix = std.posix;
 
 const State = keywork.AppContext;
 const BuildScope = keywork.BuildScope;
 
 const app_registry_key = "keywork.app";
+const invalid_fd: i32 = -1;
 
 const TextOptions = struct {
     color: ?keywork.Color = null,
@@ -86,17 +88,43 @@ const ParseContext = struct {
 };
 
 const LinearOptions = struct {
-    gap: f32 = 0,
+    spacing: f32 = 0,
     @"align": ?keywork.Widget.CrossAxisAlignment = null,
-    cross_align: ?keywork.Widget.CrossAxisAlignment = null,
 
     fn crossAlign(self: LinearOptions) keywork.Widget.CrossAxisAlignment {
-        return self.cross_align orelse self.@"align" orelse .start;
+        return self.@"align" orelse .start;
     }
 };
 
 const PaddingOptions = struct {
+    all: ?f32 = null,
+    x: ?f32 = null,
+    y: ?f32 = null,
+    left: ?f32 = null,
+    right: ?f32 = null,
+    top: ?f32 = null,
+    bottom: ?f32 = null,
     insets: keywork.EdgeInsets = .{},
+    padding: keywork.EdgeInsets = .{},
+
+    fn resolved(self: PaddingOptions) keywork.EdgeInsets {
+        if (self.all) |value| return keywork.EdgeInsets.all(value);
+        var result = self.insets;
+        if (self.padding.left != 0 or self.padding.right != 0 or self.padding.top != 0 or self.padding.bottom != 0) result = self.padding;
+        if (self.x) |value| {
+            result.left = value;
+            result.right = value;
+        }
+        if (self.y) |value| {
+            result.top = value;
+            result.bottom = value;
+        }
+        if (self.left) |value| result.left = value;
+        if (self.right) |value| result.right = value;
+        if (self.top) |value| result.top = value;
+        if (self.bottom) |value| result.bottom = value;
+        return result;
+    }
 };
 
 const SpacerOptions = struct {
@@ -203,23 +231,28 @@ const LuaStatefulWidget = struct {
         errdefer allocator.destroy(state);
         state.* = .{ .lua_state = self.lua_state, .state_ref = -1 };
 
+        c.lua_createtable(self.lua_state, 0, 0);
+        const state_table = c.lua_gettop(self.lua_state);
+        errdefer pop(self.lua_state, 1);
+        installStateMethods(self.lua_state, self.app, state, state_table);
+        setStateProps(self.lua_state, state_table, self.props_ref);
+
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         const spec = c.lua_gettop(self.lua_state);
-        defer pop(self.lua_state, 1);
-
+        c.lua_createtable(self.lua_state, 0, 1);
+        c.lua_pushvalue(self.lua_state, spec);
+        c.lua_setfield(self.lua_state, -2, "__index");
+        _ = c.lua_setmetatable(self.lua_state, state_table);
         c.lua_getfield(self.lua_state, spec, "init");
         if (c.lua_isnil(self.lua_state, -1)) {
             pop(self.lua_state, 1);
-            c.lua_createtable(self.lua_state, 0, 0);
         } else {
+            c.lua_pushvalue(self.lua_state, state_table);
             c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
-            if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful init failed");
-            if (c.lua_type(self.lua_state, -1) != c.LUA_TTABLE) return error.StatefulInitReturnedInvalidValue;
+            if (c.lua_pcall(self.lua_state, 2, 0, 0) != 0) return failLuaCall(self.lua_state, "stateful init failed");
         }
-        errdefer pop(self.lua_state, 1);
+        pop(self.lua_state, 1);
 
-        installStateMethods(self.lua_state, self.app, state, c.lua_gettop(self.lua_state));
-        setStateProps(self.lua_state, c.lua_gettop(self.lua_state), self.props_ref);
         state.state_ref = c.luaL_ref(self.lua_state, c.LUA_REGISTRYINDEX);
         return state;
     }
@@ -271,13 +304,13 @@ const LuaStatefulWidget = struct {
 
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         const spec = c.lua_gettop(self.lua_state);
-        c.lua_getfield(self.lua_state, spec, "destroy");
+        c.lua_getfield(self.lua_state, spec, "dispose");
         if (c.lua_isnil(self.lua_state, -1)) {
             pop(self.lua_state, 2);
         } else {
             c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
             if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
-                failLuaCall(self.lua_state, "stateful destroy failed") catch {};
+                failLuaCall(self.lua_state, "stateful dispose failed") catch {};
             }
             pop(self.lua_state, 1);
         }
@@ -341,6 +374,8 @@ pub const App = struct {
     script_ref: c_int = -1,
     script_dirty: bool = true,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
+    timers: std.ArrayList(*LuaTimer) = .empty,
+    processes: std.ArrayList(*LuaProcess) = .empty,
     event_loop: ?*keywork.event_loop.EventLoop = null,
     runtime: ?*keywork.Runtime = null,
 
@@ -369,18 +404,25 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (self.fd_watches.items) |watch| watch.destroy(self.allocator, self.state);
         self.fd_watches.deinit(self.allocator);
+        for (self.timers.items) |timer| timer.destroy(self.allocator, self.state);
+        self.timers.deinit(self.allocator);
+        for (self.processes.items) |process| process.destroy(self.allocator, self.state);
+        self.processes.deinit(self.allocator);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_close(self.state);
         self.allocator.free(self.path);
     }
 
-    pub fn installEventSources(self: *App, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+    pub fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+        const self: *App = @ptrCast(@alignCast(ctx.?));
         self.event_loop = loop;
         self.runtime = runtime;
         loop.addFileWatch(self.path, self, scriptChanged) catch |err| {
             if (err != error.FileWatchNotFound) std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ self.path, err });
         };
         for (self.fd_watches.items) |watch| try self.registerFdWatch(watch);
+        for (self.timers.items) |timer| try self.registerTimer(timer);
+        for (self.processes.items) |process| try self.registerProcess(process);
     }
 
     pub fn host(self: *App) keywork.AppHost {
@@ -427,7 +469,7 @@ pub const App = struct {
         return err;
     }
 
-    fn addFdWatch(self: *App, fd: i32, events: u32, ref: c_int) !void {
+    fn addFdWatch(self: *App, fd: i32, events: u32, ref: c_int) !*FdWatch {
         const watch = try self.allocator.create(FdWatch);
         errdefer self.allocator.destroy(watch);
         watch.* = .{ .app = self, .fd = fd, .events = events, .ref = ref };
@@ -436,10 +478,11 @@ pub const App = struct {
         try self.fd_watches.append(self.allocator, watch);
         errdefer _ = self.fd_watches.pop();
         try self.registerFdWatch(watch);
+        return watch;
     }
 
     fn registerFdWatch(self: *App, watch: *FdWatch) !void {
-        if (watch.registered) return;
+        if (watch.registered or watch.canceled) return;
         const loop = self.event_loop orelse return;
         try loop.addFd(.{
             .fd = watch.fd,
@@ -449,6 +492,82 @@ pub const App = struct {
         });
         watch.registered = true;
         try fdWatchCallback(watch, loop, linux.EPOLL.IN);
+    }
+
+    fn addTimerWithDelay(self: *App, delay_ms: u64, interval_ms: u64, ref: c_int) !*LuaTimer {
+        const timer = try self.allocator.create(LuaTimer);
+        errdefer self.allocator.destroy(timer);
+        timer.* = .{ .app = self, .delay_ms = delay_ms, .interval_ms = interval_ms, .ref = ref };
+        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+
+        try self.timers.append(self.allocator, timer);
+        errdefer _ = self.timers.pop();
+        try self.registerTimer(timer);
+        return timer;
+    }
+
+    fn registerTimer(self: *App, timer: *LuaTimer) !void {
+        if (timer.registered or timer.canceled) return;
+        const loop = self.event_loop orelse return;
+        const event_timer = try loop.addTimer(timer, luaTimerCallback);
+        errdefer event_timer.disarm();
+        try event_timer.arm(timer.delay_ms, timer.interval_ms);
+        timer.timer = event_timer;
+        timer.registered = true;
+    }
+
+    fn addProcess(self: *App, spec: SpawnSpec, callbacks: ProcessCallbacks) !*LuaProcess {
+        var spawned = try LuaProcess.spawn(self, spec, callbacks);
+        var moved = false;
+        errdefer if (!moved) spawned.cleanup(self.state);
+
+        const process = try self.allocator.create(LuaProcess);
+        process.* = spawned;
+        moved = true;
+        errdefer process.deinit(self.allocator, self.state);
+
+        process.stdout_pipe.process = process;
+        process.stderr_pipe.process = process;
+
+        try self.processes.append(self.allocator, process);
+        errdefer _ = self.processes.pop();
+        try self.registerProcess(process);
+        return process;
+    }
+
+    fn registerProcess(self: *App, process: *LuaProcess) !void {
+        if (process.registered or process.canceled or process.exited) return;
+        const loop = self.event_loop orelse return;
+        if (process.stdout_pipe.fd != invalid_fd) try loop.addFd(.{
+            .fd = process.stdout_pipe.fd,
+            .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR,
+            .ctx = &process.stdout_pipe,
+            .callback = processPipeCallback,
+        });
+        if (process.stderr_pipe.fd != invalid_fd) try loop.addFd(.{
+            .fd = process.stderr_pipe.fd,
+            .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR,
+            .ctx = &process.stderr_pipe,
+            .callback = processPipeCallback,
+        });
+        try loop.addFd(.{
+            .fd = process.pidfd,
+            .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR,
+            .ctx = process,
+            .callback = processExitCallback,
+        });
+        process.registered = true;
+        if (process.stdout_pipe.fd != invalid_fd) try drainProcessPipe(&process.stdout_pipe);
+        if (process.stderr_pipe.fd != invalid_fd) try drainProcessPipe(&process.stderr_pipe);
+    }
+
+    fn removeProcess(self: *App, process: *LuaProcess) void {
+        for (self.processes.items, 0..) |item, index| {
+            if (item == process) {
+                _ = self.processes.swapRemove(index);
+                return;
+            }
+        }
     }
 };
 
@@ -466,6 +585,20 @@ const FdWatch = struct {
     events: u32,
     ref: c_int,
     registered: bool = false,
+    canceled: bool = false,
+
+    fn cancel(self: *FdWatch, lua_state: *c.lua_State) void {
+        if (self.canceled) return;
+        self.canceled = true;
+        if (self.registered) {
+            if (self.app.event_loop) |loop| loop.removeFd(self.fd);
+            self.registered = false;
+        }
+        if (self.ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+            self.ref = -1;
+        }
+    }
 
     fn destroy(self: *FdWatch, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
@@ -473,8 +606,259 @@ const FdWatch = struct {
     }
 };
 
+const LuaTimer = struct {
+    app: *App,
+    delay_ms: u64,
+    interval_ms: u64,
+    ref: c_int,
+    timer: ?*keywork.event_loop.EventLoop.Timer = null,
+    registered: bool = false,
+    canceled: bool = false,
+
+    fn cancel(self: *LuaTimer, lua_state: *c.lua_State) void {
+        if (self.canceled) return;
+        self.canceled = true;
+        if (self.timer) |timer| timer.disarm();
+        if (self.ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+            self.ref = -1;
+        }
+    }
+
+    fn destroy(self: *LuaTimer, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        allocator.destroy(self);
+    }
+};
+
+const SpawnSpec = struct {
+    argv: []const []const u8,
+    stdout_pipe: bool,
+    stderr_pipe: bool,
+};
+
+const ProcessCallbacks = struct {
+    stdout_ref: c_int = -1,
+    stderr_ref: c_int = -1,
+    exit_ref: c_int = -1,
+
+    fn unref(self: *ProcessCallbacks, lua_state: *c.lua_State) void {
+        if (self.stdout_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stdout_ref);
+            self.stdout_ref = -1;
+        }
+        if (self.stderr_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stderr_ref);
+            self.stderr_ref = -1;
+        }
+        if (self.exit_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
+            self.exit_ref = -1;
+        }
+    }
+};
+
+const ProcessPipeKind = enum {
+    stdout,
+    stderr,
+};
+
+const ProcessPipe = struct {
+    process: *LuaProcess = undefined,
+    kind: ProcessPipeKind,
+    fd: i32 = invalid_fd,
+
+    fn callbackRef(self: *ProcessPipe) c_int {
+        return switch (self.kind) {
+            .stdout => self.process.stdout_ref,
+            .stderr => self.process.stderr_ref,
+        };
+    }
+};
+
+const LuaProcess = struct {
+    app: *App,
+    pid: linux.pid_t,
+    pidfd: i32,
+    stdout_pipe: ProcessPipe = .{ .kind = .stdout },
+    stderr_pipe: ProcessPipe = .{ .kind = .stderr },
+    stdout_ref: c_int = -1,
+    stderr_ref: c_int = -1,
+    exit_ref: c_int = -1,
+    handle_ref: c_int = -1,
+    registered: bool = false,
+    canceled: bool = false,
+    exited: bool = false,
+
+    fn spawn(app: *App, spec: SpawnSpec, callbacks: ProcessCallbacks) !LuaProcess {
+        var stdout_pipe: ?[2]i32 = null;
+        var stderr_pipe: ?[2]i32 = null;
+        if (spec.stdout_pipe) stdout_pipe = try createPipe();
+        errdefer if (stdout_pipe) |pipe| closePipe(pipe);
+        if (spec.stderr_pipe) stderr_pipe = try createPipe();
+        errdefer if (stderr_pipe) |pipe| closePipe(pipe);
+
+        var argv = try prepareArgv(app.allocator, spec.argv);
+        defer argv.deinit(app.allocator);
+        const executable = try resolveExecutable(app.allocator, spec.argv[0]);
+        defer app.allocator.free(executable);
+
+        const fork_result = linux.fork();
+        switch (linux.errno(fork_result)) {
+            .SUCCESS => {},
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => return error.ForkFailed,
+        }
+
+        if (fork_result == 0) {
+            if (stdout_pipe) |pipe| {
+                _ = linux.close(pipe[0]);
+                dupTo(pipe[1], posix.STDOUT_FILENO) catch linux.exit(127);
+            }
+            if (stderr_pipe) |pipe| {
+                _ = linux.close(pipe[0]);
+                dupTo(pipe[1], posix.STDERR_FILENO) catch linux.exit(127);
+            }
+            _ = linux.execve(executable.ptr, argv.ptr, std.c.environ);
+            linux.exit(127);
+        }
+
+        const pid: linux.pid_t = @intCast(fork_result);
+        errdefer _ = linux.kill(pid, .TERM);
+        var result: LuaProcess = .{
+            .app = app,
+            .pid = pid,
+            .pidfd = try linuxFd(linux.pidfd_open(pid, 0)),
+            .stdout_ref = callbacks.stdout_ref,
+            .stderr_ref = callbacks.stderr_ref,
+            .exit_ref = callbacks.exit_ref,
+        };
+        errdefer {
+            if (result.pidfd != invalid_fd) _ = linux.close(result.pidfd);
+        }
+
+        if (stdout_pipe) |pipe| {
+            _ = linux.close(pipe[1]);
+            result.stdout_pipe.fd = pipe[0];
+            errdefer {
+                if (result.stdout_pipe.fd != invalid_fd) _ = linux.close(result.stdout_pipe.fd);
+            }
+            try setNonblocking(result.stdout_pipe.fd);
+        }
+        if (stderr_pipe) |pipe| {
+            _ = linux.close(pipe[1]);
+            result.stderr_pipe.fd = pipe[0];
+            errdefer {
+                if (result.stderr_pipe.fd != invalid_fd) _ = linux.close(result.stderr_pipe.fd);
+            }
+            try setNonblocking(result.stderr_pipe.fd);
+        }
+        return result;
+    }
+
+    fn cancel(self: *LuaProcess, lua_state: *c.lua_State) void {
+        if (self.canceled or self.exited) return;
+        self.canceled = true;
+        _ = linux.kill(self.pid, .TERM);
+        self.closeOutputFds();
+        self.clearRefs(lua_state);
+    }
+
+    fn complete(self: *LuaProcess, lua_state: *c.lua_State, status: u32) !void {
+        if (self.exited) return;
+        self.exited = true;
+        try drainProcessPipe(&self.stdout_pipe);
+        try drainProcessPipe(&self.stderr_pipe);
+
+        if (!self.canceled and self.exit_ref >= 0) {
+            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
+            pushProcessResult(lua_state, status);
+            if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
+                failLuaCall(lua_state, "process exit callback failed") catch {};
+                return error.LuaCallbackFailed;
+            }
+        }
+    }
+
+    fn closeFds(self: *LuaProcess) void {
+        if (self.app.event_loop) |loop| {
+            if (self.stdout_pipe.fd != invalid_fd) loop.removeFd(self.stdout_pipe.fd);
+            if (self.stderr_pipe.fd != invalid_fd) loop.removeFd(self.stderr_pipe.fd);
+            if (self.pidfd != invalid_fd) loop.removeFd(self.pidfd);
+        }
+        self.closeOutputFds();
+        if (self.pidfd != invalid_fd) {
+            _ = linux.close(self.pidfd);
+            self.pidfd = invalid_fd;
+        }
+    }
+
+    fn closeOutputFds(self: *LuaProcess) void {
+        if (self.app.event_loop) |loop| {
+            if (self.stdout_pipe.fd != invalid_fd) loop.removeFd(self.stdout_pipe.fd);
+            if (self.stderr_pipe.fd != invalid_fd) loop.removeFd(self.stderr_pipe.fd);
+        }
+        if (self.stdout_pipe.fd != invalid_fd) {
+            _ = linux.close(self.stdout_pipe.fd);
+            self.stdout_pipe.fd = invalid_fd;
+        }
+        if (self.stderr_pipe.fd != invalid_fd) {
+            _ = linux.close(self.stderr_pipe.fd);
+            self.stderr_pipe.fd = invalid_fd;
+        }
+    }
+
+    fn clearRefs(self: *LuaProcess, lua_state: *c.lua_State) void {
+        if (self.stdout_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stdout_ref);
+            self.stdout_ref = -1;
+        }
+        if (self.stderr_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stderr_ref);
+            self.stderr_ref = -1;
+        }
+        if (self.exit_ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
+            self.exit_ref = -1;
+        }
+        if (self.handle_ref >= 0) {
+            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.handle_ref);
+            c.lua_pushcclosure(lua_state, luaNoop, 0);
+            c.lua_setfield(lua_state, -2, "cancel");
+            pop(lua_state, 1);
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.handle_ref);
+            self.handle_ref = -1;
+        }
+    }
+
+    fn deinit(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.cleanup(lua_state);
+        allocator.destroy(self);
+    }
+
+    fn cleanup(self: *LuaProcess, lua_state: *c.lua_State) void {
+        if (!self.exited and !self.canceled) {
+            _ = linux.kill(self.pid, .TERM);
+            var status: u32 = 0;
+            _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
+        }
+        self.closeFds();
+        self.clearRefs(lua_state);
+    }
+
+    fn destroy(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.cancel(lua_state);
+        if (!self.exited) {
+            var status: u32 = 0;
+            _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
+        }
+        self.deinit(allocator, lua_state);
+    }
+};
+
 fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u32) !void {
     const watch: *FdWatch = @ptrCast(@alignCast(ctx));
+    if (watch.canceled or watch.ref < 0) return;
     const app = watch.app;
     c.lua_rawgeti(app.state, c.LUA_REGISTRYINDEX, watch.ref);
     c.lua_pushinteger(app.state, watch.fd);
@@ -492,6 +876,100 @@ fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u3
         const runtime = app.runtime orelse return;
         try runtime.invalidate();
     }
+}
+
+fn luaTimerCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, expirations: u64) !void {
+    const timer: *LuaTimer = @ptrCast(@alignCast(ctx));
+    if (timer.canceled or timer.ref < 0 or expirations == 0) return;
+    const app = timer.app;
+    c.lua_rawgeti(app.state, c.LUA_REGISTRYINDEX, timer.ref);
+    c.lua_pushinteger(app.state, @intCast(expirations));
+    if (c.lua_pcall(app.state, 1, 0, 0) != 0) {
+        var len: usize = 0;
+        const message_ptr = c.lua_tolstring(app.state, -1, &len);
+        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("timer callback failed: {s}", .{message[0..len]});
+        pop(app.state, 1);
+        return error.LuaCallbackFailed;
+    }
+    if (timer.interval_ms == 0) timer.cancel(app.state);
+}
+
+fn processPipeCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+    const pipe: *ProcessPipe = @ptrCast(@alignCast(ctx));
+    try drainProcessPipe(pipe);
+}
+
+fn processExitCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+    const process: *LuaProcess = @ptrCast(@alignCast(ctx));
+    if (process.exited) return;
+    var status: u32 = 0;
+    const result = linux.waitpid(process.pid, &status, linux.W.NOHANG);
+    switch (linux.errno(result)) {
+        .SUCCESS => {},
+        .CHILD => {
+            process.closeFds();
+            process.clearRefs(process.app.state);
+            process.app.removeProcess(process);
+            process.app.allocator.destroy(process);
+            return;
+        },
+        else => return error.WaitPidFailed,
+    }
+    if (result == 0) return;
+
+    const app = process.app;
+    process.complete(app.state, status) catch |err| {
+        process.closeFds();
+        process.clearRefs(app.state);
+        app.removeProcess(process);
+        app.allocator.destroy(process);
+        return err;
+    };
+    process.closeFds();
+    process.clearRefs(app.state);
+    app.removeProcess(process);
+    app.allocator.destroy(process);
+}
+
+fn drainProcessPipe(pipe: *ProcessPipe) !void {
+    if (pipe.fd == invalid_fd) return;
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const result = linux.read(pipe.fd, &buffer, buffer.len);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) {
+                    closeProcessPipe(pipe);
+                    return;
+                }
+                try callProcessChunk(pipe, buffer[0..result]);
+            },
+            .AGAIN => return,
+            else => {
+                closeProcessPipe(pipe);
+                return;
+            },
+        }
+    }
+}
+
+fn callProcessChunk(pipe: *ProcessPipe, chunk: []const u8) !void {
+    const ref = pipe.callbackRef();
+    if (ref < 0 or pipe.process.canceled) return;
+    const lua_state = pipe.process.app.state;
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
+    c.lua_pushlstring(lua_state, chunk.ptr, chunk.len);
+    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
+        failLuaCall(lua_state, "process output callback failed") catch {};
+        return error.LuaCallbackFailed;
+    }
+}
+
+fn closeProcessPipe(pipe: *ProcessPipe) void {
+    if (pipe.fd == invalid_fd) return;
+    if (pipe.process.app.event_loop) |loop| loop.removeFd(pipe.fd);
+    _ = linux.close(pipe.fd);
+    pipe.fd = invalid_fd;
 }
 
 fn installUi(lua_state: *c.lua_State) void {
@@ -518,13 +996,44 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_createtable(lua_state, 0, 2);
     const table = c.lua_gettop(lua_state);
 
+    c.lua_createtable(lua_state, 0, 3);
+    const loop_table = c.lua_gettop(lua_state);
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaLoopTimer, 1);
+    c.lua_setfield(lua_state, loop_table, "timer");
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaWatchFd, 1);
-    c.lua_setfield(lua_state, table, "watch_fd");
+    c.lua_setfield(lua_state, loop_table, "fd");
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaSpawn, 1);
+    c.lua_setfield(lua_state, loop_table, "spawn");
+    c.lua_setfield(lua_state, table, "loop");
 
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaInvalidate, 1);
     c.lua_setfield(lua_state, table, "invalidate");
+    return 1;
+}
+
+fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
+    const interval = optionalSecondsField(lua_state, 1, "interval");
+    const delay = optionalSecondsField(lua_state, 1, "delay") orelse interval;
+    const delay_seconds = delay orelse return c.luaL_error(lua_state, "timer requires delay or interval");
+    const delay_ms = secondsToMilliseconds(delay_seconds) catch return c.luaL_error(lua_state, "invalid timer delay");
+    const interval_ms = if (interval) |seconds| secondsToMilliseconds(seconds) catch return c.luaL_error(lua_state, "invalid timer interval") else 0;
+
+    c.lua_pushvalue(lua_state, 2);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    const timer = app.addTimerWithDelay(delay_ms, interval_ms, ref) catch |err| {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        std.log.scoped(.keywork_luajit).warn("timer failed: {}", .{err});
+        return c.luaL_error(lua_state, "timer failed");
+    };
+    pushTimerHandle(lua_state, timer);
     return 1;
 }
 
@@ -533,20 +1042,102 @@ fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     const fd_int = c.luaL_checkinteger(lua_state, 1);
     if (fd_int < 0 or fd_int > std.math.maxInt(i32)) return c.luaL_error(lua_state, "invalid fd");
-    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
-    const events: u32 = if (c.lua_isnumber(lua_state, 3) != 0)
-        @intCast(c.lua_tointeger(lua_state, 3))
-    else
-        linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR;
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
+    var events: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
+    if (boolField(lua_state, 2, "read")) events |= linux.EPOLL.IN;
+    if (boolField(lua_state, 2, "write")) events |= linux.EPOLL.OUT;
+    if (events == (linux.EPOLL.HUP | linux.EPOLL.ERR)) events |= linux.EPOLL.IN;
 
-    c.lua_pushvalue(lua_state, 2);
+    c.lua_pushvalue(lua_state, 3);
     const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-    app.addFdWatch(@intCast(fd_int), events, ref) catch |err| {
+    const watch = app.addFdWatch(@intCast(fd_int), events, ref) catch |err| {
         c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
-        std.log.scoped(.keywork_luajit).warn("watch_fd failed: {}", .{err});
-        return c.luaL_error(lua_state, "watch_fd failed");
+        std.log.scoped(.keywork_luajit).warn("loop.fd failed: {}", .{err});
+        return c.luaL_error(lua_state, "loop.fd failed");
     };
+    pushFdWatchHandle(lua_state, watch);
+    return 1;
+}
+
+fn pushTimerHandle(lua_state: *c.lua_State, timer: *LuaTimer) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, timer);
+    c.lua_pushcclosure(lua_state, luaCancelTimer, 1);
+    c.lua_setfield(lua_state, -2, "cancel");
+}
+
+fn pushFdWatchHandle(lua_state: *c.lua_State, watch: *FdWatch) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, watch);
+    c.lua_pushcclosure(lua_state, luaCancelFdWatch, 1);
+    c.lua_setfield(lua_state, -2, "cancel");
+}
+
+fn pushProcessHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, process);
+    c.lua_pushcclosure(lua_state, luaCancelProcess, 1);
+    c.lua_setfield(lua_state, -2, "cancel");
+    c.lua_pushvalue(lua_state, -1);
+    process.handle_ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const timer: *LuaTimer = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    timer.cancel(lua_state);
     return 0;
+}
+
+fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const watch: *FdWatch = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    watch.cancel(lua_state);
+    return 0;
+}
+
+fn luaCancelProcess(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const process: *LuaProcess = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    process.cancel(lua_state);
+    return 0;
+}
+
+fn luaNoop(_: ?*c.lua_State) callconv(.c) c_int {
+    return 0;
+}
+
+fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+
+    const argv = parseArgv(lua_state, app.allocator, 1) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("spawn argv failed: {}", .{err});
+        return c.luaL_error(lua_state, "invalid spawn argv");
+    };
+    defer freeArgv(app.allocator, argv);
+
+    var callbacks: ProcessCallbacks = .{};
+    errdefer callbacks.unref(lua_state);
+    callbacks.stdout_ref = tableFunctionRef(lua_state, 2, "stdout") catch -1;
+    callbacks.stderr_ref = tableFunctionRef(lua_state, 2, "stderr") catch -1;
+    callbacks.exit_ref = tableFunctionRef(lua_state, 2, "exit") catch -1;
+
+    const spec: SpawnSpec = .{
+        .argv = argv,
+        .stdout_pipe = std.mem.eql(u8, stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
+        .stderr_pipe = std.mem.eql(u8, stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
+    };
+    const process = app.addProcess(spec, callbacks) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("loop.spawn failed: {}", .{err});
+        return c.luaL_error(lua_state, "loop.spawn failed");
+    };
+    callbacks = .{};
+    pushProcessHandle(lua_state, process);
+    return 1;
 }
 
 fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -599,10 +1190,8 @@ fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
-    c.lua_createtable(lua_state, 0, 5);
+    c.lua_createtable(lua_state, 0, 4);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushboolean(lua_state, if (state.pulse) 1 else 0);
-    c.lua_setfield(lua_state, table, "pulse");
     c.lua_pushlstring(lua_state, state.input_text.ptr, state.input_text.len);
     c.lua_setfield(lua_state, table, "input_text");
     c.lua_pushnumber(lua_state, state.window_width);
@@ -824,12 +1413,12 @@ fn parseWidget(
     if (std.mem.eql(u8, kind, "row")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
-        return .{ .row = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
+        return .{ .row = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "column")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
-        return .{ .column = .{ .children = children, .gap = options.gap, .cross_align = options.crossAlign() } };
+        return .{ .column = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign() } };
     }
     if (std.mem.eql(u8, kind, "padding")) {
         const options = try lua_codec.decode(PaddingOptions, lua_state, table, allocator);
@@ -838,7 +1427,7 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
-        return .{ .padding = .{ .insets = options.insets, .child = child } };
+        return .{ .padding = .{ .insets = options.resolved(), .child = child } };
     }
     if (std.mem.eql(u8, kind, "center")) {
         const child = try allocator.create(keywork.Widget);
@@ -978,6 +1567,168 @@ fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]con
     const value = try getStringField(lua_state, table, key);
     defer pop(lua_state, 1);
     return value;
+}
+
+fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
+    const value = try stringFromStack(lua_state, index);
+    return try allocator.dupe(u8, value);
+}
+
+fn boolField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) bool {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    return c.lua_toboolean(lua_state, -1) != 0;
+}
+
+fn optionalSecondsField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?f64 {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    if (c.lua_isnumber(lua_state, -1) == 0) return null;
+    return c.lua_tonumber(lua_state, -1);
+}
+
+fn secondsToMilliseconds(seconds: f64) !u64 {
+    if (!std.math.isFinite(seconds) or seconds <= 0) return error.InvalidTimerInterval;
+    const milliseconds = @ceil(seconds * std.time.ms_per_s);
+    if (milliseconds > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.InvalidTimerInterval;
+    return @intFromFloat(milliseconds);
+}
+
+fn tableFunctionRef(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_int {
+    c.lua_getfield(lua_state, table, key);
+    if (c.lua_isnil(lua_state, -1)) {
+        pop(lua_state, 1);
+        return -1;
+    }
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) {
+        pop(lua_state, 1);
+        return error.ExpectedLuaFunction;
+    }
+    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+fn parseArgv(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) ![]const []const u8 {
+    c.lua_getfield(lua_state, table, "argv");
+    defer pop(lua_state, 1);
+    const argv_table = absoluteIndex(lua_state, -1);
+    try expectType(lua_state, argv_table, c.LUA_TTABLE);
+    const count: usize = @intCast(c.lua_objlen(lua_state, argv_table));
+    if (count == 0) return error.EmptyArgv;
+    const argv = try allocator.alloc([]const u8, count);
+    errdefer freeArgv(allocator, argv);
+    for (argv, 0..) |*arg, index| {
+        c.lua_rawgeti(lua_state, argv_table, @intCast(index + 1));
+        defer pop(lua_state, 1);
+        arg.* = try dupeStringFromStack(lua_state, allocator, -1);
+    }
+    return argv;
+}
+
+fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| allocator.free(arg);
+    allocator.free(argv);
+}
+
+const PreparedArgv = struct {
+    ptr: [*:null]?[*:0]const u8,
+    values: []?[*:0]const u8,
+    strings: [][:0]u8,
+
+    fn deinit(self: *PreparedArgv, allocator: std.mem.Allocator) void {
+        for (self.strings) |value| allocator.free(value);
+        allocator.free(self.strings);
+        allocator.free(self.values);
+    }
+};
+
+fn prepareArgv(allocator: std.mem.Allocator, argv: []const []const u8) !PreparedArgv {
+    const values = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    errdefer allocator.free(values);
+    const strings = try allocator.alloc([:0]u8, argv.len);
+    errdefer allocator.free(strings);
+    var initialized: usize = 0;
+    errdefer for (strings[0..initialized]) |value| allocator.free(value);
+    for (argv, 0..) |arg, index| {
+        strings[index] = try allocator.dupeZ(u8, arg);
+        initialized += 1;
+        values[index] = strings[index].ptr;
+    }
+    return .{ .ptr = values.ptr, .values = values, .strings = strings };
+}
+
+fn resolveExecutable(allocator: std.mem.Allocator, name: []const u8) ![:0]u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return allocator.dupeZ(u8, name);
+    const path = getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    var it = std.mem.splitScalar(u8, path, ':');
+    while (it.next()) |dir| {
+        const resolved = try std.fs.path.joinZ(allocator, &.{ if (dir.len == 0) "." else dir, name });
+        errdefer allocator.free(resolved);
+        if (isExecutable(resolved)) return resolved;
+        allocator.free(resolved);
+    }
+    return error.FileNotFound;
+}
+
+fn getenv(name: []const u8) ?[]const u8 {
+    var index: usize = 0;
+    while (std.c.environ[index]) |entry_z| : (index += 1) {
+        const entry = std.mem.span(entry_z);
+        if (entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name)) return entry[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn isExecutable(path: [:0]const u8) bool {
+    return linux.errno(linux.access(path.ptr, linux.X_OK)) == .SUCCESS;
+}
+
+fn createPipe() ![2]i32 {
+    var fds: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    return fds;
+}
+
+fn closePipe(pipe: [2]i32) void {
+    _ = linux.close(pipe[0]);
+    _ = linux.close(pipe[1]);
+}
+
+fn dupTo(old: i32, new: i32) !void {
+    _ = try linuxFd(linux.dup2(old, new));
+}
+
+fn setNonblocking(fd: i32) !void {
+    const flags = try linuxFd(linux.fcntl(fd, linux.F.GETFL, 0));
+    try linuxVoid(linux.fcntl(fd, linux.F.SETFL, @as(usize, @intCast(flags)) | linux.SOCK.NONBLOCK));
+}
+
+fn pushProcessResult(lua_state: *c.lua_State, status: u32) void {
+    c.lua_createtable(lua_state, 0, 3);
+    const table = c.lua_gettop(lua_state);
+    if (linux.W.IFEXITED(status)) {
+        c.lua_pushinteger(lua_state, linux.W.EXITSTATUS(status));
+        c.lua_setfield(lua_state, table, "code");
+    } else if (linux.W.IFSIGNALED(status)) {
+        c.lua_pushinteger(lua_state, @intFromEnum(linux.W.TERMSIG(status)));
+        c.lua_setfield(lua_state, table, "signal");
+    }
+    c.lua_pushboolean(lua_state, if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "ok");
+}
+
+fn linuxFd(result: usize) !i32 {
+    return switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        else => error.LinuxSyscallFailed,
+    };
+}
+
+fn linuxVoid(result: usize) !void {
+    return switch (linux.errno(result)) {
+        .SUCCESS => {},
+        else => error.LinuxSyscallFailed,
+    };
 }
 
 fn tableRefField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_int {
@@ -1226,8 +1977,8 @@ test "lua stateful widget set_state rebuilds retained subtree" {
     const script =
         \\local ui = require("ui")
         \\local Counter = ui.stateful({
-        \\  init = function()
-        \\    return { count = 0 }
+        \\  init = function(self)
+        \\    self.count = 0
         \\  end,
         \\  build = function(self, state)
         \\    return ui.clickable("counter", ui.text(tostring(self.count)), function()
@@ -1270,4 +2021,193 @@ test "lua stateful widget set_state rebuilds retained subtree" {
 
     try runtime.click(.{ .x = 2, .y = 2 });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"1\"") != null);
+}
+
+test "lua stateful widget dispose runs when removed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local ui = require("ui")
+        \\disposed = false
+        \\local Child = ui.stateful({
+        \\  dispose = function(self)
+        \\    disposed = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    return ui.clickable("remove", ui.text("remove"), self.props.on_remove)
+        \\  end,
+        \\})
+        \\local App = ui.stateful({
+        \\  init = function(self)
+        \\    self.show = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    if self.show then
+        \\      return Child({ key = "child", on_remove = function()
+        \\        self:set_state(function(s)
+        \\          s.show = false
+        \\        end)
+        \\      end })
+        \\    end
+        \\    return ui.text("gone")
+        \\  end,
+        \\})
+        \\return App({ key = "app" })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dispose.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dispose.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.runtime = &runtime;
+
+    try runtime.repaint();
+    try runtime.click(.{ .x = 2, .y = 2 });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"gone\"") != null);
+
+    c.lua_getglobal(app.state, "disposed");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+}
+
+test "lua stateful build context includes theme" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local ui = require("ui")
+        \\local App = ui.stateful({
+        \\  build = function(self, context)
+        \\    return ui.theme(context.theme, ui.label(context.theme.color_scheme))
+        \\  end,
+        \\})
+        \\return App({ key = "app" })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "theme-context.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "theme-context.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .dark,
+    );
+    defer runtime.deinit();
+
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"dark\"") != null);
+}
+
+test "lua loop spawn captures stdout and exit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local ui = require("ui")
+        \\local keywork = require("keywork")
+        \\spawn_done = false
+        \\spawn_output = ""
+        \\local App = ui.stateful({
+        \\  init = function(self)
+        \\    self.proc = keywork.loop.spawn({
+        \\      argv = { "/usr/bin/printf", "hello" },
+        \\      stdout = "pipe",
+        \\      stderr = "ignore",
+        \\    }, {
+        \\      stdout = function(chunk)
+        \\        spawn_output = spawn_output .. chunk
+        \\      end,
+        \\      exit = function(result)
+        \\        spawn_done = result.ok and result.code == 0
+        \\      end,
+        \\    })
+        \\  end,
+        \\  dispose = function(self)
+        \\    if self.proc then
+        \\      self.proc:cancel()
+        \\    end
+        \\  end,
+        \\  build = function(self, state)
+        \\    return ui.text("spawn")
+        \\  end,
+        \\})
+        \\return App({ key = "app" })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spawn.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "spawn.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.repaint();
+
+    const SpawnTest = struct {
+        app: *App,
+        ticks: usize = 0,
+
+        fn callback(ctx: *anyopaque, loop: *keywork.event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "spawn_done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 1000) loop.quit();
+        }
+    };
+
+    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try App.installEventSources(&app, &loop, &runtime);
+    var context: SpawnTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, SpawnTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "spawn_done");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    c.lua_getglobal(app.state, "spawn_output");
+    defer pop(app.state, 1);
+    const value = try stringFromStack(app.state, -1);
+    try std.testing.expectEqualStrings("hello", value);
 }

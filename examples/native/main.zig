@@ -11,20 +11,15 @@ const widgets = keywork.widgets;
 
 const NativeApp = struct {
     count: u32 = 0,
-    pulse: bool = false,
 
     fn host(self: *NativeApp) AppHost {
-        return .{ .ptr = self, .vtable = &.{
-            .build_widget = buildWidget,
-            .timer = timer,
-        } };
+        return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
     }
 
     fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !Widget {
         const self: *NativeApp = @ptrCast(@alignCast(ptr));
         const allocator = scope.allocator;
         const count_label = try std.fmt.allocPrint(allocator, "Count: {d}", .{self.count});
-        const pulse_label = if (self.pulse) "timer: tick" else "timer: tock";
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
         const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
 
@@ -35,7 +30,6 @@ const NativeApp = struct {
             widgets.text(count_label),
             input,
             widgets.text(input_label),
-            widgets.text(pulse_label),
             widgets.text(scheme_label),
             button,
         };
@@ -48,13 +42,6 @@ const NativeApp = struct {
     fn increment(ptr: *anyopaque) !void {
         const self: *NativeApp = @ptrCast(@alignCast(ptr));
         self.count += 1;
-    }
-
-    fn timer(ptr: *anyopaque, expirations: u64) !bool {
-        const self: *NativeApp = @ptrCast(@alignCast(ptr));
-        if (expirations == 0) return false;
-        self.pulse = !self.pulse;
-        return true;
     }
 };
 

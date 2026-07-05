@@ -33,6 +33,7 @@ pub const EventLoop = struct {
         events: u32,
         ctx: *anyopaque,
         callback: SourceCallback,
+        active: bool = true,
     };
 
     pub const WaylandSource = struct {
@@ -120,6 +121,13 @@ pub const EventLoop = struct {
             .data = .{ .u64 = @intCast(index) },
         };
         try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, source.fd, &event));
+    }
+
+    pub fn removeFd(self: *EventLoop, fd: i32) void {
+        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+        for (self.sources.items) |*source| {
+            if (source.fd == fd) source.active = false;
+        }
     }
 
     pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
@@ -245,6 +253,7 @@ pub const EventLoop = struct {
                 const index: usize = @intCast(event.data.u64);
                 if (index >= self.sources.items.len) return error.InvalidEventSource;
                 const source = self.sources.items[index];
+                if (!source.active) continue;
                 try source.callback(source.ctx, self, event.events);
             }
         }

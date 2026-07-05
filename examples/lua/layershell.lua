@@ -22,9 +22,10 @@ local App = ui.stateful({
     )
 
     return ui.box({ background = colors.background },
-      ui.padding(8,
-        ui.text(label, { color = colors.foreground })
-      )
+      ui.padding({
+        all = 8,
+        child = ui.text(label, { color = colors.foreground }),
+      })
     )
   end,
 })

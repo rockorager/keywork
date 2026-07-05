@@ -6,7 +6,6 @@
 
 struct app_state {
     unsigned count;
-    int pulse;
 };
 
 static void increment(void *userdata);
@@ -43,11 +42,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
         keywork_button(build, "increment", "Increment", increment, state));
     keywork_widget_t *input = keywork_text_input(build, "c-input", context->input_text, "Type here");
-    keywork_widget_t *labels[] = {
-        keywork_text(build, state->pulse ? "timer: tick" : "timer: tock"),
-        keywork_text(build, context->color_scheme),
-    };
-    keywork_widget_t *status_row = keywork_row(build, labels, sizeof(labels) / sizeof(labels[0]), 12.0f);
+    keywork_widget_t *status_row = keywork_text(build, context->color_scheme);
     keywork_widget_t *children[] = {
         keywork_colored_text(build, "C app hosted by libkeywork", 0xff6d4affu),
         keywork_text(build, count_label),
@@ -129,25 +124,16 @@ static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, con
     return keywork_box(build, padded, 0xff6d4affu);
 }
 
-static int timer(void *userdata, uint64_t expirations) {
-    struct app_state *state = userdata;
-    if (expirations == 0) return 0;
-    state->pulse = !state->pulse;
-    return 1;
-}
-
 int main(void) {
     struct app_state state = {0};
     const struct keywork_app_vtable app = {
         .build = build,
-        .timer = timer,
     };
     const struct keywork_run_options options = {
         .title = "Keywork C app example",
         .backend = KEYWORK_BACKEND_WAYLAND_SHM,
         .width = 480.0f,
         .height = 320.0f,
-        .timer_interval_ms = 0,
     };
     const int result = keywork_run_app(&options, &app, &state);
     if (result != 0) {

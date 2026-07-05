@@ -1220,7 +1220,6 @@ pub const CursorShape = enum {
 };
 
 pub const AppContext = struct {
-    pulse: bool = false,
     input_text: []const u8 = "",
     window_width: f32 = 0,
     window_height: f32 = 0,
@@ -1233,16 +1232,10 @@ pub const AppHost = struct {
 
     pub const VTable = struct {
         build_widget: *const fn (ptr: *anyopaque, scope: *BuildScope, context: AppContext) anyerror!Widget,
-        timer: ?*const fn (ptr: *anyopaque, expirations: u64) anyerror!bool = null,
     };
 
     pub fn buildWidget(self: AppHost, scope: *BuildScope, context: AppContext) !Widget {
         return self.vtable.build_widget(self.ptr, scope, context);
-    }
-
-    pub fn timer(self: AppHost, expirations: u64) !bool {
-        const timer_fn = self.vtable.timer orelse return false;
-        return timer_fn(self.ptr, expirations);
     }
 };
 

@@ -10,11 +10,6 @@ pub const std_options: std.Options = .{
 
 const log = std.log.scoped(.keywork);
 
-const AppContext = keywork.AppContext;
-const AppHost = keywork.AppHost;
-const BuildScope = keywork.BuildScope;
-const Widget = keywork.Widget;
-
 fn logWithTimestamp(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -65,59 +60,25 @@ fn logWithTimestampTerminal(
     try terminal.writer.print(format ++ "\n", args);
 }
 
-const DemoApp = struct {
-    lua: *lua_app.App,
-    pulse: bool = false,
-
-    pub fn host(self: *DemoApp) AppHost {
-        return .{ .ptr = self, .vtable = &.{
-            .build_widget = buildWidget,
-            .timer = timer,
-        } };
-    }
-
-    fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !Widget {
-        const self: *DemoApp = @ptrCast(@alignCast(ptr));
-        var app_context = context;
-        app_context.pulse = self.pulse;
-        scope.app_context = app_context;
-        return self.lua.buildWidget(scope.allocator, app_context);
-    }
-
-    fn timer(ptr: *anyopaque, expirations: u64) !bool {
-        const self: *DemoApp = @ptrCast(@alignCast(ptr));
-        if (expirations == 0) return false;
-        self.pulse = !self.pulse;
-        return true;
-    }
-
-    fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
-        const self: *DemoApp = @ptrCast(@alignCast(ctx.?));
-        try self.lua.installEventSources(loop, runtime);
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const run_options = selectedRunOptions(init);
     var lua = try lua_app.App.init(allocator, run_options.script_path);
     defer lua.deinit();
-    var demo_app: DemoApp = .{ .lua = &lua };
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     defer stdout_writer.interface.flush() catch {};
 
-    try keywork.run(allocator, demo_app.host(), .{
+    try keywork.run(allocator, lua.host(), .{
         .title = if (run_options.backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP",
         .width = run_options.width,
         .height = run_options.height,
         .backend = run_options.backend,
         .layer_shell = run_options.layer_shell,
         .log_writer = &stdout_writer.interface,
-        .timer_interval_ms = 1000,
-        .event_source_context = &demo_app,
-        .install_event_sources = DemoApp.installEventSources,
+        .event_source_context = &lua,
+        .install_event_sources = lua_app.App.installEventSources,
     });
 
     log.debug("frame rendered", .{});

@@ -15,7 +15,6 @@ pub const KeyworkContext = extern struct {
 
 pub const KeyworkAppVTable = extern struct {
     build: ?*const fn (userdata: ?*anyopaque, build: *KeyworkBuild, context: *const KeyworkContext) callconv(.c) ?*KeyworkWidget = null,
-    timer: ?*const fn (userdata: ?*anyopaque, expirations: u64) callconv(.c) c_int = null,
 };
 
 pub const KeyworkClickCallback = *const fn (userdata: ?*anyopaque) callconv(.c) void;
@@ -66,7 +65,6 @@ pub const KeyworkRunOptions = extern struct {
     backend: c_int = 0,
     width: f32 = 640,
     height: f32 = 480,
-    timer_interval_ms: u64 = 0,
     layer_shell: c_int = 0,
     layer_namespace: ?[*:0]const u8 = null,
     layer: c_int = 2,
@@ -292,10 +290,7 @@ const CApp = struct {
     userdata: ?*anyopaque,
 
     fn host(self: *CApp) keywork.AppHost {
-        return .{ .ptr = self, .vtable = &.{
-            .build_widget = buildWidget,
-            .timer = timer,
-        } };
+        return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
     }
 
     fn buildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) !keywork.Widget {
@@ -305,12 +300,6 @@ const CApp = struct {
         const c_context = try makeContext(scope.allocator, context);
         const handle = build_fn(self.userdata, buildHandle(&c_scope), &c_context) orelse return error.BuildCallbackFailed;
         return widgetFromHandle(handle).*;
-    }
-
-    fn timer(ptr: *anyopaque, expirations: u64) !bool {
-        const self: *CApp = @ptrCast(@alignCast(ptr));
-        const timer_fn = self.vtable.timer orelse return false;
-        return timer_fn(self.userdata, expirations) != 0;
     }
 };
 
@@ -346,7 +335,6 @@ pub export fn keywork_run_app(
         .height = if (opts.height > 0) opts.height else 480,
         .backend = backendKind(opts.backend),
         .layer_shell = layerShellOptionsFromRunOptions(opts),
-        .timer_interval_ms = if (opts.timer_interval_ms == 0) null else opts.timer_interval_ms,
     }) catch |err| return errorCode(err);
     return 0;
 }
@@ -364,7 +352,6 @@ pub export fn keywork_run_text(options: ?*const KeyworkRunTextOptions) callconv(
         .height = if (opts.height > 0) opts.height else 480,
         .backend = backendKind(opts.backend),
         .layer_shell = layerShellOptionsFromRunTextOptions(opts),
-        .timer_interval_ms = null,
     }) catch |err| return errorCode(err);
     return 0;
 }

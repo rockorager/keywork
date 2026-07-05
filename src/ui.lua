@@ -57,6 +57,17 @@ function ui.keyed(key, child)
 end
 
 function ui.stateful(spec)
+  local build = spec.build
+  if build then
+    spec = setmetatable({
+      build = function(self, context)
+        context = context or {}
+        context.theme = context.theme or ui.theme_for(context)
+        return build(self, context)
+      end,
+    }, { __index = spec })
+  end
+
   return function(props)
     props = props or {}
     local widget = {
@@ -123,7 +134,7 @@ function ui.container(options, child)
     child = options.child
   end
   if options.padding then
-    child = ui.padding(options.padding, child)
+    child = ui.padding({ insets = options.padding, child = child })
   end
   return ui.box({
     background = options.background,
@@ -196,33 +207,23 @@ function ui.text_input(id, placeholder)
   }
 end
 
-function ui.column(children, gap)
-  local cross_align
-  if children.children then
-    gap = children.gap
-    cross_align = children.cross_align or children.align
-    children = children.children
-  end
+function ui.column(options)
+  options = options or {}
   return {
     type = "column",
-    children = children,
-    gap = gap or 0,
-    cross_align = cross_align,
+    children = options.children,
+    spacing = options.spacing or 0,
+    align = options.align,
   }
 end
 
-function ui.row(children, gap)
-  local cross_align
-  if children.children then
-    gap = children.gap
-    cross_align = children.cross_align or children.align
-    children = children.children
-  end
+function ui.row(options)
+  options = options or {}
   return {
     type = "row",
-    children = children,
-    gap = gap or 0,
-    cross_align = cross_align,
+    children = options.children,
+    spacing = options.spacing or 0,
+    align = options.align,
   }
 end
 
@@ -274,7 +275,7 @@ function ui.icon_label(icon_name, text, options)
   if text and text ~= "" then
     table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
   end
-  return ui.row({ gap = options.gap or 6, align = options.align or "center", children = children })
+  return ui.row({ spacing = options.spacing or 6, align = options.align or "center", children = children })
 end
 
 function ui.chip(options)
@@ -287,7 +288,7 @@ function ui.chip(options)
         label_size = options.label_size,
         font_size = options.font_size,
         role = options.role,
-        gap = options.gap,
+        spacing = options.spacing,
       })
     else
       child = ui.label(options.label or "", { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role })
@@ -330,11 +331,12 @@ function ui.icon_button(options)
   })
 end
 
-function ui.padding(insets, child)
+function ui.padding(options)
+  options = options or {}
   return {
     type = "padding",
-    insets = insets,
-    child = child,
+    insets = options.insets or options.padding,
+    child = options.child,
   }
 end
 

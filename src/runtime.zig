@@ -560,15 +560,6 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn timerTick(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        if (expirations == 0) return;
-        if (try self.app.timer(expirations)) {
-            try self.rebuild();
-            try self.requestRepaint();
-        }
-    }
-
     pub fn fileChanged(
         ctx: *anyopaque,
         _: *event_loop.EventLoop,

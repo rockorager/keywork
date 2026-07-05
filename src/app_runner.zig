@@ -30,7 +30,6 @@ pub const Options = struct {
     backend: BackendKind = .log,
     layer_shell: ?keywork.LayerShellOptions = null,
     log_writer: ?*std.Io.Writer = null,
-    timer_interval_ms: ?u64 = 1000,
     file_watch_path: ?[]const u8 = null,
     event_source_context: ?*anyopaque = null,
     install_event_sources: ?EventSourceInstaller = null,
@@ -108,7 +107,7 @@ fn runWayland(
         app,
         initial_color_scheme,
     );
-    defer runtime.deinit();
+    errdefer runtime.deinit();
 
     backend.setPointerButtonHandler(&runtime, runtime_mod.Runtime.waylandPointerButton);
     backend.setPointerMoveHandler(&runtime, runtime_mod.Runtime.waylandPointerMove);
@@ -124,6 +123,7 @@ fn runWayland(
 
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
+    defer runtime.deinit();
     try loop.setWayland(.{
         .fd = backend.eventLoopFd(),
         .ctx = backend,
@@ -138,9 +138,6 @@ fn runWayland(
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    if (options.timer_interval_ms) |interval_ms| {
-        try loop.addRepeatingTimer(interval_ms, &runtime, runtime_mod.Runtime.timerTick);
-    }
     if (options.file_watch_path) |path| {
         loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });

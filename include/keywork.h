@@ -64,7 +64,6 @@ struct keywork_context {
 
 struct keywork_app_vtable {
     keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
-    int (*timer)(void *userdata, uint64_t expirations);
 };
 
 typedef void (*keywork_click_callback_t)(void *userdata);
@@ -96,7 +95,6 @@ struct keywork_run_options {
     int backend;
     float width;
     float height;
-    uint64_t timer_interval_ms;
     int layer_shell;
     const char *layer_namespace;
     int layer;
