@@ -49,6 +49,11 @@ key_context: ?*anyopaque = null,
 scroll_handler: ?ScrollHandler = null,
 scroll_context: ?*anyopaque = null,
 
+/// Multiplier for finger and continuous axis deltas. libinput's touchpad
+/// deltas track finger travel 1:1, which feels sluggish for scrolling
+/// content; toolkits conventionally boost them.
+const touchpad_scroll_speed = 2.0;
+
 const PendingPointer = struct {
     /// The pointer entered or moved; flush dispatches one move with the
     /// final position.
@@ -60,6 +65,7 @@ const PendingPointer = struct {
     scroll_dx: f32 = 0,
     scroll_dy: f32 = 0,
     scrolled: bool = false,
+    scroll_source: wl.Pointer.AxisSource = .wheel,
 };
 
 pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
@@ -218,6 +224,7 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                     }
                     self.pending_pointer.scrolled = true;
                 },
+                .axis_source => |axis_source| self.pending_pointer.scroll_source = axis_source.axis_source,
                 .frame => self.flushPointerFrame(),
                 else => {},
             }
@@ -247,7 +254,13 @@ fn flushPointerFrame(self: *Self) void {
         for (pending.buttons[0..pending.button_count]) |state| {
             self.dispatchPointerButton(point, state);
         }
-        if (pending.scrolled) self.dispatchScroll(point, pending.scroll_dx, pending.scroll_dy);
+        if (pending.scrolled) {
+            const speed: f32 = switch (pending.scroll_source) {
+                .finger, .continuous => touchpad_scroll_speed,
+                else => 1.0,
+            };
+            self.dispatchScroll(point, pending.scroll_dx * speed, pending.scroll_dy * speed);
+        }
     }
 }
 
