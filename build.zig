@@ -267,6 +267,11 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    const app_tests = b.addTest(.{
+        .root_module = app_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(app_tests).step);
+
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "include", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);

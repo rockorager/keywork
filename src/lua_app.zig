@@ -840,7 +840,7 @@ const LuaProcess = struct {
                 _ = linux.close(pipe[0]);
                 dupTo(pipe[1], posix.STDERR_FILENO) catch linux.exit(127);
             }
-            _ = linux.execve(executable.ptr, argv.ptr, std.c.environ);
+            _ = linux.execve(executable.ptr, argv.ptr(), std.c.environ);
             linux.exit(127);
         }
 
@@ -2383,9 +2383,13 @@ fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
 }
 
 const PreparedArgv = struct {
-    ptr: [*:null]?[*:0]const u8,
-    values: []?[*:0]const u8,
+    // Sentinel-terminated so free() sees the full allocSentinel length.
+    values: [:null]?[*:0]const u8,
     strings: [][:0]u8,
+
+    fn ptr(self: *const PreparedArgv) [*:null]const ?[*:0]const u8 {
+        return self.values.ptr;
+    }
 
     fn deinit(self: *PreparedArgv, allocator: std.mem.Allocator) void {
         for (self.strings) |value| allocator.free(value);
@@ -2406,7 +2410,7 @@ fn prepareArgv(allocator: std.mem.Allocator, argv: []const []const u8) !Prepared
         initialized += 1;
         values[index] = strings[index].ptr;
     }
-    return .{ .ptr = values.ptr, .values = values, .strings = strings };
+    return .{ .values = values, .strings = strings };
 }
 
 fn resolveExecutable(allocator: std.mem.Allocator, name: []const u8) ![:0]u8 {
@@ -3151,6 +3155,10 @@ test "lua loop fs_event observes file changes" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    // The loop must outlive the runtime: runtime deinit disposes stateful
+    // widgets whose Lua dispose callbacks cancel sources on the loop.
+    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
     var runtime = try keywork.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -3160,8 +3168,6 @@ test "lua loop fs_event observes file changes" {
     );
     defer runtime.deinit();
 
-    var loop = try keywork.event_loop.EventLoop.init(allocator);
-    defer loop.deinit();
     try App.installEventSources(&app, &loop, &runtime);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.txt", .data = "after\n" });
 
@@ -3238,6 +3244,10 @@ test "lua loop spawn captures stdout and exit" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    // The loop must outlive the runtime: runtime deinit disposes stateful
+    // widgets whose Lua dispose callbacks cancel sources on the loop.
+    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
     var runtime = try keywork.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -3253,18 +3263,16 @@ test "lua loop spawn captures stdout and exit" {
         app: *App,
         ticks: usize = 0,
 
-        fn callback(ctx: *anyopaque, loop: *keywork.event_loop.EventLoop, _: u64) !void {
+        fn callback(ctx: *anyopaque, event_loop: *keywork.event_loop.EventLoop, _: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ticks += 1;
             c.lua_getglobal(self.app.state, "spawn_done");
             const done = c.lua_toboolean(self.app.state, -1) != 0;
             pop(self.app.state, 1);
-            if (done or self.ticks > 1000) loop.quit();
+            if (done or self.ticks > 1000) event_loop.quit();
         }
     };
 
-    var loop = try keywork.event_loop.EventLoop.init(allocator);
-    defer loop.deinit();
     try App.installEventSources(&app, &loop, &runtime);
     var context: SpawnTest = .{ .app = &app };
     try loop.addRepeatingTimer(1, &context, SpawnTest.callback);

@@ -153,3 +153,7 @@ fn parseKeyboardInteractivity(value: []const u8) keywork.LayerShellOptions.Keybo
     if (std.mem.eql(u8, value, "on-demand") or std.mem.eql(u8, value, "on_demand")) return .on_demand;
     return .none;
 }
+
+test {
+    _ = @import("lua_app.zig");
+}
