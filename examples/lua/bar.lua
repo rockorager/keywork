@@ -15,9 +15,9 @@ local function bar_colors(theme)
   local scheme = theme.colors
   return {
     background = scheme.surface,
-    surface = scheme.surface_variant,
-    foreground = scheme.on_surface,
-    muted = scheme.on_surface_variant,
+    surface = scheme.surface_high,
+    foreground = scheme.foreground,
+    muted = scheme.muted,
     active = scheme.primary,
     on_active = scheme.on_primary,
     error = scheme.error,

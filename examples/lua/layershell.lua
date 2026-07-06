@@ -14,14 +14,24 @@ local colors = {
 --   zig build run -- --script=examples/lua/layershell.lua --backend=vulkan --layer-shell --anchor=top,left,right --height=32 --exclusive-zone=32
 local App = ui.stateful({
   build = function(self, state)
-    local theme = ui.theme_data({
-      color_scheme = state.color_scheme,
-      colors = {
-        primary = colors.accent,
-        surface = colors.background,
-        on_surface = colors.foreground,
+    local theme = ui.resolve_theme(ui.theme_data({
+      schemes = {
+        light = {
+          colors = {
+            primary = colors.accent,
+            surface = colors.background,
+            foreground = colors.foreground,
+          },
+        },
+        dark = {
+          colors = {
+            primary = colors.accent,
+            surface = colors.background,
+            foreground = colors.foreground,
+          },
+        },
       },
-    })
+    }), state)
     local label = string.format(
       "Keywork layer shell  •  %.0fx%.0f  •  scheme: %s",
       state.window_width,
@@ -34,7 +44,7 @@ local App = ui.stateful({
       child = ui.box({ background = theme.colors.surface },
         ui.padding({
           all = 8,
-          child = ui.text(label, { color = theme.colors.on_surface }),
+          child = ui.text(label, { color = theme.colors.foreground }),
         })
       ),
     })

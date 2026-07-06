@@ -156,7 +156,7 @@ pub const Runtime = struct {
         // repaint without any layout change (e.g. a scale change) reports
         // the full frame.
         const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
-        try self.display_list.fillRect(self.allocator, full_frame, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface);
+        try self.display_list.fillRect(self.allocator, full_frame, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.background);
         const render_scale = self.backend.scale();
         try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
         self.frame_pending = try self.backend.present(.{

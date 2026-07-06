@@ -30,38 +30,44 @@ pub const Brightness = enum {
 
 pub const ColorScheme = struct {
     brightness: Brightness,
+    background: Color,
+    foreground: Color,
     primary: Color,
     on_primary: Color,
     surface: Color,
-    on_surface: Color,
-    surface_variant: Color,
-    on_surface_variant: Color,
-    outline: Color,
+    surface_high: Color,
+    surface_low: Color,
+    border: Color,
+    muted: Color,
     error_color: Color,
     on_error: Color,
 
     pub const light: ColorScheme = .{
         .brightness = .light,
+        .background = Color.argb(0xff, 0xfd, 0xfb, 0xf7),
+        .foreground = colors.ink,
         .primary = colors.accent,
         .on_primary = colors.white,
         .surface = colors.panel,
-        .on_surface = colors.ink,
-        .surface_variant = colors.white,
-        .on_surface_variant = colors.ink,
-        .outline = colors.ink,
+        .surface_high = colors.white,
+        .surface_low = Color.argb(0xff, 0xee, 0xea, 0xe4),
+        .border = Color.argb(0xff, 0x8c, 0x89, 0x91),
+        .muted = Color.argb(0xff, 0x77, 0x73, 0x7d),
         .error_color = Color.argb(0xff, 0xba, 0x1a, 0x1a),
         .on_error = colors.white,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
+        .background = Color.argb(0xff, 0x11, 0x11, 0x14),
+        .foreground = Color.argb(0xff, 0xf5, 0xf3, 0xf7),
         .primary = Color.argb(0xff, 0x9b, 0x86, 0xff),
         .on_primary = colors.black,
         .surface = Color.argb(0xff, 0x20, 0x20, 0x24),
-        .on_surface = colors.white,
-        .surface_variant = Color.argb(0xff, 0x2b, 0x2b, 0x30),
-        .on_surface_variant = colors.white,
-        .outline = Color.argb(0xff, 0x9b, 0x86, 0xff),
+        .surface_high = Color.argb(0xff, 0x2b, 0x2b, 0x30),
+        .surface_low = Color.argb(0xff, 0x17, 0x17, 0x1a),
+        .border = Color.argb(0xff, 0x8f, 0x8a, 0x99),
+        .muted = Color.argb(0xff, 0xb7, 0xb3, 0xc1),
         .error_color = Color.argb(0xff, 0xff, 0xb4, 0xab),
         .on_error = Color.argb(0xff, 0x69, 0x00, 0x05),
     };
@@ -98,7 +104,9 @@ pub const ButtonTheme = struct {
     pressed_background: ?Color = null,
     disabled_background: ?Color = null,
     disabled_foreground: ?Color = null,
-    padding: f32 = 8,
+    padding_x: f32 = 12,
+    padding_y: f32 = 8,
+    radius: f32 = 8,
 };
 
 pub const InputTheme = struct {
@@ -107,6 +115,9 @@ pub const InputTheme = struct {
     placeholder: ?Color = null,
     border: ?Color = null,
     focused_border: ?Color = null,
+    padding_x: f32 = 12,
+    padding_y: f32 = 8,
+    radius: f32 = 8,
 };
 
 pub const Theme = struct {
@@ -117,13 +128,9 @@ pub const Theme = struct {
 
     pub const light: Theme = .{
         .color_scheme = .light,
-        .button_theme = .{ .pressed_background = colors.ink },
-        .input_theme = .{ .placeholder = Color.argb(0xff, 0x77, 0x77, 0x7d) },
     };
     pub const dark: Theme = .{
         .color_scheme = .dark,
-        .button_theme = .{ .pressed_background = Color.argb(0xff, 0xcc, 0xc2, 0xff) },
-        .input_theme = .{ .placeholder = Color.argb(0xff, 0xb7, 0xb3, 0xc1) },
     };
     pub const default: Theme = light;
 
@@ -491,6 +498,9 @@ pub const Widget = union(enum) {
         border: Color = colors.ink,
         focused_border: Color = colors.accent,
         placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
+        padding_x: f32 = 12,
+        padding_y: f32 = 8,
+        radius: f32 = 8,
     };
 
     pub const Children = struct {
@@ -1045,9 +1055,19 @@ fn buildButtonWidget(
     const pressed = enabled and interaction.isPressed(button_widget.id);
     const focused = enabled and interaction.isFocused(.named(button_widget.id));
     const label: Widget = .{ .text = .{ .value = button_widget.label, .color = buttonForeground(theme, enabled, hovered), .role = .label } };
-    const padded = try widgets.padding(allocator, EdgeInsets.all(theme.button_theme.padding), label);
+    const padded = try widgets.padding(allocator, .{
+        .left = theme.button_theme.padding_x,
+        .right = theme.button_theme.padding_x,
+        .top = theme.button_theme.padding_y,
+        .bottom = theme.button_theme.padding_y,
+    }, label);
     const background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
-    const surface = try widgets.borderedBox(allocator, padded, background, if (focused) buttonFocusedBorder(theme) else null);
+    const surface: Widget = .{ .box = .{
+        .child = try Widget.alloc(allocator, padded),
+        .background = background,
+        .border = if (focused) buttonFocusedBorder(theme) else null,
+        .radius = theme.button_theme.radius,
+    } };
     if (!enabled) return surface;
     const surface_child = try Widget.alloc(allocator, surface);
     return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(on_pressed.?) } };
@@ -1079,44 +1099,44 @@ fn mergeTextStyle(base: TextStyle, overlay: TextStyle) TextStyle {
 fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widget.Text) ResolvedTextStyle {
     const role_style = roleTextStyle(theme, text_widget.role);
     return .{
-        .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.on_surface,
+        .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.foreground,
         .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse 16,
     };
 }
 
 fn buttonBackground(theme: Theme, hovered: bool) Color {
-    if (hovered) return theme.button_theme.hover_background orelse theme.button_theme.background orelse theme.color_scheme.on_surface;
+    if (hovered) return theme.button_theme.hover_background orelse theme.button_theme.background orelse theme.color_scheme.foreground;
     return theme.button_theme.background orelse theme.color_scheme.primary;
 }
 
 fn buttonForeground(theme: Theme, enabled: bool, hovered: bool) Color {
-    if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.on_surface_variant;
-    if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.surface;
+    if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.muted;
+    if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.background;
     return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
 }
 
 fn buttonPressedBackground(theme: Theme) Color {
-    return theme.button_theme.pressed_background orelse theme.color_scheme.on_surface;
+    return theme.button_theme.pressed_background orelse theme.color_scheme.foreground;
 }
 
 fn buttonDisabledBackground(theme: Theme) Color {
-    return theme.button_theme.disabled_background orelse theme.color_scheme.surface_variant;
+    return theme.button_theme.disabled_background orelse theme.color_scheme.surface_low;
 }
 
 fn buttonFocusedBorder(theme: Theme) Color {
-    return theme.button_theme.focused_border orelse theme.color_scheme.on_surface;
+    return theme.button_theme.focused_border orelse theme.color_scheme.primary;
 }
 
 fn inputForeground(theme: Theme) Color {
-    return theme.input_theme.foreground orelse theme.color_scheme.on_surface_variant;
+    return theme.input_theme.foreground orelse theme.color_scheme.foreground;
 }
 
 fn inputBackground(theme: Theme) Color {
-    return theme.input_theme.background orelse theme.color_scheme.surface_variant;
+    return theme.input_theme.background orelse theme.color_scheme.surface_high;
 }
 
 fn inputBorder(theme: Theme) Color {
-    return theme.input_theme.border orelse theme.color_scheme.outline;
+    return theme.input_theme.border orelse theme.color_scheme.border;
 }
 
 fn inputFocusedBorder(theme: Theme) Color {
@@ -1124,7 +1144,7 @@ fn inputFocusedBorder(theme: Theme) Color {
 }
 
 fn inputPlaceholder(theme: Theme) Color {
-    return theme.input_theme.placeholder orelse theme.color_scheme.on_surface_variant;
+    return theme.input_theme.placeholder orelse theme.color_scheme.muted;
 }
 
 pub const RenderNode = struct {
@@ -1159,6 +1179,8 @@ pub const RenderNode = struct {
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
     placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
+    padding_x: f32 = 12,
+    padding_y: f32 = 8,
     focused: bool = false,
     caret_x: ?f32 = null,
     /// Constraints this node was last laid out with; cached so clean
@@ -1502,8 +1524,6 @@ pub const LogBackend = struct {
 };
 
 const text_width_ratio = 0.5;
-const input_horizontal_padding = 10;
-const input_vertical_padding = 8;
 const input_min_width = 220;
 const LayoutError = anyerror;
 
@@ -2606,6 +2626,9 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             input_widget.border = inputBorder(theme);
             input_widget.focused_border = inputFocusedBorder(theme);
             input_widget.placeholder_foreground = inputPlaceholder(theme);
+            input_widget.padding_x = theme.input_theme.padding_x;
+            input_widget.padding_y = theme.input_theme.padding_y;
+            input_widget.radius = theme.input_theme.radius;
         },
         else => {},
     }
@@ -2713,6 +2736,9 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .border = input_widget.border,
                 .focused_border = input_widget.focused_border,
                 .placeholder_foreground = input_widget.placeholder_foreground,
+                .padding_x = input_widget.padding_x,
+                .padding_y = input_widget.padding_y,
+                .radius = input_widget.radius,
             } };
         },
         .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
@@ -2885,24 +2911,29 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             }
         },
         .text_input => {
-            try display_list.fillRect(allocator, node.rect, node.background);
-            try paintBorder(allocator, display_list, node.rect, if (node.focused) node.focused_border else node.border, 1);
+            const border = if (node.focused) node.focused_border else node.border;
+            if (node.box_radius > 0) {
+                try paintRoundedBox(allocator, display_list, node.rect, node.background, border, 1, node.box_radius, scale);
+            } else {
+                try display_list.fillRect(allocator, node.rect, node.background);
+                try paintBorder(allocator, display_list, node.rect, border, 1);
+            }
             const value = node.text orelse "";
             const visible_text = if (value.len > 0) value else node.placeholder orelse "";
             const text_color = if (value.len > 0) node.foreground else node.placeholder_foreground;
             // Overflowing text and caret must not paint outside the field.
             try display_list.pushClip(allocator, node.rect);
             try display_list.text(allocator, .{
-                .x = node.rect.x + input_horizontal_padding,
-                .y = node.rect.y + input_vertical_padding,
+                .x = node.rect.x + node.padding_x,
+                .y = node.rect.y + node.padding_y,
             }, visible_text, .{ .color = text_color, .font_size = node.text_style.font_size });
             if (node.focused) {
-                const caret_x = node.caret_x orelse node.rect.x + input_horizontal_padding;
+                const caret_x = node.caret_x orelse node.rect.x + node.padding_x;
                 try display_list.fillRect(allocator, .{
                     .x = caret_x,
-                    .y = node.rect.y + input_vertical_padding,
+                    .y = node.rect.y + node.padding_y,
                     .width = 1,
-                    .height = @max(1, node.rect.height - input_vertical_padding * 2),
+                    .height = @max(1, node.rect.height - node.padding_y * 2),
                 }, node.foreground);
             }
             try display_list.popClip(allocator);
@@ -3804,8 +3835,8 @@ fn layoutElementInto(
             const value_size = try measurer.measureText(value, style);
             const fill_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else 0;
             const requested = Size{
-                .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, fill_width)),
-                .height = measured.height + input_vertical_padding * 2,
+                .width = @max(input_min_width, @max(measured.width + input_widget.padding_x * 2, fill_width)),
+                .height = measured.height + input_widget.padding_y * 2,
             };
             const size_value = constraints.clamp(requested);
             _ = try ensureChildSlice(allocator, node, 0);
@@ -3822,8 +3853,11 @@ fn layoutElementInto(
                 .border = input_widget.border,
                 .focused_border = input_widget.focused_border,
                 .placeholder_foreground = input_widget.placeholder_foreground,
+                .padding_x = input_widget.padding_x,
+                .padding_y = input_widget.padding_y,
+                .box_radius = input_widget.radius,
                 .focused = element.focused,
-                .caret_x = origin.x + input_horizontal_padding + value_size.width,
+                .caret_x = origin.x + input_widget.padding_x + value_size.width,
             });
         },
         .padding => |padding_widget| {
@@ -4715,7 +4749,8 @@ test "theme widget provides ambient button styling" {
             .background = colors.black,
             .foreground = colors.white,
             .pressed_background = colors.panel,
-            .padding = 4,
+            .padding_x = 4,
+            .padding_y = 4,
         },
     };
     const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testCallback());
@@ -4892,10 +4927,10 @@ test "theme widget provides ambient text and input styling" {
 
     const text_node = root.children[0].children[0];
     const input_node = root.children[0].children[1];
-    try std.testing.expectEqual(Theme.dark.color_scheme.on_surface, text_node.foreground);
-    try std.testing.expectEqual(Theme.dark.color_scheme.surface_variant, input_node.background);
-    try std.testing.expectEqual(Theme.dark.color_scheme.outline, input_node.border);
-    try std.testing.expectEqual(Theme.dark.input_theme.placeholder.?, input_node.placeholder_foreground);
+    try std.testing.expectEqual(Theme.dark.color_scheme.foreground, text_node.foreground);
+    try std.testing.expectEqual(Theme.dark.color_scheme.surface_high, input_node.background);
+    try std.testing.expectEqual(Theme.dark.color_scheme.border, input_node.border);
+    try std.testing.expectEqual(Theme.dark.color_scheme.muted, input_node.placeholder_foreground);
 }
 
 test "text input derives focus from ambient focus node" {
