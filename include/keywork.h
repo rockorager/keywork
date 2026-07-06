@@ -66,7 +66,6 @@ struct keywork_constraints {
 };
 
 struct keywork_context {
-    const char *input_text;
     float window_width;
     float window_height;
     const char *color_scheme;

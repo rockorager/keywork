@@ -155,6 +155,28 @@ const LuaCallback = struct {
         };
     }
 
+    fn keyworkTextChangeCallback(self: *LuaCallback) keywork.Widget.TextChangeCallback {
+        return .{
+            .ptr = self,
+            .call_fn = callTextChange,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn callTextChange(ptr: *anyopaque, text: []const u8) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        c.lua_pushlstring(self.lua_state, text.ptr, text.len);
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
+            var len: usize = 0;
+            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
+            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("text change callback failed: {s}", .{message[0..len]});
+            pop(self.lua_state, 1);
+            return error.LuaCallbackFailed;
+        }
+    }
+
     fn call(ptr: *anyopaque) !void {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
@@ -1787,10 +1809,8 @@ fn addPackagePath(lua_state: *c.lua_State, path: []const u8) void {
 }
 
 fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
-    c.lua_createtable(lua_state, 0, 4);
+    c.lua_createtable(lua_state, 0, 3);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushlstring(lua_state, state.input_text.ptr, state.input_text.len);
-    c.lua_setfield(lua_state, table, "input_text");
     c.lua_pushnumber(lua_state, state.window_width);
     c.lua_setfield(lua_state, table, "window_width");
     c.lua_pushnumber(lua_state, state.window_height);
@@ -1959,8 +1979,11 @@ fn parseWidget(
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const placeholder = try dupeStringField(lua_state, allocator, table, "placeholder");
-        const value = try allocator.dupe(u8, runtime_state.input_text);
-        return keywork.widgets.textInput(id, value, placeholder);
+        const value = dupeStringField(lua_state, allocator, table, "value") catch try allocator.dupe(u8, "");
+        const on_change = try getOptionalTextChangeCallbackField(lua_state, callback_allocator, table, "on_change");
+        var widget = keywork.widgets.textInput(id, value, placeholder);
+        widget.text_input.on_change = on_change;
+        return widget;
     }
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
@@ -2750,6 +2773,29 @@ fn getOptionalCallbackField(
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return null;
     return try callbackFromStack(lua_state, allocator, -1);
+}
+
+fn getOptionalTextChangeCallbackField(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    table: c_int,
+    key: [*:0]const u8,
+) !?keywork.Widget.TextChangeCallback {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    return try textChangeCallbackFromStack(lua_state, allocator, -1);
+}
+
+fn textChangeCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.TextChangeCallback {
+    if (c.lua_type(lua_state, index) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+
+    c.lua_pushvalue(lua_state, index);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+    const callback = try allocator.create(LuaCallback);
+    callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
+    return callback.keyworkTextChangeCallback();
 }
 
 fn getOptionalFocusChangeCallbackField(

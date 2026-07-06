@@ -29,7 +29,6 @@ pub const Runtime = struct {
     app: AppHost,
     build_arena: std.heap.ArenaAllocator,
     color_scheme: desktop_settings.ColorScheme,
-    input_text: std.ArrayList(u8) = .empty,
     focused_id: ?[]u8 = null,
     autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
@@ -73,7 +72,6 @@ pub const Runtime = struct {
             self.element_root = null;
         }
         self.display_list.deinit(self.allocator);
-        self.input_text.deinit(self.allocator);
         if (self.focused_id) |id| self.allocator.free(id);
         for (self.pending_interaction_ids.items) |id| self.allocator.free(id);
         self.pending_interaction_ids.deinit(self.allocator);
@@ -84,7 +82,6 @@ pub const Runtime = struct {
 
     fn currentState(self: *const Runtime) State {
         return .{
-            .input_text = self.input_text.items,
             .window_width = self.constraints.max_width,
             .window_height = self.constraints.max_height,
             .color_scheme = self.color_scheme.name(),
@@ -293,20 +290,20 @@ pub const Runtime = struct {
         }
 
         switch (input) {
-            .tab => |tab| try self.focusNext(tab.reverse),
-            .text => |bytes| {
-                if (!self.focusedTargetIs(.text_input)) return;
-                try self.input_text.appendSlice(self.allocator, bytes);
+            .tab => |tab| {
+                try self.focusNext(tab.reverse);
+                try self.invalidate();
             },
-            .backspace => {
-                if (!self.focusedTargetIs(.text_input)) return;
-                popLastGrapheme(&self.input_text);
-            },
+            .text => |bytes| try self.editFocusedTextInput(.{ .append = bytes }),
+            .backspace => try self.editFocusedTextInput(.pop_grapheme),
             .space => {
                 const target = self.focusedTarget() orelse return;
                 switch (target.kind) {
-                    .text_input => try self.input_text.append(self.allocator, ' '),
-                    .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                    .text_input => try self.editFocusedTextInput(.{ .append = " " }),
+                    .clickable => {
+                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
+                        try self.invalidateState();
+                    },
                     .focus => {},
                 }
             },
@@ -316,13 +313,38 @@ pub const Runtime = struct {
                     .text_input => {
                         self.autofocus_suppressed = true;
                         _ = try self.setFocused(null);
+                        try self.invalidate();
                     },
-                    .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
+                    .clickable => {
+                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
+                        try self.invalidateState();
+                    },
                     .focus => {},
                 }
             },
         }
-        try self.invalidate();
+    }
+
+    const TextEdit = union(enum) {
+        append: []const u8,
+        pop_grapheme,
+    };
+
+    /// Applies a text edit to the focused text input's element-owned
+    /// editing state, fires its on_change callback, and schedules a
+    /// dirty-state pass. Typing relayouts exactly one input; no rebuild.
+    fn editFocusedTextInput(self: *Runtime, edit: TextEdit) !void {
+        if (!self.focusedTargetIs(.text_input)) return;
+        const focused_id = self.focused_id orelse return;
+        const element_root = if (self.element_root) |*element_root| element_root else return;
+        const input = keywork.dirtyTextInputElement(element_root, focused_id) orelse return;
+        const state = keywork.textInputState(input);
+        switch (edit) {
+            .append => |bytes| try state.text.appendSlice(self.allocator, bytes),
+            .pop_grapheme => popLastGrapheme(&state.text),
+        }
+        if (input.widget.text_input.on_change) |callback| try callback.call(state.text.items);
+        try self.invalidateState();
     }
 
     fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
@@ -823,6 +845,14 @@ test "rebuild passes that never stabilize return an error" {
     try std.testing.expectError(error.RebuildDidNotStabilize, runtime.invalidate());
 }
 
+fn renderedInputText(node: *const RenderNode) ?[]const u8 {
+    if (node.kind == .text_input) return node.text;
+    for (node.children) |child| {
+        if (renderedInputText(child)) |text| return text;
+    }
+    return null;
+}
+
 test "tab traversal focuses widgets and enter activates focused clickable" {
     const TestApp = struct {
         clicks: usize = 0,
@@ -831,9 +861,9 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
             return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
         }
 
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !keywork.Widget {
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const input = keywork.widgets.textInput("input", context.input_text, "placeholder");
+            const input = keywork.widgets.textInput("input", "", "placeholder");
             const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = increment });
             const children = [_]keywork.Widget{ input, button };
             return keywork.widgets.column(scope.allocator, &children, 4);
@@ -878,7 +908,7 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.{ .text = "a" });
-    try std.testing.expectEqualStrings("a", runtime.input_text.items);
+    try std.testing.expectEqualStrings("a", renderedInputText(runtime.root.?).?);
 
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("button", runtime.focused_id.?);
@@ -890,7 +920,102 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try runtime.keyInput(.{ .tab = .{ .reverse = true } });
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
-    try std.testing.expectEqualStrings("a ", runtime.input_text.items);
+    try std.testing.expectEqualStrings("a ", renderedInputText(runtime.root.?).?);
+}
+
+test "typing edits element-owned input state without rebuilding" {
+    const TestApp = struct {
+        builds: usize = 0,
+        last_change: [32]u8 = undefined,
+        last_change_len: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            var first = keywork.widgets.textInput("first", "", "first");
+            first.text_input.on_change = .{ .ptr = self, .call_fn = onChange };
+            const second = keywork.widgets.textInput("second", "", "second");
+            const children = [_]keywork.Widget{ first, second };
+            return keywork.widgets.column(scope.allocator, &children, 4);
+        }
+
+        fn onChange(ptr: *anyopaque, text: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.last_change_len = @min(text.len, self.last_change.len);
+            @memcpy(self.last_change[0..self.last_change_len], text[0..self.last_change_len]);
+        }
+
+        fn lastChange(self: *const @This()) []const u8 {
+            return self.last_change[0..self.last_change_len];
+        }
+
+        fn collectInputTexts(node: *const keywork.RenderNode, out: [][]const u8, count: *usize) void {
+            if (node.kind == .text_input) {
+                out[count.*] = node.text orelse "";
+                count.* += 1;
+            }
+            for (node.children) |child| collectInputTexts(child, out, count);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("first", runtime.focused_id.?);
+    const builds_after_focus = app.builds;
+
+    // Typing edits the element buffer and fires on_change with no rebuild.
+    try runtime.keyInput(.{ .text = "h" });
+    try runtime.keyInput(.{ .text = "i" });
+    try std.testing.expectEqual(builds_after_focus, app.builds);
+    try std.testing.expectEqualStrings("hi", app.lastChange());
+
+    // The second input keeps independent state.
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("second", runtime.focused_id.?);
+    try runtime.keyInput(.{ .text = "y" });
+    try runtime.keyInput(.{ .text = "o" });
+
+    var texts: [4][]const u8 = undefined;
+    var count: usize = 0;
+    TestApp.collectInputTexts(runtime.root.?, &texts, &count);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("hi", texts[0]);
+    try std.testing.expectEqualStrings("yo", texts[1]);
+    // on_change belongs to the first input; the second never fired it.
+    try std.testing.expectEqualStrings("hi", app.lastChange());
 }
 
 test "pointer hover restyles buttons without a full rebuild" {
@@ -993,9 +1118,9 @@ test "shortcut invokes ambient action outside text input focus" {
             return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
         }
 
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: AppContext) !keywork.Widget {
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const input = keywork.widgets.textInput("input", context.input_text, "placeholder");
+            const input = keywork.widgets.textInput("input", "", "placeholder");
             const label = keywork.widgets.text("Shortcut target");
             const children = [_]keywork.Widget{ input, label };
             const column = try keywork.widgets.column(scope.allocator, &children, 4);
@@ -1048,7 +1173,7 @@ test "shortcut invokes ambient action outside text input focus" {
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqual(@as(usize, 1), app.actions);
-    try std.testing.expectEqualStrings(" ", runtime.input_text.items);
+    try std.testing.expectEqualStrings(" ", renderedInputText(runtime.root.?).?);
 }
 
 test "focus widget participates in traversal and shortcut context" {

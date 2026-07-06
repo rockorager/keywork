@@ -416,8 +416,11 @@ pub const Widget = union(enum) {
     pub const TextInput = struct {
         id: []const u8,
         focus_node: FocusNode,
+        /// Initial text only: after the element is created, its editing
+        /// state owns the text.
         value: []const u8,
         placeholder: []const u8,
+        on_change: ?TextChangeCallback = null,
         foreground: Color = colors.ink,
         background: Color = colors.white,
         border: Color = colors.ink,
@@ -524,6 +527,32 @@ pub const Widget = union(enum) {
         }
 
         pub fn destroy(self: FocusChangeCallback, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    pub const TextChangeCallback = struct {
+        ptr: *anyopaque,
+        call_fn: *const fn (ptr: *anyopaque, text: []const u8) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
+
+        pub fn call(self: TextChangeCallback, text: []const u8) !void {
+            try self.call_fn(self.ptr, text);
+        }
+
+        pub fn clone(self: TextChangeCallback, allocator: std.mem.Allocator) !TextChangeCallback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .call_fn = self.call_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: TextChangeCallback, allocator: std.mem.Allocator) void {
             const destroy_fn = self.destroy_fn orelse return;
             destroy_fn(allocator, self.ptr);
         }
@@ -1272,11 +1301,21 @@ pub const CursorShape = enum {
 };
 
 pub const AppContext = struct {
-    input_text: []const u8 = "",
     window_width: f32 = 0,
     window_height: f32 = 0,
     color_scheme: []const u8 = "no-preference",
 };
+
+/// Editing state owned by a text_input element; the single source of truth
+/// for the input's text after creation.
+pub const TextInputState = struct {
+    text: std.ArrayList(u8) = .empty,
+};
+
+pub fn textInputState(element: *Element) *TextInputState {
+    std.debug.assert(element.kind == .text_input);
+    return @ptrCast(@alignCast(element.state.?));
+}
 
 pub const AppHost = struct {
     ptr: *anyopaque,
@@ -1343,8 +1382,18 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .sized, .widget = element_widget, .children = children };
         },
         .text_input => {
-            const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
-            return .{ .kind = .text_input, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.text_input.focus_node) };
+            var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const state = try allocator.create(TextInputState);
+            errdefer allocator.destroy(state);
+            state.* = .{};
+            try state.text.appendSlice(allocator, element_widget.text_input.value);
+            return .{
+                .kind = .text_input,
+                .widget = element_widget,
+                .state = state,
+                .focused = scope.interaction.isFocused(element_widget.text_input.focus_node),
+            };
         },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .box => |box_widget| {
@@ -1598,8 +1647,15 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
     allocator.free(element.children);
     element.children = &.{};
     if (element.state) |state| {
-        std.debug.assert(element.kind == .stateful);
-        element.widget.stateful.destroyState(state, allocator);
+        switch (element.kind) {
+            .stateful => element.widget.stateful.destroyState(state, allocator),
+            .text_input => {
+                const input_state: *TextInputState = @ptrCast(@alignCast(state));
+                input_state.text.deinit(allocator);
+                allocator.destroy(input_state);
+            },
+            else => unreachable,
+        }
         element.state = null;
     }
     if (element.key) |key| {
@@ -1790,6 +1846,25 @@ pub fn rebuildDirtyElementTreeScoped(
             return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
     }
+}
+
+/// Finds the text input element with the given focus id, marking the
+/// layout path to it dirty so an edit relayouts exactly that input.
+pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element {
+    if (element.kind == .text_input) {
+        if (std.mem.eql(u8, element.widget.text_input.focus_node.id, focus_id)) {
+            markElementLayoutDirty(element);
+            return element;
+        }
+        return null;
+    }
+    for (element.children) |*child| {
+        if (dirtyTextInputElement(child, focus_id)) |found| {
+            markElementLayoutDirty(element);
+            return found;
+        }
+    }
+    return null;
 }
 
 /// Re-expands interaction-styled elements (buttons) whose id is in `ids`
@@ -2178,11 +2253,14 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const value = try allocator.dupe(u8, input_widget.value);
             errdefer allocator.free(value);
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
+            errdefer allocator.free(placeholder);
+            const on_change = if (input_widget.on_change) |callback| try callback.clone(allocator) else null;
             break :blk .{ .text_input = .{
                 .id = id,
                 .focus_node = .named(focus_node_id),
                 .value = value,
                 .placeholder = placeholder,
+                .on_change = on_change,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .border = input_widget.border,
@@ -2236,6 +2314,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
         .text_input => |input_widget| {
+            if (input_widget.on_change) |callback| callback.destroy(allocator);
             allocator.free(input_widget.id);
             allocator.free(input_widget.focus_node.id);
             allocator.free(input_widget.value);
@@ -3033,10 +3112,11 @@ fn layoutElementInto(
             });
         },
         .text_input => |input_widget| {
-            const text_value = if (input_widget.value.len > 0) input_widget.value else input_widget.placeholder;
+            const value = textInputState(element).text.items;
+            const text_value = if (value.len > 0) value else input_widget.placeholder;
             const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
             const measured = try measurer.measureText(text_value, style);
-            const value_size = try measurer.measureText(input_widget.value, style);
+            const value_size = try measurer.measureText(value, style);
             const requested = Size{
                 .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, constraints.max_width)),
                 .height = measured.height + input_vertical_padding * 2,
@@ -3046,7 +3126,7 @@ fn layoutElementInto(
             commitRenderNode(node, .{
                 .kind = .text_input,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .text = input_widget.value,
+                .text = textInputState(element).text.items,
                 .text_input_id = input_widget.id,
                 .focus_id = input_widget.focus_node.id,
                 .text_style = style,

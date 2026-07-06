@@ -12,7 +12,6 @@ pub const KeyworkRuntime = opaque {};
 pub const KeyworkTimer = opaque {};
 
 pub const KeyworkContext = extern struct {
-    input_text: [*:0]const u8,
     window_width: f32,
     window_height: f32,
     color_scheme: [*:0]const u8,
@@ -686,10 +685,8 @@ fn linear(
 }
 
 fn makeContext(allocator: std.mem.Allocator, context: keywork.AppContext) !KeyworkContext {
-    const input_text = try allocator.dupeZ(u8, context.input_text);
     const color_scheme = try allocator.dupeZ(u8, context.color_scheme);
     return .{
-        .input_text = input_text.ptr,
         .window_width = context.window_width,
         .window_height = context.window_height,
         .color_scheme = color_scheme.ptr,

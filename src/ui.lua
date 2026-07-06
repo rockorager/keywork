@@ -229,6 +229,8 @@ function ui.text_input(options)
     type = "text_input",
     id = options.id,
     placeholder = options.placeholder,
+    value = options.value,
+    on_change = options.on_change,
   }
 end
 

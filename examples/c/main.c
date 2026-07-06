@@ -44,7 +44,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
 
     keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
         keywork_button(build, "increment", "Increment", increment, state));
-    keywork_widget_t *input = keywork_text_input(build, "c-input", context->input_text, "Type here");
+    keywork_widget_t *input = keywork_text_input(build, "c-input", "", "Type here");
     keywork_widget_t *status_row = keywork_text(build, context->color_scheme);
     keywork_widget_t *children[] = {
         keywork_colored_text(build, "C app hosted by libkeywork", 0xff6d4affu),

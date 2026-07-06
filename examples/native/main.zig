@@ -21,15 +21,12 @@ const NativeApp = struct {
         const allocator = scope.allocator;
         const count_label = try std.fmt.allocPrint(allocator, "Count: {d}", .{self.count});
         const scheme_label = try std.fmt.allocPrint(allocator, "color scheme: {s}", .{context.color_scheme});
-        const input_label = if (context.input_text.len == 0) "text input is empty" else context.input_text;
-
         const button = try widgets.actionButton(allocator, "increment", "Increment", "increment");
-        const input = widgets.textInput("native-input", context.input_text, "Type here");
+        const input = widgets.textInput("native-input", "", "Type here");
         const children = [_]Widget{
             widgets.coloredText("Native Zig libkeywork example", keywork.colors.accent),
             widgets.text(count_label),
             input,
-            widgets.text(input_label),
             widgets.text(scheme_label),
             button,
         };
