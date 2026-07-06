@@ -1999,6 +1999,23 @@ fn parseWidget(
         } else |_| {}
         return .{ .scroll = .{ .id = id, .child = child, .axes = axes } };
     }
+    if (std.mem.eql(u8, kind, "list")) {
+        const ListOptions = struct {
+            count: usize = 0,
+            item_height: f32 = 16,
+        };
+        const id = try dupeStringField(lua_state, allocator, table, "id");
+        const options = try lua_codec.decode(ListOptions, lua_state, table, allocator);
+        c.lua_getfield(lua_state, table, "build_item");
+        defer pop(lua_state, 1);
+        if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+        c.lua_pushvalue(lua_state, -1);
+        const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+        errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        const builder = try callback_allocator.create(LuaItemBuilder);
+        builder.* = .{ .allocator = callback_allocator, .lua_state = lua_state, .ref = ref };
+        return keywork.widgets.list(id, options.count, options.item_height, builder.itemBuilder());
+    }
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
         return keywork.widgets.spacer(options.flex);
@@ -2800,6 +2817,55 @@ fn getOptionalTextChangeCallbackField(
     if (c.lua_isnil(lua_state, -1)) return null;
     return try textChangeCallbackFromStack(lua_state, allocator, -1);
 }
+
+const LuaItemBuilder = struct {
+    allocator: std.mem.Allocator,
+    lua_state: *c.lua_State,
+    ref: c_int,
+
+    fn itemBuilder(self: *LuaItemBuilder) keywork.Widget.ItemBuilder {
+        return .{
+            .ptr = self,
+            .build_fn = buildItem,
+            .clone_fn = cloneBuilder,
+            .destroy_fn = destroyBuilder,
+        };
+    }
+
+    fn buildItem(ptr: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
+        const self: *const LuaItemBuilder = @ptrCast(@alignCast(ptr));
+        if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        c.lua_pushinteger(self.lua_state, @intCast(index + 1));
+        if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) {
+            var len: usize = 0;
+            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
+            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("list item builder failed: {s}", .{message[0..len]});
+            pop(self.lua_state, 1);
+            return error.LuaCallbackFailed;
+        }
+        defer pop(self.lua_state, 1);
+        return parseWidget(self.lua_state, scope.allocator, scope.allocator, .{}, .{}, -1);
+    }
+
+    /// Transfers the registry ref like LuaCallback.clone: parse-tree
+    /// originals live in the build arena and are never destroyed, so the
+    /// element clone must become the sole owner.
+    fn cloneBuilder(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *LuaItemBuilder = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
+        const copy = try allocator.create(LuaItemBuilder);
+        copy.* = .{ .allocator = allocator, .lua_state = self.lua_state, .ref = self.ref };
+        self.ref = -2;
+        return copy;
+    }
+
+    fn destroyBuilder(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *LuaItemBuilder = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        allocator.destroy(self);
+    }
+};
 
 fn textChangeCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.TextChangeCallback {
     if (c.lua_type(lua_state, index) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;

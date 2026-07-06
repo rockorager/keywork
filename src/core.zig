@@ -301,6 +301,7 @@ pub const Widget = union(enum) {
     focus: Focus,
     focus_scope: FocusScope,
     scroll: Scroll,
+    list: List,
     text_input: TextInput,
     row: Children,
     column: Children,
@@ -422,6 +423,44 @@ pub const Widget = union(enum) {
         id: []const u8,
         child: *const Widget,
         axes: ScrollAxes = .vertical,
+    };
+
+    /// A virtualized vertical list: only the items visible in the
+    /// viewport (plus a small buffer) are built as elements. Items have a
+    /// fixed extent so the content height and visible range are derivable
+    /// without building everything. Item state does not survive scrolling
+    /// out of the built window.
+    pub const List = struct {
+        id: []const u8,
+        item_count: usize,
+        item_extent: f32,
+        build_item: ItemBuilder,
+    };
+
+    pub const ItemBuilder = struct {
+        ptr: *const anyopaque,
+        build_fn: *const fn (ptr: *const anyopaque, scope: *BuildScope, index: usize) anyerror!Widget,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
+
+        pub fn build(self: ItemBuilder, scope: *BuildScope, index: usize) !Widget {
+            return self.build_fn(self.ptr, scope, index);
+        }
+
+        pub fn clone(self: ItemBuilder, allocator: std.mem.Allocator) !ItemBuilder {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .build_fn = self.build_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: ItemBuilder, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
+        }
     };
 
     pub const ScrollAxes = enum {
@@ -817,6 +856,10 @@ pub const widgets = struct {
         return .{ .scroll = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
 
+    pub fn list(id: []const u8, item_count: usize, item_extent: f32, build_item: Widget.ItemBuilder) Widget {
+        return .{ .list = .{ .id = id, .item_count = item_count, .item_extent = item_extent, .build_item = build_item } };
+    }
+
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
         _ = allocator;
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
@@ -902,6 +945,7 @@ pub const Element = struct {
         focus,
         focus_scope,
         scroll,
+        list,
         text_input,
         row,
         column,
@@ -1032,6 +1076,8 @@ pub const RenderNode = struct {
     focus_scope_id: ?[]const u8 = null,
     modal_focus_scope: bool = false,
     scroll_id: ?[]const u8 = null,
+    scroll_content: Size = .{ .width = 0, .height = 0 },
+    scroll_offset: Point = .{ .x = 0, .y = 0 },
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -1067,6 +1113,7 @@ pub const RenderNode = struct {
         focus,
         focus_scope,
         scroll,
+        list,
         text_input,
         row,
         column,
@@ -1361,6 +1408,78 @@ pub fn scrollState(element: *Element) *ScrollState {
     return @ptrCast(@alignCast(element.state.?));
 }
 
+/// State owned by a list element: the scroll offset plus the currently
+/// built item window. range_stale marks a built window that no longer
+/// matches the offset/viewport; the runtime schedules another dirty-state
+/// pass to rebuild it.
+pub const ListState = struct {
+    offset: f32 = 0,
+    viewport_height: f32 = 0,
+    first: usize = 0,
+    built: usize = 0,
+    range_stale: bool = false,
+};
+
+pub fn listState(element: *Element) *ListState {
+    std.debug.assert(element.kind == .list);
+    return @ptrCast(@alignCast(element.state.?));
+}
+
+const list_buffer_items = 2;
+
+const ListRange = struct {
+    first: usize,
+    count: usize,
+};
+
+fn listVisibleRange(list_widget: Widget.List, offset: f32, viewport_height: f32) ListRange {
+    if (list_widget.item_count == 0 or list_widget.item_extent <= 0) return .{ .first = 0, .count = 0 };
+    const height = if (std.math.isFinite(viewport_height))
+        viewport_height
+    else
+        list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
+    const first_visible: usize = @intFromFloat(@max(0, @floor(offset / list_widget.item_extent)));
+    const first = @min(first_visible -| list_buffer_items, list_widget.item_count - 1);
+    const visible: usize = @intFromFloat(@ceil(height / list_widget.item_extent) + 1);
+    const count = @min(visible + list_buffer_items * 2, list_widget.item_count - first);
+    return .{ .first = first, .count = count };
+}
+
+fn buildListChildren(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    list_widget: Widget.List,
+    range: ListRange,
+    constraints: Constraints,
+) ![]Element {
+    const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+    const children = try allocator.alloc(Element, range.count);
+    var initialized: usize = 0;
+    errdefer {
+        for (children[0..initialized]) |*child| destroyElementTree(allocator, child);
+        allocator.free(children);
+    }
+    for (children, 0..) |*child, index| {
+        const item = try list_widget.build_item.build(scope, range.first + index);
+        child.* = try buildElementTreeScoped(allocator, scope, &item, item_constraints);
+        initialized += 1;
+    }
+    return children;
+}
+
+/// Reports whether any list's built window drifted from its offset and
+/// viewport, so the runtime can run another dirty-state pass.
+pub fn anyListRangeStale(element: *const Element) bool {
+    if (element.kind == .list) {
+        const state: *const ListState = @ptrCast(@alignCast(element.state.?));
+        if (state.range_stale) return true;
+    }
+    for (element.children) |*child| {
+        if (anyListRangeStale(child)) return true;
+    }
+    return false;
+}
+
 fn scrollChildConstraints(constraints: Constraints, axes: Widget.ScrollAxes) Constraints {
     return .{
         .max_width = if (axes.horizontalUnbounded()) std.math.inf(f32) else constraints.max_width,
@@ -1496,6 +1615,18 @@ pub fn buildElementTreeScoped(
             errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
             return .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children };
+        },
+        .list => {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const state = try allocator.create(ListState);
+            errdefer allocator.destroy(state);
+            state.* = .{ .viewport_height = constraints.max_height };
+            const range = listVisibleRange(element_widget.list, state.offset, constraints.max_height);
+            state.first = range.first;
+            state.built = range.count;
+            const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
+            return .{ .kind = .list, .widget = element_widget, .state = state, .children = children };
         },
         .focus_scope => |focus_scope_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1717,6 +1848,7 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
                 allocator.destroy(input_state);
             },
             .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
+            .list => allocator.destroy(@as(*ListState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
         element.state = null;
@@ -1779,6 +1911,21 @@ pub fn updateElementTreeScoped(
         },
         .scroll => |scroll_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
+        },
+        .list => {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const state = listState(element);
+            const range = listVisibleRange(element_widget.list, state.offset, state.viewport_height);
+            const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
+            for (element.children) |*child| destroyElementTree(allocator, child);
+            allocator.free(element.children);
+            element.children = children;
+            state.first = range.first;
+            state.built = range.count;
+            state.range_stale = false;
+            destroyElementWidget(allocator, &element.widget);
+            element.widget = element_widget;
         },
         .focus_scope => |focus_scope_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, focus_scope_widget.child, constraints);
@@ -1876,6 +2023,24 @@ pub fn rebuildDirtyElementTreeScoped(
         => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
 
         .scroll => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
+        .list => |list_widget| {
+            const state = listState(element);
+            const rebuilt_children = try rebuildDirtyChildren(allocator, scope, element.children, .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent });
+            if (!state.range_stale) {
+                if (rebuilt_children) markElementLayoutDirty(element);
+                return rebuilt_children;
+            }
+            const range = listVisibleRange(list_widget, state.offset, state.viewport_height);
+            const children = try buildListChildren(allocator, scope, list_widget, range, constraints);
+            for (element.children) |*child| destroyElementTree(allocator, child);
+            allocator.free(element.children);
+            element.children = children;
+            state.first = range.first;
+            state.built = range.count;
+            state.range_stale = false;
+            markElementLayoutDirty(element);
+            return true;
+        },
         .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -1937,8 +2102,13 @@ pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element 
 /// Finds the scroll element with the given id, marking the layout path to
 /// it dirty so a scroll relayouts exactly that viewport.
 pub fn dirtyScrollElement(element: *Element, scroll_id: []const u8) ?*Element {
-    if (element.kind == .scroll) {
-        if (std.mem.eql(u8, element.widget.scroll.id, scroll_id)) {
+    const id: ?[]const u8 = switch (element.kind) {
+        .scroll => element.widget.scroll.id,
+        .list => element.widget.list.id,
+        else => null,
+    };
+    if (id) |element_id| {
+        if (std.mem.eql(u8, element_id, scroll_id)) {
             markElementLayoutDirty(element);
             return element;
         }
@@ -1996,6 +2166,15 @@ pub fn refreshInteractionElements(
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
         .scroll => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
+        .list => |list_widget| {
+            var refreshed = false;
+            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+            for (element.children) |*child| {
+                if (try refreshInteractionElements(allocator, scope, child, item_constraints, ids)) refreshed = true;
+            }
+            if (refreshed) markElementLayoutDirty(element);
+            return refreshed;
+        },
         .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -2080,6 +2259,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .focus => .focus,
         .focus_scope => .focus_scope,
         .scroll => .scroll,
+        .list => .list,
         .text_input => .text_input,
         .row => .row,
         .column => .column,
@@ -2336,6 +2516,17 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const id = try allocator.dupe(u8, scroll_widget.id);
             break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
         },
+        .list => |list_widget| blk: {
+            const id = try allocator.dupe(u8, list_widget.id);
+            errdefer allocator.free(id);
+            const builder = try list_widget.build_item.clone(allocator);
+            break :blk .{ .list = .{
+                .id = id,
+                .item_count = list_widget.item_count,
+                .item_extent = list_widget.item_extent,
+                .build_item = builder,
+            } };
+        },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
@@ -2405,6 +2596,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
         .scroll => |scroll_widget| allocator.free(scroll_widget.id),
+        .list => |list_widget| {
+            list_widget.build_item.destroy(allocator);
+            allocator.free(list_widget.id);
+        },
         .text_input => |input_widget| {
             if (input_widget.on_change) |callback| callback.destroy(allocator);
             allocator.free(input_widget.id);
@@ -2549,7 +2744,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
-        .scroll => try display_list.pushClip(allocator, node.rect),
+        .scroll, .list => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
 
@@ -2557,10 +2752,14 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         try paintScaled(allocator, child, display_list, scale);
     }
 
-    if (node.kind == .scroll) {
+    if (isViewportKind(node.kind)) {
         try paintScrollbars(allocator, node, display_list);
         try display_list.popClip(allocator);
     }
+}
+
+fn isViewportKind(kind: RenderNode.Kind) bool {
+    return kind == .scroll or kind == .list;
 }
 
 const scrollbar_thickness: f32 = 4;
@@ -2569,18 +2768,16 @@ const scrollbar_min_thumb: f32 = 12;
 const scrollbar_color: Color = Color.argb(0x60, 0x80, 0x80, 0x88);
 
 /// Paints proportional scrollbar thumbs for axes whose content overflows
-/// the viewport. Geometry is derived from the viewport and content rects,
-/// so no scroll payload beyond the child is needed.
+/// the viewport, from the geometry recorded during layout.
 fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
-    std.debug.assert(node.kind == .scroll);
-    const content = node.children[0];
+    std.debug.assert(isViewportKind(node.kind));
+    const content = node.scroll_content;
 
-    if (content.rect.height > node.rect.height) {
+    if (content.height > node.rect.height) {
         const track = node.rect.height - scrollbar_margin * 2;
-        const thumb = @max(scrollbar_min_thumb, track * node.rect.height / content.rect.height);
-        const max_offset = content.rect.height - node.rect.height;
-        const offset = node.rect.y - content.rect.y;
-        const along = (track - thumb) * (offset / max_offset);
+        const thumb = @max(scrollbar_min_thumb, track * node.rect.height / content.height);
+        const max_offset = content.height - node.rect.height;
+        const along = (track - thumb) * (node.scroll_offset.y / max_offset);
         try display_list.fillRect(allocator, .{
             .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
             .y = node.rect.y + scrollbar_margin + along,
@@ -2589,12 +2786,11 @@ fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, displa
         }, scrollbar_color);
     }
 
-    if (content.rect.width > node.rect.width) {
+    if (content.width > node.rect.width) {
         const track = node.rect.width - scrollbar_margin * 2;
-        const thumb = @max(scrollbar_min_thumb, track * node.rect.width / content.rect.width);
-        const max_offset = content.rect.width - node.rect.width;
-        const offset = node.rect.x - content.rect.x;
-        const along = (track - thumb) * (offset / max_offset);
+        const thumb = @max(scrollbar_min_thumb, track * node.rect.width / content.width);
+        const max_offset = content.width - node.rect.width;
+        const along = (track - thumb) * (node.scroll_offset.x / max_offset);
         try display_list.fillRect(allocator, .{
             .x = node.rect.x + scrollbar_margin + along,
             .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
@@ -2823,7 +3019,7 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
 }
 
 pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
-    if (node.kind == .scroll and !node.rect.contains(point)) return null;
+    if (isViewportKind(node.kind) and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
@@ -2876,7 +3072,7 @@ fn nodeHasTapCallback(node: *const RenderNode) bool {
 }
 
 pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
-    if (node.kind == .scroll and !node.rect.contains(point)) return null;
+    if (isViewportKind(node.kind) and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
@@ -2890,13 +3086,13 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
 }
 
 pub fn hitTestScroll(node: *const RenderNode, point: Point) ?[]const u8 {
-    if (node.kind == .scroll and !node.rect.contains(point)) return null;
+    if (isViewportKind(node.kind) and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
         if (hitTestScroll(node.children[index], point)) |id| return id;
     }
-    if (node.kind == .scroll) return node.scroll_id;
+    if (isViewportKind(node.kind)) return node.scroll_id;
     return null;
 }
 
@@ -3280,6 +3476,38 @@ fn layoutElementInto(
                 .kind = .scroll,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
                 .scroll_id = scroll_widget.id,
+                .scroll_content = child.rect.size(),
+                .scroll_offset = .{ .x = state.offset_x, .y = state.offset_y },
+            });
+        },
+        .list => |list_widget| {
+            const state = listState(element);
+            const content_height = list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
+            const available_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else content_height;
+            const height = @min(available_height, content_height);
+            state.viewport_height = height;
+            state.offset = std.math.clamp(state.offset, 0, @max(0, content_height - height));
+
+            // A drifted window is rebuilt by the next dirty-state pass; this
+            // pass lays out whatever window is currently built.
+            const ideal = listVisibleRange(list_widget, state.offset, height);
+            if (ideal.first != state.first or ideal.count != state.built) state.range_stale = true;
+
+            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+            const children = try ensureChildSlice(allocator, node, element.children.len);
+            var content_width: f32 = 0;
+            for (element.children, 0..) |*child_element, index| {
+                const child_y = origin.y - state.offset + @as(f32, @floatFromInt(state.first + index)) * list_widget.item_extent;
+                children[index] = try layoutElement(allocator, child_element, item_constraints, .{ .x = origin.x, .y = child_y }, measurer);
+                content_width = @max(content_width, children[index].rect.width);
+            }
+            const width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else content_width;
+            commitRenderNode(node, .{
+                .kind = .list,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
+                .scroll_id = list_widget.id,
+                .scroll_content = .{ .width = content_width, .height = content_height },
+                .scroll_offset = .{ .x = 0, .y = state.offset },
             });
         },
         .text_input => |input_widget| {
@@ -3667,6 +3895,61 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
         }
     }
     try std.testing.expect(saw_thumb);
+}
+
+test "virtualized list builds only the visible window and follows scroll" {
+    const Items = struct {
+        var dummy: u8 = 0;
+
+        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
+            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
+            return .{ .text = .{ .value = label } };
+        }
+
+        fn builder() Widget.ItemBuilder {
+            return .{ .ptr = &dummy, .build_fn = build };
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    // 1000 items at 16px in a 48px viewport.
+    const list_widget = widgets.list("big-list", 1000, 16, Items.builder());
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+
+    // Only the window is built, not 1000 elements.
+    try std.testing.expect(element.children.len < 16);
+    try std.testing.expectEqualStrings("item 0", element.children[0].widget.text.value);
+
+    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 48), root.rect.height);
+    try std.testing.expect(!anyListRangeStale(&element));
+
+    // Jump halfway down: layout clamps, flags the stale window, and the
+    // dirty pass rebuilds it around the new offset.
+    listState(&element).offset = 8000;
+    _ = dirtyScrollElement(&element, "big-list");
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expect(anyListRangeStale(&element));
+
+    var rebuild_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(retained_allocator, &rebuild_scope, &element, constraints));
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expect(!anyListRangeStale(&element));
+
+    const state = listState(&element);
+    try std.testing.expectEqual(@as(usize, 498), state.first);
+    var label_buffer: [16]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&label_buffer, "item {d}", .{state.first});
+    try std.testing.expectEqualStrings(expected, element.children[0].widget.text.value);
+    // The first built row sits just above the viewport.
+    try std.testing.expect(root.children[0].rect.y <= 0);
 }
 
 test "flex spacers collapse under unbounded scroll constraints" {

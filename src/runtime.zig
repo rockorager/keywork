@@ -135,6 +135,11 @@ pub const Runtime = struct {
             } else {
                 try self.rebuildDirtyState();
             }
+            // Layout may discover that a virtualized list's built window
+            // drifted; another dirty-state pass rebuilds it.
+            if (self.element_root) |*element_root| {
+                if (keywork.anyListRangeStale(element_root)) self.state_rebuild_pending = true;
+            }
         }
         self.repaint_pending = false;
 
@@ -556,9 +561,18 @@ pub const Runtime = struct {
         const id = keywork.hitTestScroll(root, point) orelse return;
         const element_root = if (self.element_root) |*element_root| element_root else return;
         const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
-        const state = keywork.scrollState(scroll_element);
-        state.offset_x = @max(0, state.offset_x + dx);
-        state.offset_y = @max(0, state.offset_y + dy);
+        switch (scroll_element.kind) {
+            .scroll => {
+                const state = keywork.scrollState(scroll_element);
+                state.offset_x = @max(0, state.offset_x + dx);
+                state.offset_y = @max(0, state.offset_y + dy);
+            },
+            .list => {
+                const state = keywork.listState(scroll_element);
+                state.offset = @max(0, state.offset + dy);
+            },
+            else => unreachable,
+        }
         try self.invalidateState();
     }
 
@@ -1008,6 +1022,78 @@ test "wheel scroll moves viewport content without rebuilding" {
     // Scrolling outside any viewport is a no-op.
     try runtime.scrollBy(.{ .x = 5, .y = 500 }, 0, 30);
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+}
+
+test "scrolling a virtualized list converges its window in one frame" {
+    const TestApp = struct {
+        builds: usize = 0,
+
+        var dummy: u8 = 0;
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            return keywork.widgets.list("rows", 1000, 16, .{ .ptr = &dummy, .build_fn = buildItem });
+        }
+
+        fn buildItem(_: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
+            const label = try std.fmt.allocPrint(scope.allocator, "row {d}", .{index});
+            return .{ .text = .{ .value = label } };
+        }
+
+        fn firstRowText(node: *const keywork.RenderNode) ?[]const u8 {
+            if (node.kind == .text) return node.text;
+            for (node.children) |child| {
+                if (firstRowText(child)) |text| return text;
+            }
+            return null;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
+
+    // A deep scroll rebuilds the window through the frame loop's
+    // convergence pass, with no app rebuild.
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 8000);
+    try std.testing.expectEqualStrings("row 498", TestApp.firstRowText(runtime.root.?).?);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -100_000);
+    try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
 }
 
 test "typing edits element-owned input state without rebuilding" {

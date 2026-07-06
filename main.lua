@@ -27,6 +27,17 @@ local App = ui.stateful({
         ui.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
         ui.sized({
           height = 120,
+          child = ui.list({
+            id = "demo-list",
+            count = 10000,
+            item_height = 20,
+            build_item = function(index)
+              return ui.text(string.format("virtual row %d of 10000", index))
+            end,
+          }),
+        }),
+        ui.sized({
+          height = 120,
           child = ui.scroll({
             id = "demo-scroll",
             child = ui.column({

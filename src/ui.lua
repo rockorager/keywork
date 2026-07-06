@@ -244,6 +244,17 @@ function ui.scroll(options)
   }
 end
 
+function ui.list(options)
+  options = options or {}
+  return {
+    type = "list",
+    id = options.id,
+    count = options.count,
+    item_height = options.item_height,
+    build_item = options.build_item,
+  }
+end
+
 function ui.column(options)
   options = options or {}
   return {
