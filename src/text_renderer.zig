@@ -4,6 +4,8 @@ const Self = @This();
 
 const std = @import("std");
 const c = @import("text_c");
+const image_c = @import("image_c");
+const uucode = @import("uucode");
 const keywork = @import("core.zig");
 
 const log = std.log.scoped(.keywork_text);
@@ -12,7 +14,7 @@ allocator: std.mem.Allocator,
 library: c.FT_Library,
 fonts: std.ArrayList(FontFace) = .empty,
 next_font_id: u32 = 0,
-fallback_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
+fallback_cache: std.AutoHashMapUnmanaged(FallbackKey, usize) = .empty,
 shape_cache: ShapeCache = .empty,
 glyph_cache: GlyphCache = .empty,
 cache_clock: u64 = 0,
@@ -371,24 +373,48 @@ fn appendLineGlyphs(
     }
 }
 
+/// Splits text into font runs along grapheme cluster boundaries, so
+/// multi-codepoint emoji (ZWJ sequences, flags, keycaps, skin tones) stay
+/// whole and HarfBuzz can compose them within one font.
 fn nextFontRun(self: *Self, value: []const u8, index: *usize) !?FontRun {
     if (index.* >= value.len) return null;
 
     const run_start = index.*;
-    const first = try nextCodepoint(value, index);
-    const font_index = try self.fontForCodepoint(first.codepoint);
+    var it = uucode.grapheme.utf8Iterator(value[run_start..]);
+    const first = it.nextGrapheme() orelse return null;
+    const font_index = try self.fontForCluster(value[run_start + first.start .. run_start + first.end]);
+    var run_end = run_start + first.end;
 
-    while (index.* < value.len) {
-        const saved = index.*;
-        const codepoint = try nextCodepoint(value, index);
-        const next_font_index = try self.fontForCodepoint(codepoint.codepoint);
-        if (next_font_index != font_index) {
-            index.* = saved;
-            break;
-        }
+    while (it.peekGrapheme()) |cluster| {
+        const cluster_font = try self.fontForCluster(value[run_start + cluster.start .. run_start + cluster.end]);
+        if (cluster_font != font_index) break;
+        _ = it.nextGrapheme();
+        run_end = run_start + cluster.end;
     }
 
-    return .{ .font_index = font_index, .value = value[run_start..index.*] };
+    index.* = run_end;
+    return .{ .font_index = font_index, .value = value[run_start..run_end] };
+}
+
+/// Chooses one font for a whole grapheme cluster. The base codepoint
+/// drives the lookup; an emoji-presentation signal anywhere in the cluster
+/// (VS16, ZWJ participants, emoji ranges) prefers a color font even when
+/// the base is plain text, e.g. keycap sequences starting with a digit.
+fn fontForCluster(self: *Self, cluster: []const u8) !usize {
+    var base: ?u21 = null;
+    var prefer_color = false;
+    var force_text = false;
+
+    var index: usize = 0;
+    while (index < cluster.len) {
+        const decoded = try nextCodepoint(cluster, &index);
+        if (base == null) base = decoded.codepoint;
+        if (decoded.codepoint == 0xFE0F or wantsColorGlyph(decoded.codepoint)) prefer_color = true;
+        if (decoded.codepoint == 0xFE0E) force_text = true;
+    }
+
+    const base_codepoint = base orelse return primary_font_index;
+    return self.fontForCodepoint(base_codepoint, prefer_color and !force_text);
 }
 
 fn nextCodepoint(value: []const u8, index: *usize) !CodepointSlice {
@@ -401,21 +427,29 @@ fn nextCodepoint(value: []const u8, index: *usize) !CodepointSlice {
     return .{ .value = slice, .codepoint = try std.unicode.utf8Decode(slice) };
 }
 
-fn fontForCodepoint(self: *Self, codepoint: u21) !usize {
-    if (self.fontSupports(primary_font_index, codepoint)) return primary_font_index;
-    if (self.fallback_cache.get(codepoint)) |font_index| return font_index;
+const FallbackKey = struct {
+    codepoint: u21,
+    prefer_color: bool,
+};
+
+fn fontForCodepoint(self: *Self, codepoint: u21, prefer_color: bool) !usize {
+    // A color-presentation cluster must not short-circuit to the primary
+    // font just because it covers the base codepoint (keycap digits).
+    if (!prefer_color and self.fontSupports(primary_font_index, codepoint)) return primary_font_index;
+    const key: FallbackKey = .{ .codepoint = codepoint, .prefer_color = prefer_color };
+    if (self.fallback_cache.get(key)) |font_index| return font_index;
 
     var font_path: [4096]u8 = undefined;
     const font_index = fallback: {
-        const prefer_color: c_int = if (wantsColorGlyph(codepoint)) 1 else 0;
-        if (c.keywork_fontconfig_match_codepoint(codepoint, prefer_color, font_path[0..].ptr, font_path.len) == 0) break :fallback primary_font_index;
+        const want_color: c_int = if (prefer_color) 1 else 0;
+        if (c.keywork_fontconfig_match_codepoint(codepoint, want_color, font_path[0..].ptr, font_path.len) == 0) break :fallback primary_font_index;
         const path = std.mem.sliceTo(font_path[0..], 0);
         const loaded_index = self.loadFont(path) catch break :fallback primary_font_index;
         if (!self.fontSupports(loaded_index, codepoint)) break :fallback primary_font_index;
         break :fallback loaded_index;
     };
 
-    try self.fallback_cache.put(self.allocator, codepoint, font_index);
+    try self.fallback_cache.put(self.allocator, key, font_index);
     return font_index;
 }
 
@@ -620,40 +654,27 @@ fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face, pixel_size: u31) !GlyphB
     return bitmap;
 }
 
-/// Bilinear resample of a premultiplied BGRA bitmap; premultiplied texels
-/// interpolate without fringes.
+/// Resamples a premultiplied BGRA bitmap with stb_image_resize, which
+/// filters properly at the large downscale factors fixed emoji strikes
+/// need (128px strikes at 16px text). Premultiplied texels filter without
+/// fringes.
 fn scaleColorBitmap(allocator: std.mem.Allocator, source: GlyphBitmap, factor: f32) !GlyphBitmap {
     const dst_width: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(source.width)) * factor)));
     const dst_rows: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(source.rows)) * factor)));
     const pixels = try allocator.alloc(u8, @as(usize, dst_width) * dst_rows * 4);
     errdefer allocator.free(pixels);
 
-    const src_width: f32 = @floatFromInt(source.width);
-    const src_rows: f32 = @floatFromInt(source.rows);
-    var y: usize = 0;
-    while (y < dst_rows) : (y += 1) {
-        const sy = @min(src_rows - 1, (@as(f32, @floatFromInt(y)) + 0.5) / factor - 0.5);
-        const y0: usize = @intFromFloat(@max(0, @floor(sy)));
-        const y1 = @min(source.rows - 1, y0 + 1);
-        const fy = @max(0, sy - @floor(sy));
-        var x: usize = 0;
-        while (x < dst_width) : (x += 1) {
-            const sx = @min(src_width - 1, (@as(f32, @floatFromInt(x)) + 0.5) / factor - 0.5);
-            const x0: usize = @intFromFloat(@max(0, @floor(sx)));
-            const x1 = @min(source.width - 1, x0 + 1);
-            const fx = @max(0, sx - @floor(sx));
-            var channel: usize = 0;
-            while (channel < 4) : (channel += 1) {
-                const p00: f32 = @floatFromInt(source.coverage[(y0 * source.width + x0) * 4 + channel]);
-                const p10: f32 = @floatFromInt(source.coverage[(y0 * source.width + x1) * 4 + channel]);
-                const p01: f32 = @floatFromInt(source.coverage[(y1 * source.width + x0) * 4 + channel]);
-                const p11: f32 = @floatFromInt(source.coverage[(y1 * source.width + x1) * 4 + channel]);
-                const top_row = p00 + (p10 - p00) * fx;
-                const bottom_row = p01 + (p11 - p01) * fx;
-                pixels[(y * dst_width + x) * 4 + channel] = @intFromFloat(@round(top_row + (bottom_row - top_row) * fy));
-            }
-        }
-    }
+    if (image_c.stbir_resize_uint8(
+        source.coverage.ptr,
+        @intCast(source.width),
+        @intCast(source.rows),
+        @intCast(@as(usize, source.width) * 4),
+        pixels.ptr,
+        @intCast(dst_width),
+        @intCast(dst_rows),
+        @intCast(@as(usize, dst_width) * 4),
+        4,
+    ) == 0) return error.GlyphResizeFailed;
 
     return .{
         .width = dst_width,
