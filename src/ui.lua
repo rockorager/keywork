@@ -4,32 +4,140 @@ local default_theme = {
   schemes = {
     light = {
       colors = {
-        background = 0xfff5f6fa,
-        foreground = 0xff0c0e12,
-        primary = 0xff265eb2,
-        on_primary = 0xfff5f6fa,
-        surface = 0xffffffff,
-        surface_high = 0xffffffff,
-        surface_low = 0xffe8edf5,
-        border = 0xffc4ccd8,
-        muted = 0xff5d6675,
-        error = 0xffad4143,
-        on_error = 0xffffffff,
+        black = 0xff000000,
+        white = 0xffffffff,
+
+        red = 0xffff3b30,
+        orange = 0xffff9500,
+        yellow = 0xffffcc00,
+        green = 0xff34c759,
+        mint = 0xff00c7be,
+        teal = 0xff30b0c7,
+        cyan = 0xff32ade6,
+        blue = 0xff007aff,
+        indigo = 0xff5856d6,
+        purple = 0xffaf52de,
+        pink = 0xffff2d55,
+        brown = 0xffa2845e,
+        gray = 0xff8e8e93,
+        gray2 = 0xffaeaeb2,
+        gray3 = 0xffc7c7cc,
+        gray4 = 0xffd1d1d6,
+        gray5 = 0xffe5e5ea,
+        gray6 = 0xfff2f2f7,
+
+        label = "black",
+        secondary_label = 0x993c3c43,
+        tertiary_label = 0x4c3c3c43,
+        quaternary_label = 0x2e3c3c43,
+        system_background = "white",
+        secondary_system_background = "gray6",
+        tertiary_system_background = "white",
+        system_fill = 0x33787880,
+        secondary_system_fill = 0x29787880,
+        tertiary_system_fill = 0x1f787880,
+        quaternary_system_fill = 0x14747480,
+        separator = 0x4a3c3c43,
+        opaque_separator = 0xffc6c6c8,
+
+        background = "system_background",
+        surface = "secondary_system_background",
+        surface_high = "tertiary_system_background",
+        surface_low = "gray6",
+        text = "label",
+        text_secondary = "secondary_label",
+        text_tertiary = "tertiary_label",
+        placeholder = "tertiary_label",
+        border = "separator",
+        fill = "system_fill",
+        fill_secondary = "secondary_system_fill",
+
+        accent = "blue",
+        on_accent = "white",
+        success = "green",
+        on_success = "black",
+        warning = "yellow",
+        on_warning = "black",
+        danger = "red",
+        on_danger = "black",
+        info = "cyan",
+        on_info = "black",
+
+        foreground = "text",
+        muted = "text_secondary",
+        primary = "accent",
+        on_primary = "on_accent",
+        error = "danger",
+        on_error = "on_danger",
       },
     },
     dark = {
       colors = {
-        background = 0xff0c0e12,
-        foreground = 0xfff5f6fa,
-        primary = 0xff6cacff,
-        on_primary = 0xff0c0e12,
-        surface = 0xff141820,
-        surface_high = 0xff1c2330,
-        surface_low = 0xff080a0d,
-        border = 0xff344154,
-        muted = 0xffa7afbd,
-        error = 0xffff8e8c,
-        on_error = 0xff0c0e12,
+        black = 0xff000000,
+        white = 0xffffffff,
+
+        red = 0xffff453a,
+        orange = 0xffff9f0a,
+        yellow = 0xffffd60a,
+        green = 0xff30d158,
+        mint = 0xff63e6e2,
+        teal = 0xff40c8e0,
+        cyan = 0xff64d2ff,
+        blue = 0xff0a84ff,
+        indigo = 0xff5e5ce6,
+        purple = 0xffbf5af2,
+        pink = 0xffff375f,
+        brown = 0xffac8e68,
+        gray = 0xff8e8e93,
+        gray2 = 0xff636366,
+        gray3 = 0xff48484a,
+        gray4 = 0xff3a3a3c,
+        gray5 = 0xff2c2c2e,
+        gray6 = 0xff1c1c1e,
+
+        label = "white",
+        secondary_label = 0x99ebebf5,
+        tertiary_label = 0x4cebebf5,
+        quaternary_label = 0x2eebebf5,
+        system_background = "black",
+        secondary_system_background = "gray6",
+        tertiary_system_background = "gray5",
+        system_fill = 0x5c787880,
+        secondary_system_fill = 0x52787880,
+        tertiary_system_fill = 0x3d767680,
+        quaternary_system_fill = 0x2e747480,
+        separator = 0x99545458,
+        opaque_separator = 0xff38383a,
+
+        background = "system_background",
+        surface = "secondary_system_background",
+        surface_high = "tertiary_system_background",
+        surface_low = "black",
+        text = "label",
+        text_secondary = "secondary_label",
+        text_tertiary = "tertiary_label",
+        placeholder = "tertiary_label",
+        border = "separator",
+        fill = "system_fill",
+        fill_secondary = "secondary_system_fill",
+
+        accent = "blue",
+        on_accent = "black",
+        success = "green",
+        on_success = "black",
+        warning = "yellow",
+        on_warning = "black",
+        danger = "red",
+        on_danger = "black",
+        info = "cyan",
+        on_info = "black",
+
+        foreground = "text",
+        muted = "text_secondary",
+        primary = "accent",
+        on_primary = "on_accent",
+        error = "danger",
+        on_error = "on_danger",
       },
     },
   },
@@ -49,23 +157,23 @@ local default_theme = {
       padding_y = "sm",
       radius = "md",
       default = {
-        background = "primary",
-        foreground = "on_primary",
+        background = "accent",
+        foreground = "on_accent",
       },
       hover = {
-        background = "foreground",
+        background = "text",
         foreground = "background",
       },
       pressed = {
-        background = "foreground",
+        background = "text",
         foreground = "background",
       },
       disabled = {
         background = "surface_low",
-        foreground = "muted",
+        foreground = "text_secondary",
       },
       focused = {
-        border = "primary",
+        border = "accent",
       },
     },
 
@@ -74,10 +182,10 @@ local default_theme = {
       padding_y = "sm",
       radius = "md",
       background = "surface_high",
-      foreground = "foreground",
-      placeholder = "muted",
+      foreground = "text",
+      placeholder = "placeholder",
       border = "border",
-      focused_border = "primary",
+      focused_border = "accent",
     },
   },
 }
@@ -115,6 +223,37 @@ local function resolve_ref(value, tokens)
     return tokens[value]
   end
   return value
+end
+
+local function resolve_token(name, tokens, resolved, resolving)
+  if resolved[name] ~= nil then
+    return resolved[name]
+  end
+
+  if resolving[name] then
+    error("cyclic color alias: " .. name)
+  end
+
+  local value = tokens[name]
+  if type(value) == "string" then
+    if tokens[value] == nil then
+      error("unknown color alias: " .. name .. " -> " .. value)
+    end
+    resolving[name] = true
+    value = resolve_token(value, tokens, resolved, resolving)
+    resolving[name] = nil
+  end
+
+  resolved[name] = value
+  return value
+end
+
+local function resolve_colors(colors)
+  local resolved = {}
+  for name in pairs(colors or {}) do
+    resolve_token(name, colors, resolved, {})
+  end
+  return resolved
 end
 
 local function resolve_color(value, colors)
@@ -184,7 +323,7 @@ function ui.resolve_theme(theme, state_or_scheme)
   end
 
   local scheme = theme.schemes[color_scheme] or theme.schemes.light
-  local colors = copy_table(scheme.colors)
+  local colors = resolve_colors(scheme.colors)
   local space = copy_table(theme.space or {})
   local radius = copy_table(theme.radius or {})
   local components = {

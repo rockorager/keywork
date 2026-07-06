@@ -41,6 +41,7 @@ pub const Runtime = struct {
     root: ?*RenderNode = null,
     display_list: DisplayList = .{},
     app_context: State = .{},
+    frame_background: ?keywork.Color = null,
     repaint_pending: bool = false,
     pending_interaction_ids: std.ArrayList([]u8) = .empty,
     rebuild_pending: bool = false,
@@ -156,7 +157,8 @@ pub const Runtime = struct {
         // repaint without any layout change (e.g. a scale change) reports
         // the full frame.
         const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
-        try self.display_list.fillRect(self.allocator, full_frame, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.background);
+        const background = self.frame_background orelse keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.background;
+        if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
         const render_scale = self.backend.scale();
         try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
         self.frame_pending = try self.backend.present(.{

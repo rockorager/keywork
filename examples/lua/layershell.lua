@@ -2,7 +2,7 @@ local ui = require("ui")
 
 local colors = {
   background = 0xff0c0e12,
-  foreground = 0xfff5f6fa,
+  text = 0xfff5f6fa,
   accent = 0xff6cacff,
 }
 
@@ -18,16 +18,16 @@ local App = ui.stateful({
       schemes = {
         light = {
           colors = {
-            primary = colors.accent,
+            accent = colors.accent,
             surface = colors.background,
-            foreground = colors.foreground,
+            text = colors.text,
           },
         },
         dark = {
           colors = {
-            primary = colors.accent,
+            accent = colors.accent,
             surface = colors.background,
-            foreground = colors.foreground,
+            text = colors.text,
           },
         },
       },
@@ -44,7 +44,7 @@ local App = ui.stateful({
       child = ui.box({ background = theme.colors.surface },
         ui.padding({
           all = 8,
-          child = ui.text(label, { color = theme.colors.foreground }),
+          child = ui.text(label, { color = theme.colors.text }),
         })
       ),
     })

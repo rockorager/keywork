@@ -107,6 +107,7 @@ fn runWayland(
         app,
         initial_color_scheme,
     );
+    if (options.layer_shell != null) runtime.frame_background = keywork.colors.transparent;
     errdefer runtime.deinit();
 
     backend.setPointerButtonHandler(&runtime, runtime_mod.Runtime.waylandPointerButton);

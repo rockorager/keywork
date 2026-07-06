@@ -13,19 +13,19 @@ local IPC_SUBSCRIBE = 2
 
 local function bar_colors(theme)
   local scheme = theme.colors
-  local dark = theme.color_scheme == "dark"
+  local foreground = scheme.white
   return {
-    background = scheme.surface,
-    surface = scheme.surface_high,
-    foreground = scheme.foreground,
-    muted = scheme.muted,
-    active = scheme.primary,
-    on_active = scheme.on_primary,
-    error = scheme.error,
-    on_error = scheme.on_error,
-    success = dark and 0xff71d2a7 or 0xff1c805b,
-    warning = dark and 0xffeec574 or 0xff6e5313,
-    accent = scheme.primary,
+    background = 0x00000000,
+    foreground = foreground,
+    muted = foreground,
+    active = scheme.fill_secondary,
+    on_active = foreground,
+    error = foreground,
+    on_error = foreground,
+    success = foreground,
+    warning = scheme.warning,
+    danger = scheme.danger,
+    accent = foreground,
   }
 end
 
@@ -223,7 +223,6 @@ local function status_pill(palette, id, icon_name, text, color, options)
   return ui.chip({
     id = id,
     child = child,
-    background = palette.surface,
     radius = 10,
     min_height = 30,
     align = "center",
@@ -241,8 +240,8 @@ local function workspaces(palette, sway)
     local fg = palette.muted
     local bg = palette.background
     if workspace.urgent then
-      fg = palette.on_error
-      bg = palette.error
+      fg = palette.on_active
+      bg = palette.active
     elseif workspace.focused then
       fg = palette.on_active
       bg = palette.active
@@ -678,7 +677,7 @@ local function battery_status_from_values(palette, percentage, state, line_power
   local color = palette.success
   if status ~= "Charging" and status ~= "Full" then
     if capacity <= 15 then
-      color = palette.error
+      color = palette.danger
     elseif capacity <= 30 then
       color = palette.warning
     end
@@ -1037,7 +1036,6 @@ local TrayItems = ui.stateful({
       table.insert(items, ui.chip({
         id = "tray-" .. item.id,
         child = icon,
-        background = palette.surface,
         radius = 10,
         min_height = 30,
         align = "center",

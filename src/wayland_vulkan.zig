@@ -632,6 +632,7 @@ pub const Backend = struct {
         defer self.allocator.free(formats);
         if (formats.len == 0) return error.NoSurfaceFormats;
         const surface_format = chooseSurfaceFormat(formats);
+        const composite_alpha = chooseCompositeAlpha(caps.supported_composite_alpha);
 
         const extent = chooseExtent(caps, width, height);
         var image_count = caps.min_image_count + 1;
@@ -650,7 +651,7 @@ pub const Backend = struct {
             .image_usage = usage,
             .image_sharing_mode = .exclusive,
             .pre_transform = caps.current_transform,
-            .composite_alpha = .{ .opaque_bit_khr = true },
+            .composite_alpha = composite_alpha,
             .present_mode = .fifo_khr,
             .clipped = .true,
         }, null);
@@ -1078,7 +1079,7 @@ pub const Backend = struct {
             break;
         }
 
-        const clear_value: vk.ClearValue = .{ .color = colorClearValue(self.swapchain_format, keywork.colors.panel) };
+        const clear_value: vk.ClearValue = .{ .color = colorClearValue(self.swapchain_format, keywork.colors.transparent) };
         self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
             .render_pass = self.render_pass,
             .framebuffer = self.framebuffers[image_index],
@@ -1812,6 +1813,13 @@ fn chooseSurfaceFormat(formats: []const vk.SurfaceFormatKHR) vk.SurfaceFormatKHR
         if (format.format == .b8g8r8a8_srgb and format.color_space == .srgb_nonlinear_khr) return format;
     }
     return formats[0];
+}
+
+fn chooseCompositeAlpha(supported: vk.CompositeAlphaFlagsKHR) vk.CompositeAlphaFlagsKHR {
+    if (supported.pre_multiplied_bit_khr) return .{ .pre_multiplied_bit_khr = true };
+    if (supported.post_multiplied_bit_khr) return .{ .post_multiplied_bit_khr = true };
+    if (supported.inherit_bit_khr) return .{ .inherit_bit_khr = true };
+    return .{ .opaque_bit_khr = true };
 }
 
 fn chooseExtent(caps: vk.SurfaceCapabilitiesKHR, width: u31, height: u31) vk.Extent2D {

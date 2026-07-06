@@ -608,7 +608,7 @@ fn rasterize(
     if (base_clip) |clip| {
         clearRegion(pixels, width, height, clip);
     } else {
-        @memset(pixels, @as(u32, @bitCast(keywork.colors.panel)));
+        @memset(pixels, @as(u32, @bitCast(keywork.colors.transparent)));
     }
     var clip: ?TextRenderer.PixelClip = base_clip;
     for (commands) |command| {
@@ -635,7 +635,7 @@ fn combineClips(base: ?TextRenderer.PixelClip, rect: ?keywork.Rect, scale: f32) 
 }
 
 fn clearRegion(pixels: []u32, width: u31, height: u31, clip: TextRenderer.PixelClip) void {
-    const value: u32 = @bitCast(keywork.colors.panel);
+    const value: u32 = @bitCast(keywork.colors.transparent);
     const x0 = clampClip(clip.x0, width);
     const x1 = clampClip(clip.x1, width);
     const y0 = clampClip(clip.y0, height);
