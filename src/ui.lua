@@ -521,6 +521,7 @@ function ui.gesture(options)
     type = "gesture",
     id = options.id,
     child = options.child,
+    hover_background = options.hover_background,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
@@ -689,25 +690,39 @@ function ui.icon_label(icon_name, text, options)
 end
 
 function ui.chip(options)
+  local selected = options.selected or false
+  local background = options.background
+  if selected then
+    background = options.selected_background or background
+  end
+  local color = options.color
+  if selected then
+    color = options.selected_color or color
+  end
+  local hover_background = options.hover_background
+  if selected then
+    hover_background = options.selected_hover_background
+  end
+
   local child = options.child
   if not child then
     if options.icon then
       child = ui.icon_label(options.icon, options.label, {
         size = options.icon_size or options.size,
-        color = options.color,
+        color = color,
         label_size = options.label_size,
         font_size = options.font_size,
         role = options.role,
         spacing = options.spacing,
       })
     else
-      child = ui.label(options.label or "", { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role })
+      child = ui.label(options.label or "", { color = color, size = options.label_size, font_size = options.font_size, role = options.role })
     end
   end
   return ui.gesture({
     id = options.id,
     child = ui.container({
-      background = options.background,
+      background = background,
       border = options.border,
       border_width = options.border_width,
       radius = options.radius,
@@ -718,6 +733,7 @@ function ui.chip(options)
       vertical_align = options.vertical_align,
       padding = options.padding or { x = 8, y = 4 },
     }, child),
+    hover_background = hover_background,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,

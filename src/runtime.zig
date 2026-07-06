@@ -597,7 +597,7 @@ pub const Runtime = struct {
         try self.pending_interaction_ids.append(self.allocator, owned);
     }
 
-    /// Restyles only the buttons whose hover/press state changed, marking
+    /// Restyles only the widgets whose hover/press state changed, marking
     /// their layout path dirty so the dirty-state pass relayouts and
     /// repaints them without rebuilding the app.
     fn flushInteractionRefresh(self: *Runtime) !void {

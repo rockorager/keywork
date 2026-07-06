@@ -18,8 +18,10 @@ local function bar_colors(theme)
     background = 0x00000000,
     foreground = foreground,
     muted = foreground,
-    active = scheme.fill_secondary,
-    on_active = foreground,
+    hover = scheme.blue4,
+    active = scheme.blue5,
+    active_hover = scheme.blue6,
+    on_active = scheme.blue12,
     error = foreground,
     on_error = foreground,
     success = foreground,
@@ -237,19 +239,17 @@ local function workspaces(palette, sway)
   local items = {}
   for _, workspace in ipairs(sway.workspaces or {}) do
     local name = workspace.name
-    local fg = palette.muted
-    local bg = palette.background
-    if workspace.urgent then
-      fg = palette.on_active
-      bg = palette.active
-    elseif workspace.focused then
-      fg = palette.on_active
-      bg = palette.active
-    end
+    local selected = workspace.urgent or workspace.focused
     table.insert(items, ui.chip({
       id = "workspace-" .. name,
-      child = ui.default_text_style({ color = fg, child = ui.label(name) }),
-      background = bg,
+      label = name,
+      color = palette.muted,
+      background = palette.background,
+      hover_background = palette.hover,
+      selected = selected,
+      selected_background = palette.active,
+      selected_hover_background = palette.active_hover,
+      selected_color = palette.on_active,
       radius = 9,
       min_height = 30,
       align = "center",

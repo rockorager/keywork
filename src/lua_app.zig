@@ -48,6 +48,15 @@ const BoxOptions = struct {
     }
 };
 
+const GestureOptions = struct {
+    hover_background: ?keywork.Color = null,
+
+    fn hoverStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
+        if (self.hover_background == null) return null;
+        return .{ .background = self.hover_background };
+    }
+};
+
 const FocusOptions = struct {
     autofocus: bool = false,
     skip_traversal: bool = false,
@@ -2485,6 +2494,7 @@ fn parseWidget(
         return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click, .activation = getActivationField(lua_state, table) } };
     }
     if (std.mem.eql(u8, kind, "gesture")) {
+        const options = try lua_codec.decode(GestureOptions, lua_state, table, allocator);
         const id = try dupeStringField(lua_state, allocator, table, "id");
         errdefer allocator.free(id);
         const child = try allocator.create(keywork.Widget);
@@ -2499,6 +2509,7 @@ fn parseWidget(
             .on_tap_down = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_down"),
             .on_tap_up = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_up"),
             .on_tap_cancel = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_cancel"),
+            .hover_style = options.hoverStyle(),
         } };
     }
     if (std.mem.eql(u8, kind, "focus")) {
