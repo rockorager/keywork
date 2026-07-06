@@ -224,12 +224,12 @@ pub const Backend = struct {
         self.input.setScrollHandler(context, handler);
     }
 
-    pub fn installKeyRepeat(self: *Backend, loop: *event_loop.EventLoop) !void {
-        try self.input.installKeyRepeat(loop);
+    pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {
+        try self.input.installEventTimers(loop);
     }
 
-    pub fn uninstallKeyRepeat(self: *Backend) void {
-        self.input.uninstallKeyRepeat();
+    pub fn uninstallEventTimers(self: *Backend) void {
+        self.input.uninstallEventTimers();
     }
 
     pub fn setRepaintHandler(self: *Backend, context: *anyopaque, handler: RepaintHandler) void {

@@ -31,6 +31,17 @@ pointer_enter_serial: ?u32 = null,
 pending_pointer: PendingPointer = .{},
 cursor_shape: ?keywork.CursorShape = null,
 shift_down: bool = false,
+/// Kinetic scroll state: velocity is estimated from finger axis frames
+/// and, once the fingers lift, a timer keeps scrolling the viewport
+/// under the anchor point with exponential decay.
+fling_timer: ?*event_loop.EventLoop.Timer = null,
+fling_active: bool = false,
+fling_velocity_x: f32 = 0,
+fling_velocity_y: f32 = 0,
+fling_point: keywork.Point = .{ .x = 0, .y = 0 },
+scroll_velocity_x: f32 = 0,
+scroll_velocity_y: f32 = 0,
+last_scroll_time_ms: ?u32 = null,
 repeat_timer: ?*event_loop.EventLoop.Timer = null,
 repeat_key: ?u32 = null,
 repeat_input: ?keywork.KeyInput = null,
@@ -54,6 +65,18 @@ scroll_context: ?*anyopaque = null,
 /// content; toolkits conventionally boost them.
 const touchpad_scroll_speed = 2.0;
 
+/// Kinetic scroll tuning. Velocity decays exponentially per millisecond,
+/// matching the feel of common toolkits.
+const fling_decay_per_ms = 0.998;
+const fling_interval_ms = 8;
+/// Minimum finger velocity (px/s) at lift-off that starts a fling.
+const fling_start_velocity = 150.0;
+/// Fling stops once velocity decays below this (px/s).
+const fling_min_velocity = 30.0;
+const fling_max_velocity = 8000.0;
+/// Weight of the newest frame in the velocity moving average.
+const velocity_smoothing = 0.75;
+
 const PendingPointer = struct {
     /// The pointer entered or moved; flush dispatches one move with the
     /// final position.
@@ -66,6 +89,10 @@ const PendingPointer = struct {
     scroll_dy: f32 = 0,
     scrolled: bool = false,
     scroll_source: wl.Pointer.AxisSource = .wheel,
+    /// Timestamp of the frame's axis events, for velocity estimation.
+    scroll_time_ms: u32 = 0,
+    /// The fingers lifted; flush may start a fling.
+    scroll_stopped: bool = false,
 };
 
 pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
@@ -135,14 +162,16 @@ pub fn setScrollHandler(self: *Self, context: *anyopaque, handler: ScrollHandler
     self.scroll_handler = handler;
 }
 
-pub fn installKeyRepeat(self: *Self, loop: *event_loop.EventLoop) !void {
-    if (self.repeat_timer != null) return;
-    self.repeat_timer = try loop.addTimer(self, repeatTimerCallback);
+pub fn installEventTimers(self: *Self, loop: *event_loop.EventLoop) !void {
+    if (self.repeat_timer == null) self.repeat_timer = try loop.addTimer(self, repeatTimerCallback);
+    if (self.fling_timer == null) self.fling_timer = try loop.addTimer(self, flingTimerCallback);
 }
 
-pub fn uninstallKeyRepeat(self: *Self) void {
+pub fn uninstallEventTimers(self: *Self) void {
     self.stopKeyRepeat();
     self.repeat_timer = null;
+    self.stopFling();
+    self.fling_timer = null;
 }
 
 fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Backend) void {
@@ -209,6 +238,7 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                         .released => .released,
                         _ => return,
                     };
+                    if (state == .pressed) self.stopFling();
                     const pending = &self.pending_pointer;
                     if (pending.button_count < pending.buttons.len) {
                         pending.buttons[pending.button_count] = state;
@@ -223,8 +253,10 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                         _ => return,
                     }
                     self.pending_pointer.scrolled = true;
+                    self.pending_pointer.scroll_time_ms = axis.time;
                 },
                 .axis_source => |axis_source| self.pending_pointer.scroll_source = axis_source.axis_source,
+                .axis_stop => self.pending_pointer.scroll_stopped = true,
                 .frame => self.flushPointerFrame(),
                 else => {},
             }
@@ -255,12 +287,78 @@ fn flushPointerFrame(self: *Self) void {
             self.dispatchPointerButton(point, state);
         }
         if (pending.scrolled) {
+            // Direct scrolling always overrides a running fling.
+            self.stopFling();
             const speed: f32 = switch (pending.scroll_source) {
                 .finger, .continuous => touchpad_scroll_speed,
                 else => 1.0,
             };
-            self.dispatchScroll(point, pending.scroll_dx * speed, pending.scroll_dy * speed);
+            const dx = pending.scroll_dx * speed;
+            const dy = pending.scroll_dy * speed;
+            self.dispatchScroll(point, dx, dy);
+            if (pending.scroll_source == .finger) {
+                self.trackScrollVelocity(dx, dy, pending.scroll_time_ms);
+            } else {
+                self.resetScrollVelocity();
+            }
         }
+        if (pending.scroll_stopped) {
+            self.startFling(point);
+            self.resetScrollVelocity();
+        }
+    }
+}
+
+/// Folds one finger-scroll frame into the velocity moving average, in
+/// boosted pixels per second so a fling continues at the on-screen speed.
+fn trackScrollVelocity(self: *Self, dx: f32, dy: f32, time_ms: u32) void {
+    defer self.last_scroll_time_ms = time_ms;
+    const last = self.last_scroll_time_ms orelse return;
+    const dt: f32 = @floatFromInt(time_ms -% last);
+    if (dt <= 0 or dt > 200) return;
+    const weight = velocity_smoothing;
+    self.scroll_velocity_x = (1 - weight) * self.scroll_velocity_x + weight * (dx / dt * 1000.0);
+    self.scroll_velocity_y = (1 - weight) * self.scroll_velocity_y + weight * (dy / dt * 1000.0);
+}
+
+fn resetScrollVelocity(self: *Self) void {
+    self.scroll_velocity_x = 0;
+    self.scroll_velocity_y = 0;
+    self.last_scroll_time_ms = null;
+}
+
+fn startFling(self: *Self, point: keywork.Point) void {
+    const timer = self.fling_timer orelse return;
+    const vx = std.math.clamp(self.scroll_velocity_x, -fling_max_velocity, fling_max_velocity);
+    const vy = std.math.clamp(self.scroll_velocity_y, -fling_max_velocity, fling_max_velocity);
+    if (@abs(vx) < fling_start_velocity and @abs(vy) < fling_start_velocity) return;
+    self.fling_velocity_x = vx;
+    self.fling_velocity_y = vy;
+    self.fling_point = point;
+    timer.arm(fling_interval_ms, fling_interval_ms) catch return;
+    self.fling_active = true;
+}
+
+fn stopFling(self: *Self) void {
+    if (!self.fling_active) return;
+    self.fling_active = false;
+    if (self.fling_timer) |timer| timer.disarm();
+}
+
+fn flingTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
+    const self: *Self = @ptrCast(@alignCast(ctx));
+    if (!self.fling_active) return;
+    const dt_ms: f32 = @floatFromInt(fling_interval_ms * @max(1, expirations));
+    self.dispatchScroll(
+        self.fling_point,
+        self.fling_velocity_x * dt_ms / 1000.0,
+        self.fling_velocity_y * dt_ms / 1000.0,
+    );
+    const decay = std.math.pow(f32, fling_decay_per_ms, dt_ms);
+    self.fling_velocity_x *= decay;
+    self.fling_velocity_y *= decay;
+    if (@abs(self.fling_velocity_x) < fling_min_velocity and @abs(self.fling_velocity_y) < fling_min_velocity) {
+        self.stopFling();
     }
 }
 

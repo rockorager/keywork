@@ -131,8 +131,8 @@ fn runWayland(
         .prepare = Backend.eventLoopPrepare,
         .finish = Backend.eventLoopFinish,
     });
-    try backend.installKeyRepeat(&loop);
-    defer backend.uninstallKeyRepeat();
+    try backend.installEventTimers(&loop);
+    defer backend.uninstallEventTimers();
     if (settings_client) |*settings| try loop.addFd(.{
         .fd = settings.eventLoopFd(),
         .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
