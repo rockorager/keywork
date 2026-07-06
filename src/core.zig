@@ -300,6 +300,7 @@ pub const Widget = union(enum) {
     clickable: Clickable,
     focus: Focus,
     focus_scope: FocusScope,
+    scroll: Scroll,
     text_input: TextInput,
     row: Children,
     column: Children,
@@ -410,6 +411,14 @@ pub const Widget = union(enum) {
 
     pub const Shortcuts = struct {
         bindings: []const ShortcutBinding,
+        child: *const Widget,
+    };
+
+    /// A vertically scrollable viewport: the child is laid out with
+    /// unbounded height, clipped to the viewport, and offset by the
+    /// element-owned scroll position.
+    pub const Scroll = struct {
+        id: []const u8,
         child: *const Widget,
     };
 
@@ -788,6 +797,10 @@ pub const widgets = struct {
         return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child), .modal = options.modal } };
     }
 
+    pub fn scroll(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
+        return .{ .scroll = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+    }
+
     pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
         _ = allocator;
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
@@ -872,6 +885,7 @@ pub const Element = struct {
         clickable,
         focus,
         focus_scope,
+        scroll,
         text_input,
         row,
         column,
@@ -1001,6 +1015,7 @@ pub const RenderNode = struct {
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
     modal_focus_scope: bool = false,
+    scroll_id: ?[]const u8 = null,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -1035,6 +1050,7 @@ pub const RenderNode = struct {
         clickable,
         focus,
         focus_scope,
+        scroll,
         text_input,
         row,
         column,
@@ -1317,6 +1333,21 @@ pub fn textInputState(element: *Element) *TextInputState {
     return @ptrCast(@alignCast(element.state.?));
 }
 
+/// Scroll position owned by a scroll element; clamped to the content
+/// extent during layout.
+pub const ScrollState = struct {
+    offset: f32 = 0,
+};
+
+pub fn scrollState(element: *Element) *ScrollState {
+    std.debug.assert(element.kind == .scroll);
+    return @ptrCast(@alignCast(element.state.?));
+}
+
+fn scrollChildConstraints(constraints: Constraints) Constraints {
+    return .{ .max_width = constraints.max_width, .max_height = std.math.inf(f32) };
+}
+
 pub const AppHost = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -1434,6 +1465,17 @@ pub fn buildElementTreeScoped(
             children[0] = try buildElementTreeScoped(allocator, scope, focus_widget.child, constraints);
             initialized = true;
             return .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children };
+        },
+        .scroll => |scroll_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const state = try allocator.create(ScrollState);
+            errdefer allocator.destroy(state);
+            state.* = .{};
+            const children = try allocator.alloc(Element, 1);
+            errdefer allocator.free(children);
+            children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints));
+            return .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children };
         },
         .focus_scope => |focus_scope_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1654,6 +1696,7 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
                 input_state.text.deinit(allocator);
                 allocator.destroy(input_state);
             },
+            .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
         element.state = null;
@@ -1713,6 +1756,9 @@ pub fn updateElementTreeScoped(
         .focus => |focus_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, focus_widget.child, constraints);
             element.focused = scope.interaction.isFocused(element.widget.focus.node);
+        },
+        .scroll => |scroll_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints));
         },
         .focus_scope => |focus_scope_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, focus_scope_widget.child, constraints);
@@ -1809,6 +1855,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .shortcuts,
         => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
 
+        .scroll => return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints)),
         .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -1867,6 +1914,24 @@ pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element 
     return null;
 }
 
+/// Finds the scroll element with the given id, marking the layout path to
+/// it dirty so a scroll relayouts exactly that viewport.
+pub fn dirtyScrollElement(element: *Element, scroll_id: []const u8) ?*Element {
+    if (element.kind == .scroll) {
+        if (std.mem.eql(u8, element.widget.scroll.id, scroll_id)) {
+            markElementLayoutDirty(element);
+            return element;
+        }
+    }
+    for (element.children) |*child| {
+        if (dirtyScrollElement(child, scroll_id)) |found| {
+            markElementLayoutDirty(element);
+            return found;
+        }
+    }
+    return null;
+}
+
 /// Re-expands interaction-styled elements (buttons) whose id is in `ids`
 /// using the scope's current interaction state, so hover/press changes can
 /// restyle exactly the affected widgets instead of rebuilding the app.
@@ -1910,6 +1975,7 @@ pub fn refreshInteractionElements(
         .stateful,
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
+        .scroll => return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints), ids),
         .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -1993,6 +2059,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .clickable => .clickable,
         .focus => .focus,
         .focus_scope => .focus_scope,
+        .scroll => .scroll,
         .text_input => .text_input,
         .row => .row,
         .column => .column,
@@ -2245,6 +2312,10 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const id = try allocator.dupe(u8, focus_scope_widget.id);
             break :blk .{ .focus_scope = .{ .id = id, .child = focus_scope_widget.child, .modal = focus_scope_widget.modal } };
         },
+        .scroll => |scroll_widget| blk: {
+            const id = try allocator.dupe(u8, scroll_widget.id);
+            break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child } };
+        },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
@@ -2313,6 +2384,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             allocator.free(focus_widget.node.id);
         },
         .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
+        .scroll => |scroll_widget| allocator.free(scroll_widget.id),
         .text_input => |input_widget| {
             if (input_widget.on_change) |callback| callback.destroy(allocator);
             allocator.free(input_widget.id);
@@ -2457,12 +2529,15 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
+        .scroll => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
 
     for (node.children) |child| {
         try paintScaled(allocator, child, display_list, scale);
     }
+
+    if (node.kind == .scroll) try display_list.popClip(allocator);
 }
 
 fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: Rect, color: Color, width: f32) !void {
@@ -2684,6 +2759,7 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
 }
 
 pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
+    if (node.kind == .scroll and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
@@ -2736,6 +2812,7 @@ fn nodeHasTapCallback(node: *const RenderNode) bool {
 }
 
 pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
+    if (node.kind == .scroll and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
@@ -2745,6 +2822,17 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
     if (node.kind == .text_input and node.rect.contains(point)) {
         return node.focus_id;
     }
+    return null;
+}
+
+pub fn hitTestScroll(node: *const RenderNode, point: Point) ?[]const u8 {
+    if (node.kind == .scroll and !node.rect.contains(point)) return null;
+    var index = node.children.len;
+    while (index > 0) {
+        index -= 1;
+        if (hitTestScroll(node.children[index], point)) |id| return id;
+    }
+    if (node.kind == .scroll) return node.scroll_id;
     return null;
 }
 
@@ -3111,14 +3199,34 @@ fn layoutElementInto(
                 .modal_focus_scope = focus_scope_widget.modal,
             });
         },
+        .scroll => |scroll_widget| {
+            const state = scrollState(element);
+            const child = try layoutElement(allocator, &element.children[0], scrollChildConstraints(constraints), .{
+                .x = origin.x,
+                .y = origin.y - state.offset,
+            }, measurer);
+            const width = @min(constraints.max_width, child.rect.width);
+            const height = @min(constraints.max_height, child.rect.height);
+            const max_offset = @max(0, child.rect.height - height);
+            state.offset = std.math.clamp(state.offset, 0, max_offset);
+            moveNode(child, origin.x, origin.y - state.offset);
+            const children = try ensureChildSlice(allocator, node, 1);
+            children[0] = child;
+            commitRenderNode(node, .{
+                .kind = .scroll,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
+                .scroll_id = scroll_widget.id,
+            });
+        },
         .text_input => |input_widget| {
             const value = textInputState(element).text.items;
             const text_value = if (value.len > 0) value else input_widget.placeholder;
             const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
             const measured = try measurer.measureText(text_value, style);
             const value_size = try measurer.measureText(value, style);
+            const fill_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else 0;
             const requested = Size{
-                .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, constraints.max_width)),
+                .width = @max(input_min_width, @max(measured.width + input_horizontal_padding * 2, fill_width)),
                 .height = measured.height + input_vertical_padding * 2,
             };
             const size_value = constraints.clamp(requested);
@@ -3159,16 +3267,19 @@ fn layoutElementInto(
         },
         .center => {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            // An unbounded axis centers around the child's own extent.
+            const avail_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else child.rect.width;
+            const avail_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else child.rect.height;
             moveNode(
                 child,
-                origin.x + @max(0, constraints.max_width - child.rect.width) / 2,
-                origin.y + @max(0, constraints.max_height - child.rect.height) / 2,
+                origin.x + @max(0, avail_width - child.rect.width) / 2,
+                origin.y + @max(0, avail_height - child.rect.height) / 2,
             );
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
                 .kind = .center,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = constraints.max_width, .height = constraints.max_height },
+                .rect = .{ .x = origin.x, .y = origin.y, .width = avail_width, .height = avail_height },
             });
         },
         .column => |column_widget| try layoutLinearElements(allocator, node, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
@@ -3246,7 +3357,7 @@ fn layoutLinearElements(
         .column => constraints.max_height,
         else => unreachable,
     };
-    const spare = @max(0, max_main - fixed_main - total_gap);
+    const spare = if (std.math.isFinite(max_main)) @max(0, max_main - fixed_main - total_gap) else 0;
     var cursor = origin;
     var main: f32 = 0;
     for (elements, 0..) |*child_element, index| {
@@ -3389,6 +3500,88 @@ test "rounded rect alpha covers fill and hollow border band" {
     try std.testing.expectEqual(@as(u8, 255), stroke[1 * size + 8]);
     try std.testing.expectEqual(@as(u8, 0), stroke[8 * size + 8]);
     try std.testing.expectEqual(@as(u8, 0), stroke[0]);
+}
+
+test "scroll viewport clips content, clamps offset, and blocks hits outside" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+    const build_allocator = build_arena.allocator();
+
+    // Ten 16px rows: 160px of content in a 40px viewport.
+    var rows: [10]Widget = undefined;
+    for (&rows, 0..) |*row, index| {
+        row.* = if (index == 9)
+            try widgets.clickable(build_allocator, "last-row", widgets.text("row"), testCallback())
+        else
+            widgets.text("row");
+    }
+    const column = try widgets.column(build_allocator, &rows, 0);
+    const scroll_widget = try widgets.scroll(build_allocator, "list", column);
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
+
+    var scope: BuildScope = .{ .allocator = build_allocator };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    try std.testing.expectEqual(@as(RenderNode.Kind, .scroll), root.kind);
+    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 0), root.children[0].rect.y);
+
+    // The clickable in the last row sits below the viewport; the clip
+    // blocks hits at its laid-out position.
+    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 5, .y = 150 }));
+    try std.testing.expectEqualStrings("list", hitTestScroll(root, .{ .x = 5, .y = 20 }).?);
+
+    // An absurd offset clamps to content minus viewport.
+    scrollState(&element).offset = 1000;
+    _ = dirtyScrollElement(&element, "list");
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 120), scrollState(&element).offset);
+    try std.testing.expectEqual(@as(f32, -120), root.children[0].rect.y);
+
+    // Scrolled to the bottom, the last row is inside the viewport and
+    // clickable again.
+    try std.testing.expectEqualStrings("last-row", hitTestClick(root, .{ .x = 5, .y = 30 }).?.id);
+
+    // Paint clips the content to the viewport rect.
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(retained_allocator);
+    try paintScaled(retained_allocator, root, &display_list, 1);
+    var saw_viewport_clip = false;
+    for (display_list.commands.items) |command| {
+        switch (command) {
+            .set_clip => |clip| if (clip) |rect| {
+                if (std.meta.eql(rect, root.rect)) saw_viewport_clip = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_viewport_clip);
+}
+
+test "flex spacers collapse under unbounded scroll constraints" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+    const build_allocator = build_arena.allocator();
+
+    const children = [_]Widget{ widgets.text("top"), widgets.spacer(1), widgets.text("bottom") };
+    const column = try widgets.column(build_allocator, &children, 0);
+    const scroll_widget = try widgets.scroll(build_allocator, "list", column);
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
+
+    var scope: BuildScope = .{ .allocator = build_allocator };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    const content = root.children[0];
+    try std.testing.expect(std.math.isFinite(content.rect.height));
+    // The spacer gets no share of an infinite axis.
+    try std.testing.expectEqual(@as(f32, 0), content.children[1].rect.height);
+    try std.testing.expectEqual(@as(f32, 32), content.rect.height);
 }
 
 test "display list clip stack resolves nested intersections" {

@@ -549,6 +549,25 @@ pub const Runtime = struct {
         return self.cursorShape(point);
     }
 
+    /// Scrolls the innermost viewport under the pointer. The offset is
+    /// clamped to the content extent during the relayout this schedules.
+    pub fn scrollBy(self: *Runtime, point: Point, delta: f32) !void {
+        const root = self.root orelse return error.NotBuilt;
+        const id = keywork.hitTestScroll(root, point) orelse return;
+        const element_root = if (self.element_root) |*element_root| element_root else return;
+        const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
+        const state = keywork.scrollState(scroll_element);
+        state.offset = @max(0, state.offset + delta);
+        try self.invalidateState();
+    }
+
+    pub fn waylandScroll(ctx: *anyopaque, point: Point, delta: f32) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.scrollBy(point, delta) catch |err| {
+            log.err("scroll failed: {}", .{err});
+        };
+    }
+
     pub fn waylandPointerMove(ctx: *anyopaque, point: ?Point) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         self.pointerMove(point) catch |err| {
@@ -921,6 +940,73 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqualStrings("a ", renderedInputText(runtime.root.?).?);
+}
+
+test "wheel scroll moves viewport content without rebuilding" {
+    const TestApp = struct {
+        builds: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            var rows: [20]keywork.Widget = undefined;
+            for (&rows) |*row| row.* = keywork.widgets.text("row");
+            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
+            return keywork.widgets.scroll(scope.allocator, "list", column);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+    // 20 rows at 16px in a 120px viewport: 200px of scroll range.
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 30);
+    try std.testing.expectEqual(@as(f32, -30), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+
+    // Scrolling past the edges clamps.
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 10_000);
+    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, -10_000);
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+
+    // Scrolling outside any viewport is a no-op.
+    try runtime.scrollBy(.{ .x = 5, .y = 500 }, 30);
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 }
 
 test "typing edits element-owned input state without rebuilding" {

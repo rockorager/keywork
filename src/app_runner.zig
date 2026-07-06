@@ -115,6 +115,7 @@ fn runWayland(
     backend.setRepaintHandler(&runtime, runtime_mod.Runtime.waylandConfigure);
     backend.setFrameHandler(&runtime, runtime_mod.Runtime.waylandFrameDone);
     backend.setKeyHandler(&runtime, runtime_mod.Runtime.waylandKeyInput);
+    backend.setScrollHandler(&runtime, runtime_mod.Runtime.waylandScroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
         settings.setChangeHandler(&runtime, runtime_mod.Runtime.desktopSettingsChanged);

@@ -42,11 +42,14 @@ cursor_shape_handler: ?CursorShapeHandler = null,
 cursor_shape_context: ?*anyopaque = null,
 key_handler: ?KeyHandler = null,
 key_context: ?*anyopaque = null,
+scroll_handler: ?ScrollHandler = null,
+scroll_context: ?*anyopaque = null,
 
 pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
 pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
+pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, delta: f32) void;
 
 pub fn init(seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
     const pointer = if (seat) |wl_seat| pointer: {
@@ -102,6 +105,11 @@ pub fn setCursorShapeHandler(self: *Self, context: *anyopaque, handler: CursorSh
 pub fn setKeyHandler(self: *Self, context: *anyopaque, handler: KeyHandler) void {
     self.key_context = context;
     self.key_handler = handler;
+}
+
+pub fn setScrollHandler(self: *Self, context: *anyopaque, handler: ScrollHandler) void {
+    self.scroll_context = context;
+    self.scroll_handler = handler;
 }
 
 pub fn installKeyRepeat(self: *Self, loop: *event_loop.EventLoop) !void {
@@ -184,6 +192,11 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                         }
                     }
                 },
+                .axis => |axis| {
+                    if (axis.axis != .vertical_scroll) return;
+                    const point = self.pointer_position orelse return;
+                    self.dispatchScroll(point, @floatCast(axis.value.toDouble()));
+                },
                 else => {},
             }
         }
@@ -192,6 +205,10 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
 
 fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
     if (self.pointer_move_handler) |handler| handler(self.pointer_move_context.?, point);
+}
+
+fn dispatchScroll(self: *Self, point: keywork.Point, delta: f32) void {
+    if (self.scroll_handler) |handler| handler(self.scroll_context.?, point, delta);
 }
 
 fn dispatchPointerButton(self: *Self, point: keywork.Point, state: keywork.PointerButtonState) void {

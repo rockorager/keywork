@@ -55,6 +55,7 @@ pub const Backend = struct {
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
     pub const CursorShapeHandler = WaylandInput.CursorShapeHandler;
     pub const KeyHandler = WaylandInput.KeyHandler;
+    pub const ScrollHandler = WaylandInput.ScrollHandler;
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
     pub const FrameHandler = *const fn (ctx: *anyopaque) void;
 
@@ -217,6 +218,10 @@ pub const Backend = struct {
 
     pub fn setKeyHandler(self: *Backend, context: *anyopaque, handler: KeyHandler) void {
         self.input.setKeyHandler(context, handler);
+    }
+
+    pub fn setScrollHandler(self: *Backend, context: *anyopaque, handler: ScrollHandler) void {
+        self.input.setScrollHandler(context, handler);
     }
 
     pub fn installKeyRepeat(self: *Backend, loop: *event_loop.EventLoop) !void {

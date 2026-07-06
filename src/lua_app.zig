@@ -1985,6 +1985,15 @@ fn parseWidget(
         widget.text_input.on_change = on_change;
         return widget;
     }
+    if (std.mem.eql(u8, kind, "scroll")) {
+        const id = try dupeStringField(lua_state, allocator, table, "id");
+        const child = try allocator.create(keywork.Widget);
+        errdefer allocator.destroy(child);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
+        return .{ .scroll = .{ .id = id, .child = child } };
+    }
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
         return keywork.widgets.spacer(options.flex);

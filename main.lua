@@ -25,6 +25,22 @@ local App = ui.stateful({
           end,
         }),
         ui.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
+        ui.sized({
+          height = 120,
+          child = ui.scroll({
+            id = "demo-scroll",
+            child = ui.column({
+              spacing = 6,
+              children = (function()
+                local rows = {}
+                for index = 1, 30 do
+                  rows[index] = ui.text(string.format("scrollable row %d", index))
+                end
+                return rows
+              end)(),
+            }),
+          }),
+        }),
       },
     })
 

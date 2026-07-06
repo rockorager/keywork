@@ -234,6 +234,15 @@ function ui.text_input(options)
   }
 end
 
+function ui.scroll(options)
+  options = options or {}
+  return {
+    type = "scroll",
+    id = options.id,
+    child = options.child,
+  }
+end
+
 function ui.column(options)
   options = options or {}
   return {
