@@ -170,7 +170,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(c_example);
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -179,7 +178,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const run_lua_layershell_example_cmd = b.addRunArtifact(exe);
-    run_lua_layershell_example_cmd.step.dependOn(b.getInstallStep());
     run_lua_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
         "--layer-shell",
@@ -195,7 +193,6 @@ pub fn build(b: *std.Build) void {
     run_lua_layershell_example_step.dependOn(&run_lua_layershell_example_cmd.step);
 
     const run_lua_vulkan_layershell_example_cmd = b.addRunArtifact(exe);
-    run_lua_vulkan_layershell_example_cmd.step.dependOn(b.getInstallStep());
     run_lua_vulkan_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
         "--backend=vulkan",
@@ -212,7 +209,6 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_layershell_example_step.dependOn(&run_lua_vulkan_layershell_example_cmd.step);
 
     const run_lua_bar_example_cmd = b.addRunArtifact(exe);
-    run_lua_bar_example_cmd.step.dependOn(b.getInstallStep());
     run_lua_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
         "--layer-shell",
@@ -229,7 +225,6 @@ pub fn build(b: *std.Build) void {
     run_lua_bar_example_step.dependOn(&run_lua_bar_example_cmd.step);
 
     const run_lua_vulkan_bar_example_cmd = b.addRunArtifact(exe);
-    run_lua_vulkan_bar_example_cmd.step.dependOn(b.getInstallStep());
     run_lua_vulkan_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
         "--backend=vulkan",
@@ -247,7 +242,6 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
 
     const run_native_example_cmd = b.addRunArtifact(native_example);
-    run_native_example_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_native_example_cmd.addArgs(args);
     }
@@ -256,7 +250,6 @@ pub fn build(b: *std.Build) void {
     run_native_example_step.dependOn(&run_native_example_cmd.step);
 
     const run_c_example_cmd = b.addRunArtifact(c_example);
-    run_c_example_cmd.step.dependOn(b.getInstallStep());
 
     const run_c_example_step = b.step("run-c-example", "Run the C example");
     run_c_example_step.dependOn(&run_c_example_cmd.step);
@@ -272,10 +265,17 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
 
-    const c_api_tests = b.addTest(.{
-        .root_module = c_api_module,
+    const c_api_test_module = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
-    linkKeyworkSystemLibraries(c_api_tests.root_module);
+    c_api_test_module.addImport("libkeywork", libkeywork_static_module);
+    linkKeyworkSystemLibraries(c_api_test_module);
+    const c_api_tests = b.addTest(.{
+        .root_module = c_api_test_module,
+    });
     test_step.dependOn(&b.addRunArtifact(c_api_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
