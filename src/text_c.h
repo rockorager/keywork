@@ -43,7 +43,7 @@ static inline int keywork_fontconfig_match_default(char *out, size_t out_len) {
     return ok;
 }
 
-static inline int keywork_fontconfig_match_codepoint(uint32_t codepoint, char *out, size_t out_len) {
+static inline int keywork_fontconfig_match_codepoint(uint32_t codepoint, int prefer_color, char *out, size_t out_len) {
     if (out_len == 0) return 0;
     out[0] = '\0';
 
@@ -51,6 +51,7 @@ static inline int keywork_fontconfig_match_codepoint(uint32_t codepoint, char *o
 
     FcPattern *pattern = FcNameParse((const FcChar8 *)"sans");
     if (!pattern) return 0;
+    if (prefer_color) FcPatternAddBool(pattern, FC_COLOR, FcTrue);
 
     FcCharSet *charset = FcCharSetCreate();
     if (!charset) {
@@ -87,12 +88,31 @@ static inline unsigned int keywork_ft_get_char_index(FT_Face face, uint32_t code
     return FT_Get_Char_Index(face, (FT_ULong)codepoint);
 }
 
+/// Bitmap-strike fonts reject exact FT_Set_Pixel_Sizes; select the
+/// nearest fixed strike instead.
+static inline int keywork_ft_select_size(FT_Face face, unsigned int pixel_size) {
+    if (FT_Set_Pixel_Sizes(face, 0, pixel_size) == 0) return 1;
+    if (face->num_fixed_sizes <= 0) return 0;
+    int best = 0;
+    long best_delta = -1;
+    for (int i = 0; i < face->num_fixed_sizes; i++) {
+        long height = face->available_sizes[i].height;
+        long delta = height > (long)pixel_size ? height - (long)pixel_size : (long)pixel_size - height;
+        if (best_delta < 0 || delta < best_delta) {
+            best_delta = delta;
+            best = i;
+        }
+    }
+    return FT_Select_Size(face, best) == 0;
+}
+
 static inline int keywork_ft_set_pixel_size(FT_Face face, unsigned int pixels) {
-    return FT_Set_Pixel_Sizes(face, 0, pixels) == 0;
+    return keywork_ft_select_size(face, pixels);
 }
 
 static inline int keywork_ft_load_render_glyph(FT_Face face, unsigned int glyph_index) {
-    if (FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT) != 0) return 0;
+    if (FT_Load_Glyph(face, glyph_index, FT_LOAD_COLOR) != 0) return 0;
+    if (face->glyph->format == FT_GLYPH_FORMAT_BITMAP) return 1;
     return FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL) == 0;
 }
 
@@ -110,6 +130,17 @@ static inline int keywork_ft_bitmap_pitch(FT_Face face) {
 
 static inline unsigned char *keywork_ft_bitmap_buffer(FT_Face face) {
     return face->glyph->bitmap.buffer;
+}
+
+/// 1 when the loaded glyph is a premultiplied BGRA color bitmap.
+static inline int keywork_ft_bitmap_is_color(FT_Face face) {
+    return face->glyph->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA;
+}
+
+/// The strike size actually selected for bitmap fonts; equals the
+/// requested pixel size for scalable fonts.
+static inline unsigned int keywork_ft_y_ppem(FT_Face face) {
+    return face->size->metrics.y_ppem;
 }
 
 static inline int keywork_ft_bitmap_left(FT_Face face) {

@@ -1211,9 +1211,17 @@ pub const Backend = struct {
             self.atlas.layout = .transfer_dst_optimal;
         }
 
-        const coverage_size: vk.DeviceSize = @intCast(glyph.coverage.len * 4);
+        const coverage_size: vk.DeviceSize = if (glyph.channels == 4)
+            @intCast(glyph.coverage.len)
+        else
+            @intCast(glyph.coverage.len * 4);
         if (self.staging_used + coverage_size > self.staging_buffer.size) return error.GlyphUploadTooLarge;
-        try self.stageMaskTexels(glyph.coverage);
+        if (glyph.channels == 4) {
+            // Color glyphs are already premultiplied BGRA.
+            try self.writeBuffer(self.staging_buffer, self.staging_used, glyph.coverage);
+        } else {
+            try self.stageMaskTexels(glyph.coverage);
+        }
 
         const copy: vk.BufferImageCopy = .{
             .buffer_offset = self.staging_used,
@@ -1395,6 +1403,8 @@ pub const Backend = struct {
     }
 
     fn appendGlyphVertices(self: *Backend, glyph: TextRenderer.PositionedGlyph, slot: AtlasSlot, clip: ?ClipBounds) !void {
+        // Color glyphs carry their own color; the tint must be identity.
+        const tint: [4]f32 = if (glyph.channels == 4) .{ 1, 1, 1, 1 } else colorFloats(self.swapchain_format, glyph.color);
         try self.appendQuad(.{
             .x0 = glyph.x,
             .y0 = glyph.y,
@@ -1404,7 +1414,7 @@ pub const Backend = struct {
             .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
             .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),
             .uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / @as(f32, @floatFromInt(self.atlas_size)),
-        }, colorFloats(self.swapchain_format, glyph.color), clip);
+        }, tint, clip);
     }
 
     fn appendImageVertices(self: *Backend, image: keywork.PaintCommand.AlphaImage, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {

@@ -14,6 +14,7 @@ local App = ui.stateful({
         ui.text("Keywork MVP"),
         ui.text(size),
         ui.text("scheme: " .. state.color_scheme),
+        ui.text("emoji: 😀 🎉 🚀 ✨"),
         ui.text("input: " .. self.typed),
         ui.text_input({
           id = "demo-input",

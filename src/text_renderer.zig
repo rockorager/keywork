@@ -119,6 +119,8 @@ pub const GlyphBitmap = struct {
     left: i32,
     top: i32,
     coverage: []u8,
+    /// 1 for alpha coverage, 4 for premultiplied BGRA color glyphs.
+    channels: u8 = 1,
     last_used: u64 = 0,
 
     fn deinit(self: GlyphBitmap, allocator: std.mem.Allocator) void {
@@ -136,6 +138,7 @@ pub const PositionedGlyph = struct {
     width: u32,
     rows: u32,
     coverage: []const u8,
+    channels: u8 = 1,
 };
 
 const FontRun = struct {
@@ -358,6 +361,7 @@ fn appendLineGlyphs(
                         .width = bitmap.width,
                         .rows = bitmap.rows,
                         .coverage = bitmap.coverage,
+                        .channels = bitmap.channels,
                     });
                 }
             }
@@ -403,7 +407,8 @@ fn fontForCodepoint(self: *Self, codepoint: u21) !usize {
 
     var font_path: [4096]u8 = undefined;
     const font_index = fallback: {
-        if (c.keywork_fontconfig_match_codepoint(codepoint, font_path[0..].ptr, font_path.len) == 0) break :fallback primary_font_index;
+        const prefer_color: c_int = if (wantsColorGlyph(codepoint)) 1 else 0;
+        if (c.keywork_fontconfig_match_codepoint(codepoint, prefer_color, font_path[0..].ptr, font_path.len) == 0) break :fallback primary_font_index;
         const path = std.mem.sliceTo(font_path[0..], 0);
         const loaded_index = self.loadFont(path) catch break :fallback primary_font_index;
         if (!self.fontSupports(loaded_index, codepoint)) break :fallback primary_font_index;
@@ -447,6 +452,19 @@ fn shapeRun(self: *Self, font_index: usize, pixel_size: u31, value: []const u8) 
     errdefer self.allocator.free(owned_value);
     const owned_glyphs = try self.allocator.dupe(c.KeyworkGlyph, scratch_glyphs[0..count]);
     errdefer self.allocator.free(owned_glyphs);
+
+    // Bitmap-strike fonts shape at the selected strike size; scale the
+    // positions to the requested size once, at cache time.
+    const strike: f32 = @floatFromInt(@max(1, c.keywork_ft_y_ppem(font.face)));
+    const strike_factor = @as(f32, @floatFromInt(pixel_size)) / strike;
+    if (@abs(strike_factor - 1) > 0.01) {
+        for (owned_glyphs) |*glyph| {
+            glyph.x_advance = scaleFixed(glyph.x_advance, strike_factor);
+            glyph.y_advance = scaleFixed(glyph.y_advance, strike_factor);
+            glyph.x_offset = scaleFixed(glyph.x_offset, strike_factor);
+            glyph.y_offset = scaleFixed(glyph.y_offset, strike_factor);
+        }
+    }
 
     var advance: f32 = 0;
     for (owned_glyphs) |glyph| {
@@ -542,7 +560,7 @@ fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32
 
     if (c.keywork_ft_load_render_glyph(font.face, glyph_index) == 0) return null;
 
-    var bitmap = try self.copyCurrentGlyphBitmap(font.face);
+    var bitmap = try self.copyCurrentGlyphBitmap(font.face, pixel_size);
     errdefer bitmap.deinit(self.allocator);
 
     const result = try self.glyph_cache.getOrPut(self.allocator, key);
@@ -552,7 +570,7 @@ fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32
     return result.value_ptr;
 }
 
-fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face) !GlyphBitmap {
+fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face, pixel_size: u31) !GlyphBitmap {
     const bitmap_width: u32 = @intCast(c.keywork_ft_bitmap_width(face));
     const bitmap_rows: u32 = @intCast(c.keywork_ft_bitmap_rows(face));
     const left = c.keywork_ft_bitmap_left(face);
@@ -566,21 +584,85 @@ fn copyCurrentGlyphBitmap(self: *Self, face: c.FT_Face) !GlyphBitmap {
         return .{ .width = 0, .rows = 0, .left = left, .top = top, .coverage = &.{} };
     }
 
-    const coverage = try self.allocator.alloc(u8, @as(usize, bitmap_width) * bitmap_rows);
+    const is_color = c.keywork_ft_bitmap_is_color(face) != 0;
+    const channels: u8 = if (is_color) 4 else 1;
+    const coverage = try self.allocator.alloc(u8, @as(usize, bitmap_width) * bitmap_rows * channels);
     errdefer self.allocator.free(coverage);
 
     const pitch = c.keywork_ft_bitmap_pitch(face);
     const pitch_abs: usize = @intCast(@abs(pitch));
+    const row_bytes = @as(usize, bitmap_width) * channels;
     var row: usize = 0;
     while (row < bitmap_rows) : (row += 1) {
         const src_row = if (pitch >= 0) row else bitmap_rows - 1 - row;
-        const width: usize = @intCast(bitmap_width);
-        const src = bitmap_buffer[src_row * pitch_abs ..][0..width];
-        const dst = coverage[row * width ..][0..width];
+        const src = bitmap_buffer[src_row * pitch_abs ..][0..row_bytes];
+        const dst = coverage[row * row_bytes ..][0..row_bytes];
         @memcpy(dst, src);
     }
 
-    return .{ .width = bitmap_width, .rows = bitmap_rows, .left = left, .top = top, .coverage = coverage };
+    var bitmap: GlyphBitmap = .{
+        .width = bitmap_width,
+        .rows = bitmap_rows,
+        .left = left,
+        .top = top,
+        .coverage = coverage,
+        .channels = channels,
+    };
+    // Bitmap-strike fonts render at the nearest fixed strike; prescale to
+    // the requested size once, at cache time.
+    const strike: f32 = @floatFromInt(@max(1, c.keywork_ft_y_ppem(face)));
+    const factor = @as(f32, @floatFromInt(pixel_size)) / strike;
+    if (is_color and @abs(factor - 1) > 0.01) {
+        const scaled = try scaleColorBitmap(self.allocator, bitmap, factor);
+        bitmap.deinit(self.allocator);
+        return scaled;
+    }
+    return bitmap;
+}
+
+/// Bilinear resample of a premultiplied BGRA bitmap; premultiplied texels
+/// interpolate without fringes.
+fn scaleColorBitmap(allocator: std.mem.Allocator, source: GlyphBitmap, factor: f32) !GlyphBitmap {
+    const dst_width: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(source.width)) * factor)));
+    const dst_rows: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(source.rows)) * factor)));
+    const pixels = try allocator.alloc(u8, @as(usize, dst_width) * dst_rows * 4);
+    errdefer allocator.free(pixels);
+
+    const src_width: f32 = @floatFromInt(source.width);
+    const src_rows: f32 = @floatFromInt(source.rows);
+    var y: usize = 0;
+    while (y < dst_rows) : (y += 1) {
+        const sy = @min(src_rows - 1, (@as(f32, @floatFromInt(y)) + 0.5) / factor - 0.5);
+        const y0: usize = @intFromFloat(@max(0, @floor(sy)));
+        const y1 = @min(source.rows - 1, y0 + 1);
+        const fy = @max(0, sy - @floor(sy));
+        var x: usize = 0;
+        while (x < dst_width) : (x += 1) {
+            const sx = @min(src_width - 1, (@as(f32, @floatFromInt(x)) + 0.5) / factor - 0.5);
+            const x0: usize = @intFromFloat(@max(0, @floor(sx)));
+            const x1 = @min(source.width - 1, x0 + 1);
+            const fx = @max(0, sx - @floor(sx));
+            var channel: usize = 0;
+            while (channel < 4) : (channel += 1) {
+                const p00: f32 = @floatFromInt(source.coverage[(y0 * source.width + x0) * 4 + channel]);
+                const p10: f32 = @floatFromInt(source.coverage[(y0 * source.width + x1) * 4 + channel]);
+                const p01: f32 = @floatFromInt(source.coverage[(y1 * source.width + x0) * 4 + channel]);
+                const p11: f32 = @floatFromInt(source.coverage[(y1 * source.width + x1) * 4 + channel]);
+                const top_row = p00 + (p10 - p00) * fx;
+                const bottom_row = p01 + (p11 - p01) * fx;
+                pixels[(y * dst_width + x) * 4 + channel] = @intFromFloat(@round(top_row + (bottom_row - top_row) * fy));
+            }
+        }
+    }
+
+    return .{
+        .width = dst_width,
+        .rows = dst_rows,
+        .left = @intFromFloat(@round(@as(f32, @floatFromInt(source.left)) * factor)),
+        .top = @intFromFloat(@round(@as(f32, @floatFromInt(source.top)) * factor)),
+        .coverage = pixels,
+        .channels = 4,
+    };
 }
 
 fn clearGlyphCache(self: *Self) void {
@@ -624,19 +706,64 @@ fn blitGlyphBitmap(
     while (row < row_end) : (row += 1) {
         var column = col_start;
         while (column < col_end) : (column += 1) {
-            const coverage = bitmap.coverage[row * bitmap_width + column];
-            if (coverage == 0) continue;
-            blendPixel(
-                pixels,
-                width,
-                height,
-                dst_x0 + @as(i32, @intCast(column)),
-                dst_y0 + @as(i32, @intCast(row)),
-                color,
-                coverage,
-            );
+            if (bitmap.channels == 4) {
+                const texel = bitmap.coverage[(row * bitmap_width + column) * 4 ..][0..4];
+                if (texel[3] == 0) continue;
+                blendPremultiplied(
+                    pixels,
+                    width,
+                    height,
+                    dst_x0 + @as(i32, @intCast(column)),
+                    dst_y0 + @as(i32, @intCast(row)),
+                    texel[0],
+                    texel[1],
+                    texel[2],
+                    texel[3],
+                );
+            } else {
+                const coverage = bitmap.coverage[row * bitmap_width + column];
+                if (coverage == 0) continue;
+                blendPixel(
+                    pixels,
+                    width,
+                    height,
+                    dst_x0 + @as(i32, @intCast(column)),
+                    dst_y0 + @as(i32, @intCast(row)),
+                    color,
+                    coverage,
+                );
+            }
         }
     }
+}
+
+fn blendPremultiplied(pixels: []u32, width: u31, height: u31, x: i32, y: i32, b: u8, g: u8, r: u8, a: u8) void {
+    if (x < 0 or y < 0) return;
+    const ux: usize = @intCast(x);
+    const uy: usize = @intCast(y);
+    if (ux >= width or uy >= height) return;
+
+    const index = uy * width + ux;
+    const dst: keywork.Color = @bitCast(pixels[index]);
+    const inv = 255 - @as(u32, a);
+    const out: keywork.Color = .{
+        .a = @intCast(@min(255, @as(u32, a) + (@as(u32, dst.a) * inv + 127) / 255)),
+        .r = @intCast(@min(255, @as(u32, r) + (@as(u32, dst.r) * inv + 127) / 255)),
+        .g = @intCast(@min(255, @as(u32, g) + (@as(u32, dst.g) * inv + 127) / 255)),
+        .b = @intCast(@min(255, @as(u32, b) + (@as(u32, dst.b) * inv + 127) / 255)),
+    };
+    pixels[index] = @bitCast(out);
+}
+
+fn scaleFixed(value: i32, factor: f32) i32 {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(value)) * factor));
+}
+
+/// Emoji and symbol ranges where a color font should win the fallback.
+fn wantsColorGlyph(codepoint: u21) bool {
+    return (codepoint >= 0x1F000 and codepoint <= 0x1FAFF) or
+        (codepoint >= 0x2600 and codepoint <= 0x27BF) or
+        codepoint == 0xFE0F;
 }
 
 fn clampSpan(value: i32, limit: usize) usize {
