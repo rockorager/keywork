@@ -25,6 +25,10 @@ xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
+/// Pointer events accumulated until the wl_pointer.frame marker so one
+/// logical group (e.g. a diagonal scroll or enter+motion) dispatches
+/// once, with the group's final position.
+pending_pointer: PendingPointer = .{},
 cursor_shape: ?keywork.CursorShape = null,
 shift_down: bool = false,
 repeat_timer: ?*event_loop.EventLoop.Timer = null,
@@ -44,6 +48,19 @@ key_handler: ?KeyHandler = null,
 key_context: ?*anyopaque = null,
 scroll_handler: ?ScrollHandler = null,
 scroll_context: ?*anyopaque = null,
+
+const PendingPointer = struct {
+    /// The pointer entered or moved; flush dispatches one move with the
+    /// final position.
+    moved: bool = false,
+    /// The pointer left the surface.
+    left: bool = false,
+    buttons: [4]keywork.PointerButtonState = undefined,
+    button_count: usize = 0,
+    scroll_dx: f32 = 0,
+    scroll_dy: f32 = 0,
+    scrolled: bool = false,
+};
 
 pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
 pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
@@ -159,7 +176,7 @@ fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Bac
 
 fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Event, *Backend) void {
     return struct {
-        fn callback(_: *wl.Pointer, event: wl.Pointer.Event, backend: *Backend) void {
+        fn callback(pointer: *wl.Pointer, event: wl.Pointer.Event, backend: *Backend) void {
             const self = &backend.input;
             switch (event) {
                 .enter => |enter| {
@@ -167,44 +184,71 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                     self.pointer_enter_serial = enter.serial;
                     self.cursor_shape = null;
                     self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
-                    self.dispatchPointerMove(self.pointer_position);
-                    self.updateCursorShape(self.pointer_position.?);
+                    self.pending_pointer.moved = true;
                 },
                 .leave => {
                     self.pointer_position = null;
                     self.pointer_enter_serial = null;
                     self.cursor_shape = null;
-                    self.dispatchPointerMove(null);
+                    self.pending_pointer.left = true;
                 },
                 .motion => |motion| {
                     self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
-                    self.dispatchPointerMove(self.pointer_position);
-                    self.updateCursorShape(self.pointer_position.?);
+                    self.pending_pointer.moved = true;
                 },
                 .button => |button| {
-                    if (button.button == 272) {
-                        if (self.pointer_position) |point| {
-                            self.dispatchPointerButton(point, switch (button.state) {
-                                .pressed => .pressed,
-                                .released => .released,
-                                _ => return,
-                            });
-                        }
+                    if (button.button != 272) return;
+                    const state: keywork.PointerButtonState = switch (button.state) {
+                        .pressed => .pressed,
+                        .released => .released,
+                        _ => return,
+                    };
+                    const pending = &self.pending_pointer;
+                    if (pending.button_count < pending.buttons.len) {
+                        pending.buttons[pending.button_count] = state;
+                        pending.button_count += 1;
                     }
                 },
                 .axis => |axis| {
-                    const point = self.pointer_position orelse return;
                     const delta: f32 = @floatCast(axis.value.toDouble());
                     switch (axis.axis) {
-                        .vertical_scroll => self.dispatchScroll(point, 0, delta),
-                        .horizontal_scroll => self.dispatchScroll(point, delta, 0),
-                        _ => {},
+                        .vertical_scroll => self.pending_pointer.scroll_dy += delta,
+                        .horizontal_scroll => self.pending_pointer.scroll_dx += delta,
+                        _ => return,
                     }
+                    self.pending_pointer.scrolled = true;
                 },
+                .frame => self.flushPointerFrame(),
                 else => {},
             }
+            // Pointers below version 5 never send frame; each event is its
+            // own logical group.
+            if (pointer.getVersion() < 5) self.flushPointerFrame();
         }
     }.callback;
+}
+
+/// Dispatches one accumulated pointer event group: a single move with the
+/// group's final position, buttons in arrival order, and one combined
+/// scroll delta.
+fn flushPointerFrame(self: *Self) void {
+    const pending = self.pending_pointer;
+    self.pending_pointer = .{};
+
+    if (pending.left and self.pointer_position == null) {
+        self.dispatchPointerMove(null);
+    } else if (pending.moved or pending.left) {
+        if (self.pointer_position) |point| {
+            self.dispatchPointerMove(point);
+            self.updateCursorShape(point);
+        }
+    }
+    if (self.pointer_position) |point| {
+        for (pending.buttons[0..pending.button_count]) |state| {
+            self.dispatchPointerButton(point, state);
+        }
+        if (pending.scrolled) self.dispatchScroll(point, pending.scroll_dx, pending.scroll_dy);
+    }
 }
 
 fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
