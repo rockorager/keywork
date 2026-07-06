@@ -616,6 +616,7 @@ fn rasterize(
             .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color, clip),
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
             .alpha_image => |image| alphaImage(pixels, width, height, scale, image, clip),
+            .color_image => |image| colorImage(pixels, width, height, scale, image, clip),
             .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
     }
@@ -701,6 +702,44 @@ fn alphaImage(
             const coverage = image.alpha[row * image_width + column];
             if (coverage == 0) continue;
             blendPixel(pixels, width, x, y, image.color, coverage);
+        }
+    }
+}
+
+fn colorImage(
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    scale: f32,
+    image: keywork.PaintCommand.ColorImage,
+    clip: ?TextRenderer.PixelClip,
+) void {
+    if (image.width == 0 or image.height == 0) return;
+    const image_width: usize = @intCast(image.width);
+    const image_height: usize = @intCast(image.height);
+    const dst_x0 = clampPixel(@floor(image.rect.x * scale), width);
+    const dst_y0 = clampPixel(@floor(image.rect.y * scale), height);
+    var start_x = dst_x0;
+    var start_y = dst_y0;
+    var dst_x1 = @min(dst_x0 + image_width, width);
+    var dst_y1 = @min(dst_y0 + image_height, height);
+    if (clip) |c| {
+        start_x = @max(start_x, clampClip(c.x0, width));
+        start_y = @max(start_y, clampClip(c.y0, height));
+        dst_x1 = @min(dst_x1, clampClip(c.x1, width));
+        dst_y1 = @min(dst_y1, clampClip(c.y1, height));
+    }
+    if (start_x >= dst_x1 or start_y >= dst_y1) return;
+
+    var y = start_y;
+    while (y < dst_y1) : (y += 1) {
+        const row = y - dst_y0;
+        var x = start_x;
+        while (x < dst_x1) : (x += 1) {
+            const column = x - dst_x0;
+            const source = image.pixels[row * image_width + column];
+            if (source.a == 0) continue;
+            blendPixel(pixels, width, x, y, source, 255);
         }
     }
 }

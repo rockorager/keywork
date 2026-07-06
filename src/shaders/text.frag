@@ -8,6 +8,7 @@ layout(location = 1) in vec4 frag_color;
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    float coverage = texture(atlas, frag_uv).r;
-    out_color = vec4(frag_color.rgb, frag_color.a * coverage);
+    // Both inputs are premultiplied: atlas texels (white-tinted coverage
+    // masks or premultiplied color images) and the vertex color.
+    out_color = frag_color * texture(atlas, frag_uv);
 }

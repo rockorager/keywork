@@ -791,8 +791,8 @@ pub const Backend = struct {
 
         try self.createAtlasImage();
         self.atlas_sampler = try self.vkd.createSampler(self.device, &.{
-            .mag_filter = .nearest,
-            .min_filter = .nearest,
+            .mag_filter = .linear,
+            .min_filter = .linear,
             .mipmap_mode = .nearest,
             .address_mode_u = .clamp_to_edge,
             .address_mode_v = .clamp_to_edge,
@@ -825,7 +825,7 @@ pub const Backend = struct {
 
     fn createAtlasImage(self: *Backend) !void {
         self.atlas = try self.createImage(
-            .r8_unorm,
+            .b8g8r8a8_unorm,
             self.atlas_size,
             self.atlas_size,
             .{ .transfer_dst_bit = true, .sampled_bit = true },
@@ -834,7 +834,7 @@ pub const Backend = struct {
         self.atlas.view = try self.vkd.createImageView(self.device, &.{
             .image = self.atlas.image,
             .view_type = .@"2d",
-            .format = .r8_unorm,
+            .format = .b8g8r8a8_unorm,
             .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
             .subresource_range = colorSubresourceRange(),
         }, null);
@@ -994,9 +994,11 @@ pub const Backend = struct {
             .alpha_to_coverage_enable = .false,
             .alpha_to_one_enable = .false,
         };
+        // Atlas texels and vertex colors are premultiplied: linear
+        // filtering then interpolates without dark or white fringes.
         const blend_attachment: vk.PipelineColorBlendAttachmentState = .{
             .blend_enable = .true,
-            .src_color_blend_factor = .src_alpha,
+            .src_color_blend_factor = .one,
             .dst_color_blend_factor = .one_minus_src_alpha,
             .color_blend_op = .add,
             .src_alpha_blend_factor = .one,
@@ -1140,6 +1142,12 @@ pub const Backend = struct {
     fn prepareQuads(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !void {
         self.text_vertices.clearRetainingCapacity();
         self.staging_used = 0;
+        if (self.atlas.layout == .undefined) {
+            self.transitionAtlas(.undefined, .transfer_dst_optimal);
+            self.atlas.layout = .transfer_dst_optimal;
+            const clear: vk.ClearColorValue = .{ .float_32 = .{ 0, 0, 0, 0 } };
+            self.vkd.cmdClearColorImage(self.command_buffer, self.atlas.image, .transfer_dst_optimal, &clear, &.{colorSubresourceRange()});
+        }
         if (self.staging_buffer.size == 0) {
             self.staging_buffer = try self.createBuffer(
                 initial_staging_capacity,
@@ -1170,6 +1178,10 @@ pub const Backend = struct {
                     const slot = try self.ensureSolidSlot();
                     try self.appendRectVertices(fill, slot, scale, clip);
                 },
+                .color_image => |image| {
+                    const slot = try self.ensureAtlasColorImage(image);
+                    try self.appendColorImageVertices(image, slot, scale, clip);
+                },
                 .set_clip => |rect| clip = if (rect) |value| ClipBounds.fromRect(value, scale) else null,
             }
         }
@@ -1199,9 +1211,9 @@ pub const Backend = struct {
             self.atlas.layout = .transfer_dst_optimal;
         }
 
-        const coverage_size: vk.DeviceSize = @intCast(glyph.coverage.len);
+        const coverage_size: vk.DeviceSize = @intCast(glyph.coverage.len * 4);
         if (self.staging_used + coverage_size > self.staging_buffer.size) return error.GlyphUploadTooLarge;
-        try self.writeBuffer(self.staging_buffer, self.staging_used, glyph.coverage);
+        try self.stageMaskTexels(glyph.coverage);
 
         const copy: vk.BufferImageCopy = .{
             .buffer_offset = self.staging_used,
@@ -1221,6 +1233,68 @@ pub const Backend = struct {
         return slot;
     }
 
+    /// Writes an alpha coverage mask into staging as premultiplied-white
+    /// BGRA texels, so a single atlas format serves masks and color images.
+    fn stageMaskTexels(self: *Backend, coverage: []const u8) !void {
+        const texels = try self.allocator.alloc(u8, coverage.len * 4);
+        defer self.allocator.free(texels);
+        for (coverage, 0..) |value, index| {
+            texels[index * 4 + 0] = value;
+            texels[index * 4 + 1] = value;
+            texels[index * 4 + 2] = value;
+            texels[index * 4 + 3] = value;
+        }
+        try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
+    }
+
+    /// Uploads a straight-alpha color image as premultiplied BGRA texels.
+    fn ensureAtlasColorImage(self: *Backend, image: keywork.PaintCommand.ColorImage) !AtlasSlot {
+        if (image.width == 0 or image.height == 0) return error.EmptyImage;
+        if (image.pixels.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
+
+        const key: AtlasKey = .{ .image = image.cache_key };
+        if (self.atlas_slots.get(key)) |slot| return slot;
+
+        const slot = try self.allocateAtlasSlot(image.width, image.height);
+        errdefer _ = self.atlas_slots.remove(key);
+        try self.atlas_slots.put(self.allocator, key, slot);
+
+        if (self.atlas.layout != .transfer_dst_optimal) {
+            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
+            self.atlas.layout = .transfer_dst_optimal;
+        }
+
+        const image_size: vk.DeviceSize = @intCast(image.pixels.len * 4);
+        if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
+        const texels = try self.allocator.alloc(u8, image.pixels.len * 4);
+        defer self.allocator.free(texels);
+        for (image.pixels, 0..) |pixel, index| {
+            const alpha: u32 = pixel.a;
+            texels[index * 4 + 0] = @intCast((@as(u32, pixel.b) * alpha + 127) / 255);
+            texels[index * 4 + 1] = @intCast((@as(u32, pixel.g) * alpha + 127) / 255);
+            texels[index * 4 + 2] = @intCast((@as(u32, pixel.r) * alpha + 127) / 255);
+            texels[index * 4 + 3] = pixel.a;
+        }
+        try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
+
+        const copy: vk.BufferImageCopy = .{
+            .buffer_offset = self.staging_used,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
+            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
+        };
+        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
+        self.staging_used += image_size;
+        return slot;
+    }
+
     fn ensureAtlasImage(self: *Backend, image: keywork.PaintCommand.AlphaImage) !AtlasSlot {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
         if (image.alpha.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
@@ -1237,9 +1311,9 @@ pub const Backend = struct {
             self.atlas.layout = .transfer_dst_optimal;
         }
 
-        const image_size: vk.DeviceSize = @intCast(image.alpha.len);
+        const image_size: vk.DeviceSize = @intCast(image.alpha.len * 4);
         if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
-        try self.writeBuffer(self.staging_buffer, self.staging_used, image.alpha);
+        try self.stageMaskTexels(image.alpha);
 
         const copy: vk.BufferImageCopy = .{
             .buffer_offset = self.staging_used,
@@ -1273,8 +1347,8 @@ pub const Backend = struct {
         }
 
         const coverage = [_]u8{0xff} ** (solid_block_size * solid_block_size);
-        if (self.staging_used + coverage.len > self.staging_buffer.size) return error.ImageUploadTooLarge;
-        try self.writeBuffer(self.staging_buffer, self.staging_used, &coverage);
+        if (self.staging_used + coverage.len * 4 > self.staging_buffer.size) return error.ImageUploadTooLarge;
+        try self.stageMaskTexels(&coverage);
 
         const copy: vk.BufferImageCopy = .{
             .buffer_offset = self.staging_used,
@@ -1290,7 +1364,7 @@ pub const Backend = struct {
             .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
         };
         self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
-        self.staging_used += coverage.len;
+        self.staging_used += coverage.len * 4;
         return slot;
     }
 
@@ -1365,17 +1439,34 @@ pub const Backend = struct {
         }, colorFloats(self.swapchain_format, fill.color), clip);
     }
 
+    fn appendColorImageVertices(self: *Backend, image: keywork.PaintCommand.ColorImage, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {
+        const x0 = image.rect.x * scale;
+        const y0 = image.rect.y * scale;
+        try self.appendQuad(.{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = x0 + @as(f32, @floatFromInt(slot.width)),
+            .y1 = y0 + @as(f32, @floatFromInt(slot.height)),
+            .uv_left = @as(f32, @floatFromInt(slot.x)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / @as(f32, @floatFromInt(self.atlas_size)),
+        }, .{ 1, 1, 1, 1 }, clip);
+    }
+
     fn appendQuad(self: *Backend, bounds: QuadBounds, color: [4]f32, clip: ?ClipBounds) !void {
         if (bounds.x1 <= bounds.x0 or bounds.y1 <= bounds.y0) return;
         const quad = clipQuad(bounds, clip) orelse return;
+        // Vertex colors are premultiplied to match the atlas and blending.
+        const premultiplied: [4]f32 = .{ color[0] * color[3], color[1] * color[3], color[2] * color[3], color[3] };
 
         try self.text_vertices.appendSlice(self.allocator, &.{
-            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = color },
-            .{ .pos = .{ quad.x1, quad.y0 }, .uv = .{ quad.uv_right, quad.uv_top }, .color = color },
-            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = color },
-            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = color },
-            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = color },
-            .{ .pos = .{ quad.x0, quad.y1 }, .uv = .{ quad.uv_left, quad.uv_bottom }, .color = color },
+            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = premultiplied },
+            .{ .pos = .{ quad.x1, quad.y0 }, .uv = .{ quad.uv_right, quad.uv_top }, .color = premultiplied },
+            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = premultiplied },
+            .{ .pos = .{ quad.x0, quad.y0 }, .uv = .{ quad.uv_left, quad.uv_top }, .color = premultiplied },
+            .{ .pos = .{ quad.x1, quad.y1 }, .uv = .{ quad.uv_right, quad.uv_bottom }, .color = premultiplied },
+            .{ .pos = .{ quad.x0, quad.y1 }, .uv = .{ quad.uv_left, quad.uv_bottom }, .color = premultiplied },
         });
     }
 
