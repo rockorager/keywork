@@ -3248,6 +3248,58 @@ pub fn hitTestScroll(node: *const RenderNode, point: Point) ?[]const u8 {
     return null;
 }
 
+pub const RevealAdjustment = struct {
+    /// Borrowed from the render node; valid until the next layout.
+    id: []const u8,
+    dx: f32,
+    dy: f32,
+};
+
+/// Collects the viewport offset increases needed to bring the focus
+/// target with the given id into view, innermost viewport first. Returns
+/// the target's rect (shifted by the collected adjustments) when found.
+pub fn collectRevealAdjustments(
+    allocator: std.mem.Allocator,
+    node: *const RenderNode,
+    id: []const u8,
+    out: *std.ArrayList(RevealAdjustment),
+) !?Rect {
+    const is_target = switch (node.kind) {
+        .text_input, .focus => node.focus_id != null and std.mem.eql(u8, node.focus_id.?, id),
+        .clickable => node.clickable_id != null and std.mem.eql(u8, node.clickable_id.?, id),
+        else => false,
+    };
+    if (is_target) return node.rect;
+    for (node.children) |child| {
+        const target_rect = try collectRevealAdjustments(allocator, child, id, out) orelse continue;
+        var rect = target_rect;
+        if (isViewportKind(node.kind)) {
+            if (node.scroll_id) |scroll_id| {
+                const dx = revealDelta(rect.x, rect.width, node.rect.x, node.rect.width);
+                const dy = revealDelta(rect.y, rect.height, node.rect.y, node.rect.height);
+                if (dx != 0 or dy != 0) {
+                    try out.append(allocator, .{ .id = scroll_id, .dx = dx, .dy = dy });
+                    rect.x -= dx;
+                    rect.y -= dy;
+                }
+            }
+        }
+        return rect;
+    }
+    return null;
+}
+
+/// Offset increase that reveals [start, start+extent) inside the viewport
+/// span: the minimum scroll distance, aligning to the near edge when the
+/// target is larger than the viewport.
+fn revealDelta(start: f32, extent: f32, viewport_start: f32, viewport_extent: f32) f32 {
+    if (start < viewport_start) return start - viewport_start;
+    const end = start + extent;
+    const viewport_end = viewport_start + viewport_extent;
+    if (end > viewport_end) return @min(start - viewport_start, end - viewport_end);
+    return 0;
+}
+
 pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
     if (hitTestTextInput(node, point) != null) return .text;
     if (hitTestClick(node, point) != null) return .pointer;

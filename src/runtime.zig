@@ -296,6 +296,7 @@ pub const Runtime = struct {
             if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return error.FocusTargetOutsideModal;
         }
         _ = try self.setFocused(id);
+        try self.revealFocused();
         try self.invalidate();
     }
 
@@ -429,6 +430,20 @@ pub const Runtime = struct {
         const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, active_modal_scope_id, reverse) orelse return;
 
         _ = try self.setFocused(targets[next_index].id);
+        try self.revealFocused();
+    }
+
+    /// Scrolls ancestor viewports the minimum distance needed to bring
+    /// the keyboard-focused widget into view.
+    fn revealFocused(self: *Runtime) !void {
+        const focused_id = self.focused_id orelse return;
+        const root = self.root orelse return;
+        var adjustments: std.ArrayList(keywork.RevealAdjustment) = .empty;
+        defer adjustments.deinit(self.allocator);
+        _ = try keywork.collectRevealAdjustments(self.allocator, root, focused_id, &adjustments);
+        for (adjustments.items) |adjustment| {
+            try self.scrollElementById(adjustment.id, adjustment.dx, adjustment.dy);
+        }
     }
 
     fn findCollectedFocusTarget(targets: []const keywork.FocusTarget, id: []const u8) ?keywork.FocusTarget {
@@ -1162,6 +1177,84 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     try runtime.pointerMove(.{ .x = thumb_x, .y = 60 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
+}
+
+test "keyboard focus scrolls its viewport to reveal the target" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            var rows: [12]keywork.Widget = undefined;
+            var names: [12][]const u8 = undefined;
+            for (&rows, 0..) |*row, index| {
+                names[index] = try std.fmt.allocPrint(scope.allocator, "input-{d}", .{index});
+                row.* = keywork.widgets.textInput(names[index], "", "");
+            }
+            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
+            return keywork.widgets.scroll(scope.allocator, "pane", column);
+        }
+
+        fn findFocusRect(node: *const keywork.RenderNode, id: []const u8) ?keywork.Rect {
+            if (node.focus_id) |focus_id| {
+                if (std.mem.eql(u8, focus_id, id)) return node.rect;
+            }
+            for (node.children) |child| {
+                if (findFocusRect(child, id)) |rect| return rect;
+            }
+            return null;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 300, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const viewport = runtime.root.?.rect;
+    try std.testing.expect(runtime.root.?.scroll_content.height > viewport.height);
+
+    // Tab through every input; each focused input must be inside the
+    // viewport after the reveal scroll.
+    for (0..12) |_| {
+        try runtime.keyInput(.{ .tab = .{} });
+        const focused = runtime.focused_id.?;
+        const rect = TestApp.findFocusRect(runtime.root.?, focused).?;
+        try std.testing.expect(rect.y >= viewport.y - 0.01);
+        try std.testing.expect(rect.y + rect.height <= viewport.y + viewport.height + 0.01);
+    }
+
+    // Wrapping back to the first input scrolls the viewport up again.
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqualStrings("input-0", runtime.focused_id.?);
+    const rect = TestApp.findFocusRect(runtime.root.?, "input-0").?;
+    try std.testing.expect(rect.y >= viewport.y - 0.01);
 }
 
 test "scrolling a virtualized list converges its window in one frame" {
