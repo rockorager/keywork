@@ -15,6 +15,7 @@ next_font_id: u32 = 0,
 fallback_cache: std.AutoHashMapUnmanaged(u21, usize) = .empty,
 shape_cache: ShapeCache = .empty,
 glyph_cache: GlyphCache = .empty,
+cache_clock: u64 = 0,
 
 const default_text_size = 16;
 const primary_font_index = 0;
@@ -36,6 +37,7 @@ pub const PixelClip = struct {
     }
 };
 const max_shape_cache_entries = 512;
+const max_glyph_cache_entries = 4096;
 const ShapeCache = std.HashMapUnmanaged(ShapeKey, ShapedRun, ShapeContext, std.hash_map.default_max_load_percentage);
 const GlyphCache = std.AutoHashMapUnmanaged(GlyphKey, GlyphBitmap);
 
@@ -98,6 +100,7 @@ const ShapeContext = struct {
 const ShapedRun = struct {
     glyphs: []c.KeyworkGlyph,
     advance: f32,
+    last_used: u64 = 0,
 
     fn deinit(self: ShapedRun, allocator: std.mem.Allocator) void {
         allocator.free(self.glyphs);
@@ -116,6 +119,7 @@ pub const GlyphBitmap = struct {
     left: i32,
     top: i32,
     coverage: []u8,
+    last_used: u64 = 0,
 
     fn deinit(self: GlyphBitmap, allocator: std.mem.Allocator) void {
         if (self.coverage.len > 0) allocator.free(self.coverage);
@@ -421,8 +425,12 @@ fn shapeRun(self: *Self, font_index: usize, pixel_size: u31, value: []const u8) 
 
     const font = &self.fonts.items[font_index];
     const lookup_key: ShapeKey = .{ .font_id = font.id, .pixel_size = pixel_size, .value = value };
-    if (self.shape_cache.getPtrContext(lookup_key, .{})) |run| return run;
-    if (self.shape_cache.count() >= max_shape_cache_entries) self.clearShapeCache();
+    self.cache_clock += 1;
+    if (self.shape_cache.getPtrContext(lookup_key, .{})) |run| {
+        run.last_used = self.cache_clock;
+        return run;
+    }
+    if (self.shape_cache.count() >= max_shape_cache_entries) self.evictShapeCache();
 
     const scratch_glyphs = try self.allocator.alloc(c.KeyworkGlyph, @max(value.len, 1));
     defer self.allocator.free(scratch_glyphs);
@@ -453,7 +461,7 @@ fn shapeRun(self: *Self, font_index: usize, pixel_size: u31, value: []const u8) 
     }
 
     result.key_ptr.* = .{ .font_id = font.id, .pixel_size = pixel_size, .value = owned_value };
-    result.value_ptr.* = .{ .glyphs = owned_glyphs, .advance = advance };
+    result.value_ptr.* = .{ .glyphs = owned_glyphs, .advance = advance, .last_used = self.cache_clock };
     return result.value_ptr;
 }
 
@@ -466,11 +474,71 @@ fn clearShapeCache(self: *Self) void {
     self.shape_cache.clearRetainingCapacity();
 }
 
+/// Evicts the least-recently-used quarter of the shape cache instead of
+/// clearing it wholesale, so steady-state text keeps its shaping work.
+fn evictShapeCache(self: *Self) void {
+    const cutoff = lruCutoff(ShapeCache, ShapeKey, &self.shape_cache);
+    var doomed: std.ArrayList(ShapeKey) = .empty;
+    defer doomed.deinit(self.allocator);
+    var entries = self.shape_cache.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.last_used <= cutoff) {
+            doomed.append(self.allocator, entry.key_ptr.*) catch break;
+        }
+    }
+    for (doomed.items) |key| {
+        if (self.shape_cache.fetchRemoveContext(key, .{})) |removed| {
+            self.allocator.free(removed.key.value);
+            removed.value.deinit(self.allocator);
+        }
+    }
+    // Allocation pressure fallback: never insert into a full cache.
+    if (self.shape_cache.count() >= max_shape_cache_entries) self.clearShapeCache();
+}
+
+/// The clock value below which roughly the oldest quarter of entries fall.
+fn lruCutoff(comptime Cache: type, comptime Key: type, cache: *Cache) u64 {
+    _ = Key;
+    var stamps: [max_glyph_cache_entries]u64 = undefined;
+    var count: usize = 0;
+    var values = cache.valueIterator();
+    while (values.next()) |value| {
+        if (count >= stamps.len) break;
+        stamps[count] = value.last_used;
+        count += 1;
+    }
+    std.mem.sort(u64, stamps[0..count], {}, std.sort.asc(u64));
+    return stamps[count / 4];
+}
+
+/// Evicts the least-recently-used quarter of the glyph bitmap cache.
+fn evictGlyphCache(self: *Self) void {
+    const cutoff = lruCutoff(GlyphCache, GlyphKey, &self.glyph_cache);
+    var doomed: std.ArrayList(GlyphKey) = .empty;
+    defer doomed.deinit(self.allocator);
+    var entries = self.glyph_cache.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.last_used <= cutoff) {
+            doomed.append(self.allocator, entry.key_ptr.*) catch break;
+        }
+    }
+    for (doomed.items) |key| {
+        if (self.glyph_cache.fetchRemove(key)) |removed| {
+            removed.value.deinit(self.allocator);
+        }
+    }
+}
+
 fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32) !?*const GlyphBitmap {
     try self.ensureFontPixelSize(font_index, pixel_size);
     const font = &self.fonts.items[font_index];
     const key: GlyphKey = .{ .font_id = font.id, .pixel_size = pixel_size, .glyph_index = glyph_index };
-    if (self.glyph_cache.getPtr(key)) |bitmap| return bitmap;
+    self.cache_clock += 1;
+    if (self.glyph_cache.getPtr(key)) |bitmap| {
+        bitmap.last_used = self.cache_clock;
+        return bitmap;
+    }
+    if (self.glyph_cache.count() >= max_glyph_cache_entries) self.evictGlyphCache();
 
     if (c.keywork_ft_load_render_glyph(font.face, glyph_index) == 0) return null;
 
@@ -480,6 +548,7 @@ fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32
     const result = try self.glyph_cache.getOrPut(self.allocator, key);
     std.debug.assert(!result.found_existing);
     result.value_ptr.* = bitmap;
+    result.value_ptr.last_used = self.cache_clock;
     return result.value_ptr;
 }
 
