@@ -33,6 +33,10 @@ pub const Runtime = struct {
     autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
+    /// Active scrollbar thumb drag. The pointer stays captured by the
+    /// drag until release, so motion keeps scrolling even after leaving
+    /// the thumb or the viewport.
+    scrollbar_drag: ?ScrollbarDrag = null,
     element_root: ?Element = null,
     root: ?*RenderNode = null,
     display_list: DisplayList = .{},
@@ -77,6 +81,7 @@ pub const Runtime = struct {
         self.pending_interaction_ids.deinit(self.allocator);
         if (self.hovered_id) |id| self.allocator.free(id);
         if (self.pressed_id) |id| self.allocator.free(id);
+        if (self.scrollbar_drag) |drag| self.allocator.free(drag.id);
         self.build_arena.deinit();
     }
 
@@ -179,8 +184,21 @@ pub const Runtime = struct {
         }
     }
 
+    const ScrollbarDrag = struct {
+        id: []u8,
+        axis: keywork.ScrollbarAxis,
+        /// Scroll offset change per pixel of pointer travel.
+        drag_scale: f32,
+        /// Pointer coordinate along the drag axis at the last update.
+        last_position: f32,
+    };
+
     fn pointerDown(self: *Runtime, point: Point) !void {
         const root = self.root orelse return error.NotBuilt;
+        if (keywork.hitTestScrollbarThumb(root, point)) |hit| {
+            try self.beginScrollbarDrag(hit, point);
+            return;
+        }
         if (keywork.hitTestTextInput(root, point)) |id| {
             const focus_changed = try self.setFocused(id);
             _ = try self.setPressedId(null);
@@ -213,7 +231,30 @@ pub const Runtime = struct {
         }
     }
 
+    fn beginScrollbarDrag(self: *Runtime, hit: keywork.ScrollbarThumbHit, point: Point) !void {
+        self.clearScrollbarDrag();
+        const id = try self.allocator.dupe(u8, hit.id);
+        self.scrollbar_drag = .{
+            .id = id,
+            .axis = hit.axis,
+            .drag_scale = hit.drag_scale,
+            .last_position = switch (hit.axis) {
+                .vertical => point.y,
+                .horizontal => point.x,
+            },
+        };
+    }
+
+    fn clearScrollbarDrag(self: *Runtime) void {
+        if (self.scrollbar_drag) |drag| self.allocator.free(drag.id);
+        self.scrollbar_drag = null;
+    }
+
     fn pointerUp(self: *Runtime, point: Point) !void {
+        if (self.scrollbar_drag != null) {
+            self.clearScrollbarDrag();
+            return;
+        }
         const root = self.root orelse return error.NotBuilt;
         const hit = keywork.hitTestClick(root, point);
         const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
@@ -477,6 +518,22 @@ pub const Runtime = struct {
     }
 
     pub fn pointerMove(self: *Runtime, point: ?Point) !void {
+        if (self.scrollbar_drag) |*drag| {
+            const position = point orelse return;
+            const coordinate = switch (drag.axis) {
+                .vertical => position.y,
+                .horizontal => position.x,
+            };
+            const delta = (coordinate - drag.last_position) * drag.drag_scale;
+            drag.last_position = coordinate;
+            if (delta != 0) {
+                switch (drag.axis) {
+                    .vertical => try self.scrollElementById(drag.id, 0, delta),
+                    .horizontal => try self.scrollElementById(drag.id, delta, 0),
+                }
+            }
+            return;
+        }
         const hit_id = if (point) |position| blk: {
             const root = self.root orelse return error.NotBuilt;
             break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
@@ -559,6 +616,10 @@ pub const Runtime = struct {
     pub fn scrollBy(self: *Runtime, point: Point, dx: f32, dy: f32) !void {
         const root = self.root orelse return error.NotBuilt;
         const id = keywork.hitTestScroll(root, point) orelse return;
+        try self.scrollElementById(id, dx, dy);
+    }
+
+    fn scrollElementById(self: *Runtime, id: []const u8, dx: f32, dy: f32) !void {
         const element_root = if (self.element_root) |*element_root| element_root else return;
         const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
         switch (scroll_element.kind) {
@@ -1022,6 +1083,85 @@ test "wheel scroll moves viewport content without rebuilding" {
     // Scrolling outside any viewport is a no-op.
     try runtime.scrollBy(.{ .x = 5, .y = 500 }, 0, 30);
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+}
+
+test "dragging the scrollbar thumb scrolls and captures the pointer" {
+    const TestApp = struct {
+        builds: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            var rows: [20]keywork.Widget = undefined;
+            for (&rows) |*row| row.* = keywork.widgets.text("row");
+            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
+            return keywork.widgets.scroll(scope.allocator, "list", column);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    // 20 rows at 16px in a 120px viewport: content 320, scroll range 200.
+    // Thumb: track 116, length max(12, 116*120/320) = 43.5, travel 72.5.
+    const drag_scale: f32 = 200.0 / 72.5;
+    // The viewport shrink-wraps its child's width; the thumb hugs its
+    // right edge.
+    const viewport = runtime.root.?.rect;
+    const thumb_x = viewport.x + viewport.width - 4;
+
+    // Press on the thumb; this starts a drag, not a click.
+    try runtime.pointerButton(.{ .x = thumb_x, .y = 10 }, .pressed);
+    try std.testing.expect(runtime.scrollbar_drag != null);
+
+    // Dragging down moves the content proportionally without rebuilding.
+    try runtime.pointerMove(.{ .x = thumb_x, .y = 39 });
+    try std.testing.expectApproxEqAbs(@as(f32, -29 * drag_scale), runtime.root.?.children[0].rect.y, 0.01);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+
+    // The drag stays captured when the pointer leaves the viewport.
+    try runtime.pointerMove(.{ .x = 500, .y = 1000 });
+    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
+    try runtime.pointerMove(.{ .x = 500, .y = -1000 });
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+
+    // Release ends the drag; further motion no longer scrolls.
+    try runtime.pointerButton(.{ .x = 500, .y = -1000 }, .released);
+    try std.testing.expect(runtime.scrollbar_drag == null);
+    try runtime.pointerMove(.{ .x = thumb_x, .y = 60 });
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
 }
 
 test "scrolling a virtualized list converges its window in one frame" {

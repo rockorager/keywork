@@ -2850,38 +2850,106 @@ const scrollbar_thickness: f32 = 4;
 const scrollbar_margin: f32 = 2;
 const scrollbar_min_thumb: f32 = 12;
 const scrollbar_color: Color = Color.argb(0x60, 0x80, 0x80, 0x88);
+/// Extra pointer slop around the painted thumb so the thin bar is
+/// grabbable.
+const scrollbar_hit_slop: f32 = 4;
+
+pub const ScrollbarAxis = enum { vertical, horizontal };
+
+const ScrollbarGeometry = struct {
+    thumb: Rect,
+    /// Scroll offset change per pixel of thumb travel along the track;
+    /// zero when the thumb fills the track and cannot move.
+    drag_scale: f32,
+};
+
+/// Thumb geometry for one axis of a viewport node, or null when the
+/// content does not overflow that axis. Single source for painting and
+/// pointer hit testing.
+fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeometry {
+    std.debug.assert(isViewportKind(node.kind));
+    const content = node.scroll_content;
+    const viewport = switch (axis) {
+        .vertical => node.rect.height,
+        .horizontal => node.rect.width,
+    };
+    const extent = switch (axis) {
+        .vertical => content.height,
+        .horizontal => content.width,
+    };
+    if (extent <= viewport) return null;
+
+    const track = viewport - scrollbar_margin * 2;
+    const thumb = @max(scrollbar_min_thumb, track * viewport / extent);
+    const max_offset = extent - viewport;
+    const travel = track - thumb;
+    const offset = switch (axis) {
+        .vertical => node.scroll_offset.y,
+        .horizontal => node.scroll_offset.x,
+    };
+    const along = if (travel > 0) travel * (offset / max_offset) else 0;
+    return switch (axis) {
+        .vertical => .{
+            .thumb = .{
+                .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
+                .y = node.rect.y + scrollbar_margin + along,
+                .width = scrollbar_thickness,
+                .height = thumb,
+            },
+            .drag_scale = if (travel > 0) max_offset / travel else 0,
+        },
+        .horizontal => .{
+            .thumb = .{
+                .x = node.rect.x + scrollbar_margin + along,
+                .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
+                .width = thumb,
+                .height = scrollbar_thickness,
+            },
+            .drag_scale = if (travel > 0) max_offset / travel else 0,
+        },
+    };
+}
 
 /// Paints proportional scrollbar thumbs for axes whose content overflows
 /// the viewport, from the geometry recorded during layout.
 fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
     std.debug.assert(isViewportKind(node.kind));
-    const content = node.scroll_content;
-
-    if (content.height > node.rect.height) {
-        const track = node.rect.height - scrollbar_margin * 2;
-        const thumb = @max(scrollbar_min_thumb, track * node.rect.height / content.height);
-        const max_offset = content.height - node.rect.height;
-        const along = (track - thumb) * (node.scroll_offset.y / max_offset);
-        try display_list.fillRect(allocator, .{
-            .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
-            .y = node.rect.y + scrollbar_margin + along,
-            .width = scrollbar_thickness,
-            .height = thumb,
-        }, scrollbar_color);
+    inline for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
+        if (scrollbarGeometry(node, axis)) |geometry| {
+            try display_list.fillRect(allocator, geometry.thumb, scrollbar_color);
+        }
     }
+}
 
-    if (content.width > node.rect.width) {
-        const track = node.rect.width - scrollbar_margin * 2;
-        const thumb = @max(scrollbar_min_thumb, track * node.rect.width / content.width);
-        const max_offset = content.width - node.rect.width;
-        const along = (track - thumb) * (node.scroll_offset.x / max_offset);
-        try display_list.fillRect(allocator, .{
-            .x = node.rect.x + scrollbar_margin + along,
-            .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
-            .width = thumb,
-            .height = scrollbar_thickness,
-        }, scrollbar_color);
+pub const ScrollbarThumbHit = struct {
+    id: []const u8,
+    axis: ScrollbarAxis,
+    /// Scroll offset change per pixel of pointer travel along the track.
+    drag_scale: f32,
+};
+
+/// Finds the innermost scrollbar thumb under the pointer, with a small
+/// slop so the thin thumb is grabbable.
+pub fn hitTestScrollbarThumb(node: *const RenderNode, point: Point) ?ScrollbarThumbHit {
+    if (isViewportKind(node.kind) and !node.rect.contains(point)) return null;
+    var index = node.children.len;
+    while (index > 0) {
+        index -= 1;
+        if (hitTestScrollbarThumb(node.children[index], point)) |hit| return hit;
     }
+    if (!isViewportKind(node.kind)) return null;
+    const id = node.scroll_id orelse return null;
+    for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
+        const geometry = scrollbarGeometry(node, axis) orelse continue;
+        const slop: Rect = .{
+            .x = geometry.thumb.x - scrollbar_hit_slop,
+            .y = geometry.thumb.y - scrollbar_hit_slop,
+            .width = geometry.thumb.width + scrollbar_hit_slop * 2,
+            .height = geometry.thumb.height + scrollbar_hit_slop * 2,
+        };
+        if (slop.contains(point)) return .{ .id = id, .axis = axis, .drag_scale = geometry.drag_scale };
+    }
+    return null;
 }
 
 fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: Rect, color: Color, width: f32) !void {
