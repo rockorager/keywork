@@ -648,6 +648,11 @@ pub const Widget = union(enum) {
         vtable: *const VTable,
         clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
         destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
+        /// Identity token: two stateful widgets with different tokens are
+        /// never update-compatible, so swapping widget types at the same
+        /// tree position disposes the old state and creates fresh state
+        /// instead of silently reusing it.
+        type_token: ?*const anyopaque = null,
 
         pub const VTable = struct {
             create_state: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator) anyerror!*anyopaque,
@@ -691,6 +696,7 @@ pub const Widget = union(enum) {
                 .vtable = self.vtable,
                 .clone_fn = self.clone_fn,
                 .destroy_fn = self.destroy_fn,
+                .type_token = self.type_token,
             };
         }
 
@@ -2247,7 +2253,11 @@ fn rebuildDirtyChildren(
 }
 
 fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
-    return element.kind == elementKindForWidget(widget.*);
+    if (element.kind != elementKindForWidget(widget.*)) return false;
+    return switch (widget.*) {
+        .stateful => |stateful_widget| element.widget.stateful.type_token == stateful_widget.type_token,
+        else => true,
+    };
 }
 
 fn elementKindForWidget(widget: Widget) Element.Kind {
@@ -5360,6 +5370,65 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     const damage = collectDamage(root).?;
     const sibling = root.children[0];
     try std.testing.expect(damage.y >= sibling.rect.y + sibling.rect.height);
+}
+
+test "stateful widgets with different type tokens never share state" {
+    const Tokens = struct {
+        var first_token: u8 = 0;
+        var second_token: u8 = 0;
+    };
+
+    const Counted = struct {
+        token: *const anyopaque,
+        created: *usize,
+        destroyed: *usize,
+
+        const vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = build,
+            .destroy_state = destroyState,
+        };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .stateful = .{ .ptr = self, .vtable = &vtable, .type_token = self.token } };
+        }
+
+        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.created.* += 1;
+            return try allocator.create(u8);
+        }
+
+        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
+
+        fn build(_: *const anyopaque, _: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            return .{ .text = .{ .value = "counted" } };
+        }
+
+        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroyed.* += 1;
+            allocator.destroy(@as(*u8, @ptrCast(state_ptr)));
+        }
+    };
+
+    var created: usize = 0;
+    var destroyed: usize = 0;
+    const first: Counted = .{ .token = &Tokens.first_token, .created = &created, .destroyed = &destroyed };
+    const second: Counted = .{ .token = &Tokens.second_token, .created = &created, .destroyed = &destroyed };
+
+    const first_widget = first.widget();
+    var element = try buildElementTree(std.testing.allocator, &first_widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), created);
+
+    // A different token at the same position replaces the element: the old
+    // state is disposed and fresh state created, never silently reused.
+    const second_widget = second.widget();
+    try updateElementTree(std.testing.allocator, &element, &second_widget, .{ .max_width = 200, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 2), created);
+    try std.testing.expectEqual(@as(usize, 1), destroyed);
 }
 
 test "stateful widget destroys state on element destruction and replacement" {

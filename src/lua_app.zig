@@ -228,6 +228,7 @@ const LuaStatefulWidget = struct {
     lua_state: *c.lua_State,
     spec_ref: c_int,
     props_ref: c_int,
+    spec_token: ?*const anyopaque = null,
     parse_context: ParseContext,
 
     const vtable: keywork.Widget.Stateful.VTable = .{
@@ -240,12 +241,17 @@ const LuaStatefulWidget = struct {
     };
 
     fn widget(self: *LuaStatefulWidget) keywork.Widget {
-        return .{ .stateful = .{
-            .ptr = self,
-            .vtable = &vtable,
-            .clone_fn = clone,
-            .destroy_fn = destroy,
-        } };
+        return .{
+            .stateful = .{
+                .ptr = self,
+                .vtable = &vtable,
+                .clone_fn = clone,
+                .destroy_fn = destroy,
+                // The spec table's address identifies the widget type; the
+                // registry ref keeps the table (and thus the address) alive.
+                .type_token = self.spec_token,
+            },
+        };
     }
 
     fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
@@ -371,6 +377,7 @@ const LuaStatefulWidget = struct {
             .lua_state = self.lua_state,
             .spec_ref = spec_ref,
             .props_ref = props_ref,
+            .spec_token = self.spec_token,
             .parse_context = self.parse_context,
         };
         return result;
@@ -983,7 +990,9 @@ const DbusSubscription = struct {
     fn cancel(self: *DbusSubscription, lua_state: *c.lua_State) void {
         if (self.canceled) return;
         self.canceled = true;
-        if (self.match_rule) |rule| dbus_c.dbus_bus_remove_match(self.bus.connection, rule.ptr, null);
+        if (self.match_rule) |rule| {
+            if (!self.bus.closed) dbus_c.dbus_bus_remove_match(self.bus.connection, rule.ptr, null);
+        }
         if (self.ref >= 0) {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
@@ -1063,10 +1072,13 @@ const DbusCall = struct {
     }
 
     fn deinit(self: *DbusCall, lua_state: *c.lua_State) void {
-        if (!self.completed) {
-            if (self.pending) |pending| dbus_c.dbus_pending_call_cancel(pending);
+        if (self.pending) |pending| {
+            // Clearing the notify guarantees libdbus never calls back with
+            // this soon-to-be-freed state, regardless of cancel semantics.
+            _ = dbus_c.dbus_pending_call_set_notify(pending, null, null, null);
+            if (!self.completed) dbus_c.dbus_pending_call_cancel(pending);
+            dbus_c.dbus_pending_call_unref(pending);
         }
-        if (self.pending) |pending| dbus_c.dbus_pending_call_unref(pending);
         self.pending = null;
         if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
         self.ref = -1;
@@ -1854,12 +1866,16 @@ fn parseWidget(
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
         const props_ref = try tableRefField(lua_state, table, "props");
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, props_ref);
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
+        const spec_token = c.lua_topointer(lua_state, -1);
+        pop(lua_state, 1);
         stateful.* = .{
             .allocator = allocator,
             .app = app,
             .lua_state = lua_state,
             .spec_ref = spec_ref,
             .props_ref = props_ref,
+            .spec_token = spec_token,
             .parse_context = parse_context,
         };
         return stateful.widget();
