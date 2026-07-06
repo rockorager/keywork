@@ -916,12 +916,16 @@ pub const Backend = struct {
         if (self.text_descriptor_set_layout != .null_handle) self.vkd.destroyDescriptorSetLayout(self.device, self.text_descriptor_set_layout, null);
         if (self.atlas_sampler != .null_handle) self.vkd.destroySampler(self.device, self.atlas_sampler, null);
         self.destroyImage(&self.atlas);
-        self.destroyBuffer(&self.staging_buffer);
-        self.destroyBuffer(&self.vertex_buffer);
+        // The single staging/vertex fields are views of the active frame
+        // slot; write them back and destroy each slot exactly once, or the
+        // active slot's buffers would be freed twice.
+        self.storeFrameViews();
         for (&self.frames) |*frame| {
             self.destroyBuffer(&frame.staging_buffer);
             self.destroyBuffer(&frame.vertex_buffer);
         }
+        self.staging_buffer = .{};
+        self.vertex_buffer = .{};
         self.text_pipeline = .null_handle;
         self.text_pipeline_layout = .null_handle;
         self.text_descriptor_pool = .null_handle;
