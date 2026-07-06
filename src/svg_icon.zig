@@ -9,7 +9,9 @@ const icon_supersample = 4;
 const SvgIcon = struct {
     path: []const u8,
     size: f32,
-    color: keywork.Color,
+    /// Tint for the rasterized alpha mask; null renders the SVG's own
+    /// colors as a full-color image.
+    color: ?keywork.Color,
 
     const vtable: keywork.Widget.RenderObject.VTable = .{
         .layout = layout,
@@ -40,16 +42,28 @@ const SvgIcon = struct {
         const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
         const width = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.width * render_scale))));
         const height = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.height * render_scale))));
-        const alpha_cache_key = cacheKey(self.path, width, height, icon_supersample);
-        if (context.display_list.cachedAlphaImage(alpha_cache_key, @intCast(width), @intCast(height))) |alpha| {
-            try context.display_list.alphaImage(
+        const cache_key = cacheKey(self.path, width, height, icon_supersample);
+        if (self.color) |tint| {
+            if (context.display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |alpha| {
+                try context.display_list.alphaImage(
+                    context.allocator,
+                    context.rect,
+                    @intCast(width),
+                    @intCast(height),
+                    @constCast(alpha),
+                    tint,
+                    cache_key,
+                );
+                return;
+            }
+        } else if (context.display_list.cachedColorImage(cache_key, @intCast(width), @intCast(height))) |cached| {
+            try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                @constCast(alpha),
-                self.color,
-                alpha_cache_key,
+                @constCast(cached),
+                cache_key,
             );
             return;
         }
@@ -76,17 +90,30 @@ const SvgIcon = struct {
         const ty = (@as(f32, @floatFromInt(raster_height)) - scaled_height) / 2;
         c.nsvgRasterize(rasterizer, image, tx, ty, scale, pixels.ptr, @intCast(raster_width), @intCast(raster_height), @intCast(raster_width * 4));
 
-        const alpha = try context.allocator.alloc(u8, width * height);
-        downsampleAlpha(alpha, pixels, width, height, icon_supersample);
-        try context.display_list.alphaImage(
-            context.allocator,
-            context.rect,
-            @intCast(width),
-            @intCast(height),
-            alpha,
-            self.color,
-            alpha_cache_key,
-        );
+        if (self.color) |tint| {
+            const alpha = try context.allocator.alloc(u8, width * height);
+            downsampleAlpha(alpha, pixels, width, height, icon_supersample);
+            try context.display_list.alphaImage(
+                context.allocator,
+                context.rect,
+                @intCast(width),
+                @intCast(height),
+                alpha,
+                tint,
+                cache_key,
+            );
+        } else {
+            const colors = try context.allocator.alloc(keywork.Color, width * height);
+            downsampleColor(colors, pixels, width, height, icon_supersample);
+            try context.display_list.colorImage(
+                context.allocator,
+                context.rect,
+                @intCast(width),
+                @intCast(height),
+                colors,
+                cache_key,
+            );
+        }
     }
 
     fn cacheKey(path: []const u8, width: usize, height: usize, supersample: usize) u64 {
@@ -117,6 +144,39 @@ const SvgIcon = struct {
     }
 };
 
+/// Box-filters straight-alpha RGBA with alpha-weighted color averaging,
+/// so transparent samples cannot darken edge colors.
+fn downsampleColor(dst: []keywork.Color, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
+    const raster_width = width * supersample;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            var sum_r: usize = 0;
+            var sum_g: usize = 0;
+            var sum_b: usize = 0;
+            var sum_a: usize = 0;
+            for (0..supersample) |sy| {
+                for (0..supersample) |sx| {
+                    const src_x = x * supersample + sx;
+                    const src_y = y * supersample + sy;
+                    const texel = src_rgba[(src_y * raster_width + src_x) * 4 ..][0..4];
+                    const alpha: usize = texel[3];
+                    sum_r += @as(usize, texel[0]) * alpha;
+                    sum_g += @as(usize, texel[1]) * alpha;
+                    sum_b += @as(usize, texel[2]) * alpha;
+                    sum_a += alpha;
+                }
+            }
+            const samples = supersample * supersample;
+            dst[y * width + x] = if (sum_a == 0) keywork.colors.transparent else .{
+                .r = @intCast((sum_r + sum_a / 2) / sum_a),
+                .g = @intCast((sum_g + sum_a / 2) / sum_a),
+                .b = @intCast((sum_b + sum_a / 2) / sum_a),
+                .a = @intCast((sum_a + samples / 2) / samples),
+            };
+        }
+    }
+}
+
 fn downsampleAlpha(dst: []u8, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
     const raster_width = width * supersample;
     const samples = supersample * supersample;
@@ -135,7 +195,7 @@ fn downsampleAlpha(dst: []u8, src_rgba: []const u8, width: usize, height: usize,
     }
 }
 
-pub fn icon(allocator: std.mem.Allocator, path: []const u8, size: f32, color: keywork.Color) !keywork.Widget {
+pub fn icon(allocator: std.mem.Allocator, path: []const u8, size: f32, color: ?keywork.Color) !keywork.Widget {
     const icon_size = @max(1, size);
     const self = try allocator.create(SvgIcon);
     errdefer allocator.destroy(self);

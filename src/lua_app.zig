@@ -73,10 +73,11 @@ const IconOptions = struct {
 const ParseContext = struct {
     icon: IconOptions = .{},
 
-    fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: keywork.Color } {
+    fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
         return .{
             .size = options.size orelse self.icon.size orelse 16,
-            .color = options.color orelse self.icon.color orelse keywork.colors.ink,
+            // No explicit or ambient color renders the icon's own palette.
+            .color = options.color orelse self.icon.color,
         };
     }
 
@@ -2068,7 +2069,7 @@ fn parseWidget(
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
         const name = try stringField(lua_state, table, "name");
-        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, icon.size) orelse return missingIconWidget(allocator, name, icon.color);
+        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, icon.size) orelse return missingIconWidget(allocator, name, icon.color orelse keywork.colors.ink);
         defer allocator.free(path);
         return keywork.svg_icon.icon(
             allocator,
