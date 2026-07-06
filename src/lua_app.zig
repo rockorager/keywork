@@ -14,6 +14,8 @@ const BuildScope = keywork.BuildScope;
 
 const app_registry_key = "keywork.app";
 const invalid_fd: i32 = -1;
+var dbus_temp_z_slot: usize = 0;
+var dbus_temp_z_buffers: [8][4096]u8 = undefined;
 
 const TextOptions = struct {
     color: ?keywork.Color = null,
@@ -68,6 +70,13 @@ const SizedOptions = struct {
 const IconOptions = struct {
     size: ?f32 = null,
     color: ?keywork.Color = null,
+};
+
+const ImageOptions = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    size: ?f32 = null,
+    format: []const u8 = "argb32",
 };
 
 const ParseContext = struct {
@@ -406,6 +415,70 @@ const LuaStatefulState = struct {
     lua_state: *c.lua_State,
     state_ref: c_int,
     dirty: bool = false,
+};
+
+const LuaImage = struct {
+    width: u32,
+    height: u32,
+    size: f32,
+    pixels: []keywork.Color,
+    cache_key: u64,
+
+    const vtable: keywork.Widget.RenderObject.VTable = .{
+        .layout = layout,
+        .paint = paint,
+    };
+
+    fn widget(self: *LuaImage) keywork.Widget {
+        return .{ .render_object = .{
+            .ptr = self,
+            .vtable = &vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        } };
+    }
+
+    fn layout(ptr: *const anyopaque, context: keywork.Widget.RenderObject.LayoutContext) !keywork.Size {
+        const self: *const LuaImage = @ptrCast(@alignCast(ptr));
+        return .{
+            .width = @min(self.size, context.constraints.max_width),
+            .height = @min(self.size, context.constraints.max_height),
+        };
+    }
+
+    fn paint(ptr: *const anyopaque, context: keywork.Widget.RenderObject.PaintContext) !void {
+        const self: *const LuaImage = @ptrCast(@alignCast(ptr));
+        if (context.rect.width <= 0 or context.rect.height <= 0) return;
+        const pixels = try context.allocator.dupe(keywork.Color, self.pixels);
+        try context.display_list.colorImage(
+            context.allocator,
+            context.rect,
+            self.width,
+            self.height,
+            pixels,
+            self.cache_key,
+        );
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*anyopaque {
+        const self: *const LuaImage = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(LuaImage);
+        errdefer allocator.destroy(result);
+        result.* = .{
+            .width = self.width,
+            .height = self.height,
+            .size = self.size,
+            .pixels = try allocator.dupe(keywork.Color, self.pixels),
+            .cache_key = self.cache_key,
+        };
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *LuaImage = @ptrCast(@alignCast(@constCast(ptr)));
+        allocator.free(self.pixels);
+        allocator.destroy(self);
+    }
 };
 
 pub const App = struct {
@@ -1051,6 +1124,46 @@ const DbusSubscription = struct {
     }
 };
 
+const DbusOwnedName = struct {
+    bus: *DbusBus,
+    name: [:0]const u8,
+    released: bool = false,
+
+    fn release(self: *DbusOwnedName) void {
+        if (self.released) return;
+        self.released = true;
+        if (!self.bus.closed) _ = dbus_c.dbus_bus_release_name(self.bus.connection, self.name.ptr, null);
+    }
+
+    fn destroy(self: *DbusOwnedName, allocator: std.mem.Allocator) void {
+        self.release();
+        allocator.free(self.name);
+        allocator.destroy(self);
+    }
+};
+
+const DbusExportedObject = struct {
+    bus: *DbusBus,
+    path: [:0]const u8,
+    ref: c_int,
+    unexported: bool = false,
+
+    fn unexport(self: *DbusExportedObject, lua_state: *c.lua_State) void {
+        if (self.unexported) return;
+        self.unexported = true;
+        if (self.ref >= 0) {
+            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+            self.ref = -1;
+        }
+    }
+
+    fn destroy(self: *DbusExportedObject, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.unexport(lua_state);
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+};
+
 const DbusCall = struct {
     bus: *DbusBus,
     ref: c_int = -1,
@@ -1108,6 +1221,8 @@ const DbusBus = struct {
     fd: i32,
     subscriptions: std.ArrayList(*DbusSubscription) = .empty,
     pending_calls: std.ArrayList(*DbusCall) = .empty,
+    owned_names: std.ArrayList(*DbusOwnedName) = .empty,
+    exported_objects: std.ArrayList(*DbusExportedObject) = .empty,
     registered: bool = false,
     closed: bool = false,
     filter_installed: bool = false,
@@ -1165,6 +1280,10 @@ const DbusBus = struct {
     }
 
     fn deinit(self: *DbusBus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        for (self.exported_objects.items) |object| object.destroy(allocator, lua_state);
+        self.exported_objects.deinit(allocator);
+        for (self.owned_names.items) |name| name.destroy(allocator);
+        self.owned_names.deinit(allocator);
         for (self.subscriptions.items) |subscription| subscription.destroy(allocator, lua_state);
         self.subscriptions.deinit(allocator);
         for (self.pending_calls.items) |pending_call| pending_call.destroy(allocator, lua_state);
@@ -1199,6 +1318,62 @@ const DbusBus = struct {
 
         try self.subscriptions.append(self.app.allocator, subscription);
         return subscription;
+    }
+
+    fn requestName(self: *DbusBus, lua_state: *c.lua_State, options_index: c_int) !*DbusOwnedName {
+        const name = try stringFromStack(lua_state, options_index);
+        var flags: c_uint = 0;
+        if (c.lua_type(lua_state, options_index + 1) == c.LUA_TTABLE) {
+            if (boolField(lua_state, options_index + 1, "allow_replacement")) flags |= 0x1;
+            if (boolField(lua_state, options_index + 1, "replace_existing")) flags |= 0x2;
+            if (boolField(lua_state, options_index + 1, "do_not_queue")) flags |= 0x4;
+        }
+        const result = dbus_c.dbus_bus_request_name(self.connection, tryZTemp(name).ptr, flags, null);
+        if (result != 1 and result != 4) return error.DBusNameUnavailable;
+
+        const owned = try self.app.allocator.create(DbusOwnedName);
+        errdefer self.app.allocator.destroy(owned);
+        owned.* = .{
+            .bus = self,
+            .name = try self.app.allocator.dupeZ(u8, name),
+        };
+        errdefer self.app.allocator.free(owned.name);
+        try self.owned_names.append(self.app.allocator, owned);
+        return owned;
+    }
+
+    fn releaseName(self: *DbusBus, name: []const u8) void {
+        for (self.owned_names.items) |owned| {
+            if (std.mem.eql(u8, owned.name, name)) {
+                owned.release();
+                return;
+            }
+        }
+        if (!self.closed) _ = dbus_c.dbus_bus_release_name(self.connection, tryZTemp(name).ptr, null);
+    }
+
+    fn exportObject(self: *DbusBus, lua_state: *c.lua_State, path_index: c_int, spec_index: c_int) !*DbusExportedObject {
+        const path = try stringFromStack(lua_state, path_index);
+        try expectType(lua_state, spec_index, c.LUA_TTABLE);
+        const object = try self.app.allocator.create(DbusExportedObject);
+        errdefer self.app.allocator.destroy(object);
+        c.lua_pushvalue(lua_state, spec_index);
+        object.* = .{
+            .bus = self,
+            .path = try self.app.allocator.dupeZ(u8, path),
+            .ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX),
+        };
+        errdefer object.destroy(self.app.allocator, lua_state);
+        try self.exported_objects.append(self.app.allocator, object);
+        return object;
+    }
+
+    fn exportedObjectForPath(self: *DbusBus, path_z: [*:0]const u8) ?*DbusExportedObject {
+        const path = std.mem.span(path_z);
+        for (self.exported_objects.items) |object| {
+            if (!object.unexported and std.mem.eql(u8, object.path, path)) return object;
+        }
+        return null;
     }
 
     fn call(self: *DbusBus, lua_state: *c.lua_State, options_index: c_int, callback_index: c_int) !void {
@@ -1248,6 +1423,19 @@ const DbusBus = struct {
         while (dbus_c.dbus_connection_dispatch(self.connection) == dbus_c.DBUS_DISPATCH_DATA_REMAINS) {}
     }
 
+    fn emitSignal(self: *DbusBus, lua_state: *c.lua_State, options_index: c_int) !void {
+        const path = try stringField(lua_state, options_index, "path");
+        const interface = try stringField(lua_state, options_index, "interface");
+        const member = try stringField(lua_state, options_index, "member");
+        const message = dbus_c.dbus_message_new_signal(path.ptr, interface.ptr, member.ptr) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(message);
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(message, &iter);
+        try appendDbusLuaArgs(lua_state, options_index, &iter);
+        if (dbus_c.dbus_connection_send(self.connection, message, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
     fn handleSignal(self: *DbusBus, message: *dbus_c.DBusMessage) !void {
         const lua_state = self.app.state;
         for (self.subscriptions.items) |subscription| {
@@ -1259,6 +1447,179 @@ const DbusBus = struct {
                 return error.LuaCallbackFailed;
             }
         }
+    }
+
+    fn handleMethodCall(self: *DbusBus, message: *dbus_c.DBusMessage) !bool {
+        const path_z = dbus_c.dbus_message_get_path(message) orelse return false;
+        const object = self.exportedObjectForPath(path_z) orelse return false;
+        const interface_z = dbus_c.dbus_message_get_interface(message) orelse return false;
+        const member_z = dbus_c.dbus_message_get_member(message) orelse return false;
+        const interface = std.mem.span(interface_z);
+        const member = std.mem.span(member_z);
+
+        if (std.mem.eql(u8, interface, "org.freedesktop.DBus.Properties")) {
+            std.log.scoped(.keywork_luajit).info("dbus properties call {s}.{s}", .{ interface, member });
+            try self.handlePropertiesMethod(object, message, member);
+            return true;
+        }
+        if (std.mem.eql(u8, interface, "org.freedesktop.DBus.Introspectable") and std.mem.eql(u8, member, "Introspect")) {
+            std.log.scoped(.keywork_luajit).info("dbus introspect {s}", .{object.path});
+            const xml = try buildDbusIntrospectionXml(self.app.allocator, self.app.state, object);
+            defer self.app.allocator.free(xml);
+            try self.replyString(message, xml);
+            return true;
+        }
+        return try self.callExportedMethod(object, message, interface, member);
+    }
+
+    fn callExportedMethod(self: *DbusBus, object: *DbusExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, member: []const u8) !bool {
+        const lua_state = self.app.state;
+        const original_top = c.lua_gettop(lua_state);
+        defer c.lua_settop(lua_state, original_top);
+
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+        c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
+        if (c.lua_isnil(lua_state, -1)) return false;
+        c.lua_getfield(lua_state, -1, "methods");
+        if (c.lua_isnil(lua_state, -1)) return false;
+        c.lua_getfield(lua_state, -1, tryZTemp(member).ptr);
+        if (c.lua_isnil(lua_state, -1)) return false;
+        c.lua_getfield(lua_state, -1, "call");
+        if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return false;
+
+        std.log.scoped(.keywork_luajit).info("dbus method call {s}.{s}", .{ interface, member });
+        pushDbusCallTable(lua_state, message);
+        const arg_count = pushDbusMessageArgs(lua_state, message);
+        const return_base = c.lua_gettop(lua_state) - @as(c_int, @intCast(arg_count)) - 1;
+        if (c.lua_pcall(lua_state, @intCast(arg_count + 1), c.LUA_MULTRET, 0) != 0) {
+            const error_message = stringFromStack(lua_state, -1) catch "Lua D-Bus method failed";
+            try self.replyError(message, "org.keywork.LuaError", error_message);
+            return true;
+        }
+        const after_top = c.lua_gettop(lua_state);
+        const return_count: usize = if (after_top < return_base) 0 else @intCast(after_top - return_base + 1);
+        try self.replyValues(message, lua_state, return_base, return_count);
+        return true;
+    }
+
+    fn handlePropertiesMethod(self: *DbusBus, object: *DbusExportedObject, message: *dbus_c.DBusMessage, member: []const u8) !void {
+        if (std.mem.eql(u8, member, "Get")) {
+            const pair = methodCallStringPair(message) orelse {
+                try self.replyError(message, "org.freedesktop.DBus.Error.InvalidArgs", "Get requires interface and property");
+                return;
+            };
+            try self.replyPropertyGet(object, message, pair.interface, pair.property);
+        } else if (std.mem.eql(u8, member, "GetAll")) {
+            const interface = methodCallString(message, 0) orelse {
+                try self.replyError(message, "org.freedesktop.DBus.Error.InvalidArgs", "GetAll requires interface");
+                return;
+            };
+            try self.replyPropertiesGetAll(object, message, interface);
+        } else {
+            try self.replyError(message, "org.freedesktop.DBus.Error.UnknownMethod", "unsupported Properties method");
+        }
+    }
+
+    fn replyValues(self: *DbusBus, message: *dbus_c.DBusMessage, lua_state: *c.lua_State, first_index: c_int, count: usize) !void {
+        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(reply);
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(reply, &iter);
+        var offset: usize = 0;
+        while (offset < count) : (offset += 1) {
+            const index = first_index + @as(c_int, @intCast(offset));
+            if (c.lua_isnil(lua_state, index)) continue;
+            try appendLuaValueToDbusIter(lua_state, index, &iter);
+        }
+        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    fn replyString(self: *DbusBus, message: *dbus_c.DBusMessage, value: []const u8) !void {
+        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(reply);
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(reply, &iter);
+        var value_z = tryZTemp(value);
+        try appendDbusBasic(&iter, dbus_c.DBUS_TYPE_STRING, &value_z.ptr);
+        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    fn replyError(self: *DbusBus, message: *dbus_c.DBusMessage, name: []const u8, text: []const u8) !void {
+        const error_message = dbus_c.dbus_message_new_error(message, tryZTemp(name).ptr, tryZTemp(text).ptr) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(error_message);
+        if (dbus_c.dbus_connection_send(self.connection, error_message, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    fn replyPropertyGet(self: *DbusBus, object: *DbusExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, property: []const u8) !void {
+        const lua_state = self.app.state;
+        const original_top = c.lua_gettop(lua_state);
+        defer c.lua_settop(lua_state, original_top);
+        try pushPropertyGetterResult(lua_state, object, interface, property);
+        const signature = try propertySignature(lua_state, object, interface, property);
+
+        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(reply);
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(reply, &iter);
+        var variant: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
+        try appendLuaValueWithSignature(lua_state, -1, signature, &variant);
+        if (dbus_c.dbus_message_iter_close_container(&iter, &variant) == 0) return error.OutOfMemory;
+        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    fn replyPropertiesGetAll(self: *DbusBus, object: *DbusExportedObject, message: *dbus_c.DBusMessage, interface: []const u8) !void {
+        const lua_state = self.app.state;
+        const original_top = c.lua_gettop(lua_state);
+        defer c.lua_settop(lua_state, original_top);
+
+        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
+        defer dbus_c.dbus_message_unref(reply);
+        var iter: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_init_append(reply, &iter);
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
+
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+        c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
+        if (!c.lua_isnil(lua_state, -1)) {
+            c.lua_getfield(lua_state, -1, "properties");
+            if (!c.lua_isnil(lua_state, -1)) {
+                c.lua_pushnil(lua_state);
+                while (c.lua_next(lua_state, -2) != 0) {
+                    if (c.lua_type(lua_state, -2) != c.LUA_TSTRING or c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+                        pop(lua_state, 1);
+                        continue;
+                    }
+                    const property_name = try stringFromStack(lua_state, -2);
+                    c.lua_getfield(lua_state, -1, "signature");
+                    const signature = stringFromStack(lua_state, -1) catch {
+                        pop(lua_state, 1);
+                        pop(lua_state, 1);
+                        continue;
+                    };
+                    pop(lua_state, 1);
+                    c.lua_getfield(lua_state, -1, "get");
+                    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) {
+                        pop(lua_state, 2);
+                        continue;
+                    }
+                    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) {
+                        pop(lua_state, 2);
+                        continue;
+                    }
+                    try appendPropertyDictEntry(lua_state, &array, property_name, signature, -1);
+                    pop(lua_state, 2);
+                }
+            }
+        }
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
+        dbus_c.dbus_connection_flush(self.connection);
     }
 };
 
@@ -1280,11 +1641,22 @@ fn dbusBusCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !v
 fn dbusFilter(_: ?*dbus_c.DBusConnection, message: ?*dbus_c.DBusMessage, user_data: ?*anyopaque) callconv(.c) dbus_c.DBusHandlerResult {
     const bus: *DbusBus = @ptrCast(@alignCast(user_data orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
     const msg = message orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-    if (dbus_c.dbus_message_get_type(msg) != dbus_c.DBUS_MESSAGE_TYPE_SIGNAL) return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-    bus.handleSignal(msg) catch |err| {
-        std.log.scoped(.keywork_luajit).warn("dbus signal dispatch failed: {}", .{err});
-    };
-    return dbus_c.DBUS_HANDLER_RESULT_HANDLED;
+    switch (dbus_c.dbus_message_get_type(msg)) {
+        dbus_c.DBUS_MESSAGE_TYPE_SIGNAL => {
+            bus.handleSignal(msg) catch |err| {
+                std.log.scoped(.keywork_luajit).warn("dbus signal dispatch failed: {}", .{err});
+            };
+            return dbus_c.DBUS_HANDLER_RESULT_HANDLED;
+        },
+        dbus_c.DBUS_MESSAGE_TYPE_METHOD_CALL => {
+            const handled = bus.handleMethodCall(msg) catch |err| blk: {
+                std.log.scoped(.keywork_luajit).warn("dbus method dispatch failed: {}", .{err});
+                break :blk true;
+            };
+            return if (handled) dbus_c.DBUS_HANDLER_RESULT_HANDLED else dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+        },
+        else => return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED,
+    }
 }
 
 fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u32) !void {
@@ -1464,7 +1836,7 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_setfield(lua_state, loop_table, "spawn");
     c.lua_setfield(lua_state, table, "loop");
 
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 16);
     const dbus_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaDbusSession, 1);
@@ -1472,6 +1844,22 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaDbusSystem, 1);
     c.lua_setfield(lua_state, dbus_table, "system");
+    c.lua_pushcclosure(lua_state, luaDbusString, 0);
+    c.lua_setfield(lua_state, dbus_table, "string");
+    c.lua_pushcclosure(lua_state, luaDbusObjectPath, 0);
+    c.lua_setfield(lua_state, dbus_table, "object_path");
+    c.lua_pushcclosure(lua_state, luaDbusBoolean, 0);
+    c.lua_setfield(lua_state, dbus_table, "boolean");
+    c.lua_pushcclosure(lua_state, luaDbusInt32, 0);
+    c.lua_setfield(lua_state, dbus_table, "int32");
+    c.lua_pushcclosure(lua_state, luaDbusUint32, 0);
+    c.lua_setfield(lua_state, dbus_table, "uint32");
+    c.lua_pushcclosure(lua_state, luaDbusDouble, 0);
+    c.lua_setfield(lua_state, dbus_table, "double");
+    c.lua_pushcclosure(lua_state, luaDbusArray, 0);
+    c.lua_setfield(lua_state, dbus_table, "array");
+    c.lua_pushcclosure(lua_state, luaDbusVariant, 0);
+    c.lua_setfield(lua_state, dbus_table, "variant");
     c.lua_setfield(lua_state, table, "dbus");
 
     c.lua_createtable(lua_state, 0, 4);
@@ -1604,6 +1992,66 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaDbusString(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "string", 1);
+}
+
+fn luaDbusObjectPath(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "object_path", 1);
+}
+
+fn luaDbusBoolean(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "boolean", 1);
+}
+
+fn luaDbusInt32(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "int32", 1);
+}
+
+fn luaDbusUint32(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "uint32", 1);
+}
+
+fn luaDbusDouble(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pushDbusTypedValue(lua_state_optional.?, "double", 1);
+}
+
+fn luaDbusArray(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    c.lua_createtable(lua_state, 0, 3);
+    c.lua_pushliteral(lua_state, "array");
+    c.lua_setfield(lua_state, -2, "__dbus_type");
+    c.lua_pushvalue(lua_state, 1);
+    c.lua_setfield(lua_state, -2, "signature");
+    c.lua_pushvalue(lua_state, 2);
+    c.lua_setfield(lua_state, -2, "value");
+    return 1;
+}
+
+fn luaDbusVariant(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
+    c.lua_createtable(lua_state, 0, 3);
+    c.lua_pushliteral(lua_state, "variant");
+    c.lua_setfield(lua_state, -2, "__dbus_type");
+    c.lua_pushvalue(lua_state, 1);
+    c.lua_setfield(lua_state, -2, "signature");
+    c.lua_pushvalue(lua_state, 2);
+    c.lua_setfield(lua_state, -2, "value");
+    return 1;
+}
+
+fn pushDbusTypedValue(lua_state: *c.lua_State, comptime type_name: [:0]const u8, value_index: c_int) c_int {
+    c.lua_createtable(lua_state, 0, 2);
+    c.lua_pushstring(lua_state, type_name.ptr);
+    c.lua_setfield(lua_state, -2, "__dbus_type");
+    c.lua_pushvalue(lua_state, value_index);
+    c.lua_setfield(lua_state, -2, "value");
+    return 1;
+}
+
 fn luaDbusSession(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return luaDbusBus(lua_state_optional, .session);
 }
@@ -1654,6 +2102,54 @@ fn luaDbusCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
+    const name_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
+    const owned = bus.requestName(lua_state, name_index) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus request_name failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus request_name failed");
+    };
+    pushDbusOwnedNameHandle(lua_state, owned);
+    return 1;
+}
+
+fn luaDbusReleaseName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const name_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
+    const name = stringFromStack(lua_state, name_index) catch return c.luaL_error(lua_state, "release_name requires a name");
+    bus.releaseName(name);
+    return 0;
+}
+
+fn luaDbusExport(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
+    const path_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
+    const spec_index = path_index + 1;
+    const object = bus.exportObject(lua_state, path_index, spec_index) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus export failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus export failed");
+    };
+    pushDbusExportHandle(lua_state, object);
+    return 1;
+}
+
+fn luaDbusEmit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
+    const options_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TTABLE) 2 else 1;
+    bus.emitSignal(lua_state, options_index) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus emit failed: {}", .{err});
+        return c.luaL_error(lua_state, "dbus emit failed");
+    };
+    return 0;
+}
+
 fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const bus: *DbusBus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
@@ -1683,13 +2179,25 @@ fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
 }
 
 fn pushDbusBusHandle(lua_state: *c.lua_State, bus: *DbusBus) void {
-    c.lua_createtable(lua_state, 0, 3);
+    c.lua_createtable(lua_state, 0, 7);
     c.lua_pushlightuserdata(lua_state, bus);
     c.lua_pushcclosure(lua_state, luaDbusSubscribe, 1);
     c.lua_setfield(lua_state, -2, "subscribe");
     c.lua_pushlightuserdata(lua_state, bus);
     c.lua_pushcclosure(lua_state, luaDbusCall, 1);
     c.lua_setfield(lua_state, -2, "call");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusRequestName, 1);
+    c.lua_setfield(lua_state, -2, "request_name");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusReleaseName, 1);
+    c.lua_setfield(lua_state, -2, "release_name");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusExport, 1);
+    c.lua_setfield(lua_state, -2, "export");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusEmit, 1);
+    c.lua_setfield(lua_state, -2, "emit");
     c.lua_pushlightuserdata(lua_state, bus);
     c.lua_pushcclosure(lua_state, luaDbusClose, 1);
     c.lua_setfield(lua_state, -2, "close");
@@ -1700,6 +2208,20 @@ fn pushDbusSubscriptionHandle(lua_state: *c.lua_State, subscription: *DbusSubscr
     c.lua_pushlightuserdata(lua_state, subscription);
     c.lua_pushcclosure(lua_state, luaCancelDbusSubscription, 1);
     c.lua_setfield(lua_state, -2, "cancel");
+}
+
+fn pushDbusOwnedNameHandle(lua_state: *c.lua_State, owned: *DbusOwnedName) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, owned);
+    c.lua_pushcclosure(lua_state, luaReleaseDbusOwnedName, 1);
+    c.lua_setfield(lua_state, -2, "release");
+}
+
+fn pushDbusExportHandle(lua_state: *c.lua_State, object: *DbusExportedObject) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, object);
+    c.lua_pushcclosure(lua_state, luaUnexportDbusObject, 1);
+    c.lua_setfield(lua_state, -2, "unexport");
 }
 
 fn pushProcessHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
@@ -1736,6 +2258,19 @@ fn luaCancelDbusSubscription(lua_state_optional: ?*c.lua_State) callconv(.c) c_i
     const lua_state = lua_state_optional.?;
     const subscription: *DbusSubscription = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     subscription.cancel(lua_state);
+    return 0;
+}
+
+fn luaReleaseDbusOwnedName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const owned: *DbusOwnedName = @ptrCast(@alignCast(c.lua_touserdata(lua_state_optional.?, c.lua_upvalueindex(1)).?));
+    owned.release();
+    return 0;
+}
+
+fn luaUnexportDbusObject(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const object: *DbusExportedObject = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    object.unexport(lua_state);
     return 0;
 }
 
@@ -2075,6 +2610,9 @@ fn parseWidget(
             icon.color,
         );
     }
+    if (std.mem.eql(u8, kind, "image")) {
+        return try parseImage(lua_state, allocator, table);
+    }
     if (std.mem.eql(u8, kind, "icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
@@ -2151,6 +2689,76 @@ fn isWidgetTable(lua_state: *c.lua_State, table: c_int) bool {
 fn missingIconWidget(allocator: std.mem.Allocator, name: []const u8, color: keywork.Color) !keywork.Widget {
     std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
     return .{ .text = .{ .value = try allocator.dupe(u8, "□"), .color = color } };
+}
+
+fn parseImage(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) !keywork.Widget {
+    const options = try lua_codec.decode(ImageOptions, lua_state, table, allocator);
+    if (options.width == 0 or options.height == 0) return error.InvalidImageSize;
+    if (!std.mem.eql(u8, options.format, "argb32")) return error.UnsupportedImageFormat;
+
+    c.lua_getfield(lua_state, table, "pixels");
+    defer pop(lua_state, 1);
+    const pixels = try parseArgb32Pixels(lua_state, allocator, -1, options.width, options.height);
+    errdefer allocator.free(pixels);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&options.width));
+    hasher.update(std.mem.asBytes(&options.height));
+    hasher.update(std.mem.sliceAsBytes(pixels));
+
+    const image = try allocator.create(LuaImage);
+    errdefer allocator.destroy(image);
+    image.* = .{
+        .width = options.width,
+        .height = options.height,
+        .size = options.size orelse @floatFromInt(@max(options.width, options.height)),
+        .pixels = pixels,
+        .cache_key = hasher.final(),
+    };
+    return image.widget();
+}
+
+fn parseArgb32Pixels(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int, width: u32, height: u32) ![]keywork.Color {
+    const pixel_count = @as(usize, width) * @as(usize, height);
+    const byte_count = pixel_count * 4;
+    const pixels = try allocator.alloc(keywork.Color, pixel_count);
+    errdefer allocator.free(pixels);
+
+    if (c.lua_type(lua_state, index) == c.LUA_TSTRING) {
+        const bytes = try stringFromStack(lua_state, index);
+        if (bytes.len < byte_count) return error.InvalidImagePixels;
+        fillArgb32Pixels(pixels, bytes[0..byte_count]);
+        return pixels;
+    }
+
+    try expectType(lua_state, index, c.LUA_TTABLE);
+    const table = absoluteIndex(lua_state, index);
+    var pixel_index: usize = 0;
+    while (pixel_index < pixel_count) : (pixel_index += 1) {
+        const base: c_int = @intCast(pixel_index * 4);
+        const a = try imageByteField(lua_state, table, base + 1);
+        const r = try imageByteField(lua_state, table, base + 2);
+        const g = try imageByteField(lua_state, table, base + 3);
+        const b = try imageByteField(lua_state, table, base + 4);
+        pixels[pixel_index] = keywork.Color.argb(a, r, g, b);
+    }
+    return pixels;
+}
+
+fn fillArgb32Pixels(pixels: []keywork.Color, bytes: []const u8) void {
+    for (pixels, 0..) |*pixel, index| {
+        const base = index * 4;
+        pixel.* = keywork.Color.argb(bytes[base], bytes[base + 1], bytes[base + 2], bytes[base + 3]);
+    }
+}
+
+fn imageByteField(lua_state: *c.lua_State, table: c_int, index: c_int) !u8 {
+    c.lua_rawgeti(lua_state, table, index);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) == 0) return error.InvalidImagePixels;
+    const value = c.lua_tointeger(lua_state, -1);
+    if (value < 0 or value > 255) return error.InvalidImagePixels;
+    return @intCast(value);
 }
 
 fn parseChildren(
@@ -2285,27 +2893,142 @@ fn appendDbusLuaArgs(lua_state: *c.lua_State, options_index: c_int, iter: *dbus_
             return;
         }
         const arg_type = c.lua_type(lua_state, -1);
-        switch (arg_type) {
-            c.LUA_TSTRING => {
-                var len: usize = 0;
-                var value = c.lua_tolstring(lua_state, -1, &len).?;
-                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_STRING, &value);
-            },
-            c.LUA_TBOOLEAN => {
-                var value: dbus_c.dbus_bool_t = if (c.lua_toboolean(lua_state, -1) != 0) 1 else 0;
-                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BOOLEAN, &value);
-            },
-            c.LUA_TNUMBER => {
-                var value: f64 = c.lua_tonumber(lua_state, -1);
-                try appendDbusBasic(iter, dbus_c.DBUS_TYPE_DOUBLE, &value);
-            },
-            else => {
-                pop(lua_state, 1);
-                return error.UnsupportedDbusArgument;
-            },
+        if (arg_type == c.LUA_TNIL) {
+            pop(lua_state, 1);
+            return;
+        }
+        try appendLuaValueToDbusIter(lua_state, -1, iter);
+        pop(lua_state, 1);
+    }
+}
+
+fn appendLuaValueToDbusIter(lua_state: *c.lua_State, index: c_int, iter: *dbus_c.DBusMessageIter) anyerror!void {
+    const absolute = absoluteIndex(lua_state, index);
+    if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) {
+        c.lua_getfield(lua_state, absolute, "__dbus_type");
+        defer pop(lua_state, 1);
+        if (!c.lua_isnil(lua_state, -1)) {
+            const type_name = try stringFromStack(lua_state, -1);
+            if (std.mem.eql(u8, type_name, "string")) return appendTypedField(lua_state, absolute, "s", iter);
+            if (std.mem.eql(u8, type_name, "object_path")) return appendTypedField(lua_state, absolute, "o", iter);
+            if (std.mem.eql(u8, type_name, "boolean")) return appendTypedField(lua_state, absolute, "b", iter);
+            if (std.mem.eql(u8, type_name, "int32")) return appendTypedField(lua_state, absolute, "i", iter);
+            if (std.mem.eql(u8, type_name, "uint32")) return appendTypedField(lua_state, absolute, "u", iter);
+            if (std.mem.eql(u8, type_name, "double")) return appendTypedField(lua_state, absolute, "d", iter);
+            if (std.mem.eql(u8, type_name, "array")) return appendTypedArray(lua_state, absolute, iter);
+            if (std.mem.eql(u8, type_name, "variant")) return appendTypedVariant(lua_state, absolute, iter);
+            return error.UnsupportedDbusArgument;
+        }
+    }
+    switch (c.lua_type(lua_state, absolute)) {
+        c.LUA_TSTRING => try appendLuaValueWithSignature(lua_state, absolute, "s", iter),
+        c.LUA_TBOOLEAN => try appendLuaValueWithSignature(lua_state, absolute, "b", iter),
+        c.LUA_TNUMBER => try appendLuaValueWithSignature(lua_state, absolute, "d", iter),
+        else => return error.UnsupportedDbusArgument,
+    }
+}
+
+fn appendTypedField(lua_state: *c.lua_State, table: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+    c.lua_getfield(lua_state, table, "value");
+    defer pop(lua_state, 1);
+    try appendLuaValueWithSignature(lua_state, -1, signature, iter);
+}
+
+fn appendTypedArray(lua_state: *c.lua_State, table: c_int, iter: *dbus_c.DBusMessageIter) !void {
+    c.lua_getfield(lua_state, table, "signature");
+    const signature = try stringFromStack(lua_state, -1);
+    defer pop(lua_state, 1);
+    c.lua_getfield(lua_state, table, "value");
+    defer pop(lua_state, 1);
+    try appendArrayWithSignature(lua_state, -1, signature, iter);
+}
+
+fn appendTypedVariant(lua_state: *c.lua_State, table: c_int, iter: *dbus_c.DBusMessageIter) !void {
+    c.lua_getfield(lua_state, table, "signature");
+    const signature = try stringFromStack(lua_state, -1);
+    defer pop(lua_state, 1);
+    c.lua_getfield(lua_state, table, "value");
+    defer pop(lua_state, 1);
+    var variant: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
+    try appendLuaValueWithSignature(lua_state, -1, signature, &variant);
+    if (dbus_c.dbus_message_iter_close_container(iter, &variant) == 0) return error.OutOfMemory;
+}
+
+fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) anyerror!void {
+    if (signature.len == 0) return;
+    const absolute = absoluteIndex(lua_state, index);
+    if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) {
+        c.lua_getfield(lua_state, absolute, "__dbus_type");
+        if (!c.lua_isnil(lua_state, -1)) {
+            const type_name = try stringFromStack(lua_state, -1);
+            pop(lua_state, 1);
+            if (std.mem.eql(u8, type_name, "array") or std.mem.eql(u8, type_name, "variant")) return appendLuaValueToDbusIter(lua_state, absolute, iter);
+            c.lua_getfield(lua_state, absolute, "value");
+            defer pop(lua_state, 1);
+            return appendLuaValueWithSignature(lua_state, -1, signature, iter);
         }
         pop(lua_state, 1);
     }
+    if (signature[0] == 'a') return appendArrayWithSignature(lua_state, index, signature[1..], iter);
+    switch (signature[0]) {
+        's' => {
+            var value = tryZTemp(try stringFromStack(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_STRING, &value.ptr);
+        },
+        'o' => {
+            var value = tryZTemp(try stringFromStack(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_OBJECT_PATH, &value.ptr);
+        },
+        'b' => {
+            var value: dbus_c.dbus_bool_t = if (c.lua_toboolean(lua_state, index) != 0) 1 else 0;
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BOOLEAN, &value);
+        },
+        'i' => {
+            var value: i32 = @intCast(c.lua_tointeger(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_INT32, &value);
+        },
+        'u' => {
+            var value: u32 = @intCast(c.lua_tointeger(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_UINT32, &value);
+        },
+        'd' => {
+            var value: f64 = c.lua_tonumber(lua_state, index);
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_DOUBLE, &value);
+        },
+        'v' => try appendLuaValueToDbusIter(lua_state, index, iter),
+        else => return error.UnsupportedDbusArgument,
+    }
+}
+
+fn appendArrayWithSignature(lua_state: *c.lua_State, index: c_int, element_signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+    try expectType(lua_state, index, c.LUA_TTABLE);
+    var array: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_ARRAY, tryZTemp(element_signature).ptr, &array) == 0) return error.OutOfMemory;
+    const table = absoluteIndex(lua_state, index);
+    var item_index: c_int = 1;
+    while (true) : (item_index += 1) {
+        c.lua_rawgeti(lua_state, table, item_index);
+        if (c.lua_isnil(lua_state, -1)) {
+            pop(lua_state, 1);
+            break;
+        }
+        try appendLuaValueWithSignature(lua_state, -1, element_signature, &array);
+        pop(lua_state, 1);
+    }
+    if (dbus_c.dbus_message_iter_close_container(iter, &array) == 0) return error.OutOfMemory;
+}
+
+fn appendPropertyDictEntry(lua_state: *c.lua_State, array: *dbus_c.DBusMessageIter, name: []const u8, signature: []const u8, value_index: c_int) !void {
+    var entry: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+    var name_z = tryZTemp(name);
+    try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &name_z.ptr);
+    var variant: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
+    try appendLuaValueWithSignature(lua_state, value_index, signature, &variant);
+    if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
+    if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
 }
 
 fn appendDbusBasic(iter: *dbus_c.DBusMessageIter, type_: c_int, value: anytype) !void {
@@ -2539,6 +3262,211 @@ fn pushDbusReply(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
     c.lua_setfield(lua_state, table, "args");
 }
 
+fn pushDbusCallTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+    c.lua_createtable(lua_state, 0, 6);
+    const table = c.lua_gettop(lua_state);
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_sender(message));
+    c.lua_setfield(lua_state, table, "sender");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_path(message));
+    c.lua_setfield(lua_state, table, "path");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_interface(message));
+    c.lua_setfield(lua_state, table, "interface");
+    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_member(message));
+    c.lua_setfield(lua_state, table, "member");
+    const serial = dbus_c.dbus_message_get_serial(message);
+    c.lua_pushnumber(lua_state, @floatFromInt(serial));
+    c.lua_setfield(lua_state, table, "serial");
+}
+
+fn pushDbusMessageArgs(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) usize {
+    var count: usize = 0;
+    var iter: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_init(message, &iter) != 0) {
+        while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) {
+            pushDbusIterValue(lua_state, &iter);
+            count += 1;
+            if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
+        }
+    }
+    return count;
+}
+
+fn methodCallStringPair(message: *dbus_c.DBusMessage) ?struct { interface: []const u8, property: []const u8 } {
+    const interface = methodCallString(message, 0) orelse return null;
+    const property = methodCallString(message, 1) orelse return null;
+    return .{ .interface = interface, .property = property };
+}
+
+fn methodCallString(message: *dbus_c.DBusMessage, wanted_index: usize) ?[]const u8 {
+    var iter: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_init(message, &iter) == 0) return null;
+    var index: usize = 0;
+    while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) : (index += 1) {
+        if (index == wanted_index) {
+            if (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_STRING) return null;
+            var value: [*:0]const u8 = undefined;
+            dbus_c.dbus_message_iter_get_basic(&iter, @ptrCast(&value));
+            return std.mem.span(value);
+        }
+        if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
+    }
+    return null;
+}
+
+fn propertySignature(lua_state: *c.lua_State, object: *DbusExportedObject, interface: []const u8, property: []const u8) ![]const u8 {
+    const original_top = c.lua_gettop(lua_state);
+    defer c.lua_settop(lua_state, original_top);
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+    c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
+    c.lua_getfield(lua_state, -1, "properties");
+    c.lua_getfield(lua_state, -1, tryZTemp(property).ptr);
+    c.lua_getfield(lua_state, -1, "signature");
+    const signature = try stringFromStack(lua_state, -1);
+    return tryZTemp(signature);
+}
+
+fn pushPropertyGetterResult(lua_state: *c.lua_State, object: *DbusExportedObject, interface: []const u8, property: []const u8) !void {
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+    c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
+    if (c.lua_isnil(lua_state, -1)) return error.DBusUnknownInterface;
+    c.lua_getfield(lua_state, -1, "properties");
+    if (c.lua_isnil(lua_state, -1)) return error.DBusUnknownProperty;
+    c.lua_getfield(lua_state, -1, tryZTemp(property).ptr);
+    if (c.lua_isnil(lua_state, -1)) return error.DBusUnknownProperty;
+    c.lua_getfield(lua_state, -1, "get");
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.DBusUnreadableProperty;
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return error.LuaCallbackFailed;
+}
+
+fn buildDbusIntrospectionXml(allocator: std.mem.Allocator, lua_state: *c.lua_State, object: *DbusExportedObject) ![]u8 {
+    const original_top = c.lua_gettop(lua_state);
+    defer c.lua_settop(lua_state, original_top);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.writeAll(
+        \\<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+        \\<node>
+        \\  <interface name="org.freedesktop.DBus.Introspectable">
+        \\    <method name="Introspect">
+        \\      <arg name="xml_data" type="s" direction="out"/>
+        \\    </method>
+        \\  </interface>
+        \\  <interface name="org.freedesktop.DBus.Properties">
+        \\    <method name="Get">
+        \\      <arg name="interface_name" type="s" direction="in"/>
+        \\      <arg name="property_name" type="s" direction="in"/>
+        \\      <arg name="value" type="v" direction="out"/>
+        \\    </method>
+        \\    <method name="GetAll">
+        \\      <arg name="interface_name" type="s" direction="in"/>
+        \\      <arg name="properties" type="a{sv}" direction="out"/>
+        \\    </method>
+        \\  </interface>
+        \\
+    );
+
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+    const spec_index = absoluteIndex(lua_state, -1);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, spec_index) != 0) {
+        if (c.lua_type(lua_state, -2) != c.LUA_TSTRING or c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+            pop(lua_state, 1);
+            continue;
+        }
+        const interface_name = try stringFromStack(lua_state, -2);
+        const interface_index = absoluteIndex(lua_state, -1);
+        try writer.writer.print("  <interface name=\"{s}\">\n", .{interface_name});
+        try writeDbusIntrospectionMethods(&writer.writer, lua_state, interface_index);
+        try writeDbusIntrospectionSignals(&writer.writer, lua_state, interface_index);
+        try writeDbusIntrospectionProperties(&writer.writer, lua_state, interface_index);
+        try writer.writer.writeAll("  </interface>\n");
+        pop(lua_state, 1);
+    }
+
+    try writer.writer.writeAll("</node>\n");
+    return writer.toOwnedSlice();
+}
+
+fn writeDbusIntrospectionMethods(writer: *std.Io.Writer, lua_state: *c.lua_State, interface_index: c_int) !void {
+    c.lua_getfield(lua_state, interface_index, "methods");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
+    const methods_index = absoluteIndex(lua_state, -1);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, methods_index) != 0) {
+        if (c.lua_type(lua_state, -2) != c.LUA_TSTRING or c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+            pop(lua_state, 1);
+            continue;
+        }
+        const method_name = try stringFromStack(lua_state, -2);
+        const method_index = absoluteIndex(lua_state, -1);
+        try writer.print("    <method name=\"{s}\">\n", .{method_name});
+        try writeDbusIntrospectionArgs(writer, lua_state, method_index, "in_signature", "in");
+        try writeDbusIntrospectionArgs(writer, lua_state, method_index, "out_signature", "out");
+        try writer.writeAll("    </method>\n");
+        pop(lua_state, 1);
+    }
+}
+
+fn writeDbusIntrospectionSignals(writer: *std.Io.Writer, lua_state: *c.lua_State, interface_index: c_int) !void {
+    c.lua_getfield(lua_state, interface_index, "signals");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
+    const signals_index = absoluteIndex(lua_state, -1);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, signals_index) != 0) {
+        if (c.lua_type(lua_state, -2) != c.LUA_TSTRING or c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+            pop(lua_state, 1);
+            continue;
+        }
+        const signal_name = try stringFromStack(lua_state, -2);
+        const signal_index = absoluteIndex(lua_state, -1);
+        try writer.print("    <signal name=\"{s}\">\n", .{signal_name});
+        try writeDbusIntrospectionArgs(writer, lua_state, signal_index, "signature", null);
+        try writer.writeAll("    </signal>\n");
+        pop(lua_state, 1);
+    }
+}
+
+fn writeDbusIntrospectionProperties(writer: *std.Io.Writer, lua_state: *c.lua_State, interface_index: c_int) !void {
+    c.lua_getfield(lua_state, interface_index, "properties");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
+    const properties_index = absoluteIndex(lua_state, -1);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, properties_index) != 0) {
+        if (c.lua_type(lua_state, -2) != c.LUA_TSTRING or c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+            pop(lua_state, 1);
+            continue;
+        }
+        const property_name = try stringFromStack(lua_state, -2);
+        const property_index = absoluteIndex(lua_state, -1);
+        c.lua_getfield(lua_state, property_index, "signature");
+        const signature = tryZTemp(stringFromStack(lua_state, -1) catch "v");
+        pop(lua_state, 1);
+        c.lua_getfield(lua_state, property_index, "access");
+        const access = tryZTemp(stringFromStack(lua_state, -1) catch "read");
+        pop(lua_state, 1);
+        try writer.print("    <property name=\"{s}\" type=\"{s}\" access=\"{s}\"/>\n", .{ property_name, signature, access });
+        pop(lua_state, 1);
+    }
+}
+
+fn writeDbusIntrospectionArgs(writer: *std.Io.Writer, lua_state: *c.lua_State, table_index: c_int, key: [:0]const u8, direction: ?[]const u8) !void {
+    c.lua_getfield(lua_state, table_index, key.ptr);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return;
+    const signature = try stringFromStack(lua_state, -1);
+    if (signature.len == 0) return;
+    if (direction) |dir| {
+        try writer.print("      <arg type=\"{s}\" direction=\"{s}\"/>\n", .{ signature, dir });
+    } else {
+        try writer.print("      <arg type=\"{s}\"/>\n", .{signature});
+    }
+}
+
 fn pushDbusArgsTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
     c.lua_createtable(lua_state, 0, 0);
     const args_table = c.lua_gettop(lua_state);
@@ -2729,6 +3657,15 @@ fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
     var len: usize = 0;
     const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
     return ptr[0..len];
+}
+
+fn tryZTemp(value: []const u8) [:0]const u8 {
+    std.debug.assert(value.len < dbus_temp_z_buffers[0].len);
+    const slot = dbus_temp_z_slot % dbus_temp_z_buffers.len;
+    dbus_temp_z_slot +%= 1;
+    @memcpy(dbus_temp_z_buffers[slot][0..value.len], value);
+    dbus_temp_z_buffers[slot][value.len] = 0;
+    return dbus_temp_z_buffers[slot][0..value.len :0];
 }
 
 fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: f32) f32 {

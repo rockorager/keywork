@@ -466,6 +466,18 @@ function ui.svg_icon(options)
   }
 end
 
+function ui.image(options)
+  options = options or {}
+  return {
+    type = "image",
+    width = options.width,
+    height = options.height,
+    size = options.size,
+    format = options.format,
+    pixels = options.pixels,
+  }
+end
+
 function ui.icon(options)
   options = options or {}
   return {
