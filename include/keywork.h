@@ -75,6 +75,15 @@ typedef void (*keywork_click_callback_t)(void *userdata);
 typedef int (*keywork_install_event_sources_callback_t)(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime);
 typedef int (*keywork_fd_callback_t)(void *userdata, keywork_event_loop_t *loop, uint32_t events);
 typedef int (*keywork_timer_callback_t)(void *userdata, keywork_event_loop_t *loop, uint64_t expirations);
+/* The text pointer is only valid for the duration of the callback. */
+typedef void (*keywork_text_change_callback_t)(void *userdata, const char *text, size_t len);
+typedef keywork_widget_t *(*keywork_item_builder_t)(void *userdata, keywork_build_t *build, size_t index);
+
+enum keywork_scroll_axes {
+    KEYWORK_SCROLL_VERTICAL = 0,
+    KEYWORK_SCROLL_HORIZONTAL = 1,
+    KEYWORK_SCROLL_BOTH = 2,
+};
 
 struct keywork_app_vtable {
     keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
@@ -153,6 +162,11 @@ void keywork_loop_quit(keywork_event_loop_t *loop);
 keywork_widget_t *keywork_text(keywork_build_t *build, const char *value);
 keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value, uint32_t argb);
 keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder);
+keywork_widget_t *keywork_text_input_on_change(keywork_build_t *build, const char *id, const char *value, const char *placeholder, keywork_text_change_callback_t callback, void *userdata);
+keywork_widget_t *keywork_scroll(keywork_build_t *build, const char *id, keywork_widget_t *child, enum keywork_scroll_axes axes);
+keywork_widget_t *keywork_list(keywork_build_t *build, const char *id, size_t item_count, float item_extent, keywork_item_builder_t callback, void *userdata);
+/* Pass a negative width or height to leave that axis unconstrained. */
+keywork_widget_t *keywork_sized(keywork_build_t *build, keywork_widget_t *child, float width, float height);
 keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
 keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);
 keywork_widget_t *keywork_button(keywork_build_t *build, const char *id, const char *label, keywork_click_callback_t callback, void *userdata);

@@ -6,6 +6,7 @@
 
 struct app_state {
     unsigned count;
+    unsigned input_changes;
     keywork_runtime_t *runtime;
 };
 
@@ -19,6 +20,8 @@ static int status_update(void *userdata, void *state, const struct keywork_build
 static keywork_widget_t *status_build(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context);
 static void status_destroy_state(void *userdata, void *state);
 static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, const struct keywork_build_context *context);
+static void input_changed(void *userdata, const char *text, size_t len);
+static keywork_widget_t *list_item(void *userdata, keywork_build_t *build, size_t index);
 
 static keywork_widget_t *build(void *userdata, keywork_build_t *build, const struct keywork_context *context) {
     struct app_state *state = userdata;
@@ -44,7 +47,11 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
 
     keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
         keywork_button(build, "increment", "Increment", increment, state));
-    keywork_widget_t *input = keywork_text_input(build, "c-input", "", "Type here");
+    char input_label[64];
+    snprintf(input_label, sizeof(input_label), "Type here (%u changes)", state->input_changes);
+    keywork_widget_t *input = keywork_text_input_on_change(build, "c-input", "", input_label, input_changed, state);
+    keywork_widget_t *items = keywork_list(build, "c-list", 1000, 24.0f, list_item, state);
+    keywork_widget_t *list = keywork_sized(build, items, -1.0f, 96.0f);
     keywork_widget_t *status_row = keywork_text(build, context->color_scheme);
     keywork_widget_t *children[] = {
         keywork_colored_text(build, "C app hosted by libkeywork", 0xff6d4affu),
@@ -55,9 +62,24 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
         input,
         status_row,
         keywork_center(build, button),
+        list,
     };
     keywork_widget_t *column = keywork_column(build, children, sizeof(children) / sizeof(children[0]), 12.0f);
     return keywork_padding(build, 24.0f, column);
+}
+
+static void input_changed(void *userdata, const char *text, size_t len) {
+    (void)text;
+    (void)len;
+    struct app_state *state = userdata;
+    state->input_changes += 1;
+}
+
+static keywork_widget_t *list_item(void *userdata, keywork_build_t *build, size_t index) {
+    (void)userdata;
+    char label[64];
+    snprintf(label, sizeof(label), "virtual row %zu of 1000", index + 1);
+    return keywork_text(build, label);
 }
 
 static void increment(void *userdata) {
@@ -144,7 +166,7 @@ static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, con
 }
 
 int main(void) {
-    struct app_state state = {0, NULL};
+    struct app_state state = {0, 0, NULL};
     const struct keywork_app_vtable app = {
         .build = build,
         .install_event_sources = install_event_sources,

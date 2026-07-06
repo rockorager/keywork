@@ -25,6 +25,8 @@ pub const KeyworkAppVTable = extern struct {
 pub const KeyworkClickCallback = *const fn (userdata: ?*anyopaque) callconv(.c) void;
 pub const KeyworkFdCallback = *const fn (userdata: ?*anyopaque, loop: *KeyworkEventLoop, events: u32) callconv(.c) c_int;
 pub const KeyworkTimerCallback = *const fn (userdata: ?*anyopaque, loop: *KeyworkEventLoop, expirations: u64) callconv(.c) c_int;
+pub const KeyworkTextChangeCallback = *const fn (userdata: ?*anyopaque, text: [*:0]const u8, len: usize) callconv(.c) void;
+pub const KeyworkItemBuilderCallback = *const fn (userdata: ?*anyopaque, build: *KeyworkBuild, index: usize) callconv(.c) ?*KeyworkWidget;
 
 pub const KeyworkSize = extern struct {
     width: f32,
@@ -134,6 +136,75 @@ const ClickCallback = struct {
     fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *ClickCallback = @ptrCast(@alignCast(ptr));
         allocator.destroy(self);
+    }
+};
+
+const CTextChangeCallback = struct {
+    callback: KeyworkTextChangeCallback,
+    userdata: ?*anyopaque,
+
+    fn textChangeCallback(self: *CTextChangeCallback) keywork.Widget.TextChangeCallback {
+        return .{
+            .ptr = self,
+            .call_fn = call,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn call(ptr: *anyopaque, text: []const u8) !void {
+        const self: *CTextChangeCallback = @ptrCast(@alignCast(ptr));
+        // The editing buffer is not null-terminated; C callers expect a
+        // C string, so hand out a terminated copy for the callback's
+        // duration only.
+        const copy = try std.heap.c_allocator.dupeZ(u8, text);
+        defer std.heap.c_allocator.free(copy);
+        self.callback(self.userdata, copy.ptr, text.len);
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
+        const self: *CTextChangeCallback = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(CTextChangeCallback);
+        result.* = self.*;
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
+        const self: *CTextChangeCallback = @ptrCast(@alignCast(ptr));
+        allocator.destroy(self);
+    }
+};
+
+const CItemBuilder = struct {
+    callback: KeyworkItemBuilderCallback,
+    userdata: ?*anyopaque,
+
+    fn itemBuilder(self: *const CItemBuilder) keywork.Widget.ItemBuilder {
+        return .{
+            .ptr = self,
+            .build_fn = buildItem,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn buildItem(ptr: *const anyopaque, scope: *keywork.BuildScope, index: usize) !keywork.Widget {
+        const self: *const CItemBuilder = @ptrCast(@alignCast(ptr));
+        var c_scope: CBuildScope = .{ .scope = scope };
+        const handle = self.callback(self.userdata, buildHandle(&c_scope), index) orelse return error.ListItemBuildFailed;
+        return widgetFromHandle(handle).*;
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *const CItemBuilder = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(CItemBuilder);
+        result.* = self.*;
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *const CItemBuilder = @ptrCast(@alignCast(ptr));
+        allocator.destroy(@constCast(self));
     }
 };
 
@@ -506,6 +577,91 @@ pub export fn keywork_text_input(
     ));
 }
 
+pub export fn keywork_text_input_on_change(
+    build: ?*KeyworkBuild,
+    id: ?[*:0]const u8,
+    value: ?[*:0]const u8,
+    placeholder: ?[*:0]const u8,
+    callback: ?KeyworkTextChangeCallback,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const allocator = scope.scope.allocator;
+    var widget = keywork.widgets.textInput(
+        copyString(allocator, id, "") catch return null,
+        copyString(allocator, value, "") catch return null,
+        copyString(allocator, placeholder, "") catch return null,
+    );
+    if (callback) |callback_fn| {
+        const callback_state = allocator.create(CTextChangeCallback) catch return null;
+        callback_state.* = .{ .callback = callback_fn, .userdata = userdata };
+        widget.text_input.on_change = callback_state.textChangeCallback();
+    }
+    return makeWidget(scope, widget);
+}
+
+pub export fn keywork_scroll(
+    build: ?*KeyworkBuild,
+    id: ?[*:0]const u8,
+    child: ?*KeyworkWidget,
+    axes: c_int,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    const allocator = scope.scope.allocator;
+    const child_copy = keywork.Widget.alloc(allocator, child_widget.*) catch return null;
+    const scroll_axes: keywork.Widget.ScrollAxes = switch (axes) {
+        1 => .horizontal,
+        2 => .both,
+        else => .vertical,
+    };
+    return makeWidget(scope, .{ .scroll = .{
+        .id = copyString(allocator, id, "") catch return null,
+        .child = child_copy,
+        .axes = scroll_axes,
+    } });
+}
+
+pub export fn keywork_list(
+    build: ?*KeyworkBuild,
+    id: ?[*:0]const u8,
+    item_count: usize,
+    item_extent: f32,
+    callback: ?KeyworkItemBuilderCallback,
+    userdata: ?*anyopaque,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const callback_fn = callback orelse return null;
+    if (!(item_extent > 0)) return null;
+    const allocator = scope.scope.allocator;
+    const builder = allocator.create(CItemBuilder) catch return null;
+    builder.* = .{ .callback = callback_fn, .userdata = userdata };
+    return makeWidget(scope, keywork.widgets.list(
+        copyString(allocator, id, "") catch return null,
+        item_count,
+        item_extent,
+        builder.itemBuilder(),
+    ));
+}
+
+/// Pass a negative width or height to leave that axis unconstrained.
+pub export fn keywork_sized(
+    build: ?*KeyworkBuild,
+    child: ?*KeyworkWidget,
+    width: f32,
+    height: f32,
+) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    const allocator = scope.scope.allocator;
+    return makeWidget(scope, keywork.widgets.sized(
+        allocator,
+        child_widget.*,
+        if (width >= 0) width else null,
+        if (height >= 0) height else null,
+    ) catch return null);
+}
+
 pub export fn keywork_box(build: ?*KeyworkBuild, child: ?*KeyworkWidget, argb: u32) callconv(.c) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     const child_widget = widgetFromMaybeHandle(child) orelse return null;
@@ -873,4 +1029,62 @@ fn errorCode(err: anyerror) c_int {
         error.BuildCallbackFailed => 5,
         else => 1,
     };
+}
+
+test "c constructors build scroll, list, sized, and text input with on_change" {
+    const allocator = std.testing.allocator;
+
+    const TestApp = struct {
+        var changes: usize = 0;
+        var last_text: [32]u8 = undefined;
+        var last_len: usize = 0;
+
+        fn onChange(_: ?*anyopaque, text: [*:0]const u8, len: usize) callconv(.c) void {
+            changes += 1;
+            last_len = @min(len, last_text.len);
+            @memcpy(last_text[0..last_len], text[0..last_len]);
+        }
+
+        fn buildItem(_: ?*anyopaque, build: *KeyworkBuild, index: usize) callconv(.c) ?*KeyworkWidget {
+            var label: [32]u8 = undefined;
+            const text = std.fmt.bufPrintZ(&label, "virtual row {d}", .{index}) catch return null;
+            return keywork_text(build, text.ptr);
+        }
+
+        fn buildApp(_: ?*anyopaque, build: *KeyworkBuild, _: *const KeyworkContext) callconv(.c) ?*KeyworkWidget {
+            const input = keywork_text_input_on_change(build, "input", "", "type here", onChange, null) orelse return null;
+            const items = keywork_list(build, "rows", 1000, 20.0, buildItem, null) orelse return null;
+            const sized = keywork_sized(build, items, -1, 60) orelse return null;
+            const wrapped = keywork_scroll(build, "content", sized, 0) orelse return null;
+            const children = [_]?*KeyworkWidget{ input, wrapped };
+            return keywork_column(build, &children, children.len, 4);
+        }
+    };
+    TestApp.changes = 0;
+
+    var c_app: CApp = .{ .vtable = .{ .build = TestApp.buildApp }, .userdata = null };
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 200, .max_height = 200 },
+        c_app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.repaint();
+    // The C item builder ran for visible rows only.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "virtual row 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "virtual row 999") == null);
+
+    // Typing reaches the C on_change callback through the retained tree.
+    try runtime.keyInput(.{ .tab = .{} });
+    try runtime.keyInput(.{ .text = "h" });
+    try runtime.keyInput(.{ .text = "i" });
+    try std.testing.expectEqual(@as(usize, 2), TestApp.changes);
+    try std.testing.expectEqualStrings("hi", TestApp.last_text[0..TestApp.last_len]);
 }

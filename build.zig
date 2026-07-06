@@ -272,6 +272,12 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
 
+    const c_api_tests = b.addTest(.{
+        .root_module = c_api_module,
+    });
+    linkKeyworkSystemLibraries(c_api_tests.root_module);
+    test_step.dependOn(&b.addRunArtifact(c_api_tests).step);
+
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "include", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
