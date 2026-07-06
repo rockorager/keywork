@@ -23,6 +23,18 @@ const max_atlas_size_cap = 8192;
 const atlas_padding = 1;
 const initial_staging_capacity = initial_atlas_size * initial_atlas_size;
 const max_prepare_attempts = 8;
+const frames_in_flight = 2;
+
+/// GPU resources cycled per in-flight frame so CPU recording of frame N
+/// overlaps GPU execution of frame N-1.
+const FrameResources = struct {
+    command_pool: vk.CommandPool = .null_handle,
+    command_buffer: vk.CommandBuffer = .null_handle,
+    image_available: vk.Semaphore = .null_handle,
+    in_flight: vk.Fence = .null_handle,
+    staging_buffer: GpuBuffer = .{},
+    vertex_buffer: GpuBuffer = .{},
+};
 
 const GpuBuffer = struct {
     buffer: vk.Buffer = .null_handle,
@@ -190,8 +202,12 @@ pub const Backend = struct {
     command_pool: vk.CommandPool,
     command_buffer: vk.CommandBuffer,
     image_available: vk.Semaphore,
-    render_finished: vk.Semaphore,
     in_flight: vk.Fence,
+    frames: [frames_in_flight]FrameResources,
+    frame_index: usize,
+    /// One per swapchain image: a per-frame present semaphore could still
+    /// be pending when its frame slot is reused.
+    render_finished_semaphores: []vk.Semaphore,
 
     repaint_handler: ?RepaintHandler,
     repaint_context: ?*anyopaque,
@@ -321,25 +337,20 @@ pub const Backend = struct {
         const vkd = vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
         errdefer vkd.destroyDevice(device, null);
         const queue = vkd.getDeviceQueue(device, selection.queue_family_index, 0);
-        const command_pool = try vkd.createCommandPool(device, &.{
-            .flags = .{ .reset_command_buffer_bit = true },
-            .queue_family_index = selection.queue_family_index,
-        }, null);
-        errdefer vkd.destroyCommandPool(device, command_pool, null);
-
-        var command_buffer: vk.CommandBuffer = undefined;
-        try vkd.allocateCommandBuffers(device, &.{
-            .command_pool = command_pool,
-            .level = .primary,
-            .command_buffer_count = 1,
-        }, @ptrCast(&command_buffer));
-
-        const image_available = try vkd.createSemaphore(device, &.{}, null);
-        errdefer vkd.destroySemaphore(device, image_available, null);
-        const render_finished = try vkd.createSemaphore(device, &.{}, null);
-        errdefer vkd.destroySemaphore(device, render_finished, null);
-        const in_flight = try vkd.createFence(device, &.{ .flags = .{ .signaled_bit = true } }, null);
-        errdefer vkd.destroyFence(device, in_flight, null);
+        var frames: [frames_in_flight]FrameResources = @splat(.{});
+        for (&frames) |*frame| {
+            frame.command_pool = try vkd.createCommandPool(device, &.{
+                .flags = .{ .reset_command_buffer_bit = true },
+                .queue_family_index = selection.queue_family_index,
+            }, null);
+            try vkd.allocateCommandBuffers(device, &.{
+                .command_pool = frame.command_pool,
+                .level = .primary,
+                .command_buffer_count = 1,
+            }, @ptrCast(&frame.command_buffer));
+            frame.image_available = try vkd.createSemaphore(device, &.{}, null);
+            frame.in_flight = try vkd.createFence(device, &.{ .flags = .{ .signaled_bit = true } }, null);
+        }
 
         const self = try allocator.create(Backend);
         errdefer allocator.destroy(self);
@@ -401,11 +412,13 @@ pub const Backend = struct {
             .staging_used = 0,
             .vertex_buffer = .{},
             .text_vertices = .empty,
-            .command_pool = command_pool,
-            .command_buffer = command_buffer,
-            .image_available = image_available,
-            .render_finished = render_finished,
-            .in_flight = in_flight,
+            .command_pool = frames[0].command_pool,
+            .command_buffer = frames[0].command_buffer,
+            .image_available = frames[0].image_available,
+            .in_flight = frames[0].in_flight,
+            .frames = frames,
+            .frame_index = 0,
+            .render_finished_semaphores = &.{},
             .repaint_handler = null,
             .repaint_context = null,
             .frame_handler = null,
@@ -436,10 +449,11 @@ pub const Backend = struct {
         self.destroySwapchain();
         self.text_vertices.deinit(self.allocator);
         self.atlas_slots.deinit(self.allocator);
-        self.vkd.destroyFence(self.device, self.in_flight, null);
-        self.vkd.destroySemaphore(self.device, self.render_finished, null);
-        self.vkd.destroySemaphore(self.device, self.image_available, null);
-        self.vkd.destroyCommandPool(self.device, self.command_pool, null);
+        for (&self.frames) |*frame| {
+            self.vkd.destroyFence(self.device, frame.in_flight, null);
+            self.vkd.destroySemaphore(self.device, frame.image_available, null);
+            self.vkd.destroyCommandPool(self.device, frame.command_pool, null);
+        }
         self.vkd.destroyDevice(self.device, null);
         self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
@@ -643,6 +657,8 @@ pub const Backend = struct {
         self.swapchain_images = try self.vkd.getSwapchainImagesAllocKHR(self.device, self.swapchain, self.allocator);
         self.swapchain_extent = extent;
         self.swapchain_format = surface_format.format;
+        self.render_finished_semaphores = try self.allocator.alloc(vk.Semaphore, self.swapchain_images.len);
+        for (self.render_finished_semaphores) |*semaphore| semaphore.* = try self.vkd.createSemaphore(self.device, &.{}, null);
         try self.createRenderTargets();
         try self.ensureTextResources();
         try self.ensureTextPipeline();
@@ -654,6 +670,9 @@ pub const Backend = struct {
         for (self.framebuffers) |framebuffer| self.vkd.destroyFramebuffer(self.device, framebuffer, null);
         if (self.framebuffers.len > 0) self.allocator.free(self.framebuffers);
         if (self.render_pass != .null_handle) self.vkd.destroyRenderPass(self.device, self.render_pass, null);
+        for (self.render_finished_semaphores) |semaphore| self.vkd.destroySemaphore(self.device, semaphore, null);
+        if (self.render_finished_semaphores.len > 0) self.allocator.free(self.render_finished_semaphores);
+        self.render_finished_semaphores = &.{};
         for (self.swapchain_image_views) |view| self.vkd.destroyImageView(self.device, view, null);
         if (self.swapchain_image_views.len > 0) self.allocator.free(self.swapchain_image_views);
         if (self.swapchain_images.len > 0) self.allocator.free(self.swapchain_images);
@@ -802,12 +821,6 @@ pub const Backend = struct {
         }, @ptrCast(&self.text_descriptor_set));
 
         self.updateAtlasDescriptor();
-
-        self.staging_buffer = try self.createBuffer(
-            initial_staging_capacity,
-            .{ .transfer_src_bit = true },
-            .{ .host_visible_bit = true, .host_coherent_bit = true },
-        );
     }
 
     fn createAtlasImage(self: *Backend) !void {
@@ -868,6 +881,10 @@ pub const Backend = struct {
     /// referenced the old image is reset before re-recording.
     fn growAtlas(self: *Backend) !void {
         if (self.atlas_size * 2 > self.max_atlas_size) return error.GlyphAtlasFull;
+        // The other in-flight frame may still sample the old image.
+        var fences: [frames_in_flight]vk.Fence = undefined;
+        for (&self.frames, 0..) |*frame, index| fences[index] = frame.in_flight;
+        _ = try self.vkd.waitForFences(self.device, &fences, .true, std.math.maxInt(u64));
         self.atlas_size *= 2;
         self.destroyImage(&self.atlas);
         try self.createAtlasImage();
@@ -880,7 +897,7 @@ pub const Backend = struct {
     /// uploaded, so packing restarts and the tracked layout is restored to
     /// the last value the GPU actually saw.
     fn growStaging(self: *Backend, atlas_layout_before: vk.ImageLayout) !void {
-        const new_size = self.staging_buffer.size * 2;
+        const new_size = @max(initial_staging_capacity, self.staging_buffer.size * 2);
         self.destroyBuffer(&self.staging_buffer);
         self.staging_buffer = try self.createBuffer(
             new_size,
@@ -901,6 +918,10 @@ pub const Backend = struct {
         self.destroyImage(&self.atlas);
         self.destroyBuffer(&self.staging_buffer);
         self.destroyBuffer(&self.vertex_buffer);
+        for (&self.frames) |*frame| {
+            self.destroyBuffer(&frame.staging_buffer);
+            self.destroyBuffer(&frame.vertex_buffer);
+        }
         self.text_pipeline = .null_handle;
         self.text_pipeline_layout = .null_handle;
         self.text_descriptor_pool = .null_handle;
@@ -1017,6 +1038,8 @@ pub const Backend = struct {
     };
 
     fn renderAndPresent(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !PresentResult {
+        self.loadFrameViews();
+        defer self.storeFrameViews();
         _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
 
         const acquired = self.vkd.acquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.image_available, .null_handle) catch |err| switch (err) {
@@ -1073,12 +1096,12 @@ pub const Backend = struct {
             .command_buffer_count = 1,
             .p_command_buffers = @ptrCast(&self.command_buffer),
             .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast(&self.render_finished),
+            .p_signal_semaphores = @ptrCast(&self.render_finished_semaphores[image_index]),
         }}, self.in_flight);
 
         const present_result = self.vkd.queuePresentKHR(self.queue, &.{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&self.render_finished),
+            .p_wait_semaphores = @ptrCast(&self.render_finished_semaphores[image_index]),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&self.swapchain),
             .p_image_indices = @ptrCast(&image_index),
@@ -1086,8 +1109,29 @@ pub const Backend = struct {
             error.OutOfDateKHR => return .stale,
             else => return err,
         };
+        self.storeFrameViews();
+        self.frame_index = (self.frame_index + 1) % frames_in_flight;
+        self.loadFrameViews();
         if (suboptimal or present_result == .suboptimal_khr) return .stale;
         return .presented;
+    }
+
+    /// The single command/sync/upload fields act as views of the active
+    /// frame slot so the recording helpers stay slot-agnostic.
+    fn loadFrameViews(self: *Backend) void {
+        const frame = &self.frames[self.frame_index];
+        self.command_pool = frame.command_pool;
+        self.command_buffer = frame.command_buffer;
+        self.image_available = frame.image_available;
+        self.in_flight = frame.in_flight;
+        self.staging_buffer = frame.staging_buffer;
+        self.vertex_buffer = frame.vertex_buffer;
+    }
+
+    fn storeFrameViews(self: *Backend) void {
+        const frame = &self.frames[self.frame_index];
+        frame.staging_buffer = self.staging_buffer;
+        frame.vertex_buffer = self.vertex_buffer;
     }
 
     /// Batches the display list into one ordered quad stream so painter's
@@ -1096,6 +1140,13 @@ pub const Backend = struct {
     fn prepareQuads(self: *Backend, display_list: []const keywork.PaintCommand, scale: f32) !void {
         self.text_vertices.clearRetainingCapacity();
         self.staging_used = 0;
+        if (self.staging_buffer.size == 0) {
+            self.staging_buffer = try self.createBuffer(
+                initial_staging_capacity,
+                .{ .transfer_src_bit = true },
+                .{ .host_visible_bit = true, .host_coherent_bit = true },
+            );
+        }
 
         var glyphs: std.ArrayList(TextRenderer.PositionedGlyph) = .empty;
         defer glyphs.deinit(self.allocator);
