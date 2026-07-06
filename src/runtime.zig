@@ -35,10 +35,11 @@ pub const Runtime = struct {
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
     element_root: ?Element = null,
-    root: ?RenderNode = null,
+    root: ?*RenderNode = null,
     display_list: DisplayList = .{},
     app_context: State = .{},
     repaint_pending: bool = false,
+    pending_interaction_ids: std.ArrayList([]u8) = .empty,
     rebuild_pending: bool = false,
     state_rebuild_pending: bool = false,
     frame_pending: bool = false,
@@ -67,10 +68,6 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        if (self.root) |*root| {
-            keywork.destroyRenderTree(self.allocator, root);
-            self.root = null;
-        }
         if (self.element_root) |*element_root| {
             keywork.destroyElementTree(self.allocator, element_root);
             self.element_root = null;
@@ -78,6 +75,8 @@ pub const Runtime = struct {
         self.display_list.deinit(self.allocator);
         self.input_text.deinit(self.allocator);
         if (self.focused_id) |id| self.allocator.free(id);
+        for (self.pending_interaction_ids.items) |id| self.allocator.free(id);
+        self.pending_interaction_ids.deinit(self.allocator);
         if (self.hovered_id) |id| self.allocator.free(id);
         if (self.pressed_id) |id| self.allocator.free(id);
         self.build_arena.deinit();
@@ -123,6 +122,7 @@ pub const Runtime = struct {
 
         self.rendering = true;
         defer self.rendering = false;
+        try self.flushInteractionRefresh();
         // Consume pending flags before rebuilding so invalidations raised by
         // callbacks during the rebuild are observed on the next pass instead
         // of being cleared and dropped.
@@ -141,21 +141,21 @@ pub const Runtime = struct {
         }
         self.repaint_pending = false;
 
-        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const root = self.root orelse return error.NotBuilt;
         self.display_list.clearRetainingCapacity(self.allocator);
         const frame_size = self.frameSize();
-        try self.display_list.fillRect(self.allocator, .{
-            .x = 0,
-            .y = 0,
-            .width = frame_size.width,
-            .height = frame_size.height,
-        }, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface);
+        const full_frame: keywork.Rect = .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height };
+        // Damage accumulated by relayout since the last collection; a
+        // repaint without any layout change (e.g. a scale change) reports
+        // the full frame.
+        const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
+        try self.display_list.fillRect(self.allocator, full_frame, keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface);
         const render_scale = self.backend.scale();
         try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
         self.frame_pending = try self.backend.present(.{
             .size = frame_size,
             .scale = render_scale,
-            .damage = &.{.{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height }},
+            .damage = &.{damage},
             .display_list = self.display_list.commands.items,
         });
     }
@@ -178,16 +178,16 @@ pub const Runtime = struct {
     }
 
     fn pointerDown(self: *Runtime, point: Point) !void {
-        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const root = self.root orelse return error.NotBuilt;
         if (keywork.hitTestTextInput(root, point)) |id| {
-            try self.setFocused(id);
+            const focus_changed = try self.setFocused(id);
             _ = try self.setPressedId(null);
-            try self.invalidate();
+            if (focus_changed) try self.invalidate() else try self.invalidateState();
             return;
         }
 
         if (keywork.hitTestClick(root, point)) |hit| {
-            try self.setFocused(hit.id);
+            const focus_changed = try self.setFocused(hit.id);
             var needs_update = try self.setPressedId(hit.id);
             if (hit.tap_down) |callback| {
                 try callback.call();
@@ -197,20 +197,22 @@ pub const Runtime = struct {
                 log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
                 if (try self.activateClick(hit)) needs_update = true;
             }
-            if (needs_update) {
+            if (focus_changed) {
                 try self.invalidate();
+            } else if (needs_update) {
+                try self.invalidateState();
             }
         } else {
             self.autofocus_suppressed = true;
-            try self.setFocused(null);
+            const focus_changed = try self.setFocused(null);
             log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
             _ = try self.setPressedId(null);
-            try self.invalidate();
+            if (focus_changed) try self.invalidate() else try self.invalidateState();
         }
     }
 
     fn pointerUp(self: *Runtime, point: Point) !void {
-        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const root = self.root orelse return error.NotBuilt;
         const hit = keywork.hitTestClick(root, point);
         const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
         const should_activate = if (self.pressed_id) |pressed_id| blk: {
@@ -237,12 +239,12 @@ pub const Runtime = struct {
         }
 
         if (needs_update) {
-            try self.invalidate();
+            try self.invalidateState();
         }
     }
 
     pub fn requestFocus(self: *Runtime, id: []const u8) !void {
-        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const root = self.root orelse return error.NotBuilt;
         const target = keywork.findFocusTarget(root, id) orelse return error.FocusTargetNotFound;
         if (!target.can_request_focus) return error.FocusTargetNotFocusable;
         const targets = try keywork.collectFocusTargets(self.allocator, root);
@@ -250,20 +252,20 @@ pub const Runtime = struct {
         if (activeModalScopeId(targets)) |modal_scope_id| {
             if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return error.FocusTargetOutsideModal;
         }
-        try self.setFocused(id);
+        _ = try self.setFocused(id);
         try self.invalidate();
     }
 
     pub fn clearFocus(self: *Runtime) !void {
         self.autofocus_suppressed = true;
-        try self.setFocused(null);
+        _ = try self.setFocused(null);
         try self.invalidate();
     }
 
-    fn setFocused(self: *Runtime, id: ?[]const u8) !void {
+    fn setFocused(self: *Runtime, id: ?[]const u8) !bool {
         if (self.focused_id) |old_id| {
             if (id) |new_id| {
-                if (std.mem.eql(u8, old_id, new_id)) return;
+                if (std.mem.eql(u8, old_id, new_id)) return false;
             }
             if (self.focusedTarget()) |target| {
                 if (target.focus_change_callback) |callback| try callback.call(false);
@@ -279,7 +281,9 @@ pub const Runtime = struct {
             if (self.focusedTarget()) |target| {
                 if (target.focus_change_callback) |callback| try callback.call(true);
             }
+            return true;
         }
+        return self.focused_id == null and id == null;
     }
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
@@ -311,7 +315,7 @@ pub const Runtime = struct {
                 switch (target.kind) {
                     .text_input => {
                         self.autofocus_suppressed = true;
-                        try self.setFocused(null);
+                        _ = try self.setFocused(null);
                     },
                     .clickable => _ = try self.activateClick(.{ .id = target.id, .callback = target.callback }),
                     .focus => {},
@@ -335,7 +339,7 @@ pub const Runtime = struct {
 
     fn focusedTarget(self: *Runtime) ?keywork.FocusTarget {
         const focused_id = self.focused_id orelse return null;
-        const root = if (self.root) |*root| root else return null;
+        const root = self.root orelse return null;
         return keywork.findFocusTarget(root, focused_id);
     }
 
@@ -345,7 +349,7 @@ pub const Runtime = struct {
     }
 
     fn focusNext(self: *Runtime, reverse: bool) !void {
-        const root = if (self.root) |*root| root else return error.NotBuilt;
+        const root = self.root orelse return error.NotBuilt;
         const targets = try keywork.collectFocusTargets(self.allocator, root);
         defer self.allocator.free(targets);
         if (targets.len == 0) return;
@@ -356,7 +360,7 @@ pub const Runtime = struct {
         const active_scope_id = if (current_target_in_modal) current_target.?.scope_id else null;
         const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, active_modal_scope_id, reverse) orelse return;
 
-        try self.setFocused(targets[next_index].id);
+        _ = try self.setFocused(targets[next_index].id);
     }
 
     fn findCollectedFocusTarget(targets: []const keywork.FocusTarget, id: []const u8) ?keywork.FocusTarget {
@@ -441,51 +445,74 @@ pub const Runtime = struct {
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
-        const root = if (self.root) |*root| root else return .default;
+        const root = self.root orelse return .default;
         return keywork.hitTestCursorShape(root, point);
     }
 
     pub fn pointerMove(self: *Runtime, point: ?Point) !void {
         const hit_id = if (point) |position| blk: {
-            const root = if (self.root) |*root| root else return error.NotBuilt;
+            const root = self.root orelse return error.NotBuilt;
             break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
         } else null;
         if (!try self.setHoveredId(hit_id)) return;
-        try self.invalidate();
+        try self.invalidateState();
     }
 
     fn setHoveredId(self: *Runtime, id: ?[]const u8) !bool {
-        if (self.hovered_id) |old_id| {
-            if (id) |new_id| {
-                if (std.mem.eql(u8, old_id, new_id)) return false;
-            }
-            self.allocator.free(old_id);
-            self.hovered_id = null;
-        } else if (id == null) {
-            return false;
-        }
-
-        if (id) |new_id| {
-            self.hovered_id = try self.allocator.dupe(u8, new_id);
-        }
-        return true;
+        return self.setInteractionId(&self.hovered_id, id);
     }
 
     fn setPressedId(self: *Runtime, id: ?[]const u8) !bool {
-        if (self.pressed_id) |old_id| {
+        return self.setInteractionId(&self.pressed_id, id);
+    }
+
+    fn setInteractionId(self: *Runtime, slot: *?[]u8, id: ?[]const u8) !bool {
+        if (slot.*) |old_id| {
             if (id) |new_id| {
                 if (std.mem.eql(u8, old_id, new_id)) return false;
             }
-            self.allocator.free(old_id);
-            self.pressed_id = null;
         } else if (id == null) {
             return false;
         }
 
-        if (id) |new_id| {
-            self.pressed_id = try self.allocator.dupe(u8, new_id);
-        }
+        const old_id = slot.*;
+        if (old_id) |value| try self.queueInteractionRefresh(value);
+        if (id) |value| try self.queueInteractionRefresh(value);
+        if (old_id) |value| self.allocator.free(value);
+        slot.* = if (id) |new_id| try self.allocator.dupe(u8, new_id) else null;
         return true;
+    }
+
+    /// Queues a widget id whose hover/press styling changed. The restyle is
+    /// deferred to the next frame because the event handler that triggered
+    /// it may still hold callbacks borrowed from the widgets a refresh
+    /// would replace.
+    fn queueInteractionRefresh(self: *Runtime, id: []const u8) !void {
+        for (self.pending_interaction_ids.items) |pending| {
+            if (std.mem.eql(u8, pending, id)) return;
+        }
+        const owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned);
+        try self.pending_interaction_ids.append(self.allocator, owned);
+    }
+
+    /// Restyles only the buttons whose hover/press state changed, marking
+    /// their layout path dirty so the dirty-state pass relayouts and
+    /// repaints them without rebuilding the app.
+    fn flushInteractionRefresh(self: *Runtime) !void {
+        if (self.pending_interaction_ids.items.len == 0) return;
+        defer {
+            for (self.pending_interaction_ids.items) |id| self.allocator.free(id);
+            self.pending_interaction_ids.clearRetainingCapacity();
+        }
+        // A pending full rebuild restyles everything anyway.
+        if (self.rebuild_pending) return;
+        const element_root = if (self.element_root) |*element_root| element_root else return;
+        var ids: [8][]const u8 = undefined;
+        const count = @min(ids.len, self.pending_interaction_ids.items.len);
+        for (self.pending_interaction_ids.items[0..count], 0..) |id, index| ids[index] = id;
+        var build_scope = self.buildScope(self.app_context);
+        _ = try keywork.refreshInteractionElements(self.allocator, &build_scope, element_root, self.constraints, ids[0..count]);
     }
 
     pub fn waylandPointerButton(ctx: *anyopaque, point: Point, state: PointerButtonState) void {
@@ -553,11 +580,6 @@ pub const Runtime = struct {
     }
 
     fn rebuild(self: *Runtime) !void {
-        if (self.root) |*old_root| {
-            keywork.destroyRenderTree(self.allocator, old_root);
-            self.root = null;
-        }
-
         const max_focus_rebuild_passes = 4;
         var pass: usize = 0;
         while (true) : (pass += 1) {
@@ -577,19 +599,10 @@ pub const Runtime = struct {
 
             if (!try self.reconcileFocusAfterRebuild()) break;
             if (pass + 1 >= max_focus_rebuild_passes) return error.FocusDidNotStabilize;
-            if (self.root) |*focused_with_old_tree| {
-                keywork.destroyRenderTree(self.allocator, focused_with_old_tree);
-                self.root = null;
-            }
         }
     }
 
     fn rebuildDirtyState(self: *Runtime) !void {
-        if (self.root) |*old_root| {
-            keywork.destroyRenderTree(self.allocator, old_root);
-            self.root = null;
-        }
-
         const element_root = if (self.element_root) |*element_root| element_root else {
             try self.rebuild();
             return;
@@ -620,10 +633,7 @@ pub const Runtime = struct {
 
     fn rebuildRetainedTrees(self: *Runtime) !void {
         const element_root = if (self.element_root) |*element_root| element_root else return error.NotBuilt;
-        var new_root = try keywork.buildRenderTreeFromElement(self.allocator, element_root, self.constraints, self.backend);
-        errdefer keywork.destroyRenderTree(self.allocator, &new_root);
-        self.root = new_root;
-        errdefer self.root = null;
+        self.root = try keywork.buildRenderTreeFromElement(self.allocator, element_root, self.constraints, self.backend);
         self.reconcileInteractionAfterRebuild();
     }
 
@@ -631,7 +641,7 @@ pub const Runtime = struct {
     /// cannot leak stale interaction styling into later builds. Focus has
     /// its own reconciliation with autofocus fallback.
     fn reconcileInteractionAfterRebuild(self: *Runtime) void {
-        const root = if (self.root) |*root| root else return;
+        const root = self.root orelse return;
         if (self.hovered_id) |id| {
             if (keywork.findClickHitById(root, id) == null) {
                 self.allocator.free(id);
@@ -647,7 +657,7 @@ pub const Runtime = struct {
     }
 
     fn reconcileFocusAfterRebuild(self: *Runtime) !bool {
-        const root = if (self.root) |*root| root else return false;
+        const root = self.root orelse return false;
         const targets = try keywork.collectFocusTargets(self.allocator, root);
         defer self.allocator.free(targets);
         const active_modal_scope_id = activeModalScopeId(targets);
@@ -665,7 +675,7 @@ pub const Runtime = struct {
             break :blk if (autofocusTarget(targets, active_modal_scope_id)) |target| target.id else null;
         } else null;
         if (sameOptionalString(self.focused_id, desired_focus)) return false;
-        try self.setFocused(desired_focus);
+        _ = try self.setFocused(desired_focus);
         return true;
     }
 
@@ -881,6 +891,98 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqualStrings("a ", runtime.input_text.items);
+}
+
+test "pointer hover restyles buttons without a full rebuild" {
+    const TestApp = struct {
+        builds: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            const theme: keywork.Theme = .{
+                .color_scheme = .light,
+                .button_theme = .{
+                    .background = keywork.colors.white,
+                    .foreground = keywork.colors.ink,
+                    .hover_background = keywork.colors.black,
+                },
+            };
+            const first = try keywork.widgets.button(scope.allocator, "first", "First", .{ .ptr = self, .call_fn = noop });
+            const second = try keywork.widgets.button(scope.allocator, "second", "Second", .{ .ptr = self, .call_fn = noop });
+            const children = [_]keywork.Widget{ first, second };
+            const column = try keywork.widgets.column(scope.allocator, &children, 4);
+            return keywork.widgets.theme(scope.allocator, theme, column);
+        }
+
+        fn noop(_: *anyopaque) !void {}
+
+        fn collectBoxBackgrounds(node: *const keywork.RenderNode, out: []keywork.Color, count: *usize) void {
+            if (node.kind == .box) {
+                out[count.*] = node.background;
+                count.* += 1;
+            }
+            for (node.children) |child| collectBoxBackgrounds(child, out, count);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+
+    var backgrounds: [8]keywork.Color = undefined;
+    var count: usize = 0;
+    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
+    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
+
+    // Hovering the first button restyles only it, with no root rebuild.
+    try runtime.pointerMove(.{ .x = 5, .y = 5 });
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+    count = 0;
+    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
+    try std.testing.expectEqual(keywork.colors.black, backgrounds[0]);
+    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
+
+    // Leaving the surface clears the hover styling, still without rebuilds.
+    try runtime.pointerMove(null);
+    try std.testing.expectEqual(@as(usize, 1), app.builds);
+    count = 0;
+    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
+    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
+    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
 }
 
 test "shortcut invokes ambient action outside text input focus" {
@@ -1118,7 +1220,7 @@ test "autofocus replaces focused node removed during rebuild" {
     );
     defer runtime.deinit();
 
-    try runtime.setFocused("old");
+    _ = try runtime.setFocused("old");
     try runtime.rebuild();
     try std.testing.expectEqualStrings("old", runtime.focused_id.?);
 

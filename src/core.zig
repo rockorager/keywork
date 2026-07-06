@@ -833,6 +833,7 @@ pub const Element = struct {
     key: ?Widget.Key = null,
     state: ?*anyopaque = null,
     focused: bool = false,
+    render_node: ?*RenderNode = null,
     children: []Element = &.{},
 
     pub const Kind = enum {
@@ -987,7 +988,16 @@ pub const RenderNode = struct {
     placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
     focused: bool = false,
     caret_x: ?f32 = null,
-    children: []RenderNode = &.{},
+    /// Constraints this node was last laid out with; cached so clean
+    /// subtrees can be skipped when re-laid out with identical inputs.
+    constraints: Constraints = .{ .max_width = 0, .max_height = 0 },
+    needs_layout: bool = true,
+    /// Union of this node's previous and current bounds accumulated since
+    /// the damage was last collected; null when the node has not changed.
+    damage: ?Rect = null,
+    /// Child nodes are owned by the corresponding child elements; this
+    /// slice only borrows them and is refreshed on every layout.
+    children: []*RenderNode = &.{},
 
     pub const Kind = enum {
         keyed,
@@ -1281,31 +1291,12 @@ pub const AppHost = struct {
     }
 };
 
-pub fn buildRenderTree(allocator: std.mem.Allocator, widget: *const Widget, constraints: Constraints) !RenderNode {
-    var scope: BuildScope = .{ .allocator = allocator };
-    var element = try buildElementTreeScoped(allocator, &scope, widget, constraints);
-    defer destroyElementTree(allocator, &element);
-    return layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-}
-
-pub fn buildRenderTreeMeasured(
-    allocator: std.mem.Allocator,
-    widget: *const Widget,
-    constraints: Constraints,
-    backend: RenderBackend,
-) !RenderNode {
-    var scope: BuildScope = .{ .allocator = allocator };
-    var element = try buildElementTreeScoped(allocator, &scope, widget, constraints);
-    defer destroyElementTree(allocator, &element);
-    return buildRenderTreeFromElement(allocator, &element, constraints, backend);
-}
-
 pub fn buildRenderTreeFromElement(
     allocator: std.mem.Allocator,
-    element: *const Element,
+    element: *Element,
     constraints: Constraints,
     backend: RenderBackend,
-) !RenderNode {
+) !*RenderNode {
     return layoutElement(allocator, element, constraints, .{ .x = 0, .y = 0 }, .{ .backend = backend });
 }
 
@@ -1598,6 +1589,11 @@ fn buildLinearElementTree(
 }
 
 pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void {
+    if (element.render_node) |node| {
+        allocator.free(node.children);
+        allocator.destroy(node);
+        element.render_node = null;
+    }
     for (element.children) |*child| destroyElementTree(allocator, child);
     allocator.free(element.children);
     element.children = &.{};
@@ -1625,6 +1621,9 @@ pub fn updateElementTreeScoped(
     widget: *const Widget,
     constraints: Constraints,
 ) anyerror!void {
+    // Every element this update visits gets its widget replaced, so its
+    // cached layout can no longer be trusted.
+    markElementLayoutDirty(element);
     if (!canUpdateElement(element, widget)) {
         var replacement = try buildElementTreeScoped(allocator, scope, widget, constraints);
         errdefer destroyElementTree(allocator, &replacement);
@@ -1774,18 +1773,110 @@ pub fn rebuildDirtyElementTreeScoped(
             defer scope.actions = previous_actions;
             return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
-        .row, .column => return try rebuildDirtyChildren(allocator, scope, element.children, constraints),
+        .row, .column => {
+            const rebuilt = try rebuildDirtyChildren(allocator, scope, element.children, constraints);
+            if (rebuilt) markElementLayoutDirty(element);
+            return rebuilt;
+        },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
             if (stateful_widget.needsRebuild(state)) {
                 const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
                 try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
                 stateful_widget.clearRebuild(state);
+                markElementLayoutDirty(element);
                 return true;
             }
             return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
     }
+}
+
+/// Re-expands interaction-styled elements (buttons) whose id is in `ids`
+/// using the scope's current interaction state, so hover/press changes can
+/// restyle exactly the affected widgets instead of rebuilding the app.
+/// Ancestors of refreshed elements are marked for relayout.
+pub fn refreshInteractionElements(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    constraints: Constraints,
+    ids: []const []const u8,
+) anyerror!bool {
+    switch (element.widget) {
+        .text,
+        .spacer,
+        .text_input,
+        .render_object,
+        => return false,
+
+        .button => |button_widget| {
+            var matched = false;
+            for (ids) |id| {
+                if (std.mem.eql(u8, button_widget.id, id)) matched = true;
+            }
+            if (!matched) return false;
+            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, button_widget);
+            try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
+            markElementLayoutDirty(element);
+            return true;
+        },
+
+        .keyed,
+        .box,
+        .sized,
+        .clickable,
+        .focus,
+        .focus_scope,
+        .center,
+        .component,
+        .element,
+        .shortcuts,
+        .stateful,
+        => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
+
+        .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
+        .theme => |theme_widget| {
+            const previous_theme = scope.theme;
+            scope.theme = theme_widget.theme;
+            defer scope.theme = previous_theme;
+            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
+        },
+        .default_text_style => |default_text_style| {
+            const previous_style = scope.default_text_style;
+            scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
+            defer scope.default_text_style = previous_style;
+            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
+        },
+        .actions => |actions_widget| {
+            const previous_actions = scope.actions;
+            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = previous_actions };
+            scope.actions = &nested_actions;
+            defer scope.actions = previous_actions;
+            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
+        },
+        .row, .column => {
+            var refreshed = false;
+            for (element.children) |*child| {
+                if (try refreshInteractionElements(allocator, scope, child, constraints, ids)) refreshed = true;
+            }
+            if (refreshed) markElementLayoutDirty(element);
+            return refreshed;
+        },
+    }
+}
+
+fn refreshInteractionSingleChild(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    constraints: Constraints,
+    ids: []const []const u8,
+) !bool {
+    std.debug.assert(element.children.len == 1);
+    const refreshed = try refreshInteractionElements(allocator, scope, &element.children[0], constraints, ids);
+    if (refreshed) markElementLayoutDirty(element);
+    return refreshed;
 }
 
 fn rebuildDirtySingleChildElement(
@@ -1795,7 +1886,11 @@ fn rebuildDirtySingleChildElement(
     constraints: Constraints,
 ) !bool {
     std.debug.assert(element.children.len == 1);
-    return rebuildDirtyElementTreeScoped(allocator, scope, &element.children[0], constraints);
+    // A rebuilt descendant may change size, so every ancestor on the path
+    // must re-run layout even though its own widget is unchanged.
+    const rebuilt = try rebuildDirtyElementTreeScoped(allocator, scope, &element.children[0], constraints);
+    if (rebuilt) markElementLayoutDirty(element);
+    return rebuilt;
 }
 
 fn rebuildDirtyChildren(
@@ -2239,20 +2334,6 @@ fn keysEqual(a: Widget.Key, b: Widget.Key) bool {
     };
 }
 
-pub fn destroyRenderTree(allocator: std.mem.Allocator, node: *RenderNode) void {
-    for (node.children) |*child| {
-        destroyRenderTree(allocator, child);
-    }
-    allocator.free(node.children);
-    node.children = &.{};
-    if (node.text) |value| allocator.free(value);
-    if (node.clickable_id) |id| allocator.free(id);
-    if (node.text_input_id) |id| allocator.free(id);
-    if (node.focus_id) |id| allocator.free(id);
-    if (node.focus_scope_id) |id| allocator.free(id);
-    if (node.placeholder) |placeholder| allocator.free(placeholder);
-}
-
 pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
     return paintScaled(allocator, node, display_list, 1);
 }
@@ -2300,7 +2381,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         else => {},
     }
 
-    for (node.children) |*child| {
+    for (node.children) |child| {
         try paintScaled(allocator, child, display_list, scale);
     }
 }
@@ -2482,7 +2563,7 @@ fn appendFocusTargets(
         },
         else => {},
     }
-    for (node.children) |*child| {
+    for (node.children) |child| {
         try appendFocusTargets(allocator, targets, child, active_scope_id, active_modal_scope_id);
     }
 }
@@ -2517,7 +2598,7 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
         },
         else => {},
     }
-    for (node.children) |*child| {
+    for (node.children) |child| {
         if (findFocusTargetScoped(child, id, active_scope_id, active_modal_scope_id)) |target| return target;
     }
     return null;
@@ -2527,7 +2608,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
-        if (hitTestClick(&node.children[index], point)) |hit| return hit;
+        if (hitTestClick(node.children[index], point)) |hit| return hit;
     }
 
     if (node.kind == .clickable and node.rect.contains(point)) {
@@ -2562,7 +2643,7 @@ pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
             };
         }
     }
-    for (node.children) |*child| {
+    for (node.children) |child| {
         if (findClickHitById(child, id)) |hit| return hit;
     }
     return null;
@@ -2579,7 +2660,7 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
-        if (hitTestTextInput(&node.children[index], point)) |id| return id;
+        if (hitTestTextInput(node.children[index], point)) |id| return id;
     }
 
     if (node.kind == .text_input and node.rect.contains(point)) {
@@ -2719,149 +2800,239 @@ fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
     };
 }
 
-fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constraints: Constraints, origin: Point, measurer: TextMeasurer) LayoutError!RenderNode {
-    switch (element.widget) {
-        .keyed => |keyed_widget| {
-            _ = keyed_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
+fn ensureRenderNode(allocator: std.mem.Allocator, element: *Element) !*RenderNode {
+    if (element.render_node) |node| return node;
+    const node = try allocator.create(RenderNode);
+    node.* = .{ .kind = .spacer, .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 } };
+    element.render_node = node;
+    return node;
+}
 
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .keyed,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
+/// Replaces the node payload in place, preserving node identity and its
+/// child slice. Payload strings are borrowed from the element's widget,
+/// which owns them and strictly outlives the node.
+fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
+    std.debug.assert(value.children.len == 0);
+    const children = node.children;
+    const constraints = node.constraints;
+    // Non-painting wrappers only damage when their bounds change (covering
+    // vacated regions); painted nodes always damage since their payload may
+    // have changed. Ancestors on a dirty path re-commit with identical
+    // geometry and must not inflate the damage to their full bounds.
+    const rect_changed = !std.meta.eql(node.rect, value.rect);
+    const paints = switch (value.kind) {
+        .box, .text, .text_input, .render_object => true,
+        else => false,
+    };
+    var damage = node.damage;
+    if (rect_changed or paints) {
+        damage = unionDamage(unionDamage(damage, node.rect), value.rect);
+    }
+    node.* = value;
+    node.children = children;
+    node.constraints = constraints;
+    node.damage = damage;
+    node.needs_layout = false;
+}
+
+fn unionDamage(damage: ?Rect, rect: Rect) ?Rect {
+    if (rect.isEmpty()) return damage;
+    const existing = damage orelse return rect;
+    const x0 = @min(existing.x, rect.x);
+    const y0 = @min(existing.y, rect.y);
+    const x1 = @max(existing.x + existing.width, rect.x + rect.width);
+    const y1 = @max(existing.y + existing.height, rect.y + rect.height);
+    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
+/// Collects and clears the damage accumulated across the tree since the
+/// last collection. Null means nothing changed.
+pub fn collectDamage(node: *RenderNode) ?Rect {
+    var damage = node.damage;
+    node.damage = null;
+    for (node.children) |child| {
+        if (collectDamage(child)) |child_damage| {
+            damage = unionDamage(damage, child_damage);
+        }
+    }
+    return damage;
+}
+
+fn ensureChildSlice(allocator: std.mem.Allocator, node: *RenderNode, count: usize) ![]*RenderNode {
+    if (node.children.len != count) {
+        allocator.free(node.children);
+        node.children = &.{};
+        node.children = try allocator.alloc(*RenderNode, count);
+    }
+    return node.children;
+}
+
+fn moveNode(node: *RenderNode, x: f32, y: f32) void {
+    if (node.rect.x == x and node.rect.y == y) return;
+    const dx = x - node.rect.x;
+    const dy = y - node.rect.y;
+    node.damage = unionDamage(node.damage, node.rect);
+    node.rect.x = x;
+    node.rect.y = y;
+    node.damage = unionDamage(node.damage, node.rect);
+    translateChildren(node, dx, dy);
+}
+
+/// Lays out an element subtree into its retained render node, mutating
+/// geometry in place. Nodes are created lazily and live as long as their
+/// element; repeated layouts reuse them.
+///
+/// A clean subtree re-laid out with identical constraints is skipped
+/// entirely: its cached geometry is still valid, so at most it is
+/// translated to a new origin.
+fn layoutElement(allocator: std.mem.Allocator, element: *Element, constraints: Constraints, origin: Point, measurer: TextMeasurer) LayoutError!*RenderNode {
+    const node = try ensureRenderNode(allocator, element);
+    if (!node.needs_layout and std.meta.eql(node.constraints, constraints)) {
+        if (node.rect.x != origin.x or node.rect.y != origin.y) moveNode(node, origin.x, origin.y);
+        return node;
+    }
+    try layoutElementInto(allocator, element, node, constraints, origin, measurer);
+    node.constraints = constraints;
+    return node;
+}
+
+/// Marks the element's retained render node for relayout. Called wherever
+/// an element's widget (or a descendant's) may have changed.
+fn markElementLayoutDirty(element: *Element) void {
+    if (element.render_node) |node| node.needs_layout = true;
+}
+
+fn layoutWrapper(
+    allocator: std.mem.Allocator,
+    element: *Element,
+    node: *RenderNode,
+    comptime kind: RenderNode.Kind,
+    constraints: Constraints,
+    origin: Point,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+    const children = try ensureChildSlice(allocator, node, 1);
+    children[0] = child;
+    commitRenderNode(node, .{
+        .kind = kind,
+        .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+    });
+}
+
+fn layoutElementInto(
+    allocator: std.mem.Allocator,
+    element: *Element,
+    node: *RenderNode,
+    constraints: Constraints,
+    origin: Point,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    switch (element.widget) {
+        .keyed => try layoutWrapper(allocator, element, node, .keyed, constraints, origin, measurer),
+        .button => try layoutWrapper(allocator, element, node, .button, constraints, origin, measurer),
+        .actions => try layoutWrapper(allocator, element, node, .actions, constraints, origin, measurer),
+        .shortcuts => try layoutWrapper(allocator, element, node, .shortcuts, constraints, origin, measurer),
+        .theme => try layoutWrapper(allocator, element, node, .theme, constraints, origin, measurer),
+        .default_text_style => try layoutWrapper(allocator, element, node, .default_text_style, constraints, origin, measurer),
+        .component => try layoutWrapper(allocator, element, node, .component, constraints, origin, measurer),
+        .stateful => try layoutWrapper(allocator, element, node, .stateful, constraints, origin, measurer),
+        .element => try layoutWrapper(allocator, element, node, .element, constraints, origin, measurer),
         .text => |text_widget| {
             const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
             const measured = try measurer.measureText(text_widget.value, style);
             const size_value = constraints.clamp(measured);
-            return .{
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
                 .kind = .text,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .text = try allocator.dupe(u8, text_widget.value),
+                .text = text_widget.value,
                 .text_style = style,
                 .foreground = style.color,
-            };
+            });
         },
-        .spacer => return .{
-            .kind = .spacer,
-            .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
+        .spacer => {
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
+                .kind = .spacer,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
+            });
         },
         .sized => |sized_widget| {
             const child_constraints = constrainSized(constraints, sized_widget);
-            var child = try layoutElement(allocator, &element.children[0], child_constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
+            const child = try layoutElement(allocator, &element.children[0], child_constraints, origin, measurer);
             const width = @min(constraints.max_width, @max(sized_widget.min_width, sized_widget.width orelse child.rect.width));
             const height = @min(constraints.max_height, @max(sized_widget.min_height, sized_widget.height orelse child.rect.height));
-            const dx = origin.x - child.rect.x;
-            const dy = origin.y - child.rect.y;
-            child.rect.x = origin.x;
-            child.rect.y = origin.y;
-            translateChildren(&child, dx, dy);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            moveNode(child, origin.x, origin.y);
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .sized,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
-                .children = children,
-            };
+            });
         },
         .box => |box_widget| {
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const width = @min(constraints.max_width, @max(box_widget.min_width, child.rect.width));
             const height = @min(constraints.max_height, @max(box_widget.min_height, child.rect.height));
-            const child_x = origin.x + alignedOffset(box_widget.horizontal_align, width, child.rect.width);
-            const child_y = origin.y + alignedOffset(box_widget.vertical_align, height, child.rect.height);
-            const dx = child_x - child.rect.x;
-            const dy = child_y - child.rect.y;
-            child.rect.x = child_x;
-            child.rect.y = child_y;
-            translateChildren(&child, dx, dy);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            moveNode(
+                child,
+                origin.x + alignedOffset(box_widget.horizontal_align, width, child.rect.width),
+                origin.y + alignedOffset(box_widget.vertical_align, height, child.rect.height),
+            );
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .box,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
                 .background = box_widget.background,
                 .box_border = box_widget.border,
                 .box_border_width = box_widget.border_width,
                 .box_radius = box_widget.radius,
-                .children = children,
-            };
+            });
         },
         .clickable => |clickable_widget| {
-            const id = try allocator.dupe(u8, clickable_widget.id);
-            errdefer allocator.free(id);
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .clickable,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .clickable_id = id,
+                .clickable_id = clickable_widget.id,
                 .click_callback = clickable_widget.on_click,
                 .tap_down_callback = clickable_widget.on_tap_down,
                 .tap_up_callback = clickable_widget.on_tap_up,
                 .tap_cancel_callback = clickable_widget.on_tap_cancel,
                 .click_activation = clickable_widget.activation,
-                .children = children,
-            };
+            });
         },
         .focus => |focus_widget| {
-            const focus_id = try allocator.dupe(u8, focus_widget.node.id);
-            errdefer allocator.free(focus_id);
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .focus,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .focus_id = focus_id,
+                .focus_id = focus_widget.node.id,
                 .focused = element.focused,
                 .autofocus = focus_widget.autofocus,
                 .skip_traversal = focus_widget.skip_traversal,
                 .can_request_focus = focus_widget.can_request_focus,
                 .focus_change_callback = focus_widget.on_focus_change,
-                .children = children,
-            };
+            });
         },
         .focus_scope => |focus_scope_widget| {
-            const scope_id = try allocator.dupe(u8, focus_scope_widget.id);
-            errdefer allocator.free(scope_id);
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .focus_scope,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .focus_scope_id = scope_id,
+                .focus_scope_id = focus_scope_widget.id,
                 .modal_focus_scope = focus_scope_widget.modal,
-                .children = children,
-            };
+            });
         },
         .text_input => |input_widget| {
-            const value = try allocator.dupe(u8, input_widget.value);
-            errdefer allocator.free(value);
-            const id = try allocator.dupe(u8, input_widget.id);
-            errdefer allocator.free(id);
-            const focus_id = try allocator.dupe(u8, input_widget.focus_node.id);
-            errdefer allocator.free(focus_id);
-            const placeholder = try allocator.dupe(u8, input_widget.placeholder);
-            errdefer allocator.free(placeholder);
             const text_value = if (input_widget.value.len > 0) input_widget.value else input_widget.placeholder;
             const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
             const measured = try measurer.measureText(text_value, style);
@@ -2871,33 +3042,32 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                 .height = measured.height + input_vertical_padding * 2,
             };
             const size_value = constraints.clamp(requested);
-            return .{
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
                 .kind = .text_input,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .text = value,
-                .text_input_id = id,
-                .focus_id = focus_id,
+                .text = input_widget.value,
+                .text_input_id = input_widget.id,
+                .focus_id = input_widget.focus_node.id,
                 .text_style = style,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
-                .placeholder = placeholder,
+                .placeholder = input_widget.placeholder,
                 .border = input_widget.border,
                 .focused_border = input_widget.focused_border,
                 .placeholder_foreground = input_widget.placeholder_foreground,
                 .focused = element.focused,
                 .caret_x = origin.x + input_horizontal_padding + value_size.width,
-            };
+            });
         },
         .padding => |padding_widget| {
-            var child = try layoutElement(allocator, &element.children[0], constraints.inset(padding_widget.insets), .{
+            const child = try layoutElement(allocator, &element.children[0], constraints.inset(padding_widget.insets), .{
                 .x = origin.x + padding_widget.insets.left,
                 .y = origin.y + padding_widget.insets.top,
             }, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .padding,
                 .rect = .{
                     .x = origin.x,
@@ -2905,164 +3075,51 @@ fn layoutElement(allocator: std.mem.Allocator, element: *const Element, constrai
                     .width = @min(child.rect.width + padding_widget.insets.horizontal(), constraints.max_width),
                     .height = @min(child.rect.height + padding_widget.insets.vertical(), constraints.max_height),
                 },
-                .children = children,
-            };
+            });
         },
-        .center => |center_widget| {
-            _ = center_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            child.rect.x = origin.x + @max(0, constraints.max_width - child.rect.width) / 2;
-            child.rect.y = origin.y + @max(0, constraints.max_height - child.rect.height) / 2;
-            translateChildren(&child, child.rect.x - origin.x, child.rect.y - origin.y);
-
-            const children = try allocator.alloc(RenderNode, 1);
+        .center => {
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            moveNode(
+                child,
+                origin.x + @max(0, constraints.max_width - child.rect.width) / 2,
+                origin.y + @max(0, constraints.max_height - child.rect.height) / 2,
+            );
+            const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
-            return .{
+            commitRenderNode(node, .{
                 .kind = .center,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = constraints.max_width, .height = constraints.max_height },
-                .children = children,
-            };
+            });
         },
-        .button => |button_widget| {
-            _ = button_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .button,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .actions => |actions_widget| {
-            _ = actions_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .actions,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .shortcuts => |shortcuts_widget| {
-            _ = shortcuts_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .shortcuts,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .theme => |theme_widget| {
-            _ = theme_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .theme,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .default_text_style => |default_text_style| {
-            _ = default_text_style;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .default_text_style,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .column => |column_widget| return layoutLinearElements(allocator, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
-        .row => |row_widget| return layoutLinearElements(allocator, .row, element.children, row_widget.gap, row_widget.cross_align, constraints, origin, measurer),
-        .component => |component_widget| {
-            _ = component_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .component,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .stateful => |stateful_widget| {
-            _ = stateful_widget;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .stateful,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
-        .element => |custom_element| {
-            _ = custom_element;
-            var child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            errdefer destroyRenderTree(allocator, &child);
-
-            const children = try allocator.alloc(RenderNode, 1);
-            children[0] = child;
-            return .{
-                .kind = .element,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
-                .children = children,
-            };
-        },
+        .column => |column_widget| try layoutLinearElements(allocator, node, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
+        .row => |row_widget| try layoutLinearElements(allocator, node, .row, element.children, row_widget.gap, row_widget.cross_align, constraints, origin, measurer),
         .render_object => |render_widget| {
             const measured = try render_widget.layout(.{ .constraints = constraints, .measurer = measurer });
             const size_value = constraints.clamp(measured);
-            return .{
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
                 .kind = .render_object,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .render_object = render_widget,
-            };
+            });
         },
     }
 }
 
 fn layoutLinearElements(
     allocator: std.mem.Allocator,
+    node: *RenderNode,
     comptime kind: RenderNode.Kind,
-    elements: []const Element,
+    elements: []Element,
     gap: f32,
     cross_align: Widget.CrossAxisAlignment,
     constraints: Constraints,
     origin: Point,
     measurer: TextMeasurer,
-) LayoutError!RenderNode {
+) LayoutError!void {
     std.debug.assert(kind == .row or kind == .column);
 
-    const children = try allocator.alloc(RenderNode, elements.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (children[0..initialized]) |*child| {
-            destroyRenderTree(allocator, child);
-        }
-        allocator.free(children);
-    }
+    const children = try ensureChildSlice(allocator, node, elements.len);
 
     const total_gap = if (elements.len > 0) gap * @as(f32, @floatFromInt(elements.len - 1)) else 0;
     var fixed_main: f32 = 0;
@@ -3072,17 +3129,24 @@ fn layoutLinearElements(
     for (elements, 0..) |*child_element, index| {
         if (child_element.widget == .spacer) {
             total_flex += child_element.widget.spacer.flex;
-            children[index] = .{
+            const spacer_node = try ensureRenderNode(allocator, child_element);
+            commitRenderNode(spacer_node, .{
                 .kind = .spacer,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
-            };
-            initialized += 1;
+            });
+            spacer_node.constraints = constraints;
+            children[index] = spacer_node;
             continue;
         }
 
-        const remaining = constraints;
-        children[index] = try layoutElement(allocator, child_element, remaining, origin, measurer);
-        initialized += 1;
+        // Tentatively lay the child at its previous position; the second
+        // pass moves it to its final slot. This keeps unchanged children in
+        // place instead of thrashing their damage via parent-origin moves.
+        const tentative_origin: Point = if (child_element.render_node) |existing|
+            .{ .x = existing.rect.x, .y = existing.rect.y }
+        else
+            origin;
+        children[index] = try layoutElement(allocator, child_element, constraints, tentative_origin, measurer);
 
         switch (kind) {
             .row => {
@@ -3106,15 +3170,16 @@ fn layoutLinearElements(
     var cursor = origin;
     var main: f32 = 0;
     for (elements, 0..) |*child_element, index| {
+        const child = children[index];
         if (child_element.widget == .spacer and total_flex > 0) {
             const spacer_main = spare * child_element.widget.spacer.flex / total_flex;
-            children[index].rect = switch (kind) {
+            child.rect = switch (kind) {
                 .row => .{ .x = cursor.x, .y = origin.y, .width = spacer_main, .height = cross },
                 .column => .{ .x = origin.x, .y = cursor.y, .width = cross, .height = spacer_main },
                 else => unreachable,
             };
         } else {
-            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, children[index]);
+            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, child);
             const new_x = switch (kind) {
                 .row => cursor.x,
                 .column => origin.x + aligned_cross,
@@ -3125,26 +3190,22 @@ fn layoutLinearElements(
                 .column => cursor.y,
                 else => unreachable,
             };
-            const dx = new_x - children[index].rect.x;
-            const dy = new_y - children[index].rect.y;
-            children[index].rect.x = new_x;
-            children[index].rect.y = new_y;
+            moveNode(child, new_x, new_y);
             if (cross_align == .stretch) switch (kind) {
-                .row => children[index].rect.height = cross,
-                .column => children[index].rect.width = cross,
+                .row => child.rect.height = cross,
+                .column => child.rect.width = cross,
                 else => unreachable,
             };
-            translateChildren(&children[index], dx, dy);
         }
 
         switch (kind) {
             .row => {
-                cursor.x += children[index].rect.width + gap;
-                main += children[index].rect.width;
+                cursor.x += child.rect.width + gap;
+                main += child.rect.width;
             },
             .column => {
-                cursor.y += children[index].rect.height + gap;
-                main += children[index].rect.height;
+                cursor.y += child.rect.height + gap;
+                main += child.rect.height;
             },
             else => unreachable,
         }
@@ -3156,15 +3217,10 @@ fn layoutLinearElements(
         .column => constraints.clamp(.{ .width = cross, .height = main }),
         else => unreachable,
     };
-    return .{
+    commitRenderNode(node, .{
         .kind = kind,
-        .rect = switch (kind) {
-            .row => .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-            .column => .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-            else => unreachable,
-        },
-        .children = children,
-    };
+        .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
+    });
 }
 
 fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constraints {
@@ -3176,7 +3232,7 @@ fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constraints {
     };
 }
 
-fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: RenderNode) f32 {
+fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: *const RenderNode) f32 {
     const child_cross = switch (kind) {
         .row => child.rect.height,
         .column => child.rect.width,
@@ -3202,7 +3258,7 @@ fn fixedMeasureText(value: []const u8, style: ResolvedTextStyle) Size {
 }
 
 fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
-    for (node.children) |*child| {
+    for (node.children) |child| {
         child.rect.x += dx;
         child.rect.y += dy;
         translateChildren(child, dx, dy);
@@ -3286,12 +3342,11 @@ test "text input paint clips its content" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 60, .max_height = 40 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 60, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 60, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, &root, &display_list, 1);
+    try paintScaled(retained_allocator, root, &display_list, 1);
 
     var clip_active = false;
     var text_clipped = false;
@@ -3324,8 +3379,12 @@ test "layout, paint, and hit test a padded column" {
     const column: Widget = .{ .column = .{ .children = &children, .gap = 4 } };
     const padded: Widget = .{ .padding = .{ .insets = EdgeInsets.all(10), .child = &column } };
 
-    var root = try buildRenderTree(allocator, &padded, .{ .max_width = 200, .max_height = 120 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &padded, .{ .max_width = 200, .max_height = 120 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .padding), root.kind);
     try std.testing.expectEqual(@as(f32, 60), root.rect.width);
@@ -3333,11 +3392,11 @@ test "layout, paint, and hit test a padded column" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paint(allocator, &root, &display_list);
+    try paint(allocator, root, &display_list);
 
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
-    try std.testing.expectEqualStrings("ok", hitTestButton(&root, .{ .x = 25, .y = 35 }).?);
-    try std.testing.expect(hitTestButton(&root, .{ .x = 2, .y = 2 }) == null);
+    try std.testing.expectEqualStrings("ok", hitTestButton(root, .{ .x = 25, .y = 35 }).?);
+    try std.testing.expect(hitTestButton(root, .{ .x = 2, .y = 2 }) == null);
 }
 
 test "button widget composes styled clickable content" {
@@ -3349,8 +3408,7 @@ test "button widget composes styled clickable content" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator(), .interaction = .{ .pressed_id = "confirm" } };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &button_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .button), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.children[0].kind);
@@ -3372,8 +3430,12 @@ test "row spacer takes remaining main-axis space" {
     const row = try widgets.row(allocator, &children, 0);
     defer allocator.free(row.row.children);
 
-    var root = try buildRenderTree(allocator, &row, .{ .max_width = 100, .max_height = 20 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .row), root.kind);
     try std.testing.expectEqual(@as(f32, 100), root.rect.width);
@@ -3390,8 +3452,12 @@ test "row centers children on the cross axis" {
     const children = [_]Widget{ short, tall };
     const row: Widget = .{ .row = .{ .children = &children, .gap = 0, .cross_align = .center } };
 
-    var root = try buildRenderTree(allocator, &row, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
@@ -3407,8 +3473,12 @@ test "text role resolves themed font size for layout and paint" {
         .child = &label,
     } };
 
-    var root = try buildRenderTree(allocator, &themed, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &themed, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const text_node = root.children[0];
     try std.testing.expectEqual(@as(f32, 22), text_node.rect.height);
@@ -3417,7 +3487,7 @@ test "text role resolves themed font size for layout and paint" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paint(allocator, &root, &display_list);
+    try paint(allocator, root, &display_list);
 
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
     try std.testing.expect(display_list.commands.items[0] == .text);
@@ -3432,8 +3502,12 @@ test "default text style overrides descendant text defaults" {
     const inherited = try widgets.defaultTextStyle(allocator, .{ .color = test_red, .font_size = 18 }, label);
     defer allocator.destroy(inherited.default_text_style.child);
 
-    var root = try buildRenderTree(allocator, &inherited, .{ .max_width = 200, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &inherited, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .default_text_style), root.kind);
     try std.testing.expectEqual(test_red, root.children[0].text_style.color);
@@ -3463,12 +3537,16 @@ test "rounded box paints alpha images for fill and border" {
     const child = widgets.text("A");
     const box: Widget = .{ .box = .{ .child = &child, .background = colors.panel, .border = colors.accent, .border_width = 2, .radius = 5 } };
 
-    var root = try buildRenderTree(allocator, &box, .{ .max_width = 100, .max_height = 40 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &box, .{ .max_width = 100, .max_height = 40 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paintScaled(allocator, &root, &display_list, 1.5);
+    try paintScaled(allocator, root, &display_list, 1.5);
 
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
     try std.testing.expect(display_list.commands.items[0] == .alpha_image);
@@ -3488,8 +3566,12 @@ test "box aligns child inside its minimum size" {
         .vertical_align = .center,
     } };
 
-    var root = try buildRenderTree(allocator, &box, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &box, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 40), root.rect.width);
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
@@ -3522,8 +3604,7 @@ test "theme widget provides ambient button styling" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(@as(RenderNode.Kind, .theme), root.kind);
@@ -3556,8 +3637,7 @@ test "button uses ambient hover styling" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const box_node = root.children[0].children[0].children[0];
     const text_node = box_node.children[0].children[0];
@@ -3585,8 +3665,7 @@ test "button uses ambient pressed styling" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(colors.ink, box_node.background);
@@ -3612,8 +3691,7 @@ test "button uses ambient focused border" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(colors.black, box_node.box_border.?);
@@ -3636,15 +3714,14 @@ test "button without action is disabled and skipped by focus traversal" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const box_node = root.children[0].children[0];
     try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
     try std.testing.expectEqual(colors.panel, box_node.background);
     try std.testing.expectEqual(colors.ink, box_node.children[0].children[0].foreground);
 
-    const targets = try collectFocusTargets(retained_allocator, &root);
+    const targets = try collectFocusTargets(retained_allocator, root);
     defer retained_allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 0), targets.len);
 }
@@ -3671,10 +3748,9 @@ test "action button resolves nearest ambient action" {
 
     var element = try buildElementTreeScoped(retained_allocator, &scope, &actions_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
     try hit.callback.?.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
@@ -3693,8 +3769,7 @@ test "theme widget provides ambient text and input styling" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 120 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const text_node = root.children[0].children[0];
     const input_node = root.children[0].children[1];
@@ -3716,12 +3791,11 @@ test "text input derives focus from ambient focus node" {
     };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expect(root.focused);
     try std.testing.expectEqualStrings("field-focus", root.focus_id.?);
-    try std.testing.expectEqualStrings("field-focus", hitTestTextInput(&root, .{ .x = 1, .y = 1 }).?);
+    try std.testing.expectEqualStrings("field-focus", hitTestTextInput(root, .{ .x = 1, .y = 1 }).?);
 }
 
 test "focus targets are collected in render tree order" {
@@ -3737,17 +3811,16 @@ test "focus targets are collected in render tree order" {
     var scope: BuildScope = .{ .allocator = build_allocator };
     var element = try buildElementTreeScoped(allocator, &scope, &column, .{ .max_width = 200, .max_height = 120 });
     defer destroyElementTree(allocator, &element);
-    var root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(allocator, &root);
+    const root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const targets = try collectFocusTargets(allocator, &root);
+    const targets = try collectFocusTargets(allocator, root);
     defer allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 2), targets.len);
     try std.testing.expectEqualStrings("input", targets[0].id);
     try std.testing.expectEqual(FocusTarget.Kind.text_input, targets[0].kind);
     try std.testing.expectEqualStrings("button", targets[1].id);
     try std.testing.expectEqual(FocusTarget.Kind.clickable, targets[1].kind);
-    try std.testing.expectEqual(FocusTarget.Kind.clickable, findFocusTarget(&root, "button").?.kind);
+    try std.testing.expectEqual(FocusTarget.Kind.clickable, findFocusTarget(root, "button").?.kind);
 }
 
 test "focus widget makes arbitrary subtree focusable" {
@@ -3758,15 +3831,19 @@ test "focus widget makes arbitrary subtree focusable" {
     const label = widgets.text("Focusable text");
     const focus = try widgets.focus(build_arena.allocator(), .named("label-focus"), label);
 
-    var root = try buildRenderTree(allocator, &focus, .{ .max_width = 200, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &focus, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const targets = try collectFocusTargets(allocator, &root);
+    const targets = try collectFocusTargets(allocator, root);
     defer allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 1), targets.len);
     try std.testing.expectEqualStrings("label-focus", targets[0].id);
     try std.testing.expectEqual(FocusTarget.Kind.focus, targets[0].kind);
-    try std.testing.expectEqual(FocusTarget.Kind.focus, findFocusTarget(&root, "label-focus").?.kind);
+    try std.testing.expectEqual(FocusTarget.Kind.focus, findFocusTarget(root, "label-focus").?.kind);
 }
 
 test "center moves descendants" {
@@ -3776,12 +3853,16 @@ test "center moves descendants" {
     const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label, .on_click = testCallback() } };
     const center: Widget = .{ .center = .{ .child = &button } };
 
-    var root = try buildRenderTree(allocator, &center, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &center, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 38), root.children[0].rect.x);
     try std.testing.expectEqual(@as(f32, 32), root.children[0].rect.y);
-    try std.testing.expectEqualStrings("centered", hitTestButton(&root, .{ .x = 40, .y = 35 }).?);
+    try std.testing.expectEqualStrings("centered", hitTestButton(root, .{ .x = 40, .y = 35 }).?);
 }
 
 test "clickable carries opaque callback handles through hit testing" {
@@ -3802,10 +3883,14 @@ test "clickable carries opaque callback handles through hit testing" {
         .on_click = .{ .ptr = &counter, .call_fn = Counter.increment },
     } };
 
-    var root = try buildRenderTree(std.testing.allocator, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
     try std.testing.expectEqualStrings("counter", hit.id);
     try hit.callback.?.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
@@ -3820,10 +3905,14 @@ test "clickable hit testing carries activation mode" {
         .activation = .press,
     } };
 
-    var root = try buildRenderTree(std.testing.allocator, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
     try std.testing.expectEqual(Widget.ClickActivation.press, hit.activation);
 }
 
@@ -3837,10 +3926,14 @@ test "clickable hit testing carries gesture callbacks" {
         .on_tap_cancel = testCallback(),
     } };
 
-    var root = try buildRenderTree(std.testing.allocator, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
     try std.testing.expect(hit.tap_down != null);
     try std.testing.expect(hit.tap_up != null);
     try std.testing.expect(hit.tap_cancel != null);
@@ -3850,11 +3943,15 @@ test "clickable without callback is inert" {
     const label: Widget = .{ .text = .{ .value = "Inert" } };
     const clickable: Widget = .{ .clickable = .{ .id = "inert", .child = &label } };
 
-    var root = try buildRenderTree(std.testing.allocator, &clickable, .{ .max_width = 100, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &clickable, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(&root, .{ .x = 2, .y = 2 }));
-    const targets = try collectFocusTargets(std.testing.allocator, &root);
+    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 2, .y = 2 }));
+    const targets = try collectFocusTargets(std.testing.allocator, root);
     defer std.testing.allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 0), targets.len);
 }
@@ -3917,11 +4014,10 @@ test "button and shortcut can share an intent" {
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(allocator, &scope, &root_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(allocator, &element);
-    var root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(allocator, &root);
+    const root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try findShortcutAction(&element, .enter).?.call();
-    const hit = hitTestClick(&root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
     try hit.callback.?.call();
     try std.testing.expectEqual(@as(usize, 2), counter.value);
 }
@@ -4000,8 +4096,12 @@ test "component widget builds into the render tree" {
     const component: LabelComponent = .{ .value = "Component" };
     const widget = component.widget();
 
-    var root = try buildRenderTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
@@ -4195,14 +4295,13 @@ test "element tree retains cloned render objects beyond build scope" {
     try std.testing.expectEqual(@as(usize, 0), destroys);
 
     try std.testing.expect(build_arena.reset(.free_all));
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(@as(RenderNode.Kind, .render_object), root.kind);
     try std.testing.expectEqual(@as(f32, 24), root.rect.width);
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paint(retained_allocator, &root, &display_list);
+    try paint(retained_allocator, root, &display_list);
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
 
     destroyElementTree(retained_allocator, &element);
@@ -4399,8 +4498,7 @@ test "component build products are retained outside the build arena" {
     try std.testing.expect(build_arena.reset(.free_all));
     try std.testing.expectEqualStrings("component 42", element.children[0].widget.text.value);
 
-    var root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(retained_allocator, &root);
+    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
     try std.testing.expectEqualStrings("component 42", root.children[0].text.?);
@@ -4483,6 +4581,121 @@ test "stateful widget creates state once across matching updates" {
     try std.testing.expectEqual(@as(usize, 1), updated);
     try std.testing.expectEqual(@as(usize, 0), destroyed);
     try std.testing.expectEqualStrings("second", element.children[0].widget.text.value);
+}
+
+test "clean subtrees skip layout and dirty stateful subtrees relayout" {
+    const CountingBackend = struct {
+        measures: usize = 0,
+
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scaleFn } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(ptr: *anyopaque, value: []const u8, style: ResolvedTextStyle) !Size {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.measures += 1;
+            return fixedMeasureText(value, style);
+        }
+
+        fn scaleFn(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    const ToggleStateful = struct {
+        const State = struct {
+            dirty: bool = false,
+            label: []const u8 = "one",
+        };
+
+        const vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = build,
+            .destroy_state = destroyState,
+            .needs_rebuild = needsRebuild,
+            .clear_rebuild = clearRebuild,
+        };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .stateful = .{ .ptr = self, .vtable = &vtable } };
+        }
+
+        fn createState(_: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+            const state = try allocator.create(State);
+            state.* = .{};
+            return state;
+        }
+
+        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
+
+        fn build(_: *const anyopaque, state_ptr: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            const state: *State = @ptrCast(@alignCast(state_ptr));
+            return .{ .text = .{ .value = state.label } };
+        }
+
+        fn destroyState(_: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            allocator.destroy(@as(*State, @ptrCast(@alignCast(state_ptr))));
+        }
+
+        fn needsRebuild(_: *const anyopaque, state_ptr: *anyopaque) bool {
+            return @as(*State, @ptrCast(@alignCast(state_ptr))).dirty;
+        }
+
+        fn clearRebuild(_: *const anyopaque, state_ptr: *anyopaque) void {
+            @as(*State, @ptrCast(@alignCast(state_ptr))).dirty = false;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+
+    var backend_state: CountingBackend = .{};
+    const measurer: TextMeasurer = .{ .backend = backend_state.backend() };
+
+    const stateful: ToggleStateful = .{};
+    const children = [_]Widget{ .{ .text = .{ .value = "static" } }, stateful.widget() };
+    const column: Widget = .{ .column = .{ .children = &children } };
+    const constraints: Constraints = .{ .max_width = 200, .max_height = 120 };
+
+    var scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var element = try buildElementTreeScoped(allocator, &scope, &column, constraints);
+    defer destroyElementTree(allocator, &element);
+
+    const root = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
+    const initial_measures = backend_state.measures;
+    try std.testing.expectEqual(@as(usize, 2), initial_measures);
+    try std.testing.expect(collectDamage(root) != null);
+
+    // A clean tree re-laid out with identical constraints skips entirely
+    // and accumulates no damage.
+    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
+    try std.testing.expectEqual(initial_measures, backend_state.measures);
+    try std.testing.expectEqual(@as(?Rect, null), collectDamage(root));
+
+    // Dirtying the stateful subtree relayouts it, but the clean sibling
+    // text is never re-measured.
+    const state: *ToggleStateful.State = @ptrCast(@alignCast(element.children[1].state.?));
+    state.dirty = true;
+    state.label = "two";
+    _ = built_arena.reset(.retain_capacity);
+    var rebuild_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(allocator, &rebuild_scope, &element, constraints));
+
+    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
+    try std.testing.expectEqual(initial_measures + 1, backend_state.measures);
+    try std.testing.expectEqualStrings("two", root.children[1].children[0].text.?);
+
+    // Damage covers the relaid stateful subtree, not the clean sibling
+    // above it.
+    const damage = collectDamage(root).?;
+    const sibling = root.children[0];
+    try std.testing.expect(damage.y >= sibling.rect.y + sibling.rect.height);
 }
 
 test "stateful widget destroys state on element destruction and replacement" {
@@ -4580,8 +4793,7 @@ test "custom element widget builds an element subtree" {
     try std.testing.expectEqual(@as(Element.Kind, .element), element.kind);
     try std.testing.expectEqual(@as(Element.Kind, .text), element.children[0].kind);
 
-    var root = try layoutElement(std.testing.allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    defer destroyRenderTree(std.testing.allocator, &root);
+    const root = try layoutElement(std.testing.allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .element), root.kind);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
@@ -4695,8 +4907,12 @@ test "render object widget owns custom layout paint and hit testing" {
     const badge: BadgeRenderObject = .{ .id = "badge" };
     const widget = badge.widget();
 
-    var root = try buildRenderTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyRenderTree(std.testing.allocator, &root);
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .render_object), root.kind);
     try std.testing.expectEqual(@as(f32, 48), root.rect.width);
@@ -4704,9 +4920,9 @@ test "render object widget owns custom layout paint and hit testing" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(std.testing.allocator);
-    try paint(std.testing.allocator, &root, &display_list);
+    try paint(std.testing.allocator, root, &display_list);
 
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
-    try std.testing.expectEqualStrings("badge", hitTestButton(&root, .{ .x = 8, .y = 8 }).?);
-    try std.testing.expect(hitTestButton(&root, .{ .x = 80, .y = 8 }) == null);
+    try std.testing.expectEqualStrings("badge", hitTestButton(root, .{ .x = 8, .y = 8 }).?);
+    try std.testing.expect(hitTestButton(root, .{ .x = 80, .y = 8 }) == null);
 }

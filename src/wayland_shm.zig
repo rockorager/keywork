@@ -33,6 +33,9 @@ pub const Backend = struct {
     fractional_scale: ?*wp.FractionalScaleV1,
     shell_role: ShellRole,
     buffers: std.ArrayList(*Buffer),
+    /// The buffer holding the most recently rendered frame; the source for
+    /// partial redraws when the compositor hands us a different buffer.
+    last_rendered: ?*Buffer = null,
     text_renderer: TextRenderer,
     configured: bool,
     closed: bool,
@@ -290,11 +293,21 @@ pub const Backend = struct {
         const width = try scaledFrameDimension(logical_width, self.scale);
         const height = try scaledFrameDimension(logical_height, self.scale);
         const buffer = try self.acquireBuffer(width, height);
-        try rasterize(&self.text_renderer, buffer.pixels(), width, height, self.scale, frame.display_list);
+        const damage_clip = self.partialDamageClip(frame, buffer, width, height);
+        try rasterize(&self.text_renderer, buffer.pixels(), width, height, self.scale, frame.display_list, damage_clip);
+        self.last_rendered = buffer;
 
         try self.armFrameCallback();
         self.surface.attach(buffer.wl_buffer, 0, 0);
-        self.surface.damageBuffer(0, 0, width, height);
+        if (damage_clip) |clip| {
+            const x0: i32 = @max(0, clip.x0);
+            const y0: i32 = @max(0, clip.y0);
+            const x1: i32 = @min(@as(i32, width), clip.x1);
+            const y1: i32 = @min(@as(i32, height), clip.y1);
+            self.surface.damageBuffer(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
+        } else {
+            self.surface.damageBuffer(0, 0, width, height);
+        }
         self.surface.setBufferScale(1);
         if (self.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
         self.surface.commit();
@@ -343,6 +356,22 @@ pub const Backend = struct {
         if (self.frame_handler) |handler| handler(self.frame_context.?);
     }
 
+    /// Returns the pixel region that must be re-rasterized, or null when a
+    /// full redraw is required. Partial redraw needs the previous frame's
+    /// content: either the acquired buffer already holds it, or it is
+    /// copied over from the buffer that does.
+    fn partialDamageClip(self: *Backend, frame: keywork.RenderBackend.Frame, buffer: *Buffer, width: u31, height: u31) ?TextRenderer.PixelClip {
+        if (frame.damage.len != 1) return null;
+        const clip = TextRenderer.PixelClip.fromRect(frame.damage[0], self.scale);
+        if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
+
+        const last = self.last_rendered orelse return null;
+        if (last == buffer) return clip;
+        if (last.width != width or last.height != height) return null;
+        @memcpy(buffer.pixels(), last.pixels());
+        return clip;
+    }
+
     fn acquireBuffer(self: *Backend, width: u31, height: u31) !*Buffer {
         var index: usize = 0;
         while (index < self.buffers.items.len) {
@@ -352,6 +381,7 @@ pub const Backend = struct {
                 continue;
             }
             if (buffer.width == width and buffer.height == height) return buffer;
+            if (self.last_rendered == buffer) self.last_rendered = null;
             buffer.destroy(self.allocator);
             _ = self.buffers.swapRemove(index);
         }
@@ -568,16 +598,46 @@ fn rasterize(
     height: u31,
     scale: f32,
     commands: []const keywork.PaintCommand,
+    base_clip: ?TextRenderer.PixelClip,
 ) !void {
-    @memset(pixels, @as(u32, @bitCast(keywork.colors.panel)));
-    var clip: ?TextRenderer.PixelClip = null;
+    if (base_clip) |clip| {
+        clearRegion(pixels, width, height, clip);
+    } else {
+        @memset(pixels, @as(u32, @bitCast(keywork.colors.panel)));
+    }
+    var clip: ?TextRenderer.PixelClip = base_clip;
     for (commands) |command| {
         switch (command) {
             .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color, clip),
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
             .alpha_image => |image| alphaImage(pixels, width, height, scale, image, clip),
-            .set_clip => |rect| clip = if (rect) |value| TextRenderer.PixelClip.fromRect(value, scale) else null,
+            .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
+    }
+}
+
+fn combineClips(base: ?TextRenderer.PixelClip, rect: ?keywork.Rect, scale: f32) ?TextRenderer.PixelClip {
+    const converted: ?TextRenderer.PixelClip = if (rect) |value| TextRenderer.PixelClip.fromRect(value, scale) else null;
+    const base_clip = base orelse return converted;
+    const other = converted orelse return base_clip;
+    return .{
+        .x0 = @max(base_clip.x0, other.x0),
+        .y0 = @max(base_clip.y0, other.y0),
+        .x1 = @min(base_clip.x1, other.x1),
+        .y1 = @min(base_clip.y1, other.y1),
+    };
+}
+
+fn clearRegion(pixels: []u32, width: u31, height: u31, clip: TextRenderer.PixelClip) void {
+    const value: u32 = @bitCast(keywork.colors.panel);
+    const x0 = clampClip(clip.x0, width);
+    const x1 = clampClip(clip.x1, width);
+    const y0 = clampClip(clip.y0, height);
+    const y1 = clampClip(clip.y1, height);
+    if (x0 >= x1) return;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        @memset(pixels[y * width ..][x0..x1], value);
     }
 }
 
