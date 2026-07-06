@@ -59,6 +59,8 @@ const AtlasKey = union(enum) {
         font_id: u32,
         pixel_size: u31,
         glyph_index: u32,
+        /// Subpixel bin baked into the rasterized coverage.
+        subpixel: u2,
     };
 };
 
@@ -1203,6 +1205,7 @@ pub const Backend = struct {
             .font_id = glyph.font_id,
             .pixel_size = glyph.pixel_size,
             .glyph_index = glyph.glyph_index,
+            .subpixel = glyph.subpixel,
         } };
         if (self.atlas_slots.get(key)) |slot| return slot;
 

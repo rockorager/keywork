@@ -4,6 +4,7 @@
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_OUTLINE_H
 #include <hb-ft.h>
 #include <hb.h>
 
@@ -110,9 +111,16 @@ static inline int keywork_ft_set_pixel_size(FT_Face face, unsigned int pixels) {
     return keywork_ft_select_size(face, pixels);
 }
 
-static inline int keywork_ft_load_render_glyph(FT_Face face, unsigned int glyph_index) {
+/// Loads and rasterizes a glyph, shifting the outline right by
+/// subpixel_x (26.6 fixed point) before rendering so fractional pen
+/// positions are baked into the coverage. Bitmap strikes cannot shift
+/// and render at their integer position.
+static inline int keywork_ft_load_render_glyph(FT_Face face, unsigned int glyph_index, long subpixel_x) {
     if (FT_Load_Glyph(face, glyph_index, FT_LOAD_COLOR) != 0) return 0;
     if (face->glyph->format == FT_GLYPH_FORMAT_BITMAP) return 1;
+    if (subpixel_x != 0 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        FT_Outline_Translate(&face->glyph->outline, subpixel_x, 0);
+    }
     return FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL) == 0;
 }
 

@@ -109,11 +109,31 @@ const ShapedRun = struct {
     }
 };
 
+/// Number of horizontal subpixel positions a glyph is rasterized at.
+/// Fractional pen positions quantize to the nearest 1/4 pixel, which is
+/// visually indistinguishable from exact placement for UI text.
+const subpixel_bins = 4;
+
 const GlyphKey = struct {
     font_id: u32,
     pixel_size: u31,
     glyph_index: u32,
+    subpixel: u2,
 };
+
+/// A horizontal pen position split into a whole-pixel origin and the
+/// quantized subpixel bin baked into the rasterized bitmap.
+const SubpixelPosition = struct {
+    origin: f32,
+    bin: u2,
+};
+
+fn subpixelPosition(x: f32) SubpixelPosition {
+    const whole = @floor(x);
+    const bin: u32 = @intFromFloat(@round((x - whole) * subpixel_bins));
+    if (bin >= subpixel_bins) return .{ .origin = whole + 1, .bin = 0 };
+    return .{ .origin = whole, .bin = @intCast(bin) };
+}
 
 pub const GlyphBitmap = struct {
     width: u32,
@@ -134,6 +154,8 @@ pub const PositionedGlyph = struct {
     font_id: u32,
     pixel_size: u31,
     glyph_index: u32,
+    /// Subpixel bin baked into the coverage; part of the atlas identity.
+    subpixel: u2 = 0,
     x: f32,
     y: f32,
     color: keywork.Color,
@@ -314,13 +336,14 @@ fn renderLine(
     while (try self.nextFontRun(value, &index)) |run| {
         const shaped = try self.shapeRun(run.font_index, pixel_size, run.value);
         for (shaped.glyphs) |glyph| {
-            if (try self.glyphBitmap(run.font_index, pixel_size, glyph.glyph_index)) |bitmap| {
+            const position = subpixelPosition(pen_x + fromFixed26Dot6(glyph.x_offset));
+            if (try self.glyphBitmap(run.font_index, pixel_size, glyph.glyph_index, position.bin)) |bitmap| {
                 blitGlyphBitmap(
                     bitmap,
                     pixels,
                     width,
                     height,
-                    pen_x + fromFixed26Dot6(glyph.x_offset),
+                    position.origin,
                     pen_y - fromFixed26Dot6(glyph.y_offset),
                     color,
                     clip,
@@ -351,13 +374,15 @@ fn appendLineGlyphs(
         const shaped = try self.shapeRun(run.font_index, pixel_size, run.value);
         const font = &self.fonts.items[run.font_index];
         for (shaped.glyphs) |glyph| {
-            if (try self.glyphBitmap(run.font_index, pixel_size, glyph.glyph_index)) |bitmap| {
+            const position = subpixelPosition(pen_x + fromFixed26Dot6(glyph.x_offset));
+            if (try self.glyphBitmap(run.font_index, pixel_size, glyph.glyph_index, position.bin)) |bitmap| {
                 if (bitmap.width > 0 and bitmap.rows > 0) {
                     try out.append(allocator, .{
                         .font_id = font.id,
                         .pixel_size = pixel_size,
                         .glyph_index = glyph.glyph_index,
-                        .x = pen_x + fromFixed26Dot6(glyph.x_offset) + @as(f32, @floatFromInt(bitmap.left)),
+                        .subpixel = position.bin,
+                        .x = position.origin + @as(f32, @floatFromInt(bitmap.left)),
                         .y = pen_y - fromFixed26Dot6(glyph.y_offset) - @as(f32, @floatFromInt(bitmap.top)),
                         .color = color,
                         .width = bitmap.width,
@@ -581,10 +606,10 @@ fn evictGlyphCache(self: *Self) void {
     }
 }
 
-fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32) !?*const GlyphBitmap {
+fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32, subpixel: u2) !?*const GlyphBitmap {
     try self.ensureFontPixelSize(font_index, pixel_size);
     const font = &self.fonts.items[font_index];
-    const key: GlyphKey = .{ .font_id = font.id, .pixel_size = pixel_size, .glyph_index = glyph_index };
+    const key: GlyphKey = .{ .font_id = font.id, .pixel_size = pixel_size, .glyph_index = glyph_index, .subpixel = subpixel };
     self.cache_clock += 1;
     if (self.glyph_cache.getPtr(key)) |bitmap| {
         bitmap.last_used = self.cache_clock;
@@ -592,7 +617,8 @@ fn glyphBitmap(self: *Self, font_index: usize, pixel_size: u31, glyph_index: u32
     }
     if (self.glyph_cache.count() >= max_glyph_cache_entries) self.evictGlyphCache();
 
-    if (c.keywork_ft_load_render_glyph(font.face, glyph_index) == 0) return null;
+    const subpixel_offset = @as(c_long, subpixel) * (64 / subpixel_bins);
+    if (c.keywork_ft_load_render_glyph(font.face, glyph_index, subpixel_offset) == 0) return null;
 
     var bitmap = try self.copyCurrentGlyphBitmap(font.face, pixel_size);
     errdefer bitmap.deinit(self.allocator);
@@ -825,4 +851,14 @@ fn snapToPixel(value: f32) f32 {
 
 fn fromFixed26Dot6(value: i32) f32 {
     return @as(f32, @floatFromInt(value)) / 64.0;
+}
+
+test "subpixelPosition quantizes to quarter-pixel bins" {
+    try std.testing.expectEqual(SubpixelPosition{ .origin = 10, .bin = 0 }, subpixelPosition(10.0));
+    try std.testing.expectEqual(SubpixelPosition{ .origin = 10, .bin = 1 }, subpixelPosition(10.25));
+    try std.testing.expectEqual(SubpixelPosition{ .origin = 10, .bin = 2 }, subpixelPosition(10.5));
+    try std.testing.expectEqual(SubpixelPosition{ .origin = 10, .bin = 3 }, subpixelPosition(10.7));
+    // Fractions near one roll over to the next whole pixel.
+    try std.testing.expectEqual(SubpixelPosition{ .origin = 11, .bin = 0 }, subpixelPosition(10.9));
+    try std.testing.expectEqual(SubpixelPosition{ .origin = -3, .bin = 2 }, subpixelPosition(-2.5));
 }
