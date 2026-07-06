@@ -2888,6 +2888,7 @@ fn parseWidget(
         const on_change = try getOptionalTextChangeCallbackField(lua_state, callback_allocator, table, "on_change");
         var widget = keywork.widgets.textInput(id, value, placeholder);
         widget.text_input.on_change = on_change;
+        widget.text_input.autofocus = boolField(lua_state, table, "autofocus");
         return widget;
     }
     if (std.mem.eql(u8, kind, "scroll")) {
@@ -3178,6 +3179,9 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
     if (std.mem.eql(u8, value, "enter")) return .enter;
     if (std.mem.eql(u8, value, "space")) return .space;
     if (std.mem.eql(u8, value, "backspace")) return .backspace;
+    if (std.mem.eql(u8, value, "escape")) return .escape;
+    if (std.mem.eql(u8, value, "up")) return .up;
+    if (std.mem.eql(u8, value, "down")) return .down;
     return error.UnknownShortcutKey;
 }
 

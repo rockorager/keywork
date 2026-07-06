@@ -371,6 +371,8 @@ pub const Runtime = struct {
                     .focus => {},
                 }
             },
+            // Only meaningful as shortcuts; ignored without a binding.
+            .escape, .up, .down => {},
         }
     }
 
@@ -398,7 +400,7 @@ pub const Runtime = struct {
 
     fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
         const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
-        if (self.focusedTargetIs(.text_input)) return false;
+        if (self.focusedTargetIs(.text_input) and !keywork.shortcutAllowedWhileEditing(shortcut_key)) return false;
         const element_root = if (self.element_root) |*root| root else return false;
         const callback = if (self.focused_id) |focused_id|
             keywork.findFocusedShortcutAction(element_root, shortcut_key, focused_id) orelse keywork.findShortcutAction(element_root, shortcut_key) orelse return false
@@ -1582,6 +1584,83 @@ test "shortcut invokes ambient action outside text input focus" {
     try runtime.keyInput(.space);
     try std.testing.expectEqual(@as(usize, 1), app.actions);
     try std.testing.expectEqualStrings(" ", renderedInputText(runtime.root.?).?);
+}
+
+test "non-editing shortcuts fire while a text input is focused" {
+    const TestApp = struct {
+        actions: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var input = keywork.widgets.textInput("input", "", "placeholder");
+            input.text_input.autofocus = true;
+            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{
+                .{ .key = .enter, .intent = .action("activate") },
+                .{ .key = .escape, .intent = .action("activate") },
+                .{ .key = .down, .intent = .action("activate") },
+                .{ .key = .up, .intent = .action("activate") },
+            };
+            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
+            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, input);
+            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
+        }
+
+        fn activate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.actions += 1;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    // The autofocus text input owns focus from the initial build.
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+
+    try runtime.keyInput(.enter);
+    try runtime.keyInput(.escape);
+    try runtime.keyInput(.down);
+    try runtime.keyInput(.up);
+    try std.testing.expectEqual(@as(usize, 4), app.actions);
+
+    // Editing keys still reach the input instead of shortcuts.
+    try runtime.keyInput(.{ .text = "hi" });
+    try runtime.keyInput(.space);
+    try runtime.keyInput(.backspace);
+    try std.testing.expectEqual(@as(usize, 4), app.actions);
+    try std.testing.expectEqualStrings("hi", renderedInputText(runtime.root.?).?);
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
 }
 
 test "focus widget participates in traversal and shortcut context" {

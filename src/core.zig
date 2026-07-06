@@ -224,6 +224,9 @@ pub const ShortcutKey = enum {
     enter,
     space,
     backspace,
+    escape,
+    up,
+    down,
 };
 
 pub const Intent = struct {
@@ -525,6 +528,7 @@ pub const Widget = union(enum) {
         padding_x: f32 = 12,
         padding_y: f32 = 8,
         radius: f32 = 8,
+        autofocus: bool = false,
     };
 
     pub const Children = struct {
@@ -1557,6 +1561,9 @@ pub const KeyInput = union(enum) {
     enter,
     space,
     tab: struct { reverse: bool = false },
+    escape,
+    up,
+    down,
 };
 
 pub const CursorShape = enum {
@@ -2828,6 +2835,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .padding_x = input_widget.padding_x,
                 .padding_y = input_widget.padding_y,
                 .radius = input_widget.radius,
+                .autofocus = input_widget.autofocus,
             } };
         },
         .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
@@ -3315,7 +3323,7 @@ fn appendFocusTargets(
     const active_scope_id = node.focus_scope_id orelse scope_id;
     const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
-        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id }),
+        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus }),
         .focus => if (node.focus_id) |id| try targets.append(allocator, .{
             .id = id,
             .kind = .focus,
@@ -3345,7 +3353,7 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
     const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
         .text_input => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus };
         },
         .focus => if (node.focus_id) |focus_id| {
             if (std.mem.eql(u8, focus_id, id)) return .{
@@ -3513,7 +3521,19 @@ pub fn shortcutKeyForInput(input: KeyInput) ?ShortcutKey {
         .enter => .enter,
         .space => .space,
         .backspace => .backspace,
+        .escape => .escape,
+        .up => .up,
+        .down => .down,
         .text, .tab => null,
+    };
+}
+
+/// Keys that never edit text may activate shortcuts even while a text
+/// input owns focus; editing keys must keep reaching the input.
+pub fn shortcutAllowedWhileEditing(key: ShortcutKey) bool {
+    return switch (key) {
+        .enter, .escape, .up, .down => true,
+        .space, .backspace => false,
     };
 }
 
@@ -3935,6 +3955,7 @@ fn layoutElementInto(
                 .text = textInputState(element).text.items,
                 .text_input_id = input_widget.id,
                 .focus_id = input_widget.focus_node.id,
+                .autofocus = input_widget.autofocus,
                 .text_style = style,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,

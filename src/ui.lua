@@ -560,6 +560,7 @@ function ui.text_input(options)
     placeholder = options.placeholder,
     value = options.value,
     on_change = options.on_change,
+    autofocus = options.autofocus or false,
   }
 end
 
