@@ -13,6 +13,7 @@ local IPC_SUBSCRIBE = 2
 
 local function bar_colors(theme)
   local scheme = theme.colors
+  local dark = theme.color_scheme == "dark"
   return {
     background = scheme.surface,
     surface = scheme.surface_high,
@@ -22,8 +23,8 @@ local function bar_colors(theme)
     on_active = scheme.on_primary,
     error = scheme.error,
     on_error = scheme.on_error,
-    success = 0xff9ece6a,
-    warning = 0xffe0af68,
+    success = dark and 0xff71d2a7 or 0xff1c805b,
+    warning = dark and 0xffeec574 or 0xff6e5313,
     accent = scheme.primary,
   }
 end
@@ -300,7 +301,7 @@ local function network_status_from_output(palette, output)
   local name = "network-wireless-offline"
   local color = palette.error
   if operstate == "up" then
-    color = palette.active
+    color = palette.accent
     if percent >= 80 then
       name = "network-wireless-signal-excellent"
     elseif percent >= 60 then

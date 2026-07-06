@@ -18,9 +18,9 @@ pub const colors = struct {
     pub const transparent: Color = Color.argb(0x00, 0x00, 0x00, 0x00);
     pub const white: Color = Color.argb(0xff, 0xff, 0xff, 0xff);
     pub const black: Color = Color.argb(0xff, 0x00, 0x00, 0x00);
-    pub const ink: Color = Color.argb(0xff, 0x1b, 0x1b, 0x1f);
-    pub const panel: Color = Color.argb(0xff, 0xf5, 0xf3, 0xef);
-    pub const accent: Color = Color.argb(0xff, 0x6d, 0x4a, 0xff);
+    pub const ink: Color = Color.argb(0xff, 0x0c, 0x0e, 0x12);
+    pub const panel: Color = Color.argb(0xff, 0xf5, 0xf6, 0xfa);
+    pub const accent: Color = Color.argb(0xff, 0x26, 0x5e, 0xb2);
 };
 
 pub const Brightness = enum {
@@ -44,32 +44,32 @@ pub const ColorScheme = struct {
 
     pub const light: ColorScheme = .{
         .brightness = .light,
-        .background = Color.argb(0xff, 0xfd, 0xfb, 0xf7),
+        .background = colors.panel,
         .foreground = colors.ink,
         .primary = colors.accent,
-        .on_primary = colors.white,
-        .surface = colors.panel,
+        .on_primary = colors.panel,
+        .surface = colors.white,
         .surface_high = colors.white,
-        .surface_low = Color.argb(0xff, 0xee, 0xea, 0xe4),
-        .border = Color.argb(0xff, 0x8c, 0x89, 0x91),
-        .muted = Color.argb(0xff, 0x77, 0x73, 0x7d),
-        .error_color = Color.argb(0xff, 0xba, 0x1a, 0x1a),
+        .surface_low = Color.argb(0xff, 0xe8, 0xed, 0xf5),
+        .border = Color.argb(0xff, 0xc4, 0xcc, 0xd8),
+        .muted = Color.argb(0xff, 0x5d, 0x66, 0x75),
+        .error_color = Color.argb(0xff, 0xad, 0x41, 0x43),
         .on_error = colors.white,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
-        .background = Color.argb(0xff, 0x11, 0x11, 0x14),
-        .foreground = Color.argb(0xff, 0xf5, 0xf3, 0xf7),
-        .primary = Color.argb(0xff, 0x9b, 0x86, 0xff),
-        .on_primary = colors.black,
-        .surface = Color.argb(0xff, 0x20, 0x20, 0x24),
-        .surface_high = Color.argb(0xff, 0x2b, 0x2b, 0x30),
-        .surface_low = Color.argb(0xff, 0x17, 0x17, 0x1a),
-        .border = Color.argb(0xff, 0x8f, 0x8a, 0x99),
-        .muted = Color.argb(0xff, 0xb7, 0xb3, 0xc1),
-        .error_color = Color.argb(0xff, 0xff, 0xb4, 0xab),
-        .on_error = Color.argb(0xff, 0x69, 0x00, 0x05),
+        .background = colors.ink,
+        .foreground = colors.panel,
+        .primary = Color.argb(0xff, 0x6c, 0xac, 0xff),
+        .on_primary = colors.ink,
+        .surface = Color.argb(0xff, 0x14, 0x18, 0x20),
+        .surface_high = Color.argb(0xff, 0x1c, 0x23, 0x30),
+        .surface_low = Color.argb(0xff, 0x08, 0x0a, 0x0d),
+        .border = Color.argb(0xff, 0x34, 0x41, 0x54),
+        .muted = Color.argb(0xff, 0xa7, 0xaf, 0xbd),
+        .error_color = Color.argb(0xff, 0xff, 0x8e, 0x8c),
+        .on_error = colors.ink,
     };
 };
 
