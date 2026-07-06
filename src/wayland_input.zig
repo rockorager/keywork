@@ -49,7 +49,7 @@ pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Poin
 pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
-pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, delta: f32) void;
+pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void;
 
 pub fn init(seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
     const pointer = if (seat) |wl_seat| pointer: {
@@ -193,9 +193,13 @@ fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Ev
                     }
                 },
                 .axis => |axis| {
-                    if (axis.axis != .vertical_scroll) return;
                     const point = self.pointer_position orelse return;
-                    self.dispatchScroll(point, @floatCast(axis.value.toDouble()));
+                    const delta: f32 = @floatCast(axis.value.toDouble());
+                    switch (axis.axis) {
+                        .vertical_scroll => self.dispatchScroll(point, 0, delta),
+                        .horizontal_scroll => self.dispatchScroll(point, delta, 0),
+                        _ => {},
+                    }
                 },
                 else => {},
             }
@@ -207,8 +211,8 @@ fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
     if (self.pointer_move_handler) |handler| handler(self.pointer_move_context.?, point);
 }
 
-fn dispatchScroll(self: *Self, point: keywork.Point, delta: f32) void {
-    if (self.scroll_handler) |handler| handler(self.scroll_context.?, point, delta);
+fn dispatchScroll(self: *Self, point: keywork.Point, dx: f32, dy: f32) void {
+    if (self.scroll_handler) |handler| handler(self.scroll_context.?, point, dx, dy);
 }
 
 fn dispatchPointerButton(self: *Self, point: keywork.Point, state: keywork.PointerButtonState) void {

@@ -1992,7 +1992,12 @@ fn parseWidget(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
-        return .{ .scroll = .{ .id = id, .child = child } };
+        var axes: keywork.Widget.ScrollAxes = .vertical;
+        if (stringField(lua_state, table, "axes")) |value| {
+            if (std.mem.eql(u8, value, "horizontal")) axes = .horizontal;
+            if (std.mem.eql(u8, value, "both")) axes = .both;
+        } else |_| {}
+        return .{ .scroll = .{ .id = id, .child = child, .axes = axes } };
     }
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);

@@ -414,12 +414,28 @@ pub const Widget = union(enum) {
         child: *const Widget,
     };
 
-    /// A vertically scrollable viewport: the child is laid out with
-    /// unbounded height, clipped to the viewport, and offset by the
-    /// element-owned scroll position.
+    /// A scrollable viewport: the child is laid out unbounded along the
+    /// scrollable axes, clipped to the viewport, and offset by the
+    /// element-owned scroll position. Scrollbar thumbs are painted for
+    /// axes with overflowing content.
     pub const Scroll = struct {
         id: []const u8,
         child: *const Widget,
+        axes: ScrollAxes = .vertical,
+    };
+
+    pub const ScrollAxes = enum {
+        vertical,
+        horizontal,
+        both,
+
+        pub fn horizontalUnbounded(self: ScrollAxes) bool {
+            return self != .vertical;
+        }
+
+        pub fn verticalUnbounded(self: ScrollAxes) bool {
+            return self != .horizontal;
+        }
     };
 
     pub const TextInput = struct {
@@ -1336,7 +1352,8 @@ pub fn textInputState(element: *Element) *TextInputState {
 /// Scroll position owned by a scroll element; clamped to the content
 /// extent during layout.
 pub const ScrollState = struct {
-    offset: f32 = 0,
+    offset_x: f32 = 0,
+    offset_y: f32 = 0,
 };
 
 pub fn scrollState(element: *Element) *ScrollState {
@@ -1344,8 +1361,11 @@ pub fn scrollState(element: *Element) *ScrollState {
     return @ptrCast(@alignCast(element.state.?));
 }
 
-fn scrollChildConstraints(constraints: Constraints) Constraints {
-    return .{ .max_width = constraints.max_width, .max_height = std.math.inf(f32) };
+fn scrollChildConstraints(constraints: Constraints, axes: Widget.ScrollAxes) Constraints {
+    return .{
+        .max_width = if (axes.horizontalUnbounded()) std.math.inf(f32) else constraints.max_width,
+        .max_height = if (axes.verticalUnbounded()) std.math.inf(f32) else constraints.max_height,
+    };
 }
 
 pub const AppHost = struct {
@@ -1474,7 +1494,7 @@ pub fn buildElementTreeScoped(
             state.* = .{};
             const children = try allocator.alloc(Element, 1);
             errdefer allocator.free(children);
-            children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints));
+            children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
             return .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children };
         },
         .focus_scope => |focus_scope_widget| {
@@ -1758,7 +1778,7 @@ pub fn updateElementTreeScoped(
             element.focused = scope.interaction.isFocused(element.widget.focus.node);
         },
         .scroll => |scroll_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints));
+            try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
         },
         .focus_scope => |focus_scope_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, focus_scope_widget.child, constraints);
@@ -1855,7 +1875,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .shortcuts,
         => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
 
-        .scroll => return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints)),
+        .scroll => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
         .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -1975,7 +1995,7 @@ pub fn refreshInteractionElements(
         .stateful,
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
-        .scroll => return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints), ids),
+        .scroll => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
         .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
         .theme => |theme_widget| {
             const previous_theme = scope.theme;
@@ -2314,7 +2334,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         },
         .scroll => |scroll_widget| blk: {
             const id = try allocator.dupe(u8, scroll_widget.id);
-            break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child } };
+            break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
         },
         .text_input => |input_widget| blk: {
             const id = try allocator.dupe(u8, input_widget.id);
@@ -2537,7 +2557,51 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         try paintScaled(allocator, child, display_list, scale);
     }
 
-    if (node.kind == .scroll) try display_list.popClip(allocator);
+    if (node.kind == .scroll) {
+        try paintScrollbars(allocator, node, display_list);
+        try display_list.popClip(allocator);
+    }
+}
+
+const scrollbar_thickness: f32 = 4;
+const scrollbar_margin: f32 = 2;
+const scrollbar_min_thumb: f32 = 12;
+const scrollbar_color: Color = Color.argb(0x60, 0x80, 0x80, 0x88);
+
+/// Paints proportional scrollbar thumbs for axes whose content overflows
+/// the viewport. Geometry is derived from the viewport and content rects,
+/// so no scroll payload beyond the child is needed.
+fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
+    std.debug.assert(node.kind == .scroll);
+    const content = node.children[0];
+
+    if (content.rect.height > node.rect.height) {
+        const track = node.rect.height - scrollbar_margin * 2;
+        const thumb = @max(scrollbar_min_thumb, track * node.rect.height / content.rect.height);
+        const max_offset = content.rect.height - node.rect.height;
+        const offset = node.rect.y - content.rect.y;
+        const along = (track - thumb) * (offset / max_offset);
+        try display_list.fillRect(allocator, .{
+            .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
+            .y = node.rect.y + scrollbar_margin + along,
+            .width = scrollbar_thickness,
+            .height = thumb,
+        }, scrollbar_color);
+    }
+
+    if (content.rect.width > node.rect.width) {
+        const track = node.rect.width - scrollbar_margin * 2;
+        const thumb = @max(scrollbar_min_thumb, track * node.rect.width / content.rect.width);
+        const max_offset = content.rect.width - node.rect.width;
+        const offset = node.rect.x - content.rect.x;
+        const along = (track - thumb) * (offset / max_offset);
+        try display_list.fillRect(allocator, .{
+            .x = node.rect.x + scrollbar_margin + along,
+            .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
+            .width = thumb,
+            .height = scrollbar_thickness,
+        }, scrollbar_color);
+    }
 }
 
 fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: Rect, color: Color, width: f32) !void {
@@ -3201,15 +3265,15 @@ fn layoutElementInto(
         },
         .scroll => |scroll_widget| {
             const state = scrollState(element);
-            const child = try layoutElement(allocator, &element.children[0], scrollChildConstraints(constraints), .{
-                .x = origin.x,
-                .y = origin.y - state.offset,
+            const child = try layoutElement(allocator, &element.children[0], scrollChildConstraints(constraints, scroll_widget.axes), .{
+                .x = origin.x - state.offset_x,
+                .y = origin.y - state.offset_y,
             }, measurer);
             const width = @min(constraints.max_width, child.rect.width);
             const height = @min(constraints.max_height, child.rect.height);
-            const max_offset = @max(0, child.rect.height - height);
-            state.offset = std.math.clamp(state.offset, 0, max_offset);
-            moveNode(child, origin.x, origin.y - state.offset);
+            state.offset_x = std.math.clamp(state.offset_x, 0, @max(0, child.rect.width - width));
+            state.offset_y = std.math.clamp(state.offset_y, 0, @max(0, child.rect.height - height));
+            moveNode(child, origin.x - state.offset_x, origin.y - state.offset_y);
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
@@ -3535,10 +3599,10 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     try std.testing.expectEqualStrings("list", hitTestScroll(root, .{ .x = 5, .y = 20 }).?);
 
     // An absurd offset clamps to content minus viewport.
-    scrollState(&element).offset = 1000;
+    scrollState(&element).offset_y = 1000;
     _ = dirtyScrollElement(&element, "list");
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 120), scrollState(&element).offset);
+    try std.testing.expectEqual(@as(f32, 120), scrollState(&element).offset_y);
     try std.testing.expectEqual(@as(f32, -120), root.children[0].rect.y);
 
     // Scrolled to the bottom, the last row is inside the viewport and
@@ -3559,6 +3623,50 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
         }
     }
     try std.testing.expect(saw_viewport_clip);
+}
+
+test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+    const build_allocator = build_arena.allocator();
+
+    // Ten 24px-wide cells: 240px of content in an 80px viewport.
+    var cells: [10]Widget = undefined;
+    for (&cells) |*cell| cell.* = widgets.text("row");
+    const row = try widgets.row(build_allocator, &cells, 0);
+    var scroll_widget = try widgets.scroll(build_allocator, "strip", row);
+    scroll_widget.scroll.axes = .horizontal;
+    const constraints: Constraints = .{ .max_width = 80, .max_height = 40 };
+
+    var scope: BuildScope = .{ .allocator = build_allocator };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    try std.testing.expectEqual(@as(f32, 80), root.rect.width);
+    try std.testing.expectEqual(@as(f32, 240), root.children[0].rect.width);
+
+    scrollState(&element).offset_x = 1000;
+    _ = dirtyScrollElement(&element, "strip");
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_x);
+    try std.testing.expectEqual(@as(f32, -160), root.children[0].rect.x);
+
+    // A horizontal thumb is painted along the bottom edge.
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(retained_allocator);
+    try paintScaled(retained_allocator, root, &display_list, 1);
+    var saw_thumb = false;
+    for (display_list.commands.items) |command| {
+        switch (command) {
+            .fill_rect => |fill| {
+                if (std.meta.eql(fill.color, scrollbar_color) and fill.rect.height == scrollbar_thickness) saw_thumb = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_thumb);
 }
 
 test "flex spacers collapse under unbounded scroll constraints" {

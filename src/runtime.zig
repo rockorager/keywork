@@ -549,21 +549,22 @@ pub const Runtime = struct {
         return self.cursorShape(point);
     }
 
-    /// Scrolls the innermost viewport under the pointer. The offset is
+    /// Scrolls the innermost viewport under the pointer. Offsets are
     /// clamped to the content extent during the relayout this schedules.
-    pub fn scrollBy(self: *Runtime, point: Point, delta: f32) !void {
+    pub fn scrollBy(self: *Runtime, point: Point, dx: f32, dy: f32) !void {
         const root = self.root orelse return error.NotBuilt;
         const id = keywork.hitTestScroll(root, point) orelse return;
         const element_root = if (self.element_root) |*element_root| element_root else return;
         const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
         const state = keywork.scrollState(scroll_element);
-        state.offset = @max(0, state.offset + delta);
+        state.offset_x = @max(0, state.offset_x + dx);
+        state.offset_y = @max(0, state.offset_y + dy);
         try self.invalidateState();
     }
 
-    pub fn waylandScroll(ctx: *anyopaque, point: Point, delta: f32) void {
+    pub fn waylandScroll(ctx: *anyopaque, point: Point, dx: f32, dy: f32) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.scrollBy(point, delta) catch |err| {
+        self.scrollBy(point, dx, dy) catch |err| {
             log.err("scroll failed: {}", .{err});
         };
     }
@@ -993,19 +994,19 @@ test "wheel scroll moves viewport content without rebuilding" {
     // 20 rows at 16px in a 120px viewport: 200px of scroll range.
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 30);
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 30);
     try std.testing.expectEqual(@as(f32, -30), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
     // Scrolling past the edges clamps.
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 10_000);
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 10_000);
     try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, -10_000);
+    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -10_000);
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
     // Scrolling outside any viewport is a no-op.
-    try runtime.scrollBy(.{ .x = 5, .y = 500 }, 30);
+    try runtime.scrollBy(.{ .x = 5, .y = 500 }, 0, 30);
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 }
 

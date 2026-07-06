@@ -240,6 +240,7 @@ function ui.scroll(options)
     type = "scroll",
     id = options.id,
     child = options.child,
+    axes = options.axes,
   }
 end
 
