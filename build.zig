@@ -177,13 +177,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
 
+    // Window options come from the script's keywork.window declaration.
     const run_lua_layershell_example_cmd = b.addRunArtifact(exe);
     run_lua_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
-        "--layer-shell",
-        "--anchor=top,left,right",
-        "--height=32",
-        "--exclusive-zone=32",
     });
     if (b.args) |args| {
         run_lua_layershell_example_cmd.addArgs(args);
@@ -196,10 +193,6 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
         "--backend=vulkan",
-        "--layer-shell",
-        "--anchor=top,left,right",
-        "--height=32",
-        "--exclusive-zone=32",
     });
     if (b.args) |args| {
         run_lua_vulkan_layershell_example_cmd.addArgs(args);
@@ -211,11 +204,6 @@ pub fn build(b: *std.Build) void {
     const run_lua_bar_example_cmd = b.addRunArtifact(exe);
     run_lua_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
-        "--layer-shell",
-        "--anchor=top,left,right",
-        "--width=0",
-        "--height=32",
-        "--exclusive-zone=32",
     });
     if (b.args) |args| {
         run_lua_bar_example_cmd.addArgs(args);
@@ -228,11 +216,6 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
         "--backend=vulkan",
-        "--layer-shell",
-        "--anchor=top,left,right",
-        "--width=0",
-        "--height=32",
-        "--exclusive-zone=32",
     });
     if (b.args) |args| {
         run_lua_vulkan_bar_example_cmd.addArgs(args);

@@ -490,9 +490,30 @@ const LuaImage = struct {
     }
 };
 
+/// Window options declared by the script via keywork.window({...}).
+/// Null fields fall back to CLI flags and built-in defaults.
+pub const WindowConfig = struct {
+    app_id: ?[:0]u8 = null,
+    title: ?[:0]u8 = null,
+    backend: ?keywork.BackendKind = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
+    layer_shell: ?keywork.LayerShellOptions = null,
+
+    fn deinit(self: *WindowConfig, allocator: std.mem.Allocator) void {
+        if (self.app_id) |value| allocator.free(value);
+        if (self.title) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
+    /// Chunk name passed to the Lua loader ("@" ++ path) so stack
+    /// traces point at the script file.
+    chunk_name: [:0]u8,
+    window_config: WindowConfig = .{},
     state: *c.lua_State,
     script_ref: c_int = -1,
     script_dirty: bool = true,
@@ -507,6 +528,8 @@ pub const App = struct {
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
         errdefer allocator.free(path_z);
+        const chunk_name = try std.fmt.allocPrintSentinel(allocator, "@{s}", .{path}, 0);
+        errdefer allocator.free(chunk_name);
 
         switch (linux.errno(linux.access(path_z.ptr, 0))) {
             .SUCCESS => {},
@@ -522,6 +545,7 @@ pub const App = struct {
         return .{
             .allocator = allocator,
             .path = path_z,
+            .chunk_name = chunk_name,
             .state = lua_state,
         };
     }
@@ -539,7 +563,9 @@ pub const App = struct {
         self.dbus_buses.deinit(self.allocator);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_close(self.state);
+        self.window_config.deinit(self.allocator);
         self.allocator.free(self.path);
+        self.allocator.free(self.chunk_name);
     }
 
     pub fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
@@ -560,8 +586,15 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidgetHost } };
     }
 
-    pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+    /// Run the script if it has not executed yet (or is dirty). Called
+    /// before keywork.run so top-level keywork.window declarations can
+    /// shape the window, and again on every rebuild.
+    pub fn ensureLoaded(self: *App) !void {
         if (self.script_dirty or self.script_ref < 0) try self.reloadScript();
+    }
+
+    pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+        try self.ensureLoaded();
 
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
@@ -578,7 +611,10 @@ pub const App = struct {
     fn reloadScript(self: *App) !void {
         c.lua_settop(self.state, 0);
         installKeyworkModule(self.state, self);
-        if (c.luaL_loadfile(self.state, self.path.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
+        const source = try self.readScriptFile();
+        defer self.allocator.free(source);
+        const chunk = scriptChunk(source);
+        if (c.luaL_loadbuffer(self.state, chunk.ptr, chunk.len, self.chunk_name.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
         if (c.lua_pcall(self.state, 0, 1, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
         errdefer c.lua_settop(self.state, 0);
 
@@ -588,6 +624,43 @@ pub const App = struct {
         self.script_ref = script_ref;
         self.script_dirty = false;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
+    }
+
+    fn readScriptFile(self: *App) ![]u8 {
+        const open_result = linux.openat(linux.AT.FDCWD, self.path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(open_result) != .SUCCESS) return error.ScriptReadFailed;
+        const fd: i32 = @intCast(open_result);
+        defer _ = linux.close(fd);
+
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(self.allocator);
+        while (true) {
+            try list.ensureUnusedCapacity(self.allocator, 4096);
+            const dest = list.unusedCapacitySlice();
+            const read_result = linux.read(fd, dest.ptr, dest.len);
+            switch (linux.errno(read_result)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.ScriptReadFailed,
+            }
+            if (read_result == 0) break;
+            list.items.len += read_result;
+        }
+        return list.toOwnedSlice(self.allocator);
+    }
+
+    /// Expose the standard Lua `arg` table: arg[0] is the script path,
+    /// arg[1..] are the arguments forwarded to the application.
+    pub fn setScriptArgs(self: *App, args: []const [:0]const u8) void {
+        c.lua_createtable(self.state, @intCast(args.len), 1);
+        const table = c.lua_gettop(self.state);
+        c.lua_pushlstring(self.state, self.path.ptr, self.path.len);
+        c.lua_rawseti(self.state, table, 0);
+        for (args, 1..) |arg, index| {
+            c.lua_pushlstring(self.state, arg.ptr, arg.len);
+            c.lua_rawseti(self.state, table, @intCast(index));
+        }
+        c.lua_setfield(self.state, c.LUA_GLOBALSINDEX, "arg");
     }
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
@@ -1805,8 +1878,71 @@ fn closeProcessPipe(pipe: *ProcessPipe) void {
     pipe.fd = invalid_fd;
 }
 
+/// First byte of a LuaJIT (and PUC Lua) bytecode dump.
+const bytecode_signature: u8 = 0x1b;
+
+/// Mirror luaL_loadfile's `#` first-line handling, which LuaJIT's own
+/// loader lacks for bytecode chunks. The newline is kept for source
+/// chunks so error line numbers stay correct, and dropped for bytecode
+/// where it would corrupt the dump.
+fn scriptChunk(source: []const u8) []const u8 {
+    if (source.len == 0 or source[0] != '#') return source;
+    const newline = std.mem.indexOfScalar(u8, source, '\n') orelse return source[source.len..];
+    const rest = source[newline..];
+    if (rest.len > 1 and rest[1] == bytecode_signature) return rest[1..];
+    return rest;
+}
+
+test "scriptChunk passes plain chunks through" {
+    try std.testing.expectEqualStrings("return 1\n", scriptChunk("return 1\n"));
+    try std.testing.expectEqualStrings("\x1bLJ\x02", scriptChunk("\x1bLJ\x02"));
+    try std.testing.expectEqualStrings("", scriptChunk(""));
+}
+
+test "scriptChunk keeps the newline for shebang source" {
+    try std.testing.expectEqualStrings("\nreturn 1\n", scriptChunk("#!/usr/bin/env keywork\nreturn 1\n"));
+}
+
+test "scriptChunk strips the whole line for shebang bytecode" {
+    try std.testing.expectEqualStrings("\x1bLJ\x02", scriptChunk("#!/usr/bin/env keywork\n\x1bLJ\x02"));
+}
+
+test "scriptChunk handles a shebang-only file" {
+    try std.testing.expectEqualStrings("", scriptChunk("#!/usr/bin/env keywork"));
+    try std.testing.expectEqualStrings("\n", scriptChunk("#!/usr/bin/env keywork\n"));
+}
+
+const embedded_ui_source = @embedFile("ui.lua");
+
 fn installUi(lua_state: *c.lua_State) void {
     addPackagePath(lua_state, "src/?.lua");
+
+    // Fallback loader appended after the standard searchers so a
+    // checkout's src/ui.lua wins during development while shipped
+    // scripts resolve require("ui") anywhere.
+    c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
+    const package_table = c.lua_gettop(lua_state);
+    c.lua_getfield(lua_state, package_table, "loaders");
+    const loaders_table = c.lua_gettop(lua_state);
+    const loader_count: c_int = @intCast(c.lua_objlen(lua_state, loaders_table));
+    c.lua_pushcclosure(lua_state, embeddedUiLoader, 0);
+    c.lua_rawseti(lua_state, loaders_table, loader_count + 1);
+    pop(lua_state, 2);
+}
+
+fn embeddedUiLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    var len: usize = 0;
+    const name_ptr = c.luaL_checklstring(lua_state, 1, &len);
+    if (!std.mem.eql(u8, name_ptr[0..len], "ui")) {
+        const message = "\n\tno embedded keywork module";
+        c.lua_pushlstring(lua_state, message.ptr, message.len);
+        return 1;
+    }
+    if (c.luaL_loadbuffer(lua_state, embedded_ui_source.ptr, embedded_ui_source.len, "@ui.lua") != 0) {
+        return c.lua_error(lua_state);
+    }
+    return 1;
 }
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
@@ -1886,7 +2022,203 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaInvalidate, 1);
     c.lua_setfield(lua_state, table, "invalidate");
+
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaWindow, 1);
+    c.lua_setfield(lua_state, table, "window");
     return 1;
+}
+
+/// Read an optional string field from a table. Raises a Lua error for
+/// non-string values. The returned slice stays valid while the table is
+/// reachable: the string is anchored by the table field itself.
+fn checkStringField(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8) ?[]const u8 {
+    c.lua_getfield(lua_state, table_index, name.ptr);
+    defer pop(lua_state, 1);
+    switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => return null,
+        c.LUA_TSTRING => {},
+        else => {
+            _ = c.luaL_error(lua_state, "window option '%s' must be a string", name.ptr);
+            unreachable;
+        },
+    }
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(lua_state, -1, &len).?;
+    return ptr[0..len];
+}
+
+/// Read an optional number field from a table. Raises a Lua error for
+/// non-number values.
+fn checkNumberField(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8) ?f64 {
+    c.lua_getfield(lua_state, table_index, name.ptr);
+    defer pop(lua_state, 1);
+    switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => return null,
+        c.LUA_TNUMBER => return c.lua_tonumber(lua_state, -1),
+        else => {
+            _ = c.luaL_error(lua_state, "window option '%s' must be a number", name.ptr);
+            unreachable;
+        },
+    }
+}
+
+fn checkI32Field(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8) ?i32 {
+    const value = checkNumberField(lua_state, table_index, name) orelse return null;
+    const min: f64 = @floatFromInt(std.math.minInt(i32));
+    const max: f64 = @floatFromInt(std.math.maxInt(i32));
+    if (!std.math.isFinite(value) or value < min or value > max) {
+        _ = c.luaL_error(lua_state, "window option '%s' is out of range", name.ptr);
+        unreachable;
+    }
+    return @intFromFloat(value);
+}
+
+fn backendFromName(name: []const u8) ?keywork.BackendKind {
+    if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
+    if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
+    if (std.mem.eql(u8, name, "log")) return .log;
+    return null;
+}
+
+fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) keywork.LayerShellOptions {
+    var options: keywork.LayerShellOptions = .{};
+
+    if (checkStringField(lua_state, table_index, "layer")) |name| {
+        options.layer = if (std.mem.eql(u8, name, "background"))
+            .background
+        else if (std.mem.eql(u8, name, "bottom"))
+            .bottom
+        else if (std.mem.eql(u8, name, "top"))
+            .top
+        else if (std.mem.eql(u8, name, "overlay"))
+            .overlay
+        else {
+            _ = c.luaL_error(lua_state, "unknown layer '%s' (expected background, bottom, top, or overlay)", name.ptr);
+            unreachable;
+        };
+    }
+
+    c.lua_getfield(lua_state, table_index, "anchor");
+    switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => {},
+        c.LUA_TTABLE => {
+            const anchor_table = c.lua_gettop(lua_state);
+            const count: usize = @intCast(c.lua_objlen(lua_state, anchor_table));
+            var index: usize = 1;
+            while (index <= count) : (index += 1) {
+                c.lua_rawgeti(lua_state, anchor_table, @intCast(index));
+                if (c.lua_type(lua_state, -1) != c.LUA_TSTRING) {
+                    _ = c.luaL_error(lua_state, "anchor entries must be strings");
+                    unreachable;
+                }
+                var len: usize = 0;
+                const ptr = c.lua_tolstring(lua_state, -1, &len).?;
+                const name = ptr[0..len];
+                if (std.mem.eql(u8, name, "top")) {
+                    options.anchors.top = true;
+                } else if (std.mem.eql(u8, name, "bottom")) {
+                    options.anchors.bottom = true;
+                } else if (std.mem.eql(u8, name, "left")) {
+                    options.anchors.left = true;
+                } else if (std.mem.eql(u8, name, "right")) {
+                    options.anchors.right = true;
+                } else {
+                    _ = c.luaL_error(lua_state, "unknown anchor '%s' (expected top, bottom, left, or right)", ptr);
+                    unreachable;
+                }
+                pop(lua_state, 1);
+            }
+        },
+        else => {
+            _ = c.luaL_error(lua_state, "layer_shell.anchor must be an array of strings");
+            unreachable;
+        },
+    }
+    pop(lua_state, 1);
+
+    if (checkI32Field(lua_state, table_index, "exclusive_zone")) |value| options.exclusive_zone = value;
+
+    c.lua_getfield(lua_state, table_index, "margin");
+    switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => {},
+        c.LUA_TTABLE => {
+            const margin_table = c.lua_gettop(lua_state);
+            if (checkI32Field(lua_state, margin_table, "top")) |value| options.margin.top = value;
+            if (checkI32Field(lua_state, margin_table, "right")) |value| options.margin.right = value;
+            if (checkI32Field(lua_state, margin_table, "bottom")) |value| options.margin.bottom = value;
+            if (checkI32Field(lua_state, margin_table, "left")) |value| options.margin.left = value;
+        },
+        else => {
+            _ = c.luaL_error(lua_state, "layer_shell.margin must be a table");
+            unreachable;
+        },
+    }
+    pop(lua_state, 1);
+
+    if (checkStringField(lua_state, table_index, "keyboard")) |name| {
+        options.keyboard_interactivity = if (std.mem.eql(u8, name, "none"))
+            .none
+        else if (std.mem.eql(u8, name, "exclusive"))
+            .exclusive
+        else if (std.mem.eql(u8, name, "on-demand") or std.mem.eql(u8, name, "on_demand"))
+            .on_demand
+        else {
+            _ = c.luaL_error(lua_state, "unknown keyboard interactivity '%s' (expected none, exclusive, or on-demand)", name.ptr);
+            unreachable;
+        };
+    }
+
+    return options;
+}
+
+fn luaWindow(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
+    if (app.runtime != null) {
+        std.log.scoped(.keywork_luajit).warn("keywork.window applies at startup; restart to pick up changes", .{});
+        return 0;
+    }
+
+    // Validate everything before allocating so Lua errors cannot leak
+    // partially-built configs.
+    var config: WindowConfig = .{};
+    if (checkStringField(lua_state, 1, "backend")) |name| {
+        config.backend = backendFromName(name) orelse {
+            _ = c.luaL_error(lua_state, "unknown backend '%s' (expected cpu, vulkan, or log)", name.ptr);
+            unreachable;
+        };
+    }
+    if (checkNumberField(lua_state, 1, "width")) |value| config.width = @floatCast(value);
+    if (checkNumberField(lua_state, 1, "height")) |value| config.height = @floatCast(value);
+
+    c.lua_getfield(lua_state, 1, "layer_shell");
+    switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => {},
+        c.LUA_TTABLE => config.layer_shell = parseLayerShellTable(lua_state, c.lua_gettop(lua_state)),
+        else => {
+            _ = c.luaL_error(lua_state, "window option 'layer_shell' must be a table");
+            unreachable;
+        },
+    }
+    pop(lua_state, 1);
+
+    const app_id = checkStringField(lua_state, 1, "app_id");
+    const title = checkStringField(lua_state, 1, "title");
+    if (app_id) |value| {
+        config.app_id = app.allocator.dupeZ(u8, value) catch return c.luaL_error(lua_state, "out of memory");
+    }
+    if (title) |value| {
+        config.title = app.allocator.dupeZ(u8, value) catch {
+            config.deinit(app.allocator);
+            return c.luaL_error(lua_state, "out of memory");
+        };
+    }
+
+    app.window_config.deinit(app.allocator);
+    app.window_config = config;
+    return 0;
 }
 
 fn luaLogDebug(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

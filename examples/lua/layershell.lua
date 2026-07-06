@@ -1,4 +1,5 @@
 local ui = require("ui")
+local keywork = require("keywork")
 
 local colors = {
   background = 0xff111113,
@@ -6,12 +7,24 @@ local colors = {
   accent = 0xff0090ff,
 }
 
+-- The script declares its own window; CLI flags override it, so
+-- `--backend=vulkan` or `--backend=log` still work for debugging.
+--
 -- Run with:
 --   zig build run-lua-layershell-example
 --   zig build run-lua-vulkan-layershell-example
 -- or:
---   zig build run -- --script=examples/lua/layershell.lua --layer-shell --anchor=top,left,right --height=32 --exclusive-zone=32
---   zig build run -- --script=examples/lua/layershell.lua --backend=vulkan --layer-shell --anchor=top,left,right --height=32 --exclusive-zone=32
+--   zig build run -- examples/lua/layershell.lua
+keywork.window({
+  app_id = "dev.keywork.LayerShellExample",
+  backend = "cpu",
+  height = 32,
+  layer_shell = {
+    layer = "top",
+    anchor = { "top", "left", "right" },
+    exclusive_zone = 32,
+  },
+})
 local App = ui.stateful({
   build = function(self, state)
     local theme = ui.resolve_theme(ui.theme_data({

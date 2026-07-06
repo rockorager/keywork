@@ -25,6 +25,7 @@ pub const EventSourceInstaller = *const fn (
 
 pub const Options = struct {
     title: [:0]const u8 = "Keywork",
+    app_id: [:0]const u8 = "dev.keywork.Keywork",
     width: f32 = 640,
     height: f32 = 480,
     backend: BackendKind = .log,
@@ -87,6 +88,7 @@ fn runWayland(
     const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator, .{
         .title = options.title,
+        .app_id = options.app_id,
         .width = backend_width,
         .height = try positiveU31(constraints.max_height),
         .layer_shell = options.layer_shell,

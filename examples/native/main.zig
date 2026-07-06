@@ -66,7 +66,7 @@ fn selectedBackend(init: std.process.Init) keywork.BackendKind {
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--wayland")) return .wayland_shm;
-        if (std.mem.eql(u8, arg, "--backend=shm")) return .wayland_shm;
+        if (std.mem.eql(u8, arg, "--backend=cpu")) return .wayland_shm;
         if (std.mem.eql(u8, arg, "--backend=vulkan")) return .vulkan;
     }
     return .log;

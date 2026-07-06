@@ -62,20 +62,37 @@ fn logWithTimestampTerminal(
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const run_options = selectedRunOptions(init);
+    const run_options = try selectedRunOptions(init, allocator);
+    defer allocator.free(run_options.app_args);
     var lua = try lua_app.App.init(allocator, run_options.script_path);
     defer lua.deinit();
+    lua.setScriptArgs(run_options.app_args);
+    // Run the script now so keywork.window declarations can shape the
+    // window. CLI flags override the script; the script overrides
+    // built-in defaults.
+    try lua.ensureLoaded();
+    const window = lua.window_config;
+
+    const layer_shell = run_options.layer_shell orelse window.layer_shell;
+    const backend = run_options.backend orelse window.backend orelse
+        // A layer-shell surface is useless on the log backend, so
+        // requesting one implies the cpu backend unless a backend was
+        // chosen explicitly.
+        if (layer_shell != null) keywork.BackendKind.wayland_shm else .log;
+    const title: [:0]const u8 = window.title orelse
+        if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     defer stdout_writer.interface.flush() catch {};
 
     try keywork.run(allocator, lua.host(), .{
-        .title = if (run_options.backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP",
-        .width = run_options.width,
-        .height = run_options.height,
-        .backend = run_options.backend,
-        .layer_shell = run_options.layer_shell,
+        .title = title,
+        .app_id = window.app_id orelse "dev.keywork.Keywork",
+        .width = run_options.width orelse window.width orelse 640,
+        .height = run_options.height orelse window.height orelse 480,
+        .backend = backend,
+        .layer_shell = layer_shell,
         .log_writer = &stdout_writer.interface,
         .event_source_context = &lua,
         .install_event_sources = lua_app.App.installEventSources,
@@ -84,27 +101,41 @@ pub fn main(init: std.process.Init) !void {
     log.debug("frame rendered", .{});
 }
 
+/// CLI flags; null means "not passed" so script-declared window options
+/// can fill the gap.
 const SelectedRunOptions = struct {
-    backend: keywork.BackendKind = .log,
-    width: f32 = 640,
-    height: f32 = 480,
+    backend: ?keywork.BackendKind = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
     script_path: []const u8 = "main.lua",
     layer_shell: ?keywork.LayerShellOptions = null,
+    /// Arguments after the script path, forwarded verbatim to the Lua
+    /// application via the `arg` global.
+    app_args: []const [:0]const u8 = &.{},
 };
 
-fn selectedRunOptions(init: std.process.Init) SelectedRunOptions {
+fn selectedRunOptions(init: std.process.Init, allocator: std.mem.Allocator) !SelectedRunOptions {
     var result: SelectedRunOptions = .{};
+    var app_args: std.ArrayList([:0]const u8) = .empty;
+    errdefer app_args.deinit(allocator);
+    var script_seen = false;
     var args = init.minimal.args.iterate();
     _ = args.skip();
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--wayland")) {
+        if (script_seen) {
+            try app_args.append(allocator, arg);
+        } else if (!std.mem.startsWith(u8, arg, "--")) {
+            result.script_path = arg;
+            script_seen = true;
+        } else if (std.mem.eql(u8, arg, "--wayland")) {
             result.backend = .wayland_shm;
-        } else if (std.mem.eql(u8, arg, "--backend=shm")) {
+        } else if (std.mem.eql(u8, arg, "--backend=cpu")) {
             result.backend = .wayland_shm;
         } else if (std.mem.eql(u8, arg, "--backend=vulkan")) {
             result.backend = .vulkan;
+        } else if (std.mem.eql(u8, arg, "--backend=log")) {
+            result.backend = .log;
         } else if (std.mem.eql(u8, arg, "--layer-shell")) {
-            if (result.backend == .log) result.backend = .wayland_shm;
             if (result.layer_shell == null) result.layer_shell = .{};
         } else if (std.mem.startsWith(u8, arg, "--layer=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
@@ -126,6 +157,7 @@ fn selectedRunOptions(init: std.process.Init) SelectedRunOptions {
             result.script_path = arg["--script=".len..];
         }
     }
+    result.app_args = try app_args.toOwnedSlice(allocator);
     return result;
 }
 

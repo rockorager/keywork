@@ -2,6 +2,18 @@ local ui = require("ui")
 local keywork = require("keywork")
 local bit = require("bit")
 
+keywork.window({
+  app_id = "dev.keywork.Bar",
+  backend = "cpu",
+  width = 0, -- stretch to the anchored edges
+  height = 32,
+  layer_shell = {
+    layer = "top",
+    anchor = { "top", "left", "right" },
+    exclusive_zone = 32,
+  },
+})
+
 local has_unix_socket, unix_socket = pcall(require, "socket.unix")
 
 local EPOLLIN = 1
