@@ -92,10 +92,20 @@ const ParseContext = struct {
 const LinearOptions = struct {
     spacing: f32 = 0,
     @"align": ?keywork.Widget.CrossAxisAlignment = null,
+    main_align: ?keywork.Widget.MainAxisAlignment = null,
 
     fn crossAlign(self: LinearOptions) keywork.Widget.CrossAxisAlignment {
         return self.@"align" orelse .start;
     }
+
+    fn mainAlign(self: LinearOptions) keywork.Widget.MainAxisAlignment {
+        return self.main_align orelse .start;
+    }
+};
+
+const FlexibleOptions = struct {
+    flex: f32 = 1,
+    fit: ?keywork.Widget.FlexFit = null,
 };
 
 const PaddingOptions = struct {
@@ -2081,12 +2091,12 @@ fn parseWidget(
     if (std.mem.eql(u8, kind, "row")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
-        return .{ .row = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign() } };
+        return .{ .row = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign(), .main_align = options.mainAlign() } };
     }
     if (std.mem.eql(u8, kind, "column")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
         const children = try parseChildren(lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
-        return .{ .column = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign() } };
+        return .{ .column = .{ .children = children, .gap = options.spacing, .cross_align = options.crossAlign(), .main_align = options.mainAlign() } };
     }
     if (std.mem.eql(u8, kind, "padding")) {
         const options = try lua_codec.decode(PaddingOptions, lua_state, table, allocator);
@@ -2103,6 +2113,14 @@ fn parseWidget(
         defer pop(lua_state, 1);
         child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
         return .{ .center = .{ .child = child } };
+    }
+    if (std.mem.eql(u8, kind, "flexible")) {
+        const options = try lua_codec.decode(FlexibleOptions, lua_state, table, allocator);
+        const child = try allocator.create(keywork.Widget);
+        c.lua_getfield(lua_state, table, "child");
+        defer pop(lua_state, 1);
+        child.* = try parseWidget(lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
+        return .{ .flexible = .{ .child = child, .flex = options.flex, .fit = options.fit orelse .tight } };
     }
     if (std.mem.eql(u8, kind, "actions")) {
         const child = try allocator.create(keywork.Widget);
@@ -3109,6 +3127,47 @@ test "lua stateful build context includes theme" {
 
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"dark\"") != null);
+}
+
+test "lua flexible and main_align lay out through the parser" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local ui = require("ui")
+        \\return ui.column({
+        \\  children = {
+        \\    ui.row({ main_align = "space_between", children = { ui.text("L"), ui.text("R") } }),
+        \\    ui.row({ children = { ui.text("A"), ui.expanded(ui.text("B")) } }),
+        \\  },
+        \\})
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "flex.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "flex.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var runtime = try keywork.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 60 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.repaint();
+    // space_between pushes R (8px wide) to the 100px right edge.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=92 y=0 value=\"R\"") != null);
+    // The expanded text starts right after A regardless of its own width.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=8 y=16 value=\"B\"") != null);
 }
 
 test "lua loop fs_event observes file changes" {

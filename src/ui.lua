@@ -262,6 +262,7 @@ function ui.column(options)
     children = options.children,
     spacing = options.spacing or 0,
     align = options.align,
+    main_align = options.main_align,
   }
 end
 
@@ -272,6 +273,25 @@ function ui.row(options)
     children = options.children,
     spacing = options.spacing or 0,
     align = options.align,
+    main_align = options.main_align,
+  }
+end
+
+function ui.expanded(child, flex)
+  return {
+    type = "flexible",
+    child = child,
+    flex = flex or 1,
+    fit = "tight",
+  }
+end
+
+function ui.flexible(child, flex)
+  return {
+    type = "flexible",
+    child = child,
+    flex = flex or 1,
+    fit = "loose",
   }
 end
 

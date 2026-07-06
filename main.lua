@@ -26,6 +26,22 @@ local App = ui.stateful({
           end,
         }),
         ui.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
+        ui.row({
+          spacing = 8,
+          children = {
+            ui.box({ background = 0xff6d4aff }, ui.padding({ all = 6, child = ui.text("fixed") })),
+            ui.expanded(ui.box({ background = 0xff2e7d32 }, ui.padding({ all = 6, child = ui.text("flex 1") }))),
+            ui.expanded(ui.box({ background = 0xffc62828 }, ui.padding({ all = 6, child = ui.text("flex 2") })), 2),
+          },
+        }),
+        ui.row({
+          main_align = "space_between",
+          children = {
+            ui.text("left"),
+            ui.text("middle"),
+            ui.text("right"),
+          },
+        }),
         ui.sized({
           height = 120,
           child = ui.list({

@@ -306,6 +306,7 @@ pub const Widget = union(enum) {
     row: Children,
     column: Children,
     spacer: Spacer,
+    flexible: Flexible,
     sized: Sized,
     padding: Padding,
     center: Child,
@@ -496,6 +497,7 @@ pub const Widget = union(enum) {
         children: []const Widget,
         gap: f32 = 0,
         cross_align: CrossAxisAlignment = .start,
+        main_align: MainAxisAlignment = .start,
     };
 
     pub const CrossAxisAlignment = enum {
@@ -504,6 +506,28 @@ pub const Widget = union(enum) {
         end,
         stretch,
     };
+
+    pub const MainAxisAlignment = enum {
+        start,
+        center,
+        end,
+        space_between,
+        space_around,
+        space_evenly,
+    };
+
+    /// A flex child of a row or column: after non-flex children take
+    /// their intrinsic size, the remaining main-axis space is divided
+    /// between flexible children in proportion to their flex factors.
+    pub const Flexible = struct {
+        child: *const Widget,
+        flex: f32 = 1,
+        /// tight forces the child to fill its share (Flutter's Expanded);
+        /// loose lets it be smaller.
+        fit: FlexFit = .tight,
+    };
+
+    pub const FlexFit = enum { tight, loose };
 
     pub const Alignment = enum {
         start,
@@ -897,6 +921,42 @@ pub const widgets = struct {
         return .{ .text_input = .{ .id = id, .focus_node = focus_node, .value = value, .placeholder = placeholder } };
     }
 
+    pub const LinearOptions = struct {
+        gap: f32 = 0,
+        cross_align: Widget.CrossAxisAlignment = .start,
+        main_align: Widget.MainAxisAlignment = .start,
+    };
+
+    pub fn expanded(allocator: std.mem.Allocator, child: Widget) !Widget {
+        return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .fit = .tight } };
+    }
+
+    pub fn expandedFlex(allocator: std.mem.Allocator, child: Widget, flex: f32) !Widget {
+        return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .flex = flex, .fit = .tight } };
+    }
+
+    pub fn flexible(allocator: std.mem.Allocator, child: Widget, flex: f32) !Widget {
+        return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .flex = flex, .fit = .loose } };
+    }
+
+    pub fn rowWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
+        return .{ .row = .{
+            .children = try Widget.allocSlice(allocator, children),
+            .gap = options.gap,
+            .cross_align = options.cross_align,
+            .main_align = options.main_align,
+        } };
+    }
+
+    pub fn columnWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
+        return .{ .column = .{
+            .children = try Widget.allocSlice(allocator, children),
+            .gap = options.gap,
+            .cross_align = options.cross_align,
+            .main_align = options.main_align,
+        } };
+    }
+
     pub fn row(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
         return .{ .row = .{ .children = try Widget.allocSlice(allocator, children), .gap = gap } };
     }
@@ -956,6 +1016,7 @@ pub const Element = struct {
         row,
         column,
         spacer,
+        flexible,
         sized,
         padding,
         center,
@@ -1124,6 +1185,7 @@ pub const RenderNode = struct {
         row,
         column,
         spacer,
+        flexible,
         sized,
         padding,
         center,
@@ -1734,6 +1796,19 @@ pub fn buildElementTreeScoped(
             initialized = true;
             return .{ .kind = .padding, .widget = element_widget, .children = children };
         },
+        .flexible => |flexible_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, flexible_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .flexible, .widget = element_widget, .children = children };
+        },
         .center => |center_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
@@ -2013,6 +2088,9 @@ pub fn updateElementTreeScoped(
         .padding => |padding_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, padding_widget.child, constraints.inset(padding_widget.insets));
         },
+        .flexible => |flexible_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, flexible_widget.child, constraints);
+        },
         .center => |center_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
         },
@@ -2097,6 +2175,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .focus,
         .focus_scope,
         .center,
+        .flexible,
         .component,
         .element,
         .shortcuts,
@@ -2239,6 +2318,7 @@ pub fn refreshInteractionElements(
         .focus,
         .focus_scope,
         .center,
+        .flexible,
         .component,
         .element,
         .shortcuts,
@@ -2348,6 +2428,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .row => .row,
         .column => .column,
         .spacer => .spacer,
+        .flexible => .flexible,
         .sized => .sized,
         .padding => .padding,
         .center => .center,
@@ -2634,10 +2715,11 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .placeholder_foreground = input_widget.placeholder_foreground,
             } };
         },
-        .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align } },
-        .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap, .cross_align = column_widget.cross_align } },
+        .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
+        .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap, .cross_align = column_widget.cross_align, .main_align = column_widget.main_align } },
         .padding => |padding_widget| .{ .padding = padding_widget },
         .center => |center_widget| .{ .center = center_widget },
+        .flexible => |flexible_widget| .{ .flexible = flexible_widget },
         .actions => |actions_widget| .{ .actions = .{
             .bindings = try cloneActionBindings(allocator, actions_widget.bindings),
             .child = actions_widget.child,
@@ -2696,7 +2778,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .element => |custom_element| custom_element.destroy(allocator),
         .actions => |actions_widget| destroyActionBindings(allocator, actions_widget.bindings),
         .shortcuts => |shortcuts_widget| destroyShortcutBindings(allocator, shortcuts_widget.bindings),
-        .box, .row, .column, .padding, .center, .theme, .default_text_style, .component => {},
+        .box, .row, .column, .padding, .center, .flexible, .theme, .default_text_style, .component => {},
     }
 }
 
@@ -3761,6 +3843,18 @@ fn layoutElementInto(
                 },
             });
         },
+        .flexible => {
+            // Outside a row or column a flexible wrapper is a passthrough;
+            // inside one, layoutLinearElements supplies the share as the
+            // constraints and enforces tight fit on the result.
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
+            children[0] = child;
+            commitRenderNode(node, .{
+                .kind = .flexible,
+                .rect = child.rect,
+            });
+        },
         .center => {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             // An unbounded axis centers around the child's own extent.
@@ -3778,8 +3872,8 @@ fn layoutElementInto(
                 .rect = .{ .x = origin.x, .y = origin.y, .width = avail_width, .height = avail_height },
             });
         },
-        .column => |column_widget| try layoutLinearElements(allocator, node, .column, element.children, column_widget.gap, column_widget.cross_align, constraints, origin, measurer),
-        .row => |row_widget| try layoutLinearElements(allocator, node, .row, element.children, row_widget.gap, row_widget.cross_align, constraints, origin, measurer),
+        .column => |column_widget| try layoutLinearElements(allocator, node, .column, element.children, column_widget.gap, column_widget.cross_align, column_widget.main_align, constraints, origin, measurer),
+        .row => |row_widget| try layoutLinearElements(allocator, node, .row, element.children, row_widget.gap, row_widget.cross_align, row_widget.main_align, constraints, origin, measurer),
         .render_object => |render_widget| {
             const measured = try render_widget.layout(.{ .constraints = constraints, .measurer = measurer });
             const size_value = constraints.clamp(measured);
@@ -3793,6 +3887,30 @@ fn layoutElementInto(
     }
 }
 
+fn mainExtent(comptime kind: RenderNode.Kind, child: *const RenderNode) f32 {
+    return switch (kind) {
+        .row => child.rect.width,
+        .column => child.rect.height,
+        else => unreachable,
+    };
+}
+
+fn crossExtent(comptime kind: RenderNode.Kind, child: *const RenderNode) f32 {
+    return switch (kind) {
+        .row => child.rect.height,
+        .column => child.rect.width,
+        else => unreachable,
+    };
+}
+
+fn setMainExtent(comptime kind: RenderNode.Kind, child: *RenderNode, value: f32) void {
+    switch (kind) {
+        .row => child.rect.width = value,
+        .column => child.rect.height = value,
+        else => unreachable,
+    }
+}
+
 fn layoutLinearElements(
     allocator: std.mem.Allocator,
     node: *RenderNode,
@@ -3800,6 +3918,7 @@ fn layoutLinearElements(
     elements: []Element,
     gap: f32,
     cross_align: Widget.CrossAxisAlignment,
+    main_align: Widget.MainAxisAlignment,
     constraints: Constraints,
     origin: Point,
     measurer: TextMeasurer,
@@ -3813,38 +3932,34 @@ fn layoutLinearElements(
     var cross: f32 = 0;
     var total_flex: f32 = 0;
 
+    // Pass 1: intrinsic children establish the fixed extent; spacers and
+    // flexible children only contribute their flex factors.
     for (elements, 0..) |*child_element, index| {
-        if (child_element.widget == .spacer) {
-            total_flex += child_element.widget.spacer.flex;
-            const spacer_node = try ensureRenderNode(allocator, child_element);
-            commitRenderNode(spacer_node, .{
-                .kind = .spacer,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
-            });
-            spacer_node.constraints = constraints;
-            children[index] = spacer_node;
-            continue;
-        }
-
-        // Tentatively lay the child at its previous position; the second
-        // pass moves it to its final slot. This keeps unchanged children in
-        // place instead of thrashing their damage via parent-origin moves.
-        const tentative_origin: Point = if (child_element.render_node) |existing|
-            .{ .x = existing.rect.x, .y = existing.rect.y }
-        else
-            origin;
-        children[index] = try layoutElement(allocator, child_element, constraints, tentative_origin, measurer);
-
-        switch (kind) {
-            .row => {
-                fixed_main += children[index].rect.width;
-                cross = @max(cross, children[index].rect.height);
+        switch (child_element.widget) {
+            .spacer => |spacer_widget| {
+                total_flex += spacer_widget.flex;
+                const spacer_node = try ensureRenderNode(allocator, child_element);
+                commitRenderNode(spacer_node, .{
+                    .kind = .spacer,
+                    .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
+                });
+                spacer_node.constraints = constraints;
+                children[index] = spacer_node;
             },
-            .column => {
-                fixed_main += children[index].rect.height;
-                cross = @max(cross, children[index].rect.width);
+            .flexible => |flexible_widget| total_flex += flexible_widget.flex,
+            else => {
+                // Tentatively lay the child at its previous position; the
+                // positioning pass moves it to its final slot. This keeps
+                // unchanged children in place instead of thrashing their
+                // damage via parent-origin moves.
+                const tentative_origin: Point = if (child_element.render_node) |existing|
+                    .{ .x = existing.rect.x, .y = existing.rect.y }
+                else
+                    origin;
+                children[index] = try layoutElement(allocator, child_element, constraints, tentative_origin, measurer);
+                fixed_main += mainExtent(kind, children[index]);
+                cross = @max(cross, crossExtent(kind, children[index]));
             },
-            else => unreachable,
         }
     }
 
@@ -3853,9 +3968,74 @@ fn layoutLinearElements(
         .column => constraints.max_height,
         else => unreachable,
     };
-    const spare = if (std.math.isFinite(max_main)) @max(0, max_main - fixed_main - total_gap) else 0;
-    var cursor = origin;
-    var main: f32 = 0;
+    const bounded = std.math.isFinite(max_main);
+    const spare = if (bounded) @max(0, max_main - fixed_main - total_gap) else 0;
+
+    // Pass 2: flexible children split the spare space in proportion to
+    // their factors. A tight fit fills its whole share even when the
+    // child lays out smaller, mirroring the cross-axis stretch mechanism.
+    for (elements, 0..) |*child_element, index| {
+        if (child_element.widget != .flexible) continue;
+        const flexible_widget = child_element.widget.flexible;
+        const share = if (total_flex > 0) spare * flexible_widget.flex / total_flex else 0;
+        const child_constraints: Constraints = switch (kind) {
+            .row => .{ .max_width = share, .max_height = constraints.max_height },
+            .column => .{ .max_width = constraints.max_width, .max_height = share },
+            else => unreachable,
+        };
+        const tentative_origin: Point = if (child_element.render_node) |existing|
+            .{ .x = existing.rect.x, .y = existing.rect.y }
+        else
+            origin;
+        children[index] = try layoutElement(allocator, child_element, child_constraints, tentative_origin, measurer);
+        if (flexible_widget.fit == .tight) {
+            setMainExtent(kind, children[index], share);
+            if (children[index].children.len == 1) setMainExtent(kind, children[index].children[0], share);
+        }
+        cross = @max(cross, crossExtent(kind, children[index]));
+    }
+
+    var content_main: f32 = total_gap;
+    for (elements, 0..) |*child_element, index| {
+        if (child_element.widget == .spacer) {
+            content_main += if (total_flex > 0) spare * child_element.widget.spacer.flex / total_flex else 0;
+        } else {
+            content_main += mainExtent(kind, children[index]);
+        }
+    }
+
+    // Flex children or a non-start alignment claim the whole main axis;
+    // otherwise the container shrink-wraps its content as before.
+    const wants_full = bounded and (total_flex > 0 or main_align != .start);
+    const main_size = if (wants_full) max_main else content_main;
+    const leftover = @max(0, main_size - content_main);
+
+    var lead: f32 = 0;
+    var extra_between: f32 = 0;
+    const count: f32 = @floatFromInt(elements.len);
+    switch (main_align) {
+        .start => {},
+        .center => lead = leftover / 2,
+        .end => lead = leftover,
+        .space_between => if (elements.len > 1) {
+            extra_between = leftover / (count - 1);
+        },
+        .space_around => if (elements.len > 0) {
+            lead = leftover / count / 2;
+            extra_between = leftover / count;
+        },
+        .space_evenly => if (elements.len > 0) {
+            lead = leftover / (count + 1);
+            extra_between = leftover / (count + 1);
+        },
+    }
+
+    // Positioning pass.
+    var cursor: Point = switch (kind) {
+        .row => .{ .x = origin.x + lead, .y = origin.y },
+        .column => .{ .x = origin.x, .y = origin.y + lead },
+        else => unreachable,
+    };
     for (elements, 0..) |*child_element, index| {
         const child = children[index];
         if (child_element.widget == .spacer and total_flex > 0) {
@@ -3886,22 +4066,15 @@ fn layoutLinearElements(
         }
 
         switch (kind) {
-            .row => {
-                cursor.x += child.rect.width + gap;
-                main += child.rect.width;
-            },
-            .column => {
-                cursor.y += child.rect.height + gap;
-                main += child.rect.height;
-            },
+            .row => cursor.x += child.rect.width + gap + extra_between,
+            .column => cursor.y += child.rect.height + gap + extra_between,
             else => unreachable,
         }
     }
-    main += total_gap;
 
     const size_value = switch (kind) {
-        .row => constraints.clamp(.{ .width = main, .height = cross }),
-        .column => constraints.clamp(.{ .width = cross, .height = main }),
+        .row => constraints.clamp(.{ .width = main_size, .height = cross }),
+        .column => constraints.clamp(.{ .width = cross, .height = main_size }),
         else => unreachable,
     };
     commitRenderNode(node, .{
@@ -4309,6 +4482,84 @@ test "row spacer takes remaining main-axis space" {
     try std.testing.expectEqual(@as(f32, 100), root.rect.width);
     try std.testing.expectEqual(@as(f32, 84), root.children[1].rect.width);
     try std.testing.expectEqual(@as(f32, 92), root.children[2].rect.x);
+}
+
+test "expanded children split the spare main axis by flex factor" {
+    const allocator = std.testing.allocator;
+
+    const first = try widgets.expandedFlex(allocator, widgets.text("B"), 1);
+    defer allocator.destroy(first.flexible.child);
+    const second = try widgets.expandedFlex(allocator, widgets.text("C"), 2);
+    defer allocator.destroy(second.flexible.child);
+    const children = [_]Widget{ widgets.text("A"), first, second };
+    const row = try widgets.row(allocator, &children, 0);
+    defer allocator.free(row.row.children);
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 98, .max_height = 20 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 98, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // Text A is 8 wide; the 90 spare pixels split 30/60.
+    try std.testing.expectEqual(@as(f32, 98), root.rect.width);
+    try std.testing.expectEqual(@as(f32, 30), root.children[1].rect.width);
+    try std.testing.expectEqual(@as(f32, 60), root.children[2].rect.width);
+    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
+    try std.testing.expectEqual(@as(f32, 38), root.children[2].rect.x);
+    // Tight fit forces the wrapped child to fill the share too.
+    try std.testing.expectEqual(@as(f32, 30), root.children[1].children[0].rect.width);
+}
+
+test "loose flexible keeps its intrinsic size" {
+    const allocator = std.testing.allocator;
+
+    const loose = try widgets.flexible(allocator, widgets.text("B"), 1);
+    defer allocator.destroy(loose.flexible.child);
+    const children = [_]Widget{ widgets.text("A"), loose };
+    const row = try widgets.row(allocator, &children, 0);
+    defer allocator.free(row.row.children);
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // The loose child may use up to its 92px share but stays 8 wide.
+    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.width);
+    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
+    try std.testing.expectEqual(@as(f32, 100), root.rect.width);
+}
+
+test "main axis alignment distributes leftover space" {
+    const allocator = std.testing.allocator;
+
+    const children = [_]Widget{ widgets.text("A"), widgets.text("B") };
+
+    inline for (.{
+        .{ .main_align = Widget.MainAxisAlignment.space_between, .first = 0, .second = 92 },
+        .{ .main_align = Widget.MainAxisAlignment.center, .first = 42, .second = 50 },
+        .{ .main_align = Widget.MainAxisAlignment.end, .first = 84, .second = 92 },
+        .{ .main_align = Widget.MainAxisAlignment.space_evenly, .first = 28, .second = 64 },
+    }) |case| {
+        const row = try widgets.rowWithOptions(allocator, &children, .{ .main_align = case.main_align });
+        defer allocator.free(row.row.children);
+
+        var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer built_arena.deinit();
+        var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+        var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
+        defer destroyElementTree(allocator, &built_element);
+        const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
+
+        // A non-start alignment claims the full 100px main axis.
+        try std.testing.expectEqual(@as(f32, 100), root.rect.width);
+        try std.testing.expectEqual(@as(f32, case.first), root.children[0].rect.x);
+        try std.testing.expectEqual(@as(f32, case.second), root.children[1].rect.x);
+    }
 }
 
 test "row centers children on the cross axis" {

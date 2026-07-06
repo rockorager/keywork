@@ -807,6 +807,42 @@ pub export fn keywork_column(
     return linear(build, children, child_count, gap, .column);
 }
 
+pub export fn keywork_expanded(build: ?*KeyworkBuild, child: ?*KeyworkWidget, flex: f32) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    if (!(flex > 0)) return null;
+    return makeWidget(scope, keywork.widgets.expandedFlex(scope.scope.allocator, child_widget.*, flex) catch return null);
+}
+
+pub export fn keywork_flexible(build: ?*KeyworkBuild, child: ?*KeyworkWidget, flex: f32) callconv(.c) ?*KeyworkWidget {
+    const scope = buildScope(build) orelse return null;
+    const child_widget = widgetFromMaybeHandle(child) orelse return null;
+    if (!(flex > 0)) return null;
+    return makeWidget(scope, keywork.widgets.flexible(scope.scope.allocator, child_widget.*, flex) catch return null);
+}
+
+pub export fn keywork_row_aligned(
+    build: ?*KeyworkBuild,
+    children: ?[*]const ?*KeyworkWidget,
+    child_count: usize,
+    gap: f32,
+    main_align: c_int,
+    cross_align: c_int,
+) callconv(.c) ?*KeyworkWidget {
+    return linearAligned(build, children, child_count, gap, main_align, cross_align, .row);
+}
+
+pub export fn keywork_column_aligned(
+    build: ?*KeyworkBuild,
+    children: ?[*]const ?*KeyworkWidget,
+    child_count: usize,
+    gap: f32,
+    main_align: c_int,
+    cross_align: c_int,
+) callconv(.c) ?*KeyworkWidget {
+    return linearAligned(build, children, child_count, gap, main_align, cross_align, .column);
+}
+
 pub export fn keywork_row(
     build: ?*KeyworkBuild,
     children: ?[*]const ?*KeyworkWidget,
@@ -816,12 +852,26 @@ pub export fn keywork_row(
     return linear(build, children, child_count, gap, .row);
 }
 
+const LinearDirection = enum { row, column };
+
 fn linear(
     build: ?*KeyworkBuild,
     children: ?[*]const ?*KeyworkWidget,
     child_count: usize,
     gap: f32,
-    comptime direction: enum { row, column },
+    comptime direction: LinearDirection,
+) ?*KeyworkWidget {
+    return linearAligned(build, children, child_count, gap, 0, 0, direction);
+}
+
+fn linearAligned(
+    build: ?*KeyworkBuild,
+    children: ?[*]const ?*KeyworkWidget,
+    child_count: usize,
+    gap: f32,
+    main_align: c_int,
+    cross_align: c_int,
+    comptime direction: LinearDirection,
 ) ?*KeyworkWidget {
     const scope = buildScope(build) orelse return null;
     if (child_count > 0 and children == null) return null;
@@ -833,11 +883,36 @@ fn linear(
         const child_widget = widgetFromMaybeHandle(child) orelse return null;
         child_widgets[index] = child_widget.*;
     }
+    const options: keywork.widgets.LinearOptions = .{
+        .gap = gap,
+        .main_align = mainAxisAlignment(main_align),
+        .cross_align = crossAxisAlignment(cross_align),
+    };
     const widget = switch (direction) {
-        .row => keywork.widgets.row(allocator, child_widgets, gap),
-        .column => keywork.widgets.column(allocator, child_widgets, gap),
+        .row => keywork.widgets.rowWithOptions(allocator, child_widgets, options),
+        .column => keywork.widgets.columnWithOptions(allocator, child_widgets, options),
     } catch return null;
     return makeWidget(scope, widget);
+}
+
+fn mainAxisAlignment(value: c_int) keywork.Widget.MainAxisAlignment {
+    return switch (value) {
+        1 => .center,
+        2 => .end,
+        3 => .space_between,
+        4 => .space_around,
+        5 => .space_evenly,
+        else => .start,
+    };
+}
+
+fn crossAxisAlignment(value: c_int) keywork.Widget.CrossAxisAlignment {
+    return switch (value) {
+        1 => .center,
+        2 => .end,
+        3 => .stretch,
+        else => .start,
+    };
 }
 
 fn makeContext(allocator: std.mem.Allocator, context: keywork.AppContext) !KeyworkContext {

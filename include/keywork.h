@@ -85,6 +85,22 @@ enum keywork_scroll_axes {
     KEYWORK_SCROLL_BOTH = 2,
 };
 
+enum keywork_main_align {
+    KEYWORK_MAIN_ALIGN_START = 0,
+    KEYWORK_MAIN_ALIGN_CENTER = 1,
+    KEYWORK_MAIN_ALIGN_END = 2,
+    KEYWORK_MAIN_ALIGN_SPACE_BETWEEN = 3,
+    KEYWORK_MAIN_ALIGN_SPACE_AROUND = 4,
+    KEYWORK_MAIN_ALIGN_SPACE_EVENLY = 5,
+};
+
+enum keywork_cross_align {
+    KEYWORK_CROSS_ALIGN_START = 0,
+    KEYWORK_CROSS_ALIGN_CENTER = 1,
+    KEYWORK_CROSS_ALIGN_END = 2,
+    KEYWORK_CROSS_ALIGN_STRETCH = 3,
+};
+
 struct keywork_app_vtable {
     keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
     keywork_install_event_sources_callback_t install_event_sources;
@@ -180,6 +196,12 @@ keywork_widget_t *keywork_keyed_string(keywork_build_t *build, const char *key, 
 keywork_widget_t *keywork_keyed_int(keywork_build_t *build, uint64_t key, keywork_widget_t *child);
 keywork_widget_t *keywork_column(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
 keywork_widget_t *keywork_row(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
+keywork_widget_t *keywork_column_aligned(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap, enum keywork_main_align main_align, enum keywork_cross_align cross_align);
+keywork_widget_t *keywork_row_aligned(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap, enum keywork_main_align main_align, enum keywork_cross_align cross_align);
+/* An expanded child fills its share of the row/column main axis; a
+ * flexible child may be smaller. Shares are proportional to flex. */
+keywork_widget_t *keywork_expanded(keywork_build_t *build, keywork_widget_t *child, float flex);
+keywork_widget_t *keywork_flexible(keywork_build_t *build, keywork_widget_t *child, float flex);
 
 #ifdef __cplusplus
 }
