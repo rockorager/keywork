@@ -54,7 +54,7 @@ static keywork_widget_t *build(void *userdata, keywork_build_t *build, const str
     keywork_widget_t *list = keywork_sized(build, items, -1.0f, 96.0f);
     keywork_widget_t *status_row = keywork_text(build, context->color_scheme);
     keywork_widget_t *children[] = {
-        keywork_colored_text(build, "C app hosted by libkeywork", 0xff265eb2u),
+        keywork_colored_text(build, "C app hosted by libkeywork", 0xff0090ffu),
         keywork_text(build, count_label),
         panel,
         status,
@@ -115,8 +115,8 @@ static int progress_paint(void *userdata, keywork_display_list_t *display_list, 
     const float fraction = (float)(state->count % 10u) / 9.0f;
     struct keywork_rect fill = rect;
     fill.width *= fraction;
-    return keywork_display_list_fill_rect(display_list, rect, 0xffc9e3ffu) &&
-        keywork_display_list_fill_rect(display_list, fill, 0xff265eb2u);
+    return keywork_display_list_fill_rect(display_list, rect, 0xffd5efffu) &&
+        keywork_display_list_fill_rect(display_list, fill, 0xff0090ffu);
 }
 
 struct status_state {
@@ -162,7 +162,7 @@ static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, con
     snprintf(label, sizeof(label), "custom C element: count=%u max-width=%.0f", app->count, context->constraints.max_width);
     keywork_widget_t *text = keywork_colored_text(build, label, 0xffffffffu);
     keywork_widget_t *padded = keywork_padding(build, 8.0f, text);
-    return keywork_box(build, padded, 0xff265eb2u);
+    return keywork_box(build, padded, 0xff0090ffu);
 }
 
 int main(void) {

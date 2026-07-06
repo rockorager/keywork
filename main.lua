@@ -29,9 +29,9 @@ local App = ui.stateful({
         ui.row({
           spacing = 8,
           children = {
-            ui.box({ background = 0xffc9e3ff }, ui.padding({ all = 6, child = ui.text("fixed") })),
-            ui.expanded(ui.box({ background = 0xff2e7d32 }, ui.padding({ all = 6, child = ui.text("flex 1") }))),
-            ui.expanded(ui.box({ background = 0xffc62828 }, ui.padding({ all = 6, child = ui.text("flex 2") })), 2),
+            ui.box({ background = 0xffd5efff }, ui.padding({ all = 6, child = ui.text("fixed") })),
+            ui.expanded(ui.box({ background = 0xffd6f1df }, ui.padding({ all = 6, child = ui.text("flex 1") }))),
+            ui.expanded(ui.box({ background = 0xffffdbdc }, ui.padding({ all = 6, child = ui.text("flex 2") })), 2),
           },
         }),
         ui.row({

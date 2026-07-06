@@ -18,9 +18,27 @@ pub const colors = struct {
     pub const transparent: Color = Color.argb(0x00, 0x00, 0x00, 0x00);
     pub const white: Color = Color.argb(0xff, 0xff, 0xff, 0xff);
     pub const black: Color = Color.argb(0xff, 0x00, 0x00, 0x00);
-    pub const ink: Color = Color.argb(0xff, 0x0c, 0x0e, 0x12);
-    pub const panel: Color = Color.argb(0xff, 0xf5, 0xf6, 0xfa);
-    pub const accent: Color = Color.argb(0xff, 0x26, 0x5e, 0xb2);
+
+    pub const slate1: Color = Color.argb(0xff, 0xfc, 0xfc, 0xfd);
+    pub const slate2: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
+    pub const slate3: Color = Color.argb(0xff, 0xf0, 0xf0, 0xf3);
+    pub const slate7: Color = Color.argb(0xff, 0xcd, 0xce, 0xd6);
+    pub const slate11: Color = Color.argb(0xff, 0x60, 0x64, 0x6c);
+    pub const slate12: Color = Color.argb(0xff, 0x1c, 0x20, 0x24);
+
+    pub const slate_dark1: Color = Color.argb(0xff, 0x11, 0x11, 0x13);
+    pub const slate_dark2: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
+    pub const slate_dark3: Color = Color.argb(0xff, 0x21, 0x22, 0x25);
+    pub const slate_dark7: Color = Color.argb(0xff, 0x43, 0x48, 0x4e);
+    pub const slate_dark11: Color = Color.argb(0xff, 0xb0, 0xb4, 0xba);
+    pub const slate_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
+
+    pub const blue9: Color = Color.argb(0xff, 0x00, 0x90, 0xff);
+    pub const red9: Color = Color.argb(0xff, 0xe5, 0x48, 0x4d);
+
+    pub const ink: Color = slate12;
+    pub const panel: Color = slate2;
+    pub const accent: Color = blue9;
 };
 
 pub const Brightness = enum {
@@ -44,32 +62,32 @@ pub const ColorScheme = struct {
 
     pub const light: ColorScheme = .{
         .brightness = .light,
-        .background = colors.panel,
+        .background = colors.slate2,
         .foreground = colors.ink,
         .primary = colors.accent,
-        .on_primary = colors.panel,
-        .surface = colors.white,
+        .on_primary = colors.white,
+        .surface = colors.slate1,
         .surface_high = colors.white,
-        .surface_low = Color.argb(0xff, 0xe8, 0xed, 0xf5),
-        .border = Color.argb(0xff, 0xc4, 0xcc, 0xd8),
-        .muted = Color.argb(0xff, 0x5d, 0x66, 0x75),
-        .error_color = Color.argb(0xff, 0xad, 0x41, 0x43),
+        .surface_low = colors.slate3,
+        .border = colors.slate7,
+        .muted = colors.slate11,
+        .error_color = colors.red9,
         .on_error = colors.white,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
-        .background = colors.ink,
-        .foreground = colors.panel,
-        .primary = Color.argb(0xff, 0x6c, 0xac, 0xff),
-        .on_primary = colors.ink,
-        .surface = Color.argb(0xff, 0x14, 0x18, 0x20),
-        .surface_high = Color.argb(0xff, 0x1c, 0x23, 0x30),
-        .surface_low = Color.argb(0xff, 0x08, 0x0a, 0x0d),
-        .border = Color.argb(0xff, 0x34, 0x41, 0x54),
-        .muted = Color.argb(0xff, 0xa7, 0xaf, 0xbd),
-        .error_color = Color.argb(0xff, 0xff, 0x8e, 0x8c),
-        .on_error = colors.ink,
+        .background = colors.slate_dark1,
+        .foreground = colors.slate_dark12,
+        .primary = colors.blue9,
+        .on_primary = colors.black,
+        .surface = colors.slate_dark2,
+        .surface_high = colors.slate_dark3,
+        .surface_low = colors.slate_dark1,
+        .border = colors.slate_dark7,
+        .muted = colors.slate_dark11,
+        .error_color = colors.red9,
+        .on_error = colors.black,
     };
 };
 

@@ -1,9 +1,9 @@
 local ui = require("ui")
 
 local colors = {
-  background = 0xff0c0e12,
-  text = 0xfff5f6fa,
-  accent = 0xff6cacff,
+  background = 0xff111113,
+  text = 0xffedeef0,
+  accent = 0xff0090ff,
 }
 
 -- Run with:
