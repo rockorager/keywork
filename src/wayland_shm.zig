@@ -51,6 +51,8 @@ pub const Backend = struct {
     frame_context: ?*anyopaque,
     frame_callback: ?*wl.Callback,
     frame_done_pending: bool,
+    extra_surfaces: std.ArrayList(ExtraSurface),
+    outputs: std.ArrayList(OutputRef),
 
     pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -89,6 +91,7 @@ pub const Backend = struct {
     };
 
     const Globals = struct {
+        allocator: std.mem.Allocator,
         compositor: ?*wl.Compositor = null,
         shm: ?*wl.Shm = null,
         wm_base: ?*xdg.WmBase = null,
@@ -97,6 +100,41 @@ pub const Backend = struct {
         fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
         cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
         seat: ?*wl.Seat = null,
+        outputs: std.ArrayList(OutputRef) = .empty,
+    };
+
+    const OutputRef = struct {
+        global_name: u32,
+        output: *wl.Output,
+    };
+
+    const ExtraSurface = struct {
+        backend: ?*Backend = null,
+        surface: *wl.Surface,
+        viewport: ?*wp.Viewport,
+        fractional_scale: ?*wp.FractionalScaleV1,
+        shell_role: ShellRole,
+        buffers: std.ArrayList(*Buffer) = .empty,
+        last_rendered: ?*Buffer = null,
+        configured: bool = false,
+        closed: bool = false,
+        width: u31,
+        height: u31,
+        scale: f32 = 1,
+        scale_changed: bool = false,
+        repaint_pending: bool = false,
+        frame_callback: ?*wl.Callback = null,
+        frame_done_pending: bool = false,
+
+        fn destroy(self: *ExtraSurface, allocator: std.mem.Allocator) void {
+            if (self.frame_callback) |callback| callback.destroy();
+            for (self.buffers.items) |buffer| buffer.destroy(allocator);
+            self.buffers.deinit(allocator);
+            if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
+            if (self.viewport) |viewport| viewport.destroy();
+            self.shell_role.destroy();
+            self.surface.destroy();
+        }
     };
 
     pub fn create(allocator: std.mem.Allocator, options: Options) !*Backend {
@@ -104,7 +142,8 @@ pub const Backend = struct {
         errdefer display.disconnect();
 
         const registry = try display.getRegistry();
-        var globals: Globals = .{};
+        var globals: Globals = .{ .allocator = allocator };
+        errdefer releaseOutputs(allocator, &globals.outputs);
         registry.setListener(*Globals, registryListener, &globals);
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
@@ -116,14 +155,39 @@ pub const Backend = struct {
         const fractional_scale_manager = globals.fractional_scale_manager;
         const cursor_shape_manager = globals.cursor_shape_manager;
 
+        const all_outputs = if (options.layer_shell) |layer_options| layer_options.output == .all else false;
+        if (all_outputs and globals.outputs.items.len == 0) return error.NoWlOutput;
+        const primary_output = if (all_outputs) globals.outputs.items[0].output else null;
+
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
-        const shell_role = try createShellRole(surface, wm_base, layer_shell, options);
+        const shell_role = try createShellRole(surface, primary_output, wm_base, layer_shell, options);
         errdefer shell_role.destroy();
         const viewport = if (viewporter) |manager| try manager.getViewport(surface) else null;
         errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
         const fractional_scale = if (fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
         errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+
+        var extra_surfaces: std.ArrayList(ExtraSurface) = .empty;
+        errdefer {
+            for (extra_surfaces.items) |*extra| extra.destroy(allocator);
+            extra_surfaces.deinit(allocator);
+        }
+        if (all_outputs) {
+            for (globals.outputs.items[1..]) |output_ref| {
+                const extra = try createExtraSurface(
+                    allocator,
+                    compositor,
+                    output_ref.output,
+                    wm_base,
+                    layer_shell,
+                    viewporter,
+                    fractional_scale_manager,
+                    options,
+                );
+                try extra_surfaces.append(allocator, extra);
+            }
+        }
 
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
@@ -163,6 +227,8 @@ pub const Backend = struct {
             .frame_context = null,
             .frame_callback = null,
             .frame_done_pending = false,
+            .extra_surfaces = extra_surfaces,
+            .outputs = globals.outputs,
         };
 
         if (wm_base) |base| base.setListener(*Backend, wmBaseListener, self);
@@ -174,6 +240,15 @@ pub const Backend = struct {
             .layer => |role| role.surface.setListener(*Backend, layerSurfaceListener, self),
         }
         if (fractional_scale) |surface_scale| surface_scale.setListener(*Backend, fractionalScaleListener, self);
+        for (self.extra_surfaces.items) |*extra| {
+            extra.backend = self;
+            switch (extra.shell_role) {
+                .xdg => unreachable,
+                .layer => |role| role.surface.setListener(*ExtraSurface, extraLayerSurfaceListener, extra),
+            }
+            if (extra.fractional_scale) |surface_scale| surface_scale.setListener(*ExtraSurface, extraFractionalScaleListener, extra);
+            extra.surface.commit();
+        }
         self.input.attachListeners(Backend, self);
         surface.commit();
 
@@ -184,6 +259,8 @@ pub const Backend = struct {
         if (self.frame_callback) |callback| callback.destroy();
         for (self.buffers.items) |buffer| buffer.destroy(self.allocator);
         self.buffers.deinit(self.allocator);
+        for (self.extra_surfaces.items) |*extra| extra.destroy(self.allocator);
+        self.extra_surfaces.deinit(self.allocator);
         self.text_renderer.deinit();
         self.input.deinit();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
@@ -197,6 +274,7 @@ pub const Backend = struct {
         if (self.wm_base) |wm_base| wm_base.destroy();
         self.shm.destroy();
         self.compositor.destroy();
+        releaseOutputs(self.allocator, &self.outputs);
         self.registry.destroy();
         self.display.disconnect();
         self.allocator.destroy(self);
@@ -205,6 +283,62 @@ pub const Backend = struct {
     pub fn renderBackend(self: *Backend) keywork.RenderBackend {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
     }
+
+    pub fn outputCount(self: *const Backend) usize {
+        return 1 + self.extra_surfaces.items.len;
+    }
+
+    pub fn outputSize(self: *const Backend, index: usize) keywork.Size {
+        if (index == 0) return self.currentSize();
+        const extra = &self.extra_surfaces.items[index - 1];
+        return .{ .width = @floatFromInt(extra.width), .height = @floatFromInt(extra.height) };
+    }
+
+    pub fn renderBackendForOutput(self: *Backend, index: usize) OutputRenderBackend {
+        return .{ .backend = self, .index = index };
+    }
+
+    pub const OutputRenderBackend = struct {
+        backend: *Backend,
+        index: usize,
+
+        pub fn backendInterface(self: *OutputRenderBackend) keywork.RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = presentOutput, .measure_text = measureTextOutput, .scale = scaleOutput } };
+        }
+
+        fn presentOutput(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
+            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
+            while (!self.backend.allConfigured() and !self.backend.allClosed()) {
+                if (self.backend.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            }
+            if (self.index == 0) {
+                if (self.backend.closed) return false;
+                const pending = try self.backend.presentPrimary(frame);
+                _ = self.backend.display.flush();
+                return pending;
+            }
+            const extra = &self.backend.extra_surfaces.items[self.index - 1];
+            if (extra.closed) return false;
+            const pending = try self.backend.presentExtra(extra, frame);
+            _ = self.backend.display.flush();
+            return pending;
+        }
+
+        fn measureTextOutput(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
+            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
+            return self.backend.text_renderer.measure(self.scale(), value, style);
+        }
+
+        fn scaleOutput(ptr: *anyopaque) f32 {
+            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
+            return self.scale();
+        }
+
+        fn scale(self: *const OutputRenderBackend) f32 {
+            if (self.index == 0) return self.backend.scale;
+            return self.backend.extra_surfaces.items[self.index - 1].scale;
+        }
+    };
 
     pub fn setPointerButtonHandler(self: *Backend, context: *anyopaque, handler: PointerButtonHandler) void {
         self.input.setPointerButtonHandler(context, handler);
@@ -254,10 +388,10 @@ pub const Backend = struct {
     }
 
     pub fn waitForInitialConfigure(self: *Backend) !keywork.Size {
-        while (!self.configured and !self.closed) {
+        while (!self.allConfigured() and !self.allClosed()) {
             if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
         }
-        if (self.closed) return error.WindowClosed;
+        if (self.allClosed()) return error.WindowClosed;
         self.flushPending();
         return self.currentSize();
     }
@@ -289,18 +423,28 @@ pub const Backend = struct {
 
         if (self.display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
         self.flushPending();
-        return !self.closed;
+        return !self.allClosed();
     }
 
     fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
-        if (self.closed) return error.WindowClosed;
+        if (self.allClosed()) return error.WindowClosed;
 
-        while (!self.configured and !self.closed) {
+        while (!self.allConfigured() and !self.allClosed()) {
             if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
         }
-        if (self.closed) return error.WindowClosed;
+        if (self.allClosed()) return error.WindowClosed;
 
+        var frame_pending = false;
+        if (!self.closed) frame_pending = try self.presentPrimary(frame) or frame_pending;
+        for (self.extra_surfaces.items) |*extra| {
+            if (!extra.closed) frame_pending = try self.presentExtra(extra, frame) or frame_pending;
+        }
+        _ = self.display.flush();
+        return frame_pending;
+    }
+
+    fn presentPrimary(self: *Backend, frame: keywork.RenderBackend.Frame) !bool {
         const logical_width = try frameLogicalWidth(frame, self.width);
         const logical_height = try frameLogicalHeight(frame, self.height);
         const width = try scaledFrameDimension(logical_width, self.scale);
@@ -325,7 +469,25 @@ pub const Backend = struct {
         if (self.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
         self.surface.commit();
         buffer.busy = true;
-        _ = self.display.flush();
+        return true;
+    }
+
+    fn presentExtra(self: *Backend, extra: *ExtraSurface, frame: keywork.RenderBackend.Frame) !bool {
+        const logical_width = try frameLogicalWidth(frame, extra.width);
+        const logical_height = try frameLogicalHeight(frame, extra.height);
+        const width = try scaledFrameDimension(logical_width, extra.scale);
+        const height = try scaledFrameDimension(logical_height, extra.scale);
+        const buffer = try self.acquireExtraBuffer(extra, width, height);
+        try rasterize(&self.text_renderer, buffer.pixels(), width, height, extra.scale, frame.display_list, null);
+        extra.last_rendered = buffer;
+
+        try self.armExtraFrameCallback(extra);
+        extra.surface.attach(buffer.wl_buffer, 0, 0);
+        extra.surface.damageBuffer(0, 0, width, height);
+        extra.surface.setBufferScale(1);
+        if (extra.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
+        extra.surface.commit();
+        buffer.busy = true;
         return true;
     }
 
@@ -356,11 +518,22 @@ pub const Backend = struct {
             self.scale_changed = false;
             self.queueRepaint();
         }
+        for (self.extra_surfaces.items) |*extra| {
+            if (extra.scale_changed) {
+                extra.scale_changed = false;
+                extra.repaint_pending = true;
+            }
+            if (extra.repaint_pending) {
+                extra.repaint_pending = false;
+                self.queueRepaint();
+            }
+        }
         if (self.repaint_pending) {
             self.repaint_pending = false;
             self.notifyRepaint();
         }
         self.dispatchFrameDone();
+        for (self.extra_surfaces.items) |*extra| self.dispatchExtraFrameDone(extra);
     }
 
     fn armFrameCallback(self: *Backend) !void {
@@ -384,6 +557,46 @@ pub const Backend = struct {
         if (!self.frame_done_pending) return;
         self.frame_done_pending = false;
         if (self.frame_handler) |handler| handler(self.frame_context.?);
+    }
+
+    fn armExtraFrameCallback(self: *Backend, extra: *ExtraSurface) !void {
+        _ = self;
+        if (extra.frame_callback != null) return;
+        const callback = try extra.surface.frame();
+        callback.setListener(*ExtraSurface, extraFrameListener, extra);
+        extra.frame_callback = callback;
+    }
+
+    fn extraFrameListener(callback: *wl.Callback, event: wl.Callback.Event, extra: *ExtraSurface) void {
+        switch (event) {
+            .done => {
+                if (extra.frame_callback == callback) extra.frame_callback = null;
+                callback.destroy();
+                extra.frame_done_pending = true;
+            },
+        }
+    }
+
+    fn dispatchExtraFrameDone(self: *Backend, extra: *ExtraSurface) void {
+        if (!extra.frame_done_pending) return;
+        extra.frame_done_pending = false;
+        if (self.frame_handler) |handler| handler(self.frame_context.?);
+    }
+
+    fn allConfigured(self: *const Backend) bool {
+        if (!self.closed and !self.configured) return false;
+        for (self.extra_surfaces.items) |*extra| {
+            if (!extra.closed and !extra.configured) return false;
+        }
+        return true;
+    }
+
+    fn allClosed(self: *const Backend) bool {
+        if (!self.closed) return false;
+        for (self.extra_surfaces.items) |*extra| {
+            if (!extra.closed) return false;
+        }
+        return true;
     }
 
     /// Returns the pixel region that must be re-rasterized, or null when a
@@ -422,15 +635,36 @@ pub const Backend = struct {
         return buffer;
     }
 
+    fn acquireExtraBuffer(self: *Backend, extra: *ExtraSurface, width: u31, height: u31) !*Buffer {
+        var index: usize = 0;
+        while (index < extra.buffers.items.len) {
+            const buffer = extra.buffers.items[index];
+            if (buffer.busy) {
+                index += 1;
+                continue;
+            }
+            if (buffer.width == width and buffer.height == height) return buffer;
+            if (extra.last_rendered == buffer) extra.last_rendered = null;
+            buffer.destroy(self.allocator);
+            _ = extra.buffers.swapRemove(index);
+        }
+
+        const buffer = try Buffer.create(self.allocator, self.shm, width, height);
+        errdefer buffer.destroy(self.allocator);
+        try extra.buffers.append(self.allocator, buffer);
+        return buffer;
+    }
+
     fn createShellRole(
         surface: *wl.Surface,
+        output: ?*wl.Output,
         wm_base: ?*xdg.WmBase,
         layer_shell: ?*zwlr.LayerShellV1,
         options: Options,
     ) !ShellRole {
         if (options.layer_shell) |layer_options| {
             const shell = layer_shell orelse return error.NoLayerShell;
-            const layer_surface = try shell.getLayerSurface(surface, null, layer(layer_options.layer), layer_options.namespace);
+            const layer_surface = try shell.getLayerSurface(surface, output, layer(layer_options.layer), layer_options.namespace);
             errdefer layer_surface.destroy();
             layer_surface.setSize(options.width, options.height);
             layer_surface.setAnchor(anchor(layer_options.anchors));
@@ -453,6 +687,36 @@ pub const Backend = struct {
         toplevel.setAppId(options.app_id);
         toplevel.setTitle(options.title);
         return .{ .xdg = .{ .surface = xdg_surface, .toplevel = toplevel } };
+    }
+
+    fn createExtraSurface(
+        allocator: std.mem.Allocator,
+        compositor: *wl.Compositor,
+        output: *wl.Output,
+        wm_base: ?*xdg.WmBase,
+        layer_shell: ?*zwlr.LayerShellV1,
+        viewporter: ?*wp.Viewporter,
+        fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
+        options: Options,
+    ) !ExtraSurface {
+        _ = allocator;
+        const surface = try compositor.createSurface();
+        errdefer surface.destroy();
+        const shell_role = try createShellRole(surface, output, wm_base, layer_shell, options);
+        errdefer shell_role.destroy();
+        const viewport = if (viewporter) |manager| try manager.getViewport(surface) else null;
+        errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
+        const fractional_scale = if (fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
+        errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+
+        return .{
+            .surface = surface,
+            .viewport = viewport,
+            .fractional_scale = fractional_scale,
+            .shell_role = shell_role,
+            .width = options.width,
+            .height = options.height,
+        };
     }
 
     fn layer(value: keywork.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
@@ -500,10 +764,21 @@ pub const Backend = struct {
                     globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
                 } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                     globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+                } else if (std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
+                    const output = registry.bind(global.name, wl.Output, @min(global.version, 4)) catch return;
+                    globals.outputs.append(globals.allocator, .{ .global_name = global.name, .output = output }) catch {
+                        output.release();
+                        return;
+                    };
                 }
             },
             .global_remove => {},
         }
+    }
+
+    fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRef)) void {
+        for (outputs.items) |output_ref| output_ref.output.release();
+        outputs.deinit(allocator);
     }
 
     fn fractionalScaleListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1.Event, self: *Backend) void {
@@ -545,6 +820,32 @@ pub const Backend = struct {
                 self.queueRepaint();
             },
             .closed => self.closed = true,
+        }
+    }
+
+    fn extraLayerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, extra: *ExtraSurface) void {
+        switch (event) {
+            .configure => |configure| {
+                layer_surface.ackConfigure(configure.serial);
+                if (configure.width > 0) extra.width = @intCast(configure.width);
+                if (configure.height > 0) extra.height = @intCast(configure.height);
+                extra.configured = true;
+                extra.repaint_pending = true;
+            },
+            .closed => extra.closed = true,
+        }
+    }
+
+    fn extraFractionalScaleListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1.Event, extra: *ExtraSurface) void {
+        switch (event) {
+            .preferred_scale => |preferred| {
+                if (preferred.scale == 0) return;
+                const scale = @as(f32, @floatFromInt(preferred.scale)) / 120.0;
+                if (scale == extra.scale) return;
+                extra.scale = scale;
+                extra.scale_changed = true;
+                log.info("fractional scale {d}", .{scale});
+            },
         }
     }
 

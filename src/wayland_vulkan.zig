@@ -266,6 +266,10 @@ pub const Backend = struct {
     };
 
     pub fn create(allocator: std.mem.Allocator, options: Options) !*Backend {
+        if (options.layer_shell) |layer_options| {
+            if (layer_options.output == .all) return error.UnsupportedLayerShellAllOutputs;
+        }
+
         const display = try wl.Display.connect(null);
         errdefer display.disconnect();
 

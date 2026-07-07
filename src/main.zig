@@ -149,6 +149,9 @@ fn selectedRunOptions(init: std.process.Init, allocator: std.mem.Allocator) !Sel
         } else if (std.mem.startsWith(u8, arg, "--keyboard=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
             result.layer_shell.?.keyboard_interactivity = parseKeyboardInteractivity(arg["--keyboard=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--output=")) {
+            if (result.layer_shell == null) result.layer_shell = .{};
+            result.layer_shell.?.output = parseLayerShellOutput(arg["--output=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--width=")) {
             result.width = std.fmt.parseFloat(f32, arg["--width=".len..]) catch result.width;
         } else if (std.mem.startsWith(u8, arg, "--height=")) {
@@ -184,6 +187,11 @@ fn parseKeyboardInteractivity(value: []const u8) keywork.LayerShellOptions.Keybo
     if (std.mem.eql(u8, value, "exclusive")) return .exclusive;
     if (std.mem.eql(u8, value, "on-demand") or std.mem.eql(u8, value, "on_demand")) return .on_demand;
     return .none;
+}
+
+fn parseLayerShellOutput(value: []const u8) keywork.LayerShellOptions.Output {
+    if (std.mem.eql(u8, value, "all")) return .all;
+    return .compositor_default;
 }
 
 test {

@@ -191,6 +191,7 @@ pub const LayerShellOptions = struct {
     exclusive_zone: i32 = 0,
     margin: Margin = .{},
     keyboard_interactivity: KeyboardInteractivity = .none,
+    output: Output = .compositor_default,
 
     pub const Layer = enum {
         background,
@@ -217,6 +218,11 @@ pub const LayerShellOptions = struct {
         none,
         exclusive,
         on_demand,
+    };
+
+    pub const Output = enum {
+        compositor_default,
+        all,
     };
 };
 

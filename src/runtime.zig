@@ -48,6 +48,10 @@ pub const Runtime = struct {
     state_rebuild_pending: bool = false,
     frame_pending: bool = false,
     rendering: bool = false,
+    repaint_scheduler: ?RepaintScheduler = null,
+    repaint_scheduler_context: ?*anyopaque = null,
+
+    pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
 
     pub const State = AppContext;
 
@@ -104,7 +108,16 @@ pub const Runtime = struct {
 
     pub fn requestRepaint(self: *Runtime) !void {
         self.repaint_pending = true;
+        if (self.repaint_scheduler) |scheduler| {
+            try scheduler(self.repaint_scheduler_context.?);
+            return;
+        }
         if (!self.frame_pending and !self.rendering) try self.presentFrame();
+    }
+
+    pub fn setRepaintScheduler(self: *Runtime, context: *anyopaque, scheduler: RepaintScheduler) void {
+        self.repaint_scheduler_context = context;
+        self.repaint_scheduler = scheduler;
     }
 
     pub fn invalidate(self: *Runtime) !void {
@@ -171,7 +184,13 @@ pub const Runtime = struct {
 
     fn frameDone(self: *Runtime) !void {
         self.frame_pending = false;
-        if (self.repaint_pending) try self.presentFrame();
+        if (self.repaint_pending) {
+            if (self.repaint_scheduler) |scheduler| {
+                try scheduler(self.repaint_scheduler_context.?);
+            } else {
+                try self.presentFrame();
+            }
+        }
     }
 
     pub fn click(self: *Runtime, point: Point) !void {

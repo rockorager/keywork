@@ -2213,6 +2213,17 @@ fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) keywork.Lay
         };
     }
 
+    if (checkStringField(lua_state, table_index, "output")) |name| {
+        options.output = if (std.mem.eql(u8, name, "all"))
+            .all
+        else if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "compositor_default"))
+            .compositor_default
+        else {
+            _ = c.luaL_error(lua_state, "unknown layer-shell output '%s' (expected default or all)", name.ptr);
+            unreachable;
+        };
+    }
+
     return options;
 }
 

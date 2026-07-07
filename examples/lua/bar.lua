@@ -11,6 +11,7 @@ keywork.window({
     layer = "top",
     anchor = { "top", "left", "right" },
     exclusive_zone = 32,
+    output = "all",
   },
 })
 
