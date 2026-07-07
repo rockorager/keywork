@@ -91,6 +91,8 @@ const ImageOptions = struct {
 const ParseContext = struct {
     icon: IconOptions = .{},
     icon_cache: ?*keywork.icon_theme.Cache = null,
+    /// Render scale used to select icon files at physical resolution.
+    icon_scale: f32 = 1,
 
     fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
         return .{
@@ -107,6 +109,7 @@ const ParseContext = struct {
                 .color = options.color orelse self.icon.color,
             },
             .icon_cache = self.icon_cache,
+            .icon_scale = self.icon_scale,
         };
     }
 };
@@ -462,14 +465,39 @@ const LuaImage = struct {
     fn paint(ptr: *const anyopaque, context: keywork.Widget.RenderObject.PaintContext) !void {
         const self: *const LuaImage = @ptrCast(@alignCast(ptr));
         if (context.rect.width <= 0 or context.rect.height <= 0) return;
-        const pixels = try context.allocator.dupe(keywork.Color, self.pixels);
+        if (self.width == 0 or self.height == 0) return;
+
+        // The renderer blits image pixels 1:1 at physical resolution, so
+        // the source must be resampled to rect * scale (like svg_icon).
+        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
+        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.width * render_scale))));
+        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.height * render_scale))));
+
+        var hasher = std.hash.Wyhash.init(self.cache_key);
+        hasher.update(std.mem.asBytes(&target_width));
+        hasher.update(std.mem.asBytes(&target_height));
+        const cache_key = hasher.final();
+
+        if (context.display_list.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+            try context.display_list.colorImage(
+                context.allocator,
+                context.rect,
+                target_width,
+                target_height,
+                @constCast(cached),
+                cache_key,
+            );
+            return;
+        }
+
+        const pixels = try resampledPixels(context.allocator, self.pixels, self.width, self.height, target_width, target_height);
         try context.display_list.colorImage(
             context.allocator,
             context.rect,
-            self.width,
-            self.height,
+            target_width,
+            target_height,
             pixels,
-            self.cache_key,
+            cache_key,
         );
     }
 
@@ -603,9 +631,18 @@ pub const App = struct {
     pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
         try self.ensureLoaded();
 
+        const icon_scale: f32 = blk: {
+            const runtime = self.runtime orelse break :blk 1;
+            const value = runtime.backend.scale();
+            break :blk if (std.math.isFinite(value) and value > 0) value else 1;
+        };
+
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
-        const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{ .icon_cache = &self.icon_cache }, -1);
+        const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{
+            .icon_cache = &self.icon_cache,
+            .icon_scale = icon_scale,
+        }, -1);
         c.lua_settop(self.state, 0);
         // A bounded incremental step keeps garbage from widget-table churn
         // paced across builds; a full collection here would stall every
@@ -2969,16 +3006,19 @@ fn parseWidget(
         const icon = parse_context.resolveIcon(options);
         const name = try stringField(lua_state, table, "name");
         const fallback_color = icon.color orelse keywork.colors.ink;
+        // Select the icon file for the physical pixel size so HiDPI
+        // outputs get the sharper large variant; widgets stay logical.
+        const lookup_size = icon.size * parse_context.icon_scale;
         if (parse_context.icon_cache) |cache| {
             // The cache owns the path and tombstones misses, so absent
             // icons neither re-walk the theme tree nor warn again.
-            const icon_file = try cache.lookup(name, icon.size) orelse return missingIconWidget(allocator, fallback_color);
+            const icon_file = try cache.lookup(name, lookup_size) orelse return missingIconWidget(allocator, fallback_color);
             return switch (icon_file.format) {
                 .svg => keywork.svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
                 .png => pngIconWidget(allocator, icon_file.path, icon.size),
             };
         }
-        const icon_file = try keywork.icon_theme.lookupIconSized(allocator, name, icon.size) orelse {
+        const icon_file = try keywork.icon_theme.lookupIconSized(allocator, name, lookup_size) orelse {
             std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
             return missingIconWidget(allocator, fallback_color);
         };
@@ -3069,42 +3109,22 @@ fn pngIconWidget(allocator: std.mem.Allocator, path: []const u8, size: f32) !key
     defer keywork.image_c.stbi_image_free(source_pixels);
     if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
 
-    const target_size = positiveImageSize(size);
-    const target_byte_count = target_size * target_size * 4;
-    const target_rgba = try allocator.alloc(u8, target_byte_count);
-    defer allocator.free(target_rgba);
-
-    if (source_width == target_size and source_height == target_size) {
-        const source_len: usize = @intCast(source_width * source_height * 4);
-        @memcpy(target_rgba, source_pixels[0..source_len]);
-    } else if (keywork.image_c.stbir_resize_uint8(
-        source_pixels,
-        source_width,
-        source_height,
-        0,
-        target_rgba.ptr,
-        @intCast(target_size),
-        @intCast(target_size),
-        0,
-        4,
-    ) == 0) {
-        return error.InvalidPng;
-    }
-
-    const pixels = try allocator.alloc(keywork.Color, target_size * target_size);
+    // Keep the source at native resolution; paint resamples straight to
+    // the physical target so the pixels are only interpolated once.
+    const pixel_count: usize = @intCast(source_width * source_height);
+    const pixels = try allocator.alloc(keywork.Color, pixel_count);
     errdefer allocator.free(pixels);
-    fillRgbaPixels(pixels, target_rgba);
+    fillRgbaPixels(pixels, source_pixels[0 .. pixel_count * 4]);
 
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(path);
-    hasher.update(std.mem.asBytes(&target_size));
 
     const image = try allocator.create(LuaImage);
     errdefer allocator.destroy(image);
     image.* = .{
-        .width = @intCast(target_size),
-        .height = @intCast(target_size),
-        .size = @floatFromInt(target_size),
+        .width = @intCast(source_width),
+        .height = @intCast(source_height),
+        .size = @floatFromInt(positiveImageSize(size)),
         .pixels = pixels,
         .cache_key = hasher.final(),
     };
@@ -3177,6 +3197,51 @@ fn fillRgbaPixels(pixels: []keywork.Color, bytes: []const u8) void {
         const base = index * 4;
         pixel.* = keywork.Color.argb(bytes[base + 3], bytes[base], bytes[base + 1], bytes[base + 2]);
     }
+}
+
+/// Resample source pixels to the target dimensions; returns freshly
+/// allocated pixels the caller owns (a plain copy when sizes match).
+fn resampledPixels(
+    allocator: std.mem.Allocator,
+    source: []const keywork.Color,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) ![]keywork.Color {
+    if (source_width == target_width and source_height == target_height) {
+        return allocator.dupe(keywork.Color, source);
+    }
+
+    const source_bytes = try allocator.alloc(u8, source.len * 4);
+    defer allocator.free(source_bytes);
+    for (source, 0..) |pixel, index| {
+        const base = index * 4;
+        source_bytes[base] = pixel.r;
+        source_bytes[base + 1] = pixel.g;
+        source_bytes[base + 2] = pixel.b;
+        source_bytes[base + 3] = pixel.a;
+    }
+
+    const target_bytes = try allocator.alloc(u8, @as(usize, target_width) * target_height * 4);
+    defer allocator.free(target_bytes);
+    if (keywork.image_c.stbir_resize_uint8(
+        source_bytes.ptr,
+        @intCast(source_width),
+        @intCast(source_height),
+        0,
+        target_bytes.ptr,
+        @intCast(target_width),
+        @intCast(target_height),
+        0,
+        4,
+    ) == 0) {
+        return error.ImageResizeFailed;
+    }
+
+    const pixels = try allocator.alloc(keywork.Color, @as(usize, target_width) * target_height);
+    fillRgbaPixels(pixels, target_bytes);
+    return pixels;
 }
 
 fn positiveImageSize(size: f32) usize {
