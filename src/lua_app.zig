@@ -3492,6 +3492,18 @@ fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature:
             var value: u32 = @intCast(c.lua_tointeger(lua_state, index));
             try appendDbusBasic(iter, dbus_c.DBUS_TYPE_UINT32, &value);
         },
+        'y' => {
+            var value: u8 = @intCast(c.lua_tointeger(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BYTE, &value);
+        },
+        'n' => {
+            var value: i16 = @intCast(c.lua_tointeger(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_INT16, &value);
+        },
+        'q' => {
+            var value: u16 = @intCast(c.lua_tointeger(lua_state, index));
+            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_UINT16, &value);
+        },
         'd' => {
             var value: f64 = c.lua_tonumber(lua_state, index);
             try appendDbusBasic(iter, dbus_c.DBUS_TYPE_DOUBLE, &value);
