@@ -478,6 +478,11 @@ test "lookup returns null for a missing icon" {
 }
 
 test "cache tombstones missing icons and serves repeat lookups" {
+    // The first miss per name+size logs a warning by design; keep the
+    // expected ones out of the test output.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var cache: Cache = .init(std.testing.allocator);
     defer cache.deinit();
 
@@ -496,8 +501,8 @@ test "cache tombstones missing icons and serves repeat lookups" {
 test "cache returns the same owned path for repeated hits" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "keywork-cache-test.svg", .data = "<svg/>" });
-    const absolute = try tmp.dir.realpathAlloc(std.testing.allocator, "keywork-cache-test.svg");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keywork-cache-test.svg", .data = "<svg/>" });
+    const absolute = try tmp.dir.realPathFileAlloc(std.testing.io, "keywork-cache-test.svg", std.testing.allocator);
     defer std.testing.allocator.free(absolute);
 
     var cache: Cache = .init(std.testing.allocator);
