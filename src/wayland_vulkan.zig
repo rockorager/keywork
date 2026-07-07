@@ -164,6 +164,7 @@ pub const Backend = struct {
     height: u31,
     scale: f32,
     scale_changed: bool,
+    repaint_pending: bool,
     swapchain_dirty: bool,
 
     vkb: vk.BaseWrapper,
@@ -378,6 +379,7 @@ pub const Backend = struct {
             .height = options.height,
             .scale = 1,
             .scale_changed = false,
+            .repaint_pending = false,
             .swapchain_dirty = false,
             .vkb = vkb,
             .vki = vki,
@@ -522,10 +524,20 @@ pub const Backend = struct {
         return self.display.getFd();
     }
 
+    pub fn waitForInitialConfigure(self: *Backend) !keywork.Size {
+        while (!self.configured and !self.closed) {
+            if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        }
+        if (self.closed) return error.WindowClosed;
+        self.flushPending();
+        return self.currentSize();
+    }
+
     pub fn eventLoopPrepare(ctx: *anyopaque) !u32 {
         const self: *Backend = @ptrCast(@alignCast(ctx));
         while (!self.display.prepareRead()) {
             if (self.display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
+            self.flushPending();
         }
 
         return switch (self.display.flush()) {
@@ -547,11 +559,7 @@ pub const Backend = struct {
         }
 
         if (self.display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
-        if (self.scale_changed) {
-            self.scale_changed = false;
-            self.notifyRepaint();
-        }
-        self.dispatchFrameDone();
+        self.flushPending();
         return !self.closed;
     }
 
@@ -592,10 +600,27 @@ pub const Backend = struct {
     }
 
     fn notifyRepaint(self: *Backend) void {
-        if (self.repaint_handler) |handler| handler(self.repaint_context.?, .{
-            .width = @floatFromInt(self.width),
-            .height = @floatFromInt(self.height),
-        });
+        if (self.repaint_handler) |handler| handler(self.repaint_context.?, self.currentSize());
+    }
+
+    fn currentSize(self: *const Backend) keywork.Size {
+        return .{ .width = @floatFromInt(self.width), .height = @floatFromInt(self.height) };
+    }
+
+    fn queueRepaint(self: *Backend) void {
+        self.repaint_pending = true;
+    }
+
+    fn flushPending(self: *Backend) void {
+        if (self.scale_changed) {
+            self.scale_changed = false;
+            self.queueRepaint();
+        }
+        if (self.repaint_pending) {
+            self.repaint_pending = false;
+            self.notifyRepaint();
+        }
+        self.dispatchFrameDone();
     }
 
     fn armFrameCallback(self: *Backend) !void {
@@ -1754,7 +1779,7 @@ pub const Backend = struct {
             .configure => |configure| {
                 xdg_surface.ackConfigure(configure.serial);
                 self.configured = true;
-                self.notifyRepaint();
+                self.queueRepaint();
             },
         }
     }
@@ -1766,7 +1791,7 @@ pub const Backend = struct {
                 if (configure.width > 0) self.width = @intCast(configure.width);
                 if (configure.height > 0) self.height = @intCast(configure.height);
                 self.configured = true;
-                self.notifyRepaint();
+                self.queueRepaint();
             },
             .closed => self.closed = true,
         }

@@ -85,6 +85,7 @@ fn runWayland(
     options: Options,
     comptime Backend: type,
 ) !void {
+    var initial_constraints = constraints;
     const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator, .{
         .title = options.title,
@@ -94,6 +95,8 @@ fn runWayland(
         .layer_shell = options.layer_shell,
     });
     defer backend.destroy();
+    const configured_size = try backend.waitForInitialConfigure();
+    initial_constraints = .{ .max_width = configured_size.width, .max_height = configured_size.height };
 
     var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
         log.warn("desktop settings unavailable: {}", .{err});
@@ -105,7 +108,7 @@ fn runWayland(
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         backend.renderBackend(),
-        constraints,
+        initial_constraints,
         app,
         initial_color_scheme,
     );
