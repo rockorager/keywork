@@ -5,9 +5,28 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
+const log = std.log.scoped(.keywork_icon_theme);
+
 const default_data_dirs = "/usr/local/share:/usr/share";
 const max_theme_depth = 16;
 const max_index_theme_bytes = 1024 * 1024;
+
+pub const IconFormat = enum {
+    svg,
+    png,
+
+    fn extension(self: IconFormat) []const u8 {
+        return switch (self) {
+            .svg => "svg",
+            .png => "png",
+        };
+    }
+};
+
+pub const IconFile = struct {
+    path: []u8,
+    format: IconFormat,
+};
 
 const DirectoryType = enum {
     fixed,
@@ -56,14 +75,68 @@ const Theme = struct {
     }
 };
 
+/// Caches name+size lookups, including misses (tombstones), so icons
+/// that resolve to nothing don't re-walk the theme directories on
+/// every rebuild. Entries live until deinit; an icon-theme change at
+/// runtime keeps serving stale results until the process restarts.
+pub const Cache = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMapUnmanaged(?IconFile) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Cache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |icon| self.allocator.free(icon.path);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    /// The returned icon path is owned by the cache and stays valid
+    /// until deinit; null means the icon is known to be missing.
+    pub fn lookup(self: *Cache, name: []const u8, logical_size: f32) !?IconFile {
+        const size = positiveIconSize(logical_size);
+        const key = try std.fmt.allocPrint(self.allocator, "{d}\x00{s}", .{ size, name });
+        errdefer self.allocator.free(key);
+        if (self.entries.get(key)) |cached| {
+            self.allocator.free(key);
+            return cached;
+        }
+        const icon = try lookupIconSized(self.allocator, name, logical_size);
+        errdefer if (icon) |value| self.allocator.free(value.path);
+        if (icon == null) log.warn("missing icon {s}", .{name});
+        try self.entries.put(self.allocator, key, icon);
+        return icon;
+    }
+};
+
 pub fn lookupSvgIcon(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     return lookupSvgIconSized(allocator, name, 16);
 }
 
 pub fn lookupSvgIconSized(allocator: std.mem.Allocator, name: []const u8, logical_size: f32) !?[]u8 {
+    const icon = try lookupIconSizedWithFormats(allocator, name, logical_size, &.{.svg}) orelse return null;
+    return icon.path;
+}
+
+pub fn lookupIcon(allocator: std.mem.Allocator, name: []const u8) !?IconFile {
+    return lookupIconSized(allocator, name, 16);
+}
+
+pub fn lookupIconSized(allocator: std.mem.Allocator, name: []const u8, logical_size: f32) !?IconFile {
+    return lookupIconSizedWithFormats(allocator, name, logical_size, &.{ .svg, .png });
+}
+
+fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, logical_size: f32, formats: []const IconFormat) !?IconFile {
     if (name.len == 0) return null;
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        if (try exists(allocator, name)) return try allocator.dupe(u8, name);
+        if (formatFromPath(name, formats)) |format| {
+            if (try exists(allocator, name)) return .{ .path = try allocator.dupe(u8, name), .format = format };
+        }
         return null;
     }
 
@@ -75,11 +148,11 @@ pub fn lookupSvgIconSized(allocator: std.mem.Allocator, name: []const u8, logica
     }
 
     const theme = preferredTheme();
-    if (try lookupInTheme(allocator, name, size, theme, &visited, 0)) |path| return path;
+    if (try lookupInTheme(allocator, name, size, theme, formats, &visited, 0)) |path| return path;
     if (!visitedContains(visited.items, "hicolor")) {
-        if (try lookupInTheme(allocator, name, size, "hicolor", &visited, 0)) |path| return path;
+        if (try lookupInTheme(allocator, name, size, "hicolor", formats, &visited, 0)) |path| return path;
     }
-    return lookupInPixmaps(allocator, name);
+    return lookupInPixmaps(allocator, name, formats);
 }
 
 fn lookupInTheme(
@@ -87,9 +160,10 @@ fn lookupInTheme(
     name: []const u8,
     size: u32,
     theme_name: []const u8,
+    formats: []const IconFormat,
     visited: *std.ArrayList([]u8),
     depth: usize,
-) !?[]u8 {
+) !?IconFile {
     if (depth >= max_theme_depth or visitedContains(visited.items, theme_name)) return null;
     try visited.append(allocator, try allocator.dupe(u8, theme_name));
 
@@ -99,14 +173,14 @@ fn lookupInTheme(
         inherited.deinit(allocator);
     }
 
-    if (try lookupInHomeTheme(allocator, name, size, theme_name, &inherited)) |path| return path;
-    if (try lookupInDataDirThemes(allocator, name, size, theme_name, &inherited)) |path| return path;
+    if (try lookupInHomeTheme(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
+    if (try lookupInDataDirThemes(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
 
     for (inherited.items) |parent| {
-        if (try lookupInTheme(allocator, name, size, parent, visited, depth + 1)) |path| return path;
+        if (try lookupInTheme(allocator, name, size, parent, formats, visited, depth + 1)) |path| return path;
     }
     if (!std.mem.eql(u8, theme_name, "hicolor") and !visitedContains(inherited.items, "hicolor")) {
-        if (try lookupInTheme(allocator, name, size, "hicolor", visited, depth + 1)) |path| return path;
+        if (try lookupInTheme(allocator, name, size, "hicolor", formats, visited, depth + 1)) |path| return path;
     }
     return null;
 }
@@ -116,15 +190,16 @@ fn lookupInHomeTheme(
     name: []const u8,
     size: u32,
     theme_name: []const u8,
+    formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
-) !?[]u8 {
+) !?IconFile {
     const config_home = env("XDG_DATA_HOME") orelse blk: {
         const home = env("HOME") orelse return null;
         break :blk try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
     };
     const allocated = env("XDG_DATA_HOME") == null;
     defer if (allocated) allocator.free(config_home);
-    return lookupInDataRootTheme(allocator, config_home, name, size, theme_name, inherited);
+    return lookupInDataRootTheme(allocator, config_home, name, size, theme_name, formats, inherited);
 }
 
 fn lookupInDataDirThemes(
@@ -132,13 +207,14 @@ fn lookupInDataDirThemes(
     name: []const u8,
     size: u32,
     theme_name: []const u8,
+    formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
-) !?[]u8 {
+) !?IconFile {
     const data_dirs = env("XDG_DATA_DIRS") orelse default_data_dirs;
     var it = std.mem.splitScalar(u8, data_dirs, ':');
     while (it.next()) |root| {
         if (root.len == 0) continue;
-        if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, inherited)) |path| return path;
+        if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited)) |path| return path;
     }
     return null;
 }
@@ -149,8 +225,9 @@ fn lookupInDataRootTheme(
     name: []const u8,
     size: u32,
     theme_name: []const u8,
+    formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
-) !?[]u8 {
+) !?IconFile {
     var theme = try loadTheme(allocator, data_root, theme_name) orelse return null;
     defer theme.deinit(allocator);
 
@@ -158,8 +235,8 @@ fn lookupInDataRootTheme(
         if (!visitedContains(inherited.items, parent)) try inherited.append(allocator, try allocator.dupe(u8, parent));
     }
 
-    if (try lookupExactSizeInTheme(allocator, data_root, theme_name, name, size, theme.directories.items)) |path| return path;
-    return lookupClosestSizeInTheme(allocator, data_root, theme_name, name, size, theme.directories.items);
+    if (try lookupExactSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items)) |path| return path;
+    return lookupClosestSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items);
 }
 
 fn lookupExactSizeInTheme(
@@ -168,11 +245,12 @@ fn lookupExactSizeInTheme(
     theme_name: []const u8,
     name: []const u8,
     size: u32,
+    formats: []const IconFormat,
     directories: []const Directory,
-) !?[]u8 {
+) !?IconFile {
     for (directories) |directory| {
         if (!directory.matchesSize(size)) continue;
-        if (try lookupCandidate(allocator, data_root, theme_name, directory.path, name)) |path| return path;
+        if (try lookupCandidate(allocator, data_root, theme_name, directory.path, name, formats)) |path| return path;
     }
     return null;
 }
@@ -183,22 +261,23 @@ fn lookupClosestSizeInTheme(
     theme_name: []const u8,
     name: []const u8,
     size: u32,
+    formats: []const IconFormat,
     directories: []const Directory,
-) !?[]u8 {
-    var best_path: ?[]u8 = null;
+) !?IconFile {
+    var best_icon: ?IconFile = null;
     var best_distance: u32 = std.math.maxInt(u32);
     for (directories) |directory| {
-        const path = try lookupCandidate(allocator, data_root, theme_name, directory.path, name) orelse continue;
+        const icon = try lookupCandidate(allocator, data_root, theme_name, directory.path, name, formats) orelse continue;
         const candidate_distance = directory.distance(size);
         if (candidate_distance < best_distance) {
-            if (best_path) |old| allocator.free(old);
-            best_path = path;
+            if (best_icon) |old| allocator.free(old.path);
+            best_icon = icon;
             best_distance = candidate_distance;
         } else {
-            allocator.free(path);
+            allocator.free(icon.path);
         }
     }
-    return best_path;
+    return best_icon;
 }
 
 fn loadTheme(allocator: std.mem.Allocator, data_root: []const u8, theme_name: []const u8) !?Theme {
@@ -276,49 +355,55 @@ fn parseDirectoryField(directory: *Directory, key: []const u8, value: []const u8
     }
 }
 
-fn lookupInPixmaps(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    if (try lookupInHomePixmaps(allocator, name)) |path| return path;
+fn lookupInPixmaps(allocator: std.mem.Allocator, name: []const u8, formats: []const IconFormat) !?IconFile {
+    if (try lookupInHomePixmaps(allocator, name, formats)) |path| return path;
     const data_dirs = env("XDG_DATA_DIRS") orelse default_data_dirs;
     var it = std.mem.splitScalar(u8, data_dirs, ':');
     while (it.next()) |root| {
         if (root.len == 0) continue;
-        if (try lookupInDataRootPixmaps(allocator, root, name)) |path| return path;
+        if (try lookupInDataRootPixmaps(allocator, root, name, formats)) |path| return path;
     }
     return null;
 }
 
-fn lookupInHomePixmaps(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+fn lookupInHomePixmaps(allocator: std.mem.Allocator, name: []const u8, formats: []const IconFormat) !?IconFile {
     const data_home = env("XDG_DATA_HOME") orelse blk: {
         const home = env("HOME") orelse return null;
         break :blk try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
     };
     const allocated = env("XDG_DATA_HOME") == null;
     defer if (allocated) allocator.free(data_home);
-    return lookupInDataRootPixmaps(allocator, data_home, name);
+    return lookupInDataRootPixmaps(allocator, data_home, name, formats);
 }
 
-fn lookupInDataRootPixmaps(allocator: std.mem.Allocator, data_root: []const u8, name: []const u8) !?[]u8 {
-    const exact = try std.fmt.allocPrint(allocator, "{s}/pixmaps/{s}.svg", .{ data_root, name });
-    defer allocator.free(exact);
-    if (try exists(allocator, exact)) return try allocator.dupe(u8, exact);
+fn lookupInDataRootPixmaps(allocator: std.mem.Allocator, data_root: []const u8, name: []const u8, formats: []const IconFormat) !?IconFile {
+    return lookupFileCandidates(allocator, "{s}/pixmaps/{s}.{s}", "{s}/pixmaps/{s}-symbolic.{s}", .{ data_root, name }, formats);
+}
 
-    if (!std.mem.endsWith(u8, name, "-symbolic")) {
-        const symbolic = try std.fmt.allocPrint(allocator, "{s}/pixmaps/{s}-symbolic.svg", .{ data_root, name });
-        defer allocator.free(symbolic);
-        if (try exists(allocator, symbolic)) return try allocator.dupe(u8, symbolic);
+fn lookupCandidate(allocator: std.mem.Allocator, data_root: []const u8, theme: []const u8, dir: []const u8, name: []const u8, formats: []const IconFormat) !?IconFile {
+    return lookupFileCandidates(allocator, "{s}/icons/{s}/{s}/{s}.{s}", "{s}/icons/{s}/{s}/{s}-symbolic.{s}", .{ data_root, theme, dir, name }, formats);
+}
+
+fn lookupFileCandidates(allocator: std.mem.Allocator, comptime exact_fmt: []const u8, comptime symbolic_fmt: []const u8, args: anytype, formats: []const IconFormat) !?IconFile {
+    for (formats) |format| {
+        const path = try std.fmt.allocPrint(allocator, exact_fmt, args ++ .{format.extension()});
+        defer allocator.free(path);
+        if (try exists(allocator, path)) return .{ .path = try allocator.dupe(u8, path), .format = format };
+    }
+
+    if (std.mem.endsWith(u8, args[args.len - 1], "-symbolic")) return null;
+    for (formats) |format| {
+        const path = try std.fmt.allocPrint(allocator, symbolic_fmt, args ++ .{format.extension()});
+        defer allocator.free(path);
+        if (try exists(allocator, path)) return .{ .path = try allocator.dupe(u8, path), .format = format };
     }
     return null;
 }
 
-fn lookupCandidate(allocator: std.mem.Allocator, data_root: []const u8, theme: []const u8, dir: []const u8, name: []const u8) !?[]u8 {
-    const exact = try std.fmt.allocPrint(allocator, "{s}/icons/{s}/{s}/{s}.svg", .{ data_root, theme, dir, name });
-    defer allocator.free(exact);
-    if (try exists(allocator, exact)) return try allocator.dupe(u8, exact);
-
-    if (!std.mem.endsWith(u8, name, "-symbolic")) {
-        const symbolic = try std.fmt.allocPrint(allocator, "{s}/icons/{s}/{s}/{s}-symbolic.svg", .{ data_root, theme, dir, name });
-        defer allocator.free(symbolic);
-        if (try exists(allocator, symbolic)) return try allocator.dupe(u8, symbolic);
+fn formatFromPath(path: []const u8, formats: []const IconFormat) ?IconFormat {
+    for (formats) |format| {
+        const extension = format.extension();
+        if (path.len > extension.len and path[path.len - extension.len - 1] == '.' and std.mem.endsWith(u8, path, extension)) return format;
     }
     return null;
 }
@@ -390,6 +475,41 @@ fn trim(value: []const u8) []const u8 {
 
 test "lookup returns null for a missing icon" {
     try std.testing.expect(try lookupSvgIcon(std.testing.allocator, "keywork-definitely-missing-icon") == null);
+}
+
+test "cache tombstones missing icons and serves repeat lookups" {
+    var cache: Cache = .init(std.testing.allocator);
+    defer cache.deinit();
+
+    try std.testing.expect(try cache.lookup("keywork-definitely-missing-icon", 16) == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+
+    // The tombstone answers without a second walk or a new entry.
+    try std.testing.expect(try cache.lookup("keywork-definitely-missing-icon", 16) == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+
+    // A different size is a distinct lookup.
+    try std.testing.expect(try cache.lookup("keywork-definitely-missing-icon", 32) == null);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+}
+
+test "cache returns the same owned path for repeated hits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "keywork-cache-test.svg", .data = "<svg/>" });
+    const absolute = try tmp.dir.realpathAlloc(std.testing.allocator, "keywork-cache-test.svg");
+    defer std.testing.allocator.free(absolute);
+
+    var cache: Cache = .init(std.testing.allocator);
+    defer cache.deinit();
+
+    const first = (try cache.lookup(absolute, 16)).?;
+    try std.testing.expectEqual(IconFormat.svg, first.format);
+    try std.testing.expectEqualStrings(absolute, first.path);
+
+    const second = (try cache.lookup(absolute, 16)).?;
+    try std.testing.expectEqual(first.path.ptr, second.path.ptr);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
 }
 
 test "parse index theme directories and inherited themes" {

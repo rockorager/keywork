@@ -90,6 +90,7 @@ const ImageOptions = struct {
 
 const ParseContext = struct {
     icon: IconOptions = .{},
+    icon_cache: ?*keywork.icon_theme.Cache = null,
 
     fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
         return .{
@@ -100,10 +101,13 @@ const ParseContext = struct {
     }
 
     fn mergeIcon(self: ParseContext, options: IconOptions) ParseContext {
-        return .{ .icon = .{
-            .size = options.size orelse self.icon.size,
-            .color = options.color orelse self.icon.color,
-        } };
+        return .{
+            .icon = .{
+                .size = options.size orelse self.icon.size,
+                .color = options.color orelse self.icon.color,
+            },
+            .icon_cache = self.icon_cache,
+        };
     }
 };
 
@@ -524,6 +528,7 @@ pub const App = struct {
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
     event_loop: ?*keywork.event_loop.EventLoop = null,
     runtime: ?*keywork.Runtime = null,
+    icon_cache: keywork.icon_theme.Cache,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
@@ -547,6 +552,7 @@ pub const App = struct {
             .path = path_z,
             .chunk_name = chunk_name,
             .state = lua_state,
+            .icon_cache = .init(allocator),
         };
     }
 
@@ -563,6 +569,7 @@ pub const App = struct {
         self.dbus_buses.deinit(self.allocator);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_close(self.state);
+        self.icon_cache.deinit();
         self.window_config.deinit(self.allocator);
         self.allocator.free(self.path);
         self.allocator.free(self.chunk_name);
@@ -598,7 +605,7 @@ pub const App = struct {
 
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
-        const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{}, -1);
+        const widget = try parseWidget(self.state, allocator, allocator, runtime_state, .{ .icon_cache = &self.icon_cache }, -1);
         c.lua_settop(self.state, 0);
         // A bounded incremental step keeps garbage from widget-table churn
         // paced across builds; a full collection here would stall every
@@ -2961,14 +2968,30 @@ fn parseWidget(
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
         const name = try stringField(lua_state, table, "name");
-        const path = try keywork.icon_theme.lookupSvgIconSized(allocator, name, icon.size) orelse return missingIconWidget(allocator, name, icon.color orelse keywork.colors.ink);
-        defer allocator.free(path);
-        return keywork.svg_icon.icon(
-            allocator,
-            path,
-            icon.size,
-            icon.color,
-        );
+        const fallback_color = icon.color orelse keywork.colors.ink;
+        if (parse_context.icon_cache) |cache| {
+            // The cache owns the path and tombstones misses, so absent
+            // icons neither re-walk the theme tree nor warn again.
+            const icon_file = try cache.lookup(name, icon.size) orelse return missingIconWidget(allocator, fallback_color);
+            return switch (icon_file.format) {
+                .svg => keywork.svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
+                .png => pngIconWidget(allocator, icon_file.path, icon.size),
+            };
+        }
+        const icon_file = try keywork.icon_theme.lookupIconSized(allocator, name, icon.size) orelse {
+            std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
+            return missingIconWidget(allocator, fallback_color);
+        };
+        defer allocator.free(icon_file.path);
+        return switch (icon_file.format) {
+            .svg => keywork.svg_icon.icon(
+                allocator,
+                icon_file.path,
+                icon.size,
+                icon.color,
+            ),
+            .png => pngIconWidget(allocator, icon_file.path, icon.size),
+        };
     }
     if (std.mem.eql(u8, kind, "row")) {
         const options = try lua_codec.decode(LinearOptions, lua_state, table, allocator);
@@ -3030,9 +3053,62 @@ fn isWidgetTable(lua_state: *c.lua_State, table: c_int) bool {
     return !c.lua_isnil(lua_state, -1);
 }
 
-fn missingIconWidget(allocator: std.mem.Allocator, name: []const u8, color: keywork.Color) !keywork.Widget {
-    std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
+// Callers log the miss; the cache path warns only once per name+size.
+fn missingIconWidget(allocator: std.mem.Allocator, color: keywork.Color) !keywork.Widget {
     return .{ .text = .{ .value = try allocator.dupe(u8, "□"), .color = color } };
+}
+
+fn pngIconWidget(allocator: std.mem.Allocator, path: []const u8, size: f32) !keywork.Widget {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var source_width: c_int = 0;
+    var source_height: c_int = 0;
+    var source_channels: c_int = 0;
+    const source_pixels = keywork.image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
+    defer keywork.image_c.stbi_image_free(source_pixels);
+    if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
+
+    const target_size = positiveImageSize(size);
+    const target_byte_count = target_size * target_size * 4;
+    const target_rgba = try allocator.alloc(u8, target_byte_count);
+    defer allocator.free(target_rgba);
+
+    if (source_width == target_size and source_height == target_size) {
+        const source_len: usize = @intCast(source_width * source_height * 4);
+        @memcpy(target_rgba, source_pixels[0..source_len]);
+    } else if (keywork.image_c.stbir_resize_uint8(
+        source_pixels,
+        source_width,
+        source_height,
+        0,
+        target_rgba.ptr,
+        @intCast(target_size),
+        @intCast(target_size),
+        0,
+        4,
+    ) == 0) {
+        return error.InvalidPng;
+    }
+
+    const pixels = try allocator.alloc(keywork.Color, target_size * target_size);
+    errdefer allocator.free(pixels);
+    fillRgbaPixels(pixels, target_rgba);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(path);
+    hasher.update(std.mem.asBytes(&target_size));
+
+    const image = try allocator.create(LuaImage);
+    errdefer allocator.destroy(image);
+    image.* = .{
+        .width = @intCast(target_size),
+        .height = @intCast(target_size),
+        .size = @floatFromInt(target_size),
+        .pixels = pixels,
+        .cache_key = hasher.final(),
+    };
+    return image.widget();
 }
 
 fn parseImage(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) !keywork.Widget {
@@ -3094,6 +3170,18 @@ fn fillArgb32Pixels(pixels: []keywork.Color, bytes: []const u8) void {
         const base = index * 4;
         pixel.* = keywork.Color.argb(bytes[base], bytes[base + 1], bytes[base + 2], bytes[base + 3]);
     }
+}
+
+fn fillRgbaPixels(pixels: []keywork.Color, bytes: []const u8) void {
+    for (pixels, 0..) |*pixel, index| {
+        const base = index * 4;
+        pixel.* = keywork.Color.argb(bytes[base + 3], bytes[base], bytes[base + 1], bytes[base + 2]);
+    }
+}
+
+fn positiveImageSize(size: f32) usize {
+    if (!std.math.isFinite(size) or size <= 0) return 16;
+    return @max(1, @as(usize, @intFromFloat(@round(size))));
 }
 
 fn imageByteField(lua_state: *c.lua_State, table: c_int, index: c_int) !u8 {

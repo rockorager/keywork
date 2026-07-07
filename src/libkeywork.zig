@@ -3,6 +3,7 @@
 pub const event_loop = @import("event_loop.zig");
 pub const desktop_settings = @import("desktop_settings.zig");
 pub const icon_theme = @import("icon_theme.zig");
+pub const image_c = @import("image_c");
 pub const svg_icon = @import("svg_icon.zig");
 pub const wayland_shm = @import("wayland_shm.zig");
 pub const wayland_vulkan = @import("wayland_vulkan.zig");

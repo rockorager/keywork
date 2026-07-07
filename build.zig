@@ -282,6 +282,7 @@ fn addLibkeyworkImports(b: *std.Build, module: *std.Build.Module, imports: Libke
     module.addImport("wayland", imports.wayland);
     module.addImport("image_c", imports.image_c);
     module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
+    module.addCSourceFile(.{ .file = b.path("third_party/stb/stb_image.c") });
     module.addCSourceFile(.{ .file = b.path("third_party/stb/stb_image_resize.c") });
     module.addImport("vulkan", imports.vulkan);
     module.addImport("uucode", imports.uucode);
