@@ -1,5 +1,6 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
+const luajit = @import("build/luajit.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -101,6 +102,40 @@ pub fn build(b: *std.Build) void {
     addLibkeyworkImports(b, keywork_module, libkeywork_imports);
     linkKeyworkSystemLibraries(keywork_module);
 
+    const lua = luajit.add(b, target, optimize);
+
+    const lua_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/runtime/lua_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_c.addIncludePath(lua.include_dir);
+    lua_c.addIncludePath(lua.generated_include_dir);
+    const lua_c_module = lua_c.createModule();
+
+    const runtime_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_module.addImport("keywork", keywork_module);
+    runtime_module.addImport("lua_c", lua_c_module);
+    runtime_module.linkLibrary(lua.library);
+
+    const runtime_exe = b.addExecutable(.{
+        .name = "keywork",
+        .root_module = runtime_module,
+    });
+    b.installArtifact(runtime_exe);
+
+    const run_cmd = b.addRunArtifact(runtime_exe);
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run the keywork runtime");
+    run_step.dependOn(&run_cmd.step);
+
     const zig_example_module = b.createModule(.{
         .root_source_file = b.path("examples/zig/main.zig"),
         .target = target,
@@ -127,9 +162,13 @@ pub fn build(b: *std.Build) void {
         .root_module = keywork_module,
     });
     test_step.dependOn(&b.addRunArtifact(keywork_tests).step);
+    const runtime_tests = b.addTest(.{
+        .root_module = runtime_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(runtime_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "build", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
 }
