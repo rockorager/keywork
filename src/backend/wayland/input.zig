@@ -35,6 +35,7 @@ shift_down: bool = false,
 /// and, once the fingers lift, a timer keeps scrolling the viewport
 /// under the anchor point with exponential decay.
 fling_timer: ?*event_loop.EventLoop.Timer = null,
+timer_loop: ?*event_loop.EventLoop = null,
 fling_active: bool = false,
 fling_velocity_x: f32 = 0,
 fling_velocity_y: f32 = 0,
@@ -163,15 +164,20 @@ pub fn setScrollHandler(self: *Self, context: *anyopaque, handler: ScrollHandler
 }
 
 pub fn installEventTimers(self: *Self, loop: *event_loop.EventLoop) !void {
+    self.timer_loop = loop;
+    errdefer self.uninstallEventTimers();
     if (self.repeat_timer == null) self.repeat_timer = try loop.addTimer(self, repeatTimerCallback);
     if (self.fling_timer == null) self.fling_timer = try loop.addTimer(self, flingTimerCallback);
 }
 
 pub fn uninstallEventTimers(self: *Self) void {
     self.stopKeyRepeat();
+    if (self.timer_loop) |loop| if (self.repeat_timer) |timer| loop.removeTimer(timer);
     self.repeat_timer = null;
     self.stopFling();
+    if (self.timer_loop) |loop| if (self.fling_timer) |timer| loop.removeTimer(timer);
     self.fling_timer = null;
+    self.timer_loop = null;
 }
 
 fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Backend) void {

@@ -1,5 +1,4 @@
-local ui = require("ui")
-local keywork = require("keywork")
+local kw = require("kw")
 
 local colors = {
   background = 0xff111113,
@@ -7,7 +6,7 @@ local colors = {
   accent = 0xff0090ff,
 }
 
--- The script declares its own window; CLI flags override it, so
+-- The app root declares its own window; CLI flags override it, so
 -- `--backend=vulkan` or `--backend=log` still work for debugging.
 --
 -- Run with:
@@ -15,19 +14,9 @@ local colors = {
 --   zig build run-lua-vulkan-layershell-example
 -- or:
 --   zig build run -- examples/lua/layershell.lua
-keywork.window({
-  app_id = "dev.keywork.LayerShellExample",
-  backend = "cpu",
-  height = 32,
-  layer_shell = {
-    layer = "top",
-    anchor = { "top", "left", "right" },
-    exclusive_zone = 32,
-  },
-})
-local App = ui.stateful({
+local App = kw.stateful({
   build = function(self, state)
-    local theme = ui.resolve_theme(ui.theme_data({
+    local theme = kw.resolve_theme(kw.theme_data({
       schemes = {
         light = {
           colors = {
@@ -52,16 +41,26 @@ local App = ui.stateful({
       state.color_scheme
     )
 
-    return ui.theme({
+    return kw.theme({
       data = theme,
-      child = ui.box({ background = theme.colors.surface },
-        ui.padding({
+      child = kw.box({ background = theme.colors.surface },
+        kw.padding({
           all = 8,
-          child = ui.text(label, { color = theme.colors.text }),
+          child = kw.text(label, { color = theme.colors.text }),
         })
       ),
     })
   end,
 })
 
-return App({ key = "app" })
+return kw.app({
+  app_id = "dev.keywork.LayerShellExample",
+  backend = "cpu",
+  height = 32,
+  layer_shell = {
+    layer = "top",
+    anchor = { "top", "left", "right" },
+    exclusive_zone = 32,
+  },
+  child = App({ key = "app" }),
+})

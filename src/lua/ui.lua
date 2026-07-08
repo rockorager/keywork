@@ -812,4 +812,10 @@ function ui.shortcuts(options)
   }
 end
 
+function ui.app(options)
+  options = options or {}
+  options.type = "app"
+  return options
+end
+
 return ui

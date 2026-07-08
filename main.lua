@@ -1,6 +1,6 @@
-local ui = require("ui")
+local kw = require("kw")
 
-local App = ui.stateful({
+local App = kw.stateful({
   init = function(self)
     self.typed = ""
   end,
@@ -8,15 +8,15 @@ local App = ui.stateful({
   build = function(self, state)
     local size = string.format("window: %.0fx%.0f", state.window_width, state.window_height)
 
-    local content = ui.column({
+    local content = kw.column({
       spacing = 12,
       children = {
-        ui.text("Keywork MVP"),
-        ui.text(size),
-        ui.text("scheme: " .. state.color_scheme),
-        ui.text("emoji: 😀 🎉 🚀 ✨ 🇺🇸 👍🏽 👩‍🚀 1️⃣"),
-        ui.text("input: " .. self.typed),
-        ui.text_input({
+        kw.text("Keywork MVP"),
+        kw.text(size),
+        kw.text("scheme: " .. state.color_scheme),
+        kw.text("emoji: 😀 🎉 🚀 ✨ 🇺🇸 👍🏽 👩‍🚀 1️⃣"),
+        kw.text("input: " .. self.typed),
+        kw.text_input({
           id = "demo-input",
           placeholder = "Type here",
           on_change = function(text)
@@ -25,44 +25,44 @@ local App = ui.stateful({
             end)
           end,
         }),
-        ui.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
-        ui.row({
+        kw.action_button({ id = "hello", label = "Press me", action_id = "hello" }),
+        kw.row({
           spacing = 8,
           children = {
-            ui.box({ background = 0xffd5efff }, ui.padding({ all = 6, child = ui.text("fixed") })),
-            ui.expanded(ui.box({ background = 0xffd6f1df }, ui.padding({ all = 6, child = ui.text("flex 1") }))),
-            ui.expanded(ui.box({ background = 0xffffdbdc }, ui.padding({ all = 6, child = ui.text("flex 2") })), 2),
+            kw.box({ background = 0xffd5efff }, kw.padding({ all = 6, child = kw.text("fixed") })),
+            kw.expanded(kw.box({ background = 0xffd6f1df }, kw.padding({ all = 6, child = kw.text("flex 1") }))),
+            kw.expanded(kw.box({ background = 0xffffdbdc }, kw.padding({ all = 6, child = kw.text("flex 2") })), 2),
           },
         }),
-        ui.row({
+        kw.row({
           main_align = "space_between",
           children = {
-            ui.text("left"),
-            ui.text("middle"),
-            ui.text("right"),
+            kw.text("left"),
+            kw.text("middle"),
+            kw.text("right"),
           },
         }),
-        ui.sized({
+        kw.sized({
           height = 120,
-          child = ui.list({
+          child = kw.list({
             id = "demo-list",
             count = 10000,
             item_height = 20,
             build_item = function(index)
-              return ui.text(string.format("virtual row %d of 10000", index))
+              return kw.text(string.format("virtual row %d of 10000", index))
             end,
           }),
         }),
-        ui.sized({
+        kw.sized({
           height = 120,
-          child = ui.scroll({
+          child = kw.scroll({
             id = "demo-scroll",
-            child = ui.column({
+            child = kw.column({
               spacing = 6,
               children = (function()
                 local rows = {}
                 for index = 1, 30 do
-                  rows[index] = ui.text(string.format("scrollable row %d", index))
+                  rows[index] = kw.text(string.format("scrollable row %d", index))
                 end
                 return rows
               end)(),
@@ -72,15 +72,15 @@ local App = ui.stateful({
       },
     })
 
-    return ui.padding({
+    return kw.padding({
       all = 24,
-      child = ui.actions({
+      child = kw.actions({
         bindings = {
           hello = function()
             print("hello from Lua")
           end,
         },
-        child = ui.shortcuts({
+        child = kw.shortcuts({
           bindings = {
             enter = "hello",
           },
@@ -91,4 +91,6 @@ local App = ui.stateful({
   end,
 })
 
-return App({ key = "app" })
+return kw.app({
+  child = App({ key = "app" }),
+})

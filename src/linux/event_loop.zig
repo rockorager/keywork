@@ -14,6 +14,10 @@ pub const EventLoop = struct {
     timers: std.ArrayList(*Timer) = .empty,
     file_watches: std.ArrayList(*FileWatch) = .empty,
     wayland: ?WaylandSource = null,
+    after_platform_hook: ?PhaseHook = null,
+    after_platform_context: ?*anyopaque = null,
+    end_turn_hook: ?PhaseHook = null,
+    end_turn_context: ?*anyopaque = null,
     running: bool = true,
     dispatching: bool = false,
 
@@ -38,6 +42,7 @@ pub const EventLoop = struct {
             ctx: *anyopaque,
             destroy: *const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void,
         },
+        timer: *Timer,
         file_watch: *FileWatch,
     };
 
@@ -54,6 +59,7 @@ pub const EventLoop = struct {
         mask: u32,
         name: ?[]const u8,
     ) anyerror!void;
+    pub const PhaseHook = *const fn (ctx: *anyopaque, loop: *EventLoop) anyerror!void;
 
     pub const Source = struct {
         fd: i32,
@@ -63,18 +69,30 @@ pub const EventLoop = struct {
         destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
     };
 
+    pub const SourceHandle = struct {
+        index: u32,
+        generation: u32,
+    };
+
     pub const WaylandSource = struct {
         fd: i32,
         ctx: *anyopaque,
-        prepare: *const fn (ctx: *anyopaque) anyerror!u32,
+        prepare: *const fn (ctx: *anyopaque) anyerror!WaylandPrepare,
         finish: *const fn (ctx: *anyopaque, events: u32) anyerror!bool,
+    };
+
+    pub const WaylandPrepare = struct {
+        events: u32,
+        dispatched_pending: bool = false,
     };
 
     pub const Timer = struct {
         fd: i32,
+        source_handle: ?SourceHandle,
         ctx: *anyopaque,
         callback: TimerCallback,
         destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
+        removed: bool = false,
 
         pub fn arm(self: *Timer, delay_ms: u64, interval_ms: u64) !void {
             const spec: linux.itimerspec = .{
@@ -94,9 +112,11 @@ pub const EventLoop = struct {
     pub const FileWatch = struct {
         fd: i32,
         wd: i32,
+        source_handle: ?SourceHandle,
         path: [:0]u8,
         ctx: *anyopaque,
         callback: FileWatchCallback,
+        removed: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) !EventLoop {
@@ -123,9 +143,13 @@ pub const EventLoop = struct {
 
     pub fn deinit(self: *EventLoop) void {
         self.flushPendingDestroy();
-        for (self.file_watches.items) |watch| self.destroyFileWatch(watch);
+        for (self.file_watches.items) |watch| {
+            if (watch.source_handle) |handle| self.removeSource(handle);
+            self.destroyFileWatch(watch);
+        }
         self.file_watches.deinit(self.allocator);
         for (self.timers.items) |timer| {
+            if (timer.source_handle) |handle| self.removeSource(handle);
             _ = linux.close(timer.fd);
             if (timer.destroy_ctx) |destroy| destroy(self.allocator, timer.ctx);
             self.allocator.destroy(timer);
@@ -142,7 +166,7 @@ pub const EventLoop = struct {
         _ = linux.close(self.epoll_fd);
     }
 
-    pub fn addFd(self: *EventLoop, source: Source) !void {
+    pub fn addFd(self: *EventLoop, source: Source) !SourceHandle {
         const index: u32 = if (self.free_slots.pop()) |free_index| free_index else blk: {
             const new_index: u32 = @intCast(self.sources.items.len);
             try self.sources.append(self.allocator, .{});
@@ -161,28 +185,30 @@ pub const EventLoop = struct {
             .data = .{ .u64 = sourceToken(index, slot.generation) },
         };
         try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, source.fd, &event));
+        return .{ .index = index, .generation = slot.generation };
     }
 
-    pub fn removeFd(self: *EventLoop, fd: i32) void {
-        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
-        for (self.sources.items, 0..) |*slot, index| {
-            const source = slot.source orelse continue;
-            if (source.fd != fd) continue;
-            // The generation bump invalidates any events already queued for
-            // this slot in the current dispatch batch.
-            slot.generation +%= 1;
-            slot.source = null;
-            self.free_slots.append(self.allocator, @intCast(index)) catch {};
-            if (source.destroy_ctx) |destroy| self.deferDestroy(.{ .source_ctx = .{ .ctx = source.ctx, .destroy = destroy } });
-        }
+    pub fn removeSource(self: *EventLoop, handle: SourceHandle) void {
+        if (handle.index >= self.sources.items.len) return;
+        const slot = &self.sources.items[handle.index];
+        if (slot.generation != handle.generation) return;
+        const source = slot.source orelse return;
+        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, source.fd, null);
+        // The generation bump invalidates any events already queued for this
+        // slot in the current dispatch batch.
+        slot.generation +%= 1;
+        slot.source = null;
+        self.free_slots.append(self.allocator, handle.index) catch {};
+        if (source.destroy_ctx) |destroy| self.deferDestroy(.{ .source_ctx = .{ .ctx = source.ctx, .destroy = destroy } });
     }
 
     fn deferDestroy(self: *EventLoop, pending: PendingDestroy) void {
         if (self.dispatching) {
             self.pending_destroy.append(self.allocator, pending) catch {
-                // Allocation failure: destroying immediately risks a stale
-                // reference within this batch, but leaking is worse.
-                self.destroyPending(pending);
+                // Never trade an allocation failure for use-after-free: the
+                // current epoll batch may still hold this callback context.
+                // Under OOM, leaking this removed object is the safe failure
+                // mode; normal destruction resumes for subsequent objects.
             };
             return;
         }
@@ -192,6 +218,7 @@ pub const EventLoop = struct {
     fn destroyPending(self: *EventLoop, pending: PendingDestroy) void {
         switch (pending) {
             .source_ctx => |entry| entry.destroy(self.allocator, entry.ctx),
+            .timer => |timer| self.destroyTimer(timer),
             .file_watch => |watch| self.destroyFileWatch(watch),
         }
     }
@@ -202,10 +229,18 @@ pub const EventLoop = struct {
     }
 
     fn destroyFileWatch(self: *EventLoop, watch: *FileWatch) void {
+        watch.removed = true;
         _ = linux.inotify_rm_watch(watch.fd, watch.wd);
         _ = linux.close(watch.fd);
         self.allocator.free(watch.path);
         self.allocator.destroy(watch);
+    }
+
+    fn destroyTimer(self: *EventLoop, timer: *Timer) void {
+        timer.removed = true;
+        _ = linux.close(timer.fd);
+        if (timer.destroy_ctx) |destroy| destroy(self.allocator, timer.ctx);
+        self.allocator.destroy(timer);
     }
 
     pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
@@ -214,12 +249,12 @@ pub const EventLoop = struct {
 
         const timer = try self.allocator.create(Timer);
         errdefer self.allocator.destroy(timer);
-        timer.* = .{ .fd = fd, .ctx = ctx, .callback = callback };
+        timer.* = .{ .fd = fd, .source_handle = null, .ctx = ctx, .callback = callback };
 
         try self.timers.append(self.allocator, timer);
         errdefer _ = self.timers.pop();
 
-        try self.addFd(.{
+        timer.source_handle = try self.addFd(.{
             .fd = fd,
             .events = linux.EPOLL.IN,
             .ctx = timer,
@@ -227,6 +262,22 @@ pub const EventLoop = struct {
         });
 
         return timer;
+    }
+
+    pub fn removeTimer(self: *EventLoop, timer: *Timer) void {
+        if (timer.removed) return;
+        timer.removed = true;
+        if (timer.source_handle) |handle| {
+            self.removeSource(handle);
+            timer.source_handle = null;
+        }
+        for (self.timers.items, 0..) |item, index| {
+            if (item == timer) {
+                _ = self.timers.swapRemove(index);
+                break;
+            }
+        }
+        self.deferDestroy(.{ .timer = timer });
     }
 
     pub fn addRepeatingTimer(self: *EventLoop, interval_ms: u64, ctx: *anyopaque, callback: TimerCallback) !void {
@@ -254,25 +305,31 @@ pub const EventLoop = struct {
         watch.* = .{
             .fd = fd,
             .wd = wd,
+            .source_handle = null,
             .path = path_z,
             .ctx = ctx,
             .callback = callback,
         };
 
-        try self.addFd(.{
+        watch.source_handle = try self.addFd(.{
             .fd = fd,
             .events = linux.EPOLL.IN,
             .ctx = watch,
             .callback = fileWatchSourceCallback,
         });
-        errdefer self.removeFd(fd);
+        errdefer if (watch.source_handle) |handle| self.removeSource(handle);
 
         try self.file_watches.append(self.allocator, watch);
         return watch;
     }
 
     pub fn removeFileWatch(self: *EventLoop, watch: *FileWatch) void {
-        self.removeFd(watch.fd);
+        if (watch.removed) return;
+        watch.removed = true;
+        if (watch.source_handle) |handle| {
+            self.removeSource(handle);
+            watch.source_handle = null;
+        }
         for (self.file_watches.items, 0..) |item, index| {
             if (item == watch) {
                 _ = self.file_watches.swapRemove(index);
@@ -291,6 +348,16 @@ pub const EventLoop = struct {
             .data = .{ .u64 = wayland_token },
         };
         try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, source.fd, &event));
+    }
+
+    pub fn setAfterPlatformHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
+        self.after_platform_context = context;
+        self.after_platform_hook = hook;
+    }
+
+    pub fn setEndTurnHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
+        self.end_turn_context = context;
+        self.end_turn_hook = hook;
     }
 
     pub fn wake(self: *EventLoop) !void {
@@ -313,12 +380,22 @@ pub const EventLoop = struct {
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running) {
             if (self.wayland) |wayland| {
-                const requested_events = try wayland.prepare(wayland.ctx);
+                const prepared = try wayland.prepare(wayland.ctx);
                 var event: linux.epoll_event = .{
-                    .events = requested_events,
+                    .events = prepared.events,
                     .data = .{ .u64 = wayland_token },
                 };
                 try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, wayland.fd, &event));
+
+                // The Wayland prepare step may need to dispatch events that
+                // were already queued in libwayland before it can prepare a
+                // socket read. Finish cancels that prepared read, then this
+                // turn delivers the resulting semantic events without
+                // blocking for unrelated fd activity.
+                if (prepared.dispatched_pending) {
+                    try self.dispatchTurn(0, &.{});
+                    continue;
+                }
             }
 
             const ready = try epollWait(self.epoll_fd, &events, -1);
@@ -337,40 +414,51 @@ pub const EventLoop = struct {
                 }
             }
 
-            self.dispatching = true;
-            defer {
-                self.dispatching = false;
-                self.flushPendingDestroy();
-            }
-
-            if (self.wayland) |wayland| {
-                if (!try wayland.finish(wayland.ctx, wayland_events)) self.running = false;
-            }
-
-            for (source_events[0..source_count]) |event| {
-                const token = event.data.u64;
-                const index: usize = @intCast(@as(u32, @truncate(token)));
-                const generation: u32 = @truncate(token >> 32);
-                if (index >= self.sources.items.len) continue;
-                // Re-read the slot per event: an earlier callback in this
-                // batch may have removed or replaced this source.
-                const slot = self.sources.items[index];
-                if (slot.generation != generation) continue;
-                const source = slot.source orelse continue;
-                try source.callback(source.ctx, self, event.events);
-            }
+            try self.dispatchTurn(wayland_events, source_events[0..source_count]);
         }
+    }
+
+    fn dispatchTurn(self: *EventLoop, wayland_events: u32, source_events: []const linux.epoll_event) !void {
+        std.debug.assert(!self.dispatching);
+        self.dispatching = true;
+        defer {
+            self.dispatching = false;
+            self.flushPendingDestroy();
+        }
+
+        if (self.wayland) |wayland| {
+            if (!try wayland.finish(wayland.ctx, wayland_events)) self.running = false;
+        }
+
+        if (self.after_platform_hook) |hook| try hook(self.after_platform_context.?, self);
+
+        for (source_events) |event| {
+            const token = event.data.u64;
+            const index: usize = @intCast(@as(u32, @truncate(token)));
+            const generation: u32 = @truncate(token >> 32);
+            if (index >= self.sources.items.len) continue;
+            // Re-read the slot per event: an earlier callback in this
+            // batch may have removed or replaced this source.
+            const slot = self.sources.items[index];
+            if (slot.generation != generation) continue;
+            const source = slot.source orelse continue;
+            try source.callback(source.ctx, self, event.events);
+        }
+
+        if (self.end_turn_hook) |hook| try hook(self.end_turn_context.?, self);
     }
 };
 
 fn timerSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
     const timer: *EventLoop.Timer = @ptrCast(@alignCast(ctx));
+    if (timer.removed) return;
     const expirations = try drainTimer(timer.fd);
-    if (expirations > 0) try timer.callback(timer.ctx, loop, expirations);
+    if (expirations > 0 and !timer.removed) try timer.callback(timer.ctx, loop, expirations);
 }
 
 fn fileWatchSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
     const watch: *EventLoop.FileWatch = @ptrCast(@alignCast(ctx));
+    if (watch.removed) return;
     var buffer: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
     while (true) {
         const read = linux.read(watch.fd, &buffer, buffer.len);
@@ -378,6 +466,7 @@ fn fileWatchSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
             .SUCCESS => {
                 if (read == 0) return;
                 try dispatchFileWatchEvents(watch, loop, buffer[0..read]);
+                if (watch.removed) return;
             },
             .AGAIN => return,
             else => return error.FileWatchReadFailed,
@@ -391,6 +480,7 @@ fn dispatchFileWatchEvents(watch: *EventLoop.FileWatch, loop: *EventLoop, bytes:
         const event: *const linux.inotify_event = @ptrCast(@alignCast(bytes.ptr + offset));
         const name = if (event.getName()) |event_name| event_name[0..event_name.len] else null;
         try watch.callback(watch.ctx, loop, watch.path[0..watch.path.len], event.mask, name);
+        if (watch.removed) return;
         offset += @sizeOf(linux.inotify_event) + event.len;
     }
 }
@@ -534,16 +624,16 @@ test "source removed during dispatch does not fire stale events" {
     const PipeTest = struct {
         loop: *EventLoop,
         fired: usize = 0,
-        other_fd: i32 = -1,
-        self_fd: i32 = -1,
+        other_handle: EventLoop.SourceHandle,
+        self_handle: EventLoop.SourceHandle,
 
         fn callback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.fired += 1;
             // Remove both sources mid-batch; the sibling's queued event
             // must be dropped via the generation check.
-            loop.removeFd(self.self_fd);
-            loop.removeFd(self.other_fd);
+            loop.removeSource(self.self_handle);
+            loop.removeSource(self.other_handle);
             loop.quit();
         }
     };
@@ -562,10 +652,12 @@ test "source removed during dispatch does not fire stale events" {
         _ = linux.close(fd);
     };
 
-    var context_a: PipeTest = .{ .loop = &loop, .self_fd = fds_a[0], .other_fd = fds_b[0] };
-    var context_b: PipeTest = .{ .loop = &loop, .self_fd = fds_b[0], .other_fd = fds_a[0] };
-    try loop.addFd(.{ .fd = fds_a[0], .events = linux.EPOLL.IN, .ctx = &context_a, .callback = PipeTest.callback });
-    try loop.addFd(.{ .fd = fds_b[0], .events = linux.EPOLL.IN, .ctx = &context_b, .callback = PipeTest.callback });
+    var context_a: PipeTest = undefined;
+    var context_b: PipeTest = undefined;
+    const handle_a = try loop.addFd(.{ .fd = fds_a[0], .events = linux.EPOLL.IN, .ctx = &context_a, .callback = PipeTest.callback });
+    const handle_b = try loop.addFd(.{ .fd = fds_b[0], .events = linux.EPOLL.IN, .ctx = &context_b, .callback = PipeTest.callback });
+    context_a = .{ .loop = &loop, .self_handle = handle_a, .other_handle = handle_b };
+    context_b = .{ .loop = &loop, .self_handle = handle_b, .other_handle = handle_a };
 
     // Make both pipes readable so both events arrive in one epoll batch.
     _ = linux.write(fds_a[1], "x", 1);
@@ -590,14 +682,46 @@ test "removed slot is reused with a fresh generation" {
     };
 
     var ctx: u8 = 0;
-    try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
+    const stale_handle = try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
     try std.testing.expectEqual(@as(usize, 1), loop.sources.items.len);
-    loop.removeFd(fds[0]);
+    loop.removeSource(stale_handle);
     try std.testing.expectEqual(@as(usize, 1), loop.free_slots.items.len);
 
-    try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
+    _ = try loop.addFd(.{ .fd = fds[0], .events = linux.EPOLL.IN, .ctx = &ctx, .callback = Noop.callback });
+    loop.removeSource(stale_handle);
     try std.testing.expectEqual(@as(usize, 1), loop.sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.free_slots.items.len);
     try std.testing.expectEqual(@as(u32, 1), loop.sources.items[0].generation);
+}
+
+test "timer can remove itself during dispatch" {
+    const SelfRemove = struct {
+        timer: ?*EventLoop.Timer = null,
+        fired: usize = 0,
+
+        fn callback(ctx: *anyopaque, loop: *EventLoop, expirations: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += @intCast(expirations);
+            if (self.timer) |timer| {
+                loop.removeTimer(timer);
+                loop.removeTimer(timer);
+                self.timer = null;
+            }
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var context: SelfRemove = .{};
+    context.timer = try loop.addTimer(&context, SelfRemove.callback);
+    try context.timer.?.arm(1, 0);
+    try loop.run();
+
+    try std.testing.expectEqual(@as(usize, 1), context.fired);
+    try std.testing.expectEqual(@as(usize, 0), loop.timers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.pending_destroy.items.len);
 }
 
 test "file watch can remove itself from its own callback" {
@@ -642,4 +766,94 @@ test "file watch can remove itself from its own callback" {
     try loop.run();
 
     try std.testing.expect(context.fired);
+}
+
+test "phase hooks bracket ordinary source callbacks" {
+    const HookTest = struct {
+        order: std.ArrayList(u8) = .empty,
+
+        fn after(ctx: *anyopaque, _: *EventLoop) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.order.append(std.testing.allocator, 'a');
+        }
+
+        fn end(ctx: *anyopaque, _: *EventLoop) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.order.append(std.testing.allocator, 'e');
+        }
+
+        fn timer(ctx: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.order.append(std.testing.allocator, 's');
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: HookTest = .{};
+    defer context.order.deinit(std.testing.allocator);
+    loop.setAfterPlatformHook(&context, HookTest.after);
+    loop.setEndTurnHook(&context, HookTest.end);
+    const timer = try loop.addTimer(&context, HookTest.timer);
+    try timer.arm(1, 0);
+    try loop.run();
+    try std.testing.expectEqualStrings("ase", context.order.items);
+}
+
+test "Wayland events dispatched during prepare run without polling" {
+    const WaylandTest = struct {
+        order: [4]u8 = undefined,
+        len: usize = 0,
+
+        fn append(self: *@This(), value: u8) void {
+            self.order[self.len] = value;
+            self.len += 1;
+        }
+
+        fn prepare(ctx: *anyopaque) !EventLoop.WaylandPrepare {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.append('p');
+            return .{ .events = linux.EPOLL.IN, .dispatched_pending = true };
+        }
+
+        fn finish(ctx: *anyopaque, events: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(@as(u32, 0), events);
+            self.append('f');
+            return true;
+        }
+
+        fn after(ctx: *anyopaque, _: *EventLoop) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.append('a');
+        }
+
+        fn end(ctx: *anyopaque, loop: *EventLoop) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.append('e');
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var fds: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var context: WaylandTest = .{};
+    try loop.setWayland(.{
+        .fd = fds[0],
+        .ctx = &context,
+        .prepare = WaylandTest.prepare,
+        .finish = WaylandTest.finish,
+    });
+    loop.setAfterPlatformHook(&context, WaylandTest.after);
+    loop.setEndTurnHook(&context, WaylandTest.end);
+    try loop.run();
+
+    try std.testing.expectEqualStrings("pfae", context.order[0..context.len]);
 }

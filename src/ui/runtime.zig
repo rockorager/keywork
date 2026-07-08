@@ -60,6 +60,7 @@ pub const Runtime = struct {
     state_rebuild_pending: bool = false,
     frame_pending: bool = false,
     rendering: bool = false,
+    defer_repaint_until_flush: bool = false,
     repaint_scheduler: ?RepaintScheduler = null,
     repaint_scheduler_context: ?*anyopaque = null,
 
@@ -120,11 +121,24 @@ pub const Runtime = struct {
 
     pub fn requestRepaint(self: *Runtime) !void {
         self.repaint_pending = true;
+        if (self.defer_repaint_until_flush) {
+            if (self.repaint_scheduler) |scheduler| try scheduler(self.repaint_scheduler_context.?);
+            return;
+        }
         if (self.repaint_scheduler) |scheduler| {
             try scheduler(self.repaint_scheduler_context.?);
             return;
         }
         if (!self.frame_pending and !self.rendering) try self.presentFrame();
+    }
+
+    pub fn setDeferredRepaint(self: *Runtime, enabled: bool) void {
+        self.defer_repaint_until_flush = enabled;
+    }
+
+    pub fn flushPendingRepaint(self: *Runtime) !void {
+        if (!self.repaint_pending or self.frame_pending or self.rendering) return;
+        try self.presentFrame();
     }
 
     pub fn setRepaintScheduler(self: *Runtime, context: *anyopaque, scheduler: RepaintScheduler) void {
@@ -197,6 +211,7 @@ pub const Runtime = struct {
     fn frameDone(self: *Runtime) !void {
         self.frame_pending = false;
         if (self.repaint_pending) {
+            if (self.defer_repaint_until_flush) return;
             if (self.repaint_scheduler) |scheduler| {
                 try scheduler(self.repaint_scheduler_context.?);
             } else {
@@ -931,6 +946,54 @@ test "invalidation raised during rebuild is not dropped" {
     try std.testing.expectEqual(@as(usize, 3), app.builds);
     try std.testing.expect(!runtime.rebuild_pending);
     try std.testing.expect(!runtime.state_rebuild_pending);
+}
+
+test "deferred invalidations coalesce until flush" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            return keywork.widgets.text("hello");
+        }
+    };
+
+    const TestBackend = struct {
+        presents: usize = 0,
+
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.presents += 1;
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    defer runtime.deinit();
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(usize, 1), backend.presents);
+    runtime.setDeferredRepaint(true);
+    try runtime.invalidate();
+    try runtime.invalidateState();
+    try std.testing.expectEqual(@as(usize, 1), backend.presents);
+    try runtime.flushPendingRepaint();
+    try std.testing.expectEqual(@as(usize, 2), backend.presents);
 }
 
 test "rebuild passes that never stabilize return an error" {

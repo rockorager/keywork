@@ -1,19 +1,5 @@
-local ui = require("ui")
-local keywork = require("keywork")
+local kw = require("kw")
 local bit = require("bit")
-
-keywork.window({
-  app_id = "dev.keywork.Bar",
-  backend = "cpu",
-  width = 0, -- stretch to the anchored edges
-  height = 32,
-  layer_shell = {
-    layer = "top",
-    anchor = { "top", "left", "right" },
-    exclusive_zone = 32,
-    output = "all",
-  },
-})
 
 local has_unix_socket, unix_socket = pcall(require, "socket.unix")
 
@@ -184,7 +170,7 @@ local function connect_sway(on_change)
     connected = true,
   }
 
-  client.watch = keywork.loop.fd(client.fd, { read = true }, function(_, events)
+  client.watch = kw.loop.fd(client.fd, { read = true }, function(_, events)
     if bit.band(events, bit.bor(EPOLLERR, EPOLLHUP)) ~= 0 then
       client.connected = false
     end
@@ -202,7 +188,7 @@ end
 local function capture(argv, callback)
   local stdout = {}
   local stderr = {}
-  return keywork.loop.spawn({
+  return kw.loop.spawn({
     argv = argv,
     stdout = "pipe",
     stderr = "pipe",
@@ -222,20 +208,20 @@ local function capture(argv, callback)
 end
 
 local function label(value, palette, color)
-  return ui.label(value, { color = color or palette.foreground })
+  return kw.label(value, { color = color or palette.foreground })
 end
 
 local function status_pill(palette, id, icon_name, text, color, options)
   options = options or {}
-  local child = ui.icon_theme({
+  local child = kw.icon_theme({
     color = color,
     size = options.icon_size or 16,
-    child = ui.default_text_style({
+    child = kw.default_text_style({
       color = color,
-      child = ui.icon_label(icon_name, text, { size = options.icon_size or 16 }),
+      child = kw.icon_label(icon_name, text, { size = options.icon_size or 16 }),
     }),
   })
-  return ui.chip({
+  return kw.chip({
     id = id,
     child = child,
     radius = 10,
@@ -253,7 +239,7 @@ local function workspaces(palette, sway)
   for _, workspace in ipairs(sway.workspaces or {}) do
     local name = workspace.name
     local selected = workspace.urgent or workspace.focused
-    table.insert(items, ui.chip({
+    table.insert(items, kw.chip({
       id = "workspace-" .. name,
       label = name,
       color = palette.muted,
@@ -278,7 +264,7 @@ local function workspaces(palette, sway)
   if #items == 0 then
     table.insert(items, label(sway.connected and "loading sway" or "no sway", palette, palette.muted))
   end
-  return ui.row({ spacing = 4, children = items })
+  return kw.row({ spacing = 4, children = items })
 end
 
 local function volume_status_from_output(palette, output)
@@ -382,10 +368,10 @@ end
 
 local function create_tray_host(on_change)
   local ok, bus = pcall(function()
-    return keywork.dbus.session()
+    return kw.dbus.session()
   end)
   if not ok or not bus then
-    keywork.log.warn("tray disabled: session dbus unavailable")
+    kw.log.warn("tray disabled: session dbus unavailable")
     return nil
   end
 
@@ -402,7 +388,7 @@ local function create_tray_host(on_change)
       path = SNI_WATCHER_PATH,
       interface = SNI_WATCHER,
       member = member,
-      args = id and { keywork.dbus.string(id) } or {},
+      args = id and { kw.dbus.string(id) } or {},
     })
   end
 
@@ -417,7 +403,7 @@ local function create_tray_host(on_change)
     if not item then
       return
     end
-    keywork.log.info("tray item unregistered", id)
+    kw.log.info("tray item unregistered", id)
     if item.signal_sub then
       item.signal_sub:cancel()
     end
@@ -441,11 +427,11 @@ local function create_tray_host(on_change)
       path = item.path,
       interface = DBUS_PROPERTIES,
       member = "GetAll",
-      args = { keywork.dbus.string(SNI_ITEM) },
+      args = { kw.dbus.string(SNI_ITEM) },
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        keywork.log.warn("tray item GetAll failed", item.id, err or "unknown")
+        kw.log.warn("tray item GetAll failed", item.id, err or "unknown")
         self:remove_item(item.id)
         return
       end
@@ -470,7 +456,7 @@ local function create_tray_host(on_change)
       self:read_item(self.items[id])
       return
     end
-    keywork.log.info("tray item registered", id)
+    kw.log.info("tray item registered", id)
     local item = {
       id = id,
       service = service,
@@ -544,11 +530,11 @@ local function create_tray_host(on_change)
       path = item.path,
       interface = SNI_ITEM,
       member = "Activate",
-      args = { keywork.dbus.int32(0), keywork.dbus.int32(0) },
+      args = { kw.dbus.int32(0), kw.dbus.int32(0) },
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        keywork.log.warn("tray item Activate failed", item.id, err or "unknown")
+        kw.log.warn("tray item Activate failed", item.id, err or "unknown")
       end
     end)
   end
@@ -567,11 +553,11 @@ local function create_tray_host(on_change)
     return bus:request_name(SNI_WATCHER, { replace_existing = true, do_not_queue = true })
   end)
   if not name_ok then
-    keywork.log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
+    kw.log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
     bus:close()
     return nil
   end
-  keywork.log.info("tray enabled: owning org.kde.StatusNotifierWatcher")
+  kw.log.info("tray enabled: owning org.kde.StatusNotifierWatcher")
   host.name = name
   host.exported = bus:export(SNI_WATCHER_PATH, {
     [SNI_WATCHER] = {
@@ -594,21 +580,21 @@ local function create_tray_host(on_change)
           signature = "as",
           access = "read",
           get = function()
-            return keywork.dbus.array("s", host:item_ids())
+            return kw.dbus.array("s", host:item_ids())
           end,
         },
         IsStatusNotifierHostRegistered = {
           signature = "b",
           access = "read",
           get = function()
-            return keywork.dbus.boolean(host.host_registered)
+            return kw.dbus.boolean(host.host_registered)
           end,
         },
         ProtocolVersion = {
           signature = "i",
           access = "read",
           get = function()
-            return keywork.dbus.int32(0)
+            return kw.dbus.int32(0)
           end,
         },
       },
@@ -698,7 +684,7 @@ local function battery_status_from_values(palette, percentage, state, line_power
   return status_pill(palette, "battery", name, tostring(capacity) .. "%", color, { icon_size = 14 })
 end
 
-local StatusItems = ui.stateful({
+local StatusItems = kw.stateful({
   init = function(self)
     local palette = self.props.colors
     self.volume = status_pill(palette, "volume", "audio-volume-muted", nil, palette.muted)
@@ -711,7 +697,7 @@ local StatusItems = ui.stateful({
     self:watch_network()
     self:watch_battery()
     self:update_battery()
-    self.timer = keywork.loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
+    self.timer = kw.loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
       self:set_state(function(state)
         state:update_time()
       end)
@@ -776,7 +762,7 @@ local StatusItems = ui.stateful({
     end
 
     local buffer = ""
-    self.volume_sub = keywork.loop.spawn({
+    self.volume_sub = kw.loop.spawn({
       argv = { "pactl", "subscribe" },
       stdout = "pipe",
       stderr = "pipe",
@@ -804,7 +790,7 @@ local StatusItems = ui.stateful({
       exit = function(result)
         self.volume_sub = nil
         if not result.ok then
-          keywork.log.warn("volume subscribe exited")
+          kw.log.warn("volume subscribe exited")
         end
       end,
     })
@@ -838,7 +824,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       return
     end
     local ok, bus = pcall(function()
-      return keywork.dbus.system()
+      return kw.dbus.system()
     end)
     if not ok or not bus then
       return
@@ -868,7 +854,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        keywork.log.warn("battery dbus properties failed", err or path)
+        kw.log.warn("battery dbus properties failed", err or path)
         return
       end
       self:set_state(function(state)
@@ -919,7 +905,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        keywork.log.warn("battery dbus enumerate failed", err or "unknown")
+        kw.log.warn("battery dbus enumerate failed", err or "unknown")
         return
       end
       for _, path in ipairs((reply.args or {})[1] or {}) do
@@ -942,7 +928,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       return
     end
     local ok, bus = pcall(function()
-      return keywork.dbus.system()
+      return kw.dbus.system()
     end)
     if ok and bus then
       self.battery_bus = bus
@@ -960,12 +946,12 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       if sub_ok then
         self.battery_sub = sub
       else
-        keywork.log.warn("battery dbus subscribe failed")
+        kw.log.warn("battery dbus subscribe failed")
         self.battery_bus:close()
         self.battery_bus = nil
       end
     else
-      keywork.log.warn("battery dbus unavailable")
+      kw.log.warn("battery dbus unavailable")
     end
   end,
 
@@ -979,7 +965,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
 
   build = function(self, context)
     local palette = self.props.colors
-    return ui.row({
+    return kw.row({
       spacing = 8,
       align = "center",
       children = {
@@ -992,7 +978,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
   end,
 })
 
-local SwayWorkspaces = ui.stateful({
+local SwayWorkspaces = kw.stateful({
   init = function(self)
     self.sway = connect_sway(function()
       self:set_state()
@@ -1013,7 +999,7 @@ local SwayWorkspaces = ui.stateful({
   end,
 })
 
-local TrayItems = ui.stateful({
+local TrayItems = kw.stateful({
   init = function(self)
     self.host = create_tray_host(function()
       self:set_state()
@@ -1028,7 +1014,7 @@ local TrayItems = ui.stateful({
 
   build = function(self)
     if not self.host then
-      return ui.row({ spacing = 0, children = {} })
+      return kw.row({ spacing = 0, children = {} })
     end
 
     local palette = self.props.colors
@@ -1036,17 +1022,17 @@ local TrayItems = ui.stateful({
     for _, item in ipairs(self.host:visible_items()) do
       local icon_name = item.icon_name or "application-x-executable"
       local pixmap = best_icon_pixmap(item.icon_pixmap)
-      local icon = pixmap and ui.image({
+      local icon = pixmap and kw.image({
         width = pixmap.width,
         height = pixmap.height,
         size = 16,
         format = "argb32",
         pixels = pixmap.pixels,
-      }) or ui.icon_theme({
+      }) or kw.icon_theme({
         size = 16,
-        child = ui.icon_label(icon_name, nil, { size = 16 }),
+        child = kw.icon_label(icon_name, nil, { size = 16 }),
       })
-      table.insert(items, ui.chip({
+      table.insert(items, kw.chip({
         id = "tray-" .. item.id,
         child = icon,
         radius = 10,
@@ -1058,39 +1044,39 @@ local TrayItems = ui.stateful({
         end,
       }))
     end
-    return ui.row({ spacing = 4, align = "center", children = items })
+    return kw.row({ spacing = 4, align = "center", children = items })
   end,
 })
 
-local App = ui.stateful({
+local App = kw.stateful({
   build = function(self, context)
     local theme = context.theme
     local palette = bar_colors(theme)
-    local left = ui.row({
+    local left = kw.row({
       spacing = 10,
       align = "center",
       children = {
         SwayWorkspaces({ key = "sway-workspaces", colors = palette }),
-        ui.row({
+        kw.row({
           spacing = 6,
           align = "center",
           children = {
-            ui.svg_icon({ path = "examples/lua/icons/bolt.svg", size = 16, color = palette.accent }),
+            kw.svg_icon({ path = "examples/lua/icons/bolt.svg", size = 16, color = palette.accent }),
             label("Keywork", palette),
           },
         }),
       },
     })
 
-    return ui.theme({
+    return kw.theme({
       data = theme,
-      child = ui.container({ background = palette.background, padding = { all = 4 } },
-        ui.row({
+      child = kw.container({ background = palette.background, padding = { all = 4 } },
+        kw.row({
           spacing = 12,
           align = "center",
           children = {
             left,
-            ui.spacer(),
+            kw.spacer(),
             TrayItems({ key = "tray", colors = palette }),
             StatusItems({ key = "status", colors = palette }),
           },
@@ -1100,4 +1086,16 @@ local App = ui.stateful({
   end,
 })
 
-return App({ key = "app" })
+return kw.app({
+  app_id = "dev.keywork.Bar",
+  backend = "cpu",
+  width = 0, -- stretch to the anchored edges
+  height = 32,
+  layer_shell = {
+    layer = "top",
+    anchor = { "top", "left", "right" },
+    exclusive_zone = 32,
+    output = "all",
+  },
+  child = App({ key = "app" }),
+})

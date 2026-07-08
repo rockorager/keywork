@@ -26,12 +26,6 @@ fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorS
     runtime_mod.Runtime.colorSchemeChanged(ctx, uiColorScheme(color_scheme));
 }
 
-pub const EventSourceInstaller = *const fn (
-    ctx: *anyopaque,
-    loop: *event_loop.EventLoop,
-    runtime: *runtime_mod.Runtime,
-) anyerror!void;
-
 pub const Options = struct {
     title: [:0]const u8 = "Keywork",
     app_id: [:0]const u8 = "dev.keywork.Keywork",
@@ -40,20 +34,23 @@ pub const Options = struct {
     backend: app_options.BackendKind = .log,
     layer_shell: ?wayland_options.LayerShellOptions = null,
     log_writer: *std.Io.Writer,
-    event_source_context: *anyopaque,
-    install_event_sources: EventSourceInstaller,
+    runtime_context: ?*anyopaque = null,
+    bind_runtime: ?*const fn (ctx: *anyopaque, runtime: *runtime_mod.Runtime) void = null,
+    unbind_runtime: ?*const fn (ctx: *anyopaque) void = null,
+    bind_event_loop: ?*const fn (ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void = null,
+    unbind_event_loop: ?*const fn (ctx: *anyopaque) void = null,
 };
 
-pub fn run(allocator: std.mem.Allocator, app: keywork.AppHost, options: Options) !void {
+pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
     const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
     const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = options.height };
     if (options.backend == .wayland_shm and options.layer_shell != null and options.layer_shell.?.output == .all) {
-        return runWaylandAllOutputs(allocator, app, constraints, options);
+        return runWaylandAllOutputs(allocator, loop, app, constraints, options);
     }
     return switch (options.backend) {
         .log => runLog(allocator, app, constraints, options),
-        .wayland_shm => runWayland(allocator, app, constraints, options, wayland_shm.Backend),
-        .vulkan => runWayland(allocator, app, constraints, options, wayland_vulkan.Backend),
+        .wayland_shm => runWayland(allocator, loop, app, constraints, options, wayland_shm.Backend),
+        .vulkan => runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
     };
 }
 
@@ -64,7 +61,7 @@ fn runLog(
     options: Options,
 ) !void {
     var log_backend: log_backend_mod.LogBackend = .{ .writer = options.log_writer };
-    return runHeadlessRuntime(allocator, app, constraints, log_backend.backend());
+    return runHeadlessRuntime(allocator, app, constraints, log_backend.backend(), options);
 }
 
 fn runHeadlessRuntime(
@@ -72,6 +69,7 @@ fn runHeadlessRuntime(
     app: keywork.AppHost,
     constraints: keywork.Constraints,
     backend: keywork.RenderBackend,
+    options: Options,
 ) !void {
     var runtime = try runtime_mod.Runtime.init(
         allocator,
@@ -81,11 +79,14 @@ fn runHeadlessRuntime(
         .no_preference,
     );
     defer runtime.deinit();
+    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
+    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
     try runtime.repaint();
 }
 
 fn runWayland(
     allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     constraints: keywork.Constraints,
     options: Options,
@@ -118,42 +119,162 @@ fn runWayland(
         app,
         initial_color_scheme,
     );
+    defer runtime.deinit();
+    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
+    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
+    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
     if (options.layer_shell != null) runtime.frame_background = keywork.colors.transparent;
-    errdefer runtime.deinit();
+    runtime.setDeferredRepaint(true);
 
-    backend.setPointerButtonHandler(&runtime, runtime_mod.Runtime.waylandPointerButton);
-    backend.setPointerMoveHandler(&runtime, runtime_mod.Runtime.waylandPointerMove);
+    var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime };
+    defer queue.deinit();
+    backend.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
+    backend.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
     backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
-    backend.setRepaintHandler(&runtime, runtime_mod.Runtime.waylandConfigure);
-    backend.setFrameHandler(&runtime, runtime_mod.Runtime.waylandFrameDone);
-    backend.setKeyHandler(&runtime, runtime_mod.Runtime.waylandKeyInput);
-    backend.setScrollHandler(&runtime, runtime_mod.Runtime.waylandScroll);
+    backend.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
+    backend.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
+    backend.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
+    backend.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
         settings.setChangeHandler(&runtime, desktopSettingsChanged);
     }
     try runtime.repaint();
 
-    var loop = try event_loop.EventLoop.init(allocator);
-    defer loop.deinit();
-    defer runtime.deinit();
     try loop.setWayland(.{
         .fd = backend.eventLoopFd(),
         .ctx = backend,
         .prepare = Backend.eventLoopPrepare,
         .finish = Backend.eventLoopFinish,
     });
-    try backend.installEventTimers(&loop);
+    try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
-    if (settings_client) |*settings| try loop.addFd(.{
+    var settings_source: ?event_loop.EventLoop.SourceHandle = null;
+    defer if (settings_source) |handle| loop.removeSource(handle);
+    if (settings_client) |*settings| settings_source = try loop.addFd(.{
         .fd = settings.eventLoopFd(),
         .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    try options.install_event_sources(options.event_source_context, &loop, &runtime);
+    loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
+    loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
     try loop.run();
 }
+
+const QueuedPlatformEvents = struct {
+    allocator: std.mem.Allocator,
+    runtime: *runtime_mod.Runtime,
+    multi_output: ?*MultiOutputContext = null,
+    events: std.ArrayList(Event) = .empty,
+
+    const Event = union(enum) {
+        pointer_button: struct { point: keywork.Point, state: keywork.PointerButtonState },
+        pointer_move: ?keywork.Point,
+        scroll: struct { point: keywork.Point, dx: f32, dy: f32 },
+        key: keywork.KeyInput,
+        configure: keywork.Size,
+        frame_done,
+    };
+
+    fn deinit(self: *QueuedPlatformEvents) void {
+        self.clear();
+        self.events.deinit(self.allocator);
+    }
+
+    fn clear(self: *QueuedPlatformEvents) void {
+        for (self.events.items) |event| switch (event) {
+            .key => |input| switch (input) {
+                .text => |text| self.allocator.free(text),
+                else => {},
+            },
+            else => {},
+        };
+        self.events.clearRetainingCapacity();
+    }
+
+    fn append(self: *QueuedPlatformEvents, event: Event) void {
+        self.events.append(self.allocator, event) catch |err| {
+            switch (event) {
+                .key => |input| switch (input) {
+                    .text => |text| self.allocator.free(text),
+                    else => {},
+                },
+                else => {},
+            }
+            log.err("queue platform event failed: {}", .{err});
+        };
+    }
+
+    fn pointerButton(ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        self.append(.{ .pointer_button = .{ .point = point, .state = state } });
+    }
+
+    fn pointerMove(ctx: *anyopaque, point: ?keywork.Point) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        self.append(.{ .pointer_move = point });
+    }
+
+    fn scroll(ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        self.append(.{ .scroll = .{ .point = point, .dx = dx, .dy = dy } });
+    }
+
+    fn keyInput(ctx: *anyopaque, input: keywork.KeyInput) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        const copied = switch (input) {
+            .text => |text| keywork.KeyInput{ .text = self.allocator.dupe(u8, text) catch |err| {
+                log.err("copy key text failed: {}", .{err});
+                return;
+            } },
+            else => input,
+        };
+        self.append(.{ .key = copied });
+    }
+
+    fn configure(ctx: *anyopaque, size: keywork.Size) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        self.append(.{ .configure = size });
+    }
+
+    fn frameDone(ctx: *anyopaque) void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        self.append(.frame_done);
+    }
+
+    fn drain(self: *QueuedPlatformEvents) !void {
+        if (self.events.items.len == 0) return;
+        defer self.clear();
+        for (self.events.items) |event| switch (event) {
+            .pointer_button => |value| try self.runtime.pointerButton(value.point, value.state),
+            .pointer_move => |point| try self.runtime.pointerMove(point),
+            .scroll => |value| try self.runtime.scrollBy(value.point, value.dx, value.dy),
+            .key => |input| try self.runtime.keyInput(input),
+            .configure => |size| if (self.multi_output) |multi| multi.configure(size) else runtime_mod.Runtime.waylandConfigure(self.runtime, size),
+            .frame_done => if (self.multi_output) |multi| MultiOutputContext.frameHandler(multi) else runtime_mod.Runtime.waylandFrameDone(self.runtime),
+        };
+    }
+
+    fn afterPlatformHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        try self.drain();
+    }
+
+    fn endTurnHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
+        const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
+        // Input repeat and kinetic-scroll timers are ordinary event-loop
+        // sources, so they can enqueue semantic events after the platform
+        // phase. Drain those before presenting the turn's coalesced frame.
+        try self.drain();
+        if (self.multi_output) |multi| {
+            try multi.flush();
+        } else {
+            try self.runtime.flushPendingRepaint();
+        }
+    }
+};
 
 const MultiOutputContext = struct {
     runtime: *runtime_mod.Runtime,
@@ -174,22 +295,29 @@ const MultiOutputContext = struct {
 
     fn schedule(ctx: *anyopaque) !void {
         const self: *MultiOutputContext = @ptrCast(@alignCast(ctx));
-        if (!self.runtime.frame_pending and !self.runtime.rendering) try self.repaintAll();
+        self.runtime.repaint_pending = true;
     }
 
-    fn repaintHandler(ctx: *anyopaque, _: keywork.Size) void {
-        const self: *MultiOutputContext = @ptrCast(@alignCast(ctx));
-        self.repaintAll() catch |err| log.warn("multi-output repaint failed: {}", .{err});
+    fn configure(self: *MultiOutputContext, _: keywork.Size) void {
+        self.runtime.rebuild_pending = true;
+        self.runtime.repaint_pending = true;
     }
 
     fn frameHandler(ctx: *anyopaque) void {
         const self: *MultiOutputContext = @ptrCast(@alignCast(ctx));
         runtime_mod.Runtime.waylandFrameDone(self.runtime);
     }
+
+    fn flush(self: *MultiOutputContext) !void {
+        if (!self.runtime.repaint_pending or self.runtime.frame_pending or self.runtime.rendering) return;
+        try self.repaintAll();
+        self.runtime.repaint_pending = false;
+    }
 };
 
 fn runWaylandAllOutputs(
     allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     constraints: keywork.Constraints,
     options: Options,
@@ -225,43 +353,50 @@ fn runWaylandAllOutputs(
         app,
         initial_color_scheme,
     );
+    defer runtime.deinit();
+    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
+    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
+    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
     runtime.frame_background = keywork.colors.transparent;
-    errdefer runtime.deinit();
+    runtime.setDeferredRepaint(true);
 
     var multi_context: MultiOutputContext = .{ .runtime = &runtime, .backend = backend, .output_backends = output_backends };
     runtime.setRepaintScheduler(&multi_context, MultiOutputContext.schedule);
 
-    backend.setPointerButtonHandler(&runtime, runtime_mod.Runtime.waylandPointerButton);
-    backend.setPointerMoveHandler(&runtime, runtime_mod.Runtime.waylandPointerMove);
+    var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime, .multi_output = &multi_context };
+    defer queue.deinit();
+    backend.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
+    backend.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
     backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
-    backend.setRepaintHandler(&multi_context, MultiOutputContext.repaintHandler);
-    backend.setFrameHandler(&multi_context, MultiOutputContext.frameHandler);
-    backend.setKeyHandler(&runtime, runtime_mod.Runtime.waylandKeyInput);
-    backend.setScrollHandler(&runtime, runtime_mod.Runtime.waylandScroll);
+    backend.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
+    backend.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
+    backend.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
+    backend.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
         settings.setChangeHandler(&runtime, desktopSettingsChanged);
     }
     try multi_context.repaintAll();
 
-    var loop = try event_loop.EventLoop.init(allocator);
-    defer loop.deinit();
-    defer runtime.deinit();
     try loop.setWayland(.{
         .fd = backend.eventLoopFd(),
         .ctx = backend,
         .prepare = wayland_shm.Backend.eventLoopPrepare,
         .finish = wayland_shm.Backend.eventLoopFinish,
     });
-    try backend.installEventTimers(&loop);
+    try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
-    if (settings_client) |*settings| try loop.addFd(.{
+    var settings_source: ?event_loop.EventLoop.SourceHandle = null;
+    defer if (settings_source) |handle| loop.removeSource(handle);
+    if (settings_client) |*settings| settings_source = try loop.addFd(.{
         .fd = settings.eventLoopFd(),
         .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    try options.install_event_sources(options.event_source_context, &loop, &runtime);
+    loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
+    loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
     try loop.run();
 }
 
@@ -270,4 +405,18 @@ fn positiveU31(value: f32) !u31 {
     const rounded = @ceil(value);
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
     return @intFromFloat(rounded);
+}
+
+test "queued key text is copied" {
+    var runtime: runtime_mod.Runtime = undefined;
+    var queue: QueuedPlatformEvents = .{ .allocator = std.testing.allocator, .runtime = &runtime };
+    defer queue.deinit();
+
+    var buffer = [_]u8{ 'a', 'b' };
+    QueuedPlatformEvents.keyInput(&queue, .{ .text = buffer[0..] });
+    buffer[0] = 'z';
+
+    try std.testing.expectEqual(@as(usize, 1), queue.events.items.len);
+    const input = queue.events.items[0].key;
+    try std.testing.expectEqualStrings("ab", input.text);
 }
