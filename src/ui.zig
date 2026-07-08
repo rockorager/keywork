@@ -1,66 +1,69 @@
-//! Language-neutral declarative UI model used by the public Zig API.
-//!
-//! Widgets are borrowed descriptions. `Surface.submit` copies the complete
-//! tree, so callers may build it from stack values or short-lived arenas.
+//! Internal UI engine facade.
 
-const core = @import("core.zig");
+const model = @import("ui/model.zig");
+const types = @import("ui/types.zig");
+const display = @import("ui/display.zig");
 
-pub const Widget = core.Widget;
-pub const HandlerId = core.HandlerId;
-pub const DocumentId = core.DocumentId;
-pub const ResourceId = core.ResourceId;
-pub const TextRole = core.TextRole;
-pub const CrossAlignment = Widget.CrossAxisAlignment;
-pub const MainAlignment = Widget.MainAxisAlignment;
-pub const Alignment = Widget.Alignment;
-pub const FlexFit = Widget.FlexFit;
-pub const Activation = Widget.ClickActivation;
-pub const ScrollAxes = Widget.ScrollAxes;
-pub const ShortcutKey = core.ShortcutKey;
-pub const TextStyle = core.TextStyle;
-pub const Color = core.Color;
-pub const EdgeInsets = core.EdgeInsets;
-
-pub fn text(value: []const u8) Widget {
-    return .{ .text = .{ .value = value } };
-}
-
-pub fn row(children: []const Widget) Widget {
-    return .{ .row = .{ .children = children } };
-}
-
-pub fn column(children: []const Widget) Widget {
-    return .{ .column = .{ .children = children } };
-}
-
-pub fn container(child: *const Widget) Widget {
-    return .{ .container = .{ .child = child } };
-}
-
-pub fn filledButton(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
-    return .{ .filled_button = .{ .id = id, .handler = handler, .child = child } };
-}
-
-pub fn filled_button(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
-    return filledButton(id, handler, child);
-}
-
-pub fn button(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
-    return filledButton(id, handler, child);
-}
-
-pub fn gestureDetector(id: []const u8, handler: HandlerId, child: *const Widget) Widget {
-    return .{ .gesture_detector = .{ .id = id, .handler = handler, .child = child } };
-}
-
-pub fn sizedBox(child: *const Widget, width: ?f32, height: ?f32) Widget {
-    return .{ .sized_box = .{ .child = child, .width = width, .height = height } };
-}
-
-pub fn singleChildScrollView(id: []const u8, child: *const Widget) Widget {
-    return .{ .single_child_scroll_view = .{ .id = id, .child = child } };
-}
-
-pub fn textField(id: []const u8, value: []const u8, placeholder: []const u8) Widget {
-    return .{ .text_field = .{ .id = id, .focus_node = .named(id), .value = value, .placeholder = placeholder } };
-}
+pub const Color = types.Color;
+pub const colors = types.colors;
+pub const ColorScheme = types.ColorScheme;
+pub const TextStyle = types.TextStyle;
+pub const ResolvedTextStyle = types.ResolvedTextStyle;
+pub const TextRole = types.TextRole;
+pub const TextTheme = types.TextTheme;
+pub const ButtonTheme = types.ButtonTheme;
+pub const InputTheme = types.InputTheme;
+pub const Theme = types.Theme;
+pub const PointerButtonState = types.PointerButtonState;
+pub const ShortcutKey = types.ShortcutKey;
+pub const Intent = types.Intent;
+pub const Size = types.Size;
+pub const Point = types.Point;
+pub const Rect = types.Rect;
+pub const EdgeInsets = types.EdgeInsets;
+pub const Constraints = types.Constraints;
+pub const Widget = model.Widget;
+pub const BuildScope = model.BuildScope;
+pub const widgets = model.widgets;
+pub const Element = model.Element;
+pub const RenderNode = model.RenderNode;
+pub const PaintCommand = display.PaintCommand;
+pub const DisplayList = display.DisplayList;
+pub const RenderBackend = display.RenderBackend;
+pub const TextMeasurer = display.TextMeasurer;
+pub const KeyInput = types.KeyInput;
+pub const CursorShape = types.CursorShape;
+pub const AppContext = model.AppContext;
+pub const textInputState = model.textInputState;
+pub const scrollState = model.scrollState;
+pub const listState = model.listState;
+pub const anyListRangeStale = model.anyListRangeStale;
+pub const AppHost = model.AppHost;
+pub const buildRenderTreeFromElement = model.buildRenderTreeFromElement;
+pub const buildElementTreeScoped = model.buildElementTreeScoped;
+pub const destroyElementTree = model.destroyElementTree;
+pub const updateElementTreeScoped = model.updateElementTreeScoped;
+pub const rebuildDirtyElementTreeScoped = model.rebuildDirtyElementTreeScoped;
+pub const dirtyTextInputElement = model.dirtyTextInputElement;
+pub const dirtyScrollElement = model.dirtyScrollElement;
+pub const refreshInteractionElements = model.refreshInteractionElements;
+pub const paintScaled = model.paintScaled;
+pub const ScrollbarAxis = model.ScrollbarAxis;
+pub const ScrollbarThumbHit = model.ScrollbarThumbHit;
+pub const hitTestScrollbarThumb = model.hitTestScrollbarThumb;
+pub const ClickHit = model.ClickHit;
+pub const FocusTarget = model.FocusTarget;
+pub const collectFocusTargets = model.collectFocusTargets;
+pub const findFocusTarget = model.findFocusTarget;
+pub const hitTestClick = model.hitTestClick;
+pub const findClickHitById = model.findClickHitById;
+pub const hitTestTextInput = model.hitTestTextInput;
+pub const hitTestScroll = model.hitTestScroll;
+pub const RevealAdjustment = model.RevealAdjustment;
+pub const collectRevealAdjustments = model.collectRevealAdjustments;
+pub const hitTestCursorShape = model.hitTestCursorShape;
+pub const shortcutKeyForInput = model.shortcutKeyForInput;
+pub const shortcutAllowedWhileEditing = model.shortcutAllowedWhileEditing;
+pub const findShortcutAction = model.findShortcutAction;
+pub const findFocusedShortcutAction = model.findFocusedShortcutAction;
+pub const collectDamage = model.collectDamage;

@@ -1,14 +1,12 @@
-//! Builds LuaJIT from the vendored upstream tarball, replicating the
-//! upstream Makefile bootstrap: a host `minilua` runs DynASM to generate
-//! `buildvm_arch.h`, a host `buildvm` then emits the VM assembly and the
-//! bytecode/library definition headers, and the final static library
-//! compiles the interpreter and JIT sources against them.
+//! Builds LuaJIT from the upstream tarball by replicating its Makefile
+//! bootstrap: minilua runs DynASM and genversion, then buildvm emits the
+//! generated VM assembly and definition headers used by the final library.
 
 const std = @import("std");
 
 pub const LuaJit = struct {
     library: *std.Build.Step.Compile,
-    /// Upstream `src/` containing lua.h, lauxlib.h, lualib.h, luaconf.h.
+    /// Upstream `src/` containing lua.h, lauxlib.h, lualib.h, and luaconf.h.
     include_dir: std.Build.LazyPath,
     /// Directory containing the generated luajit.h.
     generated_include_dir: std.Build.LazyPath,
@@ -34,7 +32,6 @@ pub fn add(
         else => @panic("keywork supports x86_64 and aarch64 Linux"),
     };
 
-    // Host bootstrap interpreter used to run DynASM and genversion.
     const minilua_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
@@ -44,7 +41,6 @@ pub fn add(
     minilua_mod.addCSourceFile(.{ .file = upstream.path("src/host/minilua.c") });
     const minilua = b.addExecutable(.{ .name = "minilua", .root_module = minilua_mod });
 
-    // DynASM: vm_*.dasc -> buildvm_arch.h
     const dynasm_run = b.addRunArtifact(minilua);
     dynasm_run.addFileArg(upstream.path("dynasm/dynasm.lua"));
     dynasm_run.addArgs(&.{ "-D", "ENDIAN_LE" });
@@ -55,14 +51,12 @@ pub fn add(
     const buildvm_arch_h = dynasm_run.addOutputFileArg("buildvm_arch.h");
     dynasm_run.addFileArg(upstream.path(dasc_file));
 
-    // genversion: luajit_rolling.h + .relver -> luajit.h
     const genversion_run = b.addRunArtifact(minilua);
     genversion_run.addFileArg(upstream.path("src/host/genversion.lua"));
     genversion_run.addFileArg(upstream.path("src/luajit_rolling.h"));
     genversion_run.addFileArg(upstream.path(".relver"));
     const luajit_h = genversion_run.addOutputFileArg("luajit.h");
 
-    // Host generator for the VM assembly and definition headers.
     const buildvm_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
@@ -116,9 +110,13 @@ pub fn add(
     const ljvm_s = ljvm_run.addOutputFileArg("lj_vm.S");
     lib_mod.addAssemblyFile(ljvm_s);
 
-    // External frame unwinding: zig's compiler-rt does not provide the
-    // _Unwind_* symbols gcc supplies via libgcc, so link libunwind.
+    // Zig's compiler-rt does not provide the _Unwind_* symbols that GCC
+    // supplies through libgcc, so LuaJIT uses the system unwinder.
     lib_mod.addCMacro("LUAJIT_UNWIND_EXTERNAL", "");
+    // Upstream keeps /usr/local as its local module root and adds LUA_ROOT
+    // as the distribution root. Defining /usr therefore searches both
+    // locations while preserving LUA_PATH/LUA_CPATH override semantics.
+    lib_mod.addCMacro("LUA_ROOT", "\"/usr\"");
     lib_mod.linkSystemLibrary("unwind", .{});
     lib_mod.addIncludePath(upstream.path("src"));
     lib_mod.addIncludePath(luajit_h.dirname());
@@ -141,8 +139,6 @@ pub fn add(
     };
 }
 
-/// Standard library sources; also the input list for the buildvm
-/// definition-header modes.
 const lib_sources = [_][]const u8{
     "src/lib_base.c",
     "src/lib_math.c",
