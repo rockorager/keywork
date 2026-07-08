@@ -40,19 +40,24 @@ idle work runs only when no frame is pending.
 
 ## Lua boundary
 
-Lua runs only at loop iteration boundaries — never inside Wayland dispatch,
-layout, or paint. The toolkit emits semantic events (activations, focus
-changes, text edits) into a queue during dispatch; the runtime drains the
-queue afterward and calls the corresponding Lua functions. This keeps the
-VM off the native dispatch stack and makes reentrancy into mid-mutation
-toolkit state impossible.
+Zig→Lua callbacks are phase-restricted, not forbidden (see
+`docs/widgets.md`). Wayland dispatch never calls Lua: the toolkit emits
+semantic events (activations, focus changes, text edits) into a queue
+during dispatch and the runtime drains it at the loop boundary, where
+handlers may do anything — `setState`, tasks, IO. Three further callback
+kinds run mid-pipeline under an engine phase flag: `build` (and state
+lifecycle) during rebuild, layout delegates during layout, and paint
+recorders during painting. Each is a pure function from engine-provided
+inputs to engine-consumed outputs; the `kw` API asserts on calls made in
+the wrong phase, so re-entrancy stays bounded.
 
-Widget trees flow the other way. The application returns plain Lua tables;
-the runtime walks them once into typed `ui.Widget` values allocated in an
-arena and hands the arena to the surface. Handler slots in widget tables
-hold Lua functions; the runtime pins each with `luaL_ref` and stores the
-ref as the widget's opaque `u64` handler identity, scoped to the submitted
-document. The toolkit core never sees Lua.
+Widget trees flow the other way. The script returns a root widget; the
+engine reconciles widget tables against its persistent element tree,
+calling pinned `build` refs for dirty composites and expanding primitives
+into render objects. Handler and build slots in widget tables hold Lua
+functions pinned with `luaL_ref` and owned by their element. The element
+tree lives in the core; the core sees Lua refs as opaque handles only
+through the runtime's callback table.
 
 ## Tasks
 
@@ -75,11 +80,14 @@ icon-theme cache, and the portal settings connection. A `Surface` belongs
 to a context and holds the installed document. Contexts register their fd
 sources into the runtime's loop; they do not own a loop of their own.
 
-Submission installs a complete widget tree. Reconciliation retains an
-element tree matched by widget type and optional sibling key; elements own
-interaction state (scroll offsets, text input state, focus) and retained
-render objects. Layout updates a retained render tree; painting produces a
-display list with damage rectangles.
+The core owns the element tree. Reconciliation matches widgets to
+elements by type and optional sibling key, expanding composite widgets by
+invoking their `build` callbacks through a runtime-provided callback
+interface (the core sees pinned Lua functions only as opaque handles).
+Elements own composite state handles and interaction state (scroll
+offsets, text input state, focus) plus retained render objects. Layout
+updates a retained render tree; painting produces a display list with
+damage rectangles. `docs/widgets.md` is the contract for this layer.
 
 Semantic widgets resolve presentation in the core. A button document record
 carries content and behavior, not colors: background, hover, pressed,
