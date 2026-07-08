@@ -113,6 +113,10 @@ pub fn add(
     // Zig's compiler-rt does not provide the _Unwind_* symbols that GCC
     // supplies through libgcc, so LuaJIT uses the system unwinder.
     lib_mod.addCMacro("LUAJIT_UNWIND_EXTERNAL", "");
+    // Upstream keeps /usr/local as its local module root and adds LUA_ROOT
+    // as the distribution root. Defining /usr therefore searches both
+    // locations while preserving LUA_PATH/LUA_CPATH override semantics.
+    lib_mod.addCMacro("LUA_ROOT", "\"/usr\"");
     lib_mod.linkSystemLibrary("unwind", .{});
     lib_mod.addIncludePath(upstream.path("src"));
     lib_mod.addIncludePath(luajit_h.dirname());

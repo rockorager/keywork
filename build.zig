@@ -114,6 +114,9 @@ pub fn build(b: *std.Build) void {
         .name = "keywork",
         .root_module = app_module,
     });
+    // Lua C modules resolve the statically linked LuaJIT API from the host
+    // executable when dlopen loads them.
+    exe.rdynamic = true;
 
     b.installArtifact(exe);
 
@@ -176,6 +179,7 @@ pub fn build(b: *std.Build) void {
     const app_tests = b.addTest(.{
         .root_module = app_module,
     });
+    app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
