@@ -7,17 +7,11 @@ const display = @import("display.zig");
 
 pub const Color = types.Color;
 pub const colors = types.colors;
-pub const Brightness = types.Brightness;
-pub const ColorScheme = types.ColorScheme;
 pub const TextStyle = types.TextStyle;
 pub const ResolvedTextStyle = types.ResolvedTextStyle;
 pub const TextRole = types.TextRole;
-pub const TextTheme = types.TextTheme;
-pub const ButtonTheme = types.ButtonTheme;
-pub const InputTheme = types.InputTheme;
 pub const Theme = types.Theme;
 pub const InteractionState = types.InteractionState;
-pub const PointerButtonState = types.PointerButtonState;
 pub const ShortcutKey = types.ShortcutKey;
 pub const Intent = types.Intent;
 pub const FocusNode = types.FocusNode;
@@ -28,7 +22,6 @@ pub const EdgeInsets = types.EdgeInsets;
 pub const Constraints = types.Constraints;
 pub const KeyInput = types.KeyInput;
 pub const CursorShape = types.CursorShape;
-pub const PaintCommand = display.PaintCommand;
 pub const DisplayList = display.DisplayList;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
@@ -581,24 +574,8 @@ pub const widgets = struct {
         return .{ .text = .{ .value = value } };
     }
 
-    pub fn coloredText(value: []const u8, color: Color) Widget {
-        return .{ .text = .{ .value = value, .color = color } };
-    }
-
-    pub fn box(allocator: std.mem.Allocator, child: Widget, background: Color) !Widget {
-        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background } };
-    }
-
-    pub fn borderedBox(allocator: std.mem.Allocator, child: Widget, background: Color, border: ?Color) !Widget {
-        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background, .border = border } };
-    }
-
     pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
-    }
-
-    pub fn pressClickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
-        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click, .activation = .press } };
     }
 
     pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
@@ -680,10 +657,6 @@ pub const widgets = struct {
         main_align: Widget.MainAxisAlignment = .start,
     };
 
-    pub fn expanded(allocator: std.mem.Allocator, child: Widget) !Widget {
-        return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .fit = .tight } };
-    }
-
     pub fn expandedFlex(allocator: std.mem.Allocator, child: Widget, flex: f32) !Widget {
         return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .flex = flex, .fit = .tight } };
     }
@@ -694,15 +667,6 @@ pub const widgets = struct {
 
     pub fn rowWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
         return .{ .row = .{
-            .children = try Widget.allocSlice(allocator, children),
-            .gap = options.gap,
-            .cross_align = options.cross_align,
-            .main_align = options.main_align,
-        } };
-    }
-
-    pub fn columnWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
-        return .{ .column = .{
             .children = try Widget.allocSlice(allocator, children),
             .gap = options.gap,
             .cross_align = options.cross_align,
@@ -728,14 +692,6 @@ pub const widgets = struct {
 
     pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets, child: Widget) !Widget {
         return .{ .padding = .{ .insets = insets, .child = try Widget.alloc(allocator, child) } };
-    }
-
-    pub fn center(allocator: std.mem.Allocator, child: Widget) !Widget {
-        return .{ .center = .{ .child = try Widget.alloc(allocator, child) } };
-    }
-
-    pub fn keyed(allocator: std.mem.Allocator, key: Widget.Key, child: Widget) !Widget {
-        return .{ .keyed = .{ .key = key, .child = try Widget.alloc(allocator, child) } };
     }
 
     pub fn actions(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding, child: Widget) !Widget {
@@ -2007,11 +1963,6 @@ fn updateKeyedLinearElement(
 
 fn hasKeyedChildren(children: []const Element) bool {
     for (children) |child| if (child.key != null) return true;
-    return false;
-}
-
-fn hasKeyedElements(elements: []const Element) bool {
-    for (elements) |element| if (element.key != null) return true;
     return false;
 }
 

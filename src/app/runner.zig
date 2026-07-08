@@ -26,19 +26,8 @@ fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorS
     runtime_mod.Runtime.colorSchemeChanged(ctx, uiColorScheme(color_scheme));
 }
 
-fn watchedFileChanged(
-    ctx: *anyopaque,
-    _: *event_loop.EventLoop,
-    path: []const u8,
-    mask: u32,
-    _: ?[]const u8,
-) !void {
-    const runtime: *runtime_mod.Runtime = @ptrCast(@alignCast(ctx));
-    try runtime.reloadFileChanged(path, mask);
-}
-
 pub const EventSourceInstaller = *const fn (
-    ctx: ?*anyopaque,
+    ctx: *anyopaque,
     loop: *event_loop.EventLoop,
     runtime: *runtime_mod.Runtime,
 ) anyerror!void;
@@ -50,10 +39,9 @@ pub const Options = struct {
     height: f32 = 480,
     backend: app_options.BackendKind = .log,
     layer_shell: ?wayland_options.LayerShellOptions = null,
-    log_writer: ?*std.Io.Writer = null,
-    file_watch_path: ?[]const u8 = null,
-    event_source_context: ?*anyopaque = null,
-    install_event_sources: ?EventSourceInstaller = null,
+    log_writer: *std.Io.Writer,
+    event_source_context: *anyopaque,
+    install_event_sources: EventSourceInstaller,
 };
 
 pub fn run(allocator: std.mem.Allocator, app: keywork.AppHost, options: Options) !void {
@@ -75,13 +63,8 @@ fn runLog(
     constraints: keywork.Constraints,
     options: Options,
 ) !void {
-    if (options.log_writer) |writer| {
-        var log_backend: log_backend_mod.LogBackend = .{ .writer = writer };
-        return runHeadlessRuntime(allocator, app, constraints, log_backend.backend());
-    }
-
-    var discard_backend: DiscardBackend = .{};
-    return runHeadlessRuntime(allocator, app, constraints, discard_backend.backend());
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = options.log_writer };
+    return runHeadlessRuntime(allocator, app, constraints, log_backend.backend());
 }
 
 fn runHeadlessRuntime(
@@ -168,14 +151,7 @@ fn runWayland(
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    if (options.file_watch_path) |path| {
-        _ = loop.addFileWatch(path, &runtime, watchedFileChanged) catch |err| {
-            if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
-        };
-    }
-    if (options.install_event_sources) |install| {
-        try install(options.event_source_context, &loop, &runtime);
-    }
+    try options.install_event_sources(options.event_source_context, &loop, &runtime);
     try loop.run();
 }
 
@@ -285,14 +261,7 @@ fn runWaylandAllOutputs(
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    if (options.file_watch_path) |path| {
-        _ = loop.addFileWatch(path, &runtime, watchedFileChanged) catch |err| {
-            if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
-        };
-    }
-    if (options.install_event_sources) |install| {
-        try install(options.event_source_context, &loop, &runtime);
-    }
+    try options.install_event_sources(options.event_source_context, &loop, &runtime);
     try loop.run();
 }
 
@@ -302,22 +271,3 @@ fn positiveU31(value: f32) !u31 {
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
     return @intFromFloat(rounded);
 }
-
-const DiscardBackend = struct {
-    fn backend(self: *DiscardBackend) keywork.RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-    }
-
-    fn present(_: *anyopaque, _: keywork.RenderBackend.Frame) !bool {
-        return false;
-    }
-
-    fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
-        const measurer: keywork.TextMeasurer = .fixed;
-        return try measurer.measureText(value, style);
-    }
-
-    fn scale(_: *anyopaque) f32 {
-        return 1;
-    }
-};

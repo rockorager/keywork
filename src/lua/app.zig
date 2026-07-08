@@ -611,8 +611,8 @@ pub const App = struct {
         self.allocator.free(self.chunk_name);
     }
 
-    pub fn installEventSources(ctx: ?*anyopaque, loop: *event_loop.EventLoop, runtime: *runtime_mod.Runtime) !void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
+    pub fn installEventSources(ctx: *anyopaque, loop: *event_loop.EventLoop, runtime: *runtime_mod.Runtime) !void {
+        const self: *App = @ptrCast(@alignCast(ctx));
         self.event_loop = loop;
         self.runtime = runtime;
         _ = loop.addFileWatch(self.path, self, scriptChanged) catch |err| {

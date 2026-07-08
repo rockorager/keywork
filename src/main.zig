@@ -1,7 +1,6 @@
 //! Keywork LuaJIT application runtime.
 
 const std = @import("std");
-const keywork = @import("ui.zig");
 const cli = @import("app/cli.zig");
 const app_options = @import("app/options.zig");
 const runner = @import("app/runner.zig");

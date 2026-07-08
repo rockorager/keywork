@@ -114,19 +114,6 @@ pub const Cache = struct {
     }
 };
 
-pub fn lookupSvgIcon(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return lookupSvgIconSized(allocator, name, 16);
-}
-
-pub fn lookupSvgIconSized(allocator: std.mem.Allocator, name: []const u8, logical_size: f32) !?[]u8 {
-    const icon = try lookupIconSizedWithFormats(allocator, name, logical_size, &.{.svg}) orelse return null;
-    return icon.path;
-}
-
-pub fn lookupIcon(allocator: std.mem.Allocator, name: []const u8) !?IconFile {
-    return lookupIconSized(allocator, name, 16);
-}
-
 pub fn lookupIconSized(allocator: std.mem.Allocator, name: []const u8, logical_size: f32) !?IconFile {
     return lookupIconSizedWithFormats(allocator, name, logical_size, &.{ .svg, .png });
 }
@@ -474,7 +461,7 @@ fn trim(value: []const u8) []const u8 {
 }
 
 test "lookup returns null for a missing icon" {
-    try std.testing.expect(try lookupSvgIcon(std.testing.allocator, "keywork-definitely-missing-icon") == null);
+    try std.testing.expect(try lookupIconSized(std.testing.allocator, "keywork-definitely-missing-icon", 16) == null);
 }
 
 test "cache tombstones missing icons and serves repeat lookups" {

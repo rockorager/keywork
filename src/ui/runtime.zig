@@ -738,11 +738,6 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn reloadFileChanged(self: *Runtime, path: []const u8, mask: u32) !void {
-        log.info("reload requested for {s} mask=0x{x}", .{ path, mask });
-        try self.invalidate();
-    }
-
     fn rebuild(self: *Runtime) !void {
         const max_focus_rebuild_passes = 4;
         var pass: usize = 0;
