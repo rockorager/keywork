@@ -1,7 +1,6 @@
 //! Runtime orchestration for Keywork applications.
 
 const std = @import("std");
-const uucode = @import("uucode");
 const keywork = @import("../ui.zig");
 
 const log = std.log.scoped(.keywork);
@@ -19,6 +18,11 @@ const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
+
+const backend_behavior = @import("runtime/backend_behavior.zig");
+const focus_scroll = @import("runtime/focus_scroll.zig");
+const input_behavior = @import("runtime/input.zig");
+const lifecycle_reconciliation = @import("runtime/lifecycle_reconciliation.zig");
 
 pub const UiColorScheme = enum {
     no_preference,
@@ -104,15 +108,27 @@ pub const Runtime = struct {
     }
 
     fn currentState(self: *const Runtime) State {
-        return .{
-            .window_width = self.constraints.max_width,
-            .window_height = self.constraints.max_height,
-            .color_scheme = self.color_scheme.name(),
-        };
+        return lifecycle_reconciliation.currentState(self);
     }
 
     pub fn frameSize(self: *const Runtime) Size {
         return .{ .width = self.constraints.max_width, .height = self.constraints.max_height };
+    }
+
+    pub fn renderScale(self: *const Runtime) f32 {
+        return backend_behavior.renderScale(self);
+    }
+
+    pub fn setFrameBackground(self: *Runtime, color: ?keywork.Color) void {
+        backend_behavior.setFrameBackground(self, color);
+    }
+
+    pub fn frameBackground(self: *const Runtime) keywork.Color {
+        return backend_behavior.frameBackground(self);
+    }
+
+    pub fn configure(self: *Runtime, size: Size) !void {
+        try backend_behavior.configure(self, size);
     }
 
     pub fn repaint(self: *Runtime) !void {
@@ -120,759 +136,210 @@ pub const Runtime = struct {
     }
 
     pub fn requestRepaint(self: *Runtime) !void {
-        self.repaint_pending = true;
-        if (self.defer_repaint_until_flush) {
-            if (self.repaint_scheduler) |scheduler| try scheduler(self.repaint_scheduler_context.?);
-            return;
-        }
-        if (self.repaint_scheduler) |scheduler| {
-            try scheduler(self.repaint_scheduler_context.?);
-            return;
-        }
-        if (!self.frame_pending and !self.rendering) try self.presentFrame();
+        try backend_behavior.requestRepaint(self);
     }
 
     pub fn setDeferredRepaint(self: *Runtime, enabled: bool) void {
-        self.defer_repaint_until_flush = enabled;
+        backend_behavior.setDeferredRepaint(self, enabled);
     }
 
     pub fn flushPendingRepaint(self: *Runtime) !void {
-        if (!self.repaint_pending or self.frame_pending or self.rendering) return;
-        try self.presentFrame();
+        try backend_behavior.flushPendingRepaint(self);
     }
 
     pub fn setRepaintScheduler(self: *Runtime, context: *anyopaque, scheduler: RepaintScheduler) void {
-        self.repaint_scheduler_context = context;
-        self.repaint_scheduler = scheduler;
+        backend_behavior.setRepaintScheduler(self, context, scheduler);
     }
 
     pub fn invalidate(self: *Runtime) !void {
-        self.rebuild_pending = true;
-        try self.requestRepaint();
+        try backend_behavior.invalidate(self);
     }
 
     pub fn invalidateState(self: *Runtime) !void {
-        self.state_rebuild_pending = true;
-        try self.requestRepaint();
+        try backend_behavior.invalidateState(self);
     }
 
     fn presentFrame(self: *Runtime) !void {
-        if (self.rendering) {
-            self.repaint_pending = true;
-            return;
-        }
-
-        self.rendering = true;
-        defer self.rendering = false;
-        try self.flushInteractionRefresh();
-        // Consume pending flags before rebuilding so invalidations raised by
-        // callbacks during the rebuild are observed on the next pass instead
-        // of being cleared and dropped.
-        const max_rebuild_passes = 8;
-        var pass: usize = 0;
-        while (self.rebuild_pending or self.state_rebuild_pending) : (pass += 1) {
-            if (pass >= max_rebuild_passes) return error.RebuildDidNotStabilize;
-            const full_rebuild = self.rebuild_pending;
-            self.rebuild_pending = false;
-            self.state_rebuild_pending = false;
-            if (full_rebuild) {
-                try self.rebuild();
-            } else {
-                try self.rebuildDirtyState();
-            }
-            // Layout may discover that a virtualized list's built window
-            // drifted; another dirty-state pass rebuilds it.
-            if (self.element_root) |*element_root| {
-                if (keywork.anyListRangeStale(element_root)) self.state_rebuild_pending = true;
-            }
-        }
-        self.repaint_pending = false;
-
-        const root = self.root orelse return error.NotBuilt;
-        self.display_list.clearRetainingCapacity(self.allocator);
-        const frame_size = self.frameSize();
-        const full_frame: keywork.Rect = .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height };
-        // Damage accumulated by relayout since the last collection; a
-        // repaint without any layout change (e.g. a scale change) reports
-        // the full frame.
-        const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
-        const background = self.frame_background orelse keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.background;
-        if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
-        const render_scale = self.backend.scale();
-        try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
-        self.frame_pending = try self.backend.present(.{
-            .size = frame_size,
-            .scale = render_scale,
-            .damage = &.{damage},
-            .display_list = self.display_list.commands.items,
-        });
+        try backend_behavior.presentFrame(self);
     }
 
     fn frameDone(self: *Runtime) !void {
-        self.frame_pending = false;
-        if (self.repaint_pending) {
-            if (self.defer_repaint_until_flush) return;
-            if (self.repaint_scheduler) |scheduler| {
-                try scheduler(self.repaint_scheduler_context.?);
-            } else {
-                try self.presentFrame();
-            }
-        }
+        try backend_behavior.frameDone(self);
     }
 
     pub fn click(self: *Runtime, point: Point) !void {
-        try self.pointerButton(point, .pressed);
-        try self.pointerButton(point, .released);
+        try input_behavior.click(self, point);
     }
 
     pub fn pointerButton(self: *Runtime, point: Point, state: PointerButtonState) !void {
-        switch (state) {
-            .pressed => try self.pointerDown(point),
-            .released => try self.pointerUp(point),
-        }
+        try input_behavior.pointerButton(self, point, state);
     }
 
-    const ScrollbarDrag = struct {
-        id: []u8,
-        axis: keywork.ScrollbarAxis,
-        /// Scroll offset change per pixel of pointer travel.
-        drag_scale: f32,
-        /// Pointer coordinate along the drag axis at the last update.
-        last_position: f32,
-    };
+    pub const ScrollbarDrag = focus_scroll.ScrollbarDrag;
 
     fn pointerDown(self: *Runtime, point: Point) !void {
-        const root = self.root orelse return error.NotBuilt;
-        if (keywork.hitTestScrollbarThumb(root, point)) |hit| {
-            try self.beginScrollbarDrag(hit, point);
-            return;
-        }
-        if (keywork.hitTestTextInput(root, point)) |id| {
-            const focus_changed = try self.setFocused(id);
-            _ = try self.setPressedId(null);
-            if (focus_changed) try self.invalidate() else try self.invalidateState();
-            return;
-        }
-
-        if (keywork.hitTestClick(root, point)) |hit| {
-            const focus_changed = try self.setFocused(hit.id);
-            var needs_update = try self.setPressedId(hit.id);
-            if (hit.tap_down) |callback| {
-                try callback.call();
-                needs_update = true;
-            }
-            if (hit.activation == .press) {
-                log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
-                if (try self.activateClick(hit)) needs_update = true;
-            }
-            if (focus_changed) {
-                try self.invalidate();
-            } else if (needs_update) {
-                try self.invalidateState();
-            }
-        } else {
-            self.autofocus_suppressed = true;
-            const focus_changed = try self.setFocused(null);
-            log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
-            _ = try self.setPressedId(null);
-            if (focus_changed) try self.invalidate() else try self.invalidateState();
-        }
+        try input_behavior.pointerDown(self, point);
     }
 
     fn beginScrollbarDrag(self: *Runtime, hit: keywork.ScrollbarThumbHit, point: Point) !void {
-        self.clearScrollbarDrag();
-        const id = try self.allocator.dupe(u8, hit.id);
-        self.scrollbar_drag = .{
-            .id = id,
-            .axis = hit.axis,
-            .drag_scale = hit.drag_scale,
-            .last_position = switch (hit.axis) {
-                .vertical => point.y,
-                .horizontal => point.x,
-            },
-        };
+        try focus_scroll.beginScrollbarDrag(self, hit, point);
     }
 
     fn clearScrollbarDrag(self: *Runtime) void {
-        if (self.scrollbar_drag) |drag| self.allocator.free(drag.id);
-        self.scrollbar_drag = null;
+        focus_scroll.clearScrollbarDrag(self);
     }
 
     fn pointerUp(self: *Runtime, point: Point) !void {
-        if (self.scrollbar_drag != null) {
-            self.clearScrollbarDrag();
-            return;
-        }
-        const root = self.root orelse return error.NotBuilt;
-        const hit = keywork.hitTestClick(root, point);
-        const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
-        const should_activate = if (self.pressed_id) |pressed_id| blk: {
-            const hit_id = if (hit) |click_hit| click_hit.id else break :blk false;
-            break :blk std.mem.eql(u8, pressed_id, hit_id);
-        } else false;
-
-        var needs_update = try self.setPressedId(null);
-        if (should_activate) {
-            const click_hit = hit.?;
-            if (click_hit.tap_up) |callback| {
-                try callback.call();
-                needs_update = true;
-            }
-            if (click_hit.activation == .release) {
-                log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
-                if (try self.activateClick(click_hit)) needs_update = true;
-            }
-        } else if (pressed_hit) |cancel_hit| {
-            if (cancel_hit.tap_cancel) |callback| {
-                try callback.call();
-                needs_update = true;
-            }
-        }
-
-        if (needs_update) {
-            try self.invalidateState();
-        }
+        try input_behavior.pointerUp(self, point);
     }
 
     pub fn requestFocus(self: *Runtime, id: []const u8) !void {
-        const root = self.root orelse return error.NotBuilt;
-        const target = keywork.findFocusTarget(root, id) orelse return error.FocusTargetNotFound;
-        if (!target.can_request_focus) return error.FocusTargetNotFocusable;
-        const targets = try keywork.collectFocusTargets(self.allocator, root);
-        defer self.allocator.free(targets);
-        if (activeModalScopeId(targets)) |modal_scope_id| {
-            if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return error.FocusTargetOutsideModal;
-        }
-        _ = try self.setFocused(id);
-        try self.revealFocused();
-        try self.invalidate();
+        try focus_scroll.requestFocus(self, id);
     }
 
     pub fn clearFocus(self: *Runtime) !void {
-        self.autofocus_suppressed = true;
-        _ = try self.setFocused(null);
-        try self.invalidate();
+        try focus_scroll.clearFocus(self);
     }
 
     fn setFocused(self: *Runtime, id: ?[]const u8) !bool {
-        if (self.focused_id) |old_id| {
-            if (id) |new_id| {
-                if (std.mem.eql(u8, old_id, new_id)) return false;
-            }
-            if (self.focusedTarget()) |target| {
-                if (target.focus_change_callback) |callback| try callback.call(false);
-            }
-            self.allocator.free(old_id);
-            self.focused_id = null;
-        }
-
-        if (id) |new_id| {
-            self.autofocus_suppressed = false;
-            self.focused_id = try self.allocator.dupe(u8, new_id);
-            log.info("focused {s}", .{new_id});
-            if (self.focusedTarget()) |target| {
-                if (target.focus_change_callback) |callback| try callback.call(true);
-            }
-            return true;
-        }
-        return self.focused_id == null and id == null;
+        return focus_scroll.setFocused(self, id);
     }
 
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
-        if (try self.activateShortcut(input)) {
-            try self.invalidate();
-            return;
-        }
-
-        switch (input) {
-            .tab => |tab| {
-                try self.focusNext(tab.reverse);
-                try self.invalidate();
-            },
-            .text => |bytes| try self.editFocusedTextInput(.{ .append = bytes }),
-            .backspace => try self.editFocusedTextInput(.pop_grapheme),
-            .space => {
-                const target = self.focusedTarget() orelse return;
-                switch (target.kind) {
-                    .text_input => try self.editFocusedTextInput(.{ .append = " " }),
-                    .clickable => {
-                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
-                        try self.invalidateState();
-                    },
-                    .focus => {},
-                }
-            },
-            .enter => {
-                const target = self.focusedTarget() orelse return;
-                switch (target.kind) {
-                    .text_input => {
-                        self.autofocus_suppressed = true;
-                        _ = try self.setFocused(null);
-                        try self.invalidate();
-                    },
-                    .clickable => {
-                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
-                        try self.invalidateState();
-                    },
-                    .focus => {},
-                }
-            },
-            // Only meaningful as shortcuts; ignored without a binding.
-            .escape, .up, .down => {},
-        }
-    }
-
-    const TextEdit = union(enum) {
-        append: []const u8,
-        pop_grapheme,
-    };
-
-    /// Applies a text edit to the focused text input's element-owned
-    /// editing state, fires its on_change callback, and schedules a
-    /// dirty-state pass. Typing relayouts exactly one input; no rebuild.
-    fn editFocusedTextInput(self: *Runtime, edit: TextEdit) !void {
-        if (!self.focusedTargetIs(.text_input)) return;
-        const focused_id = self.focused_id orelse return;
-        const element_root = if (self.element_root) |*element_root| element_root else return;
-        const input = keywork.dirtyTextInputElement(element_root, focused_id) orelse return;
-        const state = keywork.textInputState(input);
-        switch (edit) {
-            .append => |bytes| try state.text.appendSlice(self.allocator, bytes),
-            .pop_grapheme => popLastGrapheme(&state.text),
-        }
-        if (input.widget.text_input.on_change) |callback| try callback.call(state.text.items);
-        try self.invalidateState();
+        try input_behavior.keyInput(self, input);
     }
 
     fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
-        const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
-        if (self.focusedTargetIs(.text_input) and !keywork.shortcutAllowedWhileEditing(shortcut_key)) return false;
-        const element_root = if (self.element_root) |*root| root else return false;
-        const callback = if (self.focused_id) |focused_id|
-            keywork.findFocusedShortcutAction(element_root, shortcut_key, focused_id) orelse keywork.findShortcutAction(element_root, shortcut_key) orelse return false
-        else
-            keywork.findShortcutAction(element_root, shortcut_key) orelse return false;
-        try callback.call();
-        return true;
+        return input_behavior.activateShortcut(self, input);
     }
 
     fn focusedTarget(self: *Runtime) ?keywork.FocusTarget {
-        const focused_id = self.focused_id orelse return null;
-        const root = self.root orelse return null;
-        return keywork.findFocusTarget(root, focused_id);
+        return focus_scroll.focusedTarget(self);
     }
 
     fn focusedTargetIs(self: *Runtime, kind: keywork.FocusTarget.Kind) bool {
-        const target = self.focusedTarget() orelse return false;
-        return target.kind == kind;
+        return focus_scroll.focusedTargetIs(self, kind);
     }
 
     fn focusNext(self: *Runtime, reverse: bool) !void {
-        const root = self.root orelse return error.NotBuilt;
-        const targets = try keywork.collectFocusTargets(self.allocator, root);
-        defer self.allocator.free(targets);
-        if (targets.len == 0) return;
-
-        const active_modal_scope_id = activeModalScopeId(targets);
-        const current_target = if (self.focused_id) |focused_id| findCollectedFocusTarget(targets, focused_id) else null;
-        const current_target_in_modal = if (current_target) |target| active_modal_scope_id == null or sameOptionalString(target.modal_scope_id, active_modal_scope_id) else false;
-        const active_scope_id = if (current_target_in_modal) current_target.?.scope_id else null;
-        const next_index = nextFocusTargetIndex(targets, if (current_target) |target| target.id else null, active_scope_id, active_modal_scope_id, reverse) orelse return;
-
-        _ = try self.setFocused(targets[next_index].id);
-        try self.revealFocused();
+        try focus_scroll.focusNext(self, reverse);
     }
 
-    /// Scrolls ancestor viewports the minimum distance needed to bring
-    /// the keyboard-focused widget into view.
     fn revealFocused(self: *Runtime) !void {
-        const focused_id = self.focused_id orelse return;
-        const root = self.root orelse return;
-        var adjustments: std.ArrayList(keywork.RevealAdjustment) = .empty;
-        defer adjustments.deinit(self.allocator);
-        _ = try keywork.collectRevealAdjustments(self.allocator, root, focused_id, &adjustments);
-        for (adjustments.items) |adjustment| {
-            try self.scrollElementById(adjustment.id, adjustment.dx, adjustment.dy);
-        }
-    }
-
-    fn findCollectedFocusTarget(targets: []const keywork.FocusTarget, id: []const u8) ?keywork.FocusTarget {
-        for (targets) |target| {
-            if (std.mem.eql(u8, target.id, id)) return target;
-        }
-        return null;
-    }
-
-    fn nextFocusTargetIndex(
-        targets: []const keywork.FocusTarget,
-        focused_id: ?[]const u8,
-        scope_id: ?[]const u8,
-        modal_scope_id: ?[]const u8,
-        reverse: bool,
-    ) ?usize {
-        var first: ?usize = null;
-        var last: ?usize = null;
-        var previous_matching: ?usize = null;
-        var previous_before_focused: ?usize = null;
-        var focused_seen = focused_id == null;
-        const filter_by_scope = scope_id != null;
-
-        for (targets, 0..) |target, index| {
-            if (modal_scope_id) |active_modal_scope_id| {
-                if (!sameOptionalString(target.modal_scope_id, active_modal_scope_id)) continue;
-            }
-            if (filter_by_scope and !sameOptionalString(target.scope_id, scope_id)) continue;
-            if (focused_id) |focused| {
-                if (std.mem.eql(u8, target.id, focused)) {
-                    focused_seen = true;
-                    previous_before_focused = previous_matching;
-                    continue;
-                }
-            }
-
-            if (!isTraversableFocusTarget(target)) continue;
-            if (first == null) first = index;
-            if (focused_id) |_| {
-                if (focused_seen and !reverse) {
-                    return index;
-                }
-            } else if (!reverse) {
-                return index;
-            }
-            previous_matching = index;
-            last = index;
-        }
-
-        if (focused_id == null and reverse) return last;
-        if (reverse) return previous_before_focused orelse last;
-        return first;
-    }
-
-    fn isTraversableFocusTarget(target: keywork.FocusTarget) bool {
-        return target.can_request_focus and !target.skip_traversal;
+        try focus_scroll.revealFocused(self);
     }
 
     fn activeModalScopeId(targets: []const keywork.FocusTarget) ?[]const u8 {
-        var result: ?[]const u8 = null;
-        for (targets) |target| {
-            if (target.modal_scope_id) |modal_scope_id| result = modal_scope_id;
-        }
-        return result;
+        return focus_scroll.activeModalScopeId(targets);
     }
 
     fn sameOptionalString(a: ?[]const u8, b: ?[]const u8) bool {
-        if (a) |a_value| {
-            const b_value = b orelse return false;
-            return std.mem.eql(u8, a_value, b_value);
-        }
-        return b == null;
+        return focus_scroll.sameOptionalString(a, b);
     }
 
     fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
-        _ = self;
-        if (hit.callback) |callback| {
-            try callback.call();
-            return true;
-        }
-        return false;
+        return input_behavior.activateClick(self, hit);
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
-        const root = self.root orelse return .default;
-        return keywork.hitTestCursorShape(root, point);
+        return input_behavior.cursorShape(self, point);
     }
 
     pub fn pointerMove(self: *Runtime, point: ?Point) !void {
-        if (self.scrollbar_drag) |*drag| {
-            const position = point orelse return;
-            const coordinate = switch (drag.axis) {
-                .vertical => position.y,
-                .horizontal => position.x,
-            };
-            const delta = (coordinate - drag.last_position) * drag.drag_scale;
-            drag.last_position = coordinate;
-            if (delta != 0) {
-                switch (drag.axis) {
-                    .vertical => try self.scrollElementById(drag.id, 0, delta),
-                    .horizontal => try self.scrollElementById(drag.id, delta, 0),
-                }
-            }
-            return;
-        }
-        const hit_id = if (point) |position| blk: {
-            const root = self.root orelse return error.NotBuilt;
-            break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
-        } else null;
-        if (!try self.setHoveredId(hit_id)) return;
-        try self.invalidateState();
+        try input_behavior.pointerMove(self, point);
     }
 
     fn setHoveredId(self: *Runtime, id: ?[]const u8) !bool {
-        return self.setInteractionId(&self.hovered_id, id);
+        return input_behavior.setHoveredId(self, id);
     }
 
     fn setPressedId(self: *Runtime, id: ?[]const u8) !bool {
-        return self.setInteractionId(&self.pressed_id, id);
+        return input_behavior.setPressedId(self, id);
     }
 
-    fn setInteractionId(self: *Runtime, slot: *?[]u8, id: ?[]const u8) !bool {
-        if (slot.*) |old_id| {
-            if (id) |new_id| {
-                if (std.mem.eql(u8, old_id, new_id)) return false;
-            }
-        } else if (id == null) {
-            return false;
-        }
-
-        const old_id = slot.*;
-        if (old_id) |value| try self.queueInteractionRefresh(value);
-        if (id) |value| try self.queueInteractionRefresh(value);
-        if (old_id) |value| self.allocator.free(value);
-        slot.* = if (id) |new_id| try self.allocator.dupe(u8, new_id) else null;
-        return true;
-    }
-
-    /// Queues a widget id whose hover/press styling changed. The restyle is
-    /// deferred to the next frame because the event handler that triggered
-    /// it may still hold callbacks borrowed from the widgets a refresh
-    /// would replace.
     fn queueInteractionRefresh(self: *Runtime, id: []const u8) !void {
-        for (self.pending_interaction_ids.items) |pending| {
-            if (std.mem.eql(u8, pending, id)) return;
-        }
-        const owned = try self.allocator.dupe(u8, id);
-        errdefer self.allocator.free(owned);
-        try self.pending_interaction_ids.append(self.allocator, owned);
+        try input_behavior.queueInteractionRefresh(self, id);
     }
 
-    /// Restyles only the widgets whose hover/press state changed, marking
-    /// their layout path dirty so the dirty-state pass relayouts and
-    /// repaints them without rebuilding the app.
     fn flushInteractionRefresh(self: *Runtime) !void {
-        if (self.pending_interaction_ids.items.len == 0) return;
-        defer {
-            for (self.pending_interaction_ids.items) |id| self.allocator.free(id);
-            self.pending_interaction_ids.clearRetainingCapacity();
-        }
-        // A pending full rebuild restyles everything anyway.
-        if (self.rebuild_pending) return;
-        const element_root = if (self.element_root) |*element_root| element_root else return;
-        var ids: [8][]const u8 = undefined;
-        const count = @min(ids.len, self.pending_interaction_ids.items.len);
-        for (self.pending_interaction_ids.items[0..count], 0..) |id, index| ids[index] = id;
-        var build_scope = self.buildScope(self.app_context);
-        _ = try keywork.refreshInteractionElements(self.allocator, &build_scope, element_root, self.constraints, ids[0..count]);
+        try lifecycle_reconciliation.flushInteractionRefresh(self);
     }
 
     pub fn waylandPointerButton(ctx: *anyopaque, point: Point, state: PointerButtonState) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.pointerButton(point, state) catch |err| {
-            log.err("pointer button handling failed: {}", .{err});
-        };
+        input_behavior.waylandPointerButton(Runtime, ctx, point, state);
     }
 
     pub fn waylandCursorShape(ctx: *anyopaque, point: Point) CursorShape {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        return self.cursorShape(point);
+        return input_behavior.waylandCursorShape(Runtime, ctx, point);
     }
 
-    /// Scrolls the innermost viewport under the pointer. Offsets are
-    /// clamped to the content extent during the relayout this schedules.
     pub fn scrollBy(self: *Runtime, point: Point, dx: f32, dy: f32) !void {
-        const root = self.root orelse return error.NotBuilt;
-        const id = keywork.hitTestScroll(root, point) orelse return;
-        try self.scrollElementById(id, dx, dy);
+        try focus_scroll.scrollBy(self, point, dx, dy);
     }
 
     fn scrollElementById(self: *Runtime, id: []const u8, dx: f32, dy: f32) !void {
-        const element_root = if (self.element_root) |*element_root| element_root else return;
-        const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
-        switch (scroll_element.kind) {
-            .scroll => {
-                const state = keywork.scrollState(scroll_element);
-                state.offset_x = @max(0, state.offset_x + dx);
-                state.offset_y = @max(0, state.offset_y + dy);
-            },
-            .list => {
-                const state = keywork.listState(scroll_element);
-                state.offset = @max(0, state.offset + dy);
-            },
-            else => unreachable,
-        }
-        try self.invalidateState();
+        try focus_scroll.scrollElementById(self, id, dx, dy);
     }
 
     pub fn waylandScroll(ctx: *anyopaque, point: Point, dx: f32, dy: f32) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.scrollBy(point, dx, dy) catch |err| {
-            log.err("scroll failed: {}", .{err});
-        };
+        focus_scroll.waylandScroll(Runtime, ctx, point, dx, dy);
     }
 
     pub fn waylandPointerMove(ctx: *anyopaque, point: ?Point) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.pointerMove(point) catch |err| {
-            log.err("pointer motion failed: {}", .{err});
-        };
+        input_behavior.waylandPointerMove(Runtime, ctx, point);
     }
 
     pub fn waylandConfigure(ctx: *anyopaque, size: Size) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        if (size.width > 0 and size.height > 0) {
-            self.constraints = .{ .max_width = size.width, .max_height = size.height };
-        }
-        self.invalidate() catch |err| {
-            log.err("configure invalidate failed: {}", .{err});
-        };
+        backend_behavior.waylandConfigure(Runtime, ctx, size);
     }
 
     pub fn waylandFrameDone(ctx: *anyopaque) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.frameDone() catch |err| {
-            log.err("frame repaint failed: {}", .{err});
-        };
+        backend_behavior.waylandFrameDone(Runtime, ctx);
     }
 
     pub fn setColorScheme(self: *Runtime, color_scheme: UiColorScheme) !void {
-        if (self.color_scheme == color_scheme) return;
-        self.color_scheme = color_scheme;
-        try self.invalidate();
+        try backend_behavior.setColorScheme(self, color_scheme);
     }
 
     pub fn colorSchemeChanged(ctx: *anyopaque, color_scheme: UiColorScheme) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.setColorScheme(color_scheme) catch |err| {
-            log.err("desktop settings invalidate failed: {}", .{err});
-        };
+        backend_behavior.colorSchemeChanged(Runtime, ctx, color_scheme);
     }
 
     pub fn waylandKeyInput(ctx: *anyopaque, input: KeyInput) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        self.keyInput(input) catch |err| {
-            log.err("key input failed: {}", .{err});
-        };
+        input_behavior.waylandKeyInput(Runtime, ctx, input);
     }
 
     fn rebuild(self: *Runtime) !void {
-        const max_focus_rebuild_passes = 4;
-        var pass: usize = 0;
-        while (true) : (pass += 1) {
-            _ = self.build_arena.reset(.free_all);
-            const state = self.currentState();
-            var build_scope = self.buildScope(state);
-
-            var app_root = try self.app.buildWidget(&build_scope, state);
-            self.app_context = build_scope.app_context;
-            if (self.element_root) |*element_root| {
-                try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
-            } else {
-                self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
-            }
-
-            try self.rebuildRetainedTrees();
-
-            if (!try self.reconcileFocusAfterRebuild()) break;
-            if (pass + 1 >= max_focus_rebuild_passes) return error.FocusDidNotStabilize;
-        }
+        try lifecycle_reconciliation.rebuild(self);
     }
 
     fn rebuildDirtyState(self: *Runtime) !void {
-        const element_root = if (self.element_root) |*element_root| element_root else {
-            try self.rebuild();
-            return;
-        };
-
-        _ = self.build_arena.reset(.free_all);
-        var build_scope = self.buildScope(self.app_context);
-        const rebuilt = try keywork.rebuildDirtyElementTreeScoped(self.allocator, &build_scope, element_root, self.constraints);
-        if (!rebuilt) {
-            try self.rebuildRetainedTrees();
-            return;
-        }
-
-        try self.rebuildRetainedTrees();
-        if (try self.reconcileFocusAfterRebuild()) {
-            try self.rebuild();
-        }
+        try lifecycle_reconciliation.rebuildDirtyState(self);
     }
 
     fn buildScope(self: *Runtime, state: State) BuildScope {
-        return .{
-            .allocator = self.build_arena.allocator(),
-            .theme = keywork.Theme.fromColorScheme(state.color_scheme),
-            .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
-            .app_context = state,
-        };
+        return lifecycle_reconciliation.buildScope(self, state);
     }
 
     fn rebuildRetainedTrees(self: *Runtime) !void {
-        const element_root = if (self.element_root) |*element_root| element_root else return error.NotBuilt;
-        self.root = try keywork.buildRenderTreeFromElement(self.allocator, element_root, self.constraints, self.backend);
-        self.reconcileInteractionAfterRebuild();
+        try lifecycle_reconciliation.rebuildRetainedTrees(self);
     }
 
-    /// Drops hovered/pressed ids whose widgets no longer exist so they
-    /// cannot leak stale interaction styling into later builds. Focus has
-    /// its own reconciliation with autofocus fallback.
     fn reconcileInteractionAfterRebuild(self: *Runtime) void {
-        const root = self.root orelse return;
-        if (self.hovered_id) |id| {
-            if (keywork.findClickHitById(root, id) == null) {
-                self.allocator.free(id);
-                self.hovered_id = null;
-            }
-        }
-        if (self.pressed_id) |id| {
-            if (keywork.findClickHitById(root, id) == null) {
-                self.allocator.free(id);
-                self.pressed_id = null;
-            }
-        }
+        lifecycle_reconciliation.reconcileInteractionAfterRebuild(self);
     }
 
     fn reconcileFocusAfterRebuild(self: *Runtime) !bool {
-        const root = self.root orelse return false;
-        const targets = try keywork.collectFocusTargets(self.allocator, root);
-        defer self.allocator.free(targets);
-        const active_modal_scope_id = activeModalScopeId(targets);
-
-        if (self.focused_id) |focused_id| {
-            for (targets) |target| {
-                if (std.mem.eql(u8, target.id, focused_id) and target.can_request_focus and (active_modal_scope_id == null or sameOptionalString(target.modal_scope_id, active_modal_scope_id))) {
-                    self.autofocus_suppressed = false;
-                    return false;
-                }
-            }
-        }
-
-        const desired_focus = if (!self.autofocus_suppressed) blk: {
-            break :blk if (autofocusTarget(targets, active_modal_scope_id)) |target| target.id else null;
-        } else null;
-        if (sameOptionalString(self.focused_id, desired_focus)) return false;
-        _ = try self.setFocused(desired_focus);
-        return true;
+        return lifecycle_reconciliation.reconcileFocusAfterRebuild(self);
     }
 
     fn autofocusTarget(targets: []const keywork.FocusTarget, modal_scope_id: ?[]const u8) ?keywork.FocusTarget {
-        for (targets) |target| {
-            if (modal_scope_id) |active_modal_scope_id| {
-                if (!sameOptionalString(target.modal_scope_id, active_modal_scope_id)) continue;
-            }
-            if (target.autofocus and target.can_request_focus) return target;
-        }
-        return null;
+        return lifecycle_reconciliation.autofocusTarget(targets, modal_scope_id);
     }
 };
 
 fn popLastGrapheme(bytes: *std.ArrayList(u8)) void {
-    if (bytes.items.len == 0) return;
-
-    var it = uucode.grapheme.utf8Iterator(bytes.items);
-    var start: usize = 0;
-    while (it.nextGrapheme()) |grapheme| {
-        start = grapheme.start;
-    }
-    bytes.shrinkRetainingCapacity(start);
+    input_behavior.popLastGrapheme(bytes);
 }
 
 test "popLastGrapheme removes one extended grapheme cluster" {
