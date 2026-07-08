@@ -62,7 +62,16 @@ fn logWithTimestampTerminal(
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const run_options = try cli.parse(init, allocator);
+    const run_options = cli.parse(init, allocator) catch |err| switch (err) {
+        error.MissingScriptPath => {
+            var stderr_buffer: [256]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+            stderr.interface.writeAll(cli.usage) catch {};
+            stderr.interface.flush() catch {};
+            std.process.exit(2);
+        },
+        else => return err,
+    };
     defer allocator.free(run_options.app_args);
     var app = try Application.init(allocator, run_options.script_path);
     defer app.deinit();

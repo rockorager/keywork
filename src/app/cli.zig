@@ -8,12 +8,14 @@ pub const Options = struct {
     backend: ?app_options.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
-    script_path: []const u8 = "main.lua",
+    script_path: []const u8 = "",
     layer_shell: ?wayland_options.LayerShellOptions = null,
     /// Arguments after the script path, forwarded verbatim to the Lua
     /// application via the `arg` global.
     app_args: []const [:0]const u8 = &.{},
 };
+
+pub const usage = "usage: keywork [options] <script.lua> [args...]\n";
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
     var result: Options = .{};
@@ -61,6 +63,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
             result.script_path = arg["--script=".len..];
         }
     }
+    if (result.script_path.len == 0) return error.MissingScriptPath;
     result.app_args = try app_args.toOwnedSlice(allocator);
     return result;
 }

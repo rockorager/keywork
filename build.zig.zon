@@ -41,7 +41,6 @@
         "build.zig",
         "build.zig.zon",
         "examples",
-        "main.lua",
         "protocols",
         "src",
     },

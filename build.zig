@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the application");
+    const run_step = b.step("run", "Run a Lua application (pass -- <script.lua>)");
     run_step.dependOn(&run_cmd.step);
 
     // Window options come from the script's keywork.window declaration.
