@@ -1,4 +1,4 @@
-//! Lua child process integration for kw.loop.spawn.
+//! Lua child process integration for keywork.process.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -192,7 +192,6 @@ pub const LuaProcess = struct {
             pushResult(lua_state, status);
             if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
                 failLuaCall(lua_state, "process exit callback failed") catch {};
-                return error.LuaCallbackFailed;
             }
         }
     }
@@ -324,10 +323,13 @@ pub fn tableFunctionRef(lua_state: *c.lua_State, table: c_int, key: [*:0]const u
 }
 
 pub fn pushHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
-    c.lua_createtable(lua_state, 0, 1);
+    c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, process);
     c.lua_pushcclosure(lua_state, luaCancel, 1);
     c.lua_setfield(lua_state, -2, "cancel");
+    c.lua_pushlightuserdata(lua_state, process);
+    c.lua_pushcclosure(lua_state, luaCanceled, 1);
+    c.lua_setfield(lua_state, -2, "canceled");
     c.lua_pushvalue(lua_state, -1);
     process.handle_ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
 }
@@ -402,7 +404,18 @@ fn callChunk(pipe: *Pipe, chunk: []const u8) !void {
     c.lua_pushlstring(lua_state, chunk.ptr, chunk.len);
     if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
         failLuaCall(lua_state, "process output callback failed") catch {};
-        return error.LuaCallbackFailed;
+        switch (pipe.kind) {
+            .stdout => {
+                if (pipe.process.stdout_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, pipe.process.stdout_ref);
+                pipe.process.stdout_ref = -1;
+            },
+            .stderr => {
+                if (pipe.process.stderr_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, pipe.process.stderr_ref);
+                pipe.process.stderr_ref = -1;
+            },
+        }
+        closePipeFd(pipe);
+        return;
     }
 }
 
@@ -433,6 +446,13 @@ fn luaCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const process: *LuaProcess = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     process.cancel(lua_state);
     return 0;
+}
+
+fn luaCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const process: *LuaProcess = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_pushboolean(lua_state, if (process.canceled) 1 else 0);
+    return 1;
 }
 
 fn luaNoop(_: ?*c.lua_State) callconv(.c) c_int {

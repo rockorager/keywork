@@ -1,4 +1,4 @@
-local kw = require("kw")
+local kw = require("keywork")
 
 local App = kw.stateful({
   init = function(self)

@@ -1,4 +1,8 @@
-local kw = require("kw")
+local kw = require("keywork")
+local dbus = require("keywork.dbus")
+local log = require("keywork.log")
+local loop = require("keywork.loop")
+local process = require("keywork.process")
 local bit = require("bit")
 
 local has_unix_socket, unix_socket = pcall(require, "socket.unix")
@@ -170,7 +174,7 @@ local function connect_sway(on_change)
     connected = true,
   }
 
-  client.watch = kw.loop.fd(client.fd, { read = true }, function(_, events)
+  client.watch = loop.fd(client.fd, { read = true }, function(_, events)
     if bit.band(events, bit.bor(EPOLLERR, EPOLLHUP)) ~= 0 then
       client.connected = false
     end
@@ -188,7 +192,7 @@ end
 local function capture(argv, callback)
   local stdout = {}
   local stderr = {}
-  return kw.loop.spawn({
+  return process.spawn({
     argv = argv,
     stdout = "pipe",
     stderr = "pipe",
@@ -368,10 +372,10 @@ end
 
 local function create_tray_host(on_change)
   local ok, bus = pcall(function()
-    return kw.dbus.session()
+    return dbus.session()
   end)
   if not ok or not bus then
-    kw.log.warn("tray disabled: session dbus unavailable")
+    log.warn("tray disabled: session dbus unavailable")
     return nil
   end
 
@@ -388,7 +392,7 @@ local function create_tray_host(on_change)
       path = SNI_WATCHER_PATH,
       interface = SNI_WATCHER,
       member = member,
-      args = id and { kw.dbus.string(id) } or {},
+      args = id and { dbus.string(id) } or {},
     })
   end
 
@@ -403,7 +407,7 @@ local function create_tray_host(on_change)
     if not item then
       return
     end
-    kw.log.info("tray item unregistered", id)
+    log.info("tray item unregistered", id)
     if item.signal_sub then
       item.signal_sub:cancel()
     end
@@ -427,11 +431,11 @@ local function create_tray_host(on_change)
       path = item.path,
       interface = DBUS_PROPERTIES,
       member = "GetAll",
-      args = { kw.dbus.string(SNI_ITEM) },
+      args = { dbus.string(SNI_ITEM) },
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        kw.log.warn("tray item GetAll failed", item.id, err or "unknown")
+        log.warn("tray item GetAll failed", item.id, err or "unknown")
         self:remove_item(item.id)
         return
       end
@@ -456,7 +460,7 @@ local function create_tray_host(on_change)
       self:read_item(self.items[id])
       return
     end
-    kw.log.info("tray item registered", id)
+    log.info("tray item registered", id)
     local item = {
       id = id,
       service = service,
@@ -530,11 +534,11 @@ local function create_tray_host(on_change)
       path = item.path,
       interface = SNI_ITEM,
       member = "Activate",
-      args = { kw.dbus.int32(0), kw.dbus.int32(0) },
+      args = { dbus.int32(0), dbus.int32(0) },
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        kw.log.warn("tray item Activate failed", item.id, err or "unknown")
+        log.warn("tray item Activate failed", item.id, err or "unknown")
       end
     end)
   end
@@ -553,11 +557,11 @@ local function create_tray_host(on_change)
     return bus:request_name(SNI_WATCHER, { replace_existing = true, do_not_queue = true })
   end)
   if not name_ok then
-    kw.log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
+    log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
     bus:close()
     return nil
   end
-  kw.log.info("tray enabled: owning org.kde.StatusNotifierWatcher")
+  log.info("tray enabled: owning org.kde.StatusNotifierWatcher")
   host.name = name
   host.exported = bus:export(SNI_WATCHER_PATH, {
     [SNI_WATCHER] = {
@@ -580,21 +584,21 @@ local function create_tray_host(on_change)
           signature = "as",
           access = "read",
           get = function()
-            return kw.dbus.array("s", host:item_ids())
+            return dbus.array("s", host:item_ids())
           end,
         },
         IsStatusNotifierHostRegistered = {
           signature = "b",
           access = "read",
           get = function()
-            return kw.dbus.boolean(host.host_registered)
+            return dbus.boolean(host.host_registered)
           end,
         },
         ProtocolVersion = {
           signature = "i",
           access = "read",
           get = function()
-            return kw.dbus.int32(0)
+            return dbus.int32(0)
           end,
         },
       },
@@ -697,7 +701,7 @@ local StatusItems = kw.stateful({
     self:watch_network()
     self:watch_battery()
     self:update_battery()
-    self.timer = kw.loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
+    self.timer = loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
       self:set_state(function(state)
         state:update_time()
       end)
@@ -762,7 +766,7 @@ local StatusItems = kw.stateful({
     end
 
     local buffer = ""
-    self.volume_sub = kw.loop.spawn({
+    self.volume_sub = process.spawn({
       argv = { "pactl", "subscribe" },
       stdout = "pipe",
       stderr = "pipe",
@@ -790,7 +794,7 @@ local StatusItems = kw.stateful({
       exit = function(result)
         self.volume_sub = nil
         if not result.ok then
-          kw.log.warn("volume subscribe exited")
+          log.warn("volume subscribe exited")
         end
       end,
     })
@@ -824,7 +828,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       return
     end
     local ok, bus = pcall(function()
-      return kw.dbus.system()
+      return dbus.system()
     end)
     if not ok or not bus then
       return
@@ -854,7 +858,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        kw.log.warn("battery dbus properties failed", err or path)
+        log.warn("battery dbus properties failed", err or path)
         return
       end
       self:set_state(function(state)
@@ -905,7 +909,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       timeout_ms = 1000,
     }, function(reply, err)
       if not reply then
-        kw.log.warn("battery dbus enumerate failed", err or "unknown")
+        log.warn("battery dbus enumerate failed", err or "unknown")
         return
       end
       for _, path in ipairs((reply.args or {})[1] or {}) do
@@ -928,7 +932,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       return
     end
     local ok, bus = pcall(function()
-      return kw.dbus.system()
+      return dbus.system()
     end)
     if ok and bus then
       self.battery_bus = bus
@@ -946,12 +950,12 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       if sub_ok then
         self.battery_sub = sub
       else
-        kw.log.warn("battery dbus subscribe failed")
+        log.warn("battery dbus subscribe failed")
         self.battery_bus:close()
         self.battery_bus = nil
       end
     else
-      kw.log.warn("battery dbus unavailable")
+      log.warn("battery dbus unavailable")
     end
   end,
 

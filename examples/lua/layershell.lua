@@ -1,4 +1,4 @@
-local kw = require("kw")
+local keywork = require("keywork")
 
 local colors = {
   background = 0xff111113,
@@ -14,9 +14,9 @@ local colors = {
 --   zig build run-lua-vulkan-layershell-example
 -- or:
 --   zig build run -- examples/lua/layershell.lua
-local App = kw.stateful({
+local App = keywork.stateful({
   build = function(self, state)
-    local theme = kw.resolve_theme(kw.theme_data({
+    local theme = keywork.resolve_theme(keywork.theme_data({
       schemes = {
         light = {
           colors = {
@@ -41,19 +41,19 @@ local App = kw.stateful({
       state.color_scheme
     )
 
-    return kw.theme({
+    return keywork.theme({
       data = theme,
-      child = kw.box({ background = theme.colors.surface },
-        kw.padding({
+      child = keywork.box({ background = theme.colors.surface },
+        keywork.padding({
           all = 8,
-          child = kw.text(label, { color = theme.colors.text }),
+          child = keywork.text(label, { color = theme.colors.text }),
         })
       ),
     })
   end,
 })
 
-return kw.app({
+return keywork.app({
   app_id = "dev.keywork.LayerShellExample",
   backend = "cpu",
   height = 32,

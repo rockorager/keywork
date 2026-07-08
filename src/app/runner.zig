@@ -39,6 +39,7 @@ pub const Options = struct {
     unbind_runtime: ?*const fn (ctx: *anyopaque) void = null,
     bind_event_loop: ?*const fn (ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void = null,
     unbind_event_loop: ?*const fn (ctx: *anyopaque) void = null,
+    should_run_headless: ?*const fn (ctx: *anyopaque) bool = null,
 };
 
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
@@ -48,7 +49,7 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
         return runWaylandAllOutputs(allocator, loop, app, constraints, options);
     }
     return switch (options.backend) {
-        .log => runLog(allocator, app, constraints, options),
+        .log => runLog(allocator, loop, app, constraints, options),
         .wayland_shm => runWayland(allocator, loop, app, constraints, options, wayland_shm.Backend),
         .vulkan => runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
     };
@@ -56,16 +57,18 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
 
 fn runLog(
     allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     constraints: keywork.Constraints,
     options: Options,
 ) !void {
     var log_backend: log_backend_mod.LogBackend = .{ .writer = options.log_writer };
-    return runHeadlessRuntime(allocator, app, constraints, log_backend.backend(), options);
+    return runHeadlessRuntime(allocator, loop, app, constraints, log_backend.backend(), options);
 }
 
 fn runHeadlessRuntime(
     allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     constraints: keywork.Constraints,
     backend: keywork.RenderBackend,
@@ -81,8 +84,31 @@ fn runHeadlessRuntime(
     defer runtime.deinit();
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
     defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    runtime.setDeferredRepaint(true);
+    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
+    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
     try runtime.repaint();
+    if (options.should_run_headless) |should_run| {
+        if (should_run(options.runtime_context.?)) {
+            var headless_loop: HeadlessLoop = .{ .runtime = &runtime, .options = &options };
+            loop.setEndTurnHook(&headless_loop, HeadlessLoop.endTurn);
+            defer loop.clearEndTurnHook();
+            try loop.run();
+        }
+    }
 }
+
+const HeadlessLoop = struct {
+    runtime: *runtime_mod.Runtime,
+    options: *const Options,
+
+    fn endTurn(ctx: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *HeadlessLoop = @ptrCast(@alignCast(ctx));
+        try self.runtime.flushPendingRepaint();
+        const should_run = self.options.should_run_headless orelse return;
+        if (!should_run(self.options.runtime_context.?)) loop.quit();
+    }
+};
 
 fn runWayland(
     allocator: std.mem.Allocator,
@@ -122,10 +148,10 @@ fn runWayland(
     defer runtime.deinit();
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
     defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    if (options.layer_shell != null) runtime.setFrameBackground(keywork.colors.transparent);
+    runtime.setDeferredRepaint(true);
     if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
     defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
-    if (options.layer_shell != null) runtime.frame_background = keywork.colors.transparent;
-    runtime.setDeferredRepaint(true);
 
     var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime };
     defer queue.deinit();
@@ -148,6 +174,7 @@ fn runWayland(
         .prepare = Backend.eventLoopPrepare,
         .finish = Backend.eventLoopFinish,
     });
+    defer loop.clearWayland();
     try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
@@ -159,7 +186,9 @@ fn runWayland(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
     loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
+    defer loop.clearEndTurnHook();
     try loop.run();
 }
 
@@ -356,10 +385,10 @@ fn runWaylandAllOutputs(
     defer runtime.deinit();
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
     defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    runtime.setFrameBackground(keywork.colors.transparent);
+    runtime.setDeferredRepaint(true);
     if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
     defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
-    runtime.frame_background = keywork.colors.transparent;
-    runtime.setDeferredRepaint(true);
 
     var multi_context: MultiOutputContext = .{ .runtime = &runtime, .backend = backend, .output_backends = output_backends };
     runtime.setRepaintScheduler(&multi_context, MultiOutputContext.schedule);
@@ -385,6 +414,7 @@ fn runWaylandAllOutputs(
         .prepare = wayland_shm.Backend.eventLoopPrepare,
         .finish = wayland_shm.Backend.eventLoopFinish,
     });
+    defer loop.clearWayland();
     try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
@@ -396,7 +426,9 @@ fn runWaylandAllOutputs(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
     loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
+    defer loop.clearEndTurnHook();
     try loop.run();
 }
 

@@ -57,6 +57,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .unbind_runtime = unbindLuaRuntime,
         .bind_event_loop = bindLuaEventLoop,
         .unbind_event_loop = unbindLuaEventLoop,
+        .should_run_headless = luaShouldRunHeadless,
     });
 }
 
@@ -78,4 +79,9 @@ fn bindLuaEventLoop(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void 
 fn unbindLuaEventLoop(ctx: *anyopaque) void {
     const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
     lua.unbindEventLoop();
+}
+
+fn luaShouldRunHeadless(ctx: *anyopaque) bool {
+    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
+    return lua.hasLiveAsyncResources();
 }

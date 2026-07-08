@@ -1,4 +1,4 @@
-//! Lua D-Bus integration for kw.dbus.
+//! Lua D-Bus integration for keywork.dbus.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -20,7 +20,6 @@ pub const Host = struct {
         luaState: *const fn (*anyopaque) *c.lua_State,
         eventLoop: *const fn (*anyopaque) ?*event_loop.EventLoop,
         addBus: *const fn (*anyopaque, Kind) anyerror!*Bus,
-        removeBus: *const fn (*anyopaque, *Bus) void,
     };
 
     fn allocator(self: Host) std.mem.Allocator {
@@ -34,9 +33,6 @@ pub const Host = struct {
     }
     fn addBus(self: Host, kind: Kind) !*Bus {
         return self.vtable.addBus(self.ptr, kind);
-    }
-    fn removeBus(self: Host, bus: *Bus) void {
-        self.vtable.removeBus(self.ptr, bus);
     }
 };
 
@@ -352,24 +348,44 @@ pub const Bus = struct {
         self.registered = false;
     }
 
-    fn close(self: *Bus) void {
+    pub fn close(self: *Bus) void {
         if (self.closed) return;
-        self.closed = true;
         if (self.registered) {
             if (self.host.eventLoop()) |loop| if (self.source_handle) |handle| loop.removeSource(handle);
             self.registered = false;
             self.source_handle = null;
         }
+        const lua_state = self.host.luaState();
+        for (self.subscriptions.items) |subscription| subscription.cancel(lua_state);
+        for (self.owned_names.items) |name| name.release();
+        for (self.exported_objects.items) |object| object.unexport(lua_state);
+
+        // A call whose completion callback closes this bus is already on the
+        // C stack. Leave that one for dbusCallNotify to remove after the Lua
+        // callback returns; all other pending calls can be canceled now.
+        var index: usize = 0;
+        while (index < self.pending_calls.items.len) {
+            const pending_call = self.pending_calls.items[index];
+            if (pending_call.completed) {
+                index += 1;
+                continue;
+            }
+            _ = self.pending_calls.swapRemove(index);
+            pending_call.destroy(self.host.allocator(), lua_state);
+        }
+
         if (self.filter_installed) {
             dbus_c.dbus_connection_remove_filter(self.connection, dbusFilter, self);
             self.filter_installed = false;
         }
+        self.closed = true;
         dbus_c.dbus_connection_close(self.connection);
         dbus_c.dbus_connection_unref(self.connection);
         self.fd = invalid_fd;
     }
 
     fn deinit(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.close();
         for (self.exported_objects.items) |object| object.destroy(allocator, lua_state);
         self.exported_objects.deinit(allocator);
         for (self.owned_names.items) |name| name.destroy(allocator);
@@ -378,7 +394,6 @@ pub const Bus = struct {
         self.subscriptions.deinit(allocator);
         for (self.pending_calls.items) |pending_call| pending_call.destroy(allocator, lua_state);
         self.pending_calls.deinit(allocator);
-        self.close();
     }
 
     pub fn destroy(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -914,8 +929,15 @@ fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn luaDbusClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_pushboolean(lua_state, if (bus.closed) 1 else 0);
+    return 1;
+}
+
 fn pushBusHandle(lua_state: *c.lua_State, bus: *Bus) void {
-    c.lua_createtable(lua_state, 0, 7);
+    c.lua_createtable(lua_state, 0, 8);
     c.lua_pushlightuserdata(lua_state, bus);
     c.lua_pushcclosure(lua_state, luaDbusSubscribe, 1);
     c.lua_setfield(lua_state, -2, "subscribe");
@@ -937,6 +959,9 @@ fn pushBusHandle(lua_state: *c.lua_State, bus: *Bus) void {
     c.lua_pushlightuserdata(lua_state, bus);
     c.lua_pushcclosure(lua_state, luaDbusClose, 1);
     c.lua_setfield(lua_state, -2, "close");
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_pushcclosure(lua_state, luaDbusClosed, 1);
+    c.lua_setfield(lua_state, -2, "closed");
 }
 
 fn pushSubscriptionHandle(lua_state: *c.lua_State, subscription: *Subscription) void {

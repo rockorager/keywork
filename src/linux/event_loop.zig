@@ -18,7 +18,8 @@ pub const EventLoop = struct {
     after_platform_context: ?*anyopaque = null,
     end_turn_hook: ?PhaseHook = null,
     end_turn_context: ?*anyopaque = null,
-    running: bool = true,
+    running: bool = false,
+    stop_requested: bool = false,
     dispatching: bool = false,
 
     const wake_token = std.math.maxInt(u64);
@@ -342,7 +343,9 @@ pub const EventLoop = struct {
     }
 
     pub fn setWayland(self: *EventLoop, source: WaylandSource) !void {
+        std.debug.assert(self.wayland == null);
         self.wayland = source;
+        errdefer self.wayland = null;
         var event: linux.epoll_event = .{
             .events = linux.EPOLL.IN,
             .data = .{ .u64 = wayland_token },
@@ -350,14 +353,30 @@ pub const EventLoop = struct {
         try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, source.fd, &event));
     }
 
+    pub fn clearWayland(self: *EventLoop) void {
+        const source = self.wayland orelse return;
+        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, source.fd, null);
+        self.wayland = null;
+    }
+
     pub fn setAfterPlatformHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
         self.after_platform_context = context;
         self.after_platform_hook = hook;
     }
 
+    pub fn clearAfterPlatformHook(self: *EventLoop) void {
+        self.after_platform_hook = null;
+        self.after_platform_context = null;
+    }
+
     pub fn setEndTurnHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
         self.end_turn_context = context;
         self.end_turn_hook = hook;
+    }
+
+    pub fn clearEndTurnHook(self: *EventLoop) void {
+        self.end_turn_hook = null;
+        self.end_turn_context = null;
     }
 
     pub fn wake(self: *EventLoop) !void {
@@ -372,11 +391,21 @@ pub const EventLoop = struct {
     }
 
     pub fn quit(self: *EventLoop) void {
+        self.stop_requested = true;
         self.running = false;
         self.wake() catch {};
     }
 
     pub fn run(self: *EventLoop) !void {
+        if (self.stop_requested) {
+            self.stop_requested = false;
+            return;
+        }
+        self.running = true;
+        defer {
+            self.running = false;
+            self.stop_requested = false;
+        }
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running) {
             if (self.wayland) |wayland| {
@@ -579,6 +608,29 @@ test "repeating timer fires and can quit the loop" {
     try loop.run();
 
     try std.testing.expect(context.fired > 0);
+}
+
+test "quit before run is consumed without poisoning a later run" {
+    const TimerTest = struct {
+        fired: bool = false,
+
+        fn callback(ctx: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired = true;
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    loop.quit();
+    try loop.run();
+
+    var context: TimerTest = .{};
+    const timer = try loop.addTimer(&context, TimerTest.callback);
+    try timer.arm(1, 0);
+    try loop.run();
+    try std.testing.expect(context.fired);
 }
 
 test "file watch fires and can quit the loop" {

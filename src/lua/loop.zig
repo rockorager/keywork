@@ -1,4 +1,4 @@
-//! Lua event-loop resources for kw.loop.
+//! Lua event-loop resources for keywork.loop.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -206,7 +206,8 @@ fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void
         const message_ptr = c.lua_tolstring(lua_state, -1, &len);
         if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fd callback failed: {s}", .{message[0..len]});
         pop(lua_state, 1);
-        return error.LuaCallbackFailed;
+        watch.cancel(lua_state);
+        return;
     }
     const should_invalidate = c.lua_toboolean(lua_state, -1) != 0;
     pop(lua_state, 1);
@@ -224,7 +225,8 @@ fn fsEventCallback(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, 
         const message_ptr = c.lua_tolstring(lua_state, -1, &len);
         if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fs_event callback failed: {s}", .{message[0..len]});
         pop(lua_state, 1);
-        return error.LuaCallbackFailed;
+        fs_event.cancel(lua_state);
+        return;
     }
     const should_invalidate = c.lua_toboolean(lua_state, -1) != 0;
     pop(lua_state, 1);
@@ -242,7 +244,8 @@ fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64)
         const message_ptr = c.lua_tolstring(lua_state, -1, &len);
         if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("timer callback failed: {s}", .{message[0..len]});
         pop(lua_state, 1);
-        return error.LuaCallbackFailed;
+        timer.cancel(lua_state);
+        return;
     }
     if (timer.interval_ms == 0) timer.cancel(lua_state);
 }
@@ -307,24 +310,33 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn pushTimerHandle(lua_state: *c.lua_State, timer: *LuaTimer) void {
-    c.lua_createtable(lua_state, 0, 1);
+    c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, timer);
     c.lua_pushcclosure(lua_state, luaCancelTimer, 1);
     c.lua_setfield(lua_state, -2, "cancel");
+    c.lua_pushlightuserdata(lua_state, timer);
+    c.lua_pushcclosure(lua_state, luaTimerCanceled, 1);
+    c.lua_setfield(lua_state, -2, "canceled");
 }
 
 fn pushFdWatchHandle(lua_state: *c.lua_State, watch: *FdWatch) void {
-    c.lua_createtable(lua_state, 0, 1);
+    c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, watch);
     c.lua_pushcclosure(lua_state, luaCancelFdWatch, 1);
     c.lua_setfield(lua_state, -2, "cancel");
+    c.lua_pushlightuserdata(lua_state, watch);
+    c.lua_pushcclosure(lua_state, luaFdWatchCanceled, 1);
+    c.lua_setfield(lua_state, -2, "canceled");
 }
 
 fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
-    c.lua_createtable(lua_state, 0, 1);
+    c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, fs_event);
     c.lua_pushcclosure(lua_state, luaCancelFsEvent, 1);
     c.lua_setfield(lua_state, -2, "cancel");
+    c.lua_pushlightuserdata(lua_state, fs_event);
+    c.lua_pushcclosure(lua_state, luaFsEventCanceled, 1);
+    c.lua_setfield(lua_state, -2, "canceled");
 }
 
 fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -346,6 +358,27 @@ fn luaCancelFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const fs_event: *FsEvent = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     fs_event.cancel(lua_state);
     return 0;
+}
+
+fn luaTimerCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const timer: *LuaTimer = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_pushboolean(lua_state, if (timer.canceled) 1 else 0);
+    return 1;
+}
+
+fn luaFdWatchCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const watch: *FdWatch = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_pushboolean(lua_state, if (watch.canceled) 1 else 0);
+    return 1;
+}
+
+fn luaFsEventCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const fs_event: *FsEvent = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_pushboolean(lua_state, if (fs_event.canceled) 1 else 0);
+    return 1;
 }
 
 fn pop(lua_state: *c.lua_State, count: c_int) void {

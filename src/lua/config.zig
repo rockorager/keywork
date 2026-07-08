@@ -1,4 +1,4 @@
-//! Lua kw.app root configuration parsing.
+//! Lua keywork.app root configuration parsing.
 
 const std = @import("std");
 const app_options = @import("../app/options.zig");
@@ -26,7 +26,7 @@ pub const Config = struct {
 pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_index: c_int) !Config {
     var config: Config = .{};
     const root_type = (try checkStringField(lua_state, table_index, "type")) orelse
-        return invalidAppRoot("script must return kw.app(...) as its root", .{});
+        return invalidAppRoot("script must return keywork.app(...) as its root", .{});
     if (!std.mem.eql(u8, root_type, "app")) return invalidAppRoot("script root must be an app, got '{s}'", .{root_type});
 
     if (try checkStringField(lua_state, table_index, "backend")) |name| {
@@ -47,7 +47,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     c.lua_getfield(lua_state, table_index, "child");
     const child_is_widget = c.lua_type(lua_state, -1) == c.LUA_TTABLE and isWidgetTable(lua_state, c.lua_gettop(lua_state));
     pop(lua_state, 1);
-    if (!child_is_widget) return invalidAppRoot("kw.app requires a widget child", .{});
+    if (!child_is_widget) return invalidAppRoot("keywork.app requires a widget child", .{});
 
     const app_id = try checkStringField(lua_state, table_index, "app_id");
     const title = try checkStringField(lua_state, table_index, "title");
