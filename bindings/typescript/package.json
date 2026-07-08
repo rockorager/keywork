@@ -1,0 +1,13 @@
+{
+  "name": "@keywork/ui",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build:native": "mkdir -p build && cc -shared -fPIC -O2 -I/usr/include/node -I../../include native/keywork_node.c -ldl -o build/keywork_node.node",
+    "check": "bun build ./src/index.ts --target=node --outdir /tmp/keywork-typescript-check"
+  }
+}
