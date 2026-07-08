@@ -25,6 +25,8 @@ pub const colors = struct {
     pub const slate7: Color = Color.argb(0xff, 0xcd, 0xce, 0xd6);
     pub const slate11: Color = Color.argb(0xff, 0x60, 0x64, 0x6c);
     pub const slate12: Color = Color.argb(0xff, 0x1c, 0x20, 0x24);
+    pub const slate_a3: Color = Color.argb(0x0f, 0x00, 0x00, 0x33);
+    pub const slate_a4: Color = Color.argb(0x17, 0x00, 0x00, 0x2d);
 
     pub const slate_dark1: Color = Color.argb(0xff, 0x11, 0x11, 0x13);
     pub const slate_dark2: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
@@ -32,6 +34,8 @@ pub const colors = struct {
     pub const slate_dark7: Color = Color.argb(0xff, 0x43, 0x48, 0x4e);
     pub const slate_dark11: Color = Color.argb(0xff, 0xb0, 0xb4, 0xba);
     pub const slate_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
+    pub const slate_dark_a3: Color = Color.argb(0x14, 0xdd, 0xea, 0xf8);
+    pub const slate_dark_a4: Color = Color.argb(0x1d, 0xd3, 0xed, 0xf8);
 
     pub const blue9: Color = Color.argb(0xff, 0x00, 0x90, 0xff);
     pub const blue10: Color = Color.argb(0xff, 0x05, 0x88, 0xf0);
@@ -52,52 +56,61 @@ pub const Brightness = enum {
 
 pub const ColorScheme = struct {
     brightness: Brightness,
-    background: Color,
-    foreground: Color,
     primary: Color,
-    primary_hover: Color,
-    primary_pressed: Color,
     on_primary: Color,
+    primary_container: Color,
+    on_primary_container: Color,
     surface: Color,
-    surface_high: Color,
-    surface_low: Color,
-    border: Color,
-    muted: Color,
+    on_surface: Color,
+    on_surface_variant: Color,
+    surface_container_low: Color,
+    surface_container: Color,
+    surface_container_high: Color,
     error_color: Color,
     on_error: Color,
+    error_container: Color,
+    on_error_container: Color,
+    outline: Color,
+    outline_variant: Color,
 
     pub const light: ColorScheme = .{
         .brightness = .light,
-        .background = colors.slate2,
-        .foreground = colors.ink,
         .primary = colors.accent,
-        .primary_hover = colors.blue10,
-        .primary_pressed = colors.blue11,
         .on_primary = colors.white,
+        .primary_container = colors.blue10,
+        .on_primary_container = colors.white,
         .surface = colors.slate1,
-        .surface_high = colors.white,
-        .surface_low = colors.slate3,
-        .border = colors.slate7,
-        .muted = colors.slate11,
+        .on_surface = colors.ink,
+        .on_surface_variant = colors.slate11,
+        .surface_container_low = colors.slate_a3,
+        .surface_container = colors.slate2,
+        .surface_container_high = colors.slate_a4,
         .error_color = colors.red9,
         .on_error = colors.white,
+        .error_container = colors.red9,
+        .on_error_container = colors.white,
+        .outline = colors.slate7,
+        .outline_variant = colors.slate7,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
-        .background = colors.slate_dark1,
-        .foreground = colors.slate_dark12,
         .primary = colors.blue9,
-        .primary_hover = colors.blue_dark10,
-        .primary_pressed = colors.blue_dark11,
         .on_primary = colors.black,
+        .primary_container = colors.blue_dark10,
+        .on_primary_container = colors.black,
         .surface = colors.slate_dark2,
-        .surface_high = colors.slate_dark3,
-        .surface_low = colors.slate_dark1,
-        .border = colors.slate_dark7,
-        .muted = colors.slate_dark11,
+        .on_surface = colors.slate_dark12,
+        .on_surface_variant = colors.slate_dark11,
+        .surface_container_low = colors.slate_dark_a3,
+        .surface_container = colors.slate_dark2,
+        .surface_container_high = colors.slate_dark_a4,
         .error_color = colors.red9,
         .on_error = colors.black,
+        .error_container = colors.red9,
+        .on_error_container = colors.black,
+        .outline = colors.slate_dark7,
+        .outline_variant = colors.slate_dark7,
     };
 };
 
@@ -355,18 +368,18 @@ pub const Constraints = struct {
 
 pub const Widget = union(enum) {
     text: Text,
-    box: Box,
-    button: Button,
-    clickable: Clickable,
+    container: Container,
+    filled_button: FilledButton,
+    gesture_detector: GestureDetector,
     focus: Focus,
     focus_scope: FocusScope,
-    scroll: Scroll,
-    text_input: TextInput,
+    single_child_scroll_view: SingleChildScrollView,
+    text_field: TextField,
     row: Children,
     column: Children,
     spacer: Spacer,
     flexible: Flexible,
-    sized: Sized,
+    sized_box: SizedBox,
     padding: Padding,
     center: Child,
     shortcuts: Shortcuts,
@@ -392,7 +405,7 @@ pub const Widget = union(enum) {
         role: TextRole = .body,
     };
 
-    pub const Box = struct {
+    pub const Container = struct {
         key: ?[]const u8 = null,
         child: *const Widget,
         background: Color = colors.transparent,
@@ -408,7 +421,7 @@ pub const Widget = union(enum) {
     /// A semantic, theme-aware button. Text and untinted icons inherit the
     /// button foreground; default, hover, pressed, focused, and disabled
     /// presentation is resolved from the active Theme inside libkeywork.
-    pub const Button = struct {
+    pub const FilledButton = struct {
         key: ?[]const u8 = null,
         id: []const u8,
         /// Null disables activation, focus traversal, and pointer hover while
@@ -418,16 +431,16 @@ pub const Widget = union(enum) {
         activation: ClickActivation = .press,
     };
 
-    pub const Clickable = struct {
+    pub const GestureDetector = struct {
         key: ?[]const u8 = null,
         id: []const u8,
         handler: HandlerId,
         child: *const Widget,
         activation: ClickActivation = .release,
-        hover_style: ?ClickableStyle = null,
+        hover_style: ?GestureDetectorStyle = null,
     };
 
-    pub const ClickableStyle = struct {
+    pub const GestureDetectorStyle = struct {
         background: ?Color = null,
         base_background: ?Color = null,
     };
@@ -469,7 +482,7 @@ pub const Widget = union(enum) {
     /// scrollable axes, clipped to the viewport, and offset by the
     /// element-owned scroll position. Scrollbar thumbs are painted for
     /// axes with overflowing content.
-    pub const Scroll = struct {
+    pub const SingleChildScrollView = struct {
         key: ?[]const u8 = null,
         id: []const u8,
         child: *const Widget,
@@ -490,7 +503,7 @@ pub const Widget = union(enum) {
         }
     };
 
-    pub const TextInput = struct {
+    pub const TextField = struct {
         key: ?[]const u8 = null,
         id: []const u8,
         focus_node: FocusNode,
@@ -554,7 +567,7 @@ pub const Widget = union(enum) {
         end,
     };
 
-    pub const Sized = struct {
+    pub const SizedBox = struct {
         key: ?[]const u8 = null,
         child: *const Widget,
         width: ?f32 = null,
@@ -621,12 +634,20 @@ pub const widgets = struct {
         return .{ .text = .{ .value = value, .color = color } };
     }
 
+    pub fn container(allocator: std.mem.Allocator, child: Widget, background: Color) !Widget {
+        return .{ .container = .{ .child = try Widget.alloc(allocator, child), .background = background } };
+    }
+
     pub fn box(allocator: std.mem.Allocator, child: Widget, background: Color) !Widget {
-        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background } };
+        return container(allocator, child, background);
+    }
+
+    pub fn gestureDetector(allocator: std.mem.Allocator, id: []const u8, handler: HandlerId, child: Widget) !Widget {
+        return .{ .gesture_detector = .{ .id = id, .handler = handler, .child = try Widget.alloc(allocator, child) } };
     }
 
     pub fn clickable(allocator: std.mem.Allocator, id: []const u8, handler: HandlerId, child: Widget) !Widget {
-        return .{ .clickable = .{ .id = id, .handler = handler, .child = try Widget.alloc(allocator, child) } };
+        return gestureDetector(allocator, id, handler, child);
     }
 
     pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
@@ -655,15 +676,19 @@ pub const widgets = struct {
         return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child), .modal = modal } };
     }
 
+    pub fn singleChildScrollView(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
+        return .{ .single_child_scroll_view = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+    }
+
     pub fn scroll(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
-        return .{ .scroll = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
+        return singleChildScrollView(allocator, id, child);
     }
 
     pub fn defaultTextStyle(allocator: std.mem.Allocator, style: TextStyle, child: Widget) !Widget {
         return .{ .default_text_style = .{ .style = style, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub const TextInputOptions = struct {
+    pub const TextFieldOptions = struct {
         focus_node: ?FocusNode = null,
         on_change: ?HandlerId = null,
         foreground: Color = colors.ink,
@@ -677,8 +702,10 @@ pub const widgets = struct {
         autofocus: bool = false,
     };
 
-    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, options: TextInputOptions) Widget {
-        return .{ .text_input = .{
+    pub const TextInputOptions = TextFieldOptions;
+
+    pub fn textField(id: []const u8, value: []const u8, placeholder: []const u8, options: TextFieldOptions) Widget {
+        return .{ .text_field = .{
             .id = id,
             .focus_node = options.focus_node orelse .named(id),
             .value = value,
@@ -694,6 +721,10 @@ pub const widgets = struct {
             .radius = options.radius,
             .autofocus = options.autofocus,
         } };
+    }
+
+    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, options: TextInputOptions) Widget {
+        return textField(id, value, placeholder, options);
     }
 
     pub const LinearOptions = struct {
@@ -732,8 +763,12 @@ pub const widgets = struct {
         return .{ .spacer = .{ .flex = @max(0, flex) } };
     }
 
+    pub fn sizedBox(allocator: std.mem.Allocator, child: Widget, width: ?f32, height: ?f32) !Widget {
+        return .{ .sized_box = .{ .child = try Widget.alloc(allocator, child), .width = width, .height = height } };
+    }
+
     pub fn sized(allocator: std.mem.Allocator, child: Widget, width: ?f32, height: ?f32) !Widget {
-        return .{ .sized = .{ .child = try Widget.alloc(allocator, child), .width = width, .height = height } };
+        return sizedBox(allocator, child, width, height);
     }
 
     pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets, child: Widget) !Widget {
@@ -770,18 +805,18 @@ pub const Element = struct {
 
     pub const Kind = enum {
         text,
-        box,
-        button,
-        clickable,
+        container,
+        filled_button,
+        gesture_detector,
         focus,
         focus_scope,
-        scroll,
-        text_input,
+        single_child_scroll_view,
+        text_field,
         row,
         column,
         spacer,
         flexible,
-        sized,
+        sized_box,
         padding,
         center,
         shortcuts,
@@ -813,28 +848,28 @@ fn mergeTextStyle(base: TextStyle, overlay: TextStyle) TextStyle {
 fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widget.Text) ResolvedTextStyle {
     const role_style = roleTextStyle(theme, text_widget.role);
     return .{
-        .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.foreground,
+        .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.on_surface,
         .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse 16,
     };
 }
 
 fn buttonBackground(theme: Theme, hovered: bool) Color {
-    if (hovered) return theme.button_theme.hover_background orelse theme.color_scheme.primary_hover;
+    if (hovered) return theme.button_theme.hover_background orelse theme.color_scheme.primary_container;
     return theme.button_theme.background orelse theme.color_scheme.primary;
 }
 
 fn buttonForeground(theme: Theme, enabled: bool, hovered: bool) Color {
-    if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.muted;
+    if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.on_surface_variant;
     if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.on_primary;
     return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
 }
 
 fn buttonPressedBackground(theme: Theme) Color {
-    return theme.button_theme.pressed_background orelse theme.color_scheme.primary_pressed;
+    return theme.button_theme.pressed_background orelse theme.color_scheme.primary_container;
 }
 
 fn buttonDisabledBackground(theme: Theme) Color {
-    return theme.button_theme.disabled_background orelse theme.color_scheme.surface_low;
+    return theme.button_theme.disabled_background orelse theme.color_scheme.surface_container_low;
 }
 
 fn buttonFocusedBorder(theme: Theme) Color {
@@ -842,15 +877,15 @@ fn buttonFocusedBorder(theme: Theme) Color {
 }
 
 fn inputForeground(theme: Theme) Color {
-    return theme.input_theme.foreground orelse theme.color_scheme.foreground;
+    return theme.input_theme.foreground orelse theme.color_scheme.on_surface;
 }
 
 fn inputBackground(theme: Theme) Color {
-    return theme.input_theme.background orelse theme.color_scheme.surface_high;
+    return theme.input_theme.background orelse theme.color_scheme.surface_container_high;
 }
 
 fn inputBorder(theme: Theme) Color {
-    return theme.input_theme.border orelse theme.color_scheme.border;
+    return theme.input_theme.border orelse theme.color_scheme.outline;
 }
 
 fn inputFocusedBorder(theme: Theme) Color {
@@ -858,7 +893,7 @@ fn inputFocusedBorder(theme: Theme) Color {
 }
 
 fn inputPlaceholder(theme: Theme) Color {
-    return theme.input_theme.placeholder orelse theme.color_scheme.muted;
+    return theme.input_theme.placeholder orelse theme.color_scheme.on_surface_variant;
 }
 
 pub const RenderObject = struct {
@@ -969,17 +1004,17 @@ pub const RenderNode = struct {
 
     pub const Kind = enum {
         text,
-        box,
-        clickable,
+        container,
+        gesture_detector,
         focus,
         focus_scope,
-        scroll,
-        text_input,
+        single_child_scroll_view,
+        text_field,
         row,
         column,
         spacer,
         flexible,
-        sized,
+        sized_box,
         padding,
         center,
         shortcuts,
@@ -1310,14 +1345,14 @@ pub const CursorShape = enum {
     text,
 };
 
-/// Editing state owned by a text_input element; the single source of truth
+/// Editing state owned by a text field element; the single source of truth
 /// for the input's text after creation.
 pub const TextInputState = struct {
     text: std.ArrayList(u8) = .empty,
 };
 
 pub fn textInputState(element: *Element) *TextInputState {
-    std.debug.assert(element.kind == .text_input);
+    std.debug.assert(element.kind == .text_field);
     return @ptrCast(@alignCast(element.state.?));
 }
 
@@ -1329,7 +1364,7 @@ pub const ScrollState = struct {
 };
 
 pub fn scrollState(element: *Element) *ScrollState {
-    std.debug.assert(element.kind == .scroll);
+    std.debug.assert(element.kind == .single_child_scroll_view);
     return @ptrCast(@alignCast(element.state.?));
 }
 
@@ -1363,20 +1398,20 @@ pub fn buildElementTreeScoped(
     return switch (widget.*) {
         .text => finishElement(allocator, scope, widget, .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) }),
         .spacer => finishElement(allocator, scope, widget, .{ .kind = .spacer, .widget = try cloneWidgetForElement(allocator, widget.*) }),
-        .text_input => {
+        .text_field => {
             var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             var element_owns_fields = false;
             errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(TextInputState);
             errdefer if (!element_owns_fields) allocator.destroy(state);
             state.* = .{};
-            try state.text.appendSlice(allocator, element_widget.text_input.value);
+            try state.text.appendSlice(allocator, element_widget.text_field.value);
             element_owns_fields = true;
             return finishElement(allocator, scope, widget, .{
-                .kind = .text_input,
+                .kind = .text_field,
                 .widget = element_widget,
                 .state = state,
-                .focused = scope.interaction.isFocused(element_widget.text_input.focus_node),
+                .focused = scope.interaction.isFocused(element_widget.text_field.focus_node),
             });
         },
         .image => |image_widget| {
@@ -1401,8 +1436,8 @@ pub fn buildElementTreeScoped(
             element_owns_fields = true;
             return finishElement(allocator, scope, widget, .{ .kind = .icon, .widget = element_widget, .render_object = render_object });
         },
-        .box => |box_widget| return buildSingleChildElement(allocator, scope, widget, .box, box_widget.child, constraints),
-        .button => |button_widget| blk: {
+        .container => |box_widget| return buildSingleChildElement(allocator, scope, widget, .container, box_widget.child, constraints),
+        .filled_button => |button_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             var element_owns_fields = false;
             errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
@@ -1417,9 +1452,9 @@ pub fn buildElementTreeScoped(
             children[0] = try buildButtonChildElement(allocator, scope, button_widget, constraints);
             initialized = true;
             element_owns_fields = true;
-            break :blk try finishElement(allocator, scope, widget, .{ .kind = .button, .widget = element_widget, .children = children });
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .filled_button, .widget = element_widget, .children = children });
         },
-        .clickable => |clickable_widget| blk: {
+        .gesture_detector => |clickable_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             var element_owns_fields = false;
             errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
@@ -1434,7 +1469,7 @@ pub fn buildElementTreeScoped(
             children[0] = try buildClickableChildElement(allocator, scope, clickable_widget, constraints);
             initialized = true;
             element_owns_fields = true;
-            break :blk try finishElement(allocator, scope, widget, .{ .kind = .clickable, .widget = element_widget, .children = children });
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .gesture_detector, .widget = element_widget, .children = children });
         },
         .focus => |focus_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1453,7 +1488,7 @@ pub fn buildElementTreeScoped(
             element_owns_fields = true;
             break :blk try finishElement(allocator, scope, widget, .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children });
         },
-        .scroll => |scroll_widget| blk: {
+        .single_child_scroll_view => |scroll_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             var element_owns_fields = false;
             errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
@@ -1464,14 +1499,14 @@ pub fn buildElementTreeScoped(
             errdefer if (!element_owns_fields) allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
             element_owns_fields = true;
-            break :blk try finishElement(allocator, scope, widget, .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children });
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .single_child_scroll_view, .widget = element_widget, .state = state, .children = children });
         },
         .focus_scope => |focus_scope_widget| return buildSingleChildElement(allocator, scope, widget, .focus_scope, focus_scope_widget.child, constraints),
         .padding => |padding_widget| return buildSingleChildElement(allocator, scope, widget, .padding, padding_widget.child, constraints.inset(padding_widget.insets)),
         .flexible => |flexible_widget| return buildSingleChildElement(allocator, scope, widget, .flexible, flexible_widget.child, constraints),
         .center => |center_widget| return buildSingleChildElement(allocator, scope, widget, .center, center_widget.child, constraints),
         .shortcuts => |shortcuts_widget| return buildSingleChildElement(allocator, scope, widget, .shortcuts, shortcuts_widget.child, constraints),
-        .sized => |sized_widget| return buildSingleChildElement(allocator, scope, widget, .sized, sized_widget.child, constrainSized(constraints, sized_widget)),
+        .sized_box => |sized_widget| return buildSingleChildElement(allocator, scope, widget, .sized_box, sized_widget.child, constrainSized(constraints, sized_widget)),
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
@@ -1519,7 +1554,7 @@ fn buildSingleChildElement(
 fn buildButtonChildElement(
     allocator: std.mem.Allocator,
     scope: *BuildScope,
-    button_widget: Widget.Button,
+    button_widget: Widget.FilledButton,
     constraints: Constraints,
 ) !Element {
     var composition: ButtonComposition = undefined;
@@ -1536,7 +1571,7 @@ const ButtonComposition = struct {
     surface: Widget,
     foreground: Color,
 
-    fn init(self: *ButtonComposition, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) void {
+    fn init(self: *ButtonComposition, theme: Theme, interaction: InteractionState, button_widget: Widget.FilledButton) void {
         const enabled = button_widget.handler != null;
         const hovered = enabled and interaction.isHovered(button_widget.id);
         const pressed = enabled and interaction.isPressed(button_widget.id);
@@ -1555,7 +1590,7 @@ const ButtonComposition = struct {
             },
             .child = &self.styled_child,
         } };
-        self.surface = .{ .box = .{
+        self.surface = .{ .container = .{
             .child = &self.padded_child,
             .background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered),
             .border = if (focused) buttonFocusedBorder(theme) else null,
@@ -1606,12 +1641,12 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
     element.children = &.{};
     if (element.state) |state| {
         switch (element.kind) {
-            .text_input => {
+            .text_field => {
                 const input_state: *TextInputState = @ptrCast(@alignCast(state));
                 input_state.text.deinit(allocator);
                 allocator.destroy(input_state);
             },
-            .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
+            .single_child_scroll_view => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
         element.state = null;
@@ -1654,9 +1689,9 @@ pub fn updateElementTreeScoped(
     switch (widget.*) {
         .text => try replaceElementWidgetThemed(allocator, scope, element, widget, scope.theme, scope.default_text_style),
         .spacer => try replaceElementWidget(allocator, scope, element, widget),
-        .text_input => {
+        .text_field => {
             try replaceElementWidgetThemed(allocator, scope, element, widget, scope.theme, scope.default_text_style);
-            element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
+            element.focused = scope.interaction.isFocused(element.widget.text_field.focus_node);
         },
         .image => |image_widget| {
             const factory = scope.render_factory orelse return error.MissingRenderFactory;
@@ -1677,20 +1712,20 @@ pub fn updateElementTreeScoped(
             if (element.render_object) |old| old.destroy(allocator);
             element.render_object = render_object;
         },
-        .box => |box_widget| try updateSingleChildElement(allocator, scope, element, widget, box_widget.child, constraints),
-        .button => |button_widget| try updateButtonElement(allocator, scope, element, widget, button_widget, constraints),
-        .clickable => |clickable_widget| try updateSingleChildElement(allocator, scope, element, widget, clickable_widget.child, constraints),
+        .container => |box_widget| try updateSingleChildElement(allocator, scope, element, widget, box_widget.child, constraints),
+        .filled_button => |button_widget| try updateButtonElement(allocator, scope, element, widget, button_widget, constraints),
+        .gesture_detector => |clickable_widget| try updateSingleChildElement(allocator, scope, element, widget, clickable_widget.child, constraints),
         .focus => |focus_widget| {
             try updateSingleChildElement(allocator, scope, element, widget, focus_widget.child, constraints);
             element.focused = scope.interaction.isFocused(element.widget.focus.node);
         },
-        .scroll => |scroll_widget| try updateSingleChildElement(allocator, scope, element, widget, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes)),
+        .single_child_scroll_view => |scroll_widget| try updateSingleChildElement(allocator, scope, element, widget, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes)),
         .focus_scope => |focus_scope_widget| try updateSingleChildElement(allocator, scope, element, widget, focus_scope_widget.child, constraints),
         .padding => |padding_widget| try updateSingleChildElement(allocator, scope, element, widget, padding_widget.child, constraints.inset(padding_widget.insets)),
         .flexible => |flexible_widget| try updateSingleChildElement(allocator, scope, element, widget, flexible_widget.child, constraints),
         .center => |center_widget| try updateSingleChildElement(allocator, scope, element, widget, center_widget.child, constraints),
         .shortcuts => |shortcuts_widget| try updateSingleChildElement(allocator, scope, element, widget, shortcuts_widget.child, constraints),
-        .sized => |sized_widget| try updateSingleChildElement(allocator, scope, element, widget, sized_widget.child, constrainSized(constraints, sized_widget)),
+        .sized_box => |sized_widget| try updateSingleChildElement(allocator, scope, element, widget, sized_widget.child, constrainSized(constraints, sized_widget)),
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
@@ -1711,15 +1746,15 @@ pub fn rebuildDirtyElementTreeScoped(
     switch (element.widget) {
         .text,
         .spacer,
-        .text_input,
+        .text_field,
         .image,
         .icon,
         => return false,
 
-        .box,
-        .sized,
-        .button,
-        .clickable,
+        .container,
+        .sized_box,
+        .filled_button,
+        .gesture_detector,
         .focus,
         .focus_scope,
         .center,
@@ -1727,7 +1762,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .shortcuts,
         => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
 
-        .scroll => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
+        .single_child_scroll_view => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
         .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
@@ -1746,8 +1781,8 @@ pub fn rebuildDirtyElementTreeScoped(
 /// Finds the text input element with the given focus id, marking the
 /// layout path to it dirty so an edit relayouts exactly that input.
 pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element {
-    if (element.kind == .text_input) {
-        if (std.mem.eql(u8, element.widget.text_input.focus_node.id, focus_id)) {
+    if (element.kind == .text_field) {
+        if (std.mem.eql(u8, element.widget.text_field.focus_node.id, focus_id)) {
             markElementLayoutDirty(element);
             return element;
         }
@@ -1766,7 +1801,7 @@ pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element 
 /// it dirty so a scroll relayouts exactly that viewport.
 pub fn dirtyScrollElement(element: *Element, scroll_id: []const u8) ?*Element {
     const id: ?[]const u8 = switch (element.kind) {
-        .scroll => element.widget.scroll.id,
+        .single_child_scroll_view => element.widget.single_child_scroll_view.id,
         else => null,
     };
     if (id) |element_id| {
@@ -1798,12 +1833,12 @@ pub fn refreshInteractionElements(
     switch (element.widget) {
         .text,
         .spacer,
-        .text_input,
+        .text_field,
         .image,
         .icon,
         => return false,
 
-        .clickable => |clickable_widget| {
+        .gesture_detector => |clickable_widget| {
             var matched = false;
             for (ids) |id| {
                 if (std.mem.eql(u8, clickable_widget.id, id)) matched = true;
@@ -1817,7 +1852,7 @@ pub fn refreshInteractionElements(
             return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
         },
 
-        .button => |button_widget| {
+        .filled_button => |button_widget| {
             var matched = false;
             for (ids) |id| {
                 if (std.mem.eql(u8, button_widget.id, id)) matched = true;
@@ -1830,8 +1865,8 @@ pub fn refreshInteractionElements(
             return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
         },
 
-        .box,
-        .sized,
+        .container,
+        .sized_box,
         .focus,
         .focus_scope,
         .center,
@@ -1839,7 +1874,7 @@ pub fn refreshInteractionElements(
         .shortcuts,
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
-        .scroll => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
+        .single_child_scroll_view => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
         .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
@@ -1910,18 +1945,18 @@ fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
 fn elementKindForWidget(widget: Widget) Element.Kind {
     return switch (widget) {
         .text => .text,
-        .box => .box,
-        .button => .button,
-        .clickable => .clickable,
+        .container => .container,
+        .filled_button => .filled_button,
+        .gesture_detector => .gesture_detector,
         .focus => .focus,
         .focus_scope => .focus_scope,
-        .scroll => .scroll,
-        .text_input => .text_input,
+        .single_child_scroll_view => .single_child_scroll_view,
+        .text_field => .text_field,
         .row => .row,
         .column => .column,
         .spacer => .spacer,
         .flexible => .flexible,
-        .sized => .sized,
+        .sized_box => .sized_box,
         .padding => .padding,
         .center => .center,
         .shortcuts => .shortcuts,
@@ -1959,7 +1994,7 @@ fn updateButtonElement(
     scope: *BuildScope,
     element: *Element,
     widget: *const Widget,
-    button_widget: Widget.Button,
+    button_widget: Widget.FilledButton,
     constraints: Constraints,
 ) !void {
     std.debug.assert(element.children.len == 1);
@@ -1981,7 +2016,7 @@ fn updateButtonChildElement(
     allocator: std.mem.Allocator,
     scope: *BuildScope,
     element: *Element,
-    button_widget: Widget.Button,
+    button_widget: Widget.FilledButton,
     constraints: Constraints,
 ) !void {
     var composition: ButtonComposition = undefined;
@@ -2126,18 +2161,18 @@ fn findElementByKey(children: []const Element, used: []const bool, key: []const 
 fn widgetKey(widget: Widget) ?[]const u8 {
     return switch (widget) {
         .text => |value| value.key,
-        .box => |value| value.key,
-        .button => |value| value.key,
-        .clickable => |value| value.key,
+        .container => |value| value.key,
+        .filled_button => |value| value.key,
+        .gesture_detector => |value| value.key,
         .focus => |value| value.key,
         .focus_scope => |value| value.key,
-        .scroll => |value| value.key,
-        .text_input => |value| value.key,
+        .single_child_scroll_view => |value| value.key,
+        .text_field => |value| value.key,
         .row => |value| value.key,
         .column => |value| value.key,
         .spacer => |value| value.key,
         .flexible => |value| value.key,
-        .sized => |value| value.key,
+        .sized_box => |value| value.key,
         .padding => |value| value.key,
         .center => |value| value.key,
         .shortcuts => |value| value.key,
@@ -2187,7 +2222,7 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             text_widget.color = style.color;
             text_widget.font_size = style.font_size;
         },
-        .text_input => |*input_widget| {
+        .text_field => |*input_widget| {
             input_widget.foreground = inputForeground(theme);
             input_widget.background = inputBackground(theme);
             input_widget.border = inputBorder(theme);
@@ -2205,40 +2240,40 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
 fn buildClickableChildElement(
     allocator: std.mem.Allocator,
     scope: *BuildScope,
-    clickable_widget: Widget.Clickable,
+    clickable_widget: Widget.GestureDetector,
     constraints: Constraints,
 ) !Element {
     const child = clickableStyledChild(clickable_widget, scope.interaction);
     return buildElementTreeScoped(allocator, scope, &child, constraints);
 }
 
-fn clickableStyledChild(clickable_widget: Widget.Clickable, interaction: InteractionState) Widget {
+fn clickableStyledChild(clickable_widget: Widget.GestureDetector, interaction: InteractionState) Widget {
     var child = clickable_widget.child.*;
     const style = clickableActiveStyle(clickable_widget, interaction) orelse return child;
     const background = style.background orelse return child;
     switch (child) {
-        .box => child.box.background = background,
+        .container => child.container.background = background,
         else => {},
     }
     return child;
 }
 
-fn applyClickableHoverStyle(element: *Element, clickable_widget: Widget.Clickable, interaction: InteractionState) void {
+fn applyClickableHoverStyle(element: *Element, clickable_widget: Widget.GestureDetector, interaction: InteractionState) void {
     const style = clickable_widget.hover_style orelse return;
     const background = if (interaction.isHovered(clickable_widget.id)) style.background else style.base_background;
     const value = background orelse return;
     switch (element.widget) {
-        .box => element.widget.box.background = value,
+        .container => element.widget.container.background = value,
         else => {},
     }
 }
 
-fn clickableActiveStyle(clickable_widget: Widget.Clickable, interaction: InteractionState) ?Widget.ClickableStyle {
+fn clickableActiveStyle(clickable_widget: Widget.GestureDetector, interaction: InteractionState) ?Widget.GestureDetectorStyle {
     if (!interaction.isHovered(clickable_widget.id)) return null;
     return clickable_widget.hover_style;
 }
 
-fn clickableHoverStyle(clickable_widget: Widget.Clickable) ?Widget.ClickableStyle {
+fn clickableHoverStyle(clickable_widget: Widget.GestureDetector) ?Widget.GestureDetectorStyle {
     var style = clickable_widget.hover_style orelse return null;
     if (style.background != null and style.base_background == null) {
         style.base_background = clickableChildBackground(clickable_widget.child);
@@ -2248,7 +2283,7 @@ fn clickableHoverStyle(clickable_widget: Widget.Clickable) ?Widget.ClickableStyl
 
 fn clickableChildBackground(child: *const Widget) ?Color {
     return switch (child.*) {
-        .box => |box_widget| box_widget.background,
+        .container => |box_widget| box_widget.background,
         else => null,
     };
 }
@@ -2263,13 +2298,13 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .role = text_widget.role,
         } },
         .spacer => |spacer_widget| .{ .spacer = .{ .key = if (spacer_widget.key) |key| try allocator.dupe(u8, key) else null, .flex = spacer_widget.flex } },
-        .sized => |sized_widget| .{ .sized = .{ .key = if (sized_widget.key) |key| try allocator.dupe(u8, key) else null, .child = sized_widget.child, .width = sized_widget.width, .height = sized_widget.height, .min_width = sized_widget.min_width, .min_height = sized_widget.min_height, .max_width = sized_widget.max_width, .max_height = sized_widget.max_height } },
-        .box => |box_widget| .{ .box = .{ .key = if (box_widget.key) |key| try allocator.dupe(u8, key) else null, .child = box_widget.child, .background = box_widget.background, .border = box_widget.border, .border_width = box_widget.border_width, .radius = box_widget.radius, .min_width = box_widget.min_width, .min_height = box_widget.min_height, .horizontal_align = box_widget.horizontal_align, .vertical_align = box_widget.vertical_align } },
-        .button => |button_widget| blk: {
+        .sized_box => |sized_widget| .{ .sized_box = .{ .key = if (sized_widget.key) |key| try allocator.dupe(u8, key) else null, .child = sized_widget.child, .width = sized_widget.width, .height = sized_widget.height, .min_width = sized_widget.min_width, .min_height = sized_widget.min_height, .max_width = sized_widget.max_width, .max_height = sized_widget.max_height } },
+        .container => |box_widget| .{ .container = .{ .key = if (box_widget.key) |key| try allocator.dupe(u8, key) else null, .child = box_widget.child, .background = box_widget.background, .border = box_widget.border, .border_width = box_widget.border_width, .radius = box_widget.radius, .min_width = box_widget.min_width, .min_height = box_widget.min_height, .horizontal_align = box_widget.horizontal_align, .vertical_align = box_widget.vertical_align } },
+        .filled_button => |button_widget| blk: {
             const key = if (button_widget.key) |value| try allocator.dupe(u8, value) else null;
             errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, button_widget.id);
-            break :blk .{ .button = .{
+            break :blk .{ .filled_button = .{
                 .key = key,
                 .id = id,
                 .handler = button_widget.handler,
@@ -2277,12 +2312,12 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .activation = button_widget.activation,
             } };
         },
-        .clickable => |clickable_widget| blk: {
+        .gesture_detector => |clickable_widget| blk: {
             const key = if (clickable_widget.key) |value| try allocator.dupe(u8, value) else null;
             errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, clickable_widget.id);
             errdefer allocator.free(id);
-            break :blk .{ .clickable = .{
+            break :blk .{ .gesture_detector = .{
                 .key = key,
                 .id = id,
                 .handler = clickable_widget.handler,
@@ -2312,13 +2347,13 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const id = try allocator.dupe(u8, focus_scope_widget.id);
             break :blk .{ .focus_scope = .{ .key = key, .id = id, .child = focus_scope_widget.child, .modal = focus_scope_widget.modal } };
         },
-        .scroll => |scroll_widget| blk: {
+        .single_child_scroll_view => |scroll_widget| blk: {
             const key = if (scroll_widget.key) |value| try allocator.dupe(u8, value) else null;
             errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, scroll_widget.id);
-            break :blk .{ .scroll = .{ .key = key, .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
+            break :blk .{ .single_child_scroll_view = .{ .key = key, .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
         },
-        .text_input => |input_widget| blk: {
+        .text_field => |input_widget| blk: {
             const key = if (input_widget.key) |value| try allocator.dupe(u8, value) else null;
             errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, input_widget.id);
@@ -2329,7 +2364,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer allocator.free(value);
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             errdefer allocator.free(placeholder);
-            break :blk .{ .text_input = .{
+            break :blk .{ .text_field = .{
                 .key = key,
                 .id = id,
                 .focus_node = .named(focus_node_id),
@@ -2370,12 +2405,12 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             allocator.free(text_widget.value);
         },
         .spacer => |spacer_widget| if (spacer_widget.key) |key| allocator.free(key),
-        .sized => |sized_widget| if (sized_widget.key) |key| allocator.free(key),
-        .button => |button_widget| {
+        .sized_box => |sized_widget| if (sized_widget.key) |key| allocator.free(key),
+        .filled_button => |button_widget| {
             if (button_widget.key) |key| allocator.free(key);
             allocator.free(button_widget.id);
         },
-        .clickable => |clickable_widget| {
+        .gesture_detector => |clickable_widget| {
             if (clickable_widget.key) |key| allocator.free(key);
             allocator.free(clickable_widget.id);
         },
@@ -2387,11 +2422,11 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (focus_scope_widget.key) |key| allocator.free(key);
             allocator.free(focus_scope_widget.id);
         },
-        .scroll => |scroll_widget| {
+        .single_child_scroll_view => |scroll_widget| {
             if (scroll_widget.key) |key| allocator.free(key);
             allocator.free(scroll_widget.id);
         },
-        .text_input => |input_widget| {
+        .text_field => |input_widget| {
             if (input_widget.key) |key| allocator.free(key);
             allocator.free(input_widget.id);
             allocator.free(input_widget.focus_node.id);
@@ -2406,7 +2441,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (icon_widget.key) |key| allocator.free(key);
             allocator.free(icon_widget.name);
         },
-        .box => |box_widget| if (box_widget.key) |key| allocator.free(key),
+        .container => |box_widget| if (box_widget.key) |key| allocator.free(key),
         .row => |row_widget| if (row_widget.key) |key| allocator.free(key),
         .column => |column_widget| if (column_widget.key) |key| allocator.free(key),
         .padding => |padding_widget| if (padding_widget.key) |key| allocator.free(key),
@@ -2439,7 +2474,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
             const render_object = node.render_object orelse return error.MissingRenderObject;
             try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .display_list = display_list });
         },
-        .box => {
+        .container => {
             if (node.box_radius > 0) {
                 try paintRoundedBox(allocator, display_list, node.rect, node.background, node.box_border, node.box_border_width, node.box_radius, scale);
             } else {
@@ -2447,7 +2482,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
                 if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border, node.box_border_width);
             }
         },
-        .text_input => {
+        .text_field => {
             const border = if (node.focused) node.focused_border else node.border;
             if (node.box_radius > 0) {
                 try paintRoundedBox(allocator, display_list, node.rect, node.background, border, 1, node.box_radius, scale);
@@ -2478,7 +2513,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
-        .scroll => try display_list.pushClip(allocator, node.rect),
+        .single_child_scroll_view => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
 
@@ -2493,7 +2528,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
 }
 
 fn isViewportKind(kind: RenderNode.Kind) bool {
-    return kind == .scroll;
+    return kind == .single_child_scroll_view;
 }
 
 const scrollbar_thickness: f32 = 4;
@@ -2737,8 +2772,8 @@ pub const FocusTarget = struct {
     focus_change_handler: ?HandlerRef = null,
 
     pub const Kind = enum {
-        text_input,
-        clickable,
+        text_field,
+        gesture_detector,
         focus,
     };
 };
@@ -2760,7 +2795,7 @@ fn appendFocusTargets(
     const active_scope_id = node.focus_scope_id orelse scope_id;
     const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
-        .text_input => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus }),
+        .text_field => if (node.focus_id) |id| try targets.append(allocator, .{ .id = id, .kind = .text_field, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus }),
         .focus => if (node.focus_id) |id| try targets.append(allocator, .{
             .id = id,
             .kind = .focus,
@@ -2771,8 +2806,8 @@ fn appendFocusTargets(
             .can_request_focus = node.can_request_focus,
             .focus_change_handler = node.focus_change_handler,
         }),
-        .clickable => if (node.handler) |handler| {
-            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id });
+        .gesture_detector => if (node.handler) |handler| {
+            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .gesture_detector, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id });
         },
         else => {},
     }
@@ -2789,8 +2824,8 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
     const active_scope_id = node.focus_scope_id orelse scope_id;
     const active_modal_scope_id = if (node.modal_focus_scope) node.focus_scope_id else modal_scope_id;
     switch (node.kind) {
-        .text_input => if (node.focus_id) |focus_id| {
-            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_input, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus };
+        .text_field => if (node.focus_id) |focus_id| {
+            if (std.mem.eql(u8, focus_id, id)) return .{ .id = focus_id, .kind = .text_field, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id, .autofocus = node.autofocus };
         },
         .focus => if (node.focus_id) |focus_id| {
             if (std.mem.eql(u8, focus_id, id)) return .{
@@ -2804,9 +2839,9 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
                 .focus_change_handler = node.focus_change_handler,
             };
         },
-        .clickable => if (node.handler) |handler| {
+        .gesture_detector => if (node.handler) |handler| {
             if (node.clickable_id) |clickable_id| {
-                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
+                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .gesture_detector, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
             }
         },
         else => {},
@@ -2825,7 +2860,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
         if (hitTestClick(node.children[index], point)) |hit| return hit;
     }
 
-    if (node.kind == .clickable and node.rect.contains(point)) {
+    if (node.kind == .gesture_detector and node.rect.contains(point)) {
         if (!nodeHasHandler(node)) return null;
         return .{
             .id = node.clickable_id orelse return null,
@@ -2837,7 +2872,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
 }
 
 pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
-    if (node.kind == .clickable) {
+    if (node.kind == .gesture_detector) {
         if (node.clickable_id) |clickable_id| {
             if (std.mem.eql(u8, clickable_id, id) and nodeHasHandler(node)) return .{
                 .id = clickable_id,
@@ -2864,7 +2899,7 @@ pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
         if (hitTestTextInput(node.children[index], point)) |id| return id;
     }
 
-    if (node.kind == .text_input and node.rect.contains(point)) {
+    if (node.kind == .text_field and node.rect.contains(point)) {
         return node.focus_id;
     }
     return null;
@@ -2898,8 +2933,8 @@ pub fn collectRevealAdjustments(
     out: *std.ArrayList(RevealAdjustment),
 ) !?Rect {
     const is_target = switch (node.kind) {
-        .text_input, .focus => node.focus_id != null and std.mem.eql(u8, node.focus_id.?, id),
-        .clickable => node.clickable_id != null and std.mem.eql(u8, node.clickable_id.?, id),
+        .text_field, .focus => node.focus_id != null and std.mem.eql(u8, node.focus_id.?, id),
+        .gesture_detector => node.clickable_id != null and std.mem.eql(u8, node.clickable_id.?, id),
         else => false,
     };
     if (is_target) return node.rect;
@@ -2998,10 +3033,10 @@ fn findFocusedShortcutHandlerScoped(element: *const Element, focused_id: []const
 
 fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
     return switch (element.widget) {
-        .button => |button_widget| button_widget.handler != null and std.mem.eql(u8, button_widget.id, focused_id),
-        .clickable => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
+        .filled_button => |button_widget| button_widget.handler != null and std.mem.eql(u8, button_widget.id, focused_id),
+        .gesture_detector => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
         .focus => |focus_widget| std.mem.eql(u8, focus_widget.node.id, focused_id),
-        .text_input => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),
+        .text_field => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),
         else => false,
     };
 }
@@ -3027,7 +3062,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     // geometry and must not inflate the damage to their full bounds.
     const rect_changed = !std.meta.eql(node.rect, value.rect);
     const paints = switch (value.kind) {
-        .box, .text, .text_input, .image, .icon => true,
+        .container, .text, .text_field, .image, .icon => true,
         else => false,
     };
     var damage = node.damage;
@@ -3157,7 +3192,7 @@ fn layoutElementInto(
                 .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
             });
         },
-        .sized => |sized_widget| {
+        .sized_box => |sized_widget| {
             const child_constraints = constrainSized(constraints, sized_widget);
             const child = try layoutElement(allocator, &element.children[0], child_constraints, origin, measurer);
             const width = @min(constraints.max_width, @max(sized_widget.min_width, sized_widget.width orelse child.rect.width));
@@ -3166,11 +3201,11 @@ fn layoutElementInto(
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
-                .kind = .sized,
+                .kind = .sized_box,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
             });
         },
-        .box => |box_widget| {
+        .container => |box_widget| {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const width = @min(constraints.max_width, @max(box_widget.min_width, child.rect.width));
             const height = @min(constraints.max_height, @max(box_widget.min_height, child.rect.height));
@@ -3182,7 +3217,7 @@ fn layoutElementInto(
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
-                .kind = .box,
+                .kind = .container,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
                 .background = box_widget.background,
                 .box_border = box_widget.border,
@@ -3190,24 +3225,24 @@ fn layoutElementInto(
                 .box_radius = box_widget.radius,
             });
         },
-        .button => |button_widget| {
+        .filled_button => |button_widget| {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
-                .kind = .clickable,
+                .kind = .gesture_detector,
                 .rect = child.rect,
                 .clickable_id = button_widget.id,
                 .handler = if (button_widget.handler) |handler| .{ .document = element.document_id, .handler = handler } else null,
                 .click_activation = button_widget.activation,
             });
         },
-        .clickable => |clickable_widget| {
+        .gesture_detector => |clickable_widget| {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
-                .kind = .clickable,
+                .kind = .gesture_detector,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .clickable_id = clickable_widget.id,
                 .handler = .{ .document = element.document_id, .handler = clickable_widget.handler },
@@ -3240,7 +3275,7 @@ fn layoutElementInto(
                 .modal_focus_scope = focus_scope_widget.modal,
             });
         },
-        .scroll => |scroll_widget| {
+        .single_child_scroll_view => |scroll_widget| {
             const state = scrollState(element);
             const child = try layoutElement(allocator, &element.children[0], scrollChildConstraints(constraints, scroll_widget.axes), .{
                 .x = origin.x - state.offset_x,
@@ -3254,14 +3289,14 @@ fn layoutElementInto(
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
             commitRenderNode(node, .{
-                .kind = .scroll,
+                .kind = .single_child_scroll_view,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
                 .scroll_id = scroll_widget.id,
                 .scroll_content = child.rect.size(),
                 .scroll_offset = .{ .x = state.offset_x, .y = state.offset_y },
             });
         },
-        .text_input => |input_widget| {
+        .text_field => |input_widget| {
             const value = textInputState(element).text.items;
             const text_value = if (value.len > 0) value else input_widget.placeholder;
             const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
@@ -3275,7 +3310,7 @@ fn layoutElementInto(
             const size_value = constraints.clamp(requested);
             _ = try ensureChildSlice(allocator, node, 0);
             commitRenderNode(node, .{
-                .kind = .text_input,
+                .kind = .text_field,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = textInputState(element).text.items,
                 .text_input_id = input_widget.id,
@@ -3557,7 +3592,7 @@ fn layoutLinearElements(
     });
 }
 
-fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constraints {
+fn constrainSized(parent: Constraints, sized_widget: Widget.SizedBox) Constraints {
     const max_width = sized_widget.width orelse sized_widget.max_width orelse parent.max_width;
     const max_height = sized_widget.height orelse sized_widget.max_height orelse parent.max_height;
     return .{
@@ -3608,8 +3643,8 @@ test "widgets.text creates unkeyed text widget" {
 test "keyed reconciliation preserves element state across reorder" {
     const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
     const first_children = [_]Widget{
-        .{ .text_input = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "alpha", .placeholder = "" } },
-        .{ .text_input = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "beta", .placeholder = "" } },
+        .{ .text_field = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "alpha", .placeholder = "" } },
+        .{ .text_field = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "beta", .placeholder = "" } },
     };
     const first: Widget = .{ .row = .{ .children = &first_children } };
     var element = try buildElementTree(std.testing.allocator, &first, constraints);
@@ -3620,8 +3655,8 @@ test "keyed reconciliation preserves element state across reorder" {
     try a_state.text.appendSlice(std.testing.allocator, "edited");
 
     const second_children = [_]Widget{
-        .{ .text_input = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "new beta", .placeholder = "" } },
-        .{ .text_input = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "new alpha", .placeholder = "" } },
+        .{ .text_field = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "new beta", .placeholder = "" } },
+        .{ .text_field = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "new alpha", .placeholder = "" } },
     };
     const second: Widget = .{ .row = .{ .children = &second_children } };
     try updateElementTree(std.testing.allocator, &element, &second, constraints);
@@ -3636,11 +3671,11 @@ test "clickable box paints base and hover backgrounds" {
         .insets = .{ .left = 12, .top = 8, .right = 12, .bottom = 8 },
         .child = &label,
     } };
-    const surface: Widget = .{ .box = .{
+    const surface: Widget = .{ .container = .{
         .child = &padded,
         .background = colors.slate3,
     } };
-    const clickable: Widget = .{ .clickable = .{
+    const clickable: Widget = .{ .gesture_detector = .{
         .id = "increment",
         .handler = 1,
         .child = &surface,
@@ -3671,7 +3706,7 @@ test "clickable box paints base and hover backgrounds" {
 
 test "semantic button resolves light dark and hover theme colors" {
     const label: Widget = .{ .text = .{ .value = "Increment", .role = .label } };
-    const button: Widget = .{ .button = .{
+    const button: Widget = .{ .filled_button = .{
         .id = "increment",
         .handler = 1,
         .child = &label,
@@ -3681,23 +3716,23 @@ test "semantic button resolves light dark and hover theme colors" {
     var element = try buildElementTreeScoped(std.testing.allocator, &scope, &button, constraints);
     defer destroyElementTree(std.testing.allocator, &element);
 
-    try std.testing.expectEqual(ColorScheme.light.primary, element.children[0].widget.box.background);
+    try std.testing.expectEqual(ColorScheme.light.primary, element.children[0].widget.container.background);
     try std.testing.expectEqual(ColorScheme.light.on_primary, element.children[0].children[0].children[0].children[0].widget.text.color.?);
 
     scope.interaction.hovered_id = "increment";
     _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"increment"});
-    try std.testing.expectEqual(ColorScheme.light.primary_hover, element.children[0].widget.box.background);
+    try std.testing.expectEqual(ColorScheme.light.primary_container, element.children[0].widget.container.background);
 
     scope.theme = .dark;
     scope.interaction.hovered_id = null;
     try updateElementTreeScoped(std.testing.allocator, &scope, &element, &button, constraints);
-    try std.testing.expectEqual(ColorScheme.dark.primary, element.children[0].widget.box.background);
+    try std.testing.expectEqual(ColorScheme.dark.primary, element.children[0].widget.container.background);
     try std.testing.expectEqual(ColorScheme.dark.on_primary, element.children[0].children[0].children[0].children[0].widget.text.color.?);
 }
 
 test "semantic button restores hover pressed focus disabled and keyboard behavior" {
     const label: Widget = .{ .text = .{ .value = "Action", .role = .label } };
-    const enabled_button: Widget = .{ .button = .{
+    const enabled_button: Widget = .{ .filled_button = .{
         .id = "action",
         .handler = 7,
         .child = &label,
@@ -3720,21 +3755,21 @@ test "semantic button restores hover pressed focus disabled and keyboard behavio
     var element = try buildElementTreeScoped(std.testing.allocator, &scope, &enabled_button, constraints);
     defer destroyElementTree(std.testing.allocator, &element);
 
-    try std.testing.expectEqual(colors.blue9, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.blue9, element.children[0].widget.container.background);
     try std.testing.expectEqual(colors.white, element.children[0].children[0].children[0].children[0].widget.text.color.?);
 
     scope.interaction.hovered_id = "action";
     _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"action"});
-    try std.testing.expectEqual(colors.black, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.black, element.children[0].widget.container.background);
     try std.testing.expectEqual(colors.slate2, element.children[0].children[0].children[0].children[0].widget.text.color.?);
 
     scope.interaction.pressed_id = "action";
     _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"action"});
-    try std.testing.expectEqual(colors.red9, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.red9, element.children[0].widget.container.background);
 
     scope.interaction.focused_id = "action";
     try updateElementTreeScoped(std.testing.allocator, &scope, &element, &enabled_button, constraints);
-    try std.testing.expectEqual(colors.slate12, element.children[0].widget.box.border.?);
+    try std.testing.expectEqual(colors.slate12, element.children[0].widget.container.border.?);
 
     var root = try layoutElement(std.testing.allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expect(hitTestClick(root, .{ .x = 1, .y = 1 }) != null);
@@ -3743,14 +3778,14 @@ test "semantic button restores hover pressed focus disabled and keyboard behavio
     try std.testing.expectEqual(@as(usize, 1), enabled_targets.len);
     try std.testing.expectEqualStrings("action", enabled_targets[0].id);
 
-    const disabled_button: Widget = .{ .button = .{
+    const disabled_button: Widget = .{ .filled_button = .{
         .id = "action",
         .child = &label,
     } };
     try updateElementTreeScoped(std.testing.allocator, &scope, &element, &disabled_button, constraints);
-    try std.testing.expectEqual(colors.slate7, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.slate7, element.children[0].widget.container.background);
     try std.testing.expectEqual(colors.slate11, element.children[0].children[0].children[0].children[0].widget.text.color.?);
-    try std.testing.expectEqual(@as(?Color, null), element.children[0].widget.box.border);
+    try std.testing.expectEqual(@as(?Color, null), element.children[0].widget.container.border);
 
     root = try layoutElement(std.testing.allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expect(hitTestClick(root, .{ .x = 1, .y = 1 }) == null);

@@ -776,7 +776,7 @@ test "headless click emits handler event tagged with submitted document" {
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const label = ui.text("click");
-    const document_id = try surface.submit(.{ .clickable = .{
+    const document_id = try surface.submit(.{ .gesture_detector = .{
         .id = "button",
         .handler = 42,
         .child = &label,
@@ -798,7 +798,7 @@ test "headless semantic button activates on press and from keyboard focus" {
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 40 });
     const label = ui.text("Action");
-    const document_id = try surface.submit(ui.button("action", 43, &label));
+    const document_id = try surface.submit(ui.filled_button("action", 43, &label));
     try context.dispatch();
 
     const impl = surfaceImpl(surface);
@@ -819,7 +819,7 @@ test "replacement emits document_retired and drops stale queued handler event" {
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const first_label = ui.text("first");
-    const first_id = try surface.submit(.{ .clickable = .{ .id = "first", .handler = 1, .child = &first_label } });
+    const first_id = try surface.submit(.{ .gesture_detector = .{ .id = "first", .handler = 1, .child = &first_label } });
     try context.dispatch();
 
     const impl = surfaceImpl(surface);
@@ -827,7 +827,7 @@ test "replacement emits document_retired and drops stale queued handler event" {
     try impl.runtime.?.pointerButton(.{ .x = 1, .y = 1 }, .released);
 
     const second_label = ui.text("second");
-    const second_id = try surface.submit(.{ .clickable = .{ .id = "second", .handler = 2, .child = &second_label } });
+    const second_id = try surface.submit(.{ .gesture_detector = .{ .id = "second", .handler = 2, .child = &second_label } });
     const event = context.nextEvent() orelse return error.MissingRetiredEvent;
     try std.testing.expectEqual(first_id, event.document_retired.document);
     try std.testing.expectEqual(impl.id, event.document_retired.surface);

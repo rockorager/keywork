@@ -183,7 +183,7 @@ pub const Runtime = struct {
         // repaint without any layout change (e.g. a scale change) reports
         // the full frame.
         const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
-        const background = self.frame_background orelse keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.background;
+        const background = self.frame_background orelse keywork.Theme.fromColorScheme(self.color_scheme.name()).color_scheme.surface;
         if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
         const render_scale = self.backend.scale();
         try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
@@ -366,8 +366,8 @@ pub const Runtime = struct {
             .space => {
                 const target = self.focusedTarget() orelse return;
                 switch (target.kind) {
-                    .text_input => try self.editFocusedTextInput(.{ .append = " " }),
-                    .clickable => {
+                    .text_field => try self.editFocusedTextInput(.{ .append = " " }),
+                    .gesture_detector => {
                         if (target.handler) |handler| _ = try self.activateClick(.{ .id = target.id, .handler = handler });
                         try self.invalidateState();
                     },
@@ -377,12 +377,12 @@ pub const Runtime = struct {
             .enter => {
                 const target = self.focusedTarget() orelse return;
                 switch (target.kind) {
-                    .text_input => {
+                    .text_field => {
                         self.autofocus_suppressed = true;
                         _ = try self.setFocused(null);
                         try self.invalidate();
                     },
-                    .clickable => {
+                    .gesture_detector => {
                         if (target.handler) |handler| _ = try self.activateClick(.{ .id = target.id, .handler = handler });
                         try self.invalidateState();
                     },
@@ -403,7 +403,7 @@ pub const Runtime = struct {
     /// state, emits its on_change handler, and schedules a dirty-state pass.
     /// Typing relayouts exactly one input; no rebuild.
     fn editFocusedTextInput(self: *Runtime, edit: TextEdit) !void {
-        if (!self.focusedTargetIs(.text_input)) return;
+        if (!self.focusedTargetIs(.text_field)) return;
         const focused_id = self.focused_id orelse return;
         const element_root = if (self.element_root) |*element_root| element_root else return;
         const input = keywork.dirtyTextInputElement(element_root, focused_id) orelse return;
@@ -412,7 +412,7 @@ pub const Runtime = struct {
             .append => |bytes| try state.text.appendSlice(self.allocator, bytes),
             .pop_grapheme => popLastGrapheme(&state.text),
         }
-        if (input.widget.text_input.on_change) |handler_id| {
+        if (input.widget.text_field.on_change) |handler_id| {
             try self.emitHandler(.{ .document = input.document_id, .handler = handler_id }, .{ .text = state.text.items });
         }
         try self.invalidateState();
@@ -420,7 +420,7 @@ pub const Runtime = struct {
 
     fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
         const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
-        if (self.focusedTargetIs(.text_input) and !keywork.shortcutAllowedWhileEditing(shortcut_key)) return false;
+        if (self.focusedTargetIs(.text_field) and !keywork.shortcutAllowedWhileEditing(shortcut_key)) return false;
         const element_root = if (self.element_root) |*root| root else return false;
         const handler = if (self.focused_id) |focused_id|
             keywork.findFocusedShortcutHandler(element_root, focused_id, shortcut_key) orelse keywork.findShortcutHandler(element_root, shortcut_key) orelse return false
@@ -661,7 +661,7 @@ pub const Runtime = struct {
         const element_root = if (self.element_root) |*element_root| element_root else return;
         const scroll_element = keywork.dirtyScrollElement(element_root, id) orelse return;
         switch (scroll_element.kind) {
-            .scroll => {
+            .single_child_scroll_view => {
                 const state = keywork.scrollState(scroll_element);
                 state.offset_x = @max(0, state.offset_x + dx);
                 state.offset_y = @max(0, state.offset_y + dy);

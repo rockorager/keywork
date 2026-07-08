@@ -20,6 +20,8 @@ pub const Event = context.Event;
 pub const ColorScheme = context.ColorScheme;
 
 pub const Color = core.Color;
+pub const Theme = core.Theme;
+pub const ThemeColorScheme = core.ColorScheme;
 pub const Widget = core.Widget;
 pub const HandlerId = core.HandlerId;
 pub const DocumentId = core.DocumentId;

@@ -1,8 +1,8 @@
 # Examples
 
-This directory contains only supported examples for the current libkeywork
-API. Both are built by `zig build test` and use the host-owned event-loop
-model.
+This directory contains supported examples for the current libkeywork API.
+The Zig and C examples are built by `zig build test`; all examples use the
+host-owned event-loop model.
 
 ## Zig
 
@@ -27,6 +27,21 @@ zig build run-c-example
 The Zig example explicitly uses the CPU-rendered Wayland SHM backend. The C
 example uses the automatic renderer: Vulkan when available, with Wayland SHM
 as the fallback. Both require a running Wayland session.
+
+## LuaJIT
+
+`lua/bar/main.lua` is a LuaJIT FFI binding exercise. It loads
+`bindings/lua/keywork.lua`, owns its event loop with `luv` when available and
+`poll(2)` otherwise, reads resolved theme colors from libkeywork, reads Sway
+workspace state over the i3/Sway IPC Unix socket, encodes a bar document, and
+submits it through the stable C ABI.
+
+```sh
+zig build
+KEYWORK_LIBKEYWORK=$PWD/zig-out/lib/libkeywork.so \
+LUA_PATH="$PWD/bindings/lua/?.lua;;" \
+luajit examples/lua/bar/main.lua
+```
 
 The earlier Node/N-API and embedded-Lua programs targeted the pre-rewrite API
 and are intentionally not retained as examples. A future Node binding should

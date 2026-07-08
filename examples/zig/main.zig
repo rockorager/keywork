@@ -67,7 +67,7 @@ fn submit(surface: *keywork.Surface, count: u32) !keywork.DocumentId {
     } };
     const value = keywork.ui.text(count_text);
     const button_label: keywork.Widget = .{ .text = .{ .value = "Increment", .role = .label } };
-    const button: keywork.Widget = .{ .button = .{
+    const button: keywork.Widget = .{ .filled_button = .{
         .key = "increment",
         .id = "increment",
         .handler = increment_handler,

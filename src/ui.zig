@@ -33,6 +33,34 @@ pub fn column(children: []const Widget) Widget {
     return .{ .column = .{ .children = children } };
 }
 
+pub fn container(child: *const Widget) Widget {
+    return .{ .container = .{ .child = child } };
+}
+
+pub fn filledButton(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
+    return .{ .filled_button = .{ .id = id, .handler = handler, .child = child } };
+}
+
+pub fn filled_button(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
+    return filledButton(id, handler, child);
+}
+
 pub fn button(id: []const u8, handler: ?HandlerId, child: *const Widget) Widget {
-    return .{ .button = .{ .id = id, .handler = handler, .child = child } };
+    return filledButton(id, handler, child);
+}
+
+pub fn gestureDetector(id: []const u8, handler: HandlerId, child: *const Widget) Widget {
+    return .{ .gesture_detector = .{ .id = id, .handler = handler, .child = child } };
+}
+
+pub fn sizedBox(child: *const Widget, width: ?f32, height: ?f32) Widget {
+    return .{ .sized_box = .{ .child = child, .width = width, .height = height } };
+}
+
+pub fn singleChildScrollView(id: []const u8, child: *const Widget) Widget {
+    return .{ .single_child_scroll_view = .{ .id = id, .child = child } };
+}
+
+pub fn textField(id: []const u8, value: []const u8, placeholder: []const u8) Widget {
+    return .{ .text_field = .{ .id = id, .focus_node = .named(id), .value = value, .placeholder = placeholder } };
 }

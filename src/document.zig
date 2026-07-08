@@ -64,18 +64,18 @@ fn cloneWidget(allocator: std.mem.Allocator, store: *resources_mod.Store, refs: 
     const result = try allocator.create(ui.Widget);
     result.* = switch (source.*) {
         .text => |v| .{ .text = .{ .key = try cloneOptString(allocator, v.key), .value = try cloneString(allocator, v.value), .color = v.color, .font_size = v.font_size, .role = v.role } },
-        .box => |v| .{ .box = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .background = v.background, .border = v.border, .border_width = v.border_width, .radius = v.radius, .min_width = v.min_width, .min_height = v.min_height, .horizontal_align = v.horizontal_align, .vertical_align = v.vertical_align } },
-        .button => |v| .{ .button = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .handler = v.handler, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .activation = v.activation } },
-        .clickable => |v| .{ .clickable = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .handler = v.handler, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .activation = v.activation, .hover_style = v.hover_style } },
+        .container => |v| .{ .container = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .background = v.background, .border = v.border, .border_width = v.border_width, .radius = v.radius, .min_width = v.min_width, .min_height = v.min_height, .horizontal_align = v.horizontal_align, .vertical_align = v.vertical_align } },
+        .filled_button => |v| .{ .filled_button = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .handler = v.handler, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .activation = v.activation } },
+        .gesture_detector => |v| .{ .gesture_detector = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .handler = v.handler, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .activation = v.activation, .hover_style = v.hover_style } },
         .focus => |v| .{ .focus = .{ .key = try cloneOptString(allocator, v.key), .node = .{ .id = try cloneString(allocator, v.node.id) }, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .autofocus = v.autofocus, .skip_traversal = v.skip_traversal, .can_request_focus = v.can_request_focus, .on_focus_change = v.on_focus_change } },
         .focus_scope => |v| .{ .focus_scope = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .modal = v.modal } },
-        .scroll => |v| .{ .scroll = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .axes = v.axes } },
-        .text_input => |v| .{ .text_input = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .focus_node = .{ .id = try cloneString(allocator, v.focus_node.id) }, .value = try cloneString(allocator, v.value), .placeholder = try cloneString(allocator, v.placeholder), .on_change = v.on_change, .foreground = v.foreground, .background = v.background, .border = v.border, .focused_border = v.focused_border, .placeholder_foreground = v.placeholder_foreground, .padding_x = v.padding_x, .padding_y = v.padding_y, .radius = v.radius, .autofocus = v.autofocus } },
+        .single_child_scroll_view => |v| .{ .single_child_scroll_view = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .axes = v.axes } },
+        .text_field => |v| .{ .text_field = .{ .key = try cloneOptString(allocator, v.key), .id = try cloneString(allocator, v.id), .focus_node = .{ .id = try cloneString(allocator, v.focus_node.id) }, .value = try cloneString(allocator, v.value), .placeholder = try cloneString(allocator, v.placeholder), .on_change = v.on_change, .foreground = v.foreground, .background = v.background, .border = v.border, .focused_border = v.focused_border, .placeholder_foreground = v.placeholder_foreground, .padding_x = v.padding_x, .padding_y = v.padding_y, .radius = v.radius, .autofocus = v.autofocus } },
         .row => |v| .{ .row = try cloneChildren(allocator, store, refs, v, path, depth) },
         .column => |v| .{ .column = try cloneChildren(allocator, store, refs, v, path, depth) },
         .spacer => |v| .{ .spacer = .{ .key = try cloneOptString(allocator, v.key), .flex = v.flex } },
         .flexible => |v| .{ .flexible = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .flex = v.flex, .fit = v.fit } },
-        .sized => |v| .{ .sized = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .width = v.width, .height = v.height, .min_width = v.min_width, .min_height = v.min_height, .max_width = v.max_width, .max_height = v.max_height } },
+        .sized_box => |v| .{ .sized_box = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1), .width = v.width, .height = v.height, .min_width = v.min_width, .min_height = v.min_height, .max_width = v.max_width, .max_height = v.max_height } },
         .padding => |v| .{ .padding = .{ .key = try cloneOptString(allocator, v.key), .insets = v.insets, .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1) } },
         .center => |v| .{ .center = .{ .key = try cloneOptString(allocator, v.key), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1) } },
         .shortcuts => |v| .{ .shortcuts = .{ .key = try cloneOptString(allocator, v.key), .bindings = try cloneBindings(allocator, v.bindings), .child = try cloneWidget(allocator, store, refs, v.child, path, depth + 1) } },
@@ -208,26 +208,26 @@ const WireDecoder = struct {
             1 => .{ .text = .{ .key = try cloneOptString(self.allocator, key), .value = try cloneString(self.allocator, s), .color = if (r.flags & 1 != 0) @bitCast(r.color0) else null, .font_size = if (r.flags & 2 != 0) a else null, .role = std.enums.fromInt(ui.TextRole, @as(u8, @truncate(r.extra0))) orelse return error.InvalidNodeField } },
             2 => .{ .row = try self.linear(r, key, a, depth) },
             3 => .{ .column = try self.linear(r, key, a, depth) },
-            4 => .{ .box = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .background = @bitCast(r.color0), .border = if (r.flags & 1 != 0) @bitCast(r.color1) else null, .border_width = a, .radius = b, .min_width = c, .min_height = d, .horizontal_align = try enumFromInt(ui.Alignment, r.extra0), .vertical_align = try enumFromInt(ui.Alignment, r.extra1) } },
+            4 => .{ .container = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .background = @bitCast(r.color0), .border = if (r.flags & 1 != 0) @bitCast(r.color1) else null, .border_width = a, .radius = b, .min_width = c, .min_height = d, .horizontal_align = try enumFromInt(ui.Alignment, r.extra0), .vertical_align = try enumFromInt(ui.Alignment, r.extra1) } },
             5 => .{ .padding = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .insets = .{ .left = a, .top = b, .right = c, .bottom = d } } },
             6 => .{ .spacer = .{ .key = try cloneOptString(self.allocator, key), .flex = a } },
             7 => .{ .flexible = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .flex = a, .fit = try enumFromInt(ui.FlexFit, r.extra0) } },
-            8 => .{ .clickable = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .handler = r.id0, .child = try self.onlyChild(r, depth), .activation = if (r.flags & 2 != 0) .press else .release, .hover_style = if (r.flags & 1 != 0) .{ .background = @bitCast(r.color0) } else null } },
+            8 => .{ .gesture_detector = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .handler = r.id0, .child = try self.onlyChild(r, depth), .activation = if (r.flags & 2 != 0) .press else .release, .hover_style = if (r.flags & 1 != 0) .{ .background = @bitCast(r.color0) } else null } },
             9 => .{ .center = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth) } },
-            10 => .{ .sized = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .width = if (r.flags & 1 != 0) a else null, .height = if (r.flags & 2 != 0) b else null, .min_width = c, .min_height = d, .max_width = if (r.flags & 4 != 0) @as(f32, @bitCast(r.extra0)) else null, .max_height = if (r.flags & 8 != 0) @as(f32, @bitCast(r.extra1)) else null } },
+            10 => .{ .sized_box = .{ .key = try cloneOptString(self.allocator, key), .child = try self.onlyChild(r, depth), .width = if (r.flags & 1 != 0) a else null, .height = if (r.flags & 2 != 0) b else null, .min_width = c, .min_height = d, .max_width = if (r.flags & 4 != 0) @as(f32, @bitCast(r.extra0)) else null, .max_height = if (r.flags & 8 != 0) @as(f32, @bitCast(r.extra1)) else null } },
             11 => blk: {
                 const tint: ?core.Color = if (r.flags & 4 != 0) @bitCast(r.color0) else null;
                 try retainImage(self.store, self.refs, r.id0, tint);
                 break :blk .{ .image = .{ .key = try cloneOptString(self.allocator, key), .resource = r.id0, .width = if (r.flags & 1 != 0) a else null, .height = if (r.flags & 2 != 0) b else null, .tint = tint } };
             },
             12 => .{ .icon = .{ .key = try cloneOptString(self.allocator, key), .name = try cloneString(self.allocator, s), .size = a, .color = if (r.flags & 1 != 0) @bitCast(r.color0) else null } },
-            13 => .{ .scroll = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .child = try self.onlyChild(r, depth), .axes = try enumFromInt(ui.ScrollAxes, r.extra0) } },
+            13 => .{ .single_child_scroll_view = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .child = try self.onlyChild(r, depth), .axes = try enumFromInt(ui.ScrollAxes, r.extra0) } },
             14 => .{ .focus = .{ .key = try cloneOptString(self.allocator, key), .node = .{ .id = try cloneString(self.allocator, s) }, .child = try self.onlyChild(r, depth), .on_focus_change = if (r.id0 != 0) r.id0 else null, .autofocus = r.flags & 1 != 0, .skip_traversal = r.flags & 2 != 0, .can_request_focus = r.flags & 4 != 0 } },
             15 => .{ .focus_scope = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .child = try self.onlyChild(r, depth), .modal = r.flags & 1 != 0 } },
-            16 => .{ .text_input = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .focus_node = .{ .id = try cloneString(self.allocator, s) }, .value = try cloneString(self.allocator, try self.string(r.extra0, r.extra1)), .placeholder = try cloneString(self.allocator, try self.string(r.extra2, r.extra3)), .on_change = if (r.id0 != 0) r.id0 else null, .autofocus = r.flags & 1 != 0 } },
+            16 => .{ .text_field = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .focus_node = .{ .id = try cloneString(self.allocator, s) }, .value = try cloneString(self.allocator, try self.string(r.extra0, r.extra1)), .placeholder = try cloneString(self.allocator, try self.string(r.extra2, r.extra3)), .on_change = if (r.id0 != 0) r.id0 else null, .autofocus = r.flags & 1 != 0 } },
             17 => .{ .shortcuts = .{ .key = try cloneOptString(self.allocator, key), .bindings = try self.bindingSlice(r.extra0, r.extra1), .child = try self.onlyChild(r, depth) } },
             18 => .{ .default_text_style = .{ .key = try cloneOptString(self.allocator, key), .style = .{ .color = if (r.flags & 1 != 0) @bitCast(r.color0) else null, .font_size = if (r.flags & 2 != 0) a else null }, .child = try self.onlyChild(r, depth) } },
-            19 => .{ .button = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .handler = if (r.id0 != 0) r.id0 else null, .child = try self.onlyChild(r, depth), .activation = if (r.flags & 1 != 0) .release else .press } },
+            19 => .{ .filled_button = .{ .key = try cloneOptString(self.allocator, key), .id = try cloneString(self.allocator, s), .handler = if (r.id0 != 0) r.id0 else null, .child = try self.onlyChild(r, depth), .activation = if (r.flags & 1 != 0) .release else .press } },
             else => return error.UnknownNodeTag,
         };
         try validateWidget(result.*);
@@ -358,19 +358,19 @@ fn validateWidget(w: ui.Widget) !void {
             try validString(v.value);
             if (v.font_size) |x| try positiveFinite(x);
         },
-        .box => |v| {
+        .container => |v| {
             try validOptString(v.key);
             try nonNegativeFinite(v.border_width);
             try nonNegativeFinite(v.radius);
             try nonNegativeFinite(v.min_width);
             try nonNegativeFinite(v.min_height);
         },
-        .button => |v| {
+        .filled_button => |v| {
             try validOptString(v.key);
             try validString(v.id);
             if (v.handler == 0) return error.InvalidNodeField;
         },
-        .clickable => |v| {
+        .gesture_detector => |v| {
             try validOptString(v.key);
             try validString(v.id);
             if (v.handler == 0) return error.InvalidNodeField;
@@ -384,11 +384,11 @@ fn validateWidget(w: ui.Widget) !void {
             try validOptString(v.key);
             try validString(v.id);
         },
-        .scroll => |v| {
+        .single_child_scroll_view => |v| {
             try validOptString(v.key);
             try validString(v.id);
         },
-        .text_input => |v| {
+        .text_field => |v| {
             try validOptString(v.key);
             try validString(v.id);
             try validString(v.focus_node.id);
@@ -415,7 +415,7 @@ fn validateWidget(w: ui.Widget) !void {
             try validOptString(v.key);
             try positiveFinite(v.flex);
         },
-        .sized => |v| {
+        .sized_box => |v| {
             try validOptString(v.key);
             if (v.width) |x| try nonNegativeFinite(x);
             if (v.height) |x| try nonNegativeFinite(x);
@@ -496,10 +496,10 @@ test "typed document preserves disabled semantic button" {
     var store = resources_mod.Store.init(std.testing.allocator);
     defer store.deinit();
     const label = ui.text("Disabled");
-    var document = try Document.init(std.testing.allocator, &store, ui.button("disabled", null, &label));
+    var document = try Document.init(std.testing.allocator, &store, ui.filled_button("disabled", null, &label));
     defer document.deinit();
-    try std.testing.expectEqual(@as(?ui.HandlerId, null), document.root.button.handler);
-    try std.testing.expectEqualStrings("Disabled", document.root.button.child.text.value);
+    try std.testing.expectEqual(@as(?ui.HandlerId, null), document.root.filled_button.handler);
+    try std.testing.expectEqualStrings("Disabled", document.root.filled_button.child.text.value);
 }
 
 test "typed document rejects cycles" {
@@ -593,8 +593,8 @@ test "wire decoder decodes sized max fields" {
     writeInt(u16, &bytes, wire_header_size + wire_node_size, 1);
     var doc = try Document.decode(std.testing.allocator, &store, &bytes);
     defer doc.deinit();
-    try std.testing.expectEqual(@as(f32, 10), doc.root.sized.max_width.?);
-    try std.testing.expectEqual(@as(f32, 20), doc.root.sized.max_height.?);
+    try std.testing.expectEqual(@as(f32, 10), doc.root.sized_box.max_width.?);
+    try std.testing.expectEqual(@as(f32, 20), doc.root.sized_box.max_height.?);
 }
 
 test "wire decoder rejects zero handlers" {

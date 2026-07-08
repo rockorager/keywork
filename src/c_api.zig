@@ -41,6 +41,27 @@ const CEvent = extern struct {
     height: f32,
 };
 
+const CThemeColors = extern struct {
+    struct_size: usize,
+    color_scheme: c_int,
+    primary: u32,
+    on_primary: u32,
+    primary_container: u32,
+    on_primary_container: u32,
+    surface: u32,
+    on_surface: u32,
+    on_surface_variant: u32,
+    surface_container_low: u32,
+    surface_container: u32,
+    surface_container_high: u32,
+    error_color: u32,
+    on_error: u32,
+    error_container: u32,
+    on_error_container: u32,
+    outline: u32,
+    outline_variant: u32,
+};
+
 const Status = enum(c_int) {
     ok = 0,
     invalid_argument = 1,
@@ -52,7 +73,7 @@ const Status = enum(c_int) {
 };
 
 pub export fn keywork_abi_version() callconv(.c) u32 {
-    return 2;
+    return 3;
 }
 
 pub export fn keywork_widget_version() callconv(.c) u32 {
@@ -146,6 +167,36 @@ pub export fn keywork_context_get_color_scheme(context_handle: ?*const KeyworkCo
     const context = contextFromConstHandle(context_handle orelse return status(.invalid_argument));
     const out = out_color_scheme orelse return status(.invalid_argument);
     out.* = @intFromEnum(context.colorScheme());
+    return status(.ok);
+}
+
+pub export fn keywork_context_get_theme_colors(context_handle: ?*const KeyworkContext, out_colors: ?*CThemeColors) callconv(.c) c_int {
+    const context = contextFromConstHandle(context_handle orelse return status(.invalid_argument));
+    const out = out_colors orelse return status(.invalid_argument);
+    if (out.struct_size < @sizeOf(CThemeColors)) return status(.invalid_argument);
+
+    const color_scheme = context.colorScheme();
+    const colors = keywork.Theme.fromColorScheme(color_scheme.name()).color_scheme;
+    out.* = .{
+        .struct_size = @sizeOf(CThemeColors),
+        .color_scheme = @intFromEnum(color_scheme),
+        .primary = colorInt(colors.primary),
+        .on_primary = colorInt(colors.on_primary),
+        .primary_container = colorInt(colors.primary_container),
+        .on_primary_container = colorInt(colors.on_primary_container),
+        .surface = colorInt(colors.surface),
+        .on_surface = colorInt(colors.on_surface),
+        .on_surface_variant = colorInt(colors.on_surface_variant),
+        .surface_container_low = colorInt(colors.surface_container_low),
+        .surface_container = colorInt(colors.surface_container),
+        .surface_container_high = colorInt(colors.surface_container_high),
+        .error_color = colorInt(colors.error_color),
+        .on_error = colorInt(colors.on_error),
+        .error_container = colorInt(colors.error_container),
+        .on_error_container = colorInt(colors.on_error_container),
+        .outline = colorInt(colors.outline),
+        .outline_variant = colorInt(colors.outline_variant),
+    };
     return status(.ok);
 }
 
@@ -282,6 +333,10 @@ pub export fn keywork_surface_invalidate(surface_handle: ?*KeyworkSurface) callc
 
 fn cString(value: ?[*:0]const u8, default: []const u8) []const u8 {
     return if (value) |pointer| std.mem.span(pointer) else default;
+}
+
+fn colorInt(color: keywork.Color) u32 {
+    return @bitCast(color);
 }
 
 fn status(value: Status) c_int {

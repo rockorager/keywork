@@ -21,7 +21,7 @@ theme cache; changing the theme clears that cache and invalidates all surfaces.
 The selected SVG and PNG files are decoded with pinned NanoSVG and stb source
 dependencies compiled into libkeywork, not a desktop-framework image loader.
 
-Input handlers produce semantic events. In particular, a clickable widget
+Input handlers produce semantic events. In particular, a gesture detector widget
 stores an integer handler ID, not a function pointer. Native dispatch appends
 that ID and the installed document ID to the context event queue. Only after
 dispatch returns does the binding invoke a host-language function from its own
@@ -73,14 +73,14 @@ render tree. There is no public `Node` model, callback-bearing compatibility
 tree, or second widget engine.
 
 Semantic toolkit widgets are resolved on the library side. For example, a
-button document record carries content and behavior but not a hardcoded
+filled button document record carries content and behavior but not a hardcoded
 surface palette: libkeywork derives its background, hover background,
 pressed background, focus border, disabled presentation, foreground, padding,
-and radius from the current `Theme`. A null handler marks a button disabled and
+and radius from the current `Theme`. A null handler marks a filled button disabled and
 removes it from pointer activation and keyboard focus traversal. A portal
 appearance change therefore restyles an installed document without requiring
 every host binding to select and resubmit colors. Low-level primitives such as
-box and clickable remain available when an application intentionally wants
+container and gesture detector remain available when an application intentionally wants
 explicit styling.
 
 ## Event-loop sequence

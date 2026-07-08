@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define KEYWORK_ABI_VERSION 2u
+#define KEYWORK_ABI_VERSION 3u
 #define KEYWORK_WIDGET_VERSION 0u
 
 typedef struct keywork_context keywork_context_t;
@@ -73,8 +73,8 @@ enum keywork_color_scheme {
 
 struct keywork_surface_options {
     /*
-     * Set to sizeof(struct keywork_surface_options). ABI v2 accepts larger
-     * values and ignores trailing caller storage.
+     * Set to sizeof(struct keywork_surface_options). ABI v2 and later accept
+     * larger values and ignore trailing caller storage.
      */
     size_t struct_size;
     /*
@@ -119,6 +119,31 @@ struct keywork_event {
     float height;
 };
 
+struct keywork_theme_colors {
+    /*
+     * Set to sizeof(struct keywork_theme_colors). ABI v3 accepts larger
+     * values and ignores trailing caller storage.
+     */
+    size_t struct_size;
+    int color_scheme;
+    uint32_t primary;
+    uint32_t on_primary;
+    uint32_t primary_container;
+    uint32_t on_primary_container;
+    uint32_t surface;
+    uint32_t on_surface;
+    uint32_t on_surface_variant;
+    uint32_t surface_container_low;
+    uint32_t surface_container;
+    uint32_t surface_container_high;
+    uint32_t error;
+    uint32_t on_error;
+    uint32_t error_container;
+    uint32_t on_error_container;
+    uint32_t outline;
+    uint32_t outline_variant;
+};
+
 uint32_t keywork_abi_version(void);
 uint32_t keywork_widget_version(void);
 
@@ -137,9 +162,9 @@ int keywork_context_dispatch(keywork_context_t *context);
 /*
  * Returns 1 for an event, 0 for an empty queue, or -keywork_status.
  * The caller must set out_event->struct_size = sizeof(*out_event) before
- * every call. ABI v2 requires at least that size, writes the complete v2
- * event, and ignores any trailing caller storage. Payload pointers are owned
- * by the context and valid until the next next_event call.
+ * every call. ABI v2 and later require at least that size, write the complete
+ * v2 event, and ignore any trailing caller storage. Payload pointers are
+ * owned by the context and valid until the next next_event call.
  */
 int keywork_context_next_event(
     keywork_context_t *context,
@@ -154,6 +179,12 @@ int keywork_context_next_event(
 int keywork_context_get_color_scheme(
     const keywork_context_t *context,
     int *out_color_scheme
+);
+
+/* Returns the resolved default theme colors for the context's color scheme. */
+int keywork_context_get_theme_colors(
+    const keywork_context_t *context,
+    struct keywork_theme_colors *out_colors
 );
 
 /* Changes the context's XDG icon theme, clears icon lookup misses/hits, and invalidates surfaces. */

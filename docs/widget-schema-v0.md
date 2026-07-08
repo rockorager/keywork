@@ -84,22 +84,22 @@ The `a`–`d` fields below are `f32` unless stated otherwise.
 | 1 | text | primary string=value; flag 0=`color0` present; flag 1=`a` font size present; `extra0`=text role |
 | 2 | row | child range; `a`=gap; `extra0`=cross alignment; `extra1`=main alignment |
 | 3 | column | same as row |
-| 4 | box | one child; `color0`=background; flag 0=`color1` border present; `a`=border width; `b`=radius; `c`=minimum width; `d`=minimum height; `extra0/1`=horizontal/vertical alignment |
+| 4 | container | one child; `color0`=background; flag 0=`color1` border present; `a`=border width; `b`=radius; `c`=minimum width; `d`=minimum height; `extra0/1`=horizontal/vertical alignment |
 | 5 | padding | one child; `a/b/c/d`=left/top/right/bottom |
 | 6 | spacer | no children; `a`=positive flex |
 | 7 | flexible | one child; `a`=positive flex; `extra0`=fit |
-| 8 | clickable | one child; primary string=interaction ID; `id0`=nonzero handler ID; flag 0=`color0` hover background present; flag 1=activate on press rather than release |
+| 8 | gesture detector | one child; primary string=interaction ID; `id0`=nonzero handler ID; flag 0=`color0` hover background present; flag 1=activate on press rather than release |
 | 9 | center | one child |
-| 10 | sized | one child; flags 0/1 indicate `a/b` width/height; `c/d`=minimum width/height; flags 2/3 indicate `extra0/1` maximum width/height (`f32` bits) |
+| 10 | sized box | one child; flags 0/1 indicate `a/b` width/height; `c/d`=minimum width/height; flags 2/3 indicate `extra0/1` maximum width/height (`f32` bits) |
 | 11 | image | no children; `id0`=nonzero resource ID; flags 0/1 indicate `a/b` width/height; flag 2=`color0` A8 tint present |
 | 12 | icon | no children; primary string=icon name; `a`=positive size; flag 0=`color0` tint present |
-| 13 | scroll | one child; primary string=interaction ID; `extra0`=scroll axes |
+| 13 | single child scroll view | one child; primary string=interaction ID; `extra0`=scroll axes |
 | 14 | focus | one child; primary string=focus ID; `id0`=optional focus-change handler; flags 0/1/2=autofocus/skip traversal/can request focus |
 | 15 | focus scope | one child; primary string=scope ID; flag 0=modal |
-| 16 | text input | no children; primary string=interaction and focus ID; `id0`=optional change handler; `extra0/1`=value string offset/length; `extra2/3`=placeholder string offset/length; flag 0=autofocus |
+| 16 | text field | no children; primary string=interaction and focus ID; `id0`=optional change handler; `extra0/1`=value string offset/length; `extra2/3`=placeholder string offset/length; flag 0=autofocus |
 | 17 | shortcuts | one child; `extra0/1`=first binding/binding count |
 | 18 | default text style | one child; flag 0=`color0` present; flag 1=`a` font size present |
-| 19 | button | one child; primary string=interaction ID; `id0`=handler ID, or zero for disabled; flag 0=activate on release rather than the default press; surface, hover, pressed, focused, disabled, foreground, padding, and radius states come from the active libkeywork theme |
+| 19 | filled button | one child; primary string=interaction ID; `id0`=handler ID, or zero for disabled; flag 0=activate on release rather than the default press; surface, hover, pressed, focused, disabled, foreground, padding, and radius states come from the active libkeywork theme |
 
 Enum values are:
 
@@ -107,7 +107,7 @@ Enum values are:
 - cross alignment: `0=start`, `1=center`, `2=end`, `3=stretch`
 - main alignment: `0=start`, `1=center`, `2=end`,
   `3=space-between`, `4=space-around`, `5=space-evenly`
-- box alignment: `0=start`, `1=center`, `2=end`
+- container alignment: `0=start`, `1=center`, `2=end`
 - flex fit: `0=tight`, `1=loose`
 - scroll axes: `0=vertical`, `1=horizontal`, `2=both`
 
@@ -141,9 +141,9 @@ Handler IDs are opaque nonzero `u64` values chosen by the binding and scoped
 to the submitted document. Keywork never calls a host function from dispatch.
 It emits `(surface ID, document ID, handler ID, payload)` events instead:
 
-- button, clickable, and shortcut: no payload
+- filled button, gesture detector, and shortcut: no payload
 - focus change: boolean payload
-- text input change: UTF-8 text payload
+- text field change: UTF-8 text payload
 
 A binding normally keeps a callback registry per document. Events are matched
 against both document and handler ID. Replacing a document removes its queued
