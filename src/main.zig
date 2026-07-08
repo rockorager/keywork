@@ -1,7 +1,8 @@
-//! Keywork demo application consuming libkeywork.
+//! Keywork LuaJIT application runtime.
 
 const std = @import("std");
-const keywork = @import("libkeywork");
+const keywork = @import("core.zig");
+const app_runner = @import("app_runner.zig");
 const lua_app = @import("lua_app.zig");
 
 pub const std_options: std.Options = .{
@@ -78,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         // A layer-shell surface is useless on the log backend, so
         // requesting one implies the cpu backend unless a backend was
         // chosen explicitly.
-        if (layer_shell != null) keywork.BackendKind.wayland_shm else .log;
+        if (layer_shell != null) app_runner.BackendKind.wayland_shm else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
 
@@ -86,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     defer stdout_writer.interface.flush() catch {};
 
-    try keywork.run(allocator, lua.host(), .{
+    try app_runner.run(allocator, lua.host(), .{
         .title = title,
         .app_id = window.app_id orelse "dev.keywork.Keywork",
         .width = run_options.width orelse window.width orelse 640,
@@ -104,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 /// CLI flags; null means "not passed" so script-declared window options
 /// can fill the gap.
 const SelectedRunOptions = struct {
-    backend: ?keywork.BackendKind = null,
+    backend: ?app_runner.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
     script_path: []const u8 = "main.lua",

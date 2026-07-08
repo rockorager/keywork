@@ -690,7 +690,7 @@ fn scaleColorBitmap(allocator: std.mem.Allocator, source: GlyphBitmap, factor: f
     const pixels = try allocator.alloc(u8, @as(usize, dst_width) * dst_rows * 4);
     errdefer allocator.free(pixels);
 
-    if (image_c.stbir_resize_uint8(
+    if (image_c.stbir_resize_uint8_linear(
         source.coverage.ptr,
         @intCast(source.width),
         @intCast(source.rows),
@@ -699,8 +699,8 @@ fn scaleColorBitmap(allocator: std.mem.Allocator, source: GlyphBitmap, factor: f
         @intCast(dst_width),
         @intCast(dst_rows),
         @intCast(@as(usize, dst_width) * 4),
-        4,
-    ) == 0) return error.GlyphResizeFailed;
+        image_c.STBIR_BGRA_PM,
+    ) == null) return error.GlyphResizeFailed;
 
     return .{
         .width = dst_width,

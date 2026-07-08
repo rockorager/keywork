@@ -1,5 +1,8 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
+const luajit = @import("build/luajit.zig");
+const nanosvg = @import("build/nanosvg.zig");
+const stb = @import("build/stb.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -24,11 +27,16 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_tablet_manager_v2", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
+    const nanosvg_lib = nanosvg.add(b, target, optimize);
+    const stb_lib = stb.add(b, target, optimize);
+
     const image_c = b.addTranslateC(.{
         .root_source_file = b.path("src/image_c.h"),
         .target = target,
         .optimize = optimize,
     });
+    image_c.addSystemIncludePath(nanosvg_lib.include_dir);
+    image_c.addSystemIncludePath(stb_lib.include_dir);
     const image_c_module = image_c.createModule();
 
     const vulkan_mod = b.dependency("vulkan_zig", .{
@@ -72,33 +80,7 @@ pub fn build(b: *std.Build) void {
     addPkgConfigIncludePaths(b, text_c, &.{ "fontconfig", "freetype2", "harfbuzz" });
     const text_c_module = text_c.createModule();
 
-    const libkeywork_imports: LibkeyworkImports = .{
-        .wayland = wayland_mod,
-        .image_c = image_c_module,
-        .vulkan = vulkan_mod,
-        .uucode = uucode_module,
-        .z2d = z2d_module,
-        .xkb_c = xkb_c_module,
-        .dbus_c = dbus_c_module,
-        .text_c = text_c_module,
-    };
-
-    const libkeywork_module = b.addModule("libkeywork", .{
-        .root_source_file = b.path("src/libkeywork.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addLibkeyworkImports(b, libkeywork_module, libkeywork_imports);
-    linkKeyworkSystemLibraries(libkeywork_module);
-
-    const libkeywork_static_module = b.createModule(.{
-        .root_source_file = b.path("src/libkeywork.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addLibkeyworkImports(b, libkeywork_static_module, libkeywork_imports);
+    const lua = luajit.add(b, target, optimize);
 
     const app_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -106,17 +88,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    app_module.addImport("libkeywork", libkeywork_module);
+    app_module.addImport("wayland", wayland_mod);
+    app_module.addImport("image_c", image_c_module);
+    app_module.linkLibrary(nanosvg_lib.library);
+    app_module.linkLibrary(stb_lib.library);
+    app_module.addImport("vulkan", vulkan_mod);
+    app_module.addImport("uucode", uucode_module);
+    app_module.addImport("z2d", z2d_module);
+    app_module.addImport("xkb_c", xkb_c_module);
     app_module.addImport("dbus_c", dbus_c_module);
+    app_module.addImport("text_c", text_c_module);
+    linkKeyworkSystemLibraries(app_module);
 
     const luajit_c = b.addTranslateC(.{
         .root_source_file = b.path("src/luajit_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    luajit_c.linkSystemLibrary("luajit", .{});
+    luajit_c.addIncludePath(lua.include_dir);
+    luajit_c.addIncludePath(lua.generated_include_dir);
     app_module.addImport("luajit_c", luajit_c.createModule());
-    app_module.linkSystemLibrary("luajit", .{});
+    app_module.linkLibrary(lua.library);
 
     const exe = b.addExecutable(.{
         .name = "keywork",
@@ -124,50 +116,6 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
-
-    const native_example_module = b.createModule(.{
-        .root_source_file = b.path("examples/native/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    native_example_module.addImport("libkeywork", libkeywork_module);
-    const native_example = b.addExecutable(.{
-        .name = "keywork-native-example",
-        .root_module = native_example_module,
-    });
-
-    const c_api_module = b.createModule(.{
-        .root_source_file = b.path("src/c_api.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_api_module.addImport("libkeywork", libkeywork_static_module);
-    const c_library = b.addLibrary(.{
-        .linkage = .static,
-        .name = "keywork",
-        .root_module = c_api_module,
-    });
-    c_library.installHeader(b.path("include/keywork.h"), "keywork.h");
-
-    const c_example_module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_example_module.addCSourceFile(.{ .file = b.path("examples/c/main.c") });
-    c_example_module.addIncludePath(b.path("include"));
-    c_example_module.linkLibrary(c_library);
-    linkKeyworkSystemLibraries(c_example_module);
-    const c_example = b.addExecutable(.{
-        .name = "keywork-c-example",
-        .root_module = c_example_module,
-    });
-
-    b.installArtifact(native_example);
-    b.installArtifact(c_library);
-    b.installArtifact(c_example);
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
@@ -224,72 +172,16 @@ pub fn build(b: *std.Build) void {
     const run_lua_vulkan_bar_example_step = b.step("run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example");
     run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
 
-    const run_native_example_cmd = b.addRunArtifact(native_example);
-    if (b.args) |args| {
-        run_native_example_cmd.addArgs(args);
-    }
-
-    const run_native_example_step = b.step("run-native-example", "Run the native Zig example");
-    run_native_example_step.dependOn(&run_native_example_cmd.step);
-
-    const run_c_example_cmd = b.addRunArtifact(c_example);
-
-    const run_c_example_step = b.step("run-c-example", "Run the C example");
-    run_c_example_step.dependOn(&run_c_example_cmd.step);
-
     const test_step = b.step("test", "Run unit tests");
-    const exe_tests = b.addTest(.{
-        .root_module = libkeywork_module,
-    });
-    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-
     const app_tests = b.addTest(.{
         .root_module = app_module,
     });
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
 
-    const c_api_test_module = b.createModule(.{
-        .root_source_file = b.path("src/c_api.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_api_test_module.addImport("libkeywork", libkeywork_static_module);
-    linkKeyworkSystemLibraries(c_api_test_module);
-    const c_api_tests = b.addTest(.{
-        .root_module = c_api_test_module,
-    });
-    test_step.dependOn(&b.addRunArtifact(c_api_tests).step);
-
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "include", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "build", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
-}
-
-const LibkeyworkImports = struct {
-    wayland: *std.Build.Module,
-    image_c: *std.Build.Module,
-    vulkan: *std.Build.Module,
-    uucode: *std.Build.Module,
-    z2d: *std.Build.Module,
-    xkb_c: *std.Build.Module,
-    dbus_c: *std.Build.Module,
-    text_c: *std.Build.Module,
-};
-
-fn addLibkeyworkImports(b: *std.Build, module: *std.Build.Module, imports: LibkeyworkImports) void {
-    module.addImport("wayland", imports.wayland);
-    module.addImport("image_c", imports.image_c);
-    module.addCSourceFile(.{ .file = b.path("src/image_impl.c") });
-    module.addCSourceFile(.{ .file = b.path("third_party/stb/stb_image.c") });
-    module.addCSourceFile(.{ .file = b.path("third_party/stb/stb_image_resize.c") });
-    module.addImport("vulkan", imports.vulkan);
-    module.addImport("uucode", imports.uucode);
-    module.addImport("z2d", imports.z2d);
-    module.addImport("xkb_c", imports.xkb_c);
-    module.addImport("dbus_c", imports.dbus_c);
-    module.addImport("text_c", imports.text_c);
 }
 
 fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {

@@ -1,4 +1,4 @@
-//! Shared application runner for libkeywork hosts.
+//! Process and event-loop runner for the Keywork Lua runtime.
 
 const std = @import("std");
 const keywork = @import("core.zig");

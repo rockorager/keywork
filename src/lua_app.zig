@@ -1,8 +1,14 @@
 //! LuaJIT-backed widget descriptions.
 
 const std = @import("std");
-const keywork = @import("libkeywork");
+const keywork = @import("core.zig");
+const app_runner = @import("app_runner.zig");
+const event_loop = @import("event_loop.zig");
+const icon_theme = @import("icon_theme.zig");
+const image_c = @import("image_c");
 const lua_codec = @import("lua_codec.zig");
+const runtime_mod = @import("runtime.zig");
+const svg_icon = @import("svg_icon.zig");
 const c = @import("luajit_c");
 const dbus_c = @import("dbus_c");
 
@@ -90,7 +96,7 @@ const ImageOptions = struct {
 
 const ParseContext = struct {
     icon: IconOptions = .{},
-    icon_cache: ?*keywork.icon_theme.Cache = null,
+    icon_cache: ?*icon_theme.Cache = null,
     /// Render scale used to select icon files at physical resolution.
     icon_scale: f32 = 1,
 
@@ -527,7 +533,7 @@ const LuaImage = struct {
 pub const WindowConfig = struct {
     app_id: ?[:0]u8 = null,
     title: ?[:0]u8 = null,
-    backend: ?keywork.BackendKind = null,
+    backend: ?app_runner.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
     layer_shell: ?keywork.LayerShellOptions = null,
@@ -554,9 +560,9 @@ pub const App = struct {
     timers: std.ArrayList(*LuaTimer) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
-    event_loop: ?*keywork.event_loop.EventLoop = null,
-    runtime: ?*keywork.Runtime = null,
-    icon_cache: keywork.icon_theme.Cache,
+    event_loop: ?*event_loop.EventLoop = null,
+    runtime: ?*runtime_mod.Runtime = null,
+    icon_cache: icon_theme.Cache,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
@@ -603,7 +609,7 @@ pub const App = struct {
         self.allocator.free(self.chunk_name);
     }
 
-    pub fn installEventSources(ctx: ?*anyopaque, loop: *keywork.event_loop.EventLoop, runtime: *keywork.Runtime) !void {
+    pub fn installEventSources(ctx: ?*anyopaque, loop: *event_loop.EventLoop, runtime: *runtime_mod.Runtime) !void {
         const self: *App = @ptrCast(@alignCast(ctx.?));
         self.event_loop = loop;
         self.runtime = runtime;
@@ -622,7 +628,7 @@ pub const App = struct {
     }
 
     /// Run the script if it has not executed yet (or is dirty). Called
-    /// before keywork.run so top-level keywork.window declarations can
+    /// before app_runner.run so top-level keywork.window declarations can
     /// shape the window, and again on every rebuild.
     pub fn ensureLoaded(self: *App) !void {
         if (self.script_dirty or self.script_ref < 0) try self.reloadScript();
@@ -872,7 +878,7 @@ pub const App = struct {
     }
 };
 
-fn scriptChanged(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
+fn scriptChanged(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
     std.log.scoped(.keywork_luajit).info("reload requested for {s} mask=0x{x}", .{ path, mask });
     app.script_dirty = true;
@@ -911,7 +917,7 @@ const FsEvent = struct {
     app: *App,
     path: []const u8,
     ref: c_int,
-    watch: ?*keywork.event_loop.EventLoop.FileWatch = null,
+    watch: ?*event_loop.EventLoop.FileWatch = null,
     registered: bool = false,
     canceled: bool = false,
 
@@ -941,7 +947,7 @@ const LuaTimer = struct {
     delay_ms: u64,
     interval_ms: u64,
     ref: c_int,
-    timer: ?*keywork.event_loop.EventLoop.Timer = null,
+    timer: ?*event_loop.EventLoop.Timer = null,
     registered: bool = false,
     canceled: bool = false,
 
@@ -1758,7 +1764,7 @@ fn dbusCallNotify(_: ?*dbus_c.DBusPendingCall, user_data: ?*anyopaque) callconv(
     call.destroy(call.bus.app.allocator, call.bus.app.state);
 }
 
-fn dbusBusCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+fn dbusBusCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     const bus: *DbusBus = @ptrCast(@alignCast(ctx));
     if (bus.closed) return;
     bus.dispatch();
@@ -1785,7 +1791,7 @@ fn dbusFilter(_: ?*dbus_c.DBusConnection, message: ?*dbus_c.DBusMessage, user_da
     }
 }
 
-fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u32) !void {
+fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {
     const watch: *FdWatch = @ptrCast(@alignCast(ctx));
     if (watch.canceled or watch.ref < 0) return;
     const app = watch.app;
@@ -1807,7 +1813,7 @@ fn fdWatchCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, events: u3
     }
 }
 
-fn fsEventCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []const u8, mask: u32, name: ?[]const u8) !void {
+fn fsEventCallback(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, name: ?[]const u8) !void {
     const fs_event: *FsEvent = @ptrCast(@alignCast(ctx));
     if (fs_event.canceled or fs_event.ref < 0) return;
     const app = fs_event.app;
@@ -1828,7 +1834,7 @@ fn fsEventCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, path: []co
     }
 }
 
-fn luaTimerCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, expirations: u64) !void {
+fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
     const timer: *LuaTimer = @ptrCast(@alignCast(ctx));
     if (timer.canceled or timer.ref < 0 or expirations == 0) return;
     const app = timer.app;
@@ -1844,12 +1850,12 @@ fn luaTimerCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, expiratio
     if (timer.interval_ms == 0) timer.cancel(app.state);
 }
 
-fn processPipeCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+fn processPipeCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     const pipe: *ProcessPipe = @ptrCast(@alignCast(ctx));
     try drainProcessPipe(pipe);
 }
 
-fn processExitCallback(ctx: *anyopaque, _: *keywork.event_loop.EventLoop, _: u32) !void {
+fn processExitCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     const process: *LuaProcess = @ptrCast(@alignCast(ctx));
     if (process.exited) return;
     var status: u32 = 0;
@@ -2118,7 +2124,7 @@ fn checkI32Field(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8
     return @intFromFloat(value);
 }
 
-fn backendFromName(name: []const u8) ?keywork.BackendKind {
+fn backendFromName(name: []const u8) ?app_runner.BackendKind {
     if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
     if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
     if (std.mem.eql(u8, name, "log")) return .log;
@@ -3002,7 +3008,7 @@ fn parseWidget(
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
         const path = try stringField(lua_state, table, "path");
-        return keywork.svg_icon.icon(
+        return svg_icon.icon(
             allocator,
             path,
             icon.size,
@@ -3025,17 +3031,17 @@ fn parseWidget(
             // icons neither re-walk the theme tree nor warn again.
             const icon_file = try cache.lookup(name, lookup_size) orelse return missingIconWidget(allocator, fallback_color);
             return switch (icon_file.format) {
-                .svg => keywork.svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
+                .svg => svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
                 .png => pngIconWidget(allocator, icon_file.path, icon.size),
             };
         }
-        const icon_file = try keywork.icon_theme.lookupIconSized(allocator, name, lookup_size) orelse {
+        const icon_file = try icon_theme.lookupIconSized(allocator, name, lookup_size) orelse {
             std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
             return missingIconWidget(allocator, fallback_color);
         };
         defer allocator.free(icon_file.path);
         return switch (icon_file.format) {
-            .svg => keywork.svg_icon.icon(
+            .svg => svg_icon.icon(
                 allocator,
                 icon_file.path,
                 icon.size,
@@ -3116,8 +3122,8 @@ fn pngIconWidget(allocator: std.mem.Allocator, path: []const u8, size: f32) !key
     var source_width: c_int = 0;
     var source_height: c_int = 0;
     var source_channels: c_int = 0;
-    const source_pixels = keywork.image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
-    defer keywork.image_c.stbi_image_free(source_pixels);
+    const source_pixels = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
+    defer image_c.stbi_image_free(source_pixels);
     if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
 
     // Keep the source at native resolution; paint resamples straight to
@@ -3236,7 +3242,7 @@ fn resampledPixels(
 
     const target_bytes = try allocator.alloc(u8, @as(usize, target_width) * target_height * 4);
     defer allocator.free(target_bytes);
-    if (keywork.image_c.stbir_resize_uint8(
+    if (image_c.stbir_resize_uint8_linear(
         source_bytes.ptr,
         @intCast(source_width),
         @intCast(source_height),
@@ -3245,8 +3251,8 @@ fn resampledPixels(
         @intCast(target_width),
         @intCast(target_height),
         0,
-        4,
-    ) == 0) {
+        image_c.STBIR_RGBA_NO_AW,
+    ) == null) {
         return error.ImageResizeFailed;
     }
 
@@ -4510,7 +4516,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 40 },
@@ -4571,7 +4577,7 @@ test "lua stateful widget dispose runs when removed" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 40 },
@@ -4615,7 +4621,7 @@ test "lua stateful build context includes theme" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 40 },
@@ -4680,7 +4686,7 @@ test "lua resolves theme families and component tokens" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 240, .max_height = 40 },
@@ -4720,7 +4726,7 @@ test "lua flexible and main_align lay out through the parser" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 60 },
@@ -4782,9 +4788,9 @@ test "lua loop fs_event observes file changes" {
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
     // The loop must outlive the runtime: runtime deinit disposes stateful
     // widgets whose Lua dispose callbacks cancel sources on the loop.
-    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 40 },
@@ -4800,13 +4806,13 @@ test "lua loop fs_event observes file changes" {
         app: *App,
         ticks: u32 = 0,
 
-        fn callback(ctx: *anyopaque, event_loop: *keywork.event_loop.EventLoop, _: u64) !void {
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ticks += 1;
             c.lua_getglobal(self.app.state, "fs_event_seen");
             const seen = c.lua_toboolean(self.app.state, -1) != 0;
             pop(self.app.state, 1);
-            if (seen or self.ticks > 1000) event_loop.quit();
+            if (seen or self.ticks > 1000) event_loop_instance.quit();
         }
     };
     var context: FsEventTest = .{ .app = &app };
@@ -4871,9 +4877,9 @@ test "lua loop spawn captures stdout and exit" {
     var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
     // The loop must outlive the runtime: runtime deinit disposes stateful
     // widgets whose Lua dispose callbacks cancel sources on the loop.
-    var loop = try keywork.event_loop.EventLoop.init(allocator);
+    var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var runtime = try keywork.Runtime.init(
+    var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
         .{ .max_width = 100, .max_height = 40 },
@@ -4888,13 +4894,13 @@ test "lua loop spawn captures stdout and exit" {
         app: *App,
         ticks: usize = 0,
 
-        fn callback(ctx: *anyopaque, event_loop: *keywork.event_loop.EventLoop, _: u64) !void {
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ticks += 1;
             c.lua_getglobal(self.app.state, "spawn_done");
             const done = c.lua_toboolean(self.app.state, -1) != 0;
             pop(self.app.state, 1);
-            if (done or self.ticks > 1000) event_loop.quit();
+            if (done or self.ticks > 1000) event_loop_instance.quit();
         }
     };
 
