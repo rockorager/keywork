@@ -1,140 +1,134 @@
 # Architecture
 
-## Public model
-
-A `Context` is the unit integrated into a host event loop. It owns an internal
-epoll set and exposes that epoll descriptor as one stable, readable fd. The set
-contains Wayland display fds, a wake eventfd, and toolkit-internal timerfds.
-Those subordinate descriptors are implementation details.
-
-A `Surface` belongs to one context. A host submits a complete declarative
-document to a surface. Submission is atomic from the caller's perspective:
-Keywork copies or decodes the new document before replacing the old one. The
-host may release its input buffers as soon as submission returns.
-
-Image resources and icon-theme lookup are context-owned services, not global
-runtime state. Uploaded RGBA8/A8 image data is copied into a private resource
-store and addressed by nonzero context-local IDs. Documents retain resource
-references while installed, so releasing host ownership does not invalidate an
-already submitted tree. Named icons are resolved through a per-context XDG
-theme cache; changing the theme clears that cache and invalidates all surfaces.
-The selected SVG and PNG files are decoded with pinned NanoSVG and stb source
-dependencies compiled into libkeywork, not a desktop-framework image loader.
-
-Input handlers produce semantic events. In particular, a gesture detector widget
-stores an integer handler ID, not a function pointer. Native dispatch appends
-that ID and the installed document ID to the context event queue. Only after
-dispatch returns does the binding invoke a host-language function from its own
-per-document callback registry.
-
-Toolkit-owned desktop protocols follow the same rule. A private libdbus
-connection integrates all of its watches and timeouts into the context epoll
-set. The XDG Settings portal currently supplies the system color-scheme
-preference. Changes update default themes, invalidate surfaces, and enqueue an
-`appearance_changed` event; D-Bus never invokes host callbacks directly.
-
-This keeps JS, Lua, Go, and other runtimes off the native dispatch stack and
-avoids reentrancy into host code.
-
-## Boundaries
+Keywork is a single process with three layers: a Lua application on top, the
+runtime in the middle, and the toolkit core underneath. The runtime owns the
+process event loop; the application owns state and describes UI; the toolkit
+owns everything between a widget tree and pixels.
 
 ```text
-┌──────────────────────────────────────────────────────────┐
-│ Host / binding                                           │
-│ state, callbacks, timers, sockets, application DBus, poll│
-└───────────────┬───────────────────────────▲──────────────┘
-                │ document / invalidate     │ event queue
-┌───────────────▼───────────────────────────┴──────────────┐
-│ Public Keywork API                                      │
-│ Context, Surface, typed Zig widgets, versioned C document│
+╭──────────────────────────────────────────────────────────╮
+│ Lua application                                          │
+│ state, widget tables, handler functions, tasks           │
+╰───────────────┬──────────────────────────▲───────────────╯
+                │ widget tables            │ handler calls, task resumes
+╭───────────────▼──────────────────────────┴───────────────╮
+│ Runtime (keywork binary)                                 │
+│ embedded LuaJIT, event loop, scheduler, platform API     │
 ├──────────────────────────────────────────────────────────┤
-│ Toolkit                                                 │
-│ owned document, reconciliation, layout, input, rendering│
+│ Toolkit core (Zig module)                                │
+│ widgets, reconciliation, layout, input, rendering        │
 ├──────────────────────────────────────────────────────────┤
-│ Platform                                                │
-│ epoll/timerfd/eventfd, Wayland, layer-shell, portal DBus │
-└──────────────────────────────────────────────────────────┘
+│ Platform                                                 │
+│ epoll, timerfd, pidfd, inotify, Wayland, layer-shell,    │
+│ portal D-Bus, Vulkan/SHM                                 │
+╰──────────────────────────────────────────────────────────╯
 ```
 
-## Typed and encoded submissions
+## The event loop
 
-The Zig API accepts borrowed `keywork.ui.Widget` values. Widgets use slices and
-child pointers and are pleasant to construct from native Zig. `Surface.submit`
-validates and deep-copies the whole tree.
+There is exactly one loop, owned by the runtime. It is an epoll set into
+which every subsystem registers sources: Wayland display fds, toolkit
+timers, D-Bus watches and timeouts, and the Lua platform primitives
+(timerfd timers, pidfd subprocesses, sockets, signalfd, inotify). Nothing in
+the process blocks anywhere else.
 
-The C ABI accepts Widget Schema v0 bytes. It is the stable cross-language ABI,
-not the intended application-authoring API. Official bindings should expose
-typed builders and keep their encoder private.
+The scheduler on top of the loop is frame-aware. Surface invalidation is
+coalesced: any number of state changes and handler calls within one loop
+iteration produce at most one rebuild and one submission per surface per
+frame. Timers may be coalesced toward the next Wayland frame callback, and
+idle work runs only when no frame is pending.
 
-Both paths produce the same canonical widget tree. Reconciliation retains an
-internal element tree by widget type and optional sibling key; elements own
-interaction state and retained render objects. Layout then updates a retained
-render tree. There is no public `Node` model, callback-bearing compatibility
-tree, or second widget engine.
+## Lua boundary
 
-Semantic toolkit widgets are resolved on the library side. For example, a
-filled button document record carries content and behavior but not a hardcoded
-surface palette: libkeywork derives its background, hover background,
-pressed background, focus border, disabled presentation, foreground, padding,
-and radius from the current `Theme`. A null handler marks a filled button disabled and
-removes it from pointer activation and keyboard focus traversal. A portal
-appearance change therefore restyles an installed document without requiring
-every host binding to select and resubmit colors. Low-level primitives such as
-container and gesture detector remain available when an application intentionally wants
-explicit styling.
+Lua runs only at loop iteration boundaries — never inside Wayland dispatch,
+layout, or paint. The toolkit emits semantic events (activations, focus
+changes, text edits) into a queue during dispatch; the runtime drains the
+queue afterward and calls the corresponding Lua functions. This keeps the
+VM off the native dispatch stack and makes reentrancy into mid-mutation
+toolkit state impossible.
 
-## Event-loop sequence
+Widget trees flow the other way. The application returns plain Lua tables;
+the runtime walks them once into typed `ui.Widget` values allocated in an
+arena and hands the arena to the surface. Handler slots in widget tables
+hold Lua functions; the runtime pins each with `luaL_ref` and stores the
+ref as the widget's opaque `u64` handler identity, scoped to the submitted
+document. The toolkit core never sees Lua.
 
-1. Create a context and one or more surfaces.
-2. Watch `Context.eventFd()` or `keywork_context_event_fd()` for readability.
-3. Submit a document. Submission wakes the aggregate fd when work is queued.
-4. On readability, call `dispatch`. It is non-blocking and must be called from
-   the same thread that owns the context.
-5. Drain all context events.
-6. Apply semantic events to host state and submit replacement documents.
+## Tasks
 
-Contexts and their surfaces are opaque, heap-stable handles owned by Keywork.
-They are single-thread-affine; no public operation is currently thread-safe.
+`kw.task` wraps a Lua function in a coroutine scheduled on the loop.
+Platform IO primitives are "register interest, yield, resume with result":
+a task calling `sock:recv()` suspends until the loop marks the fd readable.
+Because LuaJIT coroutines are stackful there is no function coloring — any
+function called from a task may perform IO. Task handles are awaitable
+(`task:await()`, `kw.all`, `kw.race`) and every yield point is a
+cancellation point; the loop owns cleanup of pending registrations when a
+task is cancelled.
+
+## Toolkit core
+
+The core is a Zig module with no knowledge of Lua or the loop's platform
+API.
+
+A `Context` owns Wayland protocol state, the image resource store, the XDG
+icon-theme cache, and the portal settings connection. A `Surface` belongs
+to a context and holds the installed document. Contexts register their fd
+sources into the runtime's loop; they do not own a loop of their own.
+
+Submission installs a complete widget tree. Reconciliation retains an
+element tree matched by widget type and optional sibling key; elements own
+interaction state (scroll offsets, text input state, focus) and retained
+render objects. Layout updates a retained render tree; painting produces a
+display list with damage rectangles.
+
+Semantic widgets resolve presentation in the core. A button document record
+carries content and behavior, not colors: background, hover, pressed,
+focused, and disabled presentation derive from the active `Theme`, which
+follows the desktop color-scheme preference. A portal appearance change
+restyles installed documents without application involvement. Low-level
+primitives (container, gesture detector) remain for intentional explicit
+styling.
+
+Image resources are uploaded explicitly (RGBA8/A8), copied into a
+context-owned store, and addressed by nonzero context-local IDs; documents
+retain their resources while installed. Named icons resolve through the
+per-context XDG theme cache; SVG and PNG decoding use pinned NanoSVG and
+stb sources compiled in.
 
 ## Rendering backends
 
-The default `auto` surface backend attempts Vulkan first and falls back to
-Wayland SHM when the Vulkan loader, device, presentation support, required
-extension, surface format, or swapchain usage is unavailable. The failed
-Vulkan backend fully unwinds its independent Wayland/Vulkan state before the
-SHM backend opens a new Wayland connection. Explicit `vulkan` selection does
-not fall back, which keeps failures observable in tests and diagnostics.
-
-Selection does not cross the public event-loop boundary: every Wayland
-backend registers its display fd and toolkit timers in the context's aggregate
-epoll set. Both renderers consume the same toolkit display list. Runtime GPU
-or swapchain failures after a Vulkan surface has initialized are reported to
-the host; automatic live migration of an existing surface is not supported.
+Surface creation defaults to `auto`: Vulkan when the loader, device,
+presentation support, and swapchain requirements are available, otherwise a
+fresh Wayland SHM backend. Explicit `vulkan` selection does not fall back,
+keeping failures observable. Both backends consume the same display list
+and register their fds in the same loop.
 
 ## Repository layout
 
-- `src/keywork.zig`: public Zig exports only
-- `src/context.zig`: context/surface lifecycle and host-loop boundary
-- `src/appearance.zig`: shared public desktop appearance values
-- `src/dbus_adapter.zig`: libdbus watch/timeout integration
-- `src/desktop_settings.zig`: XDG Settings portal client
-- `src/ui.zig`: public aliases and helpers for the canonical widget model
-- `src/document.zig`: widget ownership, validation, and Widget Schema decoder
-- `src/resources.zig`: context-owned explicit RGBA8/A8 resource store
-- `src/icon_theme.zig`: context-owned XDG icon-theme lookup/cache
-- `src/icon_render.zig`: NanoSVG/stb icon decoding and rasterization
-- `src/c_api.zig`: narrow C ABI adapter
-- `src/event_loop.zig`: internal aggregate epoll and timer machinery
-- `src/core.zig`: layout, element/render trees, painting, and hit testing
+- `src/keywork.zig`: toolkit core public exports
+- `src/context.zig`: context/surface lifecycle
+- `src/ui.zig`: canonical widget model helpers
+- `src/document.zig`: widget tree ownership and validation
+- `src/core.zig`: layout, element/render trees, painting, hit testing
 - `src/runtime.zig`: per-surface toolkit state and input orchestration
-- `src/wayland_shm.zig`: Wayland/layer-shell CPU rendering backend
-- `src/wayland_vulkan.zig`: Wayland/layer-shell Vulkan rendering backend
-- `src/wayland_input.zig`: seat, pointer, keyboard, and repeat handling
+- `src/event_loop.zig`: epoll and timer machinery
+- `src/appearance.zig`, `src/desktop_settings.zig`, `src/dbus_adapter.zig`:
+  desktop appearance via the XDG Settings portal over libdbus
+- `src/resources.zig`, `src/icon_theme.zig`, `src/icon_render.zig`,
+  `src/image_render.zig`: images and icons
+- `src/wayland_shm.zig`, `src/wayland_vulkan.zig`, `src/wayland_input.zig`:
+  Wayland backends and input
 - `src/text_renderer.zig`: shaping and text rasterization
-- `include/keywork.h`: installed stable C header
-- `docs/widget-schema-v0.md`: binding wire contract
-- `examples/`: complete host-owned event-loop examples
+- `examples/`: Zig substrate example; Lua examples arrive with the runtime
 
-Backend and internal toolkit modules are not public Zig API. Compatibility is
-promised at `src/keywork.zig`, `include/keywork.h`, and versioned document
-format boundaries only.
+Planned as the runtime lands: `src/runtime/` (main binary, embedded LuaJIT,
+`kw` module, loop ownership, scheduler, platform API) and vendored LuaJIT
+built by `zig build`.
+
+## Status
+
+The toolkit core above is implemented. The runtime layer — the loop
+inversion (contexts registering into a runtime-owned loop), the LuaJIT
+embed, the `kw` module, tasks, and the platform API — is the current work.
+This document describes the target design; where code and document
+disagree, the document wins and the code is being moved toward it.

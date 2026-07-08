@@ -204,12 +204,6 @@ pub const Surface = opaque {
         return surfaceImpl(self).submit(root);
     }
 
-    /// Low-level binding entry point. Official language bindings should
-    /// expose typed builders and keep this encoding detail private.
-    pub fn submitEncoded(self: *Surface, bytes: []const u8) !DocumentId {
-        return surfaceImpl(self).submitEncoded(bytes);
-    }
-
     pub fn invalidate(self: *Surface) !void {
         try surfaceImpl(self).invalidate();
     }
@@ -539,12 +533,6 @@ const SurfaceImpl = struct {
 
     fn submit(self: *SurfaceImpl, root: ui.Widget) !DocumentId {
         var next = try document_mod.Document.init(self.context.allocator, &self.context.resources, root);
-        errdefer next.deinit();
-        return self.installDocument(next);
-    }
-
-    fn submitEncoded(self: *SurfaceImpl, bytes: []const u8) !DocumentId {
-        var next = try document_mod.Document.decode(self.context.allocator, &self.context.resources, bytes);
         errdefer next.deinit();
         return self.installDocument(next);
     }

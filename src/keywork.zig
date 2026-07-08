@@ -1,11 +1,10 @@
-//! Public Zig API for libkeywork.
-//!
-//! The host owns its application state and blocking event loop. Keywork owns
-//! rendering, Wayland protocol state, input state, and its internal timers.
+//! Keywork's toolkit core: declarative widgets, layout, rendering, input,
+//! and Wayland surface management. The keywork runtime embeds this module
+//! and owns the process event loop; Lua applications sit on top of the
+//! runtime.
 
 const core = @import("core.zig");
 const context = @import("context.zig");
-const document = @import("document.zig");
 
 pub const ui = @import("ui.zig");
 
@@ -28,9 +27,6 @@ pub const DocumentId = core.DocumentId;
 pub const ResourceId = core.ResourceId;
 pub const colors = core.colors;
 pub const EdgeInsets = core.EdgeInsets;
-
-/// Current version of the low-level widget format used by bindings.
-pub const widget_wire_version = document.wire_version;
 
 test {
     _ = @import("appearance.zig");

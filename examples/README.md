@@ -1,49 +1,27 @@
 # Examples
 
-This directory contains supported examples for the current libkeywork API.
-The Zig and C examples are built by `zig build test`; all examples use the
-host-owned event-loop model.
-
 ## Zig
 
-`zig/main.zig` is the primary application-authoring example. It uses the
-typed `keywork` Zig module, submits borrowed `ui.Widget` trees, polls the
-context's aggregate fd, and handles semantic events.
+`zig/main.zig` exercises the toolkit core directly from Zig: it submits
+typed `ui.Widget` trees, polls the context, and handles semantic events. It
+is a substrate example, not the primary authoring story — Lua applications
+on the keywork runtime are.
 
 ```sh
 zig build run-zig-example
 ```
 
-## C
+The example requires a running Wayland session.
 
-`c/main.c` is the binding-author example. It uses the stable C ABI and encodes
-a Widget Schema v0 document before submission. Normal C applications are
-expected to consume a higher-level binding rather than hand-encode documents.
+## Lua
 
-```sh
-zig build run-c-example
-```
-
-The Zig example explicitly uses the CPU-rendered Wayland SHM backend. The C
-example uses the automatic renderer: Vulkan when available, with Wayland SHM
-as the fallback. Both require a running Wayland session.
-
-## LuaJIT
-
-`lua/bar/main.lua` is a LuaJIT FFI binding exercise. It loads
-`bindings/lua/keywork.lua`, owns its event loop with `luv` when available and
-`poll(2)` otherwise, reads resolved theme colors from libkeywork, reads Sway
-workspace state over the i3/Sway IPC Unix socket, encodes a bar document, and
-submits it through the stable C ABI.
+Lua examples land together with the `keywork` runtime binary. The intended
+shape:
 
 ```sh
-zig build
-KEYWORK_LIBKEYWORK=$PWD/zig-out/lib/libkeywork.so \
-LUA_PATH="$PWD/bindings/lua/?.lua;;" \
-luajit examples/lua/bar/main.lua
+keywork bar.lua
 ```
 
-The earlier Node/N-API and embedded-Lua programs targeted the pre-rewrite API
-and are intentionally not retained as examples. A future Node binding should
-live under `bindings/node/` and get its own example once it targets the stable
-document and event APIs.
+with widgets as tables, handlers as plain Lua functions, and the platform
+API (`kw.every`, `kw.task`, `kw.exec`, `kw.socket`) for everything around
+the UI.

@@ -1,102 +1,95 @@
 # Keywork
 
-Keywork is a native UI and rendering library for Wayland hosts. It is a
-library, not an application runtime: the host owns application state, timers,
-networking, child processes, application-specific D-Bus services, and the
-blocking event loop.
+Keywork is a GUI runtime for building beautiful, performant Wayland desktop
+UIs — bars, launchers, notification daemons, and full shells — scripted in
+Lua. The core is written in Zig; applications are written in Lua running on
+an embedded LuaJIT.
 
-Keywork owns:
+```lua
+local kw = require("keywork")
 
-- Wayland and layer-shell protocol state
-- layout, rendering, hit testing, focus, and hover state
-- input processing and toolkit-internal timers
-- toolkit-relevant desktop integration, including portal appearance settings
-- the currently submitted UI document
-- context-local image resources and XDG icon-theme lookup caches
-- automatic Vulkan rendering with a Wayland SHM fallback
+local state = { time = os.date("%H:%M") }
 
-The repository exposes two first-class interfaces:
+kw.every("1s", function()
+  state.time = os.date("%H:%M")
+  kw.invalidate()
+end)
 
-- a typed Zig module rooted at `src/keywork.zig`
-- a stable C ABI in `include/keywork.h`
+kw.surface({ layer = "top", anchor = { "top", "left", "right" }, height = 32 }, function()
+  return kw.row({ gap = 8 }, {
+    kw.text(state.time),
+    kw.spacer(),
+    kw.button("quit", { on_click = function() kw.quit() end }),
+  })
+end)
 
-Language bindings should build an ergonomic, typed tree in the host language,
-encode that tree once per update, and call the C ABI. Application authors do
-not need to see the wire representation.
-
-## Event-loop contract
-
-Each context exposes one stable aggregate file descriptor. A host watches it
-for readability in its native event loop and then calls non-blocking
-`dispatch`. Dispatch never calls host code; semantic events are read afterward
-from the context queue.
-
-```text
-host state changes  -> submit a complete document
-context fd readable -> dispatch
-dispatch completes  -> drain handler/configured/closed/appearance events
-handler event        -> update host state and submit again
+kw.run()
 ```
 
-There is no Keywork thread and no library-owned blocking loop.
+The runtime owns the process: the event loop, Wayland and layer-shell
+protocol state, layout, rendering, hit testing, focus, input, timers,
+subprocesses, sockets, and desktop integration. Applications describe their
+UI as plain Lua tables, attach Lua functions as handlers, and let the
+runtime schedule everything else.
 
-## Rendering backends
+## Design
 
-Surface creation defaults to `auto`. Keywork dynamically loads the Vulkan
-loader, checks for a graphics/present device and required swapchain
-capabilities, and selects its Vulkan renderer when available. If that setup
-fails, `auto` creates a fresh Wayland SHM backend instead. Hosts can explicitly
-request Vulkan or SHM for diagnostics and controlled deployments; an explicit
-Vulkan request returns the initialization error rather than falling back.
+- **Widgets are tables, handlers are functions.** Every update, the
+  application returns a complete widget tree. The toolkit reconciles it
+  against retained element and render trees, so rebuilds are cheap and
+  rendering is damage-driven.
+- **One event loop, owned by the runtime.** A single epoll loop drives
+  Wayland, D-Bus, timers, subprocesses, sockets, and file watches. The
+  scheduler is frame-aware: timers coalesce toward frame callbacks and
+  rebuilds are batched per frame.
+- **Structured concurrency in Lua.** `kw.task` starts a coroutine-backed
+  task; IO primitives yield instead of blocking, tasks are awaitable and
+  cancellable at every yield point. No callback soup, no function coloring.
+- **Lua never runs inside layout or paint.** The toolkit queues semantic
+  events during dispatch and the runtime invokes Lua handlers only at loop
+  iteration boundaries.
+- **Semantics live in the toolkit.** Themed widgets (buttons, text fields)
+  derive their presentation from the active theme, which follows the desktop
+  color-scheme preference through the XDG Settings portal. A theme change
+  restyles a running application without any Lua involvement.
+- **Automatic rendering backend.** Vulkan when available, Wayland SHM
+  otherwise. Both consume the same display list.
 
-Backend selection is internal to the surface. Both paths consume the same
-display list and preserve the same host fd/dispatch/event-queue contract.
+## Platform API
 
-## Desktop settings
+Lua applications get a small, Linux-native platform surface, all integrated
+with the one loop:
 
-Each context connects to the session bus through libdbus and observes
-`org.freedesktop.portal.Settings`. The portal color-scheme preference is
-available through `Context.colorScheme` and the C getter, automatically drives
-default widget themes, and produces an `appearance_changed` semantic event.
-The D-Bus connection, watches, and timeouts are all folded into the context's
-single aggregate fd. If the session bus or portal is unavailable, context
-creation still succeeds with `no_preference`.
+- `kw.every` / `kw.after` — timers (timerfd)
+- `kw.task` — coroutine tasks with `await`, `cancel`, `kw.all`, `kw.race`
+- `kw.exec` — subprocesses with captured output (pidfd)
+- `kw.socket` — unix sockets (compositor IPC, mpd, ...)
+- `kw.watch` — file watching (inotify)
+- signals, idle callbacks, and frame-aligned scheduling
 
-Keywork owns D-Bus protocols that directly affect toolkit behavior. Arbitrary
-application services and protocols such as StatusNotifierItem remain host
-responsibilities.
+## Zig
 
-## Images and icons
+The toolkit core is an ordinary Zig module (`src/keywork.zig`): typed
+widgets, contexts, and surfaces. The runtime is its first client; compiled
+Zig applications can use it directly. There is no C ABI and no serialized
+widget format — Lua tables are converted straight into typed widget trees
+in-process.
 
-Hosts upload explicit image data with `Context.createImageRgba8` or
-`Context.createAlphaMaskA8` (and the equivalent C ABI functions). Upload data
-is borrowed for the call and copied into a context-owned resource store; IDs are
-nonzero, context-local, and safe to release after submitted documents retain
-them. Named `ui.icon` widgets use the context icon theme, defaulting to
-`KEYWORK_ICON_THEME`, `GTK_ICON_THEME`, then `Adwaita`; `setIconTheme` clears
-icon caches and invalidates surfaces. SVG icons are rasterized by NanoSVG; PNG
-icons and image scaling use stb. Both are pinned, content-hashed GitHub source
-dependencies compiled into libkeywork. Image support does not add GLib,
-GObject, or GdkPixbuf dependencies.
+## Status
 
-See [Architecture](docs/architecture.md), [C API](include/keywork.h), and the
-[widget schema](docs/widget-schema-v0.md).
+The toolkit core (layout, rendering, input, theming, icons, images) is
+functional; see `examples/zig`. The LuaJIT runtime — the `keywork` binary,
+the `kw` module, and the platform API — is under construction. LuaJIT is
+vendored and built from source by `zig build`; the only system dependencies
+are Wayland, xkbcommon, fontconfig, freetype, harfbuzz, and dbus.
 
 ## Build
 
 ```sh
 zig build
 zig build test
-```
-
-The build installs `libkeywork.a`, `libkeywork.so`, and `keywork.h`. Zig
-consumers import the package's `keywork` module.
-
-The maintained examples are indexed in [`examples/README.md`](examples/README.md):
-
-```sh
 zig build run-zig-example
-zig build run-c-example
 ```
 
-Both examples intentionally own their polling loops and application state.
+See [Architecture](docs/architecture.md) and
+[`examples/README.md`](examples/README.md).
