@@ -1,185 +1,158 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "keywork.h"
 
-struct app_state {
-    unsigned count;
-    unsigned input_changes;
-    keywork_runtime_t *runtime;
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+enum {
+    HEADER_SIZE = 48,
+    NODE_SIZE = 80,
+    BINDING_SIZE = 16,
+    NODE_COUNT = 4,
+    CHILD_COUNT = 3,
+    BINDING_COUNT = 0,
+    HANDLER_INCREMENT = 1,
 };
 
-static void increment(void *userdata);
-static int install_event_sources(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime);
-static int tick(void *userdata, keywork_event_loop_t *loop, uint64_t expirations);
-static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints);
-static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
-static void *status_create_state(void *userdata);
-static int status_update(void *userdata, void *state, const struct keywork_build_context *context);
-static keywork_widget_t *status_build(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context);
-static void status_destroy_state(void *userdata, void *state);
-static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, const struct keywork_build_context *context);
-static void input_changed(void *userdata, const char *text, size_t len);
-static keywork_widget_t *list_item(void *userdata, keywork_build_t *build, size_t index);
-
-static keywork_widget_t *build(void *userdata, keywork_build_t *build, const struct keywork_context *context) {
-    struct app_state *state = userdata;
-    char count_label[64];
-    snprintf(count_label, sizeof(count_label), "Count from C: %u", state->count);
-
-    const struct keywork_render_object_vtable progress_vtable = {
-        .layout = progress_layout,
-        .paint = progress_paint,
-    };
-    keywork_widget_t *progress = keywork_render_object(build, &progress_vtable, state);
-    const struct keywork_stateful_vtable status_vtable = {
-        .create_state = status_create_state,
-        .update = status_update,
-        .build = status_build,
-        .destroy_state = status_destroy_state,
-    };
-    keywork_widget_t *status = keywork_stateful(build, &status_vtable, state);
-    const struct keywork_element_vtable panel_vtable = {
-        .build = panel_build,
-    };
-    keywork_widget_t *panel = keywork_element(build, &panel_vtable, state);
-
-    keywork_widget_t *button = keywork_keyed_string(build, "increment-button",
-        keywork_button(build, "increment", "Increment", increment, state));
-    char input_label[64];
-    snprintf(input_label, sizeof(input_label), "Type here (%u changes)", state->input_changes);
-    keywork_widget_t *input = keywork_text_input_on_change(build, "c-input", "", input_label, input_changed, state);
-    keywork_widget_t *items = keywork_list(build, "c-list", 1000, 24.0f, list_item, state);
-    keywork_widget_t *list = keywork_sized(build, items, -1.0f, 96.0f);
-    keywork_widget_t *status_row = keywork_text(build, context->color_scheme);
-    keywork_widget_t *children[] = {
-        keywork_colored_text(build, "C app hosted by libkeywork", 0xff0090ffu),
-        keywork_text(build, count_label),
-        panel,
-        status,
-        progress,
-        input,
-        status_row,
-        keywork_center(build, button),
-        list,
-    };
-    keywork_widget_t *column = keywork_column(build, children, sizeof(children) / sizeof(children[0]), 12.0f);
-    return keywork_padding(build, 24.0f, column);
+static void put_u16(uint8_t *out, uint16_t value) {
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
 }
 
-static void input_changed(void *userdata, const char *text, size_t len) {
-    (void)text;
-    (void)len;
-    struct app_state *state = userdata;
-    state->input_changes += 1;
+static void put_u32(uint8_t *out, uint32_t value) {
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+    out[2] = (uint8_t)(value >> 16);
+    out[3] = (uint8_t)(value >> 24);
 }
 
-static keywork_widget_t *list_item(void *userdata, keywork_build_t *build, size_t index) {
-    (void)userdata;
-    char label[64];
-    snprintf(label, sizeof(label), "virtual row %zu of 1000", index + 1);
-    return keywork_text(build, label);
+static void put_u64(uint8_t *out, uint64_t value) {
+    put_u32(out, (uint32_t)value);
+    put_u32(out + 4, (uint32_t)(value >> 32));
 }
 
-static void increment(void *userdata) {
-    struct app_state *state = userdata;
-    state->count += 1;
-    if (state->runtime != NULL) keywork_runtime_invalidate_state(state->runtime);
+static void put_f32(uint8_t *out, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    put_u32(out, bits);
 }
 
-static int install_event_sources(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime) {
-    struct app_state *state = userdata;
-    state->runtime = runtime;
-    keywork_timer_t *timer = keywork_loop_add_timer(loop, tick, state);
-    if (timer == NULL) return 0;
-    return keywork_timer_arm(timer, 1000, 1000);
-}
+static int submit_document(keywork_surface_t *surface, unsigned count, uint64_t *out_document_id) {
+    char counter[64];
+    const int counter_len = snprintf(counter, sizeof(counter), "Count from C: %u", count);
+    static const char id[] = "increment";
+    static const char button[] = "Increment";
+    const size_t strings_size = (size_t)counter_len + sizeof(id) - 1 + sizeof(button) - 1;
+    uint8_t bytes[HEADER_SIZE + NODE_COUNT * NODE_SIZE + CHILD_COUNT * 4 + 128] = {0};
+    const size_t children_offset = HEADER_SIZE + NODE_COUNT * NODE_SIZE;
+    const size_t bindings_offset = children_offset + CHILD_COUNT * 4;
+    const size_t strings_offset = bindings_offset + BINDING_COUNT * BINDING_SIZE;
+    const size_t total_size = strings_offset + strings_size;
+    size_t string_cursor = 0;
 
-static int tick(void *userdata, keywork_event_loop_t *loop, uint64_t expirations) {
-    (void)loop;
-    struct app_state *state = userdata;
-    state->count += (unsigned)expirations;
-    return keywork_runtime_invalidate_state(state->runtime);
-}
+    memcpy(bytes, "KWW0", 4);
+    put_u16(bytes + 4, KEYWORK_WIDGET_VERSION);
+    put_u16(bytes + 6, HEADER_SIZE);
+    put_u32(bytes + 8, (uint32_t)total_size);
+    put_u32(bytes + 12, 0); /* root widget */
+    put_u32(bytes + 16, NODE_COUNT);
+    put_u32(bytes + 20, CHILD_COUNT);
+    put_u32(bytes + 24, BINDING_COUNT);
+    put_u32(bytes + 28, (uint32_t)strings_size);
 
-static struct keywork_size progress_layout(void *userdata, struct keywork_constraints constraints) {
-    (void)userdata;
-    struct keywork_size size = { constraints.max_width, 12.0f };
-    if (size.width > 240.0f) size.width = 240.0f;
-    return size;
-}
+    /* Widget 0: column(widgets 1 and 2), 12px gap. */
+    put_u16(bytes + HEADER_SIZE, 3);
+    put_u32(bytes + HEADER_SIZE + 4, 0);
+    put_u32(bytes + HEADER_SIZE + 8, 2);
+    put_f32(bytes + HEADER_SIZE + 36, 12.0f);
+    put_u32(bytes + children_offset, 1);
+    put_u32(bytes + children_offset + 4, 2);
 
-static int progress_paint(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect) {
-    struct app_state *state = userdata;
-    const float fraction = (float)(state->count % 10u) / 9.0f;
-    struct keywork_rect fill = rect;
-    fill.width *= fraction;
-    return keywork_display_list_fill_rect(display_list, rect, 0xffd5efffu) &&
-        keywork_display_list_fill_rect(display_list, fill, 0xff0090ffu);
-}
+    /* Widget 1: counter text. */
+    uint8_t *widget = bytes + HEADER_SIZE + NODE_SIZE;
+    put_u16(widget, 1);
+    put_u32(widget + 20, (uint32_t)string_cursor);
+    put_u32(widget + 24, (uint32_t)counter_len);
+    memcpy(bytes + strings_offset + string_cursor, counter, (size_t)counter_len);
+    string_cursor += (size_t)counter_len;
 
-struct status_state {
-    unsigned builds;
-    unsigned updates;
-};
+    /* Widget 2: semantic button; libkeywork supplies theme-aware styling. */
+    widget += NODE_SIZE;
+    put_u16(widget, 19);
+    put_u32(widget + 4, 2); /* first child table entry */
+    put_u32(widget + 8, 1);
+    put_u32(bytes + children_offset + 8, 3);
+    put_u32(widget + 20, (uint32_t)string_cursor);
+    put_u32(widget + 24, sizeof(id) - 1);
+    put_u64(widget + 28, HANDLER_INCREMENT);
+    memcpy(bytes + strings_offset + string_cursor, id, sizeof(id) - 1);
+    string_cursor += sizeof(id) - 1;
 
-static void *status_create_state(void *userdata) {
-    (void)userdata;
-    struct status_state *state = malloc(sizeof(*state));
-    if (state == NULL) return NULL;
-    state->builds = 0;
-    state->updates = 0;
-    return state;
-}
-
-static int status_update(void *userdata, void *state, const struct keywork_build_context *context) {
-    (void)userdata;
-    (void)context;
-    struct status_state *status = state;
-    status->updates += 1;
-    return 1;
-}
-
-static keywork_widget_t *status_build(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context) {
-    struct app_state *app = userdata;
-    struct status_state *status = state;
-    (void)context;
-    status->builds += 1;
-    char label[96];
-    snprintf(label, sizeof(label), "stateful C widget: count=%u builds=%u updates=%u", app->count, status->builds, status->updates);
-    return keywork_text(build, label);
-}
-
-static void status_destroy_state(void *userdata, void *state) {
-    (void)userdata;
-    free(state);
-}
-
-static keywork_widget_t *panel_build(void *userdata, keywork_build_t *build, const struct keywork_build_context *context) {
-    struct app_state *app = userdata;
-    char label[96];
-    snprintf(label, sizeof(label), "custom C element: count=%u max-width=%.0f", app->count, context->constraints.max_width);
-    keywork_widget_t *text = keywork_colored_text(build, label, 0xffffffffu);
-    keywork_widget_t *padded = keywork_padding(build, 8.0f, text);
-    return keywork_box(build, padded, 0xff0090ffu);
+    /* Widget 3: button label. */
+    widget += NODE_SIZE;
+    put_u16(widget, 1);
+    put_u32(widget + 20, (uint32_t)string_cursor);
+    put_u32(widget + 24, sizeof(button) - 1);
+    put_u32(widget + 60, 1); /* label text role */
+    memcpy(bytes + strings_offset + string_cursor, button, sizeof(button) - 1);
+    return keywork_surface_submit(surface, bytes, total_size, out_document_id);
 }
 
 int main(void) {
-    struct app_state state = {0, 0, NULL};
-    const struct keywork_app_vtable app = {
-        .build = build,
-        .install_event_sources = install_event_sources,
+    keywork_context_t *context = NULL;
+    keywork_surface_t *surface = NULL;
+    struct keywork_surface_options options = {
+        .struct_size = sizeof(options),
+        .backend = KEYWORK_BACKEND_AUTO,
+        .title = "Keywork C example",
+        .app_id = "dev.keywork.CExample",
+        .width = 480,
+        .height = 240,
     };
-    const struct keywork_run_options options = {
-        .title = "Keywork C app example",
-        .backend = KEYWORK_BACKEND_WAYLAND_SHM,
-        .width = 480.0f,
-        .height = 320.0f,
-    };
-    const int result = keywork_run_app(&options, &app, &state);
-    if (result != 0) {
-        fprintf(stderr, "keywork_run_app failed: %d\n", result);
+    int result = keywork_context_create(&context);
+    if (result != KEYWORK_OK) return result;
+    result = keywork_surface_create(context, &options, &surface);
+    if (result != KEYWORK_OK) {
+        keywork_context_destroy(context);
+        return result;
     }
+
+    unsigned count = 0;
+    uint64_t active_document_id = 0;
+    result = submit_document(surface, count, &active_document_id);
+    struct pollfd descriptor = {
+        .fd = keywork_context_event_fd(context),
+        .events = POLLIN,
+    };
+    while (result == KEYWORK_OK && poll(&descriptor, 1, -1) >= 0) {
+        result = keywork_context_dispatch(context);
+        struct keywork_event event = {.struct_size = sizeof(event)};
+        int event_result = 0;
+        while (result == KEYWORK_OK &&
+               (event_result = keywork_context_next_event(context, &event)) > 0) {
+            if (event.kind == KEYWORK_EVENT_CLOSED) goto done;
+            if (event.kind == KEYWORK_EVENT_APPEARANCE_CHANGED) {
+                int color_scheme = KEYWORK_COLOR_SCHEME_NO_PREFERENCE;
+                if (keywork_context_get_color_scheme(context, &color_scheme) == KEYWORK_OK) {
+                    fprintf(stderr, "desktop color scheme: %d\n", color_scheme);
+                }
+            }
+            if (event.kind == KEYWORK_EVENT_DOCUMENT_RETIRED) {
+                /* Applications with per-document registries can clean them up here. */
+            }
+            if (event.kind == KEYWORK_EVENT_HANDLER &&
+                event.document_id == active_document_id &&
+                event.handler_id == HANDLER_INCREMENT) {
+                result = submit_document(surface, ++count, &active_document_id);
+            }
+            event.struct_size = sizeof(event);
+        }
+        if (event_result < 0) result = -event_result;
+    }
+
+done:
+    keywork_surface_destroy(context, surface);
+    keywork_context_destroy(context);
     return result;
 }

@@ -4,135 +4,95 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus)
 extern "C" {
 #endif
 
-enum keywork_backend {
-    KEYWORK_BACKEND_LOG = 0,
-    KEYWORK_BACKEND_WAYLAND_SHM = 1,
-    KEYWORK_BACKEND_VULKAN = 2,
+#define KEYWORK_ABI_VERSION 2u
+#define KEYWORK_WIDGET_VERSION 0u
+
+typedef struct keywork_context keywork_context_t;
+typedef struct keywork_surface keywork_surface_t;
+
+enum keywork_status {
+    KEYWORK_OK = 0,
+    KEYWORK_INVALID_ARGUMENT = 1,
+    KEYWORK_OUT_OF_MEMORY = 2,
+    KEYWORK_UNSUPPORTED = 3,
+    KEYWORK_INVALID_DOCUMENT = 4,
+    KEYWORK_SYSTEM_ERROR = 5,
+    KEYWORK_INTERNAL_ERROR = 6,
 };
 
-enum keywork_layer_shell_layer {
+enum keywork_backend {
+    KEYWORK_BACKEND_AUTO = 0,
+    KEYWORK_BACKEND_WAYLAND_SHM = 1,
+    KEYWORK_BACKEND_VULKAN = 2,
+    KEYWORK_BACKEND_HEADLESS = 3,
+};
+
+enum keywork_layer {
     KEYWORK_LAYER_BACKGROUND = 0,
     KEYWORK_LAYER_BOTTOM = 1,
     KEYWORK_LAYER_TOP = 2,
     KEYWORK_LAYER_OVERLAY = 3,
 };
 
-enum keywork_layer_shell_anchor {
-    KEYWORK_LAYER_ANCHOR_TOP = 1 << 0,
-    KEYWORK_LAYER_ANCHOR_BOTTOM = 1 << 1,
-    KEYWORK_LAYER_ANCHOR_LEFT = 1 << 2,
-    KEYWORK_LAYER_ANCHOR_RIGHT = 1 << 3,
+enum keywork_anchor {
+    KEYWORK_ANCHOR_TOP = 1u << 0,
+    KEYWORK_ANCHOR_BOTTOM = 1u << 1,
+    KEYWORK_ANCHOR_LEFT = 1u << 2,
+    KEYWORK_ANCHOR_RIGHT = 1u << 3,
 };
 
-enum keywork_layer_shell_keyboard_interactivity {
-    KEYWORK_LAYER_KEYBOARD_NONE = 0,
-    KEYWORK_LAYER_KEYBOARD_EXCLUSIVE = 1,
-    KEYWORK_LAYER_KEYBOARD_ON_DEMAND = 2,
+enum keywork_keyboard_interactivity {
+    KEYWORK_KEYBOARD_NONE = 0,
+    KEYWORK_KEYBOARD_EXCLUSIVE = 1,
+    KEYWORK_KEYBOARD_ON_DEMAND = 2,
 };
 
-typedef struct keywork_build keywork_build_t;
-typedef struct keywork_widget keywork_widget_t;
-typedef struct keywork_display_list keywork_display_list_t;
-typedef struct keywork_event_loop keywork_event_loop_t;
-typedef struct keywork_runtime keywork_runtime_t;
-typedef struct keywork_timer keywork_timer_t;
-
-enum keywork_loop_event {
-    KEYWORK_LOOP_READ = 1 << 0,
-    KEYWORK_LOOP_WRITE = 1 << 1,
-    KEYWORK_LOOP_HANGUP = 1 << 2,
-    KEYWORK_LOOP_ERROR = 1 << 3,
+enum keywork_event_kind {
+    KEYWORK_EVENT_HANDLER = 1,
+    KEYWORK_EVENT_CONFIGURED = 2,
+    KEYWORK_EVENT_CLOSED = 3,
+    KEYWORK_EVENT_APPEARANCE_CHANGED = 4,
+    KEYWORK_EVENT_DOCUMENT_RETIRED = 5,
 };
 
-struct keywork_size {
-    float width;
-    float height;
+enum keywork_event_payload_kind {
+    KEYWORK_EVENT_PAYLOAD_NONE = 0,
+    KEYWORK_EVENT_PAYLOAD_BOOL = 1,
+    KEYWORK_EVENT_PAYLOAD_TEXT = 2,
 };
 
-struct keywork_rect {
-    float x;
-    float y;
-    float width;
-    float height;
+enum keywork_color_scheme {
+    KEYWORK_COLOR_SCHEME_NO_PREFERENCE = 0,
+    KEYWORK_COLOR_SCHEME_DARK = 1,
+    KEYWORK_COLOR_SCHEME_LIGHT = 2,
 };
 
-struct keywork_constraints {
-    float max_width;
-    float max_height;
-};
-
-struct keywork_context {
-    float window_width;
-    float window_height;
-    const char *color_scheme;
-};
-
-typedef void (*keywork_click_callback_t)(void *userdata);
-typedef int (*keywork_install_event_sources_callback_t)(void *userdata, keywork_event_loop_t *loop, keywork_runtime_t *runtime);
-typedef int (*keywork_fd_callback_t)(void *userdata, keywork_event_loop_t *loop, uint32_t events);
-typedef int (*keywork_timer_callback_t)(void *userdata, keywork_event_loop_t *loop, uint64_t expirations);
-/* The text pointer is only valid for the duration of the callback. */
-typedef void (*keywork_text_change_callback_t)(void *userdata, const char *text, size_t len);
-typedef keywork_widget_t *(*keywork_item_builder_t)(void *userdata, keywork_build_t *build, size_t index);
-
-enum keywork_scroll_axes {
-    KEYWORK_SCROLL_VERTICAL = 0,
-    KEYWORK_SCROLL_HORIZONTAL = 1,
-    KEYWORK_SCROLL_BOTH = 2,
-};
-
-enum keywork_main_align {
-    KEYWORK_MAIN_ALIGN_START = 0,
-    KEYWORK_MAIN_ALIGN_CENTER = 1,
-    KEYWORK_MAIN_ALIGN_END = 2,
-    KEYWORK_MAIN_ALIGN_SPACE_BETWEEN = 3,
-    KEYWORK_MAIN_ALIGN_SPACE_AROUND = 4,
-    KEYWORK_MAIN_ALIGN_SPACE_EVENLY = 5,
-};
-
-enum keywork_cross_align {
-    KEYWORK_CROSS_ALIGN_START = 0,
-    KEYWORK_CROSS_ALIGN_CENTER = 1,
-    KEYWORK_CROSS_ALIGN_END = 2,
-    KEYWORK_CROSS_ALIGN_STRETCH = 3,
-};
-
-struct keywork_app_vtable {
-    keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_context *context);
-    keywork_install_event_sources_callback_t install_event_sources;
-};
-
-struct keywork_render_object_vtable {
-    struct keywork_size (*layout)(void *userdata, struct keywork_constraints constraints);
-    int (*paint)(void *userdata, keywork_display_list_t *display_list, struct keywork_rect rect);
-    void (*destroy)(void *userdata);
-};
-
-struct keywork_build_context {
-    struct keywork_constraints constraints;
-};
-
-struct keywork_stateful_vtable {
-    void *(*create_state)(void *userdata);
-    int (*update)(void *userdata, void *state, const struct keywork_build_context *context);
-    keywork_widget_t *(*build)(void *userdata, void *state, keywork_build_t *build, const struct keywork_build_context *context);
-    void (*destroy_state)(void *userdata, void *state);
-};
-
-struct keywork_element_vtable {
-    keywork_widget_t *(*build)(void *userdata, keywork_build_t *build, const struct keywork_build_context *context);
-    void (*destroy)(void *userdata);
-};
-
-struct keywork_run_options {
-    const char *title;
+struct keywork_surface_options {
+    /*
+     * Set to sizeof(struct keywork_surface_options). ABI v2 accepts larger
+     * values and ignores trailing caller storage.
+     */
+    size_t struct_size;
+    /*
+     * Selects rendering backend. AUTO tries Vulkan first and falls back to
+     * Wayland SHM only if Vulkan initialization/capability setup fails.
+     * Explicit VULKAN returns its error. Zero-initialized C storage selects
+     * AUTO, matching the default behavior of the Zig API.
+     */
     int backend;
-    float width;
-    float height;
+    const char *title;
+    const char *app_id;
+    uint32_t width;
+    uint32_t height;
+
+    /*
+     * Width may be zero only for a Wayland layer surface with both LEFT and
+     * RIGHT anchors. Height must be nonzero.
+     */
     int layer_shell;
     const char *layer_namespace;
     int layer;
@@ -145,65 +105,116 @@ struct keywork_run_options {
     int layer_keyboard_interactivity;
 };
 
-struct keywork_run_text_options {
-    const char *title;
-    const char *text;
-    int backend;
+struct keywork_event {
+    size_t struct_size;
+    int kind;
+    uint64_t surface_id;
+    uint64_t document_id;
+    uint64_t handler_id;
+    int payload_kind;
+    const uint8_t *payload_ptr;
+    size_t payload_len;
+    int payload_bool;
     float width;
     float height;
-    int layer_shell;
-    const char *layer_namespace;
-    int layer;
-    uint32_t layer_anchors;
-    int32_t layer_exclusive_zone;
-    int32_t layer_margin_top;
-    int32_t layer_margin_right;
-    int32_t layer_margin_bottom;
-    int32_t layer_margin_left;
-    int layer_keyboard_interactivity;
 };
 
-int keywork_run_app(const struct keywork_run_options *options, const struct keywork_app_vtable *vtable, void *userdata);
-int keywork_run_text(const struct keywork_run_text_options *options);
+uint32_t keywork_abi_version(void);
+uint32_t keywork_widget_version(void);
 
-int keywork_loop_add_fd(keywork_event_loop_t *loop, int fd, uint32_t events, keywork_fd_callback_t callback, void *userdata);
-void keywork_loop_remove_fd(keywork_event_loop_t *loop, int fd);
-keywork_timer_t *keywork_loop_add_timer(keywork_event_loop_t *loop, keywork_timer_callback_t callback, void *userdata);
-int keywork_timer_arm(keywork_timer_t *timer, uint64_t delay_ms, uint64_t interval_ms);
-void keywork_timer_disarm(keywork_timer_t *timer);
-int keywork_runtime_invalidate(keywork_runtime_t *runtime);
-int keywork_runtime_invalidate_state(keywork_runtime_t *runtime);
-void keywork_loop_quit(keywork_event_loop_t *loop);
+int keywork_context_create(keywork_context_t **out_context);
+void keywork_context_destroy(keywork_context_t *context);
 
-keywork_widget_t *keywork_text(keywork_build_t *build, const char *value);
-keywork_widget_t *keywork_colored_text(keywork_build_t *build, const char *value, uint32_t argb);
-keywork_widget_t *keywork_text_input(keywork_build_t *build, const char *id, const char *value, const char *placeholder);
-keywork_widget_t *keywork_text_input_on_change(keywork_build_t *build, const char *id, const char *value, const char *placeholder, keywork_text_change_callback_t callback, void *userdata);
-keywork_widget_t *keywork_scroll(keywork_build_t *build, const char *id, keywork_widget_t *child, enum keywork_scroll_axes axes);
-keywork_widget_t *keywork_list(keywork_build_t *build, const char *id, size_t item_count, float item_extent, keywork_item_builder_t callback, void *userdata);
-/* Pass a negative width or height to leave that axis unconstrained. */
-keywork_widget_t *keywork_sized(keywork_build_t *build, keywork_widget_t *child, float width, float height);
-keywork_widget_t *keywork_box(keywork_build_t *build, keywork_widget_t *child, uint32_t argb);
-keywork_widget_t *keywork_clickable(keywork_build_t *build, const char *id, keywork_widget_t *child, keywork_click_callback_t callback, void *userdata);
-keywork_widget_t *keywork_button(keywork_build_t *build, const char *id, const char *label, keywork_click_callback_t callback, void *userdata);
-keywork_widget_t *keywork_render_object(keywork_build_t *build, const struct keywork_render_object_vtable *vtable, void *userdata);
-int keywork_display_list_fill_rect(keywork_display_list_t *display_list, struct keywork_rect rect, uint32_t argb);
-keywork_widget_t *keywork_stateful(keywork_build_t *build, const struct keywork_stateful_vtable *vtable, void *userdata);
-keywork_widget_t *keywork_element(keywork_build_t *build, const struct keywork_element_vtable *vtable, void *userdata);
-keywork_widget_t *keywork_padding(keywork_build_t *build, float inset, keywork_widget_t *child);
-keywork_widget_t *keywork_center(keywork_build_t *build, keywork_widget_t *child);
-keywork_widget_t *keywork_keyed_string(keywork_build_t *build, const char *key, keywork_widget_t *child);
-keywork_widget_t *keywork_keyed_int(keywork_build_t *build, uint64_t key, keywork_widget_t *child);
-keywork_widget_t *keywork_column(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
-keywork_widget_t *keywork_row(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap);
-keywork_widget_t *keywork_column_aligned(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap, enum keywork_main_align main_align, enum keywork_cross_align cross_align);
-keywork_widget_t *keywork_row_aligned(keywork_build_t *build, keywork_widget_t *const *children, size_t child_count, float gap, enum keywork_main_align main_align, enum keywork_cross_align cross_align);
-/* An expanded child fills its share of the row/column main axis; a
- * flexible child may be smaller. Shares are proportional to flex. */
-keywork_widget_t *keywork_expanded(keywork_build_t *build, keywork_widget_t *child, float flex);
-keywork_widget_t *keywork_flexible(keywork_build_t *build, keywork_widget_t *child, float flex);
+/*
+ * Returns one stable epoll descriptor owned by the context. Watch it for
+ * readability. The host must not read from or close it.
+ */
+int keywork_context_event_fd(keywork_context_t *context);
 
-#ifdef __cplusplus
+/* Non-blocking. Never invokes host callbacks. */
+int keywork_context_dispatch(keywork_context_t *context);
+
+/*
+ * Returns 1 for an event, 0 for an empty queue, or -keywork_status.
+ * The caller must set out_event->struct_size = sizeof(*out_event) before
+ * every call. ABI v2 requires at least that size, writes the complete v2
+ * event, and ignores any trailing caller storage. Payload pointers are owned
+ * by the context and valid until the next next_event call.
+ */
+int keywork_context_next_event(
+    keywork_context_t *context,
+    struct keywork_event *out_event
+);
+
+/*
+ * Returns the current XDG desktop-portal color-scheme preference. An
+ * APPEARANCE_CHANGED event has surface_id zero; query this function for the
+ * latest value. Keywork also applies the preference to default widget themes.
+ */
+int keywork_context_get_color_scheme(
+    const keywork_context_t *context,
+    int *out_color_scheme
+);
+
+/* Changes the context's XDG icon theme, clears icon lookup misses/hits, and invalidates surfaces. */
+int keywork_context_set_icon_theme(keywork_context_t *context, const char *theme_name);
+
+/*
+ * Creates immutable context-local image resources. Input rows may have
+ * padding; pixels_len must cover (height - 1) * stride_bytes plus the final
+ * packed row. RGBA8 data uses straight-alpha R,G,B,A byte order. Both calls
+ * copy their input before returning.
+ */
+int keywork_context_create_image_rgba8(
+    keywork_context_t *context,
+    uint32_t width,
+    uint32_t height,
+    size_t stride_bytes,
+    const uint8_t *pixels,
+    size_t pixels_len,
+    uint64_t *out_resource_id
+);
+int keywork_context_create_alpha_mask_a8(
+    keywork_context_t *context,
+    uint32_t width,
+    uint32_t height,
+    size_t stride_bytes,
+    const uint8_t *pixels,
+    size_t pixels_len,
+    uint64_t *out_resource_id
+);
+
+/*
+ * Releases host ownership. Installed documents retain referenced resources,
+ * so an ID remains valid for those documents until they are replaced or their
+ * surfaces are destroyed. IDs are context-local and are never reused.
+ */
+void keywork_context_release_resource(keywork_context_t *context, uint64_t resource_id);
+
+int keywork_surface_create(
+    keywork_context_t *context,
+    const struct keywork_surface_options *options,
+    keywork_surface_t **out_surface
+);
+void keywork_surface_destroy(
+    keywork_context_t *context,
+    keywork_surface_t *surface
+);
+uint64_t keywork_surface_id(const keywork_surface_t *surface);
+
+/*
+ * Atomically replaces the surface document. `bytes` only need to remain
+ * valid for this call. See docs/widget-schema-v0.md for the wire format.
+ */
+int keywork_surface_submit(
+    keywork_surface_t *surface,
+    const uint8_t *bytes,
+    size_t bytes_len,
+    uint64_t *out_document_id
+);
+int keywork_surface_invalidate(keywork_surface_t *surface);
+
+#if defined(__cplusplus)
 }
 #endif
 

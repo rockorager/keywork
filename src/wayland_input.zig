@@ -174,6 +174,15 @@ pub fn uninstallEventTimers(self: *Self) void {
     self.fling_timer = null;
 }
 
+pub fn removeEventTimers(self: *Self, loop: *event_loop.EventLoop) void {
+    self.stopKeyRepeat();
+    if (self.repeat_timer) |timer| loop.removeTimer(timer);
+    self.repeat_timer = null;
+    self.stopFling();
+    if (self.fling_timer) |timer| loop.removeTimer(timer);
+    self.fling_timer = null;
+}
+
 fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Backend) void {
     return struct {
         fn callback(seat: *wl.Seat, event: wl.Seat.Event, backend: *Backend) void {

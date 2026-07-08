@@ -16,7 +16,10 @@ const zwlr = wayland.client.zwlr;
 
 const log = std.log.scoped(.keywork_wayland_vulkan);
 
-extern fn vkGetInstanceProcAddr(instance: vk.Instance, p_name: [*:0]const u8) vk.PfnVoidFunction;
+const GetInstanceProcAddr = *const fn (
+    instance: vk.Instance,
+    p_name: [*:0]const u8,
+) callconv(vk.vulkan_call_conv) vk.PfnVoidFunction;
 
 const initial_atlas_size = 1024;
 const max_atlas_size_cap = 8192;
@@ -52,7 +55,8 @@ const GpuImage = struct {
 
 const AtlasKey = union(enum) {
     glyph: Glyph,
-    image: u64,
+    alpha_image: u64,
+    color_image: u64,
     solid,
 
     const Glyph = struct {
@@ -167,6 +171,7 @@ pub const Backend = struct {
     repaint_pending: bool,
     swapchain_dirty: bool,
 
+    vulkan_loader: std.DynLib,
     vkb: vk.BaseWrapper,
     vki: vk.InstanceWrapper,
     vkd: vk.DeviceWrapper,
@@ -270,6 +275,13 @@ pub const Backend = struct {
             if (layer_options.output == .all) return error.UnsupportedLayerShellAllOutputs;
         }
 
+        var vulkan_loader = std.DynLib.open("libvulkan.so.1") catch return error.VulkanLoaderUnavailable;
+        errdefer vulkan_loader.close();
+        const get_instance_proc_addr = vulkan_loader.lookup(
+            GetInstanceProcAddr,
+            "vkGetInstanceProcAddr",
+        ) orelse return error.VulkanLoaderSymbolMissing;
+
         const display = try wl.Display.connect(null);
         errdefer display.disconnect();
 
@@ -298,7 +310,7 @@ pub const Backend = struct {
         var input = try WaylandInput.init(globals.seat, cursor_shape_manager);
         errdefer input.deinit();
 
-        const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
+        const vkb = vk.BaseWrapper.load(get_instance_proc_addr);
         const instance_extensions = [_][*:0]const u8{
             vk.extensions.khr_surface.name,
             vk.extensions.khr_wayland_surface.name,
@@ -345,6 +357,11 @@ pub const Backend = struct {
         errdefer vkd.destroyDevice(device, null);
         const queue = vkd.getDeviceQueue(device, selection.queue_family_index, 0);
         var frames: [frames_in_flight]FrameResources = @splat(.{});
+        errdefer for (&frames) |*frame| {
+            if (frame.in_flight != .null_handle) vkd.destroyFence(device, frame.in_flight, null);
+            if (frame.image_available != .null_handle) vkd.destroySemaphore(device, frame.image_available, null);
+            if (frame.command_pool != .null_handle) vkd.destroyCommandPool(device, frame.command_pool, null);
+        };
         for (&frames) |*frame| {
             frame.command_pool = try vkd.createCommandPool(device, &.{
                 .flags = .{ .reset_command_buffer_bit = true },
@@ -385,6 +402,7 @@ pub const Backend = struct {
             .scale_changed = false,
             .repaint_pending = false,
             .swapchain_dirty = false,
+            .vulkan_loader = vulkan_loader,
             .vkb = vkb,
             .vki = vki,
             .vkd = vkd,
@@ -479,6 +497,7 @@ pub const Backend = struct {
         self.compositor.destroy();
         self.registry.destroy();
         self.display.disconnect();
+        self.vulkan_loader.close();
         self.allocator.destroy(self);
     }
 
@@ -514,6 +533,10 @@ pub const Backend = struct {
         self.input.uninstallEventTimers();
     }
 
+    pub fn removeEventTimers(self: *Backend, loop: *event_loop.EventLoop) void {
+        self.input.removeEventTimers(loop);
+    }
+
     pub fn setRepaintHandler(self: *Backend, context: *anyopaque, handler: RepaintHandler) void {
         self.repaint_context = context;
         self.repaint_handler = handler;
@@ -526,6 +549,18 @@ pub const Backend = struct {
 
     pub fn eventLoopFd(self: *Backend) i32 {
         return self.display.getFd();
+    }
+
+    pub fn isConfigured(self: *const Backend) bool {
+        return self.configured;
+    }
+
+    pub fn isClosed(self: *const Backend) bool {
+        return self.closed;
+    }
+
+    pub fn size(self: *const Backend) keywork.Size {
+        return self.currentSize();
     }
 
     pub fn waitForInitialConfigure(self: *Backend) !keywork.Size {
@@ -569,10 +604,11 @@ pub const Backend = struct {
 
     fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
-        while (!self.configured and !self.closed) {
-            if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
-        }
         if (self.closed) return error.WindowClosed;
+        if (!self.configured) {
+            self.queueRepaint();
+            return false;
+        }
 
         const logical_width = try frameLogicalWidth(frame, self.width);
         const logical_height = try frameLogicalHeight(frame, self.height);
@@ -690,6 +726,7 @@ pub const Backend = struct {
         self.swapchain_extent = extent;
         self.swapchain_format = surface_format.format;
         self.render_finished_semaphores = try self.allocator.alloc(vk.Semaphore, self.swapchain_images.len);
+        @memset(self.render_finished_semaphores, .null_handle);
         for (self.render_finished_semaphores) |*semaphore| semaphore.* = try self.vkd.createSemaphore(self.device, &.{}, null);
         try self.createRenderTargets();
         try self.ensureTextResources();
@@ -699,13 +736,19 @@ pub const Backend = struct {
     }
 
     fn destroySwapchain(self: *Backend) void {
-        for (self.framebuffers) |framebuffer| self.vkd.destroyFramebuffer(self.device, framebuffer, null);
+        for (self.framebuffers) |framebuffer| {
+            if (framebuffer != .null_handle) self.vkd.destroyFramebuffer(self.device, framebuffer, null);
+        }
         if (self.framebuffers.len > 0) self.allocator.free(self.framebuffers);
         if (self.render_pass != .null_handle) self.vkd.destroyRenderPass(self.device, self.render_pass, null);
-        for (self.render_finished_semaphores) |semaphore| self.vkd.destroySemaphore(self.device, semaphore, null);
+        for (self.render_finished_semaphores) |semaphore| {
+            if (semaphore != .null_handle) self.vkd.destroySemaphore(self.device, semaphore, null);
+        }
         if (self.render_finished_semaphores.len > 0) self.allocator.free(self.render_finished_semaphores);
         self.render_finished_semaphores = &.{};
-        for (self.swapchain_image_views) |view| self.vkd.destroyImageView(self.device, view, null);
+        for (self.swapchain_image_views) |view| {
+            if (view != .null_handle) self.vkd.destroyImageView(self.device, view, null);
+        }
         if (self.swapchain_image_views.len > 0) self.allocator.free(self.swapchain_image_views);
         if (self.swapchain_images.len > 0) self.allocator.free(self.swapchain_images);
         self.framebuffers = &.{};
@@ -1297,7 +1340,7 @@ pub const Backend = struct {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
         if (image.pixels.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
 
-        const key: AtlasKey = .{ .image = image.cache_key };
+        const key: AtlasKey = .{ .color_image = image.cache_key };
         if (self.atlas_slots.get(key)) |slot| return slot;
 
         const slot = try self.allocateAtlasSlot(image.width, image.height);
@@ -1344,7 +1387,7 @@ pub const Backend = struct {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
         if (image.alpha.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
 
-        const key: AtlasKey = .{ .image = image.cache_key };
+        const key: AtlasKey = .{ .alpha_image = image.cache_key };
         if (self.atlas_slots.get(key)) |slot| return slot;
 
         const slot = try self.allocateAtlasSlot(image.width, image.height);
@@ -1556,9 +1599,9 @@ pub const Backend = struct {
         self.vkd.cmdDraw(self.command_buffer, @intCast(self.text_vertices.items.len), 1, 0, 0);
     }
 
-    fn createBuffer(self: *Backend, size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) !GpuBuffer {
+    fn createBuffer(self: *Backend, buffer_size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) !GpuBuffer {
         const buffer = try self.vkd.createBuffer(self.device, &.{
-            .size = size,
+            .size = buffer_size,
             .usage = usage,
             .sharing_mode = .exclusive,
         }, null);
@@ -1573,10 +1616,10 @@ pub const Backend = struct {
 
         try self.vkd.bindBufferMemory(self.device, buffer, memory, 0);
         const mapped = if (properties.host_visible_bit)
-            (try self.vkd.mapMemory(self.device, memory, 0, size, .{})) orelse return error.MapFailed
+            (try self.vkd.mapMemory(self.device, memory, 0, buffer_size, .{})) orelse return error.MapFailed
         else
             null;
-        return .{ .buffer = buffer, .memory = memory, .mapped = mapped, .size = size };
+        return .{ .buffer = buffer, .memory = memory, .mapped = mapped, .size = buffer_size };
     }
 
     fn destroyBuffer(self: *Backend, buffer: *GpuBuffer) void {
@@ -1823,6 +1866,26 @@ fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, i
     const devices = try vki.enumeratePhysicalDevicesAlloc(instance, allocator);
     defer allocator.free(devices);
     for (devices) |physical_device| {
+        const extensions = try vki.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, allocator);
+        defer allocator.free(extensions);
+        var supports_swapchain = false;
+        for (extensions) |extension| {
+            const name = std.mem.sliceTo(&extension.extension_name, 0);
+            if (std.mem.eql(u8, name, vk.extensions.khr_swapchain.name)) {
+                supports_swapchain = true;
+                break;
+            }
+        }
+        if (!supports_swapchain) continue;
+
+        const formats = try vki.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, allocator);
+        defer allocator.free(formats);
+        if (formats.len == 0) continue;
+
+        const capabilities = try vki.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface);
+        const required_usage: vk.ImageUsageFlags = .{ .transfer_dst_bit = true, .color_attachment_bit = true };
+        if (!capabilities.supported_usage_flags.contains(required_usage)) continue;
+
         const families = try vki.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, allocator);
         defer allocator.free(families);
         for (families, 0..) |family, index| {
@@ -1994,4 +2057,10 @@ test "clipQuad culls quads fully outside the clip" {
         .uv_bottom = 1,
     };
     try std.testing.expectEqual(@as(?QuadBounds, null), clipQuad(quad, .{ .x0 = 10, .y0 = 0, .x1 = 20, .y1 = 10 }));
+}
+
+test "alpha and color images occupy separate atlas key domains" {
+    const alpha: AtlasKey = .{ .alpha_image = 42 };
+    const color: AtlasKey = .{ .color_image = 42 };
+    try std.testing.expect(!std.meta.eql(alpha, color));
 }

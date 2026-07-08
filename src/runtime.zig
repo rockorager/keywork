@@ -2,12 +2,11 @@
 
 const std = @import("std");
 const uucode = @import("uucode");
+const appearance = @import("appearance.zig");
 const keywork = @import("core.zig");
 
 const log = std.log.scoped(.keywork);
 
-const AppContext = keywork.AppContext;
-const AppHost = keywork.AppHost;
 const Constraints = keywork.Constraints;
 const BuildScope = keywork.BuildScope;
 const DisplayList = keywork.DisplayList;
@@ -19,16 +18,15 @@ const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
-const desktop_settings = @import("desktop_settings.zig");
 const event_loop = @import("event_loop.zig");
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     backend: RenderBackend,
     constraints: Constraints,
-    app: AppHost,
-    build_arena: std.heap.ArenaAllocator,
-    color_scheme: desktop_settings.ColorScheme,
+    widget: keywork.Widget = keywork.widgets.text(""),
+    render_factory: ?keywork.RenderFactory = null,
+    color_scheme: appearance.ColorScheme,
     focused_id: ?[]u8 = null,
     autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
@@ -40,10 +38,11 @@ pub const Runtime = struct {
     element_root: ?Element = null,
     root: ?*RenderNode = null,
     display_list: DisplayList = .{},
-    app_context: State = .{},
     frame_background: ?keywork.Color = null,
     repaint_pending: bool = false,
     pending_interaction_ids: std.ArrayList([]u8) = .empty,
+    handler_sink: keywork.HandlerSink,
+    active_document_id: keywork.DocumentId = 0,
     rebuild_pending: bool = false,
     state_rebuild_pending: bool = false,
     frame_pending: bool = false,
@@ -53,22 +52,19 @@ pub const Runtime = struct {
 
     pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
 
-    pub const State = AppContext;
-
     pub fn init(
         allocator: std.mem.Allocator,
         backend: RenderBackend,
         constraints: Constraints,
-        app: AppHost,
-        color_scheme: desktop_settings.ColorScheme,
+        handler_sink: keywork.HandlerSink,
+        color_scheme: appearance.ColorScheme,
     ) !Runtime {
         var self: Runtime = .{
             .allocator = allocator,
             .backend = backend,
             .constraints = constraints,
-            .app = app,
-            .build_arena = .init(allocator),
             .color_scheme = color_scheme,
+            .handler_sink = handler_sink,
         };
         errdefer self.deinit();
         try self.rebuild();
@@ -87,15 +83,6 @@ pub const Runtime = struct {
         if (self.hovered_id) |id| self.allocator.free(id);
         if (self.pressed_id) |id| self.allocator.free(id);
         if (self.scrollbar_drag) |drag| self.allocator.free(drag.id);
-        self.build_arena.deinit();
-    }
-
-    fn currentState(self: *const Runtime) State {
-        return .{
-            .window_width = self.constraints.max_width,
-            .window_height = self.constraints.max_height,
-            .color_scheme = self.color_scheme.name(),
-        };
     }
 
     pub fn frameSize(self: *const Runtime) Size {
@@ -120,9 +107,40 @@ pub const Runtime = struct {
         self.repaint_scheduler = scheduler;
     }
 
+    pub fn setDocument(
+        self: *Runtime,
+        widget: *const keywork.Widget,
+        document_id: keywork.DocumentId,
+        render_factory: keywork.RenderFactory,
+    ) !void {
+        const previous_widget = self.widget;
+        const previous_document_id = self.active_document_id;
+        const previous_render_factory = self.render_factory;
+        self.widget = widget.*;
+        self.active_document_id = document_id;
+        self.render_factory = render_factory;
+        self.invalidate() catch |err| {
+            self.widget = previous_widget;
+            self.active_document_id = previous_document_id;
+            self.render_factory = previous_render_factory;
+            return err;
+        };
+    }
+
+    fn emitHandler(self: *Runtime, handler: keywork.HandlerRef, payload: keywork.EventPayload) !void {
+        if (handler.document != self.active_document_id) return;
+        try self.handler_sink.emit(handler, payload);
+    }
+
     pub fn invalidate(self: *Runtime) !void {
         self.rebuild_pending = true;
         try self.requestRepaint();
+    }
+
+    pub fn setColorScheme(self: *Runtime, color_scheme: appearance.ColorScheme) !void {
+        if (self.color_scheme == color_scheme) return;
+        self.color_scheme = color_scheme;
+        try self.invalidate();
     }
 
     pub fn invalidateState(self: *Runtime) !void {
@@ -139,9 +157,9 @@ pub const Runtime = struct {
         self.rendering = true;
         defer self.rendering = false;
         try self.flushInteractionRefresh();
-        // Consume pending flags before rebuilding so invalidations raised by
-        // callbacks during the rebuild are observed on the next pass instead
-        // of being cleared and dropped.
+        // Consume pending flags before rebuilding so invalidations raised during
+        // the rebuild are observed on the next pass instead of being cleared and
+        // dropped.
         const max_rebuild_passes = 8;
         var pass: usize = 0;
         while (self.rebuild_pending or self.state_rebuild_pending) : (pass += 1) {
@@ -153,11 +171,6 @@ pub const Runtime = struct {
                 try self.rebuild();
             } else {
                 try self.rebuildDirtyState();
-            }
-            // Layout may discover that a virtualized list's built window
-            // drifted; another dirty-state pass rebuilds it.
-            if (self.element_root) |*element_root| {
-                if (keywork.anyListRangeStale(element_root)) self.state_rebuild_pending = true;
             }
         }
         self.repaint_pending = false;
@@ -230,10 +243,6 @@ pub const Runtime = struct {
         if (keywork.hitTestClick(root, point)) |hit| {
             const focus_changed = try self.setFocused(hit.id);
             var needs_update = try self.setPressedId(hit.id);
-            if (hit.tap_down) |callback| {
-                try callback.call();
-                needs_update = true;
-            }
             if (hit.activation == .press) {
                 log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
                 if (try self.activateClick(hit)) needs_update = true;
@@ -278,7 +287,6 @@ pub const Runtime = struct {
         }
         const root = self.root orelse return error.NotBuilt;
         const hit = keywork.hitTestClick(root, point);
-        const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
         const should_activate = if (self.pressed_id) |pressed_id| blk: {
             const hit_id = if (hit) |click_hit| click_hit.id else break :blk false;
             break :blk std.mem.eql(u8, pressed_id, hit_id);
@@ -287,18 +295,9 @@ pub const Runtime = struct {
         var needs_update = try self.setPressedId(null);
         if (should_activate) {
             const click_hit = hit.?;
-            if (click_hit.tap_up) |callback| {
-                try callback.call();
-                needs_update = true;
-            }
             if (click_hit.activation == .release) {
                 log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
                 if (try self.activateClick(click_hit)) needs_update = true;
-            }
-        } else if (pressed_hit) |cancel_hit| {
-            if (cancel_hit.tap_cancel) |callback| {
-                try callback.call();
-                needs_update = true;
             }
         }
 
@@ -333,7 +332,7 @@ pub const Runtime = struct {
                 if (std.mem.eql(u8, old_id, new_id)) return false;
             }
             if (self.focusedTarget()) |target| {
-                if (target.focus_change_callback) |callback| try callback.call(false);
+                if (target.focus_change_handler) |handler| try self.emitHandler(handler, .{ .bool = false });
             }
             self.allocator.free(old_id);
             self.focused_id = null;
@@ -344,7 +343,7 @@ pub const Runtime = struct {
             self.focused_id = try self.allocator.dupe(u8, new_id);
             log.info("focused {s}", .{new_id});
             if (self.focusedTarget()) |target| {
-                if (target.focus_change_callback) |callback| try callback.call(true);
+                if (target.focus_change_handler) |handler| try self.emitHandler(handler, .{ .bool = true });
             }
             return true;
         }
@@ -369,7 +368,7 @@ pub const Runtime = struct {
                 switch (target.kind) {
                     .text_input => try self.editFocusedTextInput(.{ .append = " " }),
                     .clickable => {
-                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
+                        if (target.handler) |handler| _ = try self.activateClick(.{ .id = target.id, .handler = handler });
                         try self.invalidateState();
                     },
                     .focus => {},
@@ -384,7 +383,7 @@ pub const Runtime = struct {
                         try self.invalidate();
                     },
                     .clickable => {
-                        _ = try self.activateClick(.{ .id = target.id, .callback = target.callback });
+                        if (target.handler) |handler| _ = try self.activateClick(.{ .id = target.id, .handler = handler });
                         try self.invalidateState();
                     },
                     .focus => {},
@@ -400,9 +399,9 @@ pub const Runtime = struct {
         pop_grapheme,
     };
 
-    /// Applies a text edit to the focused text input's element-owned
-    /// editing state, fires its on_change callback, and schedules a
-    /// dirty-state pass. Typing relayouts exactly one input; no rebuild.
+    /// Applies a text edit to the focused text input's element-owned editing
+    /// state, emits its on_change handler, and schedules a dirty-state pass.
+    /// Typing relayouts exactly one input; no rebuild.
     fn editFocusedTextInput(self: *Runtime, edit: TextEdit) !void {
         if (!self.focusedTargetIs(.text_input)) return;
         const focused_id = self.focused_id orelse return;
@@ -413,7 +412,9 @@ pub const Runtime = struct {
             .append => |bytes| try state.text.appendSlice(self.allocator, bytes),
             .pop_grapheme => popLastGrapheme(&state.text),
         }
-        if (input.widget.text_input.on_change) |callback| try callback.call(state.text.items);
+        if (input.widget.text_input.on_change) |handler_id| {
+            try self.emitHandler(.{ .document = input.document_id, .handler = handler_id }, .{ .text = state.text.items });
+        }
         try self.invalidateState();
     }
 
@@ -421,11 +422,11 @@ pub const Runtime = struct {
         const shortcut_key = keywork.shortcutKeyForInput(input) orelse return false;
         if (self.focusedTargetIs(.text_input) and !keywork.shortcutAllowedWhileEditing(shortcut_key)) return false;
         const element_root = if (self.element_root) |*root| root else return false;
-        const callback = if (self.focused_id) |focused_id|
-            keywork.findFocusedShortcutAction(element_root, shortcut_key, focused_id) orelse keywork.findShortcutAction(element_root, shortcut_key) orelse return false
+        const handler = if (self.focused_id) |focused_id|
+            keywork.findFocusedShortcutHandler(element_root, focused_id, shortcut_key) orelse keywork.findShortcutHandler(element_root, shortcut_key) orelse return false
         else
-            keywork.findShortcutAction(element_root, shortcut_key) orelse return false;
-        try callback.call();
+            keywork.findShortcutHandler(element_root, shortcut_key) orelse return false;
+        try self.emitHandler(handler, .none);
         return true;
     }
 
@@ -542,12 +543,8 @@ pub const Runtime = struct {
     }
 
     fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
-        _ = self;
-        if (hit.callback) |callback| {
-            try callback.call();
-            return true;
-        }
-        return false;
+        try self.emitHandler(hit.handler, .none);
+        return true;
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
@@ -606,9 +603,8 @@ pub const Runtime = struct {
     }
 
     /// Queues a widget id whose hover/press styling changed. The restyle is
-    /// deferred to the next frame because the event handler that triggered
-    /// it may still hold callbacks borrowed from the widgets a refresh
-    /// would replace.
+    /// deferred to the next frame so the event path observes stable widget
+    /// state until the next refresh replaces it.
     fn queueInteractionRefresh(self: *Runtime, id: []const u8) !void {
         for (self.pending_interaction_ids.items) |pending| {
             if (std.mem.eql(u8, pending, id)) return;
@@ -630,11 +626,15 @@ pub const Runtime = struct {
         // A pending full rebuild restyles everything anyway.
         if (self.rebuild_pending) return;
         const element_root = if (self.element_root) |*element_root| element_root else return;
-        var ids: [8][]const u8 = undefined;
-        const count = @min(ids.len, self.pending_interaction_ids.items.len);
-        for (self.pending_interaction_ids.items[0..count], 0..) |id, index| ids[index] = id;
-        var build_scope = self.buildScope(self.app_context);
-        _ = try keywork.refreshInteractionElements(self.allocator, &build_scope, element_root, self.constraints, ids[0..count]);
+        var build_scope = self.buildScope();
+        var start: usize = 0;
+        while (start < self.pending_interaction_ids.items.len) {
+            var ids: [8][]const u8 = undefined;
+            const count = @min(ids.len, self.pending_interaction_ids.items.len - start);
+            for (self.pending_interaction_ids.items[start..][0..count], 0..) |id, index| ids[index] = id;
+            _ = try keywork.refreshInteractionElements(self.allocator, &build_scope, element_root, self.constraints, ids[0..count]);
+            start += count;
+        }
     }
 
     pub fn waylandPointerButton(ctx: *anyopaque, point: Point, state: PointerButtonState) void {
@@ -665,10 +665,6 @@ pub const Runtime = struct {
                 const state = keywork.scrollState(scroll_element);
                 state.offset_x = @max(0, state.offset_x + dx);
                 state.offset_y = @max(0, state.offset_y + dy);
-            },
-            .list => {
-                const state = keywork.listState(scroll_element);
-                state.offset = @max(0, state.offset + dy);
             },
             else => unreachable,
         }
@@ -706,15 +702,6 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorScheme) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        if (self.color_scheme == color_scheme) return;
-        self.color_scheme = color_scheme;
-        self.invalidate() catch |err| {
-            log.err("desktop settings invalidate failed: {}", .{err});
-        };
-    }
-
     pub fn waylandKeyInput(ctx: *anyopaque, input: KeyInput) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         self.keyInput(input) catch |err| {
@@ -735,19 +722,15 @@ pub const Runtime = struct {
     }
 
     fn rebuild(self: *Runtime) !void {
+        errdefer self.discardRetainedTrees();
         const max_focus_rebuild_passes = 4;
         var pass: usize = 0;
         while (true) : (pass += 1) {
-            _ = self.build_arena.reset(.free_all);
-            const state = self.currentState();
-            var build_scope = self.buildScope(state);
-
-            var app_root = try self.app.buildWidget(&build_scope, state);
-            self.app_context = build_scope.app_context;
+            var build_scope = self.buildScope();
             if (self.element_root) |*element_root| {
-                try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &app_root, self.constraints);
+                try keywork.updateElementTreeScoped(self.allocator, &build_scope, element_root, &self.widget, self.constraints);
             } else {
-                self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &app_root, self.constraints);
+                self.element_root = try keywork.buildElementTreeScoped(self.allocator, &build_scope, &self.widget, self.constraints);
             }
 
             try self.rebuildRetainedTrees();
@@ -758,13 +741,13 @@ pub const Runtime = struct {
     }
 
     fn rebuildDirtyState(self: *Runtime) !void {
+        errdefer self.discardRetainedTrees();
         const element_root = if (self.element_root) |*element_root| element_root else {
             try self.rebuild();
             return;
         };
 
-        _ = self.build_arena.reset(.free_all);
-        var build_scope = self.buildScope(self.app_context);
+        var build_scope = self.buildScope();
         const rebuilt = try keywork.rebuildDirtyElementTreeScoped(self.allocator, &build_scope, element_root, self.constraints);
         if (!rebuilt) {
             try self.rebuildRetainedTrees();
@@ -777,12 +760,24 @@ pub const Runtime = struct {
         }
     }
 
-    fn buildScope(self: *Runtime, state: State) BuildScope {
+    /// Element widgets own payloads borrowed by render nodes. If an update
+    /// fails after partially replacing widgets, the previous render tree may
+    /// contain stale pointers, so neither retained tree is safe to preserve.
+    fn discardRetainedTrees(self: *Runtime) void {
+        self.root = null;
+        if (self.element_root) |*element_root| {
+            keywork.destroyElementTree(self.allocator, element_root);
+            self.element_root = null;
+        }
+        self.rebuild_pending = true;
+    }
+
+    fn buildScope(self: *Runtime) BuildScope {
         return .{
-            .allocator = self.build_arena.allocator(),
-            .theme = keywork.Theme.fromColorScheme(state.color_scheme),
+            .document_id = self.active_document_id,
+            .theme = keywork.Theme.fromColorScheme(self.color_scheme.name()),
             .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
-            .app_context = state,
+            .render_factory = self.render_factory,
         };
     }
 
@@ -860,1376 +855,9 @@ test "popLastGrapheme removes one extended grapheme cluster" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(std.testing.allocator);
 
-    try bytes.appendSlice(std.testing.allocator, "aé🇺🇸👩🏽‍🚀");
-    popLastGrapheme(&bytes);
-    try std.testing.expectEqualStrings("aé🇺🇸", bytes.items);
-    popLastGrapheme(&bytes);
-    try std.testing.expectEqualStrings("aé", bytes.items);
+    try bytes.appendSlice(std.testing.allocator, "a🇺🇸");
     popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("a", bytes.items);
     popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("", bytes.items);
-}
-
-test "invalidation raised during rebuild is not dropped" {
-    const TestApp = struct {
-        builds: usize = 0,
-        runtime: ?*Runtime = null,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            // Re-invalidate exactly once from inside a rebuild pass.
-            if (self.builds == 2) {
-                if (self.runtime) |runtime| try runtime.invalidate();
-            }
-            return keywork.widgets.text("hello");
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-    app.runtime = &runtime;
-
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    try runtime.invalidate();
-    try std.testing.expectEqual(@as(usize, 3), app.builds);
-    try std.testing.expect(!runtime.rebuild_pending);
-    try std.testing.expect(!runtime.state_rebuild_pending);
-}
-
-test "rebuild passes that never stabilize return an error" {
-    const TestApp = struct {
-        runtime: ?*Runtime = null,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.runtime) |runtime| try runtime.invalidate();
-            return keywork.widgets.text("hello");
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-    app.runtime = &runtime;
-
-    try std.testing.expectError(error.RebuildDidNotStabilize, runtime.invalidate());
-}
-
-fn renderedInputText(node: *const RenderNode) ?[]const u8 {
-    if (node.kind == .text_input) return node.text;
-    for (node.children) |child| {
-        if (renderedInputText(child)) |text| return text;
-    }
-    return null;
-}
-
-test "tab traversal focuses widgets and enter activates focused clickable" {
-    const TestApp = struct {
-        clicks: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const input = keywork.widgets.textInput("input", "", "placeholder");
-            const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = increment });
-            const children = [_]keywork.Widget{ input, button };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-
-        fn increment(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.clicks += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
-    try runtime.keyInput(.{ .text = "a" });
-    try std.testing.expectEqualStrings("a", renderedInputText(runtime.root.?).?);
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("button", runtime.focused_id.?);
-    try runtime.keyInput(.enter);
-    try std.testing.expectEqual(@as(usize, 1), app.clicks);
-    try runtime.keyInput(.space);
-    try std.testing.expectEqual(@as(usize, 2), app.clicks);
-
-    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
-    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
-    try runtime.keyInput(.space);
-    try std.testing.expectEqualStrings("a ", renderedInputText(runtime.root.?).?);
-}
-
-test "wheel scroll moves viewport content without rebuilding" {
-    const TestApp = struct {
-        builds: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            var rows: [20]keywork.Widget = undefined;
-            for (&rows) |*row| row.* = keywork.widgets.text("row");
-            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
-            return keywork.widgets.scroll(scope.allocator, "list", column);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    // 20 rows at 16px in a 120px viewport: 200px of scroll range.
-    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
-
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 30);
-    try std.testing.expectEqual(@as(f32, -30), runtime.root.?.children[0].rect.y);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    // Scrolling past the edges clamps.
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 10_000);
-    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -10_000);
-    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    // Scrolling outside any viewport is a no-op.
-    try runtime.scrollBy(.{ .x = 5, .y = 500 }, 0, 30);
-    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
-}
-
-test "dragging the scrollbar thumb scrolls and captures the pointer" {
-    const TestApp = struct {
-        builds: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            var rows: [20]keywork.Widget = undefined;
-            for (&rows) |*row| row.* = keywork.widgets.text("row");
-            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
-            return keywork.widgets.scroll(scope.allocator, "list", column);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    // 20 rows at 16px in a 120px viewport: content 320, scroll range 200.
-    // Thumb: track 116, length max(12, 116*120/320) = 43.5, travel 72.5.
-    const drag_scale: f32 = 200.0 / 72.5;
-    // The viewport shrink-wraps its child's width; the thumb hugs its
-    // right edge.
-    const viewport = runtime.root.?.rect;
-    const thumb_x = viewport.x + viewport.width - 4;
-
-    // Press on the thumb; this starts a drag, not a click.
-    try runtime.pointerButton(.{ .x = thumb_x, .y = 10 }, .pressed);
-    try std.testing.expect(runtime.scrollbar_drag != null);
-
-    // Dragging down moves the content proportionally without rebuilding.
-    try runtime.pointerMove(.{ .x = thumb_x, .y = 39 });
-    try std.testing.expectApproxEqAbs(@as(f32, -29 * drag_scale), runtime.root.?.children[0].rect.y, 0.01);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    // The drag stays captured when the pointer leaves the viewport.
-    try runtime.pointerMove(.{ .x = 500, .y = 1000 });
-    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
-    try runtime.pointerMove(.{ .x = 500, .y = -1000 });
-    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
-
-    // Release ends the drag; further motion no longer scrolls.
-    try runtime.pointerButton(.{ .x = 500, .y = -1000 }, .released);
-    try std.testing.expect(runtime.scrollbar_drag == null);
-    try runtime.pointerMove(.{ .x = thumb_x, .y = 60 });
-    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-}
-
-test "keyboard focus scrolls its viewport to reveal the target" {
-    const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            var rows: [12]keywork.Widget = undefined;
-            var names: [12][]const u8 = undefined;
-            for (&rows, 0..) |*row, index| {
-                names[index] = try std.fmt.allocPrint(scope.allocator, "input-{d}", .{index});
-                row.* = keywork.widgets.textInput(names[index], "", "");
-            }
-            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
-            return keywork.widgets.scroll(scope.allocator, "pane", column);
-        }
-
-        fn findFocusRect(node: *const keywork.RenderNode, id: []const u8) ?keywork.Rect {
-            if (node.focus_id) |focus_id| {
-                if (std.mem.eql(u8, focus_id, id)) return node.rect;
-            }
-            for (node.children) |child| {
-                if (findFocusRect(child, id)) |rect| return rect;
-            }
-            return null;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 300, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    const viewport = runtime.root.?.rect;
-    try std.testing.expect(runtime.root.?.scroll_content.height > viewport.height);
-
-    // Tab through every input; each focused input must be inside the
-    // viewport after the reveal scroll.
-    for (0..12) |_| {
-        try runtime.keyInput(.{ .tab = .{} });
-        const focused = runtime.focused_id.?;
-        const rect = TestApp.findFocusRect(runtime.root.?, focused).?;
-        try std.testing.expect(rect.y >= viewport.y - 0.01);
-        try std.testing.expect(rect.y + rect.height <= viewport.y + viewport.height + 0.01);
-    }
-
-    // Wrapping back to the first input scrolls the viewport up again.
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("input-0", runtime.focused_id.?);
-    const rect = TestApp.findFocusRect(runtime.root.?, "input-0").?;
-    try std.testing.expect(rect.y >= viewport.y - 0.01);
-}
-
-test "scrolling a virtualized list converges its window in one frame" {
-    const TestApp = struct {
-        builds: usize = 0,
-
-        var dummy: u8 = 0;
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            return keywork.widgets.list("rows", 1000, 16, .{ .ptr = &dummy, .build_fn = buildItem });
-        }
-
-        fn buildItem(_: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
-            const label = try std.fmt.allocPrint(scope.allocator, "row {d}", .{index});
-            return .{ .text = .{ .value = label } };
-        }
-
-        fn firstRowText(node: *const keywork.RenderNode) ?[]const u8 {
-            if (node.kind == .text) return node.text;
-            for (node.children) |child| {
-                if (firstRowText(child)) |text| return text;
-            }
-            return null;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-    try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
-
-    // A deep scroll rebuilds the window through the frame loop's
-    // convergence pass, with no app rebuild.
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 8000);
-    try std.testing.expectEqualStrings("row 498", TestApp.firstRowText(runtime.root.?).?);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -100_000);
-    try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-}
-
-test "typing edits element-owned input state without rebuilding" {
-    const TestApp = struct {
-        builds: usize = 0,
-        last_change: [32]u8 = undefined,
-        last_change_len: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            var first = keywork.widgets.textInput("first", "", "first");
-            first.text_input.on_change = .{ .ptr = self, .call_fn = onChange };
-            const second = keywork.widgets.textInput("second", "", "second");
-            const children = [_]keywork.Widget{ first, second };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-
-        fn onChange(ptr: *anyopaque, text: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.last_change_len = @min(text.len, self.last_change.len);
-            @memcpy(self.last_change[0..self.last_change_len], text[0..self.last_change_len]);
-        }
-
-        fn lastChange(self: *const @This()) []const u8 {
-            return self.last_change[0..self.last_change_len];
-        }
-
-        fn collectInputTexts(node: *const keywork.RenderNode, out: [][]const u8, count: *usize) void {
-            if (node.kind == .text_input) {
-                out[count.*] = node.text orelse "";
-                count.* += 1;
-            }
-            for (node.children) |child| collectInputTexts(child, out, count);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("first", runtime.focused_id.?);
-    const builds_after_focus = app.builds;
-
-    // Typing edits the element buffer and fires on_change with no rebuild.
-    try runtime.keyInput(.{ .text = "h" });
-    try runtime.keyInput(.{ .text = "i" });
-    try std.testing.expectEqual(builds_after_focus, app.builds);
-    try std.testing.expectEqualStrings("hi", app.lastChange());
-
-    // The second input keeps independent state.
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("second", runtime.focused_id.?);
-    try runtime.keyInput(.{ .text = "y" });
-    try runtime.keyInput(.{ .text = "o" });
-
-    var texts: [4][]const u8 = undefined;
-    var count: usize = 0;
-    TestApp.collectInputTexts(runtime.root.?, &texts, &count);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("hi", texts[0]);
-    try std.testing.expectEqualStrings("yo", texts[1]);
-    // on_change belongs to the first input; the second never fired it.
-    try std.testing.expectEqualStrings("hi", app.lastChange());
-}
-
-test "pointer hover restyles buttons without a full rebuild" {
-    const TestApp = struct {
-        builds: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            const theme: keywork.Theme = .{
-                .color_scheme = .light,
-                .button_theme = .{
-                    .background = keywork.colors.white,
-                    .foreground = keywork.colors.ink,
-                    .hover_background = keywork.colors.black,
-                },
-            };
-            const first = try keywork.widgets.button(scope.allocator, "first", "First", .{ .ptr = self, .call_fn = noop });
-            const second = try keywork.widgets.button(scope.allocator, "second", "Second", .{ .ptr = self, .call_fn = noop });
-            const children = [_]keywork.Widget{ first, second };
-            const column = try keywork.widgets.column(scope.allocator, &children, 4);
-            return keywork.widgets.theme(scope.allocator, theme, column);
-        }
-
-        fn noop(_: *anyopaque) !void {}
-
-        fn collectBoxBackgrounds(node: *const keywork.RenderNode, out: []keywork.Color, count: *usize) void {
-            if (node.kind == .box) {
-                out[count.*] = node.background;
-                count.* += 1;
-            }
-            for (node.children) |child| collectBoxBackgrounds(child, out, count);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    var backgrounds: [8]keywork.Color = undefined;
-    var count: usize = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-
-    // Hovering the first button restyles only it, with no root rebuild.
-    try runtime.pointerMove(.{ .x = 5, .y = 5 });
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    count = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(keywork.colors.black, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-
-    // Leaving the surface clears the hover styling, still without rebuilds.
-    try runtime.pointerMove(null);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    count = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-}
-
-test "shortcut invokes ambient action outside text input focus" {
-    const TestApp = struct {
-        actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const input = keywork.widgets.textInput("input", "", "placeholder");
-            const label = keywork.widgets.text("Shortcut target");
-            const children = [_]keywork.Widget{ input, label };
-            const column = try keywork.widgets.column(scope.allocator, &children, 4);
-            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
-            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
-            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, column);
-            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
-        }
-
-        fn activate(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.actions += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.keyInput(.space);
-    try std.testing.expectEqual(@as(usize, 1), app.actions);
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
-    try runtime.keyInput(.space);
-    try std.testing.expectEqual(@as(usize, 1), app.actions);
-    try std.testing.expectEqualStrings(" ", renderedInputText(runtime.root.?).?);
-}
-
-test "non-editing shortcuts fire while a text input is focused" {
-    const TestApp = struct {
-        actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            var input = keywork.widgets.textInput("input", "", "placeholder");
-            input.text_input.autofocus = true;
-            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{
-                .{ .key = .enter, .intent = .action("activate") },
-                .{ .key = .escape, .intent = .action("activate") },
-                .{ .key = .down, .intent = .action("activate") },
-                .{ .key = .up, .intent = .action("activate") },
-            };
-            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
-            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, input);
-            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
-        }
-
-        fn activate(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.actions += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    // The autofocus text input owns focus from the initial build.
-    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
-
-    try runtime.keyInput(.enter);
-    try runtime.keyInput(.escape);
-    try runtime.keyInput(.down);
-    try runtime.keyInput(.up);
-    try std.testing.expectEqual(@as(usize, 4), app.actions);
-
-    // Editing keys still reach the input instead of shortcuts.
-    try runtime.keyInput(.{ .text = "hi" });
-    try runtime.keyInput(.space);
-    try runtime.keyInput(.backspace);
-    try std.testing.expectEqual(@as(usize, 4), app.actions);
-    try std.testing.expectEqualStrings("hi", renderedInputText(runtime.root.?).?);
-    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
-}
-
-test "focus widget participates in traversal and shortcut context" {
-    const TestApp = struct {
-        actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const label = keywork.widgets.text("Focusable shortcut target");
-            const focused_label = try keywork.widgets.focus(scope.allocator, .named("label-focus"), label);
-            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
-            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
-            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, focused_label);
-            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
-        }
-
-        fn activate(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.actions += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 80 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("label-focus", runtime.focused_id.?);
-    try runtime.keyInput(.space);
-    try std.testing.expectEqual(@as(usize, 1), app.actions);
-}
-
-test "autofocus focus node is selected during initial build" {
-    const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            return keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("initial"),
-                keywork.widgets.text("Initial focus"),
-                .{ .autofocus = true },
-            );
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 80 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try std.testing.expectEqualStrings("initial", runtime.focused_id.?);
-    try std.testing.expect(runtime.root.?.focused);
-
-    try runtime.clearFocus();
-    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
-    try std.testing.expect(!runtime.root.?.focused);
-}
-
-test "autofocus replaces focused node removed during rebuild" {
-    const TestApp = struct {
-        show_old_focus: bool = true,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const first = if (self.show_old_focus)
-                try keywork.widgets.focus(scope.allocator, .named("old"), keywork.widgets.text("Old"))
-            else
-                keywork.widgets.text("Removed");
-            const replacement = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("replacement"),
-                keywork.widgets.text("Replacement"),
-                .{ .autofocus = true },
-            );
-            const children = [_]keywork.Widget{ first, replacement };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    _ = try runtime.setFocused("old");
-    try runtime.rebuild();
-    try std.testing.expectEqualStrings("old", runtime.focused_id.?);
-
-    app.show_old_focus = false;
-    try runtime.rebuild();
-    try std.testing.expectEqualStrings("replacement", runtime.focused_id.?);
-    try std.testing.expect(runtime.root.?.children[1].focused);
-}
-
-test "runtime requestFocus and clearFocus notify focus widgets" {
-    const TestApp = struct {
-        a_focused: usize = 0,
-        a_blurred: usize = 0,
-        b_focused: usize = 0,
-        b_blurred: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const a = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("a"),
-                keywork.widgets.text("A"),
-                .{ .on_focus_change = .{ .ptr = self, .call_fn = focusA } },
-            );
-            const b = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("b"),
-                keywork.widgets.text("B"),
-                .{ .on_focus_change = .{ .ptr = self, .call_fn = focusB } },
-            );
-            const children = [_]keywork.Widget{ a, b };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-
-        fn focusA(ptr: *anyopaque, focused: bool) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (focused) {
-                self.a_focused += 1;
-            } else {
-                self.a_blurred += 1;
-            }
-        }
-
-        fn focusB(ptr: *anyopaque, focused: bool) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (focused) {
-                self.b_focused += 1;
-            } else {
-                self.b_blurred += 1;
-            }
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
-    try runtime.requestFocus("a");
-    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
-    try std.testing.expect(runtime.root.?.children[0].focused);
-    try std.testing.expectEqual(@as(usize, 1), app.a_focused);
-    try std.testing.expectEqual(@as(usize, 0), app.a_blurred);
-
-    try runtime.requestFocus("b");
-    try std.testing.expectEqualStrings("b", runtime.focused_id.?);
-    try std.testing.expect(runtime.root.?.children[1].focused);
-    try std.testing.expectEqual(@as(usize, 1), app.a_blurred);
-    try std.testing.expectEqual(@as(usize, 1), app.b_focused);
-
-    try runtime.clearFocus();
-    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
-    try std.testing.expectEqual(@as(usize, 1), app.b_blurred);
-    try std.testing.expectError(error.FocusTargetNotFound, runtime.requestFocus("missing"));
-}
-
-test "focus traversal respects request and traversal policy" {
-    const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const a = try keywork.widgets.focus(scope.allocator, .named("a"), keywork.widgets.text("A"));
-            const skipped = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("skipped"),
-                keywork.widgets.text("Skipped"),
-                .{ .skip_traversal = true },
-            );
-            const blocked = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("blocked"),
-                keywork.widgets.text("Blocked"),
-                .{ .autofocus = true, .can_request_focus = false },
-            );
-            const c = try keywork.widgets.focus(scope.allocator, .named("c"), keywork.widgets.text("C"));
-            const children = [_]keywork.Widget{ a, skipped, blocked, c };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 160 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("c", runtime.focused_id.?);
-
-    try runtime.requestFocus("skipped");
-    try std.testing.expectEqualStrings("skipped", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("c", runtime.focused_id.?);
-    try std.testing.expectError(error.FocusTargetNotFocusable, runtime.requestFocus("blocked"));
-}
-
-test "focused node becoming non-requestable falls back to autofocus" {
-    const TestApp = struct {
-        allow_a_focus: bool = true,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const a = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("a"),
-                keywork.widgets.text("A"),
-                .{ .can_request_focus = self.allow_a_focus },
-            );
-            const replacement = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("replacement"),
-                keywork.widgets.text("Replacement"),
-                .{ .autofocus = true },
-            );
-            const children = [_]keywork.Widget{ a, replacement };
-            return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.requestFocus("a");
-    try std.testing.expectEqualStrings("a", runtime.focused_id.?);
-
-    app.allow_a_focus = false;
-    try runtime.rebuild();
-    try std.testing.expectEqualStrings("replacement", runtime.focused_id.?);
-    try std.testing.expect(runtime.root.?.children[1].focused);
-}
-
-test "focus scope contains tab traversal once focus is inside it" {
-    const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const a1 = try keywork.widgets.focus(scope.allocator, .named("a1"), keywork.widgets.text("A1"));
-            const a2 = try keywork.widgets.focus(scope.allocator, .named("a2"), keywork.widgets.text("A2"));
-            const a_children = [_]keywork.Widget{ a1, a2 };
-            const a_column = try keywork.widgets.column(scope.allocator, &a_children, 4);
-            const scope_a = try keywork.widgets.focusScope(scope.allocator, "scope-a", a_column);
-
-            const b1 = try keywork.widgets.focus(scope.allocator, .named("b1"), keywork.widgets.text("B1"));
-            const b2 = try keywork.widgets.focus(scope.allocator, .named("b2"), keywork.widgets.text("B2"));
-            const b_children = [_]keywork.Widget{ b1, b2 };
-            const b_column = try keywork.widgets.column(scope.allocator, &b_children, 4);
-            const scope_b = try keywork.widgets.focusScope(scope.allocator, "scope-b", b_column);
-
-            const children = [_]keywork.Widget{ scope_a, scope_b };
-            return keywork.widgets.column(scope.allocator, &children, 8);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 160 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("a1", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("a2", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("a1", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
-    try std.testing.expectEqualStrings("a2", runtime.focused_id.?);
-}
-
-test "modal focus scope traps autofocus traversal and focus requests" {
-    const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const background = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("background"),
-                keywork.widgets.text("Background"),
-                .{ .autofocus = true },
-            );
-
-            const modal_a = try keywork.widgets.focusWithOptions(
-                scope.allocator,
-                .named("modal-a"),
-                keywork.widgets.text("Modal A"),
-                .{ .autofocus = true },
-            );
-            const modal_b = try keywork.widgets.focus(scope.allocator, .named("modal-b"), keywork.widgets.text("Modal B"));
-            const modal_children = [_]keywork.Widget{ modal_a, modal_b };
-            const modal_column = try keywork.widgets.column(scope.allocator, &modal_children, 4);
-            const modal = try keywork.widgets.focusScopeWithOptions(scope.allocator, "modal", modal_column, .{ .modal = true });
-
-            const after_modal = try keywork.widgets.focus(scope.allocator, .named("after-modal"), keywork.widgets.text("After modal"));
-            const children = [_]keywork.Widget{ background, modal, after_modal };
-            return keywork.widgets.column(scope.allocator, &children, 8);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 180 },
-        app.host(),
-        .no_preference,
-    );
-    defer runtime.deinit();
-
-    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
-    try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("background"));
-    try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("after-modal"));
-
-    try runtime.requestFocus("modal-b");
-    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
-    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
-    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
-
-    try runtime.clearFocus();
-    try runtime.keyInput(.{ .tab = .{} });
-    try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
 }

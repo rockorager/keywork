@@ -308,8 +308,9 @@ pub const Backend = struct {
 
         fn presentOutput(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
             const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
-            while (!self.backend.allConfigured() and !self.backend.allClosed()) {
-                if (self.backend.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            if (!self.backend.allConfigured()) {
+                self.backend.queueRepaint();
+                return false;
             }
             if (self.index == 0) {
                 if (self.backend.closed) return false;
@@ -368,6 +369,10 @@ pub const Backend = struct {
         self.input.uninstallEventTimers();
     }
 
+    pub fn removeEventTimers(self: *Backend, loop: *event_loop.EventLoop) void {
+        self.input.removeEventTimers(loop);
+    }
+
     pub fn setRepaintHandler(self: *Backend, context: *anyopaque, handler: RepaintHandler) void {
         self.repaint_context = context;
         self.repaint_handler = handler;
@@ -385,6 +390,18 @@ pub const Backend = struct {
 
     pub fn eventLoopFd(self: *Backend) i32 {
         return self.display.getFd();
+    }
+
+    pub fn isConfigured(self: *const Backend) bool {
+        return self.allConfigured();
+    }
+
+    pub fn isClosed(self: *const Backend) bool {
+        return self.allClosed();
+    }
+
+    pub fn size(self: *const Backend) keywork.Size {
+        return self.currentSize();
     }
 
     pub fn waitForInitialConfigure(self: *Backend) !keywork.Size {
@@ -430,10 +447,12 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (self.allClosed()) return error.WindowClosed;
 
-        while (!self.allConfigured() and !self.allClosed()) {
-            if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        // Surface configuration is asynchronous. Blocking here would make
+        // a host-owned event loop deadlock during its first submission.
+        if (!self.allConfigured()) {
+            self.queueRepaint();
+            return false;
         }
-        if (self.allClosed()) return error.WindowClosed;
 
         var frame_pending = false;
         if (!self.closed) frame_pending = try self.presentPrimary(frame) or frame_pending;

@@ -34,6 +34,10 @@ pub const colors = struct {
     pub const slate_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
 
     pub const blue9: Color = Color.argb(0xff, 0x00, 0x90, 0xff);
+    pub const blue10: Color = Color.argb(0xff, 0x05, 0x88, 0xf0);
+    pub const blue11: Color = Color.argb(0xff, 0x0d, 0x74, 0xce);
+    pub const blue_dark10: Color = Color.argb(0xff, 0x3b, 0x9e, 0xff);
+    pub const blue_dark11: Color = Color.argb(0xff, 0x70, 0xb8, 0xff);
     pub const red9: Color = Color.argb(0xff, 0xe5, 0x48, 0x4d);
 
     pub const ink: Color = slate12;
@@ -51,6 +55,8 @@ pub const ColorScheme = struct {
     background: Color,
     foreground: Color,
     primary: Color,
+    primary_hover: Color,
+    primary_pressed: Color,
     on_primary: Color,
     surface: Color,
     surface_high: Color,
@@ -65,6 +71,8 @@ pub const ColorScheme = struct {
         .background = colors.slate2,
         .foreground = colors.ink,
         .primary = colors.accent,
+        .primary_hover = colors.blue10,
+        .primary_pressed = colors.blue11,
         .on_primary = colors.white,
         .surface = colors.slate1,
         .surface_high = colors.white,
@@ -80,6 +88,8 @@ pub const ColorScheme = struct {
         .background = colors.slate_dark1,
         .foreground = colors.slate_dark12,
         .primary = colors.blue9,
+        .primary_hover = colors.blue_dark10,
+        .primary_pressed = colors.blue_dark11,
         .on_primary = colors.black,
         .surface = colors.slate_dark2,
         .surface_high = colors.slate_dark3,
@@ -235,11 +245,27 @@ pub const ShortcutKey = enum {
     down,
 };
 
-pub const Intent = struct {
-    action_id: []const u8,
+pub const HandlerId = u64;
+pub const DocumentId = u64;
+pub const ResourceId = u64;
 
-    pub fn action(action_id: []const u8) Intent {
-        return .{ .action_id = action_id };
+pub const HandlerRef = struct {
+    document: DocumentId,
+    handler: HandlerId,
+};
+
+pub const EventPayload = union(enum) {
+    none,
+    bool: bool,
+    text: []const u8,
+};
+
+pub const HandlerSink = struct {
+    ptr: *anyopaque,
+    emit_fn: *const fn (ptr: *anyopaque, handler: HandlerRef, payload: EventPayload) anyerror!void,
+
+    pub fn emit(self: HandlerSink, handler: HandlerRef, payload: EventPayload) !void {
+        try self.emit_fn(self.ptr, handler, payload);
     }
 };
 
@@ -328,14 +354,13 @@ pub const Constraints = struct {
 };
 
 pub const Widget = union(enum) {
-    keyed: Keyed,
     text: Text,
     box: Box,
+    button: Button,
     clickable: Clickable,
     focus: Focus,
     focus_scope: FocusScope,
     scroll: Scroll,
-    list: List,
     text_input: TextInput,
     row: Children,
     column: Children,
@@ -344,15 +369,10 @@ pub const Widget = union(enum) {
     sized: Sized,
     padding: Padding,
     center: Child,
-    button: Button,
-    actions: Actions,
     shortcuts: Shortcuts,
-    theme: ThemeWidget,
     default_text_style: DefaultTextStyle,
-    component: Component,
-    stateful: Stateful,
-    element: CustomElement,
-    render_object: RenderObject,
+    image: Image,
+    icon: Icon,
 
     pub fn alloc(allocator: std.mem.Allocator, widget: Widget) !*Widget {
         const result = try allocator.create(Widget);
@@ -364,31 +384,16 @@ pub const Widget = union(enum) {
         return allocator.dupe(Widget, items);
     }
 
-    pub const Key = union(enum) {
-        string: []const u8,
-        integer: u64,
-    };
-
-    pub const Keyed = struct {
-        key: Key,
-        child: *const Widget,
-    };
-
     pub const Text = struct {
+        key: ?[]const u8 = null,
         value: []const u8,
         color: ?Color = null,
         font_size: ?f32 = null,
         role: TextRole = .body,
     };
 
-    pub const Button = struct {
-        id: []const u8,
-        label: []const u8,
-        on_pressed: ?Callback = null,
-        intent: ?Intent = null,
-    };
-
     pub const Box = struct {
+        key: ?[]const u8 = null,
         child: *const Widget,
         background: Color = colors.transparent,
         border: ?Color = null,
@@ -400,13 +405,24 @@ pub const Widget = union(enum) {
         vertical_align: Alignment = .start,
     };
 
-    pub const Clickable = struct {
+    /// A semantic, theme-aware button. Text and untinted icons inherit the
+    /// button foreground; default, hover, pressed, focused, and disabled
+    /// presentation is resolved from the active Theme inside libkeywork.
+    pub const Button = struct {
+        key: ?[]const u8 = null,
         id: []const u8,
+        /// Null disables activation, focus traversal, and pointer hover while
+        /// retaining the button's themed disabled presentation.
+        handler: ?HandlerId = null,
         child: *const Widget,
-        on_click: ?Callback = null,
-        on_tap_down: ?Callback = null,
-        on_tap_up: ?Callback = null,
-        on_tap_cancel: ?Callback = null,
+        activation: ClickActivation = .press,
+    };
+
+    pub const Clickable = struct {
+        key: ?[]const u8 = null,
+        id: []const u8,
+        handler: HandlerId,
+        child: *const Widget,
         activation: ClickActivation = .release,
         hover_style: ?ClickableStyle = null,
     };
@@ -422,36 +438,29 @@ pub const Widget = union(enum) {
     };
 
     pub const Focus = struct {
+        key: ?[]const u8 = null,
         node: FocusNode,
         child: *const Widget,
         autofocus: bool = false,
         skip_traversal: bool = false,
         can_request_focus: bool = true,
-        on_focus_change: ?FocusChangeCallback = null,
+        on_focus_change: ?HandlerId = null,
     };
 
     pub const FocusScope = struct {
+        key: ?[]const u8 = null,
         id: []const u8,
         child: *const Widget,
         modal: bool = false,
     };
 
-    pub const ActionBinding = struct {
-        id: []const u8,
-        callback: Callback,
-    };
-
     pub const ShortcutBinding = struct {
         key: ShortcutKey,
-        intent: Intent,
-    };
-
-    pub const Actions = struct {
-        bindings: []const ActionBinding,
-        child: *const Widget,
+        handler: HandlerId,
     };
 
     pub const Shortcuts = struct {
+        key: ?[]const u8 = null,
         bindings: []const ShortcutBinding,
         child: *const Widget,
     };
@@ -461,47 +470,10 @@ pub const Widget = union(enum) {
     /// element-owned scroll position. Scrollbar thumbs are painted for
     /// axes with overflowing content.
     pub const Scroll = struct {
+        key: ?[]const u8 = null,
         id: []const u8,
         child: *const Widget,
         axes: ScrollAxes = .vertical,
-    };
-
-    /// A virtualized vertical list: only the items visible in the
-    /// viewport (plus a small buffer) are built as elements. Items have a
-    /// fixed extent so the content height and visible range are derivable
-    /// without building everything. Item state does not survive scrolling
-    /// out of the built window.
-    pub const List = struct {
-        id: []const u8,
-        item_count: usize,
-        item_extent: f32,
-        build_item: ItemBuilder,
-    };
-
-    pub const ItemBuilder = struct {
-        ptr: *const anyopaque,
-        build_fn: *const fn (ptr: *const anyopaque, scope: *BuildScope, index: usize) anyerror!Widget,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
-
-        pub fn build(self: ItemBuilder, scope: *BuildScope, index: usize) !Widget {
-            return self.build_fn(self.ptr, scope, index);
-        }
-
-        pub fn clone(self: ItemBuilder, allocator: std.mem.Allocator) !ItemBuilder {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .build_fn = self.build_fn,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: ItemBuilder, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
     };
 
     pub const ScrollAxes = enum {
@@ -519,13 +491,14 @@ pub const Widget = union(enum) {
     };
 
     pub const TextInput = struct {
+        key: ?[]const u8 = null,
         id: []const u8,
         focus_node: FocusNode,
         /// Initial text only: after the element is created, its editing
         /// state owns the text.
         value: []const u8,
         placeholder: []const u8,
-        on_change: ?TextChangeCallback = null,
+        on_change: ?HandlerId = null,
         foreground: Color = colors.ink,
         background: Color = colors.white,
         border: Color = colors.ink,
@@ -538,6 +511,7 @@ pub const Widget = union(enum) {
     };
 
     pub const Children = struct {
+        key: ?[]const u8 = null,
         children: []const Widget,
         gap: f32 = 0,
         cross_align: CrossAxisAlignment = .start,
@@ -564,6 +538,7 @@ pub const Widget = union(enum) {
     /// their intrinsic size, the remaining main-axis space is divided
     /// between flexible children in proportion to their flex factors.
     pub const Flexible = struct {
+        key: ?[]const u8 = null,
         child: *const Widget,
         flex: f32 = 1,
         /// tight forces the child to fill its share (Flutter's Expanded);
@@ -580,6 +555,7 @@ pub const Widget = union(enum) {
     };
 
     pub const Sized = struct {
+        key: ?[]const u8 = null,
         child: *const Widget,
         width: ?f32 = null,
         height: ?f32 = null,
@@ -590,281 +566,50 @@ pub const Widget = union(enum) {
     };
 
     pub const Spacer = struct {
+        key: ?[]const u8 = null,
         flex: f32 = 1,
     };
 
     pub const Padding = struct {
+        key: ?[]const u8 = null,
         insets: EdgeInsets,
         child: *const Widget,
     };
 
     pub const Child = struct {
-        child: *const Widget,
-    };
-
-    pub const ThemeWidget = struct {
-        theme: Theme,
+        key: ?[]const u8 = null,
         child: *const Widget,
     };
 
     pub const DefaultTextStyle = struct {
+        key: ?[]const u8 = null,
         style: TextStyle,
         child: *const Widget,
     };
 
-    pub const Callback = struct {
-        ptr: *anyopaque,
-        call_fn: *const fn (ptr: *anyopaque) anyerror!void,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
-
-        pub fn call(self: Callback) !void {
-            try self.call_fn(self.ptr);
-        }
-
-        pub fn clone(self: Callback, allocator: std.mem.Allocator) !Callback {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .call_fn = self.call_fn,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: Callback, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
+    pub const Image = struct {
+        key: ?[]const u8 = null,
+        resource: ResourceId,
+        width: ?f32 = null,
+        height: ?f32 = null,
+        tint: ?Color = null,
     };
 
-    pub const FocusChangeCallback = struct {
-        ptr: *anyopaque,
-        call_fn: *const fn (ptr: *anyopaque, focused: bool) anyerror!void,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
-
-        pub fn call(self: FocusChangeCallback, focused: bool) !void {
-            try self.call_fn(self.ptr, focused);
-        }
-
-        pub fn clone(self: FocusChangeCallback, allocator: std.mem.Allocator) !FocusChangeCallback {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .call_fn = self.call_fn,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: FocusChangeCallback, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
-    };
-
-    pub const TextChangeCallback = struct {
-        ptr: *anyopaque,
-        call_fn: *const fn (ptr: *anyopaque, text: []const u8) anyerror!void,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
-
-        pub fn call(self: TextChangeCallback, text: []const u8) !void {
-            try self.call_fn(self.ptr, text);
-        }
-
-        pub fn clone(self: TextChangeCallback, allocator: std.mem.Allocator) !TextChangeCallback {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .call_fn = self.call_fn,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: TextChangeCallback, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
-    };
-
-    pub const BuildContext = struct {
-        constraints: Constraints,
-        theme: Theme = .default,
-        default_text_style: TextStyle = .{},
-        interaction: InteractionState = .{},
-        app_context: AppContext = .{},
-    };
-
-    pub const Component = struct {
-        ptr: *const anyopaque,
-        vtable: *const VTable,
-
-        pub const VTable = struct {
-            build: *const fn (ptr: *const anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
-        };
-
-        pub fn build(self: Component, scope: *BuildScope, context: BuildContext) !Widget {
-            return self.vtable.build(self.ptr, scope, context);
-        }
-    };
-
-    pub const Stateful = struct {
-        ptr: *const anyopaque,
-        vtable: *const VTable,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
-        /// Identity token: two stateful widgets with different tokens are
-        /// never update-compatible, so swapping widget types at the same
-        /// tree position disposes the old state and creates fresh state
-        /// instead of silently reusing it.
-        type_token: ?*const anyopaque = null,
-
-        pub const VTable = struct {
-            create_state: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator) anyerror!*anyopaque,
-            update: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!void,
-            build: *const fn (ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
-            destroy_state: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator) void,
-            needs_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) bool = null,
-            clear_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) void = null,
-        };
-
-        pub fn createState(self: Stateful, allocator: std.mem.Allocator) !*anyopaque {
-            return self.vtable.create_state(self.ptr, allocator);
-        }
-
-        pub fn update(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) !void {
-            try self.vtable.update(self.ptr, state, allocator, context);
-        }
-
-        pub fn build(self: Stateful, state: *anyopaque, scope: *BuildScope, context: BuildContext) !Widget {
-            return self.vtable.build(self.ptr, state, scope, context);
-        }
-
-        pub fn destroyState(self: Stateful, state: *anyopaque, allocator: std.mem.Allocator) void {
-            self.vtable.destroy_state(self.ptr, state, allocator);
-        }
-
-        pub fn needsRebuild(self: Stateful, state: *anyopaque) bool {
-            const needs_rebuild = self.vtable.needs_rebuild orelse return false;
-            return needs_rebuild(self.ptr, state);
-        }
-
-        pub fn clearRebuild(self: Stateful, state: *anyopaque) void {
-            const clear_rebuild = self.vtable.clear_rebuild orelse return;
-            clear_rebuild(self.ptr, state);
-        }
-
-        pub fn clone(self: Stateful, allocator: std.mem.Allocator) !Stateful {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .vtable = self.vtable,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-                .type_token = self.type_token,
-            };
-        }
-
-        pub fn destroy(self: Stateful, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
-    };
-
-    pub const CustomElement = struct {
-        ptr: *const anyopaque,
-        vtable: *const VTable,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
-
-        pub const VTable = struct {
-            build: *const fn (ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: BuildContext) anyerror!Element,
-        };
-
-        pub fn build(self: CustomElement, allocator: std.mem.Allocator, scope: *BuildScope, context: BuildContext) !Element {
-            return self.vtable.build(self.ptr, allocator, scope, context);
-        }
-
-        pub fn clone(self: CustomElement, allocator: std.mem.Allocator) !CustomElement {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .vtable = self.vtable,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: CustomElement, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
-    };
-
-    pub const RenderObject = struct {
-        ptr: *const anyopaque,
-        vtable: *const VTable,
-        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
-        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
-
-        pub const LayoutContext = struct {
-            constraints: Constraints,
-            measurer: TextMeasurer,
-        };
-
-        pub const PaintContext = struct {
-            allocator: std.mem.Allocator,
-            rect: Rect,
-            scale: f32,
-            display_list: *DisplayList,
-        };
-
-        pub const VTable = struct {
-            layout: *const fn (ptr: *const anyopaque, context: LayoutContext) anyerror!Size,
-            paint: *const fn (ptr: *const anyopaque, context: PaintContext) anyerror!void,
-            hit_test: ?*const fn (ptr: *const anyopaque, rect: Rect, point: Point) ?[]const u8 = null,
-        };
-
-        pub fn layout(self: RenderObject, context: LayoutContext) !Size {
-            return self.vtable.layout(self.ptr, context);
-        }
-
-        pub fn paint(self: RenderObject, context: PaintContext) !void {
-            try self.vtable.paint(self.ptr, context);
-        }
-
-        pub fn hitTest(self: RenderObject, rect: Rect, point: Point) ?[]const u8 {
-            const hit_test = self.vtable.hit_test orelse return null;
-            return hit_test(self.ptr, rect, point);
-        }
-
-        pub fn clone(self: RenderObject, allocator: std.mem.Allocator) !RenderObject {
-            const clone_fn = self.clone_fn orelse return self;
-            return .{
-                .ptr = try clone_fn(allocator, self.ptr),
-                .vtable = self.vtable,
-                .clone_fn = self.clone_fn,
-                .destroy_fn = self.destroy_fn,
-            };
-        }
-
-        pub fn destroy(self: RenderObject, allocator: std.mem.Allocator) void {
-            const destroy_fn = self.destroy_fn orelse return;
-            destroy_fn(allocator, self.ptr);
-        }
+    pub const Icon = struct {
+        key: ?[]const u8 = null,
+        name: []const u8,
+        size: f32,
+        color: ?Color = null,
     };
 };
 
 pub const BuildScope = struct {
-    allocator: std.mem.Allocator,
+    document_id: DocumentId = 0,
     theme: Theme = .default,
     default_text_style: TextStyle = .{},
+    default_icon_color: ?Color = null,
     interaction: InteractionState = .{},
-    actions: ?*const ActionScope = null,
-    app_context: AppContext = .{},
+    render_factory: ?RenderFactory = null,
 };
 
 pub const widgets = struct {
@@ -880,16 +625,8 @@ pub const widgets = struct {
         return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background } };
     }
 
-    pub fn borderedBox(allocator: std.mem.Allocator, child: Widget, background: Color, border: ?Color) !Widget {
-        return .{ .box = .{ .child = try Widget.alloc(allocator, child), .background = background, .border = border } };
-    }
-
-    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
-        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
-    }
-
-    pub fn pressClickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
-        return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click, .activation = .press } };
+    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, handler: HandlerId, child: Widget) !Widget {
+        return .{ .clickable = .{ .id = id, .handler = handler, .child = try Widget.alloc(allocator, child) } };
     }
 
     pub fn focus(allocator: std.mem.Allocator, node: FocusNode, child: Widget) !Widget {
@@ -900,7 +637,7 @@ pub const widgets = struct {
         autofocus: bool = false,
         skip_traversal: bool = false,
         can_request_focus: bool = true,
-        on_focus_change: ?Widget.FocusChangeCallback = null,
+        on_focus_change: ?HandlerId = null,
     };
 
     pub fn focusWithOptions(allocator: std.mem.Allocator, node: FocusNode, child: Widget, options: FocusOptions) !Widget {
@@ -914,55 +651,49 @@ pub const widgets = struct {
         } };
     }
 
-    pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
-        return focusScopeWithOptions(allocator, id, child, .{});
-    }
-
-    pub const FocusScopeOptions = struct {
-        modal: bool = false,
-    };
-
-    pub fn focusScopeWithOptions(allocator: std.mem.Allocator, id: []const u8, child: Widget, options: FocusScopeOptions) !Widget {
-        return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child), .modal = options.modal } };
+    pub fn focusScope(allocator: std.mem.Allocator, id: []const u8, child: Widget, modal: bool) !Widget {
+        return .{ .focus_scope = .{ .id = id, .child = try Widget.alloc(allocator, child), .modal = modal } };
     }
 
     pub fn scroll(allocator: std.mem.Allocator, id: []const u8, child: Widget) !Widget {
         return .{ .scroll = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn list(id: []const u8, item_count: usize, item_extent: f32, build_item: Widget.ItemBuilder) Widget {
-        return .{ .list = .{ .id = id, .item_count = item_count, .item_extent = item_extent, .build_item = build_item } };
-    }
-
-    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
-        _ = allocator;
-        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
-    }
-
-    pub fn actionButton(allocator: std.mem.Allocator, id: []const u8, label: []const u8, action_id: []const u8) !Widget {
-        _ = allocator;
-        return .{ .button = .{ .id = id, .label = label, .intent = .action(action_id) } };
-    }
-
-    pub fn intentButton(allocator: std.mem.Allocator, id: []const u8, label: []const u8, intent: Intent) !Widget {
-        _ = allocator;
-        return .{ .button = .{ .id = id, .label = label, .intent = intent } };
-    }
-
-    pub fn theme(allocator: std.mem.Allocator, theme_value: Theme, child: Widget) !Widget {
-        return .{ .theme = .{ .theme = theme_value, .child = try Widget.alloc(allocator, child) } };
-    }
-
     pub fn defaultTextStyle(allocator: std.mem.Allocator, style: TextStyle, child: Widget) !Widget {
         return .{ .default_text_style = .{ .style = style, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8) Widget {
-        return .{ .text_input = .{ .id = id, .focus_node = .named(id), .value = value, .placeholder = placeholder } };
-    }
+    pub const TextInputOptions = struct {
+        focus_node: ?FocusNode = null,
+        on_change: ?HandlerId = null,
+        foreground: Color = colors.ink,
+        background: Color = colors.white,
+        border: Color = colors.ink,
+        focused_border: Color = colors.accent,
+        placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
+        padding_x: f32 = 12,
+        padding_y: f32 = 8,
+        radius: f32 = 8,
+        autofocus: bool = false,
+    };
 
-    pub fn textInputWithFocusNode(id: []const u8, focus_node: FocusNode, value: []const u8, placeholder: []const u8) Widget {
-        return .{ .text_input = .{ .id = id, .focus_node = focus_node, .value = value, .placeholder = placeholder } };
+    pub fn textInput(id: []const u8, value: []const u8, placeholder: []const u8, options: TextInputOptions) Widget {
+        return .{ .text_input = .{
+            .id = id,
+            .focus_node = options.focus_node orelse .named(id),
+            .value = value,
+            .placeholder = placeholder,
+            .on_change = options.on_change,
+            .foreground = options.foreground,
+            .background = options.background,
+            .border = options.border,
+            .focused_border = options.focused_border,
+            .placeholder_foreground = options.placeholder_foreground,
+            .padding_x = options.padding_x,
+            .padding_y = options.padding_y,
+            .radius = options.radius,
+            .autofocus = options.autofocus,
+        } };
     }
 
     pub const LinearOptions = struct {
@@ -975,15 +706,11 @@ pub const widgets = struct {
         return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .fit = .tight } };
     }
 
-    pub fn expandedFlex(allocator: std.mem.Allocator, child: Widget, flex: f32) !Widget {
-        return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .flex = flex, .fit = .tight } };
-    }
-
     pub fn flexible(allocator: std.mem.Allocator, child: Widget, flex: f32) !Widget {
         return .{ .flexible = .{ .child = try Widget.alloc(allocator, child), .flex = flex, .fit = .loose } };
     }
 
-    pub fn rowWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
+    pub fn row(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
         return .{ .row = .{
             .children = try Widget.allocSlice(allocator, children),
             .gap = options.gap,
@@ -992,21 +719,13 @@ pub const widgets = struct {
         } };
     }
 
-    pub fn columnWithOptions(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
+    pub fn column(allocator: std.mem.Allocator, children: []const Widget, options: LinearOptions) !Widget {
         return .{ .column = .{
             .children = try Widget.allocSlice(allocator, children),
             .gap = options.gap,
             .cross_align = options.cross_align,
             .main_align = options.main_align,
         } };
-    }
-
-    pub fn row(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
-        return .{ .row = .{ .children = try Widget.allocSlice(allocator, children), .gap = gap } };
-    }
-
-    pub fn column(allocator: std.mem.Allocator, children: []const Widget, gap: f32) !Widget {
-        return .{ .column = .{ .children = try Widget.allocSlice(allocator, children), .gap = gap } };
     }
 
     pub fn spacer(flex: f32) Widget {
@@ -1025,37 +744,38 @@ pub const widgets = struct {
         return .{ .center = .{ .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn keyed(allocator: std.mem.Allocator, key: Widget.Key, child: Widget) !Widget {
-        return .{ .keyed = .{ .key = key, .child = try Widget.alloc(allocator, child) } };
-    }
-
-    pub fn actions(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding, child: Widget) !Widget {
-        return .{ .actions = .{ .bindings = try allocator.dupe(Widget.ActionBinding, bindings), .child = try Widget.alloc(allocator, child) } };
-    }
-
     pub fn shortcuts(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding, child: Widget) !Widget {
         return .{ .shortcuts = .{ .bindings = try allocator.dupe(Widget.ShortcutBinding, bindings), .child = try Widget.alloc(allocator, child) } };
+    }
+
+    pub fn image(resource: ResourceId, width: ?f32, height: ?f32, tint: ?Color) Widget {
+        return .{ .image = .{ .resource = resource, .width = width, .height = height, .tint = tint } };
+    }
+
+    pub fn icon(name: []const u8, size: f32, color: ?Color) Widget {
+        return .{ .icon = .{ .name = name, .size = size, .color = color } };
     }
 };
 
 pub const Element = struct {
     kind: Kind,
     widget: Widget,
-    key: ?Widget.Key = null,
+    key: ?[]const u8 = null,
+    document_id: DocumentId = 0,
     state: ?*anyopaque = null,
     focused: bool = false,
+    render_object: ?RenderObject = null,
     render_node: ?*RenderNode = null,
     children: []Element = &.{},
 
     pub const Kind = enum {
-        keyed,
         text,
         box,
+        button,
         clickable,
         focus,
         focus_scope,
         scroll,
-        list,
         text_input,
         row,
         column,
@@ -1064,52 +784,12 @@ pub const Element = struct {
         sized,
         padding,
         center,
-        button,
-        actions,
         shortcuts,
-        theme,
         default_text_style,
-        component,
-        stateful,
-        element,
-        render_object,
+        image,
+        icon,
     };
 };
-
-fn buildButtonWidget(
-    allocator: std.mem.Allocator,
-    theme: Theme,
-    interaction: InteractionState,
-    actions: ?*const ActionScope,
-    button_widget: Widget.Button,
-) !Widget {
-    const on_pressed = button_widget.on_pressed orelse if (button_widget.intent) |intent| findActionForIntent(actions, intent) else null;
-    const enabled = on_pressed != null;
-    const hovered = enabled and interaction.isHovered(button_widget.id);
-    const pressed = enabled and interaction.isPressed(button_widget.id);
-    const focused = enabled and interaction.isFocused(.named(button_widget.id));
-    const label: Widget = .{ .text = .{ .value = button_widget.label, .color = buttonForeground(theme, enabled, hovered), .role = .label } };
-    const padded = try widgets.padding(allocator, .{
-        .left = theme.button_theme.padding_x,
-        .right = theme.button_theme.padding_x,
-        .top = theme.button_theme.padding_y,
-        .bottom = theme.button_theme.padding_y,
-    }, label);
-    const background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered);
-    const surface: Widget = .{ .box = .{
-        .child = try Widget.alloc(allocator, padded),
-        .background = background,
-        .border = if (focused) buttonFocusedBorder(theme) else null,
-        .radius = theme.button_theme.radius,
-    } };
-    if (!enabled) return surface;
-    const surface_child = try Widget.alloc(allocator, surface);
-    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(on_pressed.?) } };
-}
-
-fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
-    return .{ .ptr = callback.ptr, .call_fn = callback.call_fn };
-}
 
 fn defaultResolvedTextStyle() ResolvedTextStyle {
     return .{ .color = colors.ink, .font_size = 16 };
@@ -1139,18 +819,18 @@ fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widge
 }
 
 fn buttonBackground(theme: Theme, hovered: bool) Color {
-    if (hovered) return theme.button_theme.hover_background orelse theme.button_theme.background orelse theme.color_scheme.foreground;
+    if (hovered) return theme.button_theme.hover_background orelse theme.color_scheme.primary_hover;
     return theme.button_theme.background orelse theme.color_scheme.primary;
 }
 
 fn buttonForeground(theme: Theme, enabled: bool, hovered: bool) Color {
     if (!enabled) return theme.button_theme.disabled_foreground orelse theme.color_scheme.muted;
-    if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.background;
+    if (hovered) return theme.button_theme.hover_foreground orelse theme.button_theme.foreground orelse theme.color_scheme.on_primary;
     return theme.button_theme.foreground orelse theme.color_scheme.on_primary;
 }
 
 fn buttonPressedBackground(theme: Theme) Color {
-    return theme.button_theme.pressed_background orelse theme.color_scheme.foreground;
+    return theme.button_theme.pressed_background orelse theme.color_scheme.primary_pressed;
 }
 
 fn buttonDisabledBackground(theme: Theme) Color {
@@ -1181,16 +861,75 @@ fn inputPlaceholder(theme: Theme) Color {
     return theme.input_theme.placeholder orelse theme.color_scheme.muted;
 }
 
+pub const RenderObject = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        layout: *const fn (ptr: *anyopaque, context: LayoutContext) anyerror!Size,
+        paint: *const fn (ptr: *anyopaque, context: PaintContext) anyerror!void,
+        hit_test: *const fn (ptr: *anyopaque, rect: Rect, point: Point) ?[]const u8,
+        clone: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!RenderObject,
+        destroy: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+    };
+
+    pub const LayoutContext = struct {
+        constraints: Constraints,
+        text_measurer: TextMeasurer,
+    };
+
+    pub const PaintContext = struct {
+        allocator: std.mem.Allocator,
+        display_list: *DisplayList,
+        rect: Rect,
+    };
+
+    pub fn layout(self: RenderObject, context: LayoutContext) !Size {
+        return self.vtable.layout(self.ptr, context);
+    }
+
+    pub fn paint(self: RenderObject, context: PaintContext) !void {
+        try self.vtable.paint(self.ptr, context);
+    }
+
+    pub fn hitTest(self: RenderObject, rect: Rect, point: Point) ?[]const u8 {
+        return self.vtable.hit_test(self.ptr, rect, point);
+    }
+
+    pub fn clone(self: RenderObject, allocator: std.mem.Allocator) !RenderObject {
+        return self.vtable.clone(self.ptr, allocator);
+    }
+
+    pub fn destroy(self: RenderObject, allocator: std.mem.Allocator) void {
+        self.vtable.destroy(self.ptr, allocator);
+    }
+};
+
+pub const RenderFactory = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        image: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, widget: Widget.Image) anyerror!RenderObject,
+        icon: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, widget: Widget.Icon) anyerror!RenderObject,
+    };
+
+    pub fn image(self: RenderFactory, allocator: std.mem.Allocator, widget: Widget.Image) !RenderObject {
+        return self.vtable.image(self.ptr, allocator, widget);
+    }
+
+    pub fn icon(self: RenderFactory, allocator: std.mem.Allocator, widget: Widget.Icon) !RenderObject {
+        return self.vtable.icon(self.ptr, allocator, widget);
+    }
+};
+
 pub const RenderNode = struct {
     kind: Kind,
     rect: Rect,
     text: ?[]const u8 = null,
     text_style: ResolvedTextStyle = defaultResolvedTextStyle(),
     clickable_id: ?[]const u8 = null,
-    click_callback: ?Widget.Callback = null,
-    tap_down_callback: ?Widget.Callback = null,
-    tap_up_callback: ?Widget.Callback = null,
-    tap_cancel_callback: ?Widget.Callback = null,
+    handler: ?HandlerRef = null,
     click_activation: Widget.ClickActivation = .release,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
@@ -1202,8 +941,8 @@ pub const RenderNode = struct {
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
-    focus_change_callback: ?Widget.FocusChangeCallback = null,
-    render_object: ?Widget.RenderObject = null,
+    focus_change_handler: ?HandlerRef = null,
+    render_object: ?RenderObject = null,
     foreground: Color = colors.ink,
     background: Color = colors.transparent,
     box_border: ?Color = null,
@@ -1229,14 +968,12 @@ pub const RenderNode = struct {
     children: []*RenderNode = &.{},
 
     pub const Kind = enum {
-        keyed,
         text,
         box,
         clickable,
         focus,
         focus_scope,
         scroll,
-        list,
         text_input,
         row,
         column,
@@ -1245,15 +982,10 @@ pub const RenderNode = struct {
         sized,
         padding,
         center,
-        button,
-        actions,
         shortcuts,
-        theme,
         default_text_style,
-        component,
-        stateful,
-        element,
-        render_object,
+        image,
+        icon,
     };
 };
 
@@ -1578,12 +1310,6 @@ pub const CursorShape = enum {
     text,
 };
 
-pub const AppContext = struct {
-    window_width: f32 = 0,
-    window_height: f32 = 0,
-    color_scheme: []const u8 = "no-preference",
-};
-
 /// Editing state owned by a text_input element; the single source of truth
 /// for the input's text after creation.
 pub const TextInputState = struct {
@@ -1607,97 +1333,12 @@ pub fn scrollState(element: *Element) *ScrollState {
     return @ptrCast(@alignCast(element.state.?));
 }
 
-/// State owned by a list element: the scroll offset plus the currently
-/// built item window. range_stale marks a built window that no longer
-/// matches the offset/viewport; the runtime schedules another dirty-state
-/// pass to rebuild it.
-pub const ListState = struct {
-    offset: f32 = 0,
-    viewport_height: f32 = 0,
-    first: usize = 0,
-    built: usize = 0,
-    range_stale: bool = false,
-};
-
-pub fn listState(element: *Element) *ListState {
-    std.debug.assert(element.kind == .list);
-    return @ptrCast(@alignCast(element.state.?));
-}
-
-const list_buffer_items = 2;
-
-const ListRange = struct {
-    first: usize,
-    count: usize,
-};
-
-fn listVisibleRange(list_widget: Widget.List, offset: f32, viewport_height: f32) ListRange {
-    if (list_widget.item_count == 0 or list_widget.item_extent <= 0) return .{ .first = 0, .count = 0 };
-    const height = if (std.math.isFinite(viewport_height))
-        viewport_height
-    else
-        list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
-    const first_visible: usize = @intFromFloat(@max(0, @floor(offset / list_widget.item_extent)));
-    const first = @min(first_visible -| list_buffer_items, list_widget.item_count - 1);
-    const visible: usize = @intFromFloat(@ceil(height / list_widget.item_extent) + 1);
-    const count = @min(visible + list_buffer_items * 2, list_widget.item_count - first);
-    return .{ .first = first, .count = count };
-}
-
-fn buildListChildren(
-    allocator: std.mem.Allocator,
-    scope: *BuildScope,
-    list_widget: Widget.List,
-    range: ListRange,
-    constraints: Constraints,
-) ![]Element {
-    const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
-    const children = try allocator.alloc(Element, range.count);
-    var initialized: usize = 0;
-    errdefer {
-        for (children[0..initialized]) |*child| destroyElementTree(allocator, child);
-        allocator.free(children);
-    }
-    for (children, 0..) |*child, index| {
-        const item = try list_widget.build_item.build(scope, range.first + index);
-        child.* = try buildElementTreeScoped(allocator, scope, &item, item_constraints);
-        initialized += 1;
-    }
-    return children;
-}
-
-/// Reports whether any list's built window drifted from its offset and
-/// viewport, so the runtime can run another dirty-state pass.
-pub fn anyListRangeStale(element: *const Element) bool {
-    if (element.kind == .list) {
-        const state: *const ListState = @ptrCast(@alignCast(element.state.?));
-        if (state.range_stale) return true;
-    }
-    for (element.children) |*child| {
-        if (anyListRangeStale(child)) return true;
-    }
-    return false;
-}
-
 fn scrollChildConstraints(constraints: Constraints, axes: Widget.ScrollAxes) Constraints {
     return .{
         .max_width = if (axes.horizontalUnbounded()) std.math.inf(f32) else constraints.max_width,
         .max_height = if (axes.verticalUnbounded()) std.math.inf(f32) else constraints.max_height,
     };
 }
-
-pub const AppHost = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        build_widget: *const fn (ptr: *anyopaque, scope: *BuildScope, context: AppContext) anyerror!Widget,
-    };
-
-    pub fn buildWidget(self: AppHost, scope: *BuildScope, context: AppContext) !Widget {
-        return self.vtable.build_widget(self.ptr, scope, context);
-    }
-};
 
 pub fn buildRenderTreeFromElement(
     allocator: std.mem.Allocator,
@@ -1709,7 +1350,7 @@ pub fn buildRenderTreeFromElement(
 }
 
 pub fn buildElementTree(allocator: std.mem.Allocator, widget: *const Widget, constraints: Constraints) anyerror!Element {
-    var scope: BuildScope = .{ .allocator = allocator };
+    var scope: BuildScope = .{};
     return buildElementTreeScoped(allocator, &scope, widget, constraints);
 }
 
@@ -1719,301 +1360,209 @@ pub fn buildElementTreeScoped(
     widget: *const Widget,
     constraints: Constraints,
 ) anyerror!Element {
-    switch (widget.*) {
-        .keyed => |keyed_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const element_key = try cloneKey(allocator, keyed_widget.key);
-            errdefer destroyKey(allocator, element_key);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, keyed_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
-        },
-        .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) },
-        .spacer => return .{ .kind = .spacer, .widget = try cloneWidgetForElement(allocator, widget.*) },
-        .sized => |sized_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, sized_widget.child, constrainSized(constraints, sized_widget));
-            initialized = true;
-            return .{ .kind = .sized, .widget = element_widget, .children = children };
-        },
+    return switch (widget.*) {
+        .text => finishElement(allocator, scope, widget, .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) }),
+        .spacer => finishElement(allocator, scope, widget, .{ .kind = .spacer, .widget = try cloneWidgetForElement(allocator, widget.*) }),
         .text_input => {
             var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
-            errdefer destroyElementWidget(allocator, &element_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(TextInputState);
-            errdefer allocator.destroy(state);
+            errdefer if (!element_owns_fields) allocator.destroy(state);
             state.* = .{};
             try state.text.appendSlice(allocator, element_widget.text_input.value);
-            return .{
+            element_owns_fields = true;
+            return finishElement(allocator, scope, widget, .{
                 .kind = .text_input,
                 .widget = element_widget,
                 .state = state,
                 .focused = scope.interaction.isFocused(element_widget.text_input.focus_node),
-            };
+            });
         },
-        .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
-        .box => |box_widget| {
+        .image => |image_widget| {
+            const factory = scope.render_factory orelse return error.MissingRenderFactory;
+            var render_object = try factory.image(allocator, image_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) render_object.destroy(allocator);
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
+            element_owns_fields = true;
+            return finishElement(allocator, scope, widget, .{ .kind = .image, .widget = element_widget, .render_object = render_object });
+        },
+        .icon => |icon_widget| {
+            const factory = scope.render_factory orelse return error.MissingRenderFactory;
+            var resolved_widget = icon_widget;
+            if (resolved_widget.color == null) resolved_widget.color = scope.default_icon_color;
+            var render_object = try factory.icon(allocator, resolved_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) render_object.destroy(allocator);
+            var element_widget = try cloneWidgetForElement(allocator, .{ .icon = resolved_widget });
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
+            element_owns_fields = true;
+            return finishElement(allocator, scope, widget, .{ .kind = .icon, .widget = element_widget, .render_object = render_object });
+        },
+        .box => |box_widget| return buildSingleChildElement(allocator, scope, widget, .box, box_widget.child, constraints),
+        .button => |button_widget| blk: {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
+                if (!element_owns_fields) {
+                    if (initialized) destroyElementTree(allocator, &children[0]);
+                    allocator.free(children);
+                }
             }
-            children[0] = try buildElementTreeScoped(allocator, scope, box_widget.child, constraints);
+            children[0] = try buildButtonChildElement(allocator, scope, button_widget, constraints);
             initialized = true;
-            return .{ .kind = .box, .widget = element_widget, .children = children };
+            element_owns_fields = true;
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .button, .widget = element_widget, .children = children });
         },
-        .clickable => |clickable_widget| {
+        .clickable => |clickable_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
+                if (!element_owns_fields) {
+                    if (initialized) destroyElementTree(allocator, &children[0]);
+                    allocator.free(children);
+                }
             }
             children[0] = try buildClickableChildElement(allocator, scope, clickable_widget, constraints);
             initialized = true;
-            return .{ .kind = .clickable, .widget = element_widget, .children = children };
+            element_owns_fields = true;
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .clickable, .widget = element_widget, .children = children });
         },
-        .focus => |focus_widget| {
+        .focus => |focus_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
             errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
+                if (!element_owns_fields) {
+                    if (initialized) destroyElementTree(allocator, &children[0]);
+                    allocator.free(children);
+                }
             }
             children[0] = try buildElementTreeScoped(allocator, scope, focus_widget.child, constraints);
             initialized = true;
-            return .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children };
+            element_owns_fields = true;
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children });
         },
-        .scroll => |scroll_widget| {
+        .scroll => |scroll_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
+            var element_owns_fields = false;
+            errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(ScrollState);
-            errdefer allocator.destroy(state);
+            errdefer if (!element_owns_fields) allocator.destroy(state);
             state.* = .{};
             const children = try allocator.alloc(Element, 1);
-            errdefer allocator.free(children);
+            errdefer if (!element_owns_fields) allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
-            return .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children };
+            element_owns_fields = true;
+            break :blk try finishElement(allocator, scope, widget, .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children });
         },
-        .list => {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const state = try allocator.create(ListState);
-            errdefer allocator.destroy(state);
-            state.* = .{ .viewport_height = constraints.max_height };
-            const range = listVisibleRange(element_widget.list, state.offset, constraints.max_height);
-            state.first = range.first;
-            state.built = range.count;
-            const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
-            return .{ .kind = .list, .widget = element_widget, .state = state, .children = children };
-        },
-        .focus_scope => |focus_scope_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, focus_scope_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .focus_scope, .widget = element_widget, .children = children };
-        },
-        .padding => |padding_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, padding_widget.child, constraints.inset(padding_widget.insets));
-            initialized = true;
-            return .{ .kind = .padding, .widget = element_widget, .children = children };
-        },
-        .flexible => |flexible_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, flexible_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .flexible, .widget = element_widget, .children = children };
-        },
-        .center => |center_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, center_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .center, .widget = element_widget, .children = children };
-        },
-        .button => {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, element_widget.button);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
-            initialized = true;
-            return .{ .kind = .button, .widget = element_widget, .children = children };
-        },
-        .actions => |actions_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const previous_actions = scope.actions;
-            const nested_actions: ActionScope = .{ .bindings = element_widget.actions.bindings, .parent = previous_actions };
-            scope.actions = &nested_actions;
-            defer scope.actions = previous_actions;
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, actions_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .actions, .widget = element_widget, .children = children };
-        },
-        .shortcuts => |shortcuts_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, shortcuts_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .shortcuts, .widget = element_widget, .children = children };
-        },
-        .theme => |theme_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const previous_theme = scope.theme;
-            scope.theme = theme_widget.theme;
-            defer scope.theme = previous_theme;
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, theme_widget.child, constraints);
-            initialized = true;
-            return .{ .kind = .theme, .widget = element_widget, .children = children };
-        },
+        .focus_scope => |focus_scope_widget| return buildSingleChildElement(allocator, scope, widget, .focus_scope, focus_scope_widget.child, constraints),
+        .padding => |padding_widget| return buildSingleChildElement(allocator, scope, widget, .padding, padding_widget.child, constraints.inset(padding_widget.insets)),
+        .flexible => |flexible_widget| return buildSingleChildElement(allocator, scope, widget, .flexible, flexible_widget.child, constraints),
+        .center => |center_widget| return buildSingleChildElement(allocator, scope, widget, .center, center_widget.child, constraints),
+        .shortcuts => |shortcuts_widget| return buildSingleChildElement(allocator, scope, widget, .shortcuts, shortcuts_widget.child, constraints),
+        .sized => |sized_widget| return buildSingleChildElement(allocator, scope, widget, .sized, sized_widget.child, constrainSized(constraints, sized_widget)),
         .default_text_style => |default_text_style| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
             defer scope.default_text_style = previous_style;
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, default_text_style.child, constraints);
-            initialized = true;
-            return .{ .kind = .default_text_style, .widget = element_widget, .children = children };
+            return buildSingleChildElement(allocator, scope, widget, .default_text_style, default_text_style.child, constraints);
         },
         .row => |row_widget| return buildLinearElementTree(allocator, scope, .row, widget.*, row_widget.children, constraints),
         .column => |column_widget| return buildLinearElementTree(allocator, scope, .column, widget.*, column_widget.children, constraints),
-        .component => |component_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try component_widget.build(scope, buildContext(scope, constraints));
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
-            initialized = true;
-            return .{ .kind = .component, .widget = element_widget, .children = children };
-        },
-        .stateful => |stateful_widget| {
-            _ = stateful_widget;
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const retained_stateful = element_widget.stateful;
-            const state = try retained_stateful.createState(allocator);
-            errdefer retained_stateful.destroyState(state, allocator);
-            const built = try retained_stateful.build(state, scope, buildContext(scope, constraints));
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
-            initialized = true;
-            return .{ .kind = .stateful, .widget = element_widget, .state = state, .children = children };
-        },
-        .element => |custom_element| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
-            children[0] = try custom_element.build(allocator, scope, buildContext(scope, constraints));
-            initialized = true;
-            return .{ .kind = .element, .widget = element_widget, .children = children };
-        },
-    }
-}
-
-fn buildContext(scope: *const BuildScope, constraints: Constraints) Widget.BuildContext {
-    return .{
-        .constraints = constraints,
-        .theme = scope.theme,
-        .default_text_style = scope.default_text_style,
-        .interaction = scope.interaction,
-        .app_context = scope.app_context,
     };
 }
+
+fn finishElement(allocator: std.mem.Allocator, scope: *const BuildScope, widget: *const Widget, element: Element) !Element {
+    var result = element;
+    errdefer destroyElementTree(allocator, &result);
+    result.document_id = scope.document_id;
+    result.key = if (widgetKey(widget.*)) |key| try allocator.dupe(u8, key) else null;
+    return result;
+}
+
+fn buildSingleChildElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    widget: *const Widget,
+    kind: Element.Kind,
+    child_widget: *const Widget,
+    constraints: Constraints,
+) !Element {
+    var element_widget = try cloneWidgetForElement(allocator, widget.*);
+    var element_owns_fields = false;
+    errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
+    const children = try allocator.alloc(Element, 1);
+    var initialized = false;
+    errdefer {
+        if (!element_owns_fields) {
+            if (initialized) destroyElementTree(allocator, &children[0]);
+            allocator.free(children);
+        }
+    }
+    children[0] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
+    initialized = true;
+    element_owns_fields = true;
+    return finishElement(allocator, scope, widget, .{ .kind = kind, .widget = element_widget, .children = children });
+}
+
+fn buildButtonChildElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    button_widget: Widget.Button,
+    constraints: Constraints,
+) !Element {
+    var composition: ButtonComposition = undefined;
+    composition.init(scope.theme, scope.interaction, button_widget);
+    const previous_icon_color = scope.default_icon_color;
+    scope.default_icon_color = composition.foreground;
+    defer scope.default_icon_color = previous_icon_color;
+    return buildElementTreeScoped(allocator, scope, &composition.surface, constraints);
+}
+
+const ButtonComposition = struct {
+    styled_child: Widget,
+    padded_child: Widget,
+    surface: Widget,
+    foreground: Color,
+
+    fn init(self: *ButtonComposition, theme: Theme, interaction: InteractionState, button_widget: Widget.Button) void {
+        const enabled = button_widget.handler != null;
+        const hovered = enabled and interaction.isHovered(button_widget.id);
+        const pressed = enabled and interaction.isPressed(button_widget.id);
+        const focused = enabled and interaction.isFocused(.named(button_widget.id));
+        self.foreground = buttonForeground(theme, enabled, hovered);
+        self.styled_child = .{ .default_text_style = .{
+            .style = .{ .color = self.foreground },
+            .child = button_widget.child,
+        } };
+        self.padded_child = .{ .padding = .{
+            .insets = .{
+                .left = theme.button_theme.padding_x,
+                .top = theme.button_theme.padding_y,
+                .right = theme.button_theme.padding_x,
+                .bottom = theme.button_theme.padding_y,
+            },
+            .child = &self.styled_child,
+        } };
+        self.surface = .{ .box = .{
+            .child = &self.padded_child,
+            .background = if (!enabled) buttonDisabledBackground(theme) else if (pressed) buttonPressedBackground(theme) else buttonBackground(theme, hovered),
+            .border = if (focused) buttonFocusedBorder(theme) else null,
+            .radius = theme.button_theme.radius,
+        } };
+    }
+};
 
 fn buildLinearElementTree(
     allocator: std.mem.Allocator,
@@ -2026,12 +1575,15 @@ fn buildLinearElementTree(
     std.debug.assert(kind == .row or kind == .column);
 
     var element_widget = try cloneWidgetForElement(allocator, widget);
-    errdefer destroyElementWidget(allocator, &element_widget);
+    var element_owns_fields = false;
+    errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
     const children = try allocator.alloc(Element, child_widgets.len);
     var initialized: usize = 0;
     errdefer {
-        for (children[0..initialized]) |*child| destroyElementTree(allocator, child);
-        allocator.free(children);
+        if (!element_owns_fields) {
+            for (children[0..initialized]) |*child| destroyElementTree(allocator, child);
+            allocator.free(children);
+        }
     }
 
     for (child_widgets, 0..) |*child_widget, index| {
@@ -2039,7 +1591,8 @@ fn buildLinearElementTree(
         initialized += 1;
     }
 
-    return .{ .kind = kind, .widget = element_widget, .children = children };
+    element_owns_fields = true;
+    return finishElement(allocator, scope, &widget, .{ .kind = kind, .widget = element_widget, .children = children });
 }
 
 pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void {
@@ -2053,27 +1606,29 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
     element.children = &.{};
     if (element.state) |state| {
         switch (element.kind) {
-            .stateful => element.widget.stateful.destroyState(state, allocator),
             .text_input => {
                 const input_state: *TextInputState = @ptrCast(@alignCast(state));
                 input_state.text.deinit(allocator);
                 allocator.destroy(input_state);
             },
             .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
-            .list => allocator.destroy(@as(*ListState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
         element.state = null;
     }
     if (element.key) |key| {
-        destroyKey(allocator, key);
+        allocator.free(key);
         element.key = null;
+    }
+    if (element.render_object) |render_object| {
+        render_object.destroy(allocator);
+        element.render_object = null;
     }
     destroyElementWidget(allocator, &element.widget);
 }
 
 pub fn updateElementTree(allocator: std.mem.Allocator, element: *Element, widget: *const Widget, constraints: Constraints) anyerror!void {
-    var scope: BuildScope = .{ .allocator = allocator };
+    var scope: BuildScope = .{};
     try updateElementTreeScoped(allocator, &scope, element, widget, constraints);
 }
 
@@ -2095,119 +1650,55 @@ pub fn updateElementTreeScoped(
         return;
     }
 
+    element.document_id = scope.document_id;
     switch (widget.*) {
-        .keyed => |keyed_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, keyed_widget.child, constraints);
-            if (element.key) |old_key| destroyKey(allocator, old_key);
-            element.key = try cloneKey(allocator, keyed_widget.key);
-        },
-        .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
-        .spacer => try replaceElementWidget(allocator, element, widget.*),
-        .sized => |sized_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, sized_widget.child, constrainSized(constraints, sized_widget));
-        },
+        .text => try replaceElementWidgetThemed(allocator, scope, element, widget, scope.theme, scope.default_text_style),
+        .spacer => try replaceElementWidget(allocator, scope, element, widget),
         .text_input => {
-            try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style);
+            try replaceElementWidgetThemed(allocator, scope, element, widget, scope.theme, scope.default_text_style);
             element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
         },
-        .render_object => try replaceElementWidget(allocator, element, widget.*),
-        .box => |box_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
+        .image => |image_widget| {
+            const factory = scope.render_factory orelse return error.MissingRenderFactory;
+            var render_object = try factory.image(allocator, image_widget);
+            errdefer render_object.destroy(allocator);
+            try replaceElementWidget(allocator, scope, element, widget);
+            if (element.render_object) |old| old.destroy(allocator);
+            element.render_object = render_object;
         },
-        .clickable => |clickable_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, clickable_widget.child, constraints);
+        .icon => |icon_widget| {
+            const factory = scope.render_factory orelse return error.MissingRenderFactory;
+            var resolved_widget = icon_widget;
+            if (resolved_widget.color == null) resolved_widget.color = scope.default_icon_color;
+            var render_object = try factory.icon(allocator, resolved_widget);
+            errdefer render_object.destroy(allocator);
+            const resolved: Widget = .{ .icon = resolved_widget };
+            try replaceElementWidget(allocator, scope, element, &resolved);
+            if (element.render_object) |old| old.destroy(allocator);
+            element.render_object = render_object;
         },
+        .box => |box_widget| try updateSingleChildElement(allocator, scope, element, widget, box_widget.child, constraints),
+        .button => |button_widget| try updateButtonElement(allocator, scope, element, widget, button_widget, constraints),
+        .clickable => |clickable_widget| try updateSingleChildElement(allocator, scope, element, widget, clickable_widget.child, constraints),
         .focus => |focus_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, focus_widget.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget, focus_widget.child, constraints);
             element.focused = scope.interaction.isFocused(element.widget.focus.node);
         },
-        .scroll => |scroll_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
-        },
-        .list => {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const state = listState(element);
-            const range = listVisibleRange(element_widget.list, state.offset, state.viewport_height);
-            const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
-            for (element.children) |*child| destroyElementTree(allocator, child);
-            allocator.free(element.children);
-            element.children = children;
-            state.first = range.first;
-            state.built = range.count;
-            state.range_stale = false;
-            destroyElementWidget(allocator, &element.widget);
-            element.widget = element_widget;
-        },
-        .focus_scope => |focus_scope_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, focus_scope_widget.child, constraints);
-        },
-        .padding => |padding_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, padding_widget.child, constraints.inset(padding_widget.insets));
-        },
-        .flexible => |flexible_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, flexible_widget.child, constraints);
-        },
-        .center => |center_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, center_widget.child, constraints);
-        },
-        .button => |button_widget| {
-            _ = button_widget;
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, element_widget.button);
-            try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
-            destroyElementWidget(allocator, &element.widget);
-            element.widget = element_widget;
-        },
-        .actions => |actions_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            const previous_actions = scope.actions;
-            const nested_actions: ActionScope = .{ .bindings = element_widget.actions.bindings, .parent = previous_actions };
-            scope.actions = &nested_actions;
-            defer scope.actions = previous_actions;
-            try updateElementTreeScoped(allocator, scope, &element.children[0], actions_widget.child, constraints);
-            destroyElementWidget(allocator, &element.widget);
-            element.widget = element_widget;
-        },
-        .shortcuts => |shortcuts_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, shortcuts_widget.child, constraints);
-        },
-        .theme => |theme_widget| {
-            const previous_theme = scope.theme;
-            scope.theme = theme_widget.theme;
-            defer scope.theme = previous_theme;
-            try updateSingleChildElement(allocator, scope, element, widget.*, theme_widget.child, constraints);
-        },
+        .scroll => |scroll_widget| try updateSingleChildElement(allocator, scope, element, widget, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes)),
+        .focus_scope => |focus_scope_widget| try updateSingleChildElement(allocator, scope, element, widget, focus_scope_widget.child, constraints),
+        .padding => |padding_widget| try updateSingleChildElement(allocator, scope, element, widget, padding_widget.child, constraints.inset(padding_widget.insets)),
+        .flexible => |flexible_widget| try updateSingleChildElement(allocator, scope, element, widget, flexible_widget.child, constraints),
+        .center => |center_widget| try updateSingleChildElement(allocator, scope, element, widget, center_widget.child, constraints),
+        .shortcuts => |shortcuts_widget| try updateSingleChildElement(allocator, scope, element, widget, shortcuts_widget.child, constraints),
+        .sized => |sized_widget| try updateSingleChildElement(allocator, scope, element, widget, sized_widget.child, constrainSized(constraints, sized_widget)),
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
             defer scope.default_text_style = previous_style;
-            try updateSingleChildElement(allocator, scope, element, widget.*, default_text_style.child, constraints);
+            try updateSingleChildElement(allocator, scope, element, widget, default_text_style.child, constraints);
         },
         .row => |row_widget| try updateLinearElement(allocator, scope, element, widget.*, row_widget.children, constraints),
         .column => |column_widget| try updateLinearElement(allocator, scope, element, widget.*, column_widget.children, constraints),
-        .component => |component_widget| {
-            const built = try component_widget.build(scope, buildContext(scope, constraints));
-            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
-        },
-        .stateful => |stateful_widget| {
-            const state = element.state orelse return error.MissingState;
-            try stateful_widget.update(state, allocator, buildContext(scope, constraints));
-            const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
-            try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
-        },
-        .element => |custom_element| {
-            var replacement_child = try custom_element.build(allocator, scope, buildContext(scope, constraints));
-            errdefer destroyElementTree(allocator, &replacement_child);
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
-            errdefer destroyElementWidget(allocator, &element_widget);
-            destroyElementTree(allocator, &element.children[0]);
-            element.children[0] = replacement_child;
-            destroyElementWidget(allocator, &element.widget);
-            element.widget = element_widget;
-        },
     }
 }
 
@@ -2221,77 +1712,33 @@ pub fn rebuildDirtyElementTreeScoped(
         .text,
         .spacer,
         .text_input,
-        .render_object,
-        .button,
+        .image,
+        .icon,
         => return false,
 
-        .keyed,
         .box,
         .sized,
+        .button,
         .clickable,
         .focus,
         .focus_scope,
         .center,
         .flexible,
-        .component,
-        .element,
         .shortcuts,
         => return try rebuildDirtySingleChildElement(allocator, scope, element, constraints),
 
         .scroll => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
-        .list => |list_widget| {
-            const state = listState(element);
-            const rebuilt_children = try rebuildDirtyChildren(allocator, scope, element.children, .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent });
-            if (!state.range_stale) {
-                if (rebuilt_children) markElementLayoutDirty(element);
-                return rebuilt_children;
-            }
-            const range = listVisibleRange(list_widget, state.offset, state.viewport_height);
-            const children = try buildListChildren(allocator, scope, list_widget, range, constraints);
-            for (element.children) |*child| destroyElementTree(allocator, child);
-            allocator.free(element.children);
-            element.children = children;
-            state.first = range.first;
-            state.built = range.count;
-            state.range_stale = false;
-            markElementLayoutDirty(element);
-            return true;
-        },
         .padding => |padding_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, constraints.inset(padding_widget.insets)),
-        .theme => |theme_widget| {
-            const previous_theme = scope.theme;
-            scope.theme = theme_widget.theme;
-            defer scope.theme = previous_theme;
-            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
-        },
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
             defer scope.default_text_style = previous_style;
             return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
-        .actions => |actions_widget| {
-            const previous_actions = scope.actions;
-            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = previous_actions };
-            scope.actions = &nested_actions;
-            defer scope.actions = previous_actions;
-            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
-        },
         .row, .column => {
             const rebuilt = try rebuildDirtyChildren(allocator, scope, element.children, constraints);
             if (rebuilt) markElementLayoutDirty(element);
             return rebuilt;
-        },
-        .stateful => |stateful_widget| {
-            const state = element.state orelse return error.MissingState;
-            if (stateful_widget.needsRebuild(state)) {
-                const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
-                try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
-                stateful_widget.clearRebuild(state);
-                markElementLayoutDirty(element);
-                return true;
-            }
-            return try rebuildDirtySingleChildElement(allocator, scope, element, constraints);
         },
     }
 }
@@ -2320,7 +1767,6 @@ pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element 
 pub fn dirtyScrollElement(element: *Element, scroll_id: []const u8) ?*Element {
     const id: ?[]const u8 = switch (element.kind) {
         .scroll => element.widget.scroll.id,
-        .list => element.widget.list.id,
         else => null,
     };
     if (id) |element_id| {
@@ -2353,20 +1799,9 @@ pub fn refreshInteractionElements(
         .text,
         .spacer,
         .text_input,
-        .render_object,
+        .image,
+        .icon,
         => return false,
-
-        .button => |button_widget| {
-            var matched = false;
-            for (ids) |id| {
-                if (std.mem.eql(u8, button_widget.id, id)) matched = true;
-            }
-            if (!matched) return false;
-            const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, button_widget);
-            try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
-            markElementLayoutDirty(element);
-            return true;
-        },
 
         .clickable => |clickable_widget| {
             var matched = false;
@@ -2382,47 +1817,34 @@ pub fn refreshInteractionElements(
             return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
         },
 
-        .keyed,
+        .button => |button_widget| {
+            var matched = false;
+            for (ids) |id| {
+                if (std.mem.eql(u8, button_widget.id, id)) matched = true;
+            }
+            if (matched) {
+                try updateButtonChildElement(allocator, scope, &element.children[0], button_widget, constraints);
+                markElementLayoutDirty(element);
+                return true;
+            }
+            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
+        },
+
         .box,
         .sized,
         .focus,
         .focus_scope,
         .center,
         .flexible,
-        .component,
-        .element,
         .shortcuts,
-        .stateful,
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
         .scroll => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
-        .list => |list_widget| {
-            var refreshed = false;
-            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
-            for (element.children) |*child| {
-                if (try refreshInteractionElements(allocator, scope, child, item_constraints, ids)) refreshed = true;
-            }
-            if (refreshed) markElementLayoutDirty(element);
-            return refreshed;
-        },
         .padding => |padding_widget| return try refreshInteractionSingleChild(allocator, scope, element, constraints.inset(padding_widget.insets), ids),
-        .theme => |theme_widget| {
-            const previous_theme = scope.theme;
-            scope.theme = theme_widget.theme;
-            defer scope.theme = previous_theme;
-            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
-        },
         .default_text_style => |default_text_style| {
             const previous_style = scope.default_text_style;
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
             defer scope.default_text_style = previous_style;
-            return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
-        },
-        .actions => |actions_widget| {
-            const previous_actions = scope.actions;
-            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = previous_actions };
-            scope.actions = &nested_actions;
-            defer scope.actions = previous_actions;
             return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids);
         },
         .row, .column => {
@@ -2478,22 +1900,22 @@ fn rebuildDirtyChildren(
 
 fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
     if (element.kind != elementKindForWidget(widget.*)) return false;
-    return switch (widget.*) {
-        .stateful => |stateful_widget| element.widget.stateful.type_token == stateful_widget.type_token,
-        else => true,
-    };
+    const old_key = element.key;
+    const new_key = widgetKey(widget.*);
+    if (old_key == null and new_key == null) return true;
+    if (old_key == null or new_key == null) return false;
+    return std.mem.eql(u8, old_key.?, new_key.?);
 }
 
 fn elementKindForWidget(widget: Widget) Element.Kind {
     return switch (widget) {
-        .keyed => .keyed,
         .text => .text,
         .box => .box,
+        .button => .button,
         .clickable => .clickable,
         .focus => .focus,
         .focus_scope => .focus_scope,
         .scroll => .scroll,
-        .list => .list,
         .text_input => .text_input,
         .row => .row,
         .column => .column,
@@ -2502,15 +1924,10 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .sized => .sized,
         .padding => .padding,
         .center => .center,
-        .button => .button,
-        .actions => .actions,
         .shortcuts => .shortcuts,
-        .theme => .theme,
         .default_text_style => .default_text_style,
-        .component => .component,
-        .stateful => .stateful,
-        .element => .element,
-        .render_object => .render_object,
+        .image => .image,
+        .icon => .icon,
     };
 }
 
@@ -2518,16 +1935,61 @@ fn updateSingleChildElement(
     allocator: std.mem.Allocator,
     scope: *BuildScope,
     element: *Element,
-    widget: Widget,
+    widget: *const Widget,
     child_widget: *const Widget,
     child_constraints: Constraints,
 ) anyerror!void {
     std.debug.assert(element.children.len == 1);
-    var element_widget = try cloneWidgetForElement(allocator, widget);
+    var element_widget = try cloneWidgetForElement(allocator, widget.*);
     errdefer destroyElementWidget(allocator, &element_widget);
+    const new_key = try cloneElementKey(allocator, widget.*);
+    errdefer if (new_key) |key| allocator.free(key);
     try updateElementTreeScoped(allocator, scope, &element.children[0], child_widget, child_constraints);
+
+    // All fallible work is complete before ownership is transferred.
     destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
     element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
+}
+
+fn updateButtonElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    widget: *const Widget,
+    button_widget: Widget.Button,
+    constraints: Constraints,
+) !void {
+    std.debug.assert(element.children.len == 1);
+    var element_widget = try cloneWidgetForElement(allocator, widget.*);
+    errdefer destroyElementWidget(allocator, &element_widget);
+    const new_key = try cloneElementKey(allocator, widget.*);
+    errdefer if (new_key) |key| allocator.free(key);
+
+    try updateButtonChildElement(allocator, scope, &element.children[0], button_widget, constraints);
+
+    destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
+    element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
+}
+
+fn updateButtonChildElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    button_widget: Widget.Button,
+    constraints: Constraints,
+) !void {
+    var composition: ButtonComposition = undefined;
+    composition.init(scope.theme, scope.interaction, button_widget);
+    const previous_icon_color = scope.default_icon_color;
+    scope.default_icon_color = composition.foreground;
+    defer scope.default_icon_color = previous_icon_color;
+    try updateElementTreeScoped(allocator, scope, element, &composition.surface, constraints);
 }
 
 fn updateLinearElement(
@@ -2553,11 +2015,18 @@ fn updateLinearElement(
 
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
+    const new_key = try cloneElementKey(allocator, widget);
+    errdefer if (new_key) |key| allocator.free(key);
     for (child_widgets, 0..) |*child_widget, index| {
         try updateElementTreeScoped(allocator, scope, &element.children[index], child_widget, constraints);
     }
+
+    // All fallible work is complete before ownership is transferred.
     destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
     element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
 }
 
 fn updateKeyedLinearElement(
@@ -2576,15 +2045,20 @@ fn updateKeyedLinearElement(
     defer allocator.free(used);
     @memset(used, false);
 
+    const origins = try allocator.alloc(?usize, child_widgets.len);
+    defer allocator.free(origins);
+    @memset(origins, null);
     const new_children = try allocator.alloc(Element, child_widgets.len);
     var initialized: usize = 0;
     errdefer {
-        for (new_children[0..initialized]) |*child| destroyElementTree(allocator, child);
-        allocator.free(new_children);
-        for (old_children, 0..) |*old_child, index| {
-            if (!used[index]) destroyElementTree(allocator, old_child);
+        for (new_children[0..initialized], origins[0..initialized]) |*child, origin| {
+            if (origin) |old_index| {
+                old_children[old_index] = child.*;
+            } else {
+                destroyElementTree(allocator, child);
+            }
         }
-        allocator.free(old_children);
+        allocator.free(new_children);
     }
 
     for (child_widgets, 0..) |*child_widget, index| {
@@ -2592,15 +2066,17 @@ fn updateKeyedLinearElement(
             if (findElementByKey(old_children, used, key)) |old_index| {
                 used[old_index] = true;
                 new_children[index] = old_children[old_index];
-                try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
+                origins[index] = old_index;
                 initialized += 1;
+                try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
                 continue;
             }
         } else if (index < old_children.len and !used[index] and old_children[index].key == null) {
             used[index] = true;
             new_children[index] = old_children[index];
-            try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
+            origins[index] = index;
             initialized += 1;
+            try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
             continue;
         }
 
@@ -2608,12 +2084,18 @@ fn updateKeyedLinearElement(
         initialized += 1;
     }
 
+    const new_key = if (widgetKey(widget)) |key| try allocator.dupe(u8, key) else null;
+    errdefer if (new_key) |key| allocator.free(key);
+
     for (old_children, 0..) |*old_child, index| {
         if (!used[index]) destroyElementTree(allocator, old_child);
     }
     allocator.free(old_children);
     destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
     element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
     element.children = new_children;
 }
 
@@ -2632,34 +2114,69 @@ fn hasKeyedWidgets(items: []const Widget) bool {
     return false;
 }
 
-fn findElementByKey(children: []const Element, used: []const bool, key: Widget.Key) ?usize {
+fn findElementByKey(children: []const Element, used: []const bool, key: []const u8) ?usize {
     for (children, 0..) |child, index| {
         if (used[index]) continue;
         const child_key = child.key orelse continue;
-        if (keysEqual(child_key, key)) return index;
+        if (std.mem.eql(u8, child_key, key)) return index;
     }
     return null;
 }
 
-fn widgetKey(widget: Widget) ?Widget.Key {
+fn widgetKey(widget: Widget) ?[]const u8 {
     return switch (widget) {
-        .keyed => |keyed_widget| keyed_widget.key,
-        else => null,
+        .text => |value| value.key,
+        .box => |value| value.key,
+        .button => |value| value.key,
+        .clickable => |value| value.key,
+        .focus => |value| value.key,
+        .focus_scope => |value| value.key,
+        .scroll => |value| value.key,
+        .text_input => |value| value.key,
+        .row => |value| value.key,
+        .column => |value| value.key,
+        .spacer => |value| value.key,
+        .flexible => |value| value.key,
+        .sized => |value| value.key,
+        .padding => |value| value.key,
+        .center => |value| value.key,
+        .shortcuts => |value| value.key,
+        .default_text_style => |value| value.key,
+        .image => |value| value.key,
+        .icon => |value| value.key,
     };
 }
 
-fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget: Widget) anyerror!void {
-    var element_widget = try cloneWidgetForElement(allocator, widget);
-    errdefer destroyElementWidget(allocator, &element_widget);
-    destroyElementWidget(allocator, &element.widget);
-    element.widget = element_widget;
+fn cloneElementKey(allocator: std.mem.Allocator, widget: Widget) !?[]u8 {
+    return if (widgetKey(widget)) |key| try allocator.dupe(u8, key) else null;
 }
 
-fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme, inherited_style: TextStyle) anyerror!void {
-    var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme, inherited_style);
+fn replaceElementWidget(allocator: std.mem.Allocator, scope: *BuildScope, element: *Element, widget: *const Widget) anyerror!void {
+    var element_widget = try cloneWidgetForElement(allocator, widget.*);
     errdefer destroyElementWidget(allocator, &element_widget);
+    const new_key = try cloneElementKey(allocator, widget.*);
+    errdefer if (new_key) |key| allocator.free(key);
+
+    // All fallible work is complete before ownership is transferred.
     destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
     element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
+}
+
+fn replaceElementWidgetThemed(allocator: std.mem.Allocator, scope: *BuildScope, element: *Element, widget: *const Widget, theme: Theme, inherited_style: TextStyle) anyerror!void {
+    var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, theme, inherited_style);
+    errdefer destroyElementWidget(allocator, &element_widget);
+    const new_key = try cloneElementKey(allocator, widget.*);
+    errdefer if (new_key) |key| allocator.free(key);
+
+    // All fallible work is complete before ownership is transferred.
+    destroyElementWidget(allocator, &element.widget);
+    if (element.key) |old_key| allocator.free(old_key);
+    element.widget = element_widget;
+    element.key = new_key;
+    element.document_id = scope.document_id;
 }
 
 fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme, inherited_style: TextStyle) !Widget {
@@ -2738,86 +2255,72 @@ fn clickableChildBackground(child: *const Widget) ?Color {
 
 fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
     return switch (widget) {
-        .keyed => |keyed_widget| .{ .keyed = .{
-            .key = try cloneKey(allocator, keyed_widget.key),
-            .child = keyed_widget.child,
-        } },
         .text => |text_widget| .{ .text = .{
+            .key = if (text_widget.key) |key| try allocator.dupe(u8, key) else null,
             .value = try allocator.dupe(u8, text_widget.value),
             .color = text_widget.color,
             .font_size = text_widget.font_size,
             .role = text_widget.role,
         } },
-        .spacer => |spacer_widget| .{ .spacer = spacer_widget },
-        .sized => |sized_widget| .{ .sized = sized_widget },
+        .spacer => |spacer_widget| .{ .spacer = .{ .key = if (spacer_widget.key) |key| try allocator.dupe(u8, key) else null, .flex = spacer_widget.flex } },
+        .sized => |sized_widget| .{ .sized = .{ .key = if (sized_widget.key) |key| try allocator.dupe(u8, key) else null, .child = sized_widget.child, .width = sized_widget.width, .height = sized_widget.height, .min_width = sized_widget.min_width, .min_height = sized_widget.min_height, .max_width = sized_widget.max_width, .max_height = sized_widget.max_height } },
+        .box => |box_widget| .{ .box = .{ .key = if (box_widget.key) |key| try allocator.dupe(u8, key) else null, .child = box_widget.child, .background = box_widget.background, .border = box_widget.border, .border_width = box_widget.border_width, .radius = box_widget.radius, .min_width = box_widget.min_width, .min_height = box_widget.min_height, .horizontal_align = box_widget.horizontal_align, .vertical_align = box_widget.vertical_align } },
         .button => |button_widget| blk: {
+            const key = if (button_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, button_widget.id);
-            errdefer allocator.free(id);
-            const label = try allocator.dupe(u8, button_widget.label);
-            errdefer allocator.free(label);
-            const intent = if (button_widget.intent) |intent_value| try cloneIntent(allocator, intent_value) else null;
-            errdefer if (intent) |intent_value| destroyIntent(allocator, intent_value);
-            const callback = if (button_widget.on_pressed) |on_pressed| try on_pressed.clone(allocator) else null;
-            errdefer if (callback) |on_pressed| on_pressed.destroy(allocator);
-            break :blk .{ .button = .{ .id = id, .label = label, .on_pressed = callback, .intent = intent } };
+            break :blk .{ .button = .{
+                .key = key,
+                .id = id,
+                .handler = button_widget.handler,
+                .child = button_widget.child,
+                .activation = button_widget.activation,
+            } };
         },
-        .box => |box_widget| .{ .box = box_widget },
         .clickable => |clickable_widget| blk: {
+            const key = if (clickable_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, clickable_widget.id);
             errdefer allocator.free(id);
-            const callback = if (clickable_widget.on_click) |on_click| try on_click.clone(allocator) else null;
-            errdefer if (callback) |on_click| on_click.destroy(allocator);
-            const tap_down = if (clickable_widget.on_tap_down) |on_tap_down| try on_tap_down.clone(allocator) else null;
-            errdefer if (tap_down) |on_tap_down| on_tap_down.destroy(allocator);
-            const tap_up = if (clickable_widget.on_tap_up) |on_tap_up| try on_tap_up.clone(allocator) else null;
-            errdefer if (tap_up) |on_tap_up| on_tap_up.destroy(allocator);
-            const tap_cancel = if (clickable_widget.on_tap_cancel) |on_tap_cancel| try on_tap_cancel.clone(allocator) else null;
-            errdefer if (tap_cancel) |on_tap_cancel| on_tap_cancel.destroy(allocator);
             break :blk .{ .clickable = .{
+                .key = key,
                 .id = id,
+                .handler = clickable_widget.handler,
                 .child = clickable_widget.child,
-                .on_click = callback,
-                .on_tap_down = tap_down,
-                .on_tap_up = tap_up,
-                .on_tap_cancel = tap_cancel,
                 .activation = clickable_widget.activation,
                 .hover_style = clickableHoverStyle(clickable_widget),
             } };
         },
         .focus => |focus_widget| blk: {
+            const key = if (focus_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const focus_id = try allocator.dupe(u8, focus_widget.node.id);
             errdefer allocator.free(focus_id);
-            const focus_change_callback = if (focus_widget.on_focus_change) |callback| try callback.clone(allocator) else null;
-            errdefer if (focus_change_callback) |callback| callback.destroy(allocator);
             break :blk .{ .focus = .{
+                .key = key,
                 .node = .named(focus_id),
                 .child = focus_widget.child,
                 .autofocus = focus_widget.autofocus,
                 .skip_traversal = focus_widget.skip_traversal,
                 .can_request_focus = focus_widget.can_request_focus,
-                .on_focus_change = focus_change_callback,
+                .on_focus_change = focus_widget.on_focus_change,
             } };
         },
         .focus_scope => |focus_scope_widget| blk: {
+            const key = if (focus_scope_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, focus_scope_widget.id);
-            break :blk .{ .focus_scope = .{ .id = id, .child = focus_scope_widget.child, .modal = focus_scope_widget.modal } };
+            break :blk .{ .focus_scope = .{ .key = key, .id = id, .child = focus_scope_widget.child, .modal = focus_scope_widget.modal } };
         },
         .scroll => |scroll_widget| blk: {
+            const key = if (scroll_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, scroll_widget.id);
-            break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
-        },
-        .list => |list_widget| blk: {
-            const id = try allocator.dupe(u8, list_widget.id);
-            errdefer allocator.free(id);
-            const builder = try list_widget.build_item.clone(allocator);
-            break :blk .{ .list = .{
-                .id = id,
-                .item_count = list_widget.item_count,
-                .item_extent = list_widget.item_extent,
-                .build_item = builder,
-            } };
+            break :blk .{ .scroll = .{ .key = key, .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
         },
         .text_input => |input_widget| blk: {
+            const key = if (input_widget.key) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (key) |value| allocator.free(value);
             const id = try allocator.dupe(u8, input_widget.id);
             errdefer allocator.free(id);
             const focus_node_id = try allocator.dupe(u8, input_widget.focus_node.id);
@@ -2826,13 +2329,13 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer allocator.free(value);
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             errdefer allocator.free(placeholder);
-            const on_change = if (input_widget.on_change) |callback| try callback.clone(allocator) else null;
             break :blk .{ .text_input = .{
+                .key = key,
                 .id = id,
                 .focus_node = .named(focus_node_id),
                 .value = value,
                 .placeholder = placeholder,
-                .on_change = on_change,
+                .on_change = input_widget.on_change,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .border = input_widget.border,
@@ -2844,155 +2347,86 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .autofocus = input_widget.autofocus,
             } };
         },
-        .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
-        .column => |column_widget| .{ .column = .{ .children = &.{}, .gap = column_widget.gap, .cross_align = column_widget.cross_align, .main_align = column_widget.main_align } },
-        .padding => |padding_widget| .{ .padding = padding_widget },
-        .center => |center_widget| .{ .center = center_widget },
-        .flexible => |flexible_widget| .{ .flexible = flexible_widget },
-        .actions => |actions_widget| .{ .actions = .{
-            .bindings = try cloneActionBindings(allocator, actions_widget.bindings),
-            .child = actions_widget.child,
-        } },
+        .row => |row_widget| .{ .row = .{ .key = if (row_widget.key) |key| try allocator.dupe(u8, key) else null, .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
+        .column => |column_widget| .{ .column = .{ .key = if (column_widget.key) |key| try allocator.dupe(u8, key) else null, .children = &.{}, .gap = column_widget.gap, .cross_align = column_widget.cross_align, .main_align = column_widget.main_align } },
+        .padding => |padding_widget| .{ .padding = .{ .key = if (padding_widget.key) |key| try allocator.dupe(u8, key) else null, .insets = padding_widget.insets, .child = padding_widget.child } },
+        .center => |center_widget| .{ .center = .{ .key = if (center_widget.key) |key| try allocator.dupe(u8, key) else null, .child = center_widget.child } },
+        .flexible => |flexible_widget| .{ .flexible = .{ .key = if (flexible_widget.key) |key| try allocator.dupe(u8, key) else null, .child = flexible_widget.child, .flex = flexible_widget.flex, .fit = flexible_widget.fit } },
         .shortcuts => |shortcuts_widget| .{ .shortcuts = .{
+            .key = if (shortcuts_widget.key) |key| try allocator.dupe(u8, key) else null,
             .bindings = try cloneShortcutBindings(allocator, shortcuts_widget.bindings),
             .child = shortcuts_widget.child,
         } },
-        .theme => |theme_widget| .{ .theme = theme_widget },
-        .default_text_style => |default_text_style| .{ .default_text_style = default_text_style },
-        .component => |component_widget| .{ .component = component_widget },
-        .stateful => |stateful_widget| .{ .stateful = try stateful_widget.clone(allocator) },
-        .element => |custom_element| .{ .element = try custom_element.clone(allocator) },
-        .render_object => |render_object| .{ .render_object = try render_object.clone(allocator) },
+        .default_text_style => |default_text_style| .{ .default_text_style = .{ .key = if (default_text_style.key) |key| try allocator.dupe(u8, key) else null, .style = default_text_style.style, .child = default_text_style.child } },
+        .image => |image_widget| .{ .image = .{ .key = if (image_widget.key) |key| try allocator.dupe(u8, key) else null, .resource = image_widget.resource, .width = image_widget.width, .height = image_widget.height, .tint = image_widget.tint } },
+        .icon => |icon_widget| .{ .icon = .{ .key = if (icon_widget.key) |key| try allocator.dupe(u8, key) else null, .name = try allocator.dupe(u8, icon_widget.name), .size = icon_widget.size, .color = icon_widget.color } },
     };
 }
 
 fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
     switch (widget.*) {
-        .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
-        .text => |text_widget| allocator.free(text_widget.value),
-        .spacer => {},
-        .sized => {},
+        .text => |text_widget| {
+            if (text_widget.key) |key| allocator.free(key);
+            allocator.free(text_widget.value);
+        },
+        .spacer => |spacer_widget| if (spacer_widget.key) |key| allocator.free(key),
+        .sized => |sized_widget| if (sized_widget.key) |key| allocator.free(key),
         .button => |button_widget| {
-            if (button_widget.on_pressed) |callback| callback.destroy(allocator);
+            if (button_widget.key) |key| allocator.free(key);
             allocator.free(button_widget.id);
-            allocator.free(button_widget.label);
-            if (button_widget.intent) |intent| destroyIntent(allocator, intent);
         },
         .clickable => |clickable_widget| {
-            if (clickable_widget.on_click) |callback| callback.destroy(allocator);
-            if (clickable_widget.on_tap_down) |callback| callback.destroy(allocator);
-            if (clickable_widget.on_tap_up) |callback| callback.destroy(allocator);
-            if (clickable_widget.on_tap_cancel) |callback| callback.destroy(allocator);
+            if (clickable_widget.key) |key| allocator.free(key);
             allocator.free(clickable_widget.id);
         },
         .focus => |focus_widget| {
-            if (focus_widget.on_focus_change) |callback| callback.destroy(allocator);
+            if (focus_widget.key) |key| allocator.free(key);
             allocator.free(focus_widget.node.id);
         },
-        .focus_scope => |focus_scope_widget| allocator.free(focus_scope_widget.id),
-        .scroll => |scroll_widget| allocator.free(scroll_widget.id),
-        .list => |list_widget| {
-            list_widget.build_item.destroy(allocator);
-            allocator.free(list_widget.id);
+        .focus_scope => |focus_scope_widget| {
+            if (focus_scope_widget.key) |key| allocator.free(key);
+            allocator.free(focus_scope_widget.id);
+        },
+        .scroll => |scroll_widget| {
+            if (scroll_widget.key) |key| allocator.free(key);
+            allocator.free(scroll_widget.id);
         },
         .text_input => |input_widget| {
-            if (input_widget.on_change) |callback| callback.destroy(allocator);
+            if (input_widget.key) |key| allocator.free(key);
             allocator.free(input_widget.id);
             allocator.free(input_widget.focus_node.id);
             allocator.free(input_widget.value);
             allocator.free(input_widget.placeholder);
         },
-        .stateful => |stateful_widget| stateful_widget.destroy(allocator),
-        .render_object => |render_object| render_object.destroy(allocator),
-        .element => |custom_element| custom_element.destroy(allocator),
-        .actions => |actions_widget| destroyActionBindings(allocator, actions_widget.bindings),
-        .shortcuts => |shortcuts_widget| destroyShortcutBindings(allocator, shortcuts_widget.bindings),
-        .box, .row, .column, .padding, .center, .flexible, .theme, .default_text_style, .component => {},
+        .shortcuts => |shortcuts_widget| {
+            if (shortcuts_widget.key) |key| allocator.free(key);
+            destroyShortcutBindings(allocator, shortcuts_widget.bindings);
+        },
+        .icon => |icon_widget| {
+            if (icon_widget.key) |key| allocator.free(key);
+            allocator.free(icon_widget.name);
+        },
+        .box => |box_widget| if (box_widget.key) |key| allocator.free(key),
+        .row => |row_widget| if (row_widget.key) |key| allocator.free(key),
+        .column => |column_widget| if (column_widget.key) |key| allocator.free(key),
+        .padding => |padding_widget| if (padding_widget.key) |key| allocator.free(key),
+        .center => |center_widget| if (center_widget.key) |key| allocator.free(key),
+        .flexible => |flexible_widget| if (flexible_widget.key) |key| allocator.free(key),
+        .default_text_style => |default_text_style| if (default_text_style.key) |key| allocator.free(key),
+        .image => |image_widget| if (image_widget.key) |key| allocator.free(key),
     }
-}
-
-fn cloneActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding) ![]Widget.ActionBinding {
-    const result = try allocator.alloc(Widget.ActionBinding, bindings.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (result[0..initialized]) |binding| {
-            allocator.free(binding.id);
-            binding.callback.destroy(allocator);
-        }
-        allocator.free(result);
-    }
-    for (bindings, 0..) |binding, index| {
-        const id = try allocator.dupe(u8, binding.id);
-        const callback = binding.callback.clone(allocator) catch |err| {
-            allocator.free(id);
-            return err;
-        };
-        result[index] = .{ .id = id, .callback = callback };
-        initialized += 1;
-    }
-    return result;
-}
-
-fn destroyActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.ActionBinding) void {
-    for (bindings) |binding| {
-        allocator.free(binding.id);
-        binding.callback.destroy(allocator);
-    }
-    allocator.free(bindings);
 }
 
 fn cloneShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding) ![]Widget.ShortcutBinding {
     const result = try allocator.alloc(Widget.ShortcutBinding, bindings.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (result[0..initialized]) |binding| destroyIntent(allocator, binding.intent);
-        allocator.free(result);
-    }
     for (bindings, 0..) |binding, index| {
-        result[index] = .{ .key = binding.key, .intent = try cloneIntent(allocator, binding.intent) };
-        initialized += 1;
+        result[index] = binding;
     }
     return result;
 }
 
 fn destroyShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widget.ShortcutBinding) void {
-    for (bindings) |binding| destroyIntent(allocator, binding.intent);
     allocator.free(bindings);
-}
-
-fn cloneIntent(allocator: std.mem.Allocator, intent: Intent) !Intent {
-    return .{ .action_id = try allocator.dupe(u8, intent.action_id) };
-}
-
-fn destroyIntent(allocator: std.mem.Allocator, intent: Intent) void {
-    allocator.free(intent.action_id);
-}
-
-fn cloneKey(allocator: std.mem.Allocator, key: Widget.Key) !Widget.Key {
-    return switch (key) {
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .integer => |value| .{ .integer = value },
-    };
-}
-
-fn destroyKey(allocator: std.mem.Allocator, key: Widget.Key) void {
-    switch (key) {
-        .string => |value| allocator.free(value),
-        .integer => {},
-    }
-}
-
-fn keysEqual(a: Widget.Key, b: Widget.Key) bool {
-    return switch (a) {
-        .string => |a_value| switch (b) {
-            .string => |b_value| std.mem.eql(u8, a_value, b_value),
-            .integer => false,
-        },
-        .integer => |a_value| switch (b) {
-            .string => false,
-            .integer => |b_value| a_value == b_value,
-        },
-    };
 }
 
 pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
@@ -3001,9 +2435,9 @@ pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list
 
 pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
     switch (node.kind) {
-        .render_object => {
+        .image, .icon => {
             const render_object = node.render_object orelse return error.MissingRenderObject;
-            try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list });
+            try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .display_list = display_list });
         },
         .box => {
             if (node.box_radius > 0) {
@@ -3044,7 +2478,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
-        .scroll, .list => try display_list.pushClip(allocator, node.rect),
+        .scroll => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
 
@@ -3059,7 +2493,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
 }
 
 fn isViewportKind(kind: RenderNode.Kind) bool {
-    return kind == .scroll or kind == .list;
+    return kind == .scroll;
 }
 
 const scrollbar_thickness: f32 = 4;
@@ -3287,23 +2721,20 @@ pub fn hitTestButton(node: *const RenderNode, point: Point) ?[]const u8 {
 
 pub const ClickHit = struct {
     id: []const u8,
-    callback: ?Widget.Callback = null,
-    tap_down: ?Widget.Callback = null,
-    tap_up: ?Widget.Callback = null,
-    tap_cancel: ?Widget.Callback = null,
+    handler: HandlerRef,
     activation: Widget.ClickActivation = .release,
 };
 
 pub const FocusTarget = struct {
     id: []const u8,
     kind: Kind,
-    callback: ?Widget.Callback = null,
+    handler: ?HandlerRef = null,
     scope_id: ?[]const u8 = null,
     modal_scope_id: ?[]const u8 = null,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
-    focus_change_callback: ?Widget.FocusChangeCallback = null,
+    focus_change_handler: ?HandlerRef = null,
 
     pub const Kind = enum {
         text_input,
@@ -3338,10 +2769,10 @@ fn appendFocusTargets(
             .autofocus = node.autofocus,
             .skip_traversal = node.skip_traversal,
             .can_request_focus = node.can_request_focus,
-            .focus_change_callback = node.focus_change_callback,
+            .focus_change_handler = node.focus_change_handler,
         }),
-        .clickable => if (node.click_callback) |callback| {
-            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id });
+        .clickable => if (node.handler) |handler| {
+            if (node.clickable_id) |id| try targets.append(allocator, .{ .id = id, .kind = .clickable, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id });
         },
         else => {},
     }
@@ -3370,12 +2801,12 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
                 .autofocus = node.autofocus,
                 .skip_traversal = node.skip_traversal,
                 .can_request_focus = node.can_request_focus,
-                .focus_change_callback = node.focus_change_callback,
+                .focus_change_handler = node.focus_change_handler,
             };
         },
-        .clickable => if (node.click_callback) |callback| {
+        .clickable => if (node.handler) |handler| {
             if (node.clickable_id) |clickable_id| {
-                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .callback = callback, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
+                if (std.mem.eql(u8, clickable_id, id)) return .{ .id = clickable_id, .kind = .clickable, .handler = handler, .scope_id = active_scope_id, .modal_scope_id = active_modal_scope_id };
             }
         },
         else => {},
@@ -3395,20 +2826,12 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     }
 
     if (node.kind == .clickable and node.rect.contains(point)) {
-        if (!nodeHasTapCallback(node)) return null;
+        if (!nodeHasHandler(node)) return null;
         return .{
             .id = node.clickable_id orelse return null,
-            .callback = node.click_callback,
-            .tap_down = node.tap_down_callback,
-            .tap_up = node.tap_up_callback,
-            .tap_cancel = node.tap_cancel_callback,
+            .handler = node.handler orelse return null,
             .activation = node.click_activation,
         };
-    }
-    if (node.kind == .render_object) {
-        if (node.render_object) |render_object| {
-            if (render_object.hitTest(node.rect, point)) |id| return .{ .id = id };
-        }
     }
     return null;
 }
@@ -3416,12 +2839,9 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
 pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
     if (node.kind == .clickable) {
         if (node.clickable_id) |clickable_id| {
-            if (std.mem.eql(u8, clickable_id, id) and nodeHasTapCallback(node)) return .{
+            if (std.mem.eql(u8, clickable_id, id) and nodeHasHandler(node)) return .{
                 .id = clickable_id,
-                .callback = node.click_callback,
-                .tap_down = node.tap_down_callback,
-                .tap_up = node.tap_up_callback,
-                .tap_cancel = node.tap_cancel_callback,
+                .handler = node.handler orelse return null,
                 .activation = node.click_activation,
             };
         }
@@ -3432,11 +2852,8 @@ pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
     return null;
 }
 
-fn nodeHasTapCallback(node: *const RenderNode) bool {
-    return node.click_callback != null or
-        node.tap_down_callback != null or
-        node.tap_up_callback != null or
-        node.tap_cancel_callback != null;
+fn nodeHasHandler(node: *const RenderNode) bool {
+    return node.handler != null;
 }
 
 pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {
@@ -3543,115 +2960,45 @@ pub fn shortcutAllowedWhileEditing(key: ShortcutKey) bool {
     };
 }
 
-pub fn findShortcutAction(element: *const Element, key: ShortcutKey) ?Widget.Callback {
-    return findShortcutActionScoped(element, key, null);
-}
-
-pub fn findFocusedShortcutAction(element: *const Element, key: ShortcutKey, focused_id: []const u8) ?Widget.Callback {
-    return findFocusedShortcutActionScoped(element, key, focused_id, null, null);
-}
-
-const ActionScope = struct {
-    bindings: []const Widget.ActionBinding,
-    parent: ?*const ActionScope = null,
-};
-
-const ShortcutScope = struct {
-    bindings: []const Widget.ShortcutBinding,
-    parent: ?*const ShortcutScope = null,
-};
-
-fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*const ActionScope) ?Widget.Callback {
-    switch (element.widget) {
-        .actions => |actions_widget| {
-            const nested: ActionScope = .{ .bindings = actions_widget.bindings, .parent = scope };
-            for (element.children) |*child| {
-                if (findShortcutActionScoped(child, key, &nested)) |callback| return callback;
-            }
-            return null;
-        },
-        else => {},
-    }
-
-    switch (element.widget) {
-        .shortcuts => |shortcuts_widget| {
-            for (shortcuts_widget.bindings) |binding| {
-                if (binding.key != key) continue;
-                if (findActionForIntent(scope, binding.intent)) |callback| return callback;
-            }
-        },
-        else => {},
-    }
-
-    for (element.children) |*child| {
-        if (findShortcutActionScoped(child, key, scope)) |callback| return callback;
-    }
-    return null;
-}
-
-fn findActionForIntent(scope: ?*const ActionScope, intent: Intent) ?Widget.Callback {
-    var cursor = scope;
-    while (cursor) |action_scope| {
-        for (action_scope.bindings) |binding| {
-            if (std.mem.eql(u8, binding.id, intent.action_id)) return binding.callback;
+pub fn findShortcutHandler(element: *const Element, key: ShortcutKey) ?HandlerRef {
+    if (element.widget == .shortcuts) {
+        for (element.widget.shortcuts.bindings) |binding| {
+            if (binding.key == key) return .{ .document = element.document_id, .handler = binding.handler };
         }
-        cursor = action_scope.parent;
     }
-    return null;
-}
-
-fn findFocusedShortcutActionScoped(
-    element: *const Element,
-    key: ShortcutKey,
-    focused_id: []const u8,
-    actions: ?*const ActionScope,
-    shortcuts: ?*const ShortcutScope,
-) ?Widget.Callback {
-    switch (element.widget) {
-        .actions => |actions_widget| {
-            const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = actions };
-            return findFocusedShortcutActionInChildren(element, key, focused_id, &nested_actions, shortcuts);
-        },
-        .shortcuts => |shortcuts_widget| {
-            const nested_shortcuts: ShortcutScope = .{ .bindings = shortcuts_widget.bindings, .parent = shortcuts };
-            if (elementIsFocused(element, focused_id)) return findShortcutInScope(&nested_shortcuts, key, actions);
-            return findFocusedShortcutActionInChildren(element, key, focused_id, actions, &nested_shortcuts);
-        },
-        else => {
-            if (elementIsFocused(element, focused_id)) return findShortcutInScope(shortcuts, key, actions);
-            return findFocusedShortcutActionInChildren(element, key, focused_id, actions, shortcuts);
-        },
-    }
-}
-
-fn findFocusedShortcutActionInChildren(
-    element: *const Element,
-    key: ShortcutKey,
-    focused_id: []const u8,
-    actions: ?*const ActionScope,
-    shortcuts: ?*const ShortcutScope,
-) ?Widget.Callback {
     for (element.children) |*child| {
-        if (findFocusedShortcutActionScoped(child, key, focused_id, actions, shortcuts)) |callback| return callback;
+        if (findShortcutHandler(child, key)) |handler| return handler;
     }
     return null;
 }
 
-fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: ?*const ActionScope) ?Widget.Callback {
-    var cursor = scope;
-    while (cursor) |shortcut_scope| {
-        for (shortcut_scope.bindings) |binding| {
-            if (binding.key != key) continue;
-            if (findActionForIntent(actions, binding.intent)) |callback| return callback;
+pub fn findFocusedShortcutHandler(element: *const Element, focused_id: []const u8, key: ShortcutKey) ?HandlerRef {
+    var nearest: ?HandlerRef = null;
+    return findFocusedShortcutHandlerScoped(element, focused_id, key, &nearest);
+}
+
+fn findFocusedShortcutHandlerScoped(element: *const Element, focused_id: []const u8, key: ShortcutKey, nearest: *?HandlerRef) ?HandlerRef {
+    const previous = nearest.*;
+    if (element.widget == .shortcuts) {
+        for (element.widget.shortcuts.bindings) |binding| {
+            if (binding.key == key) {
+                nearest.* = .{ .document = element.document_id, .handler = binding.handler };
+                break;
+            }
         }
-        cursor = shortcut_scope.parent;
+    }
+    defer nearest.* = previous;
+
+    if (elementIsFocused(element, focused_id)) return nearest.*;
+    for (element.children) |*child| {
+        if (findFocusedShortcutHandlerScoped(child, focused_id, key, nearest)) |handler| return handler;
     }
     return null;
 }
 
 fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
     return switch (element.widget) {
-        .button => |button_widget| std.mem.eql(u8, button_widget.id, focused_id),
+        .button => |button_widget| button_widget.handler != null and std.mem.eql(u8, button_widget.id, focused_id),
         .clickable => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
         .focus => |focus_widget| std.mem.eql(u8, focus_widget.node.id, focused_id),
         .text_input => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),
@@ -3680,7 +3027,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     // geometry and must not inflate the damage to their full bounds.
     const rect_changed = !std.meta.eql(node.rect, value.rect);
     const paints = switch (value.kind) {
-        .box, .text, .text_input, .render_object => true,
+        .box, .text, .text_input, .image, .icon => true,
         else => false,
     };
     var damage = node.damage;
@@ -3788,15 +3135,8 @@ fn layoutElementInto(
     measurer: TextMeasurer,
 ) LayoutError!void {
     switch (element.widget) {
-        .keyed => try layoutWrapper(allocator, element, node, .keyed, constraints, origin, measurer),
-        .button => try layoutWrapper(allocator, element, node, .button, constraints, origin, measurer),
-        .actions => try layoutWrapper(allocator, element, node, .actions, constraints, origin, measurer),
         .shortcuts => try layoutWrapper(allocator, element, node, .shortcuts, constraints, origin, measurer),
-        .theme => try layoutWrapper(allocator, element, node, .theme, constraints, origin, measurer),
         .default_text_style => try layoutWrapper(allocator, element, node, .default_text_style, constraints, origin, measurer),
-        .component => try layoutWrapper(allocator, element, node, .component, constraints, origin, measurer),
-        .stateful => try layoutWrapper(allocator, element, node, .stateful, constraints, origin, measurer),
-        .element => try layoutWrapper(allocator, element, node, .element, constraints, origin, measurer),
         .text => |text_widget| {
             const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
             const measured = try measurer.measureText(text_widget.value, style);
@@ -3850,6 +3190,18 @@ fn layoutElementInto(
                 .box_radius = box_widget.radius,
             });
         },
+        .button => |button_widget| {
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
+            children[0] = child;
+            commitRenderNode(node, .{
+                .kind = .clickable,
+                .rect = child.rect,
+                .clickable_id = button_widget.id,
+                .handler = if (button_widget.handler) |handler| .{ .document = element.document_id, .handler = handler } else null,
+                .click_activation = button_widget.activation,
+            });
+        },
         .clickable => |clickable_widget| {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const children = try ensureChildSlice(allocator, node, 1);
@@ -3858,10 +3210,7 @@ fn layoutElementInto(
                 .kind = .clickable,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
                 .clickable_id = clickable_widget.id,
-                .click_callback = clickable_widget.on_click,
-                .tap_down_callback = clickable_widget.on_tap_down,
-                .tap_up_callback = clickable_widget.on_tap_up,
-                .tap_cancel_callback = clickable_widget.on_tap_cancel,
+                .handler = .{ .document = element.document_id, .handler = clickable_widget.handler },
                 .click_activation = clickable_widget.activation,
             });
         },
@@ -3877,7 +3226,7 @@ fn layoutElementInto(
                 .autofocus = focus_widget.autofocus,
                 .skip_traversal = focus_widget.skip_traversal,
                 .can_request_focus = focus_widget.can_request_focus,
-                .focus_change_callback = focus_widget.on_focus_change,
+                .focus_change_handler = if (focus_widget.on_focus_change) |handler| .{ .document = element.document_id, .handler = handler } else null,
             });
         },
         .focus_scope => |focus_scope_widget| {
@@ -3910,36 +3259,6 @@ fn layoutElementInto(
                 .scroll_id = scroll_widget.id,
                 .scroll_content = child.rect.size(),
                 .scroll_offset = .{ .x = state.offset_x, .y = state.offset_y },
-            });
-        },
-        .list => |list_widget| {
-            const state = listState(element);
-            const content_height = list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
-            const available_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else content_height;
-            const height = @min(available_height, content_height);
-            state.viewport_height = height;
-            state.offset = std.math.clamp(state.offset, 0, @max(0, content_height - height));
-
-            // A drifted window is rebuilt by the next dirty-state pass; this
-            // pass lays out whatever window is currently built.
-            const ideal = listVisibleRange(list_widget, state.offset, height);
-            if (ideal.first != state.first or ideal.count != state.built) state.range_stale = true;
-
-            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
-            const children = try ensureChildSlice(allocator, node, element.children.len);
-            var content_width: f32 = 0;
-            for (element.children, 0..) |*child_element, index| {
-                const child_y = origin.y - state.offset + @as(f32, @floatFromInt(state.first + index)) * list_widget.item_extent;
-                children[index] = try layoutElement(allocator, child_element, item_constraints, .{ .x = origin.x, .y = child_y }, measurer);
-                content_width = @max(content_width, children[index].rect.width);
-            }
-            const width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else content_width;
-            commitRenderNode(node, .{
-                .kind = .list,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
-                .scroll_id = list_widget.id,
-                .scroll_content = .{ .width = content_width, .height = content_height },
-                .scroll_offset = .{ .x = 0, .y = state.offset },
             });
         },
         .text_input => |input_widget| {
@@ -4024,14 +3343,19 @@ fn layoutElementInto(
         },
         .column => |column_widget| try layoutLinearElements(allocator, node, .column, element.children, column_widget.gap, column_widget.cross_align, column_widget.main_align, constraints, origin, measurer),
         .row => |row_widget| try layoutLinearElements(allocator, node, .row, element.children, row_widget.gap, row_widget.cross_align, row_widget.main_align, constraints, origin, measurer),
-        .render_object => |render_widget| {
-            const measured = try render_widget.layout(.{ .constraints = constraints, .measurer = measurer });
+        .image, .icon => {
+            const render_object = element.render_object orelse return error.MissingRenderObject;
+            const measured = try render_object.layout(.{ .constraints = constraints, .text_measurer = measurer });
             const size_value = constraints.clamp(measured);
             _ = try ensureChildSlice(allocator, node, 0);
             commitRenderNode(node, .{
-                .kind = .render_object,
+                .kind = switch (element.kind) {
+                    .image => .image,
+                    .icon => .icon,
+                    else => unreachable,
+                },
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .render_object = render_widget,
+                .render_object = render_object,
             });
         },
     }
@@ -4275,2037 +3599,171 @@ fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
     }
 }
 
-var test_callback_state: u8 = 0;
-
-fn testCallback() Widget.Callback {
-    return .{ .ptr = &test_callback_state, .call_fn = testCallbackCall };
+test "widgets.text creates unkeyed text widget" {
+    const widget = widgets.text("x");
+    try std.testing.expect(widget == .text);
+    try std.testing.expectEqual(@as(?[]const u8, null), widget.text.key);
 }
 
-fn testCallbackCall(_: *anyopaque) !void {}
-
-const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
-
-test "display list reuses cached alpha image data" {
-    const allocator = std.testing.allocator;
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
-
-    const first_alpha = try allocator.dupe(u8, &.{ 1, 2, 3, 4 });
-    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, first_alpha, colors.white, 42);
-    const cached_ptr = display_list.commands.items[0].alpha_image.alpha.ptr;
-
-    display_list.clearRetainingCapacity(allocator);
-
-    const second_alpha = try allocator.dupe(u8, &.{ 5, 6, 7, 8 });
-    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, second_alpha, colors.black, 42);
-    try std.testing.expectEqual(cached_ptr, display_list.commands.items[0].alpha_image.alpha.ptr);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, display_list.commands.items[0].alpha_image.alpha);
-}
-
-test "rounded rect alpha covers fill and hollow border band" {
-    const allocator = std.testing.allocator;
-    const size = 16;
-
-    const fill = try roundedRectAlpha(allocator, size, size, 4, null);
-    defer allocator.free(fill);
-    // Center is fully covered, the rounded-off corner is empty.
-    try std.testing.expectEqual(@as(u8, 255), fill[8 * size + 8]);
-    try std.testing.expectEqual(@as(u8, 0), fill[0]);
-
-    const stroke = try roundedRectAlpha(allocator, size, size, 4, 2);
-    defer allocator.free(stroke);
-    // The band covers the edge but leaves the interior hollow.
-    try std.testing.expectEqual(@as(u8, 255), stroke[1 * size + 8]);
-    try std.testing.expectEqual(@as(u8, 0), stroke[8 * size + 8]);
-    try std.testing.expectEqual(@as(u8, 0), stroke[0]);
-}
-
-test "scroll viewport clips content, clamps offset, and blocks hits outside" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-    const build_allocator = build_arena.allocator();
-
-    // Ten 16px rows: 160px of content in a 40px viewport.
-    var rows: [10]Widget = undefined;
-    for (&rows, 0..) |*row, index| {
-        row.* = if (index == 9)
-            try widgets.clickable(build_allocator, "last-row", widgets.text("row"), testCallback())
-        else
-            widgets.text("row");
-    }
-    const column = try widgets.column(build_allocator, &rows, 0);
-    const scroll_widget = try widgets.scroll(build_allocator, "list", column);
-    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
-
-    var scope: BuildScope = .{ .allocator = build_allocator };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .scroll), root.kind);
-    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 0), root.children[0].rect.y);
-
-    // The clickable in the last row sits below the viewport; the clip
-    // blocks hits at its laid-out position.
-    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 5, .y = 150 }));
-    try std.testing.expectEqualStrings("list", hitTestScroll(root, .{ .x = 5, .y = 20 }).?);
-
-    // An absurd offset clamps to content minus viewport.
-    scrollState(&element).offset_y = 1000;
-    _ = dirtyScrollElement(&element, "list");
-    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 120), scrollState(&element).offset_y);
-    try std.testing.expectEqual(@as(f32, -120), root.children[0].rect.y);
-
-    // Scrolled to the bottom, the last row is inside the viewport and
-    // clickable again.
-    try std.testing.expectEqualStrings("last-row", hitTestClick(root, .{ .x = 5, .y = 30 }).?.id);
-
-    // Paint clips the content to the viewport rect.
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
-    var saw_viewport_clip = false;
-    for (display_list.commands.items) |command| {
-        switch (command) {
-            .set_clip => |clip| if (clip) |rect| {
-                if (std.meta.eql(rect, root.rect)) saw_viewport_clip = true;
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_viewport_clip);
-}
-
-test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-    const build_allocator = build_arena.allocator();
-
-    // Ten 24px-wide cells: 240px of content in an 80px viewport.
-    var cells: [10]Widget = undefined;
-    for (&cells) |*cell| cell.* = widgets.text("row");
-    const row = try widgets.row(build_allocator, &cells, 0);
-    var scroll_widget = try widgets.scroll(build_allocator, "strip", row);
-    scroll_widget.scroll.axes = .horizontal;
-    const constraints: Constraints = .{ .max_width = 80, .max_height = 40 };
-
-    var scope: BuildScope = .{ .allocator = build_allocator };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(f32, 80), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 240), root.children[0].rect.width);
-
-    scrollState(&element).offset_x = 1000;
-    _ = dirtyScrollElement(&element, "strip");
-    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_x);
-    try std.testing.expectEqual(@as(f32, -160), root.children[0].rect.x);
-
-    // A horizontal thumb is painted along the bottom edge.
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
-    var saw_thumb = false;
-    for (display_list.commands.items) |command| {
-        switch (command) {
-            .fill_rect => |fill| {
-                if (std.meta.eql(fill.color, scrollbar_color) and fill.rect.height == scrollbar_thickness) saw_thumb = true;
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_thumb);
-}
-
-test "virtualized list builds only the visible window and follows scroll" {
-    const Items = struct {
-        var dummy: u8 = 0;
-
-        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
-            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
-            return .{ .text = .{ .value = label } };
-        }
-
-        fn builder() Widget.ItemBuilder {
-            return .{ .ptr = &dummy, .build_fn = build };
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    // 1000 items at 16px in a 48px viewport.
-    const list_widget = widgets.list("big-list", 1000, 16, Items.builder());
-    const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
-
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
-    defer destroyElementTree(retained_allocator, &element);
-
-    // Only the window is built, not 1000 elements.
-    try std.testing.expect(element.children.len < 16);
-    try std.testing.expectEqualStrings("item 0", element.children[0].widget.text.value);
-
-    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 48), root.rect.height);
-    try std.testing.expect(!anyListRangeStale(&element));
-
-    // Jump halfway down: layout clamps, flags the stale window, and the
-    // dirty pass rebuilds it around the new offset.
-    listState(&element).offset = 8000;
-    _ = dirtyScrollElement(&element, "big-list");
-    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expect(anyListRangeStale(&element));
-
-    var rebuild_scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    try std.testing.expect(try rebuildDirtyElementTreeScoped(retained_allocator, &rebuild_scope, &element, constraints));
-    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expect(!anyListRangeStale(&element));
-
-    const state = listState(&element);
-    try std.testing.expectEqual(@as(usize, 498), state.first);
-    var label_buffer: [16]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&label_buffer, "item {d}", .{state.first});
-    try std.testing.expectEqualStrings(expected, element.children[0].widget.text.value);
-    // The first built row sits just above the viewport.
-    try std.testing.expect(root.children[0].rect.y <= 0);
-}
-
-test "flex spacers collapse under unbounded scroll constraints" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-    const build_allocator = build_arena.allocator();
-
-    const children = [_]Widget{ widgets.text("top"), widgets.spacer(1), widgets.text("bottom") };
-    const column = try widgets.column(build_allocator, &children, 0);
-    const scroll_widget = try widgets.scroll(build_allocator, "list", column);
-    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
-
-    var scope: BuildScope = .{ .allocator = build_allocator };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-
-    const content = root.children[0];
-    try std.testing.expect(std.math.isFinite(content.rect.height));
-    // The spacer gets no share of an infinite axis.
-    try std.testing.expectEqual(@as(f32, 0), content.children[1].rect.height);
-    try std.testing.expectEqual(@as(f32, 32), content.rect.height);
-}
-
-test "display list clip stack resolves nested intersections" {
-    const allocator = std.testing.allocator;
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
-
-    try display_list.pushClip(allocator, .{ .x = 10, .y = 10, .width = 100, .height = 50 });
-    try display_list.pushClip(allocator, .{ .x = 0, .y = 0, .width = 40, .height = 200 });
-    try display_list.popClip(allocator);
-    try display_list.popClip(allocator);
-
-    const commands = display_list.commands.items;
-    try std.testing.expectEqual(@as(usize, 4), commands.len);
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 100, .height = 50 }, commands[0].set_clip.?);
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 30, .height = 50 }, commands[1].set_clip.?);
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 10, .width = 100, .height = 50 }, commands[2].set_clip.?);
-    try std.testing.expectEqual(@as(?Rect, null), commands[3].set_clip);
-
-    display_list.clearRetainingCapacity(allocator);
-    try std.testing.expectEqual(@as(usize, 0), display_list.clip_stack.items.len);
-}
-
-test "text input paint clips its content" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const input = widgets.textInput("input", "overflowing value", "placeholder");
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 60, .max_height = 40 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 60, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
-
-    var clip_active = false;
-    var text_clipped = false;
-    var last_clip: ?Rect = .{ .x = -1, .y = -1, .width = 0, .height = 0 };
-    for (display_list.commands.items) |command| {
-        switch (command) {
-            .set_clip => |clip| {
-                clip_active = clip != null;
-                last_clip = clip;
-            },
-            .text => if (clip_active) {
-                text_clipped = true;
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(text_clipped);
-    try std.testing.expectEqual(@as(?Rect, null), last_clip);
-}
-
-test "layout, paint, and hit test a padded column" {
-    const allocator = std.testing.allocator;
-
-    const title: Widget = .{ .text = .{ .value = "Title" } };
-    const label: Widget = .{ .text = .{ .value = "OK", .color = colors.white } };
-    const button_padding: Widget = .{ .padding = .{ .insets = EdgeInsets.all(8), .child = &label } };
-    const button_box: Widget = .{ .box = .{ .background = colors.accent, .child = &button_padding } };
-    const button: Widget = .{ .clickable = .{ .id = "ok", .child = &button_box, .on_click = testCallback() } };
-    const children = [_]Widget{ title, button };
-    const column: Widget = .{ .column = .{ .children = &children, .gap = 4 } };
-    const padded: Widget = .{ .padding = .{ .insets = EdgeInsets.all(10), .child = &column } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &padded, .{ .max_width = 200, .max_height = 120 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .padding), root.kind);
-    try std.testing.expectEqual(@as(f32, 60), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 72), root.rect.height);
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
-    try paint(allocator, root, &display_list);
-
-    try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
-    try std.testing.expectEqualStrings("ok", hitTestButton(root, .{ .x = 25, .y = 35 }).?);
-    try std.testing.expect(hitTestButton(root, .{ .x = 2, .y = 2 }) == null);
-}
-
-test "button widget composes styled clickable content" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", testCallback());
-    var scope: BuildScope = .{ .allocator = build_arena.allocator(), .interaction = .{ .pressed_id = "confirm" } };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &button_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .button), root.kind);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.children[0].kind);
-    try std.testing.expectEqualStrings("confirm", root.children[0].clickable_id.?);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].children[0].kind);
-    try std.testing.expectEqual(colors.ink, root.children[0].children[0].background);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].children[0].kind);
-    try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].children[0].text.?);
-}
-
-test "row spacer takes remaining main-axis space" {
-    const allocator = std.testing.allocator;
-
-    const children = [_]Widget{
-        widgets.text("A"),
-        widgets.spacer(1),
-        widgets.text("B"),
-    };
-    const row = try widgets.row(allocator, &children, 0);
-    defer allocator.free(row.row.children);
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .row), root.kind);
-    try std.testing.expectEqual(@as(f32, 100), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 84), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 92), root.children[2].rect.x);
-}
-
-test "expanded children split the spare main axis by flex factor" {
-    const allocator = std.testing.allocator;
-
-    const first = try widgets.expandedFlex(allocator, widgets.text("B"), 1);
-    defer allocator.destroy(first.flexible.child);
-    const second = try widgets.expandedFlex(allocator, widgets.text("C"), 2);
-    defer allocator.destroy(second.flexible.child);
-    const children = [_]Widget{ widgets.text("A"), first, second };
-    const row = try widgets.row(allocator, &children, 0);
-    defer allocator.free(row.row.children);
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 98, .max_height = 20 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 98, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    // Text A is 8 wide; the 90 spare pixels split 30/60.
-    try std.testing.expectEqual(@as(f32, 98), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 30), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 60), root.children[2].rect.width);
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
-    try std.testing.expectEqual(@as(f32, 38), root.children[2].rect.x);
-    // Tight fit forces the wrapped child to fill the share too.
-    try std.testing.expectEqual(@as(f32, 30), root.children[1].children[0].rect.width);
-}
-
-test "loose flexible keeps its intrinsic size" {
-    const allocator = std.testing.allocator;
-
-    const loose = try widgets.flexible(allocator, widgets.text("B"), 1);
-    defer allocator.destroy(loose.flexible.child);
-    const children = [_]Widget{ widgets.text("A"), loose };
-    const row = try widgets.row(allocator, &children, 0);
-    defer allocator.free(row.row.children);
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    // The loose child may use up to its 92px share but stays 8 wide.
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
-    try std.testing.expectEqual(@as(f32, 100), root.rect.width);
-}
-
-test "main axis alignment distributes leftover space" {
-    const allocator = std.testing.allocator;
-
-    const children = [_]Widget{ widgets.text("A"), widgets.text("B") };
-
-    inline for (.{
-        .{ .main_align = Widget.MainAxisAlignment.space_between, .first = 0, .second = 92 },
-        .{ .main_align = Widget.MainAxisAlignment.center, .first = 42, .second = 50 },
-        .{ .main_align = Widget.MainAxisAlignment.end, .first = 84, .second = 92 },
-        .{ .main_align = Widget.MainAxisAlignment.space_evenly, .first = 28, .second = 64 },
-    }) |case| {
-        const row = try widgets.rowWithOptions(allocator, &children, .{ .main_align = case.main_align });
-        defer allocator.free(row.row.children);
-
-        var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer built_arena.deinit();
-        var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-        var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 20 });
-        defer destroyElementTree(allocator, &built_element);
-        const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
-
-        // A non-start alignment claims the full 100px main axis.
-        try std.testing.expectEqual(@as(f32, 100), root.rect.width);
-        try std.testing.expectEqual(@as(f32, case.first), root.children[0].rect.x);
-        try std.testing.expectEqual(@as(f32, case.second), root.children[1].rect.x);
-    }
-}
-
-test "row centers children on the cross axis" {
-    const allocator = std.testing.allocator;
-
-    const short = widgets.text("A");
-    const tall = try widgets.sized(allocator, widgets.text("B"), null, 40);
-    defer allocator.destroy(tall.sized.child);
-    const children = [_]Widget{ short, tall };
-    const row: Widget = .{ .row = .{ .children = &children, .gap = 0, .cross_align = .center } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
-    try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
-}
-
-test "text role resolves themed font size for layout and paint" {
-    const allocator = std.testing.allocator;
-
-    const label: Widget = .{ .text = .{ .value = "Hi", .role = .label } };
-    const themed: Widget = .{ .theme = .{
-        .theme = .{ .color_scheme = .light, .text_theme = .{ .label = .{ .color = colors.accent, .font_size = 22 } } },
-        .child = &label,
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &themed, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const text_node = root.children[0];
-    try std.testing.expectEqual(@as(f32, 22), text_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 22), text_node.text_style.font_size);
-    try std.testing.expectEqual(colors.accent, text_node.text_style.color);
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
-    try paint(allocator, root, &display_list);
-
-    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
-    try std.testing.expect(display_list.commands.items[0] == .text);
-    try std.testing.expectEqual(@as(f32, 22), display_list.commands.items[0].text.style.font_size);
-    try std.testing.expectEqual(colors.accent, display_list.commands.items[0].text.style.color);
-}
-
-test "default text style overrides descendant text defaults" {
-    const allocator = std.testing.allocator;
-
-    const label = widgets.text("Inherited");
-    const inherited = try widgets.defaultTextStyle(allocator, .{ .color = test_red, .font_size = 18 }, label);
-    defer allocator.destroy(inherited.default_text_style.child);
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &inherited, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .default_text_style), root.kind);
-    try std.testing.expectEqual(test_red, root.children[0].text_style.color);
-    try std.testing.expectEqual(@as(f32, 18), root.children[0].text_style.font_size);
-}
-
-test "linear element clone preserves cross-axis alignment" {
-    const allocator = std.testing.allocator;
-
-    const child = widgets.text("A");
-    const children = [_]Widget{child};
-    const row: Widget = .{ .row = .{ .children = &children, .cross_align = .center } };
-    const column: Widget = .{ .column = .{ .children = &children, .cross_align = .end } };
-
-    var row_element = try buildElementTree(allocator, &row, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &row_element);
-    var column_element = try buildElementTree(allocator, &column, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &column_element);
-
-    try std.testing.expectEqual(Widget.CrossAxisAlignment.center, row_element.widget.row.cross_align);
-    try std.testing.expectEqual(Widget.CrossAxisAlignment.end, column_element.widget.column.cross_align);
-}
-
-test "rounded box paints alpha images for fill and border" {
-    const allocator = std.testing.allocator;
-
-    const child = widgets.text("A");
-    const box: Widget = .{ .box = .{ .child = &child, .background = colors.panel, .border = colors.accent, .border_width = 2, .radius = 5 } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &box, .{ .max_width = 100, .max_height = 40 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
-    try paintScaled(allocator, root, &display_list, 1.5);
-
-    try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
-    try std.testing.expect(display_list.commands.items[0] == .alpha_image);
-    try std.testing.expect(display_list.commands.items[1] == .alpha_image);
-    try std.testing.expect(display_list.commands.items[2] == .text);
-}
-
-test "box aligns child inside its minimum size" {
-    const allocator = std.testing.allocator;
-
-    const child = widgets.text("A");
-    const box: Widget = .{ .box = .{
-        .child = &child,
-        .min_width = 40,
-        .min_height = 40,
-        .horizontal_align = .center,
-        .vertical_align = .center,
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &box, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(f32, 40), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 16), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
-}
-
-test "theme selects light and dark defaults from color scheme" {
-    try std.testing.expectEqual(Theme.light.color_scheme.primary, Theme.fromColorScheme("light").color_scheme.primary);
-    try std.testing.expectEqual(Theme.dark.color_scheme.primary, Theme.fromColorScheme("dark").color_scheme.primary);
-    try std.testing.expectEqual(Theme.light.color_scheme.primary, Theme.fromColorScheme("no-preference").color_scheme.primary);
-}
-
-test "theme widget provides ambient button styling" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const theme: Theme = .{
-        .color_scheme = .light,
-        .button_theme = .{
-            .background = colors.black,
-            .foreground = colors.white,
-            .pressed_background = colors.panel,
-            .padding_x = 4,
-            .padding_y = 4,
-        },
-    };
-    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testCallback());
-    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const box_node = root.children[0].children[0].children[0];
-    try std.testing.expectEqual(@as(RenderNode.Kind, .theme), root.kind);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
-    try std.testing.expectEqual(colors.black, box_node.background);
-    // "Themed" is 6 chars at half the 14px font size, plus 4px padding on
-    // both sides: 6 * 7 + 8.
-    try std.testing.expectEqual(@as(f32, 50), root.rect.width);
-}
-
-test "button uses ambient hover styling" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const theme: Theme = .{
-        .color_scheme = .light,
-        .button_theme = .{
-            .background = colors.accent,
-            .foreground = colors.white,
-            .hover_background = colors.black,
-            .hover_foreground = colors.panel,
-        },
-    };
-    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", testCallback());
-    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var scope: BuildScope = .{
-        .allocator = build_arena.allocator(),
-        .interaction = .{ .hovered_id = "hovered" },
-    };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const box_node = root.children[0].children[0].children[0];
-    const text_node = box_node.children[0].children[0];
-    try std.testing.expectEqual(colors.black, box_node.background);
-    try std.testing.expectEqual(colors.panel, text_node.foreground);
-}
-
-test "button uses ambient pressed styling" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const theme: Theme = .{
-        .color_scheme = .light,
-        .button_theme = .{
-            .background = colors.accent,
-            .pressed_background = colors.ink,
-        },
-    };
-    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", testCallback());
-    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var scope: BuildScope = .{
-        .allocator = build_arena.allocator(),
-        .interaction = .{ .pressed_id = "pressed" },
-    };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const box_node = root.children[0].children[0].children[0];
-    try std.testing.expectEqual(colors.ink, box_node.background);
-}
-
-test "button uses ambient focused border" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const theme: Theme = .{
-        .color_scheme = .light,
-        .button_theme = .{
-            .background = colors.accent,
-            .focused_border = colors.black,
-        },
-    };
-    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", testCallback());
-    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var scope: BuildScope = .{
-        .allocator = build_arena.allocator(),
-        .interaction = .{ .focused_id = "focused" },
-    };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const box_node = root.children[0].children[0].children[0];
-    try std.testing.expectEqual(colors.black, box_node.box_border.?);
-}
-
-test "button without action is disabled and skipped by focus traversal" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const theme: Theme = .{
-        .color_scheme = .light,
-        .button_theme = .{
-            .disabled_background = colors.panel,
-            .disabled_foreground = colors.ink,
-        },
-    };
-    const button_widget = try widgets.button(build_arena.allocator(), "disabled", "Disabled", null);
-    const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const box_node = root.children[0].children[0];
-    try std.testing.expectEqual(@as(RenderNode.Kind, .box), box_node.kind);
-    try std.testing.expectEqual(colors.panel, box_node.background);
-    try std.testing.expectEqual(colors.ink, box_node.children[0].children[0].foreground);
-
-    const targets = try collectFocusTargets(retained_allocator, root);
-    defer retained_allocator.free(targets);
-    try std.testing.expectEqual(@as(usize, 0), targets.len);
-}
-
-test "action button resolves nearest ambient action" {
-    const Counter = struct {
-        value: usize = 0,
-
-        fn increment(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.value += 1;
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var counter: Counter = .{};
-    const button_widget = try widgets.actionButton(build_arena.allocator(), "increment", "Increment", "increment");
-    const bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
-    const actions_widget = try widgets.actions(build_arena.allocator(), &bindings, button_widget);
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &actions_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try hit.callback.?.call();
-    try std.testing.expectEqual(@as(usize, 1), counter.value);
-}
-
-test "theme widget provides ambient text and input styling" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const children = [_]Widget{
-        widgets.text("plain"),
-        widgets.textInput("input", "", "placeholder"),
-    };
-    const column = try widgets.column(build_arena.allocator(), &children, 4);
-    const themed = try widgets.theme(build_arena.allocator(), Theme.dark, column);
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 120 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const text_node = root.children[0].children[0];
-    const input_node = root.children[0].children[1];
-    try std.testing.expectEqual(Theme.dark.color_scheme.foreground, text_node.foreground);
-    try std.testing.expectEqual(Theme.dark.color_scheme.surface_high, input_node.background);
-    try std.testing.expectEqual(Theme.dark.color_scheme.border, input_node.border);
-    try std.testing.expectEqual(Theme.dark.color_scheme.muted, input_node.placeholder_foreground);
-}
-
-test "text input derives focus from ambient focus node" {
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const input = widgets.textInputWithFocusNode("input", .named("field-focus"), "", "placeholder");
-    var scope: BuildScope = .{
-        .allocator = build_arena.allocator(),
-        .interaction = .{ .focused_id = "field-focus" },
-    };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &input, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expect(root.focused);
-    try std.testing.expectEqualStrings("field-focus", root.focus_id.?);
-    try std.testing.expectEqualStrings("field-focus", hitTestTextInput(root, .{ .x = 1, .y = 1 }).?);
-}
-
-test "focus targets are collected in render tree order" {
-    const allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(allocator);
-    defer build_arena.deinit();
-    const build_allocator = build_arena.allocator();
-
-    const input = widgets.textInput("input", "", "placeholder");
-    const button = try widgets.button(build_allocator, "button", "Button", testCallback());
-    const children = [_]Widget{ input, button };
-    const column = try widgets.column(build_allocator, &children, 4);
-    var scope: BuildScope = .{ .allocator = build_allocator };
-    var element = try buildElementTreeScoped(allocator, &scope, &column, .{ .max_width = 200, .max_height = 120 });
-    defer destroyElementTree(allocator, &element);
-    const root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const targets = try collectFocusTargets(allocator, root);
-    defer allocator.free(targets);
-    try std.testing.expectEqual(@as(usize, 2), targets.len);
-    try std.testing.expectEqualStrings("input", targets[0].id);
-    try std.testing.expectEqual(FocusTarget.Kind.text_input, targets[0].kind);
-    try std.testing.expectEqualStrings("button", targets[1].id);
-    try std.testing.expectEqual(FocusTarget.Kind.clickable, targets[1].kind);
-    try std.testing.expectEqual(FocusTarget.Kind.clickable, findFocusTarget(root, "button").?.kind);
-}
-
-test "focus widget makes arbitrary subtree focusable" {
-    const allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(allocator);
-    defer build_arena.deinit();
-
-    const label = widgets.text("Focusable text");
-    const focus = try widgets.focus(build_arena.allocator(), .named("label-focus"), label);
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &focus, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const targets = try collectFocusTargets(allocator, root);
-    defer allocator.free(targets);
-    try std.testing.expectEqual(@as(usize, 1), targets.len);
-    try std.testing.expectEqualStrings("label-focus", targets[0].id);
-    try std.testing.expectEqual(FocusTarget.Kind.focus, targets[0].kind);
-    try std.testing.expectEqual(FocusTarget.Kind.focus, findFocusTarget(root, "label-focus").?.kind);
-}
-
-test "center moves descendants" {
-    const allocator = std.testing.allocator;
-
-    const label: Widget = .{ .text = .{ .value = "Run" } };
-    const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label, .on_click = testCallback() } };
-    const center: Widget = .{ .center = .{ .child = &button } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &center, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(f32, 38), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 32), root.children[0].rect.y);
-    try std.testing.expectEqualStrings("centered", hitTestButton(root, .{ .x = 40, .y = 35 }).?);
-}
-
-test "clickable carries opaque callback handles through hit testing" {
-    const Counter = struct {
-        value: usize = 0,
-
-        fn increment(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.value += 1;
-        }
-    };
-
-    var counter: Counter = .{};
-    const label: Widget = .{ .text = .{ .value = "Count" } };
-    const button: Widget = .{ .clickable = .{
-        .id = "counter",
-        .child = &label,
-        .on_click = .{ .ptr = &counter, .call_fn = Counter.increment },
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try std.testing.expectEqualStrings("counter", hit.id);
-    try hit.callback.?.call();
-    try std.testing.expectEqual(@as(usize, 1), counter.value);
-}
-
-test "clickable applies hover background style" {
-    const allocator = std.testing.allocator;
-    const label = widgets.text("chip");
-    const box: Widget = .{ .box = .{
-        .child = &label,
-        .background = colors.transparent,
-    } };
-    const chip: Widget = .{ .clickable = .{
-        .id = "chip",
-        .child = &box,
-        .hover_style = .{ .background = colors.blue9 },
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{
-        .allocator = built_arena.allocator(),
-        .interaction = .{ .hovered_id = "chip" },
-    };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &chip, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(allocator, &built_element);
-
-    try std.testing.expectEqual(colors.blue9, built_element.children[0].widget.box.background);
-}
-
-test "clickable hover refresh updates painted background" {
-    const allocator = std.testing.allocator;
-    const label = widgets.text("chip");
-    const box: Widget = .{ .box = .{
-        .child = &label,
-        .background = colors.transparent,
-    } };
-    const chip: Widget = .{ .clickable = .{
-        .id = "chip",
-        .child = &box,
-        .hover_style = .{ .background = colors.blue9 },
-    } };
-    const constraints: Constraints = .{ .max_width = 100, .max_height = 80 };
-
-    var built_arena = std.heap.ArenaAllocator.init(allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(allocator, &build_scope, &chip, constraints);
-    defer destroyElementTree(allocator, &built_element);
-
-    var root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(colors.transparent, root.children[0].background);
-
-    build_scope.interaction = .{ .hovered_id = "chip" };
-    try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
-    root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(colors.blue9, root.children[0].background);
-}
-
-test "clickable hit testing carries activation mode" {
-    const label: Widget = .{ .text = .{ .value = "Press" } };
-    const button: Widget = .{ .clickable = .{
-        .id = "pressable",
-        .child = &label,
-        .on_click = testCallback(),
-        .activation = .press,
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try std.testing.expectEqual(Widget.ClickActivation.press, hit.activation);
-}
-
-test "clickable hit testing carries gesture callbacks" {
-    const label: Widget = .{ .text = .{ .value = "Gesture" } };
-    const button: Widget = .{ .clickable = .{
-        .id = "gesture",
-        .child = &label,
-        .on_tap_down = testCallback(),
-        .on_tap_up = testCallback(),
-        .on_tap_cancel = testCallback(),
-    } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &button, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try std.testing.expect(hit.tap_down != null);
-    try std.testing.expect(hit.tap_up != null);
-    try std.testing.expect(hit.tap_cancel != null);
-}
-
-test "clickable without callback is inert" {
-    const label: Widget = .{ .text = .{ .value = "Inert" } };
-    const clickable: Widget = .{ .clickable = .{ .id = "inert", .child = &label } };
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &clickable, .{ .max_width = 100, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 2, .y = 2 }));
-    const targets = try collectFocusTargets(std.testing.allocator, root);
-    defer std.testing.allocator.free(targets);
-    try std.testing.expectEqual(@as(usize, 0), targets.len);
-}
-
-test "shortcuts invoke ambient actions" {
-    const Counter = struct {
-        value: usize = 0,
-
-        fn increment(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.value += 1;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(allocator);
-    defer build_arena.deinit();
-
-    var counter: Counter = .{};
-    const child = widgets.text("Shortcut child");
-    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .intent = .action("increment") }};
-    const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
-    const shortcuts_widget = try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, child);
-    const actions_widget = try widgets.actions(build_arena.allocator(), &action_bindings, shortcuts_widget);
-
-    var element = try buildElementTree(allocator, &actions_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &element);
-
-    const callback = findShortcutAction(&element, .enter).?;
-    try callback.call();
-    try std.testing.expectEqual(@as(usize, 1), counter.value);
-    try std.testing.expectEqual(@as(?Widget.Callback, null), findShortcutAction(&element, .space));
-}
-
-test "button and shortcut can share an intent" {
-    const Counter = struct {
-        value: usize = 0,
-
-        fn increment(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.value += 1;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(allocator);
-    defer build_arena.deinit();
-
-    var counter: Counter = .{};
-    const intent = Intent.action("increment");
-    const button = try widgets.intentButton(build_arena.allocator(), "increment-button", "Increment", intent);
-    const shortcut_bindings = [_]Widget.ShortcutBinding{.{ .key = .enter, .intent = intent }};
-    const action_bindings = [_]Widget.ActionBinding{.{ .id = "increment", .callback = .{ .ptr = &counter, .call_fn = Counter.increment } }};
-    const root_widget = try widgets.actions(
-        build_arena.allocator(),
-        &action_bindings,
-        try widgets.shortcuts(build_arena.allocator(), &shortcut_bindings, button),
-    );
-
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(allocator, &scope, &root_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &element);
-    const root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try findShortcutAction(&element, .enter).?.call();
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try hit.callback.?.call();
-    try std.testing.expectEqual(@as(usize, 2), counter.value);
-}
-
-test "focused shortcut resolution prefers nearest shortcut and action scopes" {
-    const Counters = struct {
-        global: usize = 0,
-        local: usize = 0,
-
-        fn incrementGlobal(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.global += 1;
-        }
-
-        fn incrementLocal(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.local += 1;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(allocator);
-    defer build_arena.deinit();
-
-    var counters: Counters = .{};
-    const global_button = try widgets.actionButton(build_arena.allocator(), "global-button", "Global", "activate");
-    const local_button = try widgets.actionButton(build_arena.allocator(), "local-button", "Local", "activate");
-    const local_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementLocal } }};
-    const local_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
-    const local_subtree = try widgets.actions(
-        build_arena.allocator(),
-        &local_actions,
-        try widgets.shortcuts(build_arena.allocator(), &local_shortcuts, local_button),
-    );
-    const children = [_]Widget{ global_button, local_subtree };
-    const column = try widgets.column(build_arena.allocator(), &children, 4);
-    const global_actions = [_]Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = &counters, .call_fn = Counters.incrementGlobal } }};
-    const global_shortcuts = [_]Widget.ShortcutBinding{.{ .key = .space, .intent = .action("activate") }};
-    const root_widget = try widgets.actions(
-        build_arena.allocator(),
-        &global_actions,
-        try widgets.shortcuts(build_arena.allocator(), &global_shortcuts, column),
-    );
-
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(allocator, &scope, &root_widget, .{ .max_width = 200, .max_height = 120 });
-    defer destroyElementTree(allocator, &element);
-
-    try findFocusedShortcutAction(&element, .space, "local-button").?.call();
-    try std.testing.expectEqual(@as(usize, 0), counters.global);
-    try std.testing.expectEqual(@as(usize, 1), counters.local);
-
-    try findFocusedShortcutAction(&element, .space, "global-button").?.call();
-    try std.testing.expectEqual(@as(usize, 1), counters.global);
-    try std.testing.expectEqual(@as(usize, 1), counters.local);
-}
-
-test "component widget builds into the render tree" {
-    const LabelComponent = struct {
-        value: []const u8,
-
-        const vtable: Widget.Component.VTable = .{ .build = build };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .component = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn build(ptr: *const anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
-            _ = scope;
-            _ = context;
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return .{ .text = .{ .value = self.value } };
-        }
-    };
-
-    const component: LabelComponent = .{ .value = "Component" };
-    const widget = component.widget();
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
-    try std.testing.expectEqualStrings("Component", root.children[0].text.?);
-}
-
-test "element tree retains cloned callbacks beyond build scope" {
-    const CallbackState = struct {
-        calls: *usize,
-        clones: *usize,
-        destroys: *usize,
-
-        fn callback(self: *@This()) Widget.Callback {
-            return .{
-                .ptr = self,
-                .call_fn = call,
-                .clone_fn = clone,
-                .destroy_fn = destroy,
-            };
-        }
-
-        fn call(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls.* += 1;
-        }
-
-        fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.clones.* += 1;
-            const result = try allocator.create(@This());
-            result.* = self.*;
-            return result;
-        }
-
-        fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.destroys.* += 1;
-            allocator.destroy(self);
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var calls: usize = 0;
-    var clones: usize = 0;
-    var destroys: usize = 0;
-    const build_allocator = build_arena.allocator();
-    const state = try build_allocator.create(CallbackState);
-    state.* = .{ .calls = &calls, .clones = &clones, .destroys = &destroys };
-    const label_value = try build_allocator.dupe(u8, "arena label");
-    const label: Widget = .{ .text = .{ .value = label_value } };
-    const button: Widget = .{ .clickable = .{
-        .id = try build_allocator.dupe(u8, "arena-button"),
-        .child = &label,
-        .on_click = state.callback(),
-    } };
-    var scope: BuildScope = .{ .allocator = build_allocator };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &button, .{ .max_width = 100, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), clones);
-    try std.testing.expectEqual(@as(usize, 0), destroys);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    try element.widget.clickable.on_click.?.call();
-    try std.testing.expectEqual(@as(usize, 1), calls);
-    try std.testing.expectEqualStrings("arena-button", element.widget.clickable.id);
-    try std.testing.expectEqualStrings("arena label", element.children[0].widget.text.value);
-
-    destroyElementTree(retained_allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), destroys);
-}
-
-test "button composed clickable borrows retained action callback" {
-    const CallbackState = struct {
-        calls: *usize,
-        clones: *usize,
-        destroys: *usize,
-
-        fn callback(self: *@This()) Widget.Callback {
-            return .{
-                .ptr = self,
-                .call_fn = call,
-                .clone_fn = clone,
-                .destroy_fn = destroy,
-            };
-        }
-
-        fn call(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls.* += 1;
-        }
-
-        fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.clones.* += 1;
-            const result = try allocator.create(@This());
-            result.* = self.*;
-            return result;
-        }
-
-        fn destroy(allocator: std.mem.Allocator, ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.destroys.* += 1;
-            allocator.destroy(self);
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var calls: usize = 0;
-    var clones: usize = 0;
-    var destroys: usize = 0;
-    const state = try build_arena.allocator().create(CallbackState);
-    state.* = .{ .calls = &calls, .clones = &clones, .destroys = &destroys };
-    const button = try widgets.button(build_arena.allocator(), "action", "Action", state.callback());
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &button, .{ .max_width = 120, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), clones);
-    try std.testing.expectEqual(element.widget.button.on_pressed.?.ptr, element.children[0].widget.clickable.on_click.?.ptr);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    try element.children[0].widget.clickable.on_click.?.call();
-    try std.testing.expectEqual(@as(usize, 1), calls);
-
-    destroyElementTree(retained_allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), destroys);
-}
-
-test "element tree retains cloned render objects beyond build scope" {
-    const RenderState = struct {
-        clones: *usize,
-        destroys: *usize,
-
-        const vtable: Widget.RenderObject.VTable = .{
-            .layout = layout,
-            .paint = paintObject,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .render_object = .{
-                .ptr = self,
-                .vtable = &vtable,
-                .clone_fn = clone,
-                .destroy_fn = destroy,
-            } };
-        }
-
-        fn layout(ptr: *const anyopaque, context: Widget.RenderObject.LayoutContext) !Size {
-            _ = ptr;
-            return context.constraints.clamp(.{ .width = 24, .height = 12 });
-        }
-
-        fn paintObject(ptr: *const anyopaque, context: Widget.RenderObject.PaintContext) !void {
-            _ = ptr;
-            try context.display_list.fillRect(context.allocator, context.rect, colors.accent);
-        }
-
-        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.clones.* += 1;
-            const result = try allocator.create(@This());
-            result.* = self.*;
-            return result;
-        }
-
-        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroys.* += 1;
-            allocator.destroy(@constCast(self));
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var clones: usize = 0;
-    var destroys: usize = 0;
-    const state = try build_arena.allocator().create(RenderState);
-    state.* = .{ .clones = &clones, .destroys = &destroys };
-    const widget = state.widget();
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), clones);
-    try std.testing.expectEqual(@as(usize, 0), destroys);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .render_object), root.kind);
-    try std.testing.expectEqual(@as(f32, 24), root.rect.width);
-
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(retained_allocator);
-    try paint(retained_allocator, root, &display_list);
-    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
-
-    destroyElementTree(retained_allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), destroys);
-}
-
-test "element tree retains cloned stateful widgets beyond build scope" {
-    const StatefulSource = struct {
-        clones: *usize,
-        destroys: *usize,
-        states_created: *usize,
-        states_destroyed: *usize,
-
-        const State = struct {};
-        const vtable: Widget.Stateful.VTable = .{
-            .create_state = createState,
-            .update = update,
-            .build = build,
-            .destroy_state = destroyState,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .stateful = .{
-                .ptr = self,
-                .vtable = &vtable,
-                .clone_fn = clone,
-                .destroy_fn = destroy,
-            } };
-        }
-
-        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.states_created.* += 1;
-            const state = try allocator.create(State);
-            state.* = .{};
-            return state;
-        }
-
-        fn update(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !void {
-            _ = ptr;
-            _ = state;
-            _ = allocator;
-            _ = context;
-        }
-
-        fn build(ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
-            _ = ptr;
-            _ = state;
-            _ = context;
-            const value = try std.fmt.allocPrint(scope.allocator, "stateful survives", .{});
-            return .{ .text = .{ .value = value } };
-        }
-
-        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.states_destroyed.* += 1;
-            const state: *State = @ptrCast(@alignCast(state_ptr));
-            allocator.destroy(state);
-        }
-
-        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.clones.* += 1;
-            const result = try allocator.create(@This());
-            result.* = self.*;
-            return result;
-        }
-
-        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroys.* += 1;
-            allocator.destroy(@constCast(self));
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var clones: usize = 0;
-    var destroys: usize = 0;
-    var states_created: usize = 0;
-    var states_destroyed: usize = 0;
-    const source = try build_arena.allocator().create(StatefulSource);
-    source.* = .{
-        .clones = &clones,
-        .destroys = &destroys,
-        .states_created = &states_created,
-        .states_destroyed = &states_destroyed,
-    };
-    const widget = source.widget();
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), clones);
-    try std.testing.expectEqual(@as(usize, 1), states_created);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    try std.testing.expectEqualStrings("stateful survives", element.children[0].widget.text.value);
-
-    destroyElementTree(retained_allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), states_destroyed);
-    try std.testing.expectEqual(@as(usize, 1), destroys);
-}
-
-test "element tree retains cloned custom elements beyond build scope" {
-    const CustomSource = struct {
-        clones: *usize,
-        destroys: *usize,
-
-        const vtable: Widget.CustomElement.VTable = .{ .build = build };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .element = .{
-                .ptr = self,
-                .vtable = &vtable,
-                .clone_fn = clone,
-                .destroy_fn = destroy,
-            } };
-        }
-
-        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: Widget.BuildContext) !Element {
-            _ = ptr;
-            const value = try std.fmt.allocPrint(scope.allocator, "custom element {d}", .{@as(u32, 7)});
-            const label: Widget = .{ .text = .{ .value = value, .color = colors.accent } };
-            return buildElementTreeScoped(allocator, scope, &label, context.constraints);
-        }
-
-        fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.clones.* += 1;
-            const result = try allocator.create(@This());
-            result.* = self.*;
-            return result;
-        }
-
-        fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroys.* += 1;
-            allocator.destroy(@constCast(self));
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    var clones: usize = 0;
-    var destroys: usize = 0;
-    const source = try build_arena.allocator().create(CustomSource);
-    source.* = .{ .clones = &clones, .destroys = &destroys };
-    const widget = source.widget();
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 100, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), clones);
-    try std.testing.expectEqual(@as(usize, 0), destroys);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    try std.testing.expectEqualStrings("custom element 7", element.children[0].widget.text.value);
-
-    destroyElementTree(retained_allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), destroys);
-}
-
-test "component build products are retained outside the build arena" {
-    const ArenaComponent = struct {
-        value: usize,
-
-        const vtable: Widget.Component.VTable = .{ .build = build };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .component = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn build(ptr: *const anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
-            _ = context;
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            const value = try std.fmt.allocPrint(scope.allocator, "component {d}", .{self.value});
-            return .{ .text = .{ .value = value } };
-        }
-    };
-
-    const retained_allocator = std.testing.allocator;
-    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
-    defer build_arena.deinit();
-
-    const component: ArenaComponent = .{ .value = 42 };
-    const widget = component.widget();
-    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
-    var element = try buildElementTreeScoped(retained_allocator, &scope, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(retained_allocator, &element);
-
-    try std.testing.expect(build_arena.reset(.free_all));
-    try std.testing.expectEqualStrings("component 42", element.children[0].widget.text.value);
-
-    const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .component), root.kind);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
-    try std.testing.expectEqualStrings("component 42", root.children[0].text.?);
-}
-
-test "stateful widget creates state once across matching updates" {
-    const StatefulCounter = struct {
-        label: []const u8,
-        created: *usize,
-        updated: *usize,
-        destroyed: *usize,
-
-        const State = struct {
-            builds: usize = 0,
-        };
-
-        const vtable: Widget.Stateful.VTable = .{
-            .create_state = createState,
-            .update = update,
-            .build = build,
-            .destroy_state = destroyState,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .stateful = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.created.* += 1;
-            const state = try allocator.create(State);
-            state.* = .{};
-            return state;
-        }
-
-        fn update(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !void {
-            _ = state_ptr;
-            _ = allocator;
-            _ = context;
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.updated.* += 1;
-        }
-
-        fn build(ptr: *const anyopaque, state_ptr: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
-            _ = scope;
-            _ = context;
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            const state: *State = @ptrCast(@alignCast(state_ptr));
-            state.builds += 1;
-            return .{ .text = .{ .value = self.label } };
-        }
-
-        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroyed.* += 1;
-            const state: *State = @ptrCast(@alignCast(state_ptr));
-            allocator.destroy(state);
-        }
-    };
-
-    var created: usize = 0;
-    var updated: usize = 0;
-    var destroyed: usize = 0;
-    const first: StatefulCounter = .{ .label = "first", .created = &created, .updated = &updated, .destroyed = &destroyed };
-    const first_widget = first.widget();
-    var element = try buildElementTree(std.testing.allocator, &first_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &element);
-
-    const original_state = element.state.?;
-    try std.testing.expectEqual(@as(usize, 1), created);
-    try std.testing.expectEqual(@as(usize, 0), updated);
-    try std.testing.expectEqualStrings("first", element.children[0].widget.text.value);
-
-    const second: StatefulCounter = .{ .label = "second", .created = &created, .updated = &updated, .destroyed = &destroyed };
-    const second_widget = second.widget();
-    try updateElementTree(std.testing.allocator, &element, &second_widget, .{ .max_width = 200, .max_height = 80 });
-
-    try std.testing.expectEqual(original_state, element.state.?);
-    try std.testing.expectEqual(@as(usize, 1), created);
-    try std.testing.expectEqual(@as(usize, 1), updated);
-    try std.testing.expectEqual(@as(usize, 0), destroyed);
-    try std.testing.expectEqualStrings("second", element.children[0].widget.text.value);
-}
-
-test "clean subtrees skip layout and dirty stateful subtrees relayout" {
-    const CountingBackend = struct {
-        measures: usize = 0,
-
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scaleFn } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(ptr: *anyopaque, value: []const u8, style: ResolvedTextStyle) !Size {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.measures += 1;
-            return fixedMeasureText(value, style);
-        }
-
-        fn scaleFn(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
-    const ToggleStateful = struct {
-        const State = struct {
-            dirty: bool = false,
-            label: []const u8 = "one",
-        };
-
-        const vtable: Widget.Stateful.VTable = .{
-            .create_state = createState,
-            .update = update,
-            .build = build,
-            .destroy_state = destroyState,
-            .needs_rebuild = needsRebuild,
-            .clear_rebuild = clearRebuild,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .stateful = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn createState(_: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
-            const state = try allocator.create(State);
-            state.* = .{};
-            return state;
-        }
-
-        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
-
-        fn build(_: *const anyopaque, state_ptr: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
-            const state: *State = @ptrCast(@alignCast(state_ptr));
-            return .{ .text = .{ .value = state.label } };
-        }
-
-        fn destroyState(_: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-            allocator.destroy(@as(*State, @ptrCast(@alignCast(state_ptr))));
-        }
-
-        fn needsRebuild(_: *const anyopaque, state_ptr: *anyopaque) bool {
-            return @as(*State, @ptrCast(@alignCast(state_ptr))).dirty;
-        }
-
-        fn clearRebuild(_: *const anyopaque, state_ptr: *anyopaque) void {
-            @as(*State, @ptrCast(@alignCast(state_ptr))).dirty = false;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var built_arena = std.heap.ArenaAllocator.init(allocator);
-    defer built_arena.deinit();
-
-    var backend_state: CountingBackend = .{};
-    const measurer: TextMeasurer = .{ .backend = backend_state.backend() };
-
-    const stateful: ToggleStateful = .{};
-    const children = [_]Widget{ .{ .text = .{ .value = "static" } }, stateful.widget() };
-    const column: Widget = .{ .column = .{ .children = &children } };
-    const constraints: Constraints = .{ .max_width = 200, .max_height = 120 };
-
-    var scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var element = try buildElementTreeScoped(allocator, &scope, &column, constraints);
-    defer destroyElementTree(allocator, &element);
-
-    const root = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
-    const initial_measures = backend_state.measures;
-    try std.testing.expectEqual(@as(usize, 2), initial_measures);
-    try std.testing.expect(collectDamage(root) != null);
-
-    // A clean tree re-laid out with identical constraints skips entirely
-    // and accumulates no damage.
-    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
-    try std.testing.expectEqual(initial_measures, backend_state.measures);
-    try std.testing.expectEqual(@as(?Rect, null), collectDamage(root));
-
-    // Dirtying the stateful subtree relayouts it, but the clean sibling
-    // text is never re-measured.
-    const state: *ToggleStateful.State = @ptrCast(@alignCast(element.children[1].state.?));
-    state.dirty = true;
-    state.label = "two";
-    _ = built_arena.reset(.retain_capacity);
-    var rebuild_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    try std.testing.expect(try rebuildDirtyElementTreeScoped(allocator, &rebuild_scope, &element, constraints));
-
-    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
-    try std.testing.expectEqual(initial_measures + 1, backend_state.measures);
-    try std.testing.expectEqualStrings("two", root.children[1].children[0].text.?);
-
-    // Damage covers the relaid stateful subtree, not the clean sibling
-    // above it.
-    const damage = collectDamage(root).?;
-    const sibling = root.children[0];
-    try std.testing.expect(damage.y >= sibling.rect.y + sibling.rect.height);
-}
-
-test "stateful widgets with different type tokens never share state" {
-    const Tokens = struct {
-        var first_token: u8 = 0;
-        var second_token: u8 = 0;
-    };
-
-    const Counted = struct {
-        token: *const anyopaque,
-        created: *usize,
-        destroyed: *usize,
-
-        const vtable: Widget.Stateful.VTable = .{
-            .create_state = createState,
-            .update = update,
-            .build = build,
-            .destroy_state = destroyState,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .stateful = .{ .ptr = self, .vtable = &vtable, .type_token = self.token } };
-        }
-
-        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.created.* += 1;
-            return try allocator.create(u8);
-        }
-
-        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
-
-        fn build(_: *const anyopaque, _: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
-            return .{ .text = .{ .value = "counted" } };
-        }
-
-        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroyed.* += 1;
-            allocator.destroy(@as(*u8, @ptrCast(state_ptr)));
-        }
-    };
-
-    var created: usize = 0;
-    var destroyed: usize = 0;
-    const first: Counted = .{ .token = &Tokens.first_token, .created = &created, .destroyed = &destroyed };
-    const second: Counted = .{ .token = &Tokens.second_token, .created = &created, .destroyed = &destroyed };
-
-    const first_widget = first.widget();
-    var element = try buildElementTree(std.testing.allocator, &first_widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), created);
-
-    // A different token at the same position replaces the element: the old
-    // state is disposed and fresh state created, never silently reused.
-    const second_widget = second.widget();
-    try updateElementTree(std.testing.allocator, &element, &second_widget, .{ .max_width = 200, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 2), created);
-    try std.testing.expectEqual(@as(usize, 1), destroyed);
-}
-
-test "stateful widget destroys state on element destruction and replacement" {
-    const Lifecycle = struct {
-        created: *usize,
-        destroyed: *usize,
-
-        const State = struct {};
-        const vtable: Widget.Stateful.VTable = .{
-            .create_state = createState,
-            .update = update,
-            .build = build,
-            .destroy_state = destroyState,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .stateful = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.created.* += 1;
-            const state = try allocator.create(State);
-            state.* = .{};
-            return state;
-        }
-
-        fn update(ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: Widget.BuildContext) !void {
-            _ = ptr;
-            _ = state;
-            _ = allocator;
-            _ = context;
-        }
-
-        fn build(ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: Widget.BuildContext) !Widget {
-            _ = ptr;
-            _ = state;
-            _ = scope;
-            _ = context;
-            return .{ .text = .{ .value = "stateful" } };
-        }
-
-        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.destroyed.* += 1;
-            const state: *State = @ptrCast(@alignCast(state_ptr));
-            allocator.destroy(state);
-        }
-    };
-
-    var created: usize = 0;
-    var destroyed: usize = 0;
-    const lifecycle: Lifecycle = .{ .created = &created, .destroyed = &destroyed };
-    const widget = lifecycle.widget();
-    var element = try buildElementTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
-    try std.testing.expectEqual(@as(usize, 1), created);
-
-    const replacement: Widget = .{ .text = .{ .value = "replacement" } };
-    try updateElementTree(std.testing.allocator, &element, &replacement, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &element);
-    try std.testing.expectEqual(@as(usize, 1), destroyed);
-    try std.testing.expectEqual(@as(Element.Kind, .text), element.kind);
-
-    var destroyed_on_deinit: usize = 0;
-    const second_lifecycle: Lifecycle = .{ .created = &created, .destroyed = &destroyed_on_deinit };
-    const second_widget = second_lifecycle.widget();
-    var second_element = try buildElementTree(std.testing.allocator, &second_widget, .{ .max_width = 200, .max_height = 80 });
-    destroyElementTree(std.testing.allocator, &second_element);
-    try std.testing.expectEqual(@as(usize, 1), destroyed_on_deinit);
-}
-
-test "custom element widget builds an element subtree" {
-    const LabelElement = struct {
-        value: []const u8,
-
-        const vtable: Widget.CustomElement.VTable = .{ .build = build };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .element = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn build(ptr: *const anyopaque, allocator: std.mem.Allocator, scope: *BuildScope, context: Widget.BuildContext) !Element {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            const label: Widget = .{ .text = .{ .value = self.value, .color = colors.accent } };
-            return buildElementTreeScoped(allocator, scope, &label, context.constraints);
-        }
-    };
-
-    const custom: LabelElement = .{ .value = "Element" };
-    const widget = custom.widget();
-
-    var element = try buildElementTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &element);
-
-    try std.testing.expectEqual(@as(Element.Kind, .element), element.kind);
-    try std.testing.expectEqual(@as(Element.Kind, .text), element.children[0].kind);
-
-    const root = try layoutElement(std.testing.allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .element), root.kind);
-    try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].kind);
-    try std.testing.expectEqualStrings("Element", root.children[0].text.?);
-    try std.testing.expectEqual(colors.accent, root.children[0].foreground);
-}
-
-test "element update reuses matching children and replaces shape changes" {
-    const allocator = std.testing.allocator;
-
+test "keyed reconciliation preserves element state across reorder" {
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
     const first_children = [_]Widget{
-        .{ .text = .{ .value = "A" } },
-        .{ .text = .{ .value = "B" } },
+        .{ .text_input = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "alpha", .placeholder = "" } },
+        .{ .text_input = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "beta", .placeholder = "" } },
     };
-    const first: Widget = .{ .column = .{ .children = &first_children, .gap = 2 } };
-    var element = try buildElementTree(allocator, &first, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &element);
+    const first: Widget = .{ .row = .{ .children = &first_children } };
+    var element = try buildElementTree(std.testing.allocator, &first, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
 
-    const original_children = element.children.ptr;
+    const a_state = textInputState(&element.children[0]);
+    a_state.text.clearRetainingCapacity();
+    try a_state.text.appendSlice(std.testing.allocator, "edited");
+
     const second_children = [_]Widget{
-        .{ .text = .{ .value = "C" } },
-        .{ .text = .{ .value = "D" } },
+        .{ .text_input = .{ .key = "b", .id = "b", .focus_node = .named("b"), .value = "new beta", .placeholder = "" } },
+        .{ .text_input = .{ .key = "a", .id = "a", .focus_node = .named("a"), .value = "new alpha", .placeholder = "" } },
     };
-    const second: Widget = .{ .column = .{ .children = &second_children, .gap = 6 } };
-    try updateElementTree(allocator, &element, &second, .{ .max_width = 200, .max_height = 80 });
+    const second: Widget = .{ .row = .{ .children = &second_children } };
+    try updateElementTree(std.testing.allocator, &element, &second, constraints);
 
-    try std.testing.expectEqual(original_children, element.children.ptr);
-    try std.testing.expectEqual(@as(usize, 2), element.children.len);
-    try std.testing.expectEqual(@as(f32, 6), element.widget.column.gap);
-    try std.testing.expectEqualStrings("C", element.children[0].widget.text.value);
-    try std.testing.expectEqualStrings("D", element.children[1].widget.text.value);
-
-    const third_children = [_]Widget{
-        .{ .text = .{ .value = "E" } },
-    };
-    const third: Widget = .{ .column = .{ .children = &third_children, .gap = 1 } };
-    try updateElementTree(allocator, &element, &third, .{ .max_width = 200, .max_height = 80 });
-
-    try std.testing.expectEqual(@as(usize, 1), element.children.len);
-    try std.testing.expectEqual(@as(f32, 1), element.widget.column.gap);
-    try std.testing.expectEqualStrings("E", element.children[0].widget.text.value);
+    try std.testing.expectEqual(a_state, textInputState(&element.children[1]));
+    try std.testing.expectEqualStrings("edited", textInputState(&element.children[1]).text.items);
 }
 
-test "keyed linear update matches children by key" {
-    const allocator = std.testing.allocator;
+test "clickable box paints base and hover backgrounds" {
+    const label = widgets.text("Increment");
+    const padded: Widget = .{ .padding = .{
+        .insets = .{ .left = 12, .top = 8, .right = 12, .bottom = 8 },
+        .child = &label,
+    } };
+    const surface: Widget = .{ .box = .{
+        .child = &padded,
+        .background = colors.slate3,
+    } };
+    const clickable: Widget = .{ .clickable = .{
+        .id = "increment",
+        .handler = 1,
+        .child = &surface,
+        .hover_style = .{ .background = colors.slate7 },
+    } };
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+    var scope: BuildScope = .{};
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &clickable, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
 
-    const a_text: Widget = .{ .text = .{ .value = "A" } };
-    const b_text: Widget = .{ .text = .{ .value = "B" } };
-    const first_children = [_]Widget{
-        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &a_text } },
-        .{ .keyed = .{ .key = .{ .string = "b" }, .child = &b_text } },
-    };
-    const first: Widget = .{ .column = .{ .children = &first_children } };
-    var element = try buildElementTree(allocator, &first, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(allocator, &element);
-
-    const old_b_child = element.children[1].children.ptr;
-
-    const b2_text: Widget = .{ .text = .{ .value = "B2" } };
-    const c_text: Widget = .{ .text = .{ .value = "C" } };
-    const a2_text: Widget = .{ .text = .{ .value = "A2" } };
-    const second_children = [_]Widget{
-        .{ .keyed = .{ .key = .{ .string = "b" }, .child = &b2_text } },
-        .{ .keyed = .{ .key = .{ .string = "c" }, .child = &c_text } },
-        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &a2_text } },
-    };
-    const second: Widget = .{ .column = .{ .children = &second_children } };
-    try updateElementTree(allocator, &element, &second, .{ .max_width = 200, .max_height = 80 });
-
-    try std.testing.expectEqual(@as(usize, 3), element.children.len);
-    try std.testing.expectEqual(old_b_child, element.children[0].children.ptr);
-    try std.testing.expectEqualStrings("b", element.children[0].key.?.string);
-    try std.testing.expectEqualStrings("B2", element.children[0].children[0].widget.text.value);
-    try std.testing.expectEqualStrings("c", element.children[1].key.?.string);
-    try std.testing.expectEqualStrings("C", element.children[1].children[0].widget.text.value);
-    try std.testing.expectEqualStrings("a", element.children[2].key.?.string);
-    try std.testing.expectEqualStrings("A2", element.children[2].children[0].widget.text.value);
-}
-
-test "render object widget owns custom layout paint and hit testing" {
-    const BadgeRenderObject = struct {
-        id: []const u8,
-
-        const vtable: Widget.RenderObject.VTable = .{
-            .layout = layoutBadge,
-            .paint = paintBadge,
-            .hit_test = hitTest,
-        };
-
-        fn widget(self: *const @This()) Widget {
-            return .{ .render_object = .{ .ptr = self, .vtable = &vtable } };
-        }
-
-        fn layoutBadge(ptr: *const anyopaque, context: Widget.RenderObject.LayoutContext) !Size {
-            _ = ptr;
-            _ = context.measurer;
-            return context.constraints.clamp(.{ .width = 48, .height = 20 });
-        }
-
-        fn paintBadge(ptr: *const anyopaque, context: Widget.RenderObject.PaintContext) !void {
-            _ = ptr;
-            try context.display_list.fillRect(context.allocator, context.rect, colors.accent);
-        }
-
-        fn hitTest(ptr: *const anyopaque, rect: Rect, point: Point) ?[]const u8 {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return if (rect.contains(point)) self.id else null;
-        }
-    };
-
-    const badge: BadgeRenderObject = .{ .id = "badge" };
-    const widget = badge.widget();
-
-    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer built_arena.deinit();
-    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
-    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &widget, .{ .max_width = 200, .max_height = 80 });
-    defer destroyElementTree(std.testing.allocator, &built_element);
-    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
-
-    try std.testing.expectEqual(@as(RenderNode.Kind, .render_object), root.kind);
-    try std.testing.expectEqual(@as(f32, 48), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 20), root.rect.height);
-
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var log_backend: LogBackend = .{ .writer = &output.writer };
     var display_list: DisplayList = .{};
     defer display_list.deinit(std.testing.allocator);
-    try paint(std.testing.allocator, root, &display_list);
 
-    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
-    try std.testing.expectEqualStrings("badge", hitTestButton(root, .{ .x = 8, .y = 8 }).?);
-    try std.testing.expect(hitTestButton(root, .{ .x = 80, .y = 8 }) == null);
+    var render_root = try buildRenderTreeFromElement(std.testing.allocator, &element, constraints, log_backend.backend());
+    try paint(std.testing.allocator, render_root, &display_list);
+    try std.testing.expect(displayListHasColor(&display_list, colors.slate3));
+
+    scope.interaction.hovered_id = "increment";
+    _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"increment"});
+    render_root = try buildRenderTreeFromElement(std.testing.allocator, &element, constraints, log_backend.backend());
+    display_list.clearRetainingCapacity(std.testing.allocator);
+    try paint(std.testing.allocator, render_root, &display_list);
+    try std.testing.expect(displayListHasColor(&display_list, colors.slate7));
+}
+
+test "semantic button resolves light dark and hover theme colors" {
+    const label: Widget = .{ .text = .{ .value = "Increment", .role = .label } };
+    const button: Widget = .{ .button = .{
+        .id = "increment",
+        .handler = 1,
+        .child = &label,
+    } };
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+    var scope: BuildScope = .{ .theme = .light };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &button, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    try std.testing.expectEqual(ColorScheme.light.primary, element.children[0].widget.box.background);
+    try std.testing.expectEqual(ColorScheme.light.on_primary, element.children[0].children[0].children[0].children[0].widget.text.color.?);
+
+    scope.interaction.hovered_id = "increment";
+    _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"increment"});
+    try std.testing.expectEqual(ColorScheme.light.primary_hover, element.children[0].widget.box.background);
+
+    scope.theme = .dark;
+    scope.interaction.hovered_id = null;
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &button, constraints);
+    try std.testing.expectEqual(ColorScheme.dark.primary, element.children[0].widget.box.background);
+    try std.testing.expectEqual(ColorScheme.dark.on_primary, element.children[0].children[0].children[0].children[0].widget.text.color.?);
+}
+
+test "semantic button restores hover pressed focus disabled and keyboard behavior" {
+    const label: Widget = .{ .text = .{ .value = "Action", .role = .label } };
+    const enabled_button: Widget = .{ .button = .{
+        .id = "action",
+        .handler = 7,
+        .child = &label,
+    } };
+    const theme: Theme = .{
+        .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.blue9,
+            .foreground = colors.white,
+            .hover_background = colors.black,
+            .hover_foreground = colors.slate2,
+            .pressed_background = colors.red9,
+            .focused_border = colors.slate12,
+            .disabled_background = colors.slate7,
+            .disabled_foreground = colors.slate11,
+        },
+    };
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+    var scope: BuildScope = .{ .theme = theme };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &enabled_button, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    try std.testing.expectEqual(colors.blue9, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.white, element.children[0].children[0].children[0].children[0].widget.text.color.?);
+
+    scope.interaction.hovered_id = "action";
+    _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"action"});
+    try std.testing.expectEqual(colors.black, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.slate2, element.children[0].children[0].children[0].children[0].widget.text.color.?);
+
+    scope.interaction.pressed_id = "action";
+    _ = try refreshInteractionElements(std.testing.allocator, &scope, &element, constraints, &.{"action"});
+    try std.testing.expectEqual(colors.red9, element.children[0].widget.box.background);
+
+    scope.interaction.focused_id = "action";
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &enabled_button, constraints);
+    try std.testing.expectEqual(colors.slate12, element.children[0].widget.box.border.?);
+
+    var root = try layoutElement(std.testing.allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expect(hitTestClick(root, .{ .x = 1, .y = 1 }) != null);
+    const enabled_targets = try collectFocusTargets(std.testing.allocator, root);
+    defer std.testing.allocator.free(enabled_targets);
+    try std.testing.expectEqual(@as(usize, 1), enabled_targets.len);
+    try std.testing.expectEqualStrings("action", enabled_targets[0].id);
+
+    const disabled_button: Widget = .{ .button = .{
+        .id = "action",
+        .child = &label,
+    } };
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &disabled_button, constraints);
+    try std.testing.expectEqual(colors.slate7, element.children[0].widget.box.background);
+    try std.testing.expectEqual(colors.slate11, element.children[0].children[0].children[0].children[0].widget.text.color.?);
+    try std.testing.expectEqual(@as(?Color, null), element.children[0].widget.box.border);
+
+    root = try layoutElement(std.testing.allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expect(hitTestClick(root, .{ .x = 1, .y = 1 }) == null);
+    const disabled_targets = try collectFocusTargets(std.testing.allocator, root);
+    defer std.testing.allocator.free(disabled_targets);
+    try std.testing.expectEqual(@as(usize, 0), disabled_targets.len);
+}
+
+fn displayListHasColor(display_list: *const DisplayList, color: Color) bool {
+    for (display_list.commands.items) |command| switch (command) {
+        .fill_rect => |fill| if (fill.color == color) return true,
+        .alpha_image => |image| if (image.color == color) return true,
+        else => {},
+    };
+    return false;
 }

@@ -77,27 +77,43 @@ const Theme = struct {
 
 /// Caches name+size lookups, including misses (tombstones), so icons
 /// that resolve to nothing don't re-walk the theme directories on
-/// every rebuild. Entries live until deinit; an icon-theme change at
-/// runtime keeps serving stale results until the process restarts.
 pub const Cache = struct {
     allocator: std.mem.Allocator,
+    theme_name: []u8,
+    generation: u64 = 1,
     entries: std.StringHashMapUnmanaged(?IconFile) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) Cache {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator) !Cache {
+        return .{ .allocator = allocator, .theme_name = try allocator.dupe(u8, preferredTheme()) };
     }
 
     pub fn deinit(self: *Cache) void {
+        self.clear();
+        self.allocator.free(self.theme_name);
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *Cache) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             if (entry.value_ptr.*) |icon| self.allocator.free(icon.path);
         }
-        self.entries.deinit(self.allocator);
+        self.entries.clearRetainingCapacity();
     }
 
-    /// The returned icon path is owned by the cache and stays valid
-    /// until deinit; null means the icon is known to be missing.
+    pub fn setTheme(self: *Cache, theme_name: []const u8) !void {
+        if (theme_name.len == 0) return error.InvalidIconTheme;
+        const copy = try self.allocator.dupe(u8, theme_name);
+        self.allocator.free(self.theme_name);
+        self.theme_name = copy;
+        self.generation +%= 1;
+        self.clear();
+    }
+
+    /// The returned icon path is owned by the cache and stays valid until
+    /// the theme changes, the cache is cleared, or deinit; null is a cached
+    /// miss.
     pub fn lookup(self: *Cache, name: []const u8, logical_size: f32) !?IconFile {
         const size = positiveIconSize(logical_size);
         const key = try std.fmt.allocPrint(self.allocator, "{d}\x00{s}", .{ size, name });
@@ -106,7 +122,7 @@ pub const Cache = struct {
             self.allocator.free(key);
             return cached;
         }
-        const icon = try lookupIconSized(self.allocator, name, logical_size);
+        const icon = try lookupIconSizedWithTheme(self.allocator, self.theme_name, name, logical_size, &.{ .svg, .png });
         errdefer if (icon) |value| self.allocator.free(value.path);
         if (icon == null) log.warn("missing icon {s}", .{name});
         try self.entries.put(self.allocator, key, icon);
@@ -132,6 +148,10 @@ pub fn lookupIconSized(allocator: std.mem.Allocator, name: []const u8, logical_s
 }
 
 fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, logical_size: f32, formats: []const IconFormat) !?IconFile {
+    return lookupIconSizedWithTheme(allocator, preferredTheme(), name, logical_size, formats);
+}
+
+fn lookupIconSizedWithTheme(allocator: std.mem.Allocator, theme: []const u8, name: []const u8, logical_size: f32, formats: []const IconFormat) !?IconFile {
     if (name.len == 0) return null;
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
         if (formatFromPath(name, formats)) |format| {
@@ -143,11 +163,10 @@ fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, lo
     const size = positiveIconSize(logical_size);
     var visited: std.ArrayList([]u8) = .empty;
     defer {
-        for (visited.items) |theme| allocator.free(theme);
+        for (visited.items) |visited_theme| allocator.free(visited_theme);
         visited.deinit(allocator);
     }
 
-    const theme = preferredTheme();
     if (try lookupInTheme(allocator, name, size, theme, formats, &visited, 0)) |path| return path;
     if (!visitedContains(visited.items, "hicolor")) {
         if (try lookupInTheme(allocator, name, size, "hicolor", formats, &visited, 0)) |path| return path;
@@ -483,7 +502,7 @@ test "cache tombstones missing icons and serves repeat lookups" {
     std.testing.log_level = .err;
     defer std.testing.log_level = .warn;
 
-    var cache: Cache = .init(std.testing.allocator);
+    var cache: Cache = try .init(std.testing.allocator);
     defer cache.deinit();
 
     try std.testing.expect(try cache.lookup("keywork-definitely-missing-icon", 16) == null);
@@ -505,7 +524,7 @@ test "cache returns the same owned path for repeated hits" {
     const absolute = try tmp.dir.realPathFileAlloc(std.testing.io, "keywork-cache-test.svg", std.testing.allocator);
     defer std.testing.allocator.free(absolute);
 
-    var cache: Cache = .init(std.testing.allocator);
+    var cache: Cache = try .init(std.testing.allocator);
     defer cache.deinit();
 
     const first = (try cache.lookup(absolute, 16)).?;
