@@ -1,7 +1,7 @@
 //! SVG icon render object support.
 
 const std = @import("std");
-const keywork = @import("core.zig");
+const keywork = @import("../ui.zig");
 const c = @import("image_c");
 
 const icon_supersample = 4;

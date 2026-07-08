@@ -1,10 +1,11 @@
 //! Minimal `wl_shm` render backend for Keywork display lists.
 
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
-const keywork = @import("core.zig");
-const TextRenderer = @import("text_renderer.zig");
-const WaylandInput = @import("wayland_input.zig");
+const event_loop = @import("../../linux/event_loop.zig");
+const keywork = @import("../../ui.zig");
+const TextRenderer = @import("../../graphics/text.zig");
+const WaylandInput = @import("input.zig");
+const wayland_options = @import("options.zig");
 const wayland = @import("wayland");
 
 const linux = std.os.linux;
@@ -67,7 +68,7 @@ pub const Backend = struct {
         app_id: [:0]const u8 = "dev.keywork.Keywork",
         width: u31 = 640,
         height: u31 = 480,
-        layer_shell: ?keywork.LayerShellOptions = null,
+        layer_shell: ?wayland_options.LayerShellOptions = null,
     };
 
     const ShellRole = union(enum) {
@@ -719,7 +720,7 @@ pub const Backend = struct {
         };
     }
 
-    fn layer(value: keywork.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
+    fn layer(value: wayland_options.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
         return switch (value) {
             .background => .background,
             .bottom => .bottom,
@@ -728,7 +729,7 @@ pub const Backend = struct {
         };
     }
 
-    fn anchor(value: keywork.LayerShellOptions.AnchorSet) zwlr.LayerSurfaceV1.Anchor {
+    fn anchor(value: wayland_options.LayerShellOptions.AnchorSet) zwlr.LayerSurfaceV1.Anchor {
         return .{
             .top = value.top,
             .bottom = value.bottom,
@@ -737,7 +738,7 @@ pub const Backend = struct {
         };
     }
 
-    fn keyboardInteractivity(value: keywork.LayerShellOptions.KeyboardInteractivity) zwlr.LayerSurfaceV1.KeyboardInteractivity {
+    fn keyboardInteractivity(value: wayland_options.LayerShellOptions.KeyboardInteractivity) zwlr.LayerSurfaceV1.KeyboardInteractivity {
         return switch (value) {
             .none => .none,
             .exclusive => .exclusive,

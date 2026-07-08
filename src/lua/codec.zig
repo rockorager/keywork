@@ -1,7 +1,7 @@
 //! Small comptime Lua table codec for app-side option structs.
 
 const std = @import("std");
-const keywork = @import("core.zig");
+const keywork = @import("../ui.zig");
 const c = @import("luajit_c");
 
 pub fn decode(comptime T: type, lua_state: *c.lua_State, index: c_int, allocator: std.mem.Allocator) !T {

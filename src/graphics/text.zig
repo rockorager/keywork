@@ -6,7 +6,7 @@ const std = @import("std");
 const c = @import("text_c");
 const image_c = @import("image_c");
 const uucode = @import("uucode");
-const keywork = @import("core.zig");
+const keywork = @import("../ui.zig");
 
 const log = std.log.scoped(.keywork_text);
 

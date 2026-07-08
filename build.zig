@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     const stb_lib = stb.add(b, target, optimize);
 
     const image_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/image_c.h"),
+        .root_source_file = b.path("src/ffi/image_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     const z2d_module = z2d_dep.module("z2d");
 
     const xkb_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/xkb_c.h"),
+        .root_source_file = b.path("src/ffi/xkb_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     const xkb_c_module = xkb_c.createModule();
 
     const dbus_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/dbus_c.h"),
+        .root_source_file = b.path("src/ffi/dbus_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
     const dbus_c_module = dbus_c.createModule();
 
     const text_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/text_c.h"),
+        .root_source_file = b.path("src/ffi/text_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     linkKeyworkSystemLibraries(app_module);
 
     const luajit_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/luajit_c.h"),
+        .root_source_file = b.path("src/ffi/luajit_c.h"),
         .target = target,
         .optimize = optimize,
     });

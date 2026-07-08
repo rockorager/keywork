@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const uucode = @import("uucode");
-const keywork = @import("core.zig");
+const keywork = @import("../ui.zig");
 
 const log = std.log.scoped(.keywork);
 
@@ -19,8 +19,20 @@ const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
-const desktop_settings = @import("desktop_settings.zig");
-const event_loop = @import("event_loop.zig");
+
+pub const UiColorScheme = enum {
+    no_preference,
+    dark,
+    light,
+
+    pub fn name(self: UiColorScheme) []const u8 {
+        return switch (self) {
+            .no_preference => "no-preference",
+            .dark => "dark",
+            .light => "light",
+        };
+    }
+};
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -28,7 +40,7 @@ pub const Runtime = struct {
     constraints: Constraints,
     app: AppHost,
     build_arena: std.heap.ArenaAllocator,
-    color_scheme: desktop_settings.ColorScheme,
+    color_scheme: UiColorScheme,
     focused_id: ?[]u8 = null,
     autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
@@ -60,7 +72,7 @@ pub const Runtime = struct {
         backend: RenderBackend,
         constraints: Constraints,
         app: AppHost,
-        color_scheme: desktop_settings.ColorScheme,
+        color_scheme: UiColorScheme,
     ) !Runtime {
         var self: Runtime = .{
             .allocator = allocator,
@@ -706,11 +718,15 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorScheme) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
+    pub fn setColorScheme(self: *Runtime, color_scheme: UiColorScheme) !void {
         if (self.color_scheme == color_scheme) return;
         self.color_scheme = color_scheme;
-        self.invalidate() catch |err| {
+        try self.invalidate();
+    }
+
+    pub fn colorSchemeChanged(ctx: *anyopaque, color_scheme: UiColorScheme) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        self.setColorScheme(color_scheme) catch |err| {
             log.err("desktop settings invalidate failed: {}", .{err});
         };
     }
@@ -722,15 +738,8 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn fileChanged(
-        ctx: *anyopaque,
-        _: *event_loop.EventLoop,
-        path: []const u8,
-        mask: u32,
-        _: ?[]const u8,
-    ) !void {
+    pub fn reloadFileChanged(self: *Runtime, path: []const u8, mask: u32) !void {
         log.info("reload requested for {s} mask=0x{x}", .{ path, mask });
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
         try self.invalidate();
     }
 

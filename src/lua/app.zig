@@ -1,14 +1,16 @@
-//! LuaJIT-backed widget descriptions.
+//! LuaJIT application host and native Keywork bindings.
 
 const std = @import("std");
-const keywork = @import("core.zig");
-const app_runner = @import("app_runner.zig");
-const event_loop = @import("event_loop.zig");
-const icon_theme = @import("icon_theme.zig");
+const keywork = @import("../ui.zig");
+const app_options = @import("../app/options.zig");
+const log_backend_mod = @import("../backend/log.zig");
+const wayland_options = @import("../backend/wayland/options.zig");
+const event_loop = @import("../linux/event_loop.zig");
+const icon_theme = @import("../linux/icon_theme.zig");
 const image_c = @import("image_c");
-const lua_codec = @import("lua_codec.zig");
-const runtime_mod = @import("runtime.zig");
-const svg_icon = @import("svg_icon.zig");
+const lua_codec = @import("codec.zig");
+const runtime_mod = @import("../ui/runtime.zig");
+const svg_icon = @import("../graphics/svg_icon.zig");
 const c = @import("luajit_c");
 const dbus_c = @import("dbus_c");
 
@@ -533,10 +535,10 @@ const LuaImage = struct {
 pub const WindowConfig = struct {
     app_id: ?[:0]u8 = null,
     title: ?[:0]u8 = null,
-    backend: ?app_runner.BackendKind = null,
+    backend: ?app_options.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
-    layer_shell: ?keywork.LayerShellOptions = null,
+    layer_shell: ?wayland_options.LayerShellOptions = null,
 
     fn deinit(self: *WindowConfig, allocator: std.mem.Allocator) void {
         if (self.app_id) |value| allocator.free(value);
@@ -628,7 +630,7 @@ pub const App = struct {
     }
 
     /// Run the script if it has not executed yet (or is dirty). Called
-    /// before app_runner.run so top-level keywork.window declarations can
+    /// before app/runner.zig starts the backend so top-level keywork.window declarations can
     /// shape the window, and again on every rebuild.
     pub fn ensureLoaded(self: *App) !void {
         if (self.script_dirty or self.script_ref < 0) try self.reloadScript();
@@ -1965,10 +1967,10 @@ test "scriptChunk handles a shebang-only file" {
 const embedded_ui_source = @embedFile("ui.lua");
 
 fn installUi(lua_state: *c.lua_State) void {
-    addPackagePath(lua_state, "src/?.lua");
+    addPackagePath(lua_state, "src/lua/?.lua");
 
     // Fallback loader appended after the standard searchers so a
-    // checkout's src/ui.lua wins during development while shipped
+    // checkout's src/lua/ui.lua wins during development while shipped
     // scripts resolve require("ui") anywhere.
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
     const package_table = c.lua_gettop(lua_state);
@@ -2124,15 +2126,15 @@ fn checkI32Field(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8
     return @intFromFloat(value);
 }
 
-fn backendFromName(name: []const u8) ?app_runner.BackendKind {
+fn backendFromName(name: []const u8) ?app_options.BackendKind {
     if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
     if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
     if (std.mem.eql(u8, name, "log")) return .log;
     return null;
 }
 
-fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) keywork.LayerShellOptions {
-    var options: keywork.LayerShellOptions = .{};
+fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) wayland_options.LayerShellOptions {
+    var options: wayland_options.LayerShellOptions = .{};
 
     if (checkStringField(lua_state, table_index, "layer")) |name| {
         options.layer = if (std.mem.eql(u8, name, "background"))
@@ -4515,7 +4517,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -4576,7 +4578,7 @@ test "lua stateful widget dispose runs when removed" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -4620,7 +4622,7 @@ test "lua stateful build context includes theme" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -4685,7 +4687,7 @@ test "lua resolves theme families and component tokens" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -4725,7 +4727,7 @@ test "lua flexible and main_align lay out through the parser" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
@@ -4785,7 +4787,7 @@ test "lua loop fs_event observes file changes" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     // The loop must outlive the runtime: runtime deinit disposes stateful
     // widgets whose Lua dispose callbacks cancel sources on the loop.
     var loop = try event_loop.EventLoop.init(allocator);
@@ -4874,7 +4876,7 @@ test "lua loop spawn captures stdout and exit" {
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    var log_backend: keywork.LogBackend = .{ .writer = &output.writer };
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     // The loop must outlive the runtime: runtime deinit disposes stateful
     // widgets whose Lua dispose callbacks cancel sources on the loop.
     var loop = try event_loop.EventLoop.init(allocator);

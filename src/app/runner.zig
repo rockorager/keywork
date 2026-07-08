@@ -1,21 +1,41 @@
 //! Process and event-loop runner for the Keywork Lua runtime.
 
 const std = @import("std");
-const keywork = @import("core.zig");
+const keywork = @import("../ui.zig");
 
-const desktop_settings = @import("desktop_settings.zig");
-const event_loop = @import("event_loop.zig");
-const runtime_mod = @import("runtime.zig");
-const wayland_shm = @import("wayland_shm.zig");
-const wayland_vulkan = @import("wayland_vulkan.zig");
+const desktop_settings = @import("../linux/desktop_settings.zig");
+const event_loop = @import("../linux/event_loop.zig");
+const log_backend_mod = @import("../backend/log.zig");
+const app_options = @import("options.zig");
+const runtime_mod = @import("../ui/runtime.zig");
+const wayland_options = @import("../backend/wayland/options.zig");
+const wayland_shm = @import("../backend/wayland/shm.zig");
+const wayland_vulkan = @import("../backend/wayland/vulkan.zig");
 
 const log = std.log.scoped(.keywork_runner);
 
-pub const BackendKind = enum {
-    log,
-    wayland_shm,
-    vulkan,
-};
+fn uiColorScheme(value: desktop_settings.ColorScheme) runtime_mod.UiColorScheme {
+    return switch (value) {
+        .no_preference => .no_preference,
+        .dark => .dark,
+        .light => .light,
+    };
+}
+
+fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorScheme) void {
+    runtime_mod.Runtime.colorSchemeChanged(ctx, uiColorScheme(color_scheme));
+}
+
+fn watchedFileChanged(
+    ctx: *anyopaque,
+    _: *event_loop.EventLoop,
+    path: []const u8,
+    mask: u32,
+    _: ?[]const u8,
+) !void {
+    const runtime: *runtime_mod.Runtime = @ptrCast(@alignCast(ctx));
+    try runtime.reloadFileChanged(path, mask);
+}
 
 pub const EventSourceInstaller = *const fn (
     ctx: ?*anyopaque,
@@ -28,8 +48,8 @@ pub const Options = struct {
     app_id: [:0]const u8 = "dev.keywork.Keywork",
     width: f32 = 640,
     height: f32 = 480,
-    backend: BackendKind = .log,
-    layer_shell: ?keywork.LayerShellOptions = null,
+    backend: app_options.BackendKind = .log,
+    layer_shell: ?wayland_options.LayerShellOptions = null,
     log_writer: ?*std.Io.Writer = null,
     file_watch_path: ?[]const u8 = null,
     event_source_context: ?*anyopaque = null,
@@ -56,7 +76,7 @@ fn runLog(
     options: Options,
 ) !void {
     if (options.log_writer) |writer| {
-        var log_backend: keywork.LogBackend = .{ .writer = writer };
+        var log_backend: log_backend_mod.LogBackend = .{ .writer = writer };
         return runHeadlessRuntime(allocator, app, constraints, log_backend.backend());
     }
 
@@ -106,7 +126,7 @@ fn runWayland(
         break :blk null;
     };
     defer if (settings_client) |*settings| settings.deinit();
-    const initial_color_scheme: desktop_settings.ColorScheme = if (settings_client) |settings| settings.color_scheme else .no_preference;
+    const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     var runtime = try runtime_mod.Runtime.init(
         allocator,
@@ -127,7 +147,7 @@ fn runWayland(
     backend.setScrollHandler(&runtime, runtime_mod.Runtime.waylandScroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
-        settings.setChangeHandler(&runtime, runtime_mod.Runtime.desktopSettingsChanged);
+        settings.setChangeHandler(&runtime, desktopSettingsChanged);
     }
     try runtime.repaint();
 
@@ -149,7 +169,7 @@ fn runWayland(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     if (options.file_watch_path) |path| {
-        _ = loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
+        _ = loop.addFileWatch(path, &runtime, watchedFileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
         };
     }
@@ -219,7 +239,7 @@ fn runWaylandAllOutputs(
         break :blk null;
     };
     defer if (settings_client) |*settings| settings.deinit();
-    const initial_color_scheme: desktop_settings.ColorScheme = if (settings_client) |settings| settings.color_scheme else .no_preference;
+    const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     const first_size = backend.outputSize(0);
     var runtime = try runtime_mod.Runtime.init(
@@ -244,7 +264,7 @@ fn runWaylandAllOutputs(
     backend.setScrollHandler(&runtime, runtime_mod.Runtime.waylandScroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
-        settings.setChangeHandler(&runtime, runtime_mod.Runtime.desktopSettingsChanged);
+        settings.setChangeHandler(&runtime, desktopSettingsChanged);
     }
     try multi_context.repaintAll();
 
@@ -266,7 +286,7 @@ fn runWaylandAllOutputs(
         .callback = desktop_settings.Client.eventLoopCallback,
     });
     if (options.file_watch_path) |path| {
-        _ = loop.addFileWatch(path, &runtime, runtime_mod.Runtime.fileChanged) catch |err| {
+        _ = loop.addFileWatch(path, &runtime, watchedFileChanged) catch |err| {
             if (err != error.FileWatchNotFound) log.warn("{s} watch not installed: {}", .{ path, err });
         };
     }
