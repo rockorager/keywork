@@ -386,6 +386,7 @@ pub const Widget = union(enum) {
     default_text_style: DefaultTextStyle,
     image: Image,
     icon: Icon,
+    composite: Composite,
 
     pub fn alloc(allocator: std.mem.Allocator, widget: Widget) !*Widget {
         const result = try allocator.create(Widget);
@@ -614,6 +615,110 @@ pub const Widget = union(enum) {
         size: f32,
         color: ?Color = null,
     };
+
+    /// A runtime-defined widget expanded by calling back into the runtime
+    /// (`CompositeCallbacks.build`). The core sees only opaque handles:
+    /// `identity` is the runtime-side type identity used for element
+    /// matching, `config` is a pinned handle to the widget's configuration.
+    pub const Composite = struct {
+        key: ?[]const u8 = null,
+        /// Nonzero runtime-side type identity. Elements match when
+        /// identities are equal and keys agree.
+        identity: u64,
+        /// Nonzero pinned config handle. Owned by the pin list of the
+        /// enclosing composite's build output (or the surface root).
+        config: u64,
+        kind: Kind,
+
+        pub const Kind = enum { stateless, stateful };
+    };
+};
+
+/// Runtime-provided callbacks the core uses to expand composite widgets.
+/// All `u64` values are opaque runtime handles; the core never inspects
+/// them. Callbacks run under the engine's build phase: they must not
+/// re-enter the core.
+pub const CompositeCallbacks = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    /// A composite's build output: the widget subtree, allocated from the
+    /// arena the core supplied, plus every handle the runtime pinned while
+    /// producing it (handlers and nested composite configs). The refs
+    /// slice must also live in the arena.
+    pub const BuildResult = struct {
+        root: *const Widget,
+        refs: []const u64,
+    };
+
+    pub const VTable = struct {
+        /// Calls the composite's build function. `state` is zero for
+        /// stateless composites.
+        build: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, config: u64, state: u64) anyerror!BuildResult,
+        /// Creates the state for a stateful composite: createState,
+        /// setState injection, then initState. `element` is the stable
+        /// element id used to address dirty marks.
+        createState: *const fn (ptr: *anyopaque, element: u64, config: u64) anyerror!u64,
+        /// Notifies a surviving stateful element that its config changed.
+        didUpdateWidget: *const fn (ptr: *anyopaque, state: u64, old_config: u64, new_config: u64) anyerror!void,
+        /// Disposes a stateful composite's state. Never called for
+        /// stateless composites.
+        dispose: *const fn (ptr: *anyopaque, state: u64) void,
+        /// Releases pinned handles. The runtime may defer the actual
+        /// unpin to a safe point (queued events may still reference them).
+        releaseRefs: *const fn (ptr: *anyopaque, refs: []const u64) void,
+        /// True when two config handles refer to the same runtime object
+        /// (Lua rawequal); used for the unchanged-subtree skip.
+        sameConfig: *const fn (ptr: *anyopaque, a: u64, b: u64) bool,
+    };
+
+    pub fn build(self: CompositeCallbacks, arena: std.mem.Allocator, config: u64, state: u64) !BuildResult {
+        return self.vtable.build(self.ptr, arena, config, state);
+    }
+
+    pub fn createState(self: CompositeCallbacks, element: u64, config: u64) !u64 {
+        return self.vtable.createState(self.ptr, element, config);
+    }
+
+    pub fn didUpdateWidget(self: CompositeCallbacks, state: u64, old_config: u64, new_config: u64) !void {
+        try self.vtable.didUpdateWidget(self.ptr, state, old_config, new_config);
+    }
+
+    pub fn dispose(self: CompositeCallbacks, state: u64) void {
+        self.vtable.dispose(self.ptr, state);
+    }
+
+    pub fn releaseRefs(self: CompositeCallbacks, refs: []const u64) void {
+        if (refs.len == 0) return;
+        self.vtable.releaseRefs(self.ptr, refs);
+    }
+
+    pub fn sameConfig(self: CompositeCallbacks, a: u64, b: u64) bool {
+        return self.vtable.sameConfig(self.ptr, a, b);
+    }
+};
+
+/// Element-owned state of a mounted composite. Heap-allocated so the
+/// pointer stays stable while sibling elements move; holds the callbacks
+/// so unmounting needs no scope.
+pub const CompositeElementState = struct {
+    callbacks: CompositeCallbacks,
+    /// Stable nonzero id; `markCompositeDirty` addresses elements by it.
+    id: u64,
+    identity: u64,
+    /// Borrowed from the enclosing segment's pin list; replaced on every
+    /// visit from the parent's rebuild.
+    config: u64,
+    /// Owned pinned state handle; zero for stateless composites.
+    state: u64,
+    kind: Widget.Composite.Kind,
+    dirty: bool = false,
+    /// Owns the current build output tree and its refs slice.
+    arena: std.heap.ArenaAllocator,
+    /// Pinned handles inside the current build output; released when the
+    /// composite rebuilds or unmounts.
+    refs: []const u64,
+    built: *const Widget,
 };
 
 pub const BuildScope = struct {
@@ -623,6 +728,18 @@ pub const BuildScope = struct {
     default_icon_color: ?Color = null,
     interaction: InteractionState = .{},
     render_factory: ?RenderFactory = null,
+    /// Required to build trees containing composite widgets.
+    composites: ?CompositeCallbacks = null,
+    /// Stable element id source for composite mounts, owned by the
+    /// surface. Required alongside `composites`.
+    next_composite_id: ?*u64 = null,
+
+    fn takeCompositeId(self: *BuildScope) u64 {
+        const counter = self.next_composite_id.?;
+        counter.* += 1;
+        std.debug.assert(counter.* != 0);
+        return counter.*;
+    }
 };
 
 pub const widgets = struct {
@@ -823,6 +940,7 @@ pub const Element = struct {
         default_text_style,
         image,
         icon,
+        composite,
     };
 };
 
@@ -1021,6 +1139,7 @@ pub const RenderNode = struct {
         default_text_style,
         image,
         icon,
+        composite,
     };
 };
 
@@ -1436,6 +1555,7 @@ pub fn buildElementTreeScoped(
             element_owns_fields = true;
             return finishElement(allocator, scope, widget, .{ .kind = .icon, .widget = element_widget, .render_object = render_object });
         },
+        .composite => return buildCompositeElement(allocator, scope, widget, constraints),
         .container => |box_widget| return buildSingleChildElement(allocator, scope, widget, .container, box_widget.child, constraints),
         .filled_button => |button_widget| blk: {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1524,6 +1644,66 @@ fn finishElement(allocator: std.mem.Allocator, scope: *const BuildScope, widget:
     result.document_id = scope.document_id;
     result.key = if (widgetKey(widget.*)) |key| try allocator.dupe(u8, key) else null;
     return result;
+}
+
+/// Mounts a composite: creates state (stateful only), calls the runtime's
+/// build, and builds the child element from the output. The element owns
+/// the build output arena and its pinned refs until rebuild or unmount.
+fn buildCompositeElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    widget: *const Widget,
+    constraints: Constraints,
+) anyerror!Element {
+    const callbacks = scope.composites orelse return error.MissingCompositeCallbacks;
+    const composite = widget.composite;
+    std.debug.assert(composite.identity != 0 and composite.config != 0);
+
+    const state_ptr = try allocator.create(CompositeElementState);
+    var element_owns_fields = false;
+    errdefer if (!element_owns_fields) allocator.destroy(state_ptr);
+
+    const id = scope.takeCompositeId();
+    const state_ref: u64 = if (composite.kind == .stateful)
+        try callbacks.createState(id, composite.config)
+    else
+        0;
+    errdefer if (!element_owns_fields and state_ref != 0) callbacks.dispose(state_ref);
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer if (!element_owns_fields) arena.deinit();
+    const result = try callbacks.build(arena.allocator(), composite.config, state_ref);
+    errdefer if (!element_owns_fields) callbacks.releaseRefs(result.refs);
+
+    var element_widget = try cloneWidgetForElement(allocator, widget.*);
+    errdefer if (!element_owns_fields) destroyElementWidget(allocator, &element_widget);
+    const children = try allocator.alloc(Element, 1);
+    var initialized = false;
+    errdefer if (!element_owns_fields) {
+        if (initialized) destroyElementTree(allocator, &children[0]);
+        allocator.free(children);
+    };
+    children[0] = try buildElementTreeScoped(allocator, scope, result.root, constraints);
+    initialized = true;
+
+    state_ptr.* = .{
+        .callbacks = callbacks,
+        .id = id,
+        .identity = composite.identity,
+        .config = composite.config,
+        .state = state_ref,
+        .kind = composite.kind,
+        .arena = arena,
+        .refs = result.refs,
+        .built = result.root,
+    };
+    element_owns_fields = true;
+    return finishElement(allocator, scope, widget, .{
+        .kind = .composite,
+        .widget = element_widget,
+        .state = state_ptr,
+        .children = children,
+    });
 }
 
 fn buildSingleChildElement(
@@ -1647,6 +1827,15 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
                 allocator.destroy(input_state);
             },
             .single_child_scroll_view => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
+            .composite => {
+                // Children were destroyed above, so dispose runs
+                // innermost-out.
+                const composite_state: *CompositeElementState = @ptrCast(@alignCast(state));
+                if (composite_state.state != 0) composite_state.callbacks.dispose(composite_state.state);
+                composite_state.callbacks.releaseRefs(composite_state.refs);
+                composite_state.arena.deinit();
+                allocator.destroy(composite_state);
+            },
             else => unreachable,
         }
         element.state = null;
@@ -1712,6 +1901,7 @@ pub fn updateElementTreeScoped(
             if (element.render_object) |old| old.destroy(allocator);
             element.render_object = render_object;
         },
+        .composite => try updateCompositeElement(allocator, scope, element, widget, constraints),
         .container => |box_widget| try updateSingleChildElement(allocator, scope, element, widget, box_widget.child, constraints),
         .filled_button => |button_widget| try updateButtonElement(allocator, scope, element, widget, button_widget, constraints),
         .gesture_detector => |clickable_widget| try updateSingleChildElement(allocator, scope, element, widget, clickable_widget.child, constraints),
@@ -1775,7 +1965,37 @@ pub fn rebuildDirtyElementTreeScoped(
             if (rebuilt) markElementLayoutDirty(element);
             return rebuilt;
         },
+        .composite => {
+            const state: *CompositeElementState = @ptrCast(@alignCast(element.state.?));
+            var rebuilt = false;
+            if (state.dirty) {
+                try rebuildComposite(allocator, scope, element, state, state.config, constraints);
+                rebuilt = true;
+            }
+            // Descendants skipped by the unchanged-config heuristic keep
+            // their dirty marks, so the child subtree is always visited.
+            if (try rebuildDirtySingleChildElement(allocator, scope, element, constraints)) rebuilt = true;
+            if (rebuilt) markElementLayoutDirty(element);
+            return rebuilt;
+        },
     }
+}
+
+/// Marks the composite element with the given id dirty. Returns false
+/// when no mounted composite has that id (already unmounted; a stale
+/// setState from a disposed state object).
+pub fn markCompositeDirty(element: *Element, id: u64) bool {
+    if (element.kind == .composite) {
+        const state: *CompositeElementState = @ptrCast(@alignCast(element.state.?));
+        if (state.id == id) {
+            state.dirty = true;
+            return true;
+        }
+    }
+    for (element.children) |*child| {
+        if (markCompositeDirty(child, id)) return true;
+    }
+    return false;
 }
 
 /// Finds the text input element with the given focus id, marking the
@@ -1872,6 +2092,7 @@ pub fn refreshInteractionElements(
         .center,
         .flexible,
         .shortcuts,
+        .composite,
         => return try refreshInteractionSingleChild(allocator, scope, element, constraints, ids),
 
         .single_child_scroll_view => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
@@ -1935,6 +2156,10 @@ fn rebuildDirtyChildren(
 
 fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
     if (element.kind != elementKindForWidget(widget.*)) return false;
+    if (widget.* == .composite) {
+        const state: *const CompositeElementState = @ptrCast(@alignCast(element.state.?));
+        if (state.identity != widget.composite.identity) return false;
+    }
     const old_key = element.key;
     const new_key = widgetKey(widget.*);
     if (old_key == null and new_key == null) return true;
@@ -1963,7 +2188,70 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .default_text_style => .default_text_style,
         .image => .image,
         .icon => .icon,
+        .composite => .composite,
     };
+}
+
+/// Updates a matched composite element from a new widget. Same config
+/// table and a clean element skip the rebuild entirely (the Flutter
+/// `identical()` heuristic); otherwise didUpdateWidget fires and the
+/// composite rebuilds against its existing child.
+fn updateCompositeElement(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    widget: *const Widget,
+    constraints: Constraints,
+) anyerror!void {
+    std.debug.assert(element.children.len == 1);
+    const callbacks = scope.composites orelse return error.MissingCompositeCallbacks;
+    const state: *CompositeElementState = @ptrCast(@alignCast(element.state.?));
+    const composite = widget.composite;
+    std.debug.assert(state.identity == composite.identity);
+
+    if (!state.dirty and callbacks.sameConfig(state.config, composite.config)) {
+        // The parent's old pin list is about to be released, so adopt the
+        // borrow from its new list even though the config is unchanged.
+        try replaceElementWidget(allocator, scope, element, widget);
+        state.config = composite.config;
+        return;
+    }
+
+    if (composite.kind == .stateful) {
+        try callbacks.didUpdateWidget(state.state, state.config, composite.config);
+    }
+    try replaceElementWidget(allocator, scope, element, widget);
+    try rebuildComposite(allocator, scope, element, state, composite.config, constraints);
+}
+
+/// Rebuilds a mounted composite's segment: calls build, reconciles the
+/// child element against the output, and commits the new arena and pin
+/// list in place of the old ones. On error the old segment stays
+/// installed and the caller discards the retained trees wholesale.
+fn rebuildComposite(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    state: *CompositeElementState,
+    config: u64,
+    constraints: Constraints,
+) anyerror!void {
+    const callbacks = state.callbacks;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const result = try callbacks.build(arena.allocator(), config, state.state);
+    errdefer callbacks.releaseRefs(result.refs);
+
+    try updateElementTreeScoped(allocator, scope, &element.children[0], result.root, constraints);
+
+    // Commit: all fallible work is done; swap segment ownership.
+    callbacks.releaseRefs(state.refs);
+    state.arena.deinit();
+    state.arena = arena;
+    state.refs = result.refs;
+    state.built = result.root;
+    state.config = config;
+    state.dirty = false;
 }
 
 fn updateSingleChildElement(
@@ -2179,6 +2467,7 @@ fn widgetKey(widget: Widget) ?[]const u8 {
         .default_text_style => |value| value.key,
         .image => |value| value.key,
         .icon => |value| value.key,
+        .composite => |value| value.key,
     };
 }
 
@@ -2395,6 +2684,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         .default_text_style => |default_text_style| .{ .default_text_style = .{ .key = if (default_text_style.key) |key| try allocator.dupe(u8, key) else null, .style = default_text_style.style, .child = default_text_style.child } },
         .image => |image_widget| .{ .image = .{ .key = if (image_widget.key) |key| try allocator.dupe(u8, key) else null, .resource = image_widget.resource, .width = image_widget.width, .height = image_widget.height, .tint = image_widget.tint } },
         .icon => |icon_widget| .{ .icon = .{ .key = if (icon_widget.key) |key| try allocator.dupe(u8, key) else null, .name = try allocator.dupe(u8, icon_widget.name), .size = icon_widget.size, .color = icon_widget.color } },
+        .composite => |composite_widget| .{ .composite = .{ .key = if (composite_widget.key) |key| try allocator.dupe(u8, key) else null, .identity = composite_widget.identity, .config = composite_widget.config, .kind = composite_widget.kind } },
     };
 }
 
@@ -2449,6 +2739,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .flexible => |flexible_widget| if (flexible_widget.key) |key| allocator.free(key),
         .default_text_style => |default_text_style| if (default_text_style.key) |key| allocator.free(key),
         .image => |image_widget| if (image_widget.key) |key| allocator.free(key),
+        .composite => |composite_widget| if (composite_widget.key) |key| allocator.free(key),
     }
 }
 
@@ -3172,6 +3463,7 @@ fn layoutElementInto(
     switch (element.widget) {
         .shortcuts => try layoutWrapper(allocator, element, node, .shortcuts, constraints, origin, measurer),
         .default_text_style => try layoutWrapper(allocator, element, node, .default_text_style, constraints, origin, measurer),
+        .composite => try layoutWrapper(allocator, element, node, .composite, constraints, origin, measurer),
         .text => |text_widget| {
             const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
             const measured = try measurer.measureText(text_widget.value, style);
@@ -3801,4 +4093,212 @@ fn displayListHasColor(display_list: *const DisplayList, color: Color) bool {
         else => {},
     };
     return false;
+}
+
+/// Test double for the runtime side of composite expansion. Each build
+/// emits a text widget describing its inputs and pins one fresh fake ref
+/// so release accounting is observable.
+const FakeComposites = struct {
+    allocator: std.mem.Allocator,
+    create_count: usize = 0,
+    build_count: usize = 0,
+    update_count: usize = 0,
+    dispose_count: usize = 0,
+    next_ref: u64 = 1000,
+    next_state: u64 = 100,
+    last_element: u64 = 0,
+    last_disposed: u64 = 0,
+    last_old_config: u64 = 0,
+    last_new_config: u64 = 0,
+    released: std.ArrayList(u64) = .empty,
+    /// Config handle pairs `sameConfig` reports as the same object.
+    same_pairs: []const [2]u64 = &.{},
+
+    fn deinit(self: *FakeComposites) void {
+        self.released.deinit(self.allocator);
+    }
+
+    fn callbacks(self: *FakeComposites) CompositeCallbacks {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn scope(self: *FakeComposites, next_id: *u64) BuildScope {
+        return .{ .composites = self.callbacks(), .next_composite_id = next_id };
+    }
+
+    const vtable: CompositeCallbacks.VTable = .{
+        .build = fakeBuild,
+        .createState = fakeCreateState,
+        .didUpdateWidget = fakeDidUpdateWidget,
+        .dispose = fakeDispose,
+        .releaseRefs = fakeReleaseRefs,
+        .sameConfig = fakeSameConfig,
+    };
+
+    fn fakeBuild(ptr: *anyopaque, arena: std.mem.Allocator, config: u64, state: u64) anyerror!CompositeCallbacks.BuildResult {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        self.build_count += 1;
+        const value = try std.fmt.allocPrint(arena, "config={d} state={d} build={d}", .{ config, state, self.build_count });
+        const root = try Widget.alloc(arena, .{ .text = .{ .value = value } });
+        const refs = try arena.alloc(u64, 1);
+        self.next_ref += 1;
+        refs[0] = self.next_ref;
+        return .{ .root = root, .refs = refs };
+    }
+
+    fn fakeCreateState(ptr: *anyopaque, element: u64, config: u64) anyerror!u64 {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        _ = config;
+        self.create_count += 1;
+        self.last_element = element;
+        self.next_state += 1;
+        return self.next_state;
+    }
+
+    fn fakeDidUpdateWidget(ptr: *anyopaque, state: u64, old_config: u64, new_config: u64) anyerror!void {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        _ = state;
+        self.update_count += 1;
+        self.last_old_config = old_config;
+        self.last_new_config = new_config;
+    }
+
+    fn fakeDispose(ptr: *anyopaque, state: u64) void {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        self.dispose_count += 1;
+        self.last_disposed = state;
+    }
+
+    fn fakeReleaseRefs(ptr: *anyopaque, refs: []const u64) void {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        self.released.appendSlice(self.allocator, refs) catch @panic("oom");
+    }
+
+    fn fakeSameConfig(ptr: *anyopaque, a: u64, b: u64) bool {
+        const self: *FakeComposites = @ptrCast(@alignCast(ptr));
+        if (a == b) return true;
+        for (self.same_pairs) |pair| {
+            if ((pair[0] == a and pair[1] == b) or (pair[0] == b and pair[1] == a)) return true;
+        }
+        return false;
+    }
+};
+
+fn compositeState(element: *const Element) *CompositeElementState {
+    std.debug.assert(element.kind == .composite);
+    return @ptrCast(@alignCast(element.state.?));
+}
+
+test "stateful composite mounts state, builds its segment, and disposes on unmount" {
+    var fake: FakeComposites = .{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    var next_id: u64 = 0;
+    var scope = fake.scope(&next_id);
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+
+    const widget: Widget = .{ .composite = .{ .identity = 1, .config = 7, .kind = .stateful } };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &widget, constraints);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.create_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.build_count);
+    try std.testing.expectEqual(@as(u64, 1), fake.last_element);
+    try std.testing.expectEqual(@as(u64, 101), compositeState(&element).state);
+    try std.testing.expectEqualStrings("config=7 state=101 build=1", element.children[0].widget.text.value);
+
+    destroyElementTree(std.testing.allocator, &element);
+    try std.testing.expectEqual(@as(usize, 1), fake.dispose_count);
+    try std.testing.expectEqual(@as(u64, 101), fake.last_disposed);
+    try std.testing.expectEqualSlices(u64, &.{1001}, fake.released.items);
+}
+
+test "markCompositeDirty rebuilds exactly the dirty composite and releases its old pins" {
+    var fake: FakeComposites = .{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    var next_id: u64 = 0;
+    var scope = fake.scope(&next_id);
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+
+    const widget: Widget = .{ .composite = .{ .identity = 1, .config = 7, .kind = .stateful } };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &widget, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    const id = compositeState(&element).id;
+    try std.testing.expect(markCompositeDirty(&element, id));
+    try std.testing.expect(!markCompositeDirty(&element, id + 999));
+
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(std.testing.allocator, &scope, &element, constraints));
+    try std.testing.expectEqual(@as(usize, 2), fake.build_count);
+    try std.testing.expect(!compositeState(&element).dirty);
+    try std.testing.expectEqualStrings("config=7 state=101 build=2", element.children[0].widget.text.value);
+    try std.testing.expectEqualSlices(u64, &.{1001}, fake.released.items);
+
+    // Clean tree: nothing rebuilds.
+    try std.testing.expect(!try rebuildDirtyElementTreeScoped(std.testing.allocator, &scope, &element, constraints));
+    try std.testing.expectEqual(@as(usize, 2), fake.build_count);
+}
+
+test "unchanged config skips the rebuild and adopts the new pin" {
+    var fake: FakeComposites = .{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    fake.same_pairs = &.{.{ 7, 8 }};
+    var next_id: u64 = 0;
+    var scope = fake.scope(&next_id);
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+
+    const first: Widget = .{ .composite = .{ .identity = 1, .config = 7, .kind = .stateful } };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &first, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    const second: Widget = .{ .composite = .{ .identity = 1, .config = 8, .kind = .stateful } };
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &second, constraints);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.build_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.update_count);
+    try std.testing.expectEqual(@as(u64, 8), compositeState(&element).config);
+    try std.testing.expectEqual(@as(usize, 0), fake.released.items.len);
+}
+
+test "config change fires didUpdateWidget and rebuilds with preserved state" {
+    var fake: FakeComposites = .{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    var next_id: u64 = 0;
+    var scope = fake.scope(&next_id);
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+
+    const first: Widget = .{ .composite = .{ .identity = 1, .config = 7, .kind = .stateful } };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &first, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    const second: Widget = .{ .composite = .{ .identity = 1, .config = 9, .kind = .stateful } };
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &second, constraints);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.update_count);
+    try std.testing.expectEqual(@as(u64, 7), fake.last_old_config);
+    try std.testing.expectEqual(@as(u64, 9), fake.last_new_config);
+    try std.testing.expectEqual(@as(usize, 1), fake.create_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.build_count);
+    try std.testing.expectEqualStrings("config=9 state=101 build=2", element.children[0].widget.text.value);
+    try std.testing.expectEqualSlices(u64, &.{1001}, fake.released.items);
+}
+
+test "identity change remounts the composite and disposes the old state" {
+    var fake: FakeComposites = .{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    var next_id: u64 = 0;
+    var scope = fake.scope(&next_id);
+    const constraints: Constraints = .{ .max_width = 400, .max_height = 100 };
+
+    const first: Widget = .{ .composite = .{ .identity = 1, .config = 7, .kind = .stateful } };
+    var element = try buildElementTreeScoped(std.testing.allocator, &scope, &first, constraints);
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    const second: Widget = .{ .composite = .{ .identity = 2, .config = 9, .kind = .stateful } };
+    try updateElementTreeScoped(std.testing.allocator, &scope, &element, &second, constraints);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.dispose_count);
+    try std.testing.expectEqual(@as(u64, 101), fake.last_disposed);
+    try std.testing.expectEqual(@as(usize, 2), fake.create_count);
+    try std.testing.expectEqual(@as(u64, 102), compositeState(&element).state);
+    try std.testing.expectEqual(@as(usize, 0), fake.update_count);
+    try std.testing.expectEqualSlices(u64, &.{1001}, fake.released.items);
 }

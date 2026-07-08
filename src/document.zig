@@ -70,6 +70,7 @@ fn cloneWidget(allocator: std.mem.Allocator, store: *resources_mod.Store, refs: 
             break :blk .{ .image = .{ .key = try cloneOptString(allocator, v.key), .resource = v.resource, .width = v.width, .height = v.height, .tint = v.tint } };
         },
         .icon => |v| .{ .icon = .{ .key = try cloneOptString(allocator, v.key), .name = try cloneString(allocator, v.name), .size = v.size, .color = v.color } },
+        .composite => |v| .{ .composite = .{ .key = try cloneOptString(allocator, v.key), .identity = v.identity, .config = v.config, .kind = v.kind } },
     };
     return result;
 }
@@ -219,6 +220,10 @@ fn validateWidget(w: ui.Widget) !void {
             try validOptString(v.key);
             try validString(v.name);
             try positiveFinite(v.size);
+        },
+        .composite => |v| {
+            try validOptString(v.key);
+            if (v.identity == 0 or v.config == 0) return error.InvalidNodeField;
         },
     }
 }
