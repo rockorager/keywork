@@ -1,11 +1,13 @@
-//! Public context/surface lifecycle and host event-loop boundary.
+//! Public context/surface lifecycle. A context registers its Wayland,
+//! D-Bus, and timer sources into a caller-owned loop; the loop owner runs
+//! `Loop.dispatch` then `Context.flush` once per iteration.
 
 const std = @import("std");
 const appearance = @import("appearance.zig");
 const core = @import("core.zig");
 const DesktopSettings = @import("desktop_settings.zig");
 const document_mod = @import("document.zig");
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 const icon_render = @import("icon_render.zig");
 const icon_theme = @import("icon_theme.zig");
 const image_render = @import("image_render.zig");
@@ -122,17 +124,14 @@ const EventDocumentRetired = struct {
 
 const EventHandlerPayload = union(enum) { none, boolean: bool, text: []const u8 };
 
-/// Opaque, heap-stable context owned by Keywork. The handle may be copied,
-/// but the context it identifies is single-thread-affine.
+/// Opaque, heap-stable context. The handle may be copied, but the context
+/// it identifies is single-thread-affine. A context borrows the loop for
+/// its whole lifetime and must be destroyed before it.
 pub const Context = opaque {
-    pub fn init(allocator: std.mem.Allocator, options: ContextOptions) !*Context {
+    pub fn init(allocator: std.mem.Allocator, loop: *Loop, options: ContextOptions) !*Context {
         const self = try allocator.create(ContextImpl);
         errdefer allocator.destroy(self);
-        var loop = try event_loop.EventLoop.init(allocator);
-        const icon_cache = icon_theme.Cache.init(allocator) catch |err| {
-            loop.deinit();
-            return err;
-        };
+        const icon_cache = try icon_theme.Cache.init(allocator);
         self.* = .{
             .allocator = allocator,
             .loop = loop,
@@ -141,7 +140,7 @@ pub const Context = opaque {
         };
         errdefer self.deinitFields();
         if (options.desktop_settings) {
-            self.desktop_settings = DesktopSettings.create(allocator, &self.loop, self, desktopColorSchemeChanged) catch |err| blk: {
+            self.desktop_settings = DesktopSettings.create(allocator, loop, self, desktopColorSchemeChanged) catch |err| blk: {
                 log.warn("desktop settings unavailable: {s}", .{@errorName(err)});
                 break :blk null;
             };
@@ -153,10 +152,6 @@ pub const Context = opaque {
         contextImpl(self).deinit();
     }
 
-    pub fn eventFd(self: *const Context) i32 {
-        return contextConstImpl(self).eventFd();
-    }
-
     pub fn createSurface(self: *Context, options: SurfaceOptions) !*Surface {
         return surfaceHandle(try contextImpl(self).createSurface(options));
     }
@@ -165,8 +160,11 @@ pub const Context = opaque {
         contextImpl(self).destroySurface(surfaceImpl(surface));
     }
 
-    pub fn dispatch(self: *Context) !void {
-        try contextImpl(self).dispatch();
+    /// Runs deferred per-iteration work: pending desktop-settings D-Bus
+    /// messages, surface configure/close detection, and queued repaints.
+    /// The loop owner calls this once per iteration after `Loop.dispatch`.
+    pub fn flush(self: *Context) !void {
+        try contextImpl(self).flush();
     }
 
     pub fn nextEvent(self: *Context) ?Event {
@@ -211,7 +209,7 @@ pub const Surface = opaque {
 
 const ContextImpl = struct {
     allocator: std.mem.Allocator,
-    loop: event_loop.EventLoop,
+    loop: *Loop,
     resources: resources.Store,
     icon_cache: icon_theme.Cache,
     desktop_settings: ?*DesktopSettings = null,
@@ -221,11 +219,9 @@ const ContextImpl = struct {
     event_payload_scratch: ?[]u8 = null,
     next_surface_id: SurfaceId = 1,
     next_document_id: DocumentId = 1,
-    dispatching: bool = false,
     pending_error: ?anyerror = null,
 
     fn deinit(self: *ContextImpl) void {
-        std.debug.assert(!self.dispatching);
         self.deinitFields();
         const allocator = self.allocator;
         self.* = undefined;
@@ -243,17 +239,9 @@ const ContextImpl = struct {
         self.event_payload_scratch = null;
         self.icon_cache.deinit();
         self.resources.deinit();
-        self.loop.deinit();
-    }
-
-    /// Stable aggregate descriptor. The host watches it for readability and
-    /// calls `dispatch` when ready; Keywork owns every descriptor inside it.
-    fn eventFd(self: *const ContextImpl) i32 {
-        return self.loop.epoll_fd;
     }
 
     fn createSurface(self: *ContextImpl, options: SurfaceOptions) !*SurfaceImpl {
-        std.debug.assert(!self.dispatching);
         const id = self.next_surface_id;
         self.next_surface_id = std.math.add(SurfaceId, id, 1) catch return error.SurfaceIdExhausted;
         const surface = try SurfaceImpl.init(self, id, options);
@@ -263,7 +251,6 @@ const ContextImpl = struct {
     }
 
     fn destroySurface(self: *ContextImpl, surface: *SurfaceImpl) void {
-        std.debug.assert(!self.dispatching);
         std.debug.assert(surface.context == self);
         for (self.surfaces.items, 0..) |item, index| {
             if (item != surface) continue;
@@ -275,24 +262,11 @@ const ContextImpl = struct {
         unreachable;
     }
 
-    /// Non-blocking dispatch. This never invokes host-language code; all
-    /// externally meaningful input is appended to the semantic event queue.
-    fn dispatch(self: *ContextImpl) !void {
-        if (self.dispatching) return error.ReentrantDispatch;
-        self.dispatching = true;
-        defer self.dispatching = false;
-        for (self.surfaces.items) |surface| surface.beginDispatch();
-        errdefer {
-            for (self.surfaces.items) |surface| surface.cancelDispatch();
-            self.loop.refreshWayland() catch {};
-        }
-
-        try self.loop.dispatch(0);
+    fn flush(self: *ContextImpl) !void {
         if (self.desktop_settings) |settings| try settings.dispatchPending();
         for (self.surfaces.items) |surface| {
-            try surface.afterDispatch();
+            try surface.flush();
         }
-        try self.loop.refreshWayland();
         if (self.pending_error) |err| {
             self.pending_error = null;
             return err;
@@ -396,7 +370,6 @@ const SurfaceImpl = struct {
     document: ?document_mod.Document = null,
     document_id: ?DocumentId = null,
     repaint_queued: bool = false,
-    repaint_ready: bool = false,
     configured_reported: bool = false,
     closed_reported: bool = false,
 
@@ -528,7 +501,7 @@ const SurfaceImpl = struct {
             .finish = BackendType.eventLoopFinish,
         });
         errdefer self.context.loop.removeWayland(backend.eventLoopFd());
-        try backend.installEventTimers(&self.context.loop);
+        try backend.installEventTimers(self.context.loop);
     }
 
     fn submit(self: *SurfaceImpl, root: ui.Widget) !DocumentId {
@@ -616,30 +589,15 @@ const SurfaceImpl = struct {
         self.configured_reported = true;
     }
 
-    /// Freeze repaint work that existed before native dispatch. Invalidations
-    /// raised by input during this dispatch remain queued for the next turn,
-    /// allowing the host to handle semantic events and coalesce its document
-    /// update into that repaint.
-    fn beginDispatch(self: *SurfaceImpl) void {
-        std.debug.assert(!self.repaint_ready);
-        self.repaint_ready = self.repaint_queued;
-        self.repaint_queued = false;
-    }
-
-    fn cancelDispatch(self: *SurfaceImpl) void {
-        self.repaint_queued = self.repaint_queued or self.repaint_ready;
-        self.repaint_ready = false;
-    }
-
-    fn afterDispatch(self: *SurfaceImpl) !void {
+    fn flush(self: *SurfaceImpl) !void {
         switch (self.backend) {
             .auto => unreachable,
             .headless => {},
-            .wayland_shm => |backend| try self.afterWaylandDispatch(backend),
-            .vulkan => |backend| try self.afterWaylandDispatch(backend),
+            .wayland_shm => |backend| try self.pumpWaylandStatus(backend),
+            .vulkan => |backend| try self.pumpWaylandStatus(backend),
         }
-        if (self.repaint_ready) {
-            self.repaint_ready = false;
+        if (self.repaint_queued) {
+            self.repaint_queued = false;
             if (!self.closed_reported) {
                 self.runtime.?.repaint() catch |err| {
                     self.repaint_queued = true;
@@ -649,7 +607,7 @@ const SurfaceImpl = struct {
         }
     }
 
-    fn afterWaylandDispatch(self: *SurfaceImpl, backend: anytype) !void {
+    fn pumpWaylandStatus(self: *SurfaceImpl, backend: anytype) !void {
         if (backend.isConfigured() and !self.configured_reported) {
             const size = backend.size();
             self.context.pushEvent(.{ .configured = .{
@@ -680,12 +638,12 @@ const SurfaceImpl = struct {
             .headless => {},
             .wayland_shm => |backend| {
                 self.context.loop.removeWayland(backend.eventLoopFd());
-                backend.removeEventTimers(&self.context.loop);
+                backend.removeEventTimers(self.context.loop);
                 backend.destroy();
             },
             .vulkan => |backend| {
                 self.context.loop.removeWayland(backend.eventLoopFd());
-                backend.removeEventTimers(&self.context.loop);
+                backend.removeEventTimers(self.context.loop);
                 backend.destroy();
             },
         }
@@ -760,7 +718,9 @@ const HeadlessBackend = struct {
 };
 
 test "headless click emits handler event tagged with submitted document" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const label = ui.text("click");
@@ -769,7 +729,7 @@ test "headless click emits handler event tagged with submitted document" {
         .handler = 42,
         .child = &label,
     } });
-    try context.dispatch();
+    try context.flush();
 
     const impl = surfaceImpl(surface);
     try impl.runtime.?.pointerButton(.{ .x = 1, .y = 1 }, .pressed);
@@ -782,12 +742,14 @@ test "headless click emits handler event tagged with submitted document" {
 }
 
 test "headless semantic button activates on press and from keyboard focus" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 40 });
     const label = ui.text("Action");
     const document_id = try surface.submit(ui.filled_button("action", 43, &label));
-    try context.dispatch();
+    try context.flush();
 
     const impl = surfaceImpl(surface);
     try impl.runtime.?.pointerButton(.{ .x = 1, .y = 1 }, .pressed);
@@ -803,12 +765,14 @@ test "headless semantic button activates on press and from keyboard focus" {
 }
 
 test "replacement emits document_retired and drops stale queued handler event" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const first_label = ui.text("first");
     const first_id = try surface.submit(.{ .gesture_detector = .{ .id = "first", .handler = 1, .child = &first_label } });
-    try context.dispatch();
+    try context.flush();
 
     const impl = surfaceImpl(surface);
     try impl.runtime.?.pointerButton(.{ .x = 1, .y = 1 }, .pressed);
@@ -824,7 +788,9 @@ test "replacement emits document_retired and drops stale queued handler event" {
 }
 
 test "text payload remains valid until next nextEvent call" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const impl = surfaceImpl(surface);
@@ -846,7 +812,9 @@ test "surface options default to automatic backend selection" {
 }
 
 test "appearance changes update runtimes and survive surface destruction" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const impl = contextImpl(context);
@@ -860,19 +828,16 @@ test "appearance changes update runtimes and survive surface destruction" {
     try std.testing.expectEqual(ColorScheme.dark, event.appearance_changed.color_scheme);
 }
 
-test "repaint raised during dispatch remains queued for the host's next turn" {
-    const context = try Context.init(std.testing.allocator, .{ .desktop_settings = false });
+test "queued repaint is painted during flush" {
+    var loop = try Loop.init(std.testing.allocator);
+    defer loop.deinit();
+    const context = try Context.init(std.testing.allocator, &loop, .{ .desktop_settings = false });
     defer context.deinit();
     const surface = try context.createSurface(.{ .backend = .headless, .width = 100, .height = 30 });
     const impl = surfaceImpl(surface);
 
-    impl.repaint_queued = true;
-    impl.beginDispatch();
-    try std.testing.expect(impl.repaint_ready);
-    try std.testing.expect(!impl.repaint_queued);
-
     try SurfaceImpl.scheduleRepaint(impl);
-    try impl.afterDispatch();
-    try std.testing.expect(!impl.repaint_ready);
     try std.testing.expect(impl.repaint_queued);
+    try impl.flush();
+    try std.testing.expect(!impl.repaint_queued);
 }

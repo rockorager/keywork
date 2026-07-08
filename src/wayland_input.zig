@@ -3,7 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 const keywork = @import("core.zig");
 const wayland = @import("wayland");
 const xkb = @import("xkb_c");
@@ -34,7 +34,7 @@ shift_down: bool = false,
 /// Kinetic scroll state: velocity is estimated from finger axis frames
 /// and, once the fingers lift, a timer keeps scrolling the viewport
 /// under the anchor point with exponential decay.
-fling_timer: ?*event_loop.EventLoop.Timer = null,
+fling_timer: ?*Loop.Timer = null,
 fling_active: bool = false,
 fling_velocity_x: f32 = 0,
 fling_velocity_y: f32 = 0,
@@ -42,7 +42,7 @@ fling_point: keywork.Point = .{ .x = 0, .y = 0 },
 scroll_velocity_x: f32 = 0,
 scroll_velocity_y: f32 = 0,
 last_scroll_time_ms: ?u32 = null,
-repeat_timer: ?*event_loop.EventLoop.Timer = null,
+repeat_timer: ?*Loop.Timer = null,
 repeat_key: ?u32 = null,
 repeat_input: ?keywork.KeyInput = null,
 repeat_text_buffer: [64]u8 = undefined,
@@ -162,7 +162,7 @@ pub fn setScrollHandler(self: *Self, context: *anyopaque, handler: ScrollHandler
     self.scroll_handler = handler;
 }
 
-pub fn installEventTimers(self: *Self, loop: *event_loop.EventLoop) !void {
+pub fn installEventTimers(self: *Self, loop: *Loop) !void {
     if (self.repeat_timer == null) self.repeat_timer = try loop.addTimer(self, repeatTimerCallback);
     if (self.fling_timer == null) self.fling_timer = try loop.addTimer(self, flingTimerCallback);
 }
@@ -174,7 +174,7 @@ pub fn uninstallEventTimers(self: *Self) void {
     self.fling_timer = null;
 }
 
-pub fn removeEventTimers(self: *Self, loop: *event_loop.EventLoop) void {
+pub fn removeEventTimers(self: *Self, loop: *Loop) void {
     self.stopKeyRepeat();
     if (self.repeat_timer) |timer| loop.removeTimer(timer);
     self.repeat_timer = null;
@@ -354,7 +354,7 @@ fn stopFling(self: *Self) void {
     if (self.fling_timer) |timer| timer.disarm();
 }
 
-fn flingTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
+fn flingTimerCallback(ctx: *anyopaque, _: *Loop, expirations: u64) !void {
     const self: *Self = @ptrCast(@alignCast(ctx));
     if (!self.fling_active) return;
     const dt_ms: f32 = @floatFromInt(fling_interval_ms * @max(1, expirations));
@@ -605,7 +605,7 @@ fn stopKeyRepeat(self: *Self) void {
     self.repeat_input = null;
 }
 
-fn repeatTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
+fn repeatTimerCallback(ctx: *anyopaque, _: *Loop, expirations: u64) !void {
     const self: *Self = @ptrCast(@alignCast(ctx));
     const input = self.repeat_input orelse return;
     var remaining = expirations;

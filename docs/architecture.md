@@ -111,7 +111,7 @@ and register their fds in the same loop.
 - `src/document.zig`: widget tree ownership and validation
 - `src/core.zig`: layout, element/render trees, painting, hit testing
 - `src/runtime.zig`: per-surface toolkit state and input orchestration
-- `src/event_loop.zig`: epoll and timer machinery
+- `src/loop.zig`: epoll and timer machinery
 - `src/appearance.zig`, `src/desktop_settings.zig`, `src/dbus_adapter.zig`:
   desktop appearance via the XDG Settings portal over libdbus
 - `src/resources.zig`, `src/icon_theme.zig`, `src/icon_render.zig`,

@@ -1,10 +1,11 @@
-//! Small Linux epoll event loop with a Wayland prepare-read integration point.
+//! The keywork event loop: a Linux epoll loop that owns the process's
+//! blocking wait. Every subsystem registers sources into one loop.
 
 const std = @import("std");
 
 const linux = std.os.linux;
 
-pub const EventLoop = struct {
+pub const Loop = struct {
     allocator: std.mem.Allocator,
     epoll_fd: i32,
     wake_fd: i32,
@@ -51,8 +52,8 @@ pub const EventLoop = struct {
         return wayland_token_bit | index;
     }
 
-    pub const SourceCallback = *const fn (ctx: *anyopaque, loop: *EventLoop, events: u32) anyerror!void;
-    pub const TimerCallback = *const fn (ctx: *anyopaque, loop: *EventLoop, expirations: u64) anyerror!void;
+    pub const SourceCallback = *const fn (ctx: *anyopaque, loop: *Loop, events: u32) anyerror!void;
+    pub const TimerCallback = *const fn (ctx: *anyopaque, loop: *Loop, expirations: u64) anyerror!void;
     pub const Source = struct {
         fd: i32,
         events: u32,
@@ -94,14 +95,14 @@ pub const EventLoop = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) !EventLoop {
+    pub fn init(allocator: std.mem.Allocator) !Loop {
         const epoll_fd = try linuxFd(linux.epoll_create1(linux.EPOLL.CLOEXEC));
         errdefer _ = linux.close(epoll_fd);
 
         const wake_fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
         errdefer _ = linux.close(wake_fd);
 
-        var self: EventLoop = .{
+        var self: Loop = .{
             .allocator = allocator,
             .epoll_fd = epoll_fd,
             .wake_fd = wake_fd,
@@ -116,7 +117,7 @@ pub const EventLoop = struct {
         return self;
     }
 
-    pub fn deinit(self: *EventLoop) void {
+    pub fn deinit(self: *Loop) void {
         self.flushPendingDestroy();
         for (self.timers.items) |timer| {
             _ = linux.close(timer.fd);
@@ -141,14 +142,14 @@ pub const EventLoop = struct {
         _ = linux.close(self.epoll_fd);
     }
 
-    pub fn addFd(self: *EventLoop, source: Source) !void {
+    pub fn addFd(self: *Loop, source: Source) !void {
         _ = try self.addFdSource(source, true);
     }
 
     /// Allocates a stable source slot. Disabled sources retain their slot so
     /// integrations with infallible toggle callbacks can change epoll state
     /// without allocating.
-    pub fn addFdSource(self: *EventLoop, source: Source, enabled: bool) !SourceHandle {
+    pub fn addFdSource(self: *Loop, source: Source, enabled: bool) !SourceHandle {
         const index: u32 = if (self.free_slots.pop()) |free_index| free_index else blk: {
             const new_index: u32 = @intCast(self.sources.items.len);
             try self.sources.append(self.allocator, .{});
@@ -177,7 +178,7 @@ pub const EventLoop = struct {
     /// Changes an existing source's interest set without allocating. The
     /// handle generation changes when disabling so readiness already queued
     /// by epoll cannot be delivered after a toggle.
-    pub fn updateFdSource(self: *EventLoop, handle: *SourceHandle, events: u32, enabled: bool) !void {
+    pub fn updateFdSource(self: *Loop, handle: *SourceHandle, events: u32, enabled: bool) !void {
         if (handle.index >= self.sources.items.len) return error.InvalidSourceHandle;
         const slot = &self.sources.items[handle.index];
         if (slot.source == null or slot.generation != handle.generation) return error.InvalidSourceHandle;
@@ -208,14 +209,14 @@ pub const EventLoop = struct {
         }
     }
 
-    pub fn removeFdSource(self: *EventLoop, handle: SourceHandle) void {
+    pub fn removeFdSource(self: *Loop, handle: SourceHandle) void {
         if (handle.index >= self.sources.items.len) return;
         const slot = &self.sources.items[handle.index];
         if (slot.source == null or slot.generation != handle.generation) return;
         self.removeSlot(handle.index);
     }
 
-    pub fn removeFd(self: *EventLoop, fd: i32) void {
+    pub fn removeFd(self: *Loop, fd: i32) void {
         for (self.sources.items, 0..) |*slot, index| {
             const source = slot.source orelse continue;
             if (source.fd != fd) continue;
@@ -223,7 +224,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn removeSlot(self: *EventLoop, index: u32) void {
+    fn removeSlot(self: *Loop, index: u32) void {
         const slot = &self.sources.items[index];
         const source = slot.source orelse return;
         if (slot.registered) _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, source.fd, null);
@@ -236,7 +237,7 @@ pub const EventLoop = struct {
         if (source.destroy_ctx) |destroy| self.deferDestroy(.{ .ctx = source.ctx, .destroy = destroy });
     }
 
-    fn deferDestroy(self: *EventLoop, pending: PendingDestroy) void {
+    fn deferDestroy(self: *Loop, pending: PendingDestroy) void {
         if (self.dispatching) {
             self.pending_destroy.append(self.allocator, pending) catch {
                 // Keep the current dispatch memory-safe. This leaks only the
@@ -249,16 +250,16 @@ pub const EventLoop = struct {
         self.destroyPending(pending);
     }
 
-    fn destroyPending(self: *EventLoop, pending: PendingDestroy) void {
+    fn destroyPending(self: *Loop, pending: PendingDestroy) void {
         pending.destroy(self.allocator, pending.ctx);
     }
 
-    fn flushPendingDestroy(self: *EventLoop) void {
+    fn flushPendingDestroy(self: *Loop) void {
         for (self.pending_destroy.items) |pending| self.destroyPending(pending);
         self.pending_destroy.clearRetainingCapacity();
     }
 
-    pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
+    pub fn addTimer(self: *Loop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
         const fd = try linuxFd(linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true }));
         errdefer _ = linux.close(fd);
 
@@ -279,12 +280,12 @@ pub const EventLoop = struct {
         return timer;
     }
 
-    pub fn addRepeatingTimer(self: *EventLoop, interval_ms: u64, ctx: *anyopaque, callback: TimerCallback) !void {
+    pub fn addRepeatingTimer(self: *Loop, interval_ms: u64, ctx: *anyopaque, callback: TimerCallback) !void {
         const timer = try self.addTimer(ctx, callback);
         try timer.arm(interval_ms, interval_ms);
     }
 
-    pub fn removeTimer(self: *EventLoop, timer: *Timer) void {
+    pub fn removeTimer(self: *Loop, timer: *Timer) void {
         self.removeFd(timer.fd);
         for (self.timers.items, 0..) |item, index| {
             if (item == timer) {
@@ -297,7 +298,7 @@ pub const EventLoop = struct {
         self.allocator.destroy(timer);
     }
 
-    pub fn setWayland(self: *EventLoop, source: WaylandSource) !void {
+    pub fn setWayland(self: *Loop, source: WaylandSource) !void {
         const index: u32 = @intCast(self.wayland_sources.items.len);
         try self.wayland_sources.append(self.allocator, .{ .source = source });
         errdefer _ = self.wayland_sources.pop();
@@ -310,7 +311,7 @@ pub const EventLoop = struct {
         try self.prepareWayland(index);
     }
 
-    pub fn removeWayland(self: *EventLoop, fd: i32) void {
+    pub fn removeWayland(self: *Loop, fd: i32) void {
         for (self.wayland_sources.items) |*slot| {
             const source = slot.source orelse continue;
             if (source.fd != fd) continue;
@@ -321,9 +322,10 @@ pub const EventLoop = struct {
         }
     }
 
-    /// Re-establishes every Wayland prepare-read after callers have queued
+    /// Re-establishes every Wayland prepare-read after owners have queued
     /// protocol requests between dispatches (for example while painting).
-    pub fn refreshWayland(self: *EventLoop) !void {
+    /// Runs at the top of `dispatch`, immediately before blocking.
+    fn refreshWayland(self: *Loop) !void {
         for (self.wayland_sources.items, 0..) |*slot, index| {
             const source = slot.source orelse continue;
             if (slot.prepared) {
@@ -334,7 +336,7 @@ pub const EventLoop = struct {
         }
     }
 
-    pub fn wake(self: *EventLoop) !void {
+    pub fn wake(self: *Loop) !void {
         const value: u64 = 1;
         const bytes = std.mem.asBytes(&value);
         const written = linux.write(self.wake_fd, bytes.ptr, bytes.len);
@@ -345,11 +347,13 @@ pub const EventLoop = struct {
         }
     }
 
-    /// Dispatches one batch. A zero timeout is fully non-blocking and is
-    /// the mode used by libkeywork hosts watching `epoll_fd` themselves.
-    /// Wayland sources remain unprepared afterward so rendering and WSI code
-    /// may use their displays; the owner calls `refreshWayland` when done.
-    pub fn dispatch(self: *EventLoop, timeout_ms: i32) !void {
+    /// Runs one loop iteration: re-establishes Wayland prepare-reads and
+    /// flushes queued protocol requests, waits up to `timeout_ms` (negative
+    /// blocks indefinitely, zero polls), and dispatches one batch of ready
+    /// sources. Wayland sources remain unprepared afterward so rendering
+    /// and WSI code may use their displays between iterations.
+    pub fn dispatch(self: *Loop, timeout_ms: i32) !void {
+        try self.refreshWayland();
         var events: [max_events]linux.epoll_event = undefined;
         const ready = try epollWait(self.epoll_fd, &events, timeout_ms);
         var source_events: [max_events]linux.epoll_event = undefined;
@@ -402,7 +406,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn prepareWayland(self: *EventLoop, index: u32) !void {
+    fn prepareWayland(self: *Loop, index: u32) !void {
         const slot = &self.wayland_sources.items[index];
         const source = slot.source orelse return;
         std.debug.assert(!slot.prepared);
@@ -416,8 +420,8 @@ pub const EventLoop = struct {
     }
 };
 
-fn timerSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
-    const timer: *EventLoop.Timer = @ptrCast(@alignCast(ctx));
+fn timerSourceCallback(ctx: *anyopaque, loop: *Loop, _: u32) !void {
+    const timer: *Loop.Timer = @ptrCast(@alignCast(ctx));
     const expirations = try drainTimer(timer.fd);
     if (expirations > 0) try timer.callback(timer.ctx, loop, expirations);
 }
@@ -449,9 +453,9 @@ fn drainWake(fd: i32) void {
     }
 }
 
-fn epollWait(fd: i32, events: *[EventLoop.max_events]linux.epoll_event, timeout_ms: i32) !usize {
+fn epollWait(fd: i32, events: *[Loop.max_events]linux.epoll_event, timeout_ms: i32) !usize {
     while (true) {
-        const result = linux.epoll_wait(fd, events.ptr, EventLoop.max_events, timeout_ms);
+        const result = linux.epoll_wait(fd, events.ptr, Loop.max_events, timeout_ms);
         switch (linux.errno(result)) {
             .SUCCESS => return result,
             .INTR => continue,
@@ -489,7 +493,7 @@ fn millisecondsAllowZero(value: u64) !linux.timespec {
     };
 }
 
-test "Wayland remains unprepared during owner work after dispatch" {
+test "Wayland is prepared before the wait and unprepared for owner work after" {
     const FakeWayland = struct {
         fd: i32,
         finishes: usize = 0,
@@ -509,7 +513,7 @@ test "Wayland remains unprepared during owner work after dispatch" {
         }
     };
 
-    var loop = try EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
     var fds: [2]i32 = undefined;
     try linuxVoid(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
@@ -524,26 +528,28 @@ test "Wayland remains unprepared during owner work after dispatch" {
         .prepare = FakeWayland.prepare,
         .finish = FakeWayland.finish,
     });
+    try std.testing.expect(loop.wayland_sources.items[0].prepared);
     _ = linux.write(fds[1], "x", 1);
     try loop.dispatch(-1);
 
-    try std.testing.expectEqual(@as(usize, 1), fake.finishes);
+    // The dispatch-top refresh finished the initial prepare and re-prepared;
+    // the batch finished again with the readable events. Owner work between
+    // iterations sees the source unprepared.
+    try std.testing.expectEqual(@as(usize, 2), fake.finishes);
     try std.testing.expect(!loop.wayland_sources.items[0].prepared);
-    try loop.refreshWayland();
-    try std.testing.expect(loop.wayland_sources.items[0].prepared);
 }
 
 test "repeating timer fires and can quit the loop" {
     const TimerTest = struct {
         fired: u64 = 0,
 
-        fn callback(ctx: *anyopaque, _: *EventLoop, expirations: u64) !void {
+        fn callback(ctx: *anyopaque, _: *Loop, expirations: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.fired += expirations;
         }
     };
 
-    var loop = try EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
     var context: TimerTest = .{};
@@ -557,13 +563,13 @@ test "fd source toggles without reallocating its slot" {
     const PipeTest = struct {
         fired: usize = 0,
 
-        fn callback(ctx: *anyopaque, _: *EventLoop, _: u32) !void {
+        fn callback(ctx: *anyopaque, _: *Loop, _: u32) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.fired += 1;
         }
     };
 
-    var loop = try EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
     var fds: [2]i32 = undefined;
     try linuxVoid(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
@@ -596,12 +602,12 @@ test "fd source toggles without reallocating its slot" {
 
 test "source removed during dispatch does not fire stale events" {
     const PipeTest = struct {
-        loop: *EventLoop,
+        loop: *Loop,
         fired: usize = 0,
         other_fd: i32 = -1,
         self_fd: i32 = -1,
 
-        fn callback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
+        fn callback(ctx: *anyopaque, loop: *Loop, _: u32) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.fired += 1;
             // Remove both sources mid-batch; the sibling's queued event
@@ -611,7 +617,7 @@ test "source removed during dispatch does not fire stale events" {
         }
     };
 
-    var loop = try EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
     var fds_a: [2]i32 = undefined;
@@ -640,10 +646,10 @@ test "source removed during dispatch does not fire stale events" {
 
 test "removed slot is reused with a fresh generation" {
     const Noop = struct {
-        fn callback(_: *anyopaque, _: *EventLoop, _: u32) !void {}
+        fn callback(_: *anyopaque, _: *Loop, _: u32) !void {}
     };
 
-    var loop = try EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
     var fds: [2]i32 = undefined;

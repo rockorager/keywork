@@ -1,7 +1,7 @@
 //! Minimal `wl_shm` render backend for Keywork display lists.
 
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 const keywork = @import("core.zig");
 const TextRenderer = @import("text_renderer.zig");
 const WaylandInput = @import("wayland_input.zig");
@@ -361,7 +361,7 @@ pub const Backend = struct {
         self.input.setScrollHandler(context, handler);
     }
 
-    pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {
+    pub fn installEventTimers(self: *Backend, loop: *Loop) !void {
         try self.input.installEventTimers(loop);
     }
 
@@ -369,7 +369,7 @@ pub const Backend = struct {
         self.input.uninstallEventTimers();
     }
 
-    pub fn removeEventTimers(self: *Backend, loop: *event_loop.EventLoop) void {
+    pub fn removeEventTimers(self: *Backend, loop: *Loop) void {
         self.input.removeEventTimers(loop);
     }
 

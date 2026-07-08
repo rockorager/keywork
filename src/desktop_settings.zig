@@ -6,7 +6,7 @@ const std = @import("std");
 const appearance = @import("appearance.zig");
 const c = @import("dbus_c");
 const DbusAdapter = @import("dbus_adapter.zig");
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 
 const log = std.log.scoped(.keywork_desktop_settings);
 
@@ -28,7 +28,7 @@ pub const ChangeHandler = *const fn (context: *anyopaque, color_scheme: appearan
 
 pub fn create(
     allocator: std.mem.Allocator,
-    loop: *event_loop.EventLoop,
+    loop: *Loop,
     change_context: *anyopaque,
     change_handler: ChangeHandler,
 ) !*Self {

@@ -8,6 +8,7 @@ const context = @import("context.zig");
 
 pub const ui = @import("ui.zig");
 
+pub const Loop = @import("loop.zig").Loop;
 pub const Context = context.Context;
 pub const ContextOptions = context.ContextOptions;
 pub const Surface = context.Surface;
@@ -35,7 +36,7 @@ test {
     _ = @import("dbus_adapter.zig");
     _ = @import("desktop_settings.zig");
     _ = @import("document.zig");
-    _ = @import("event_loop.zig");
+    _ = @import("loop.zig");
     _ = @import("icon_render.zig");
     _ = @import("icon_theme.zig");
     _ = @import("image_render.zig");

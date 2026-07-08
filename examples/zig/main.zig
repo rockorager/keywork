@@ -17,7 +17,9 @@ pub fn main(_: std.process.Init) !void {
     else
         std.heap.smp_allocator;
 
-    const context = try keywork.Context.init(allocator, .{});
+    var loop = try keywork.Loop.init(allocator);
+    defer loop.deinit();
+    const context = try keywork.Context.init(allocator, &loop, .{});
     defer context.deinit();
     const surface = try context.createSurface(.{
         .backend = .wayland_shm,
@@ -30,14 +32,9 @@ pub fn main(_: std.process.Init) !void {
     var count: u32 = 0;
     var active_document = try submit(surface, count);
 
-    var descriptors = [_]std.posix.pollfd{.{
-        .fd = context.eventFd(),
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
     while (true) {
-        _ = try std.posix.poll(&descriptors, -1);
-        try context.dispatch();
+        try loop.dispatch(-1);
+        try context.flush();
 
         while (context.nextEvent()) |event| switch (event) {
             .handler => |handler| if (handler.document == active_document and handler.handler == increment_handler) {

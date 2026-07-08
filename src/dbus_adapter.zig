@@ -7,12 +7,12 @@ const Self = @This();
 
 const std = @import("std");
 const c = @import("dbus_c");
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 
 const linux = std.os.linux;
 
 allocator: std.mem.Allocator,
-loop: *event_loop.EventLoop,
+loop: *Loop,
 connection: *c.DBusConnection,
 needs_dispatch: bool = false,
 pending_error: ?anyerror = null,
@@ -23,7 +23,7 @@ const WatchState = struct {
     owner: *Self,
     watch: *c.DBusWatch,
     fd: i32,
-    source: event_loop.EventLoop.SourceHandle,
+    source: Loop.SourceHandle,
     in_callback: bool = false,
     pending_remove: bool = false,
 };
@@ -31,12 +31,12 @@ const WatchState = struct {
 const TimeoutState = struct {
     owner: *Self,
     timeout: *c.DBusTimeout,
-    timer: *event_loop.EventLoop.Timer,
+    timer: *Loop.Timer,
     in_callback: bool = false,
     pending_remove: bool = false,
 };
 
-pub fn create(allocator: std.mem.Allocator, loop: *event_loop.EventLoop) !*Self {
+pub fn create(allocator: std.mem.Allocator, loop: *Loop) !*Self {
     const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse return error.DBusUnavailable;
     errdefer {
         c.dbus_connection_close(connection);
@@ -97,7 +97,7 @@ pub fn raw(self: *Self) *c.DBusConnection {
 }
 
 /// Dispatches complete messages already assembled by libdbus. It performs no
-/// blocking read and must be called by Context after EventLoop dispatch.
+/// blocking read and must be called by Context after loop dispatch.
 pub fn dispatchPending(self: *Self) void {
     while (self.needs_dispatch or c.dbus_connection_get_dispatch_status(self.connection) == c.DBUS_DISPATCH_DATA_REMAINS) {
         self.needs_dispatch = false;
@@ -179,7 +179,7 @@ fn toggleWatch(watch_optional: ?*c.DBusWatch, _: ?*anyopaque) callconv(.c) void 
     ) catch |err| state.owner.recordError(err);
 }
 
-fn watchReady(context: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {
+fn watchReady(context: *anyopaque, _: *Loop, events: u32) !void {
     const state: *WatchState = @ptrCast(@alignCast(context));
     const owner = state.owner;
     state.in_callback = true;
@@ -258,7 +258,7 @@ fn configureTimeout(state: *TimeoutState) void {
     state.timer.arm(interval, interval) catch |err| state.owner.recordError(err);
 }
 
-fn timeoutReady(context: *anyopaque, _: *event_loop.EventLoop, _: u64) !void {
+fn timeoutReady(context: *anyopaque, _: *Loop, _: u64) !void {
     const state: *TimeoutState = @ptrCast(@alignCast(context));
     const owner = state.owner;
     state.in_callback = true;
@@ -290,7 +290,7 @@ fn duplicateFd(fd: i32) !i32 {
 }
 
 test "session bus adapter releases watches and timeouts" {
-    var loop = try event_loop.EventLoop.init(std.testing.allocator);
+    var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
     const adapter = create(std.testing.allocator, &loop) catch |err| switch (err) {
         error.DBusUnavailable => return error.SkipZigTest,

@@ -18,7 +18,7 @@ const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
-const event_loop = @import("event_loop.zig");
+const Loop = @import("loop.zig").Loop;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -711,7 +711,7 @@ pub const Runtime = struct {
 
     pub fn fileChanged(
         ctx: *anyopaque,
-        _: *event_loop.EventLoop,
+        _: *Loop,
         path: []const u8,
         mask: u32,
         _: ?[]const u8,
