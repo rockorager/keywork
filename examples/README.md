@@ -15,13 +15,13 @@ The example requires a running Wayland session.
 
 ## Lua
 
-Lua examples land together with the `keywork` runtime binary. The intended
-shape:
+Lua applications run on the `keywork` runtime binary:
 
 ```sh
-keywork bar.lua
+zig build
+./zig-out/bin/keywork examples/lua/counter.lua
 ```
 
-with widgets as tables, handlers as plain Lua functions, and the platform
-API (`kw.every`, `kw.task`, `kw.exec`, `kw.socket`) for everything around
-the UI.
+`lua/counter.lua` is the canonical example: widgets as plain tables,
+handlers as Lua functions. The platform API (`kw.every`, `kw.task`,
+`kw.exec`, `kw.socket`) lands next.
