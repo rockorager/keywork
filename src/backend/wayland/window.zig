@@ -12,7 +12,9 @@ const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const zwlr = wayland.client.zwlr;
 
-pub const ShellRole = union(enum) {
+const log = std.log.scoped(.keywork_wayland_window);
+
+const ShellRole = union(enum) {
     xdg: struct {
         surface: *xdg.Surface,
         toplevel: *xdg.Toplevel,
@@ -32,19 +34,175 @@ pub const ShellRole = union(enum) {
     }
 };
 
-pub const OutputRef = struct {
+/// Protocol state shared by every renderer targeting a Wayland surface.
+/// Renderer-owned buffers and swapchains deliberately remain outside this
+/// type so protocol callbacks cannot depend on a rendering implementation.
+pub const Surface = struct {
+    surface: *wl.Surface,
+    viewport: ?*wp.Viewport,
+    fractional_scale: ?*wp.FractionalScaleV1,
+    shell_role: ShellRole,
+    configured: bool = false,
+    closed: bool = false,
+    width: u31,
+    height: u31,
+    scale: f32 = 1,
+    scale_changed: bool = false,
+    repaint_pending: bool = false,
+    frame_callback: ?*wl.Callback = null,
+    frame_done_pending: bool = false,
+
+    pub const Pending = packed struct {
+        repaint: bool = false,
+        frame_done: bool = false,
+    };
+
+    pub fn init(connection: *const Connection, output: ?*wl.Output, options: anytype) !Surface {
+        const compositor = connection.compositor orelse return error.NoWlCompositor;
+        const surface = try compositor.createSurface();
+        errdefer surface.destroy();
+        const shell_role = try createShellRole(surface, output, connection.wm_base, connection.layer_shell, options);
+        errdefer shell_role.destroy();
+        const viewport = if (connection.viewporter) |manager| try manager.getViewport(surface) else null;
+        errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
+        const fractional_scale = if (connection.fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
+        errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+
+        return .{
+            .surface = surface,
+            .viewport = viewport,
+            .fractional_scale = fractional_scale,
+            .shell_role = shell_role,
+            .width = options.width,
+            .height = options.height,
+        };
+    }
+
+    pub fn deinit(self: *Surface) void {
+        if (self.frame_callback) |callback| callback.destroy();
+        if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
+        if (self.viewport) |viewport| viewport.destroy();
+        self.shell_role.destroy();
+        self.surface.destroy();
+    }
+
+    /// Listener installation is separate from initialization because the
+    /// callback context must point at the object's final storage location.
+    pub fn attachListeners(self: *Surface) void {
+        switch (self.shell_role) {
+            .xdg => |role| {
+                role.surface.setListener(*Surface, xdgSurfaceListener, self);
+                role.toplevel.setListener(*Surface, toplevelListener, self);
+            },
+            .layer => |role| role.surface.setListener(*Surface, layerSurfaceListener, self),
+        }
+        if (self.fractional_scale) |fractional_scale| {
+            fractional_scale.setListener(*Surface, fractionalScaleListener, self);
+        }
+    }
+
+    pub fn currentSize(self: *const Surface) keywork.Size {
+        return .{ .width = @floatFromInt(self.width), .height = @floatFromInt(self.height) };
+    }
+
+    pub fn flushPending(self: *Surface) Pending {
+        if (self.scale_changed) {
+            self.scale_changed = false;
+            self.repaint_pending = true;
+        }
+        const pending: Pending = .{
+            .repaint = self.repaint_pending,
+            .frame_done = self.frame_done_pending,
+        };
+        self.repaint_pending = false;
+        self.frame_done_pending = false;
+        return pending;
+    }
+
+    pub fn armFrameCallback(self: *Surface) !void {
+        if (self.frame_callback != null) return;
+        const callback = try self.surface.frame();
+        callback.setListener(*Surface, frameListener, self);
+        self.frame_callback = callback;
+    }
+
+    fn frameListener(callback: *wl.Callback, event: wl.Callback.Event, self: *Surface) void {
+        switch (event) {
+            .done => {
+                if (self.frame_callback == callback) self.frame_callback = null;
+                callback.destroy();
+                self.frame_done_pending = true;
+            },
+        }
+    }
+
+    fn fractionalScaleListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1.Event, self: *Surface) void {
+        switch (event) {
+            .preferred_scale => |preferred| {
+                if (preferred.scale == 0) return;
+                const scale = @as(f32, @floatFromInt(preferred.scale)) / 120.0;
+                if (scale == self.scale) return;
+                self.scale = scale;
+                self.scale_changed = true;
+                log.info("fractional scale {d}", .{scale});
+            },
+        }
+    }
+
+    fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self: *Surface) void {
+        switch (event) {
+            .configure => |configure| {
+                xdg_surface.ackConfigure(configure.serial);
+                self.configured = true;
+                self.repaint_pending = true;
+            },
+        }
+    }
+
+    fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *Surface) void {
+        switch (event) {
+            .configure => |configure| {
+                layer_surface.ackConfigure(configure.serial);
+                if (configure.width > 0) self.width = @intCast(configure.width);
+                if (configure.height > 0) self.height = @intCast(configure.height);
+                self.configured = true;
+                self.repaint_pending = true;
+            },
+            .closed => self.closed = true,
+        }
+    }
+
+    fn toplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Surface) void {
+        switch (event) {
+            .configure => |configure| {
+                if (configure.width > 0) self.width = @intCast(configure.width);
+                if (configure.height > 0) self.height = @intCast(configure.height);
+            },
+            .close => self.closed = true,
+            .configure_bounds => {},
+            .wm_capabilities => {},
+        }
+    }
+};
+
+const OutputRef = struct {
     global_name: u32,
     output: *wl.Output,
 };
 
-pub const GlobalNeeds = struct {
+const GlobalNeeds = struct {
     shm: bool = false,
     outputs: bool = false,
 };
 
-pub const Globals = struct {
+/// Owns the Wayland connection and all registry globals. Seats are moved to
+/// the input subsystem after its initialization succeeds; every other proxy
+/// remains connection-owned for its full lifetime.
+pub const Connection = struct {
     allocator: std.mem.Allocator,
     needs: GlobalNeeds,
+    display: *wl.Display,
+    registry: *wl.Registry,
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     wm_base: ?*xdg.WmBase = null,
@@ -55,33 +213,77 @@ pub const Globals = struct {
     seat: ?*wl.Seat = null,
     outputs: std.ArrayList(OutputRef) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, needs: GlobalNeeds) Globals {
-        return .{ .allocator = allocator, .needs = needs };
+    pub fn init(allocator: std.mem.Allocator, needs: GlobalNeeds) !*Connection {
+        const display = try wl.Display.connect(null);
+        errdefer display.disconnect();
+
+        const registry = try display.getRegistry();
+        errdefer registry.destroy();
+        const self = try allocator.create(Connection);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .needs = needs,
+            .display = display,
+            .registry = registry,
+        };
+        errdefer self.deinitGlobals();
+
+        registry.setListener(*Connection, registryListener, self);
+        if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+        if (self.compositor == null) return error.NoWlCompositor;
+        if (needs.shm and self.shm == null) return error.NoWlShm;
+        return self;
+    }
+
+    pub fn deinit(self: *Connection) void {
+        self.deinitGlobals();
+        self.registry.destroy();
+        self.display.disconnect();
+        self.allocator.destroy(self);
+    }
+
+    fn deinitGlobals(self: *Connection) void {
+        if (self.seat) |seat| seat.release();
+        releaseOutputs(self.allocator, &self.outputs);
+        if (self.cursor_shape_manager) |manager| manager.destroy();
+        if (self.fractional_scale_manager) |manager| manager.destroy();
+        if (self.viewporter) |viewporter| viewporter.destroy();
+        if (self.layer_shell) |layer_shell| layer_shell.destroy();
+        if (self.wm_base) |wm_base| wm_base.destroy();
+        if (self.shm) |shm| shm.destroy();
+        if (self.compositor) |compositor| compositor.destroy();
+    }
+
+    pub fn takeSeat(self: *Connection) ?*wl.Seat {
+        const seat = self.seat;
+        self.seat = null;
+        return seat;
     }
 };
 
-pub fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *Globals) void {
+fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Connection) void {
     switch (event) {
         .global => |global| {
             if (std.mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
-                globals.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
-            } else if (globals.needs.shm and std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
-                globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
+                self.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
+            } else if (self.needs.shm and std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
+                self.shm = registry.bind(global.name, wl.Shm, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
-                globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
+                self.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
-                globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, @min(global.version, 5)) catch return;
+                self.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, @min(global.version, 5)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
-                globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
+                self.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
-                globals.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+                self.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
-                globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
+                self.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
-                globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
-            } else if (globals.needs.outputs and std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
+                self.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+            } else if (self.needs.outputs and std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
                 const output = registry.bind(global.name, wl.Output, @min(global.version, 4)) catch return;
-                globals.outputs.append(globals.allocator, .{ .global_name = global.name, .output = output }) catch {
+                self.outputs.append(self.allocator, .{ .global_name = global.name, .output = output }) catch {
                     output.release();
                     return;
                 };
@@ -91,12 +293,22 @@ pub fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, global
     }
 }
 
-pub fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRef)) void {
+fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRef)) void {
     for (outputs.items) |output_ref| output_ref.output.release();
     outputs.deinit(allocator);
 }
 
-pub fn createShellRole(
+pub fn installWmBaseListener(wm_base: ?*xdg.WmBase) void {
+    if (wm_base) |base| base.setListener(*xdg.WmBase, wmBaseListener, base);
+}
+
+fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, _: *xdg.WmBase) void {
+    switch (event) {
+        .ping => |ping| wm_base.pong(ping.serial),
+    }
+}
+
+fn createShellRole(
     surface: *wl.Surface,
     output: ?*wl.Output,
     wm_base: ?*xdg.WmBase,

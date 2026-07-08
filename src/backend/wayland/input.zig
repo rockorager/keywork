@@ -15,6 +15,7 @@ const wl = wayland.client.wl;
 
 const log = std.log.scoped(.keywork_wayland_input);
 
+surface: *wl.Surface,
 seat: ?*wl.Seat = null,
 pointer: ?*wl.Pointer = null,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
@@ -102,16 +103,17 @@ pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point)
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
 pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void;
 
-pub fn init(seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
+pub fn init(surface: *wl.Surface, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
+    const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
     const pointer = if (seat) |wl_seat| pointer: {
         break :pointer wl_seat.getPointer() catch null;
     } else null;
     const keyboard = if (seat) |wl_seat| keyboard: {
         break :keyboard wl_seat.getKeyboard() catch null;
     } else null;
-    const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
 
     var self: Self = .{
+        .surface = surface,
         .seat = seat,
         .pointer = pointer,
         .cursor_shape_manager = cursor_shape_manager,
@@ -129,13 +131,12 @@ pub fn deinit(self: *Self) void {
     if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
-    self.* = .{};
 }
 
-pub fn attachListeners(self: *Self, comptime Backend: type, backend: *Backend) void {
-    if (self.seat) |seat| seat.setListener(*Backend, seatListener(Backend), backend);
-    if (self.pointer) |pointer| pointer.setListener(*Backend, pointerListener(Backend), backend);
-    if (self.keyboard) |keyboard| keyboard.setListener(*Backend, keyboardListener(Backend), backend);
+pub fn attachListeners(self: *Self) void {
+    if (self.seat) |seat| seat.setListener(*Self, seatListener, self);
+    if (self.pointer) |pointer| pointer.setListener(*Self, pointerListener, self);
+    if (self.keyboard) |keyboard| keyboard.setListener(*Self, keyboardListener, self);
 }
 
 pub fn setPointerButtonHandler(self: *Self, context: *anyopaque, handler: PointerButtonHandler) void {
@@ -180,97 +181,87 @@ pub fn uninstallEventTimers(self: *Self) void {
     self.timer_loop = null;
 }
 
-fn seatListener(comptime Backend: type) *const fn (*wl.Seat, wl.Seat.Event, *Backend) void {
-    return struct {
-        fn callback(seat: *wl.Seat, event: wl.Seat.Event, backend: *Backend) void {
-            const self = &backend.input;
-            switch (event) {
-                .capabilities => |caps| {
-                    if (caps.capabilities.pointer and self.pointer == null) {
-                        self.pointer = seat.getPointer() catch null;
-                        if (self.pointer) |pointer| pointer.setListener(*Backend, pointerListener(Backend), backend);
-                        self.createCursorShapeDevice();
-                    } else if (!caps.capabilities.pointer and self.pointer != null) {
-                        self.destroyCursorShapeDevice();
-                        self.pointer.?.release();
-                        self.pointer = null;
-                        self.pointer_position = null;
-                        self.pointer_enter_serial = null;
-                        self.cursor_shape = null;
-                    }
-                    if (caps.capabilities.keyboard and self.keyboard == null) {
-                        self.keyboard = seat.getKeyboard() catch null;
-                        if (self.keyboard) |keyboard| keyboard.setListener(*Backend, keyboardListener(Backend), backend);
-                    } else if (!caps.capabilities.keyboard and self.keyboard != null) {
-                        self.keyboard.?.release();
-                        self.keyboard = null;
-                        self.shift_down = false;
-                        self.stopKeyRepeat();
-                        self.clearXkbKeymap();
-                    }
-                },
-                .name => {},
+fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
+    switch (event) {
+        .capabilities => |caps| {
+            if (caps.capabilities.pointer and self.pointer == null) {
+                self.pointer = seat.getPointer() catch null;
+                if (self.pointer) |pointer| pointer.setListener(*Self, pointerListener, self);
+                self.createCursorShapeDevice();
+            } else if (!caps.capabilities.pointer and self.pointer != null) {
+                self.destroyCursorShapeDevice();
+                self.pointer.?.release();
+                self.pointer = null;
+                self.pointer_position = null;
+                self.pointer_enter_serial = null;
+                self.cursor_shape = null;
             }
-        }
-    }.callback;
+            if (caps.capabilities.keyboard and self.keyboard == null) {
+                self.keyboard = seat.getKeyboard() catch null;
+                if (self.keyboard) |keyboard| keyboard.setListener(*Self, keyboardListener, self);
+            } else if (!caps.capabilities.keyboard and self.keyboard != null) {
+                self.keyboard.?.release();
+                self.keyboard = null;
+                self.shift_down = false;
+                self.stopKeyRepeat();
+                self.clearXkbKeymap();
+            }
+        },
+        .name => {},
+    }
 }
 
-fn pointerListener(comptime Backend: type) *const fn (*wl.Pointer, wl.Pointer.Event, *Backend) void {
-    return struct {
-        fn callback(pointer: *wl.Pointer, event: wl.Pointer.Event, backend: *Backend) void {
-            const self = &backend.input;
-            switch (event) {
-                .enter => |enter| {
-                    if (enter.surface != backend.surface) return;
-                    self.pointer_enter_serial = enter.serial;
-                    self.cursor_shape = null;
-                    self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
-                    self.pending_pointer.moved = true;
-                },
-                .leave => {
-                    self.pointer_position = null;
-                    self.pointer_enter_serial = null;
-                    self.cursor_shape = null;
-                    self.pending_pointer.left = true;
-                },
-                .motion => |motion| {
-                    self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
-                    self.pending_pointer.moved = true;
-                },
-                .button => |button| {
-                    if (button.button != 272) return;
-                    const state: keywork.PointerButtonState = switch (button.state) {
-                        .pressed => .pressed,
-                        .released => .released,
-                        _ => return,
-                    };
-                    if (state == .pressed) self.stopFling();
-                    const pending = &self.pending_pointer;
-                    if (pending.button_count < pending.buttons.len) {
-                        pending.buttons[pending.button_count] = state;
-                        pending.button_count += 1;
-                    }
-                },
-                .axis => |axis| {
-                    const delta: f32 = @floatCast(axis.value.toDouble());
-                    switch (axis.axis) {
-                        .vertical_scroll => self.pending_pointer.scroll_dy += delta,
-                        .horizontal_scroll => self.pending_pointer.scroll_dx += delta,
-                        _ => return,
-                    }
-                    self.pending_pointer.scrolled = true;
-                    self.pending_pointer.scroll_time_ms = axis.time;
-                },
-                .axis_source => |axis_source| self.pending_pointer.scroll_source = axis_source.axis_source,
-                .axis_stop => self.pending_pointer.scroll_stopped = true,
-                .frame => self.flushPointerFrame(),
-                else => {},
+fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) void {
+    switch (event) {
+        .enter => |enter| {
+            if (enter.surface != self.surface) return;
+            self.pointer_enter_serial = enter.serial;
+            self.cursor_shape = null;
+            self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
+            self.pending_pointer.moved = true;
+        },
+        .leave => {
+            self.pointer_position = null;
+            self.pointer_enter_serial = null;
+            self.cursor_shape = null;
+            self.pending_pointer.left = true;
+        },
+        .motion => |motion| {
+            self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
+            self.pending_pointer.moved = true;
+        },
+        .button => |button| {
+            if (button.button != 272) return;
+            const state: keywork.PointerButtonState = switch (button.state) {
+                .pressed => .pressed,
+                .released => .released,
+                _ => return,
+            };
+            if (state == .pressed) self.stopFling();
+            const pending = &self.pending_pointer;
+            if (pending.button_count < pending.buttons.len) {
+                pending.buttons[pending.button_count] = state;
+                pending.button_count += 1;
             }
-            // Pointers below version 5 never send frame; each event is its
-            // own logical group.
-            if (pointer.getVersion() < 5) self.flushPointerFrame();
-        }
-    }.callback;
+        },
+        .axis => |axis| {
+            const delta: f32 = @floatCast(axis.value.toDouble());
+            switch (axis.axis) {
+                .vertical_scroll => self.pending_pointer.scroll_dy += delta,
+                .horizontal_scroll => self.pending_pointer.scroll_dx += delta,
+                _ => return,
+            }
+            self.pending_pointer.scrolled = true;
+            self.pending_pointer.scroll_time_ms = axis.time;
+        },
+        .axis_source => |axis_source| self.pending_pointer.scroll_source = axis_source.axis_source,
+        .axis_stop => self.pending_pointer.scroll_stopped = true,
+        .frame => self.flushPointerFrame(),
+        else => {},
+    }
+    // Pointers below version 5 never send frame; each event is its
+    // own logical group.
+    if (pointer.getVersion() < 5) self.flushPointerFrame();
 }
 
 /// Dispatches one accumulated pointer event group: a single move with the
@@ -413,56 +404,51 @@ fn waylandCursorShape(shape: keywork.CursorShape) wp.CursorShapeDeviceV1.Shape {
     };
 }
 
-fn keyboardListener(comptime Backend: type) *const fn (*wl.Keyboard, wl.Keyboard.Event, *Backend) void {
-    return struct {
-        fn callback(_: *wl.Keyboard, event: wl.Keyboard.Event, backend: *Backend) void {
-            const self = &backend.input;
-            switch (event) {
-                .keymap => |keymap| self.installXkbKeymap(keymap),
-                .enter => |enter| {
-                    if (enter.surface != backend.surface) {
-                        self.shift_down = false;
-                        self.stopKeyRepeat();
-                    }
-                },
-                .leave => {
-                    self.shift_down = false;
-                    self.stopKeyRepeat();
-                },
-                .key => |key| {
-                    const pressed = key.state == .pressed;
-                    switch (key.key) {
-                        42, 54 => {
-                            self.shift_down = pressed;
-                            return;
-                        },
-                        else => {},
-                    }
-                    if (!pressed) {
-                        if (self.repeat_key == key.key) self.stopKeyRepeat();
-                        return;
-                    }
-                    const input = self.keyInputFromWaylandKey(key.key) orelse return;
-                    self.dispatchKeyInput(input);
-                    self.startKeyRepeat(key.key, input);
-                },
-                .modifiers => |modifiers| {
-                    if (self.xkb_state) |state| {
-                        _ = xkb.xkb_state_update_mask(
-                            state,
-                            modifiers.mods_depressed,
-                            modifiers.mods_latched,
-                            modifiers.mods_locked,
-                            0,
-                            0,
-                            modifiers.group,
-                        );
-                    }
-                },
-                .repeat_info => |repeat_info| self.setRepeatInfo(repeat_info.rate, repeat_info.delay),
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void {
+    switch (event) {
+        .keymap => |keymap| self.installXkbKeymap(keymap),
+        .enter => |enter| {
+            if (enter.surface != self.surface) {
+                self.shift_down = false;
+                self.stopKeyRepeat();
             }
-        }
-    }.callback;
+        },
+        .leave => {
+            self.shift_down = false;
+            self.stopKeyRepeat();
+        },
+        .key => |key| {
+            const pressed = key.state == .pressed;
+            switch (key.key) {
+                42, 54 => {
+                    self.shift_down = pressed;
+                    return;
+                },
+                else => {},
+            }
+            if (!pressed) {
+                if (self.repeat_key == key.key) self.stopKeyRepeat();
+                return;
+            }
+            const input = self.keyInputFromWaylandKey(key.key) orelse return;
+            self.dispatchKeyInput(input);
+            self.startKeyRepeat(key.key, input);
+        },
+        .modifiers => |modifiers| {
+            if (self.xkb_state) |state| {
+                _ = xkb.xkb_state_update_mask(
+                    state,
+                    modifiers.mods_depressed,
+                    modifiers.mods_latched,
+                    modifiers.mods_locked,
+                    0,
+                    0,
+                    modifiers.group,
+                );
+            }
+        },
+        .repeat_info => |repeat_info| self.setRepeatInfo(repeat_info.rate, repeat_info.delay),
+    }
 }
 
 fn installXkbKeymap(self: *Self, keymap: @TypeOf(@as(wl.Keyboard.Event, undefined).keymap)) void {
