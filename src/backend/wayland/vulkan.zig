@@ -45,6 +45,13 @@ pub const Backend = struct {
         var protocol = try window.Surface.init(connection, null, options);
         errdefer protocol.deinit();
 
+        // Commit and flush now so the compositor prepares the initial
+        // configure while input and the Vulkan device are initialized
+        // below. Events queue until the first dispatch, which happens
+        // after listeners are attached.
+        protocol.surface.commit();
+        _ = connection.display.flush();
+
         const seat = connection.takeSeat();
         var input = WaylandInput.init(protocol.surface, seat, connection.cursor_shape_manager) catch |err| {
             if (seat) |wl_seat| wl_seat.release();
@@ -72,7 +79,6 @@ pub const Backend = struct {
         window.installWmBaseListener(self.connection.wm_base);
         self.protocol.attachListeners();
         self.input.attachListeners();
-        self.protocol.surface.commit();
         return self;
     }
 

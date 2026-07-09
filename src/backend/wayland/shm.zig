@@ -92,6 +92,14 @@ pub const Backend = struct {
             }
         }
 
+        // Commit and flush now so the compositor prepares the initial
+        // configure while fonts and input are initialized below. Events
+        // queue until the first dispatch, which happens after listeners
+        // are attached.
+        protocol.surface.commit();
+        for (extra_surfaces.items) |*extra| extra.protocol.surface.commit();
+        _ = connection.display.flush();
+
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
         const seat = connection.takeSeat();
@@ -119,12 +127,8 @@ pub const Backend = struct {
 
         window.installWmBaseListener(self.connection.wm_base);
         self.protocol.attachListeners();
-        for (self.extra_surfaces.items) |*extra| {
-            extra.protocol.attachListeners();
-            extra.protocol.surface.commit();
-        }
+        for (self.extra_surfaces.items) |*extra| extra.protocol.attachListeners();
         self.input.attachListeners();
-        self.protocol.surface.commit();
 
         return self;
     }
