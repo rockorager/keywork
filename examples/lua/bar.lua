@@ -716,10 +716,14 @@ local StatusItems = kw.stateful({
     self:watch_network()
     self:watch_battery()
     self:update_battery()
-    self.timer = loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 }, function()
-      self:set_state(function(state)
-        state:update_time()
-      end)
+    self.timer = loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 })
+    local timer = self.timer
+    loop.spawn(function()
+      for _ in timer:ticks() do
+        self:set_state(function(state)
+          state:update_time()
+        end)
+      end
     end)
   end,
 

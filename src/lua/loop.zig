@@ -157,21 +157,28 @@ pub const LuaTimer = struct {
     host: Host,
     delay_ms: u64,
     interval_ms: u64,
-    /// Registry ref of the callback function, or of the parked coroutine
-    /// when this timer backs a loop.sleep.
+    /// Registry ref of the coroutine parked in loop.sleep when this timer
+    /// backs a sleep; unused (-1) for stream timers.
     ref: c_int,
     handle_ref: c_int = -1,
-    /// A waiter timer resumes the coroutine behind `ref` instead of calling
-    /// a function. Cancelling one without firing (app teardown) drops the
-    /// ref without resuming, so the sleep simply never returns and the
+    /// A waiter timer resumes the coroutine behind `ref` instead of
+    /// delivering ticks. Cancelling one without firing (app teardown) drops
+    /// the ref without resuming, so the sleep simply never returns and the
     /// coroutine becomes collectible.
     waiter: bool = false,
+    /// Coroutine parked in next(), if any.
+    reader_ref: c_int = -1,
+    /// Expirations reported while no reader was parked. Ticks coalesce
+    /// into a count instead of queueing.
+    pending: u64 = 0,
+    /// A one-shot timer that has fired; iteration ends once pending drains.
+    expired: bool = false,
     timer: ?*event_loop.EventLoop.Timer = null,
     registered: bool = false,
     canceled: bool = false,
 
     pub fn register(self: *LuaTimer) !void {
-        if (self.registered or self.canceled) return;
+        if (self.registered or self.canceled or self.expired) return;
         const loop = self.host.eventLoop() orelse return;
         const event_timer = try loop.addTimer(self, luaTimerCallback);
         errdefer loop.removeTimer(event_timer);
@@ -186,7 +193,7 @@ pub const LuaTimer = struct {
         self.registered = false;
     }
 
-    pub fn cancel(self: *LuaTimer, lua_state: *c.lua_State) void {
+    pub fn cancel(self: *LuaTimer, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         if (self.timer) |_| if (self.host.eventLoop()) |loop| self.unregister(loop);
@@ -196,10 +203,19 @@ pub const LuaTimer = struct {
         }
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
+        self.pending = 0;
+        if (self.reader_ref < 0) return;
+        switch (mode) {
+            .resume_reader => lua_coro.resumeReaderWith(lua_state, &self.reader_ref, 0),
+            .silent => {
+                c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.reader_ref);
+                self.reader_ref = -1;
+            },
+        }
     }
 
     pub fn destroy(self: *LuaTimer, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        self.cancel(lua_state);
+        self.cancel(lua_state, .silent);
         allocator.destroy(self);
     }
 };
@@ -250,10 +266,11 @@ fn fsEventCallback(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, 
 
 fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
     const timer: *LuaTimer = @ptrCast(@alignCast(ctx));
-    if (timer.canceled or timer.ref < 0 or expirations == 0) return;
+    if (timer.canceled or expirations == 0) return;
     const lua_state = timer.host.luaState();
     if (timer.waiter) {
         std.debug.assert(timer.interval_ms == 0);
+        if (timer.ref < 0) return;
         c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, timer.ref);
         const thread = c.lua_tothread(lua_state, -1).?;
         pop(lua_state, 1);
@@ -261,36 +278,34 @@ fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64)
         // coroutine against collection, and cancel drops it. If the resumed
         // code awaits again, the new resource takes its own ref.
         lua_coro.resumeThread(thread, 0);
-        timer.cancel(lua_state);
+        timer.cancel(lua_state, .silent);
         return;
     }
-    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, timer.ref);
-    c.lua_pushinteger(lua_state, @intCast(expirations));
-    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
-        var len: usize = 0;
-        const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("timer callback failed: {s}", .{message[0..len]});
-        pop(lua_state, 1);
-        timer.cancel(lua_state);
+    // Mark a one-shot expired before resuming so a reader that immediately
+    // asks for the next tick observes the end instead of parking forever.
+    if (timer.interval_ms == 0) {
+        timer.expired = true;
+        if (timer.host.eventLoop()) |loop| timer.unregister(loop);
+    }
+    if (timer.reader_ref >= 0) {
+        c.lua_pushinteger(lua_state, @intCast(expirations));
+        lua_coro.resumeReaderWith(lua_state, &timer.reader_ref, 1);
         return;
     }
-    if (timer.interval_ms == 0) timer.cancel(lua_state);
+    timer.pending += expirations;
 }
 
 fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
     const interval = optionalSecondsField(lua_state, 1, "interval");
     const delay = optionalSecondsField(lua_state, 1, "delay") orelse interval;
     const delay_seconds = delay orelse return c.luaL_error(lua_state, "timer requires delay or interval");
     const delay_ms = secondsToMilliseconds(delay_seconds) catch return c.luaL_error(lua_state, "invalid timer delay");
     const interval_ms = if (interval) |seconds| secondsToMilliseconds(seconds) catch return c.luaL_error(lua_state, "invalid timer interval") else 0;
 
-    c.lua_pushvalue(lua_state, 2);
-    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-    const timer = host.addTimer(delay_ms, interval_ms, ref) catch |err| {
+    const timer = host.addTimer(delay_ms, interval_ms, -1) catch |err| {
         std.log.scoped(.keywork_luajit).warn("timer failed: {}", .{err});
         return c.luaL_error(lua_state, "timer failed");
     };
@@ -358,6 +373,8 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 const timer_type: [*:0]const u8 = "keywork.timer";
 const timer_methods = [_]lua_handle.Method{
+    .{ .name = "next", .func = luaTimerNext },
+    .{ .name = "ticks", .func = luaTimerTicks },
     .{ .name = "cancel", .func = luaCancelTimer },
     .{ .name = "canceled", .func = luaTimerCanceled },
 };
@@ -393,8 +410,30 @@ fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
 fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const timer = lua_handle.resource(LuaTimer, lua_state, 1, timer_type) orelse return 0;
-    timer.cancel(lua_state);
+    timer.cancel(lua_state, .resume_reader);
     return 0;
+}
+
+fn luaTimerNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead handle ends the iteration instead of parking forever.
+    const timer = lua_handle.resource(LuaTimer, lua_state, 1, timer_type) orelse return 0;
+    if (timer.pending != 0) {
+        c.lua_pushinteger(lua_state, @intCast(timer.pending));
+        timer.pending = 0;
+        return 1;
+    }
+    if (timer.expired or timer.canceled) return 0;
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "next must be called from a coroutine (wrap the caller in loop.spawn)");
+    if (timer.reader_ref >= 0) return c.luaL_error(lua_state, "timer already has a waiting reader");
+    timer.reader_ref = lua_coro.refCurrentThread(lua_state);
+    return c.lua_yield(lua_state, 0);
+}
+
+fn luaTimerTicks(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, timer_type);
+    return lua_coro.pushIterator(lua_state, luaTimerNext);
 }
 
 fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

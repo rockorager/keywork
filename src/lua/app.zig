@@ -164,7 +164,7 @@ pub const App = struct {
     pub fn hasLiveAsyncResources(self: *const App) bool {
         for (self.fd_watches.items) |watch| if (!watch.canceled) return true;
         for (self.fs_events.items) |fs_event| if (!fs_event.canceled) return true;
-        for (self.timers.items) |timer| if (!timer.canceled) return true;
+        for (self.timers.items) |timer| if (!timer.canceled and !timer.expired) return true;
         for (self.processes.items) |process| if (!process.canceled and !process.exited) return true;
         for (self.dbus_buses.items) |bus| if (!bus.closed) return true;
         return false;
@@ -269,7 +269,7 @@ pub const App = struct {
     fn cancelScriptResources(self: *App) void {
         for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
-        for (self.timers.items) |timer| timer.cancel(self.state);
+        for (self.timers.items) |timer| timer.cancel(self.state, .silent);
         for (self.processes.items) |process| process.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
     }
@@ -884,7 +884,7 @@ test "reload cancels resources from the previous script load" {
     const script =
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\loop.timer({ interval = 60 }, function() end)
+        \\loop.timer({ interval = 60 })
         \\return kw.app({ child = kw.text("reload") })
         \\
     ;
@@ -923,7 +923,7 @@ test "stale handles from a previous script load are inert" {
         \\  stale_timer:cancel()
         \\  stale_still_canceled = stale_timer:canceled()
         \\else
-        \\  stale_timer = loop.timer({ interval = 60 }, function() end)
+        \\  stale_timer = loop.timer({ interval = 60 })
         \\  fresh_canceled = stale_timer:canceled()
         \\end
         \\return kw.app({ child = kw.text("stale") })
@@ -984,7 +984,7 @@ test "application quit is idempotent before the loop starts" {
     try loop.run();
 }
 
-test "timer callback errors cancel only the timer" {
+test "lua timer streams ticks to a coroutine reader" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -992,12 +992,21 @@ test "timer callback errors cancel only the timer" {
     const script =
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\loop.timer({ delay = 0.001 }, function() error("timer failed") end)
+        \\ticks = 0
+        \\done = false
+        \\local t = loop.timer({ delay = 0.001, interval = 0.001 })
+        \\loop.spawn(function()
+        \\  for n in t:ticks() do
+        \\    ticks = ticks + n
+        \\    if ticks >= 3 then t:cancel() end
+        \\  end
+        \\  done = true
+        \\end)
         \\return kw.app({ child = kw.text("timer") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-error.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-error.lua" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-ticks.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-ticks.lua" });
     defer allocator.free(script_path);
 
     var app = try App.init(allocator, script_path);
@@ -1009,16 +1018,126 @@ test "timer callback errors cancel only the timer" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const Guard = struct {
-        fn callback(_: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            event_loop_instance.quit();
+    const TickTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.rounds > 1000) event_loop_instance.quit();
         }
     };
-    var guard: u8 = 0;
-    const guard_timer = try loop.addTimer(&guard, Guard.callback);
-    try guard_timer.arm(25, 0);
+    var context: TickTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, TickTest.callback);
     try loop.run();
 
+    c.lua_getglobal(app.state, "done");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "ticks");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_tointeger(app.state, -1) >= 3);
+    try std.testing.expect(app.timers.items[0].canceled);
+}
+
+test "lua one-shot timer ends iteration after its tick" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\ticks = 0
+        \\done = false
+        \\local t = loop.timer({ delay = 0.001 })
+        \\loop.spawn(function()
+        \\  for n in t:ticks() do
+        \\    ticks = ticks + n
+        \\  end
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("timer") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-oneshot.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-oneshot.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const TickTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.rounds > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: TickTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, TickTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "done");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "ticks");
+    defer pop(app.state, 1);
+    try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    // The spent one-shot is expired, not canceled, and no longer counts as
+    // live work.
+    try std.testing.expect(app.timers.items[0].expired);
+    try std.testing.expect(!app.timers.items[0].canceled);
+    try std.testing.expect(!app.hasLiveAsyncResources());
+}
+
+test "lua timer cancel resumes a parked reader and ends iteration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Cancel comes from the main state while the reader coroutine is parked
+    // in next(); it must resume with no value so the loop ends.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\ended = false
+        \\local t = loop.timer({ interval = 60 })
+        \\loop.spawn(function()
+        \\  for _ in t:ticks() do end
+        \\  ended = true
+        \\end)
+        \\t:cancel()
+        \\return kw.app({ child = kw.text("timer") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-cancel.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-cancel.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "ended");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
     try std.testing.expect(app.timers.items[0].canceled);
 }
 
