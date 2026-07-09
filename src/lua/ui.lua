@@ -208,6 +208,7 @@ local default_theme = {
   },
 
   space = space_scale,
+  font_size = font_size_scale,
   radius = radius_scale,
 
   components = {
@@ -391,6 +392,7 @@ function ui.resolve_theme(theme, state_or_scheme)
   local scheme = theme.schemes[color_scheme] or theme.schemes.light
   local colors = resolve_colors(scheme.colors)
   local space = copy_table(theme.space or {})
+  local font_size = copy_table(theme.font_size or {})
   local radius = copy_table(theme.radius or {})
   local components = {
     button = resolve_button(theme.components and theme.components.button, colors, space, radius),
@@ -402,6 +404,7 @@ function ui.resolve_theme(theme, state_or_scheme)
     colors = colors,
     text = copy_table(theme.text or {}),
     space = space,
+    font_size = font_size,
     radius = radius,
     components = components,
   }
