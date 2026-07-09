@@ -90,7 +90,6 @@ const stringField = lua_value.stringField;
 const boolField = lua_value.boolField;
 const stringFromStack = lua_value.stringFromStack;
 const dupeStringFromStack = lua_value.dupeStringFromStack;
-const failLuaCall = lua_value.failLuaCall;
 
 fn optionalStringFieldDupe(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?[]const u8 {
     c.lua_getfield(lua_state, table, key);
@@ -108,7 +107,7 @@ fn getIntegerField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, de
 
 const Subscription = struct {
     bus: *Bus,
-    ref: c_int,
+    stream: lua_coro.Stream = .{},
     handle_ref: c_int = -1,
     match_rule: ?[:0]const u8 = null,
     sender: ?[]const u8 = null,
@@ -118,22 +117,21 @@ const Subscription = struct {
     member: ?[]const u8 = null,
     canceled: bool = false,
 
-    fn cancel(self: *Subscription, lua_state: *c.lua_State) void {
+    fn cancel(self: *Subscription, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         if (self.match_rule) |rule| {
             if (!self.bus.closed) dbus_c.dbus_bus_remove_match(self.bus.connection, rule.ptr, null);
         }
-        if (self.ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
-            self.ref = -1;
-        }
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
+        // End the stream last so a resumed reader observes the subscription
+        // already canceled and its handle dead.
+        self.stream.cancel(self.bus.host.allocator(), lua_state, mode);
     }
 
     fn deinit(self: *Subscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        _ = lua_state;
         if (self.match_rule) |rule| allocator.free(rule);
         if (self.sender) |value| allocator.free(value);
         if (self.path) |value| allocator.free(value);
@@ -143,13 +141,13 @@ const Subscription = struct {
     }
 
     fn destroy(self: *Subscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        self.cancel(lua_state);
+        self.cancel(lua_state, .silent);
         self.deinit(allocator, lua_state);
         allocator.destroy(self);
     }
 
     fn matches(self: *const Subscription, message: *dbus_c.DBusMessage) bool {
-        if (self.canceled or self.ref < 0) return false;
+        if (self.canceled) return false;
         if (self.sender) |expected| {
             const actual = dbus_c.dbus_message_get_sender(message) orelse return false;
             if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
@@ -359,7 +357,9 @@ pub const Bus = struct {
             self.source_handle = null;
         }
         const lua_state = self.host.luaState();
-        for (self.subscriptions.items) |subscription| subscription.cancel(lua_state);
+        // Drop parked readers without resuming them: close may already be
+        // on the C stack of a resumed waiter (see pending calls below).
+        for (self.subscriptions.items) |subscription| subscription.cancel(lua_state, .silent);
         for (self.owned_names.items) |name| name.release();
         for (self.exported_objects.items) |object| object.unexport(lua_state);
 
@@ -407,13 +407,12 @@ pub const Bus = struct {
         allocator.destroy(self);
     }
 
-    fn subscribe(self: *Bus, lua_state: *c.lua_State, options_index: c_int, callback_index: c_int) !*Subscription {
+    fn subscribe(self: *Bus, lua_state: *c.lua_State, options_index: c_int) !*Subscription {
         const subscription = try self.host.allocator().create(Subscription);
         errdefer self.host.allocator().destroy(subscription);
 
         subscription.* = .{
             .bus = self,
-            .ref = -1,
             .sender = try optionalStringFieldDupe(lua_state, self.host.allocator(), options_index, "sender"),
             .path = try optionalStringFieldDupe(lua_state, self.host.allocator(), options_index, "path"),
             .path_namespace = try optionalStringFieldDupe(lua_state, self.host.allocator(), options_index, "path_namespace"),
@@ -423,9 +422,6 @@ pub const Bus = struct {
         errdefer subscription.deinit(self.host.allocator(), lua_state);
         subscription.match_rule = try buildDbusMatchRule(self.host.allocator(), subscription);
         dbus_c.dbus_bus_add_match(self.connection, subscription.match_rule.?.ptr, null);
-
-        c.lua_pushvalue(lua_state, callback_index);
-        subscription.ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
 
         try self.subscriptions.append(self.host.allocator(), subscription);
         return subscription;
@@ -553,12 +549,8 @@ pub const Bus = struct {
         const lua_state = self.host.luaState();
         for (self.subscriptions.items) |subscription| {
             if (!subscription.matches(message)) continue;
-            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, subscription.ref);
             pushDbusSignal(lua_state, message);
-            if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
-                failLuaCall(lua_state, "dbus signal callback failed") catch {};
-                return error.LuaCallbackFailed;
-            }
+            try subscription.stream.deliver(self.host.allocator(), lua_state);
         }
     }
 
@@ -858,8 +850,7 @@ fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
-    const subscription = bus.subscribe(lua_state, 2, 3) catch |err| {
+    const subscription = bus.subscribe(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus subscribe failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus subscribe failed");
     };
@@ -972,6 +963,8 @@ const bus_methods = [_]lua_handle.Method{
 
 const subscription_type: [*:0]const u8 = "keywork.dbus_subscription";
 const subscription_methods = [_]lua_handle.Method{
+    .{ .name = "next", .func = luaSubscriptionNext },
+    .{ .name = "events", .func = luaSubscriptionEvents },
     .{ .name = "cancel", .func = luaCancelSubscription },
 };
 
@@ -988,8 +981,21 @@ const export_methods = [_]lua_handle.Method{
 fn luaCancelSubscription(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const subscription = lua_handle.resource(Subscription, lua_state, 1, subscription_type) orelse return 0;
-    subscription.cancel(lua_state);
+    subscription.cancel(lua_state, .resume_reader);
     return 0;
+}
+
+fn luaSubscriptionNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead handle ends the iteration instead of parking forever.
+    const subscription = lua_handle.resource(Subscription, lua_state, 1, subscription_type) orelse return 0;
+    return subscription.stream.awaitNext(lua_state, subscription.canceled);
+}
+
+fn luaSubscriptionEvents(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, subscription_type);
+    return lua_coro.pushIterator(lua_state, luaSubscriptionNext);
 }
 
 fn luaReleaseOwnedName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

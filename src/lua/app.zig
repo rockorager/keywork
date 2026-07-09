@@ -1223,6 +1223,79 @@ test "lua bus:call awaits replies and reports peer errors as nil, err" {
     pop(app.state, 1);
 }
 
+test "lua bus:subscribe streams signals to a coroutine reader" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The bus subscribes to its own broadcast signal: the daemon routes it
+    // back because of the match rule, so no second peer is needed.
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\local bus = assert(dbus.session())
+        \\local sub = bus:subscribe({ interface = "org.keywork.StreamTest", member = "Ping" })
+        \\got_signal = false
+        \\sub_ended = false
+        \\loop.spawn(function()
+        \\  for signal in sub:events() do
+        \\    got_signal = signal.interface == "org.keywork.StreamTest"
+        \\      and signal.member == "Ping"
+        \\      and signal.args[1] == "hello"
+        \\    sub:cancel()
+        \\  end
+        \\  sub_ended = true
+        \\  done = true
+        \\end)
+        \\bus:emit({
+        \\  path = "/org/keywork/stream_test",
+        \\  interface = "org.keywork.StreamTest",
+        \\  member = "Ping",
+        \\  args = { "hello" },
+        \\})
+        \\return kw.app({ child = kw.text("dbus-sub") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-subscribe.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-subscribe.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusSubscribeTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 3000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusSubscribeTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusSubscribeTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "got_signal");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "sub_ended");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+}
+
 test "lua stateful widget set_state rebuilds retained subtree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
