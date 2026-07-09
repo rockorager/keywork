@@ -808,6 +808,13 @@ function ui.padding(options)
   options = options or {}
   return {
     type = "padding",
+    all = options.all,
+    x = options.x,
+    y = options.y,
+    left = options.left,
+    right = options.right,
+    top = options.top,
+    bottom = options.bottom,
     insets = options.insets or options.padding,
     child = options.child,
   }
