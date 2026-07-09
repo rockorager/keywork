@@ -342,6 +342,11 @@ pub const Widget = union(enum) {
         center,
         end,
         stretch,
+        /// Rows only: text children center as usual, while other children
+        /// (icons) center on the first text child's cap-height midline,
+        /// matching how macOS aligns symbol icons next to text. Falls back
+        /// to center when the row has no text child.
+        baseline,
     };
 
     pub const MainAxisAlignment = enum {

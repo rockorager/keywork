@@ -338,6 +338,10 @@ pub const Renderer = struct {
         return self.text_renderer.measure(scale, value, style);
     }
 
+    pub fn textMetrics(self: *Self, scale: f32, font_size: f32) !keywork.TextMetrics {
+        return self.text_renderer.metrics(scale, font_size);
+    }
+
     fn ensureSwapchain(self: *Self, width: u31, height: u31) !bool {
         if (!self.swapchain_dirty and self.swapchain != .null_handle and self.swapchain_extent.width == width and self.swapchain_extent.height == height) return true;
         try self.vkd.deviceWaitIdle(self.device);

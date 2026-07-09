@@ -230,6 +230,25 @@ pub fn render(
     }
 }
 
+pub fn metrics(self: *Self, scale: f32, font_size: f32) !keywork.TextMetrics {
+    const pixel_size = try scaledPixelSize(scale, font_size);
+    try self.ensureFontPixelSize(primary_font_index, pixel_size);
+
+    const primary = &self.fonts.items[primary_font_index];
+    const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
+    const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const cap_pixels = c.keywork_ft_cap_height(primary.face);
+    const cap_height: f32 = if (cap_pixels > 0)
+        @floatFromInt(cap_pixels)
+    else
+        0.7 * @as(f32, @floatFromInt(pixel_size));
+    return .{
+        .ascender = ascender / scale,
+        .cap_height = cap_height / scale,
+        .line_height = line_height / scale,
+    };
+}
+
 pub fn measure(self: *Self, scale: f32, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
     const pixel_size = try scaledPixelSize(scale, style.font_size);
     try self.ensureFontPixelSize(primary_font_index, pixel_size);

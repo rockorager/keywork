@@ -220,6 +220,9 @@ pub const RenderBackend = struct {
         present: *const fn (ptr: *anyopaque, frame: Frame) anyerror!bool,
         measure_text: *const fn (ptr: *anyopaque, value: []const u8, style: ResolvedTextStyle) anyerror!Size,
         scale: *const fn (ptr: *anyopaque) f32,
+        /// Optional; backends without real font metrics fall back to the
+        /// fixed approximation.
+        text_metrics: ?*const fn (ptr: *anyopaque, font_size: f32) anyerror!TextMetrics = null,
     };
 
     pub const Frame = struct {
@@ -237,6 +240,11 @@ pub const RenderBackend = struct {
         return self.vtable.measure_text(self.ptr, value, style);
     }
 
+    pub fn textMetrics(self: RenderBackend, font_size: f32) !TextMetrics {
+        const text_metrics = self.vtable.text_metrics orelse return fixedTextMetrics(font_size);
+        return text_metrics(self.ptr, font_size);
+    }
+
     pub fn scale(self: RenderBackend) f32 {
         return self.vtable.scale(self.ptr);
     }
@@ -252,7 +260,32 @@ pub const TextMeasurer = union(enum) {
             .backend => |backend| backend.measureText(value, style),
         };
     }
+
+    pub fn textMetrics(self: TextMeasurer, font_size: f32) !TextMetrics {
+        return switch (self) {
+            .fixed => fixedTextMetrics(font_size),
+            .backend => |backend| backend.textMetrics(font_size),
+        };
+    }
 };
+
+/// Vertical font metrics in logical units, mirroring how text paints:
+/// glyphs sit at box top + ascender, all leading below the baseline.
+pub const TextMetrics = struct {
+    ascender: f32,
+    cap_height: f32,
+    line_height: f32,
+};
+
+pub fn fixedTextMetrics(font_size: f32) TextMetrics {
+    // Matches fixedMeasureText's line height; ascender and cap height
+    // use common sans-serif ratios.
+    return .{
+        .ascender = 0.8 * font_size,
+        .cap_height = 0.7 * font_size,
+        .line_height = font_size,
+    };
+}
 
 pub const text_width_ratio = 0.5;
 

@@ -32,6 +32,7 @@ pub const PaintCommand = display.PaintCommand;
 pub const DisplayList = display.DisplayList;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
+pub const TextMetrics = display.TextMetrics;
 pub const KeyInput = types.KeyInput;
 pub const CursorShape = types.CursorShape;
 pub const AppContext = model.AppContext;

@@ -616,6 +616,10 @@ fn layoutLinearElements(
     }
 
     // Positioning pass.
+    const cap_center: ?f32 = if (kind == .row and cross_align == .baseline)
+        try rowCapHeightCenter(children, cross, measurer)
+    else
+        null;
     var cursor: Point = switch (kind) {
         .row => .{ .x = origin.x + lead, .y = origin.y },
         .column => .{ .x = origin.x, .y = origin.y + lead },
@@ -631,7 +635,7 @@ fn layoutLinearElements(
                 else => unreachable,
             };
         } else {
-            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, child);
+            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, child, cap_center);
             const new_x = switch (kind) {
                 .row => cursor.x,
                 .column => origin.x + aligned_cross,
@@ -693,7 +697,7 @@ pub fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constrain
     };
 }
 
-fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: *const RenderNode) f32 {
+fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: *const RenderNode, cap_center: ?f32) f32 {
     const child_cross = switch (kind) {
         .row => child.rect.height,
         .column => child.rect.width,
@@ -703,7 +707,27 @@ fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignmen
         .start, .stretch => 0,
         .center => @max(0, cross - child_cross) / 2,
         .end => @max(0, cross - child_cross),
+        .baseline => switch (child.kind) {
+            .text, .text_input => @max(0, cross - child_cross) / 2,
+            else => if (cap_center) |center|
+                center - child_cross / 2
+            else
+                @max(0, cross - child_cross) / 2,
+        },
     };
+}
+
+/// Cross-axis position of the first text child's cap-height midline,
+/// mirroring paint: the text box centers in the row and glyphs sit at
+/// box top + ascender. Null when the row has no text child.
+fn rowCapHeightCenter(children: []const *RenderNode, cross: f32, measurer: TextMeasurer) LayoutError!?f32 {
+    for (children) |child| {
+        if (child.kind != .text) continue;
+        const text_metrics = try measurer.textMetrics(child.text_style.font_size);
+        const top = @max(0, cross - child.rect.height) / 2;
+        return top + text_metrics.ascender - text_metrics.cap_height / 2;
+    }
+    return null;
 }
 
 fn alignedOffset(alignment: Widget.Alignment, outer: f32, inner: f32) f32 {

@@ -777,7 +777,9 @@ function ui.icon_label(icon_name, text, options)
   if text and text ~= "" then
     table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
   end
-  return ui.row({ spacing = options.spacing or 6, align = options.align or "center", children = children })
+  -- "baseline" centers the icon on the text's cap-height midline (like
+  -- macOS symbol alignment) instead of the text box's geometric center.
+  return ui.row({ spacing = options.spacing or 6, align = options.align or "baseline", children = children })
 end
 
 --- Pass a resolved theme (see ui.resolve_theme) as `theme` to default the

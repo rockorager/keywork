@@ -271,7 +271,7 @@ pub const Backend = struct {
         frame_context: ?*anyopaque = null,
 
         pub fn renderBackend(self: *Window) keywork.RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale, .text_metrics = textMetrics } };
         }
 
         pub fn setPointerButtonHandler(self: *Window, context: *anyopaque, handler: PointerButtonHandler) void {
@@ -379,6 +379,11 @@ pub const Backend = struct {
         fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
             const self: *Window = @ptrCast(@alignCast(ptr));
             return self.backend.text_renderer.measure(self.protocol.scale, value, style);
+        }
+
+        fn textMetrics(ptr: *anyopaque, font_size: f32) !keywork.TextMetrics {
+            const self: *Window = @ptrCast(@alignCast(ptr));
+            return self.backend.text_renderer.metrics(self.protocol.scale, font_size);
         }
 
         fn renderScale(ptr: *anyopaque) f32 {

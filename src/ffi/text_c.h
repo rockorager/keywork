@@ -5,6 +5,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
+#include FT_TRUETYPE_TABLES_H
 #include <hb-ft.h>
 #include <hb.h>
 
@@ -165,6 +166,14 @@ static inline int keywork_ft_ascender(FT_Face face) {
 
 static inline int keywork_ft_line_height(FT_Face face) {
     return (int)(face->size->metrics.height >> 6);
+}
+
+// Cap height at the current pixel size, or 0 when the font has no OS/2
+// table (callers approximate with ~0.7em).
+static inline int keywork_ft_cap_height(FT_Face face) {
+    TT_OS2 *os2 = (TT_OS2 *)FT_Get_Sfnt_Table(face, FT_SFNT_OS2);
+    if (!os2 || os2->sCapHeight <= 0) return 0;
+    return (int)(FT_MulFix(os2->sCapHeight, face->size->metrics.y_scale) >> 6);
 }
 
 static inline hb_font_t *keywork_hb_font_create(FT_Face face) {
