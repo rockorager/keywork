@@ -1145,6 +1145,80 @@ test "lua stateful widget dispose runs when removed" {
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
 }
 
+test "lua stateful set_state is inert after dispose" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A callback may retain the state table (via self) past dispose. The
+    // stale set_state must be a safe no-op that neither errors nor marks
+    // the freed state dirty.
+    const script =
+        \\local kw = require("keywork")
+        \\disposed = false
+        \\local Child = kw.stateful({
+        \\  init = function(self)
+        \\    stale_set_state = function()
+        \\      self:set_state(function(s) s.poked = true end)
+        \\    end
+        \\  end,
+        \\  dispose = function(self)
+        \\    disposed = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    return kw.gesture({ id = "remove", child = kw.text("remove"), on_tap = self.props.on_remove })
+        \\  end,
+        \\})
+        \\local App = kw.stateful({
+        \\  init = function(self)
+        \\    self.show = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    if self.show then
+        \\      return Child({ key = "child", on_remove = function()
+        \\        self:set_state(function(s)
+        \\          s.show = false
+        \\        end)
+        \\      end })
+        \\    end
+        \\    return kw.text("gone")
+        \\  end,
+        \\})
+        \\return kw.app({ child = App({ key = "app" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stale-set-state.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stale-set-state.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.runtime = &runtime;
+
+    try runtime.repaint();
+    try runtime.click(.{ .x = 2, .y = 2 });
+
+    c.lua_getglobal(app.state, "disposed");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+
+    c.lua_getglobal(app.state, "stale_set_state");
+    try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+}
+
 test "lua stateful build context includes theme" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

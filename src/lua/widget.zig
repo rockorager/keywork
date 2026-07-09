@@ -4,6 +4,7 @@ const std = @import("std");
 const keywork = @import("../ui.zig");
 const icon_theme = @import("../linux/icon_theme.zig");
 const lua_codec = @import("codec.zig");
+const lua_handle = @import("handle.zig");
 const lua_image = @import("image.zig");
 const lua_theme = @import("theme.zig");
 const lua_value = @import("value.zig");
@@ -35,7 +36,9 @@ pub const Host = struct {
 
 fn luaSetState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const state: *LuaStatefulState = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    // A callback may retain the state table past dispose; a dead slot makes
+    // the stale set_state a no-op instead of touching freed memory.
+    const state = lua_handle.slotResource(LuaStatefulState, lua_state, c.lua_upvalueindex(1)) orelse return 0;
     if (c.lua_type(lua_state, 2) == c.LUA_TFUNCTION) {
         c.lua_pushvalue(lua_state, 2);
         c.lua_pushvalue(lua_state, 1);
@@ -317,6 +320,7 @@ const LuaStatefulWidget = struct {
         const state_table = c.lua_gettop(self.lua_state);
         errdefer pop(self.lua_state, 1);
         installStateMethods(self.lua_state, state, state_table);
+        errdefer lua_handle.invalidate(self.lua_state, state.slot_ref);
         setStateProps(self.lua_state, state_table, self.props_ref);
 
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
@@ -398,6 +402,7 @@ const LuaStatefulWidget = struct {
         }
 
         if (state.state_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
+        lua_handle.invalidate(self.lua_state, state.slot_ref);
         allocator.destroy(state);
     }
 
@@ -448,6 +453,7 @@ const LuaStatefulState = struct {
     host: Host,
     lua_state: *c.lua_State,
     state_ref: c_int,
+    slot_ref: c_int = -1,
     dirty: bool = false,
 };
 
@@ -861,7 +867,7 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
 }
 
 fn installStateMethods(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int) void {
-    c.lua_pushlightuserdata(lua_state, state);
+    state.slot_ref = lua_handle.createSlot(lua_state, state);
     c.lua_pushcclosure(lua_state, luaSetState, 1);
     c.lua_setfield(lua_state, state_table, "set_state");
 }

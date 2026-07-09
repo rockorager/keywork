@@ -35,6 +35,26 @@ pub fn create(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: []cons
     return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
 }
 
+/// Pushes a bare slot userdata for use as a closure upvalue and returns a
+/// registry ref that the resource must keep for later invalidation. Unlike
+/// `create`, the slot has no metatable and is never visible to Lua code, so
+/// no type check is needed to read it back.
+pub fn createSlot(lua_state: *c.lua_State, resource_ptr: *anyopaque) c_int {
+    const slot: *?*anyopaque = @ptrCast(@alignCast(c.lua_newuserdata(lua_state, @sizeOf(?*anyopaque)).?));
+    slot.* = resource_ptr;
+    c.lua_pushvalue(lua_state, -1);
+    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+/// Returns the resource behind a slot userdata at `index` (typically a
+/// `lua_upvalueindex`), or null when the slot has been invalidated.
+pub fn slotResource(comptime T: type, lua_state: *c.lua_State, index: c_int) ?*T {
+    const ptr = c.lua_touserdata(lua_state, index) orelse return null;
+    const slot: *?*anyopaque = @ptrCast(@alignCast(ptr));
+    const value = slot.* orelse return null;
+    return @ptrCast(@alignCast(value));
+}
+
 /// Nulls the handle's resource slot and drops the registry ref. Safe to call
 /// with a negative ref, so owners can invalidate unconditionally.
 pub fn invalidate(lua_state: *c.lua_State, ref: c_int) void {
