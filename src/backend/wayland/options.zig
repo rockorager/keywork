@@ -41,3 +41,14 @@ pub const LayerShellOptions = struct {
         all,
     };
 };
+
+/// Snapshot of one output's identity and geometry for window placement
+/// and app-side output iteration.
+pub const OutputInfo = struct {
+    name: []const u8,
+    /// Logical size: pixel mode divided by the integer scale. Zero until
+    /// the compositor reports a mode.
+    width: f32,
+    height: f32,
+    scale: f32,
+};

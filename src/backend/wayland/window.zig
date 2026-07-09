@@ -316,7 +316,18 @@ test toplevelHasState {
 const OutputRef = struct {
     global_name: u32,
     output: *wl.Output,
+    /// Owned copy of the wl_output v4 name (e.g. "DP-1"); null until the
+    /// compositor sends it or on older protocol versions.
+    name: ?[]u8 = null,
+    mode_width: i32 = 0,
+    mode_height: i32 = 0,
+    scale: i32 = 1,
+    /// The initial property burst ended with a done event, so the info
+    /// is complete enough to expose.
+    ready: bool = false,
 };
+
+pub const OutputInfo = wayland_options.OutputInfo;
 
 const GlobalNeeds = struct {
     shm: bool = false,
@@ -340,6 +351,11 @@ pub const Connection = struct {
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     seat: ?*wl.Seat = null,
     outputs: std.ArrayList(OutputRef) = .empty,
+    /// Fired when the output set or an output's properties change:
+    /// hotplug adds (after the initial done), removals, and mode/scale
+    /// updates. Consumers re-read the outputs list.
+    outputs_changed_ctx: ?*anyopaque = null,
+    outputs_changed_fn: ?*const fn (ctx: *anyopaque) void = null,
 
     pub fn init(allocator: std.mem.Allocator, needs: GlobalNeeds) !*Connection {
         const display = try wl.Display.connect(null);
@@ -361,6 +377,12 @@ pub const Connection = struct {
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         if (self.compositor == null) return error.NoWlCompositor;
         if (needs.shm and self.shm == null) return error.NoWlShm;
+        // Output listeners were installed during the first roundtrip; a
+        // second collects the initial name/mode/scale bursts so output
+        // info is complete before the caller reads it.
+        if (needs.outputs and self.outputs.items.len > 0) {
+            if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+        }
         return self;
     }
 
@@ -388,7 +410,62 @@ pub const Connection = struct {
         self.seat = null;
         return seat;
     }
+
+    pub fn setOutputsChangedHandler(self: *Connection, ctx: *anyopaque, handler: *const fn (ctx: *anyopaque) void) void {
+        self.outputs_changed_ctx = ctx;
+        self.outputs_changed_fn = handler;
+    }
+
+    fn notifyOutputsChanged(self: *Connection) void {
+        const handler = self.outputs_changed_fn orelse return;
+        handler(self.outputs_changed_ctx.?);
+    }
+
+    pub fn outputInfoAt(self: *const Connection, index: usize) OutputInfo {
+        const ref = self.outputs.items[index];
+        const scale: f32 = @floatFromInt(@max(1, ref.scale));
+        return .{
+            .name = ref.name orelse "",
+            .width = @as(f32, @floatFromInt(@max(0, ref.mode_width))) / scale,
+            .height = @as(f32, @floatFromInt(@max(0, ref.mode_height))) / scale,
+            .scale = scale,
+        };
+    }
+
+    pub fn findOutputByName(self: *const Connection, name: []const u8) ?*wl.Output {
+        for (self.outputs.items) |ref| {
+            const ref_name = ref.name orelse continue;
+            if (std.mem.eql(u8, ref_name, name)) return ref.output;
+        }
+        return null;
+    }
 };
+
+fn outputListener(output: *wl.Output, event: wl.Output.Event, connection: *Connection) void {
+    const ref = for (connection.outputs.items) |*candidate| {
+        if (candidate.output == output) break candidate;
+    } else return;
+    switch (event) {
+        .geometry => {},
+        .mode => |mode| {
+            // Only the current mode describes the active resolution.
+            if (!mode.flags.current) return;
+            ref.mode_width = mode.width;
+            ref.mode_height = mode.height;
+        },
+        .scale => |scale| ref.scale = scale.factor,
+        .name => |name| {
+            const duped = connection.allocator.dupe(u8, std.mem.span(name.name)) catch return;
+            if (ref.name) |old| connection.allocator.free(old);
+            ref.name = duped;
+        },
+        .description => {},
+        .done => {
+            ref.ready = true;
+            connection.notifyOutputsChanged();
+        },
+    }
+}
 
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Connection) void {
     switch (event) {
@@ -415,6 +492,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
                     output.release();
                     return;
                 };
+                output.setListener(*Connection, outputListener, self);
             }
         },
         .global_remove => |remove| {
@@ -423,8 +501,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
             // their own closed/configure events from the compositor.
             for (self.outputs.items, 0..) |output_ref, index| {
                 if (output_ref.global_name != remove.name) continue;
+                if (output_ref.name) |name| self.allocator.free(name);
                 output_ref.output.release();
                 _ = self.outputs.orderedRemove(index);
+                self.notifyOutputsChanged();
                 break;
             }
         },
@@ -432,7 +512,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
 }
 
 fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRef)) void {
-    for (outputs.items) |output_ref| output_ref.output.release();
+    for (outputs.items) |output_ref| {
+        if (output_ref.name) |name| allocator.free(name);
+        output_ref.output.release();
+    }
     outputs.deinit(allocator);
 }
 
