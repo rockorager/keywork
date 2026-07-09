@@ -7,6 +7,9 @@ const stb = @import("build/stb.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Escape hatch for toolchains where the self-hosted linker cannot link
+    // system CRT objects (e.g. .sframe sections from GCC 16's crt1.o).
+    const use_llvm = b.option(bool, "llvm", "Use the LLVM backend and LLD linker");
 
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -113,6 +116,8 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "keywork",
         .root_module = app_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
     });
     // Lua C modules resolve the statically linked LuaJIT API from the host
     // executable when dlopen loads them.
@@ -178,6 +183,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const app_tests = b.addTest(.{
         .root_module = app_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
     });
     app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
