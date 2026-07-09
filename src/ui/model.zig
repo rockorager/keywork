@@ -6,6 +6,7 @@ const display = @import("display.zig");
 
 pub const Color = types.Color;
 pub const colors = types.colors;
+pub const scale = types.scale;
 pub const TextStyle = types.TextStyle;
 pub const ResolvedTextStyle = types.ResolvedTextStyle;
 pub const TextRole = types.TextRole;
@@ -27,6 +28,10 @@ pub const TextMeasurer = display.TextMeasurer;
 
 pub const input_min_width = 220;
 pub const LayoutError = anyerror;
+
+/// Default component themes; widget-level defaults reference these so the
+/// theme structs in types.zig stay the single source of truth.
+const default_input_theme: types.InputTheme = .{};
 
 pub const Widget = union(enum) {
     keyed: Keyed,
@@ -318,9 +323,10 @@ pub const Widget = union(enum) {
         border: Color = colors.ink,
         focused_border: Color = colors.accent,
         placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
-        padding_x: f32 = 12,
-        padding_y: f32 = 8,
-        radius: f32 = 8,
+        padding_x: f32 = default_input_theme.padding_x,
+        padding_y: f32 = default_input_theme.padding_y,
+        radius: f32 = default_input_theme.radius,
+        font_size: f32 = default_input_theme.font_size,
         autofocus: bool = false,
     };
 
@@ -871,7 +877,7 @@ fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
 }
 
 fn defaultResolvedTextStyle() ResolvedTextStyle {
-    return .{ .color = colors.ink, .font_size = 16 };
+    return .{ .color = colors.ink, .font_size = scale.fontSize(3) };
 }
 
 fn roleTextStyle(theme: Theme, role: TextRole) TextStyle {
@@ -893,7 +899,7 @@ fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widge
     const role_style = roleTextStyle(theme, text_widget.role);
     return .{
         .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.foreground,
-        .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse 16,
+        .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse scale.fontSize(3),
     };
 }
 
@@ -972,8 +978,8 @@ pub const RenderNode = struct {
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
     placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
-    padding_x: f32 = 12,
-    padding_y: f32 = 8,
+    padding_x: f32 = default_input_theme.padding_x,
+    padding_y: f32 = default_input_theme.padding_y,
     focused: bool = false,
     caret_x: ?f32 = null,
     /// Constraints this node was last laid out with; cached so clean
@@ -2166,6 +2172,7 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             input_widget.padding_x = theme.input_theme.padding_x;
             input_widget.padding_y = theme.input_theme.padding_y;
             input_widget.radius = theme.input_theme.radius;
+            input_widget.font_size = theme.input_theme.font_size;
         },
         else => {},
     }
@@ -2338,6 +2345,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .padding_x = input_widget.padding_x,
                 .padding_y = input_widget.padding_y,
                 .radius = input_widget.radius,
+                .font_size = input_widget.font_size,
                 .autofocus = input_widget.autofocus,
             } };
         },

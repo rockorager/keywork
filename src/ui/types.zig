@@ -40,6 +40,27 @@ pub const colors = struct {
     pub const accent: Color = blue9;
 };
 
+/// Radix Themes design scales at 100% scaling and medium radius
+/// (https://www.radix-ui.com/themes/docs/theme/spacing). Steps are 1-based
+/// to match Radix token names: `space(3)` is Radix `--space-3`.
+pub const scale = struct {
+    pub const space_steps = [9]f32{ 4, 8, 12, 16, 24, 32, 40, 48, 64 };
+    pub const font_size_steps = [9]f32{ 12, 14, 16, 18, 20, 24, 28, 35, 60 };
+    pub const radius_steps = [6]f32{ 3, 4, 6, 8, 12, 16 };
+
+    pub fn space(step: usize) f32 {
+        return space_steps[step - 1];
+    }
+
+    pub fn fontSize(step: usize) f32 {
+        return font_size_steps[step - 1];
+    }
+
+    pub fn radius(step: usize) f32 {
+        return radius_steps[step - 1];
+    }
+};
+
 pub const Brightness = enum {
     light,
     dark,
@@ -107,9 +128,9 @@ pub const TextRole = enum {
 };
 
 pub const TextTheme = struct {
-    body: TextStyle = .{ .font_size = 16 },
-    label: TextStyle = .{ .font_size = 14 },
-    title: TextStyle = .{ .font_size = 20 },
+    body: TextStyle = .{ .font_size = scale.fontSize(3) },
+    label: TextStyle = .{ .font_size = scale.fontSize(2) },
+    title: TextStyle = .{ .font_size = scale.fontSize(5) },
 };
 
 pub const ButtonTheme = struct {
@@ -121,9 +142,12 @@ pub const ButtonTheme = struct {
     pressed_background: ?Color = null,
     disabled_background: ?Color = null,
     disabled_foreground: ?Color = null,
-    padding_x: f32 = 12,
-    padding_y: f32 = 8,
-    radius: f32 = 8,
+    // Radix size-2 button: 32px tall, space-3 horizontal padding, radius-2.
+    // Our control height is text-driven (14px label with ~20px line height),
+    // so 6px of vertical padding approximates the 32px Radix height.
+    padding_x: f32 = scale.space(3),
+    padding_y: f32 = 6,
+    radius: f32 = scale.radius(2),
 };
 
 pub const InputTheme = struct {
@@ -132,9 +156,12 @@ pub const InputTheme = struct {
     placeholder: ?Color = null,
     border: ?Color = null,
     focused_border: ?Color = null,
-    padding_x: f32 = 12,
-    padding_y: f32 = 8,
-    radius: f32 = 8,
+    // Radix size-2 text field: 32px tall, space-2 horizontal padding,
+    // radius-2, font-size-2.
+    padding_x: f32 = scale.space(2),
+    padding_y: f32 = 6,
+    radius: f32 = scale.radius(2),
+    font_size: f32 = scale.fontSize(2),
 };
 
 pub const Theme = struct {

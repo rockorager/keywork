@@ -317,7 +317,7 @@ fn layoutElementInto(
         .text_input => |input_widget| {
             const value = textInputState(element).text.items;
             const text_value = if (value.len > 0) value else input_widget.placeholder;
-            const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = 16 };
+            const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = input_widget.font_size };
             const measured = try measurer.measureText(text_value, style);
             const value_size = try measurer.measureText(value, style);
             const fill_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else 0;

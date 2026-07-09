@@ -1,5 +1,12 @@
 local ui = {}
 
+-- Radix Themes scales at 100% scaling and medium radius, mirroring `scale`
+-- in src/ui/types.zig. Lua's 1-based arrays match Radix token names:
+-- space_scale[3] is Radix --space-3.
+local space_scale = { 4, 8, 12, 16, 24, 32, 40, 48, 64 }
+local font_size_scale = { 12, 14, 16, 18, 20, 24, 28, 35, 60 }
+local radius_scale = { 3, 4, 6, 8, 12, 16 }
+
 local default_theme = {
   schemes = {
     light = {
@@ -195,19 +202,22 @@ local default_theme = {
   },
 
   text = {
-    body = { size = 16 },
-    label = { size = 14 },
-    title = { size = 20 },
+    body = { size = font_size_scale[3] },
+    label = { size = font_size_scale[2] },
+    title = { size = font_size_scale[5] },
   },
 
-  space = { xs = 4, sm = 8, md = 12, lg = 16, xl = 24 },
-  radius = { sm = 4, md = 8, lg = 12, full = 999 },
+  space = space_scale,
+  radius = radius_scale,
 
   components = {
     button = {
-      padding_x = "md",
-      padding_y = "sm",
-      radius = "md",
+      -- Radix size-2 button: 32px tall, space-3 horizontal padding, radius-2.
+      -- Control height is text-driven, so 6px vertical padding approximates
+      -- the 32px Radix height at a 14px label size.
+      padding_x = space_scale[3],
+      padding_y = 6,
+      radius = radius_scale[2],
       default = {
         background = "accent",
         foreground = "on_accent",
@@ -230,9 +240,12 @@ local default_theme = {
     },
 
     input = {
-      padding_x = "md",
-      padding_y = "sm",
-      radius = "md",
+      -- Radix size-2 text field: 32px tall, space-2 horizontal padding,
+      -- radius-2, font-size-2.
+      padding_x = space_scale[2],
+      padding_y = 6,
+      radius = radius_scale[2],
+      font_size = font_size_scale[2],
       background = "surface_high",
       foreground = "text",
       placeholder = "placeholder",
@@ -354,6 +367,7 @@ local function resolve_input(input, colors, space, radius)
     padding_x = resolve_space(input.padding_x, space),
     padding_y = resolve_space(input.padding_y, space),
     radius = resolve_radius(input.radius, radius),
+    font_size = input.font_size,
     background = resolve_color(input.background, colors),
     foreground = resolve_color(input.foreground, colors),
     placeholder = resolve_color(input.placeholder, colors),

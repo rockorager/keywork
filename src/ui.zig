@@ -6,6 +6,7 @@ const display = @import("ui/display.zig");
 
 pub const Color = types.Color;
 pub const colors = types.colors;
+pub const scale = types.scale;
 pub const ColorScheme = types.ColorScheme;
 pub const TextStyle = types.TextStyle;
 pub const ResolvedTextStyle = types.ResolvedTextStyle;

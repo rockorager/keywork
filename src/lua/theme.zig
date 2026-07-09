@@ -151,6 +151,7 @@ fn parseInputTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.In
     result.padding_x = getNumberField(lua_state, input_table, "padding_x", result.padding_x);
     result.padding_y = getNumberField(lua_state, input_table, "padding_y", result.padding_y);
     result.radius = getNumberField(lua_state, input_table, "radius", result.radius);
+    result.font_size = getNumberField(lua_state, input_table, "font_size", result.font_size);
     return result;
 }
 

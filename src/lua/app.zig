@@ -2241,8 +2241,10 @@ test "lua resolves theme families and component tokens" {
 
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=40 color=#ff111113") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=32 color=#ff223344") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=12 y=8 value=\"Name\" color=#ff445566") != null);
+    // Input geometry follows the default input theme: 14px text plus 6px
+    // vertical and 8px horizontal padding (Radix size-2 text field).
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=26 color=#ff223344") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=8 y=6 value=\"Name\" color=#ff445566") != null);
 }
 
 test "lua flexible and main_align lay out through the parser" {
