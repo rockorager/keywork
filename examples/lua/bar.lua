@@ -11,6 +11,14 @@ local IPC_COMMAND = 0
 local IPC_GET_WORKSPACES = 1
 local IPC_SUBSCRIBE = 2
 
+-- Bar controls share one pill geometry; kw.chip reads it from
+-- theme.components.chip so call sites don't repeat the metrics.
+local bar_theme = kw.resolve_theme(kw.theme_data({
+  components = {
+    chip = { radius = 10, min_height = 30, padding_x = 7, padding_y = 0 },
+  },
+}))
+
 local function bar_colors(theme)
   local scheme = theme.colors
   local foreground = scheme.white
@@ -233,11 +241,9 @@ local function status_pill(palette, id, icon_name, text, color, options)
   })
   return kw.chip({
     id = id,
+    theme = bar_theme,
     child = child,
-    radius = 10,
-    min_height = 30,
     align = "center",
-    padding = { x = 7 },
     on_tap = function()
       print("clicked " .. id)
     end,
@@ -251,6 +257,7 @@ local function workspaces(palette, sway)
     local selected = workspace.urgent or workspace.focused
     table.insert(items, kw.chip({
       id = "workspace-" .. name,
+      theme = bar_theme,
       label = name,
       color = palette.muted,
       background = palette.background,
@@ -259,8 +266,6 @@ local function workspaces(palette, sway)
       selected_background = palette.active,
       selected_hover_background = palette.active_hover,
       selected_color = palette.on_active,
-      radius = 9,
-      min_height = 30,
       align = "center",
       padding = { x = 12 },
       on_tap_down = function()
@@ -1070,11 +1075,9 @@ local TrayItems = kw.stateful({
       })
       table.insert(items, kw.chip({
         id = "tray-" .. item.id,
+        theme = bar_theme,
         child = icon,
-        radius = 10,
-        min_height = 30,
         align = "center",
-        padding = { x = 7 },
         on_tap = function()
           self.host:activate(item)
         end,

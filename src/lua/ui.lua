@@ -253,6 +253,14 @@ local default_theme = {
       border = "border",
       focused_border = "accent",
     },
+
+    chip = {
+      -- Compact pill control: space-2 horizontal padding, space-1 vertical,
+      -- radius-2. Height stays text-driven unless min_height is set.
+      padding_x = space_scale[2],
+      padding_y = space_scale[1],
+      radius = radius_scale[2],
+    },
   },
 }
 
@@ -377,6 +385,22 @@ local function resolve_input(input, colors, space, radius)
   }
 end
 
+local function resolve_chip(chip, colors, space, radius)
+  chip = chip or {}
+  return {
+    padding_x = resolve_space(chip.padding_x, space),
+    padding_y = resolve_space(chip.padding_y, space),
+    radius = resolve_radius(chip.radius, radius),
+    min_height = resolve_space(chip.min_height, space),
+    background = resolve_color(chip.background, colors),
+    foreground = resolve_color(chip.foreground, colors),
+    hover_background = resolve_color(chip.hover_background, colors),
+    selected_background = resolve_color(chip.selected_background, colors),
+    selected_foreground = resolve_color(chip.selected_foreground, colors),
+    selected_hover_background = resolve_color(chip.selected_hover_background, colors),
+  }
+end
+
 function ui.resolve_theme(theme, state_or_scheme)
   theme = theme or default_theme
   local color_scheme = "light"
@@ -397,6 +421,7 @@ function ui.resolve_theme(theme, state_or_scheme)
   local components = {
     button = resolve_button(theme.components and theme.components.button, colors, space, radius),
     input = resolve_input(theme.components and theme.components.input, colors, space, radius),
+    chip = resolve_chip(theme.components and theme.components.chip, colors, space, radius),
   }
 
   return {
@@ -753,19 +778,28 @@ function ui.icon_label(icon_name, text, options)
   return ui.row({ spacing = options.spacing or 6, align = options.align or "center", children = children })
 end
 
+--- Pass a resolved theme (see ui.resolve_theme) as `theme` to default the
+--- chip's metrics and colors from `theme.components.chip`; explicit options
+--- always win.
 function ui.chip(options)
+  local chip_theme = options.theme and options.theme.components and options.theme.components.chip or {}
   local selected = options.selected or false
-  local background = options.background
+  local background = options.background or chip_theme.background
   if selected then
-    background = options.selected_background or background
+    background = options.selected_background or chip_theme.selected_background or background
   end
-  local color = options.color
+  local color = options.color or chip_theme.foreground
   if selected then
-    color = options.selected_color or color
+    color = options.selected_color or chip_theme.selected_foreground or color
   end
-  local hover_background = options.hover_background
+  local hover_background = options.hover_background or chip_theme.hover_background
   if selected then
-    hover_background = options.selected_hover_background
+    hover_background = options.selected_hover_background or chip_theme.selected_hover_background
+  end
+
+  local padding = options.padding
+  if not padding then
+    padding = { x = chip_theme.padding_x or 8, y = chip_theme.padding_y or 4 }
   end
 
   local child = options.child
@@ -789,13 +823,13 @@ function ui.chip(options)
       background = background,
       border = options.border,
       border_width = options.border_width,
-      radius = options.radius,
+      radius = options.radius or chip_theme.radius,
       min_width = options.min_width,
-      min_height = options.min_height,
+      min_height = options.min_height or chip_theme.min_height,
       align = options.align,
       horizontal_align = options.horizontal_align,
       vertical_align = options.vertical_align,
-      padding = options.padding or { x = 8, y = 4 },
+      padding = padding,
     }, child),
     hover_background = hover_background,
     on_tap = options.on_tap,
@@ -808,6 +842,7 @@ end
 function ui.icon_button(options)
   return ui.chip({
     id = options.id,
+    theme = options.theme,
     icon = options.icon,
     icon_size = options.size,
     color = options.color,
