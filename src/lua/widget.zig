@@ -871,13 +871,7 @@ fn setStateProps(lua_state: *c.lua_State, state_table: c_int, props_ref: c_int) 
     c.lua_setfield(lua_state, state_table, "props");
 }
 
-fn failLuaCall(lua_state: *c.lua_State, err: []const u8) anyerror {
-    var len: usize = 0;
-    const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-    if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s}: {s}", .{ err, message[0..len] });
-    pop(lua_state, 1);
-    return error.LuaCallbackFailed;
-}
+const failLuaCall = lua_value.failLuaCall;
 
 fn getActivationField(lua_state: *c.lua_State, table: c_int) keywork.Widget.ClickActivation {
     c.lua_getfield(lua_state, table, "activation");

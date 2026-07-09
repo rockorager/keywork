@@ -56,6 +56,20 @@ pub fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
     return ptr[0..len];
 }
 
+pub fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
+    return allocator.dupe(u8, try stringFromStack(lua_state, index));
+}
+
 pub fn pop(lua_state: *c.lua_State, count: c_int) void {
     c.lua_settop(lua_state, -count - 1);
+}
+
+/// Logs and pops the Lua error at the top of the stack, then returns
+/// error.LuaCallbackFailed for the caller to propagate.
+pub fn failLuaCall(lua_state: *c.lua_State, err: []const u8) anyerror {
+    var len: usize = 0;
+    const message_ptr = c.lua_tolstring(lua_state, -1, &len);
+    if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s}: {s}", .{ err, message[0..len] });
+    pop(lua_state, 1);
+    return error.LuaCallbackFailed;
 }

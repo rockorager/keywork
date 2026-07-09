@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const keywork = @import("../ui.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 pub fn decode(comptime T: type, lua_state: *c.lua_State, index: c_int, allocator: std.mem.Allocator) !T {
@@ -125,17 +126,6 @@ fn decodeInsets(lua_state: *c.lua_State, index: c_int, allocator: std.mem.Alloca
     };
 }
 
-fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
-    return ptr[0..len];
-}
-
-fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
-    if (index > 0 or index <= c.LUA_REGISTRYINDEX) return index;
-    return c.lua_gettop(lua_state) + index + 1;
-}
-
-fn pop(lua_state: *c.lua_State, count: c_int) void {
-    c.lua_settop(lua_state, -count - 1);
-}
+const stringFromStack = lua_value.stringFromStack;
+const absoluteIndex = lua_value.absoluteIndex;
+const pop = lua_value.pop;

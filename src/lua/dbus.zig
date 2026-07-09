@@ -3,6 +3,7 @@
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_handle = @import("handle.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 const dbus_c = @import("dbus_c");
 
@@ -81,25 +82,15 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_setfield(lua_state, dbus_table, "variant");
 }
 
-fn pop(lua_state: *c.lua_State, count: c_int) void {
-    c.lua_settop(lua_state, -count - 1);
-}
-fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
-    if (index > 0 or index <= c.LUA_REGISTRYINDEX) return index;
-    return c.lua_gettop(lua_state) + index + 1;
-}
-fn expectType(lua_state: *c.lua_State, index: c_int, expected: c_int) !void {
-    if (c.lua_type(lua_state, index) != expected) return error.UnexpectedLuaType;
-}
-fn getStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
-    c.lua_getfield(lua_state, table, key);
-    return stringFromStack(lua_state, -1);
-}
-fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
-    const value = try getStringField(lua_state, table, key);
-    defer pop(lua_state, 1);
-    return value;
-}
+const pop = lua_value.pop;
+const absoluteIndex = lua_value.absoluteIndex;
+const expectType = lua_value.expectType;
+const stringField = lua_value.stringField;
+const boolField = lua_value.boolField;
+const stringFromStack = lua_value.stringFromStack;
+const dupeStringFromStack = lua_value.dupeStringFromStack;
+const failLuaCall = lua_value.failLuaCall;
+
 fn optionalStringFieldDupe(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?[]const u8 {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
@@ -112,16 +103,6 @@ fn getIntegerField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, de
     defer pop(lua_state, 1);
     if (c.lua_isnumber(lua_state, -1) == 0) return default;
     return @intCast(c.lua_tointeger(lua_state, -1));
-}
-fn boolField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) bool {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    return c.lua_toboolean(lua_state, -1) != 0;
-}
-fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
-    return ptr[0..len];
 }
 
 const Subscription = struct {
@@ -1178,11 +1159,6 @@ fn appendDbusBasic(iter: *dbus_c.DBusMessageIter, type_: c_int, value: anytype) 
     if (dbus_c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
 }
 
-fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
-    const value = try stringFromStack(lua_state, index);
-    return try allocator.dupe(u8, value);
-}
-
 fn buildDbusMatchRule(allocator: std.mem.Allocator, subscription: *const Subscription) ![:0]const u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
@@ -1549,14 +1525,6 @@ fn tableRefField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_i
         return error.ExpectedLuaTable;
     }
     return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-}
-
-fn failLuaCall(lua_state: *c.lua_State, err: []const u8) anyerror {
-    var len: usize = 0;
-    const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-    if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s}: {s}", .{ err, message[0..len] });
-    pop(lua_state, 1);
-    return error.LuaCallbackFailed;
 }
 
 fn tryZTemp(value: []const u8) [:0]const u8 {

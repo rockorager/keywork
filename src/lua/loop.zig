@@ -3,6 +3,7 @@
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_handle = @import("handle.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -405,32 +406,11 @@ fn luaFsEventCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn pop(lua_state: *c.lua_State, count: c_int) void {
-    c.lua_settop(lua_state, -count - 1);
-}
-
-fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
-    if (index > 0 or index <= c.LUA_REGISTRYINDEX) return index;
-    return c.lua_gettop(lua_state) + index + 1;
-}
-
-fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
-    return ptr[0..len];
-}
-
-fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    return try stringFromStack(lua_state, -1);
-}
-
-fn boolField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) bool {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    return c.lua_toboolean(lua_state, -1) != 0;
-}
+const pop = lua_value.pop;
+const absoluteIndex = lua_value.absoluteIndex;
+const stringFromStack = lua_value.stringFromStack;
+const stringField = lua_value.stringField;
+const boolField = lua_value.boolField;
 
 fn optionalSecondsField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?f64 {
     c.lua_getfield(lua_state, table, key);

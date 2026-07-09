@@ -755,8 +755,8 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
-        .stdout_pipe = std.mem.eql(u8, lua_process.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
-        .stderr_pipe = std.mem.eql(u8, lua_process.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
+        .stdout_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
+        .stderr_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
     };
     // A missing executable or exhausted system resources are expected
     // runtime failures, so spawn reports nil, err instead of raising.

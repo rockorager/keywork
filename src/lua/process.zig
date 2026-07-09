@@ -3,6 +3,7 @@
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_handle = @import("handle.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -329,14 +330,6 @@ pub fn pushHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
     process.handle_ref = lua_handle.create(lua_state, process_type, &process_methods, process);
 }
 
-pub fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
-    c.lua_getfield(lua_state, table, key);
-    defer pop(lua_state, 1);
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, -1, &len) orelse return error.ExpectedLuaString;
-    return ptr[0..len];
-}
-
 fn pipeCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     const pipe: *Pipe = @ptrCast(@alignCast(ctx));
     try drainPipe(pipe);
@@ -546,29 +539,8 @@ fn linuxVoid(result: usize) !void {
     };
 }
 
-fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
-    if (index > 0 or index <= c.LUA_REGISTRYINDEX) return index;
-    return c.lua_gettop(lua_state) + index + 1;
-}
-
-fn expectType(lua_state: *c.lua_State, index: c_int, expected: c_int) !void {
-    if (c.lua_type(lua_state, index) != expected) return error.UnexpectedLuaType;
-}
-
-fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(lua_state, index, &len) orelse return error.ExpectedLuaString;
-    return try allocator.dupe(u8, ptr[0..len]);
-}
-
-fn pop(lua_state: *c.lua_State, count: c_int) void {
-    c.lua_settop(lua_state, -count - 1);
-}
-
-fn failLuaCall(lua_state: *c.lua_State, err: []const u8) anyerror {
-    var len: usize = 0;
-    const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-    if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s}: {s}", .{ err, message[0..len] });
-    pop(lua_state, 1);
-    return error.LuaCallbackFailed;
-}
+const absoluteIndex = lua_value.absoluteIndex;
+const expectType = lua_value.expectType;
+const dupeStringFromStack = lua_value.dupeStringFromStack;
+const pop = lua_value.pop;
+const failLuaCall = lua_value.failLuaCall;
