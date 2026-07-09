@@ -321,7 +321,17 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
                 };
             }
         },
-        .global_remove => {},
+        .global_remove => |remove| {
+            // Outputs are the only globals we track by name; an unplugged
+            // monitor must not linger in the list. Surfaces on it receive
+            // their own closed/configure events from the compositor.
+            for (self.outputs.items, 0..) |output_ref, index| {
+                if (output_ref.global_name != remove.name) continue;
+                output_ref.output.release();
+                _ = self.outputs.orderedRemove(index);
+                break;
+            }
+        },
     }
 }
 
