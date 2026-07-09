@@ -24,6 +24,7 @@ pub const Client = struct {
     connection: *c.DBusConnection,
     fd: i32,
     color_scheme: ColorScheme = .no_preference,
+    pending_read: ?*c.DBusPendingCall = null,
     filter_installed: bool = false,
     change_context: ?*anyopaque = null,
     change_handler: ?ChangeHandler = null,
@@ -43,11 +44,16 @@ pub const Client = struct {
         if (c.dbus_connection_get_unix_fd(connection, &fd) == 0 or fd < 0) return error.DBusUnavailable;
 
         var self: Client = .{ .connection = connection, .fd = @intCast(fd) };
-        self.readPortalColorScheme();
+        self.sendColorSchemeRead();
         return self;
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.pending_read) |pending| {
+            c.dbus_pending_call_cancel(pending);
+            c.dbus_pending_call_unref(pending);
+            self.pending_read = null;
+        }
         if (self.filter_installed) c.dbus_connection_remove_filter(self.connection, dbusFilter, self);
         c.dbus_connection_close(self.connection);
         c.dbus_connection_unref(self.connection);
@@ -79,7 +85,10 @@ pub const Client = struct {
         while (c.dbus_connection_dispatch(self.connection) == c.DBUS_DISPATCH_DATA_REMAINS) {}
     }
 
-    fn readPortalColorScheme(self: *Client) void {
+    /// Send the portal color-scheme query without waiting for the reply,
+    /// so the round trip through the session bus overlaps the caller's
+    /// window setup. finishColorSchemeRead collects the result.
+    fn sendColorSchemeRead(self: *Client) void {
         const message = c.dbus_message_new_method_call(
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
@@ -95,8 +104,27 @@ pub const Client = struct {
         var key: [*:0]const u8 = "color-scheme";
         dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &key) catch return;
 
-        const reply = c.dbus_connection_send_with_reply_and_block(self.connection, message, 1000, null) orelse return;
+        var pending: ?*c.DBusPendingCall = null;
+        if (c.dbus_connection_send_with_reply(self.connection, message, &pending, 1000) == 0) return;
+        self.pending_read = pending;
+        // Push the request onto the wire now; the reply lands while the
+        // caller does other setup.
+        _ = c.dbus_connection_flush(self.connection);
+    }
+
+    /// Collect the reply to the initial color-scheme query, blocking only
+    /// for whatever remains of the request latency. Call after the send
+    /// has been overlapped with other setup; a no-op if the query was
+    /// never sent or already finished.
+    pub fn finishColorSchemeRead(self: *Client) void {
+        const pending = self.pending_read orelse return;
+        self.pending_read = null;
+        defer c.dbus_pending_call_unref(pending);
+
+        c.dbus_pending_call_block(pending);
+        const reply = c.dbus_pending_call_steal_reply(pending) orelse return;
         defer c.dbus_message_unref(reply);
+        if (c.dbus_message_get_type(reply) != c.DBUS_MESSAGE_TYPE_METHOD_RETURN) return;
 
         var reply_iter: c.DBusMessageIter = undefined;
         if (c.dbus_message_iter_init(reply, &reply_iter) == 0) return;

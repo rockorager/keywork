@@ -118,6 +118,14 @@ fn runWayland(
     options: Options,
     comptime Backend: type,
 ) !void {
+    // Send the portal color-scheme query before window setup so the dbus
+    // round trip completes while the compositor configures the surface.
+    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
+        log.warn("desktop settings unavailable: {}", .{err});
+        break :blk null;
+    };
+    defer if (settings_client) |*settings| settings.deinit();
+
     var initial_constraints = constraints;
     const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator, .{
@@ -131,11 +139,7 @@ fn runWayland(
     const configured_size = try backend.waitForInitialConfigure();
     initial_constraints = .{ .max_width = configured_size.width, .max_height = configured_size.height };
 
-    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
-        log.warn("desktop settings unavailable: {}", .{err});
-        break :blk null;
-    };
-    defer if (settings_client) |*settings| settings.deinit();
+    if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     var runtime = try runtime_mod.Runtime.init(
@@ -369,6 +373,14 @@ fn runWaylandAllOutputs(
     constraints: keywork.Constraints,
     options: Options,
 ) !void {
+    // Send the portal color-scheme query before window setup so the dbus
+    // round trip completes while the compositor configures the surfaces.
+    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
+        log.warn("desktop settings unavailable: {}", .{err});
+        break :blk null;
+    };
+    defer if (settings_client) |*settings| settings.deinit();
+
     const backend_width = if (options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try wayland_shm.Backend.create(allocator, .{
         .title = options.title,
@@ -385,11 +397,7 @@ fn runWaylandAllOutputs(
     defer allocator.free(output_backends);
     for (output_backends, 0..) |*output_backend, index| output_backend.* = backend.renderBackendForOutput(index);
 
-    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
-        log.warn("desktop settings unavailable: {}", .{err});
-        break :blk null;
-    };
-    defer if (settings_client) |*settings| settings.deinit();
+    if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     const first_size = backend.outputSize(0);
