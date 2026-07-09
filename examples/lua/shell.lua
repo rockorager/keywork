@@ -78,7 +78,7 @@ local Bar = kw.stateful({
         spacing = 12,
         align = "center",
         children = {
-          -- [launcher] becomes a clickable that toggles the launcher
+          -- [launcher] becomes a gesture that toggles the launcher
           -- window in app state.
           kw.text("keywork", { color = colors.muted }),
           kw.spacer(),

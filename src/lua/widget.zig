@@ -564,15 +564,6 @@ pub fn parse(
             .vertical_align = options.verticalAlign(),
         } };
     }
-    if (std.mem.eql(u8, kind, "clickable")) {
-        const id = try dupeStringField(lua_state, allocator, table, "id");
-        const child = try allocator.create(keywork.Widget);
-        c.lua_getfield(lua_state, table, "child");
-        defer pop(lua_state, 1);
-        child.* = try parse(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
-        const on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_click");
-        return .{ .clickable = .{ .id = id, .child = child, .on_click = on_click, .activation = getActivationField(lua_state, table) } };
-    }
     if (std.mem.eql(u8, kind, "gesture")) {
         const options = try lua_codec.decode(GestureOptions, lua_state, table, allocator);
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -878,15 +869,6 @@ fn setStateProps(lua_state: *c.lua_State, state_table: c_int, props_ref: c_int) 
 }
 
 const failLuaCall = lua_value.failLuaCall;
-
-fn getActivationField(lua_state: *c.lua_State, table: c_int) keywork.Widget.ClickActivation {
-    c.lua_getfield(lua_state, table, "activation");
-    defer pop(lua_state, 1);
-    if (c.lua_isnil(lua_state, -1)) return .release;
-    const value = stringFromStack(lua_state, -1) catch return .release;
-    if (std.mem.eql(u8, value, "press")) return .press;
-    return .release;
-}
 
 fn getOptionalIntentField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, key: [*:0]const u8) !?keywork.Intent {
     c.lua_getfield(lua_state, table, key);
