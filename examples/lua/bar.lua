@@ -556,7 +556,7 @@ local function create_tray_host(on_change)
   local name_ok, name = pcall(function()
     return bus:request_name(SNI_WATCHER, { replace_existing = true, do_not_queue = true })
   end)
-  if not name_ok then
+  if not name_ok or not name then
     log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
     bus:close()
     return nil

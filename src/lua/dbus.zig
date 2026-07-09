@@ -849,9 +849,14 @@ fn luaDbusSystem(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    // A missing session or system bus is an expected runtime condition, so
+    // connection failure reports nil, err instead of raising.
     const bus = host.addBus(kind) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
-        return c.luaL_error(lua_state, "dbus bus failed");
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
     };
     bus.handle_ref = lua_handle.create(lua_state, bus_type, &bus_methods, bus);
     return 1;
@@ -875,9 +880,17 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
+    // Sending on a disconnected bus is an expected runtime condition and
+    // reports nil, err; bad options and allocation failures still raise.
+    // Method-call errors from the peer arrive asynchronously as
+    // (nil, error_name) in the callback.
     bus.call(lua_state, 2, 3) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus call failed: {}", .{err});
-        return c.luaL_error(lua_state, "dbus call failed");
+        if (err != error.DBusCallFailed) return c.luaL_error(lua_state, "dbus call failed");
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
     };
     return 0;
 }
@@ -885,9 +898,16 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    _ = c.luaL_checklstring(lua_state, 2, null);
+    // Losing the race for a bus name is an expected runtime condition, so
+    // an unavailable name reports nil, err instead of raising.
     const owned = bus.requestName(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus request_name failed: {}", .{err});
-        return c.luaL_error(lua_state, "dbus request_name failed");
+        if (err != error.DBusNameUnavailable) return c.luaL_error(lua_state, "dbus request_name failed");
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
     };
     owned.handle_ref = lua_handle.create(lua_state, owned_name_type, &owned_name_methods, owned);
     return 1;

@@ -308,12 +308,17 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const host = hostFromLua(lua_state);
     const path = fsEventPath(lua_state, 1) catch return c.luaL_error(lua_state, "fs_event requires a path");
     c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
+    // Watching a not-yet-existing path is an expected runtime failure, so it
+    // reports nil, err instead of raising.
 
     c.lua_pushvalue(lua_state, 2);
     const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
     const fs_event = host.addFsEvent(path, ref) catch |err| {
         std.log.scoped(.keywork_luajit).warn("loop.fs_event failed: {}", .{err});
-        return c.luaL_error(lua_state, "loop.fs_event failed");
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
     };
     pushFsEventHandle(lua_state, fs_event);
     return 1;

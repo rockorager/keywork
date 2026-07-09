@@ -758,10 +758,15 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         .stdout_pipe = std.mem.eql(u8, lua_process.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
         .stderr_pipe = std.mem.eql(u8, lua_process.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
     };
+    // A missing executable or exhausted system resources are expected
+    // runtime failures, so spawn reports nil, err instead of raising.
     const process = app.addProcess(spec, &callbacks) catch |err| {
         callbacks.unref(lua_state);
         std.log.scoped(.keywork_luajit).warn("process.spawn failed: {}", .{err});
-        return c.luaL_error(lua_state, "process.spawn failed");
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
     };
     lua_process.pushHandle(lua_state, process);
     return 1;
@@ -1477,6 +1482,73 @@ test "lua process spawn captures stdout and exit" {
     c.lua_getglobal(app.state, "spawn_cancel");
     try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+}
+
+test "lua process spawn reports a missing executable as nil, err" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local process = require("keywork.process")
+        \\spawn_result, spawn_err = process.spawn({
+        \\  argv = { "keywork-test-no-such-binary" },
+        \\}, {})
+        \\return kw.app({ child = kw.text("spawn") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spawn-missing.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "spawn-missing.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "spawn_result");
+    try std.testing.expectEqual(c.LUA_TNIL, c.lua_type(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "spawn_err");
+    try std.testing.expectEqual(c.LUA_TSTRING, c.lua_type(app.state, -1));
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 0), app.processes.items.len);
+}
+
+test "lua fs_event reports a missing path as nil, err" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\watch_result, watch_err = loop.fs_event("/nonexistent/keywork/test/path", function() end)
+        \\return kw.app({ child = kw.text("fs_event") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event-missing.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event-missing.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    // Registration is deferred until an event loop is bound, so bind first
+    // to make the inotify failure surface synchronously during script load.
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "watch_result");
+    try std.testing.expectEqual(c.LUA_TNIL, c.lua_type(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "watch_err");
+    try std.testing.expectEqual(c.LUA_TSTRING, c.lua_type(app.state, -1));
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 0), app.fs_events.items.len);
 }
 
 test "lua process survives failed event loop bind" {
