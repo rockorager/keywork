@@ -189,6 +189,24 @@ pub const EventLoop = struct {
         return .{ .index = index, .generation = slot.generation };
     }
 
+    /// Changes the epoll event mask of a registered source in place, so
+    /// callers can toggle interests (e.g. write readiness) without churning
+    /// slots and generations. Stale handles are ignored.
+    pub fn modifySource(self: *EventLoop, handle: SourceHandle, events: u32) void {
+        if (handle.index >= self.sources.items.len) return;
+        const slot = &self.sources.items[handle.index];
+        if (slot.generation != handle.generation) return;
+        if (slot.source) |*source| {
+            if (source.events == events) return;
+            source.events = events;
+            var event: linux.epoll_event = .{
+                .events = events,
+                .data = .{ .u64 = sourceToken(handle.index, slot.generation) },
+            };
+            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, source.fd, &event);
+        }
+    }
+
     pub fn removeSource(self: *EventLoop, handle: SourceHandle) void {
         if (handle.index >= self.sources.items.len) return;
         const slot = &self.sources.items[handle.index];

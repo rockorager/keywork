@@ -9,6 +9,7 @@ const lua_config = @import("config.zig");
 const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
 const lua_loop = @import("loop.zig");
+const lua_socket = @import("socket.zig");
 const lua_value = @import("value.zig");
 const lua_widget = @import("widget.zig");
 const runtime_mod = @import("../ui/runtime.zig");
@@ -20,6 +21,7 @@ const BuildScope = keywork.BuildScope;
 
 const invalid_fd: i32 = -1;
 const LuaProcess = lua_process.LuaProcess;
+const LuaSocket = lua_socket.LuaSocket;
 const DbusBus = lua_dbus.Bus;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
@@ -47,9 +49,11 @@ pub const App = struct {
     fs_events: std.ArrayList(*FsEvent) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
+    sockets: std.ArrayList(*LuaSocket) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
     dbus_host: lua_dbus.Host = undefined,
     loop_host: lua_loop.Host = undefined,
+    socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
     runtime: ?*runtime_mod.Runtime = null,
     script_watch: ?*event_loop.EventLoop.FileWatch = null,
@@ -90,6 +94,8 @@ pub const App = struct {
         self.timers.deinit(self.allocator);
         for (self.processes.items) |process| process.destroy(self.allocator, self.state);
         self.processes.deinit(self.allocator);
+        for (self.sockets.items) |socket| socket.destroy(self.allocator, self.state);
+        self.sockets.deinit(self.allocator);
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
@@ -120,6 +126,7 @@ pub const App = struct {
         };
         for (self.timers.items) |timer| try timer.register();
         for (self.processes.items) |process| try self.registerProcess(process);
+        for (self.sockets.items) |socket| try socket.register();
         for (self.dbus_buses.items) |bus| try bus.register();
         if (self.runtime != null) try self.startLifecycle();
         if (self.quit_requested) {
@@ -146,6 +153,7 @@ pub const App = struct {
         for (self.fs_events.items) |fs_event| fs_event.unregister(loop);
         for (self.timers.items) |timer| timer.unregister(loop);
         for (self.processes.items) |process| process.unregister(loop);
+        for (self.sockets.items) |socket| socket.unregister(loop);
         for (self.dbus_buses.items) |bus| bus.unregister();
         self.event_loop = null;
     }
@@ -166,6 +174,7 @@ pub const App = struct {
         for (self.fs_events.items) |fs_event| if (!fs_event.canceled) return true;
         for (self.timers.items) |timer| if (!timer.canceled and !timer.expired) return true;
         for (self.processes.items) |process| if (!process.canceled and !process.exited) return true;
+        for (self.sockets.items) |socket| if (!socket.canceled and socket.fd != invalid_fd) return true;
         for (self.dbus_buses.items) |bus| if (!bus.closed) return true;
         return false;
     }
@@ -271,6 +280,7 @@ pub const App = struct {
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state, .silent);
         for (self.processes.items) |process| process.cancel(self.state, .silent);
+        for (self.sockets.items) |socket| socket.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
     }
 
@@ -402,6 +412,22 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &loop_host_vtable };
     }
 
+    /// Takes ownership of `fd`: on failure the caller must close it.
+    fn addSocket(self: *App, fd: i32) !*LuaSocket {
+        const socket = try self.allocator.create(LuaSocket);
+        errdefer self.allocator.destroy(socket);
+        socket.* = .{ .host = self.socketHost(), .fd = fd };
+
+        try self.sockets.append(self.allocator, socket);
+        errdefer _ = self.sockets.pop();
+        try socket.register();
+        return socket;
+    }
+
+    fn socketHost(self: *App) lua_socket.Host {
+        return .{ .ptr = self, .vtable = &socket_host_vtable };
+    }
+
     fn addDbusBus(self: *App, kind: lua_dbus.Kind) !*DbusBus {
         const bus = try DbusBus.create(self.dbusHost(), kind);
         errdefer bus.destroy(self.allocator, self.state);
@@ -481,6 +507,33 @@ fn loopHostAddFsEvent(ptr: *anyopaque, path: []const u8) anyerror!*FsEvent {
 fn loopHostAddTimer(ptr: *anyopaque, delay_ms: u64, interval_ms: u64, ref: c_int) anyerror!*LuaTimer {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addTimerWithDelay(delay_ms, interval_ms, ref);
+}
+
+const socket_host_vtable: lua_socket.Host.VTable = .{
+    .allocator = socketHostAllocator,
+    .luaState = socketHostLuaState,
+    .eventLoop = socketHostEventLoop,
+    .addSocket = socketHostAddSocket,
+};
+
+fn socketHostAllocator(ptr: *anyopaque) std.mem.Allocator {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.allocator;
+}
+
+fn socketHostLuaState(ptr: *anyopaque) *c.lua_State {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.state;
+}
+
+fn socketHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.event_loop;
+}
+
+fn socketHostAddSocket(ptr: *anyopaque, fd: i32) anyerror!*LuaSocket {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addSocket(fd);
 }
 
 const dbus_host_vtable: lua_dbus.Host.VTable = .{
@@ -601,6 +654,8 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const loop_table = c.lua_gettop(lua_state);
     app.loop_host = app.loopHost();
     lua_loop.installResourceApis(lua_state, loop_table, &app.loop_host);
+    app.socket_host = app.socketHost();
+    lua_socket.installApi(lua_state, loop_table, &app.socket_host);
     return 1;
 }
 
@@ -2253,4 +2308,282 @@ test "lua process output produced before bind is queued for readers" {
     defer pop(app.state, 1);
     const value = try stringFromStack(app.state, -1);
     try std.testing.expectEqualStrings("hello", value);
+}
+
+fn testUnixListener(path: []const u8) !i32 {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    if (path.len >= address.path.len) return error.PathTooLong;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(socket_result);
+    errdefer _ = linux.close(fd);
+    const address_len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), address_len)) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.ListenFailed;
+    return fd;
+}
+
+fn testAccept(listener: i32) !i32 {
+    const result = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
+    if (linux.errno(result) != .SUCCESS) return error.AcceptFailed;
+    return @intCast(result);
+}
+
+test "lua loop.connect reports a missing socket path as nil, err" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\sock_result, sock_err = loop.connect("/nonexistent/keywork/test.sock")
+        \\return kw.app({ child = kw.text("connect") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "connect-missing.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "connect-missing.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "sock_result");
+    try std.testing.expectEqual(c.LUA_TNIL, c.lua_type(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "sock_err");
+    try std.testing.expectEqualStrings("FileNotFound", try stringFromStack(app.state, -1));
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 0), app.sockets.items.len);
+}
+
+test "lua socket streams chunks and finishes on peer EOF" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const socket_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "ipc.sock" });
+    defer allocator.free(socket_path);
+    const listener = try testUnixListener(socket_path);
+    defer _ = linux.close(listener);
+
+    // The script connects and writes synchronously from the main state (a
+    // small write never parks), then a coroutine reads until peer EOF ends
+    // the stream.
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\sock = assert(loop.connect("{s}"))
+        \\assert(sock:write("ping"))
+        \\received = ""
+        \\done = false
+        \\loop.spawn(function()
+        \\  for chunk in sock:chunks() do
+        \\    received = received .. chunk
+        \\  end
+        \\  closed_after = sock:closed()
+        \\  done = true
+        \\end)
+        \\return kw.app({{ child = kw.text("socket") }})
+        \\
+    , .{socket_path});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-stream.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-stream.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.sockets.items.len);
+
+    // The connection is already pending, and "ping" is already in flight.
+    const conn = try testAccept(listener);
+    var request: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), linux.read(conn, &request, request.len));
+    try std.testing.expectEqualStrings("ping", &request);
+    try std.testing.expectEqual(@as(usize, 4), linux.write(conn, "pong", 4));
+    _ = linux.close(conn);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const SocketTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: SocketTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, SocketTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "done");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "received");
+    try std.testing.expectEqualStrings("pong", try stringFromStack(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "closed_after");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    // EOF closed the socket without canceling it; it no longer counts as
+    // live async work.
+    try std.testing.expect(!app.sockets.items[0].canceled);
+    try std.testing.expectEqual(invalid_fd, app.sockets.items[0].fd);
+    try std.testing.expect(!app.hasLiveAsyncResources());
+}
+
+test "lua socket close resumes a parked reader and ends iteration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const socket_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "ipc.sock" });
+    defer allocator.free(socket_path);
+    const listener = try testUnixListener(socket_path);
+    defer _ = linux.close(listener);
+
+    // No event loop is bound, so the socket never registers and the reader
+    // parks until close resumes it with no value, all synchronously.
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local sock = assert(loop.connect("{s}"))
+        \\stream_ended = false
+        \\local reader = loop.spawn(function()
+        \\  for _ in sock:chunks() do end
+        \\  stream_ended = true
+        \\end)
+        \\assert(coroutine.status(reader) == "suspended")
+        \\sock:close()
+        \\assert(stream_ended)
+        \\assert(coroutine.status(reader) == "dead")
+        \\assert(sock:closed())
+        \\-- Writing to a dead handle reports nil, err.
+        \\local ok, err = sock:write("late")
+        \\assert(ok == nil and err == "closed")
+        \\-- next() on a dead handle ends iteration instead of parking.
+        \\loop.spawn(function()
+        \\  assert(sock:next() == nil)
+        \\  dead_next_ok = true
+        \\end)
+        \\assert(dead_next_ok)
+        \\return kw.app({{ child = kw.text("socket-close") }})
+        \\
+    , .{socket_path});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-close.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-close.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.sockets.items.len);
+    try std.testing.expect(app.sockets.items[0].canceled);
+}
+
+test "lua socket write parks under backpressure and resumes when flushed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const socket_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "ipc.sock" });
+    defer allocator.free(socket_path);
+    const listener = try testUnixListener(socket_path);
+    defer _ = linux.close(listener);
+
+    // 4 MiB exceeds the kernel socket buffer, so the coroutine writer must
+    // park; a partial write on the main state must raise instead.
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local big = string.rep("x", 4 * 1024 * 1024)
+        \\total = #big
+        \\sock = assert(loop.connect("{s}"))
+        \\write_ok = false
+        \\wrote = false
+        \\loop.spawn(function()
+        \\  write_ok = sock:write(big)
+        \\  wrote = true
+        \\end)
+        \\local sock2 = assert(loop.connect("{s}"))
+        \\local ok, err = pcall(sock2.write, sock2, big)
+        \\main_write_raised = not ok and err:find("coroutine", 1, true) ~= nil
+        \\sock2:close()
+        \\return kw.app({{ child = kw.text("socket-write") }})
+        \\
+    , .{ socket_path, socket_path });
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-write.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-write.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    // The writer parked with unflushed bytes buffered.
+    c.lua_getglobal(app.state, "wrote");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) == 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "main_write_raised");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 2), app.sockets.items.len);
+    try std.testing.expect(app.sockets.items[0].write_buffer.items.len > 0);
+
+    const conn = try testAccept(listener);
+    defer _ = linux.close(conn);
+    const flags = linux.fcntl(conn, linux.F.GETFL, 0);
+    _ = linux.fcntl(conn, linux.F.SETFL, flags | linux.SOCK.NONBLOCK);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const WriteTest = struct {
+        app: *App,
+        conn: i32,
+        drained: usize = 0,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            var buffer: [65536]u8 = undefined;
+            while (true) {
+                const result = linux.read(self.conn, &buffer, buffer.len);
+                if (linux.errno(result) != .SUCCESS or result == 0) break;
+                self.drained += result;
+            }
+            c.lua_getglobal(self.app.state, "wrote");
+            const wrote = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if ((wrote and self.drained >= 4 * 1024 * 1024) or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: WriteTest = .{ .app = &app, .conn = conn };
+    try loop.addRepeatingTimer(1, &context, WriteTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "write_ok");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), context.drained);
+    try std.testing.expectEqual(@as(usize, 0), app.sockets.items[0].write_buffer.items.len);
 }
