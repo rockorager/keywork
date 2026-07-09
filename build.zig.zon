@@ -36,10 +36,6 @@
             .url = "https://github.com/LuaJIT/LuaJIT/archive/acb223497d84c65139a7eaaac395b42f112249ac.tar.gz",
             .hash = "N-V-__8AACf1QgAgaRdqNy2Hj7p6JdoTh2teD6EX4Kvi24BC",
         },
-        .phosphor = .{
-            .url = "https://github.com/phosphor-icons/core/archive/2b75f3ad12b420c9504ef05df8d2564a28f8500e.tar.gz",
-            .hash = "N-V-__8AAAs5rgBPpaLsBuZqGQeigaAsfc4PMQII4PxfDL7d",
-        },
     },
     .paths = .{
         "build.zig",
