@@ -51,19 +51,70 @@ local Clock = kw.stateful({
     self.time = os.date("%a %b %d  %I:%M %p")
   end,
 
+  build_menu = function(self)
+    local function item(label)
+      return kw.gesture({
+        id = "menu-" .. label,
+        hover_background = 0xff2a2c31,
+        on_tap = function()
+          self:set_state(function(state)
+            state.menu_open = false
+          end)
+        end,
+        child = kw.padding({
+          x = 12,
+          y = 6,
+          child = kw.text(label, { color = colors.text }),
+        }),
+      })
+    end
+    return kw.container({
+      background = colors.background,
+      radius = 6,
+      padding = 4,
+      child = kw.column({
+        children = {
+          kw.padding({
+            x = 12,
+            y = 6,
+            child = kw.text(os.date("%A, %B %d %Y"), { color = colors.muted }),
+          }),
+          item("Calendar"),
+          item("Clock settings"),
+        },
+      }),
+    })
+  end,
+
   build = function(self)
-    -- [popups] This gesture becomes a kw.anchored host: clicking
-    -- toggles state.menu_open and the calendar hangs off this cell.
-    -- Until then, toggling just accents the clock.
-    return kw.gesture({
+    -- [popups] Clicking the clock toggles menu_open; the popup's
+    -- existence follows that state, so the compositor dismissing it
+    -- (on_close) and tapping an item both just clear the flag.
+    return kw.anchored({
       id = "clock",
-      on_tap = function()
-        self:set_state(function(state)
-          state.menu_open = not state.menu_open
-        end)
-      end,
-      child = kw.text(self.time, {
-        color = self.menu_open and colors.accent or colors.text,
+      popup = self.menu_open and kw.popup({
+        edge = "bottom",
+        alignment = "end",
+        gap = 4,
+        content = function()
+          return self:build_menu()
+        end,
+        on_close = function()
+          self:set_state(function(state)
+            state.menu_open = false
+          end)
+        end,
+      }) or nil,
+      child = kw.gesture({
+        id = "clock-tap",
+        on_tap = function()
+          self:set_state(function(state)
+            state.menu_open = not state.menu_open
+          end)
+        end,
+        child = kw.text(self.time, {
+          color = self.menu_open and colors.accent or colors.text,
+        }),
       }),
     })
   end,
@@ -100,7 +151,8 @@ return kw.app({
     layer = "top",
     anchor = { "top", "left", "right" },
     exclusive_zone = 32,
-    output = "all",
+    -- [windows] output = "all" returns once declarative windows land;
+    -- the single-runtime multi-output path has no popup support.
   },
   child = Bar({ key = "bar" }),
 })
