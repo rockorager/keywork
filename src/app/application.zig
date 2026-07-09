@@ -35,8 +35,9 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
     const window = self.lua.window_config;
 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;
+    // Apps declaring a window set need a windowing backend by default.
     const backend = run_options.backend orelse window.backend orelse
-        if (layer_shell != null) app_options.BackendKind.wayland_shm else .log;
+        if (layer_shell != null or window.has_windows) app_options.BackendKind.wayland_shm else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
 
@@ -53,7 +54,9 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .layer_shell = layer_shell,
         .log_writer = &stdout_writer.interface,
         .runtime_context = &self.lua,
+        .windows_host = self.lua.windowsHost(),
         .bind_runtime = bindLuaRuntime,
+        .bind_invalidator = bindLuaInvalidator,
         .unbind_runtime = unbindLuaRuntime,
         .bind_event_loop = bindLuaEventLoop,
         .unbind_event_loop = unbindLuaEventLoop,
@@ -64,6 +67,11 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
 fn bindLuaRuntime(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
     const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
     lua.bindRuntime(runtime);
+}
+
+fn bindLuaInvalidator(ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void {
+    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
+    lua.bindInvalidator(invalidator);
 }
 
 fn unbindLuaRuntime(ctx: *anyopaque) void {

@@ -1122,16 +1122,26 @@ local App = kw.stateful({
   end,
 })
 
+-- One bar per output, diffed by id as outputs come and go.
 return kw.app({
   app_id = "dev.keywork.Bar",
   backend = "cpu",
-  width = 0, -- stretch to the anchored edges
-  height = 32,
-  layer_shell = {
-    layer = "top",
-    anchor = { "top", "left", "right" },
-    exclusive_zone = 32,
-    output = "all",
-  },
-  child = App({ key = "app" }),
+  windows = function(ctx)
+    local windows = {}
+    for _, output in ipairs(ctx.outputs) do
+      windows[#windows + 1] = kw.window({
+        id = "bar:" .. output.name,
+        output = output.name,
+        width = 0, -- stretch to the anchored edges
+        height = 32,
+        layer_shell = {
+          layer = "top",
+          anchor = { "top", "left", "right" },
+          exclusive_zone = 32,
+        },
+        child = App({ key = "app" }),
+      })
+    end
+    return windows
+  end,
 })

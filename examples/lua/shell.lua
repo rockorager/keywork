@@ -2,12 +2,12 @@ local kw = require("keywork")
 local loop = require("keywork.loop")
 
 -- Seed of the keywork-shell example: a bar that grows into a full
--- desktop shell (bar + menus + launcher) as multi-window support lands.
+-- desktop shell (bar + menus + launcher).
 --
--- Roadmap markers below track the declarative window design:
---   [windows]  the app returns kw.window nodes keyed by id, one per
---              output, replacing the layer_shell output="all" option
---   [popups]   the clock opens a calendar via kw.anchored/kw.popup
+--   [windows]  the app's windows(ctx) function returns kw.window nodes
+--              keyed by id, one bar per output; outputs hotplug just
+--              rebuilds the window set
+--   [popups]   the clock opens a menu via kw.anchored/kw.popup
 --   [launcher] a launcher window toggled by state, not a process
 --
 -- Run with:
@@ -140,19 +140,28 @@ local Bar = kw.stateful({
   end,
 })
 
--- [windows] This app table becomes a build function returning one
--- kw.window per entry in the outputs list of the app build context.
+-- [windows] One bar per output, each its own window with its own
+-- runtime and popups. Plugging or unplugging a monitor re-runs this
+-- function and the window set is diffed by id.
 return kw.app({
   app_id = "dev.keywork.Shell",
   backend = "cpu",
-  width = 0, -- stretch to the anchored edges
-  height = 32,
-  layer_shell = {
-    layer = "top",
-    anchor = { "top", "left", "right" },
-    exclusive_zone = 32,
-    -- [windows] output = "all" returns once declarative windows land;
-    -- the single-runtime multi-output path has no popup support.
-  },
-  child = Bar({ key = "bar" }),
+  windows = function(ctx)
+    local windows = {}
+    for _, output in ipairs(ctx.outputs) do
+      windows[#windows + 1] = kw.window({
+        id = "bar:" .. output.name,
+        output = output.name,
+        width = 0, -- stretch to the anchored edges
+        height = 32,
+        layer_shell = {
+          layer = "top",
+          anchor = { "top", "left", "right" },
+          exclusive_zone = 32,
+        },
+        child = Bar({ key = "bar" }),
+      })
+    end
+    return windows
+  end,
 })

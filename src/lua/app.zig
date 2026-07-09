@@ -1,6 +1,7 @@
 //! LuaJIT application host and native Keywork bindings.
 
 const std = @import("std");
+const app_windows = @import("../app/windows.zig");
 const keywork = @import("../ui.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const event_loop = @import("../linux/event_loop.zig");
@@ -56,7 +57,10 @@ pub const App = struct {
     loop_host: lua_loop.Host = undefined,
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
-    runtime: ?*runtime_mod.Runtime = null,
+    invalidator: ?runtime_mod.Invalidator = null,
+    /// Registry refs of the child widget tables from the last window-set
+    /// build, keyed by window id (keys owned by `allocator`).
+    window_children: std.StringHashMapUnmanaged(c_int) = .empty,
     script_watch: ?*event_loop.EventLoop.FileWatch = null,
     icon_cache: icon_theme.Cache,
 
@@ -99,6 +103,7 @@ pub const App = struct {
         self.sockets.deinit(self.allocator);
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
+        self.releaseWindowChildren(&self.window_children);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
@@ -129,7 +134,7 @@ pub const App = struct {
         for (self.processes.items) |process| try self.registerProcess(process);
         for (self.sockets.items) |socket| try socket.register();
         for (self.dbus_buses.items) |bus| try bus.register();
-        if (self.runtime != null) try self.startLifecycle();
+        if (self.invalidator != null) try self.startLifecycle();
         if (self.quit_requested) {
             self.quit_requested = false;
             loop.quit();
@@ -137,12 +142,16 @@ pub const App = struct {
     }
 
     pub fn bindRuntime(self: *App, runtime: *runtime_mod.Runtime) void {
-        self.runtime = runtime;
+        self.invalidator = .fromRuntime(runtime);
+    }
+
+    pub fn bindInvalidator(self: *App, invalidator: runtime_mod.Invalidator) void {
+        self.invalidator = invalidator;
     }
 
     pub fn unbindRuntime(self: *App) void {
         self.stopLifecycleLog();
-        self.runtime = null;
+        self.invalidator = null;
     }
 
     pub fn unbindEventLoop(self: *App) void {
@@ -201,6 +210,185 @@ pub const App = struct {
         return widget;
     }
 
+    pub fn windowsHost(self: *App) app_windows.WindowsHost {
+        return .{ .ptr = self, .vtable = &windows_host_vtable };
+    }
+
+    const windows_host_vtable: app_windows.WindowsHost.VTable = .{
+        .build_windows = hostBuildWindows,
+        .build_window_widget = hostBuildWindowWidget,
+    };
+
+    fn hostBuildWindows(ptr: *anyopaque, allocator: std.mem.Allocator, context: app_windows.WindowsContext) anyerror![]app_windows.WindowDeclaration {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.buildWindowDecls(allocator, context);
+    }
+
+    fn hostBuildWindowWidget(ptr: *anyopaque, id: []const u8, scope: *BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.buildWindowWidget(id, scope, context);
+    }
+
+    /// Runs the script's windows function (or synthesizes a single main
+    /// window from the app child) and captures each window's child table
+    /// so per-window runtimes can build it later. Captures are staged and
+    /// swapped in only on success, so a failing build leaves the previous
+    /// window set's widget refs intact for live windows.
+    pub fn buildWindowDecls(self: *App, allocator: std.mem.Allocator, context: app_windows.WindowsContext) ![]app_windows.WindowDeclaration {
+        try self.ensureLoaded();
+        var staged: std.StringHashMapUnmanaged(c_int) = .empty;
+        errdefer self.releaseWindowChildren(&staged);
+
+        c.lua_settop(self.state, 0);
+        defer c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        const script = c.lua_gettop(self.state);
+
+        c.lua_getfield(self.state, script, "windows");
+        if (c.lua_isnil(self.state, -1)) {
+            // Single-window sugar: kw.app{ child = ... } declares one
+            // window inheriting all app-level options.
+            pop(self.state, 1);
+            c.lua_getfield(self.state, script, "child");
+            if (c.lua_isnil(self.state, -1)) return error.AppChildMissing;
+            try self.captureWindowChild(&staged, "main");
+            const decls = try allocator.alloc(app_windows.WindowDeclaration, 1);
+            decls[0] = .{ .id = "main" };
+            self.commitWindowChildren(&staged);
+            return decls;
+        }
+
+        pushWindowsContext(self.state, context);
+        if (c.lua_pcall(self.state, 1, 1, 0) != 0) return self.failWithLuaError(error.LuaCallbackFailed);
+        if (c.lua_type(self.state, -1) != c.LUA_TTABLE) return error.WindowsListInvalid;
+        const list = c.lua_gettop(self.state);
+
+        const count: usize = @intCast(c.lua_objlen(self.state, list));
+        var decls: std.ArrayList(app_windows.WindowDeclaration) = .empty;
+        errdefer decls.deinit(allocator);
+        var index: usize = 1;
+        while (index <= count) : (index += 1) {
+            c.lua_rawgeti(self.state, list, @intCast(index));
+            defer pop(self.state, 1);
+            const decl = try self.parseWindowDecl(allocator, &staged, c.lua_gettop(self.state));
+            try decls.append(allocator, decl);
+        }
+        self.commitWindowChildren(&staged);
+        return decls.toOwnedSlice(allocator);
+    }
+
+    fn parseWindowDecl(self: *App, allocator: std.mem.Allocator, staged: *std.StringHashMapUnmanaged(c_int), table: c_int) !app_windows.WindowDeclaration {
+        if (c.lua_type(self.state, table) != c.LUA_TTABLE) return error.WindowDeclInvalid;
+
+        c.lua_getfield(self.state, table, "id");
+        if (c.lua_type(self.state, -1) != c.LUA_TSTRING) {
+            pop(self.state, 1);
+            return error.WindowIdMissing;
+        }
+        const id = try allocator.dupe(u8, stringFromStack(self.state, -1) catch unreachable);
+        pop(self.state, 1);
+
+        var decl: app_windows.WindowDeclaration = .{ .id = id };
+
+        c.lua_getfield(self.state, table, "title");
+        if (c.lua_type(self.state, -1) == c.LUA_TSTRING) {
+            decl.title = try allocator.dupeZ(u8, stringFromStack(self.state, -1) catch unreachable);
+        }
+        pop(self.state, 1);
+
+        c.lua_getfield(self.state, table, "width");
+        if (c.lua_isnumber(self.state, -1) != 0) decl.width = @floatCast(c.lua_tonumber(self.state, -1));
+        pop(self.state, 1);
+        c.lua_getfield(self.state, table, "height");
+        if (c.lua_isnumber(self.state, -1) != 0) decl.height = @floatCast(c.lua_tonumber(self.state, -1));
+        pop(self.state, 1);
+
+        c.lua_getfield(self.state, table, "output");
+        if (c.lua_type(self.state, -1) == c.LUA_TSTRING) {
+            decl.output = try allocator.dupe(u8, stringFromStack(self.state, -1) catch unreachable);
+        }
+        pop(self.state, 1);
+
+        c.lua_getfield(self.state, table, "layer_shell");
+        if (c.lua_type(self.state, -1) == c.LUA_TTABLE) {
+            decl.layer_shell = try lua_config.parseLayerShellTable(self.state, c.lua_gettop(self.state));
+        }
+        pop(self.state, 1);
+
+        c.lua_getfield(self.state, table, "child");
+        if (c.lua_isnil(self.state, -1)) return error.WindowChildMissing;
+        try self.captureWindowChild(staged, id);
+        return decl;
+    }
+
+    /// Takes the value on top of the stack as `id`'s child table and
+    /// stores a registry ref to it in `staged`. Pops the value.
+    fn captureWindowChild(self: *App, staged: *std.StringHashMapUnmanaged(c_int), id: []const u8) !void {
+        if (staged.contains(id)) {
+            pop(self.state, 1);
+            return error.DuplicateWindowId;
+        }
+        const ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+        const key = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(key);
+        try staged.putNoClobber(self.allocator, key, ref);
+    }
+
+    /// Replaces the live window-child refs with the staged set.
+    fn commitWindowChildren(self: *App, staged: *std.StringHashMapUnmanaged(c_int)) void {
+        self.releaseWindowChildren(&self.window_children);
+        self.window_children = staged.*;
+        staged.* = .empty;
+    }
+
+    fn pushWindowsContext(lua_state: *c.lua_State, context: app_windows.WindowsContext) void {
+        c.lua_createtable(lua_state, 0, 2);
+        const table = c.lua_gettop(lua_state);
+        c.lua_createtable(lua_state, @intCast(context.outputs.len), 0);
+        const outputs = c.lua_gettop(lua_state);
+        for (context.outputs, 1..) |output, index| {
+            c.lua_createtable(lua_state, 0, 4);
+            c.lua_pushlstring(lua_state, output.name.ptr, output.name.len);
+            c.lua_setfield(lua_state, -2, "name");
+            c.lua_pushnumber(lua_state, output.width);
+            c.lua_setfield(lua_state, -2, "width");
+            c.lua_pushnumber(lua_state, output.height);
+            c.lua_setfield(lua_state, -2, "height");
+            c.lua_pushnumber(lua_state, output.scale);
+            c.lua_setfield(lua_state, -2, "scale");
+            c.lua_rawseti(lua_state, outputs, @intCast(index));
+        }
+        c.lua_setfield(lua_state, table, "outputs");
+        c.lua_pushlstring(lua_state, context.color_scheme.ptr, context.color_scheme.len);
+        c.lua_setfield(lua_state, table, "color_scheme");
+    }
+
+    fn releaseWindowChildren(self: *App, map: *std.StringHashMapUnmanaged(c_int)) void {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        map.deinit(self.allocator);
+        map.* = .empty;
+    }
+
+    pub fn buildWindowWidget(self: *App, id: []const u8, scope: *BuildScope, context: keywork.AppContext) !keywork.Widget {
+        const ref = self.window_children.get(id) orelse return error.UnknownWindow;
+        const icon_scale: f32 = if (std.math.isFinite(scope.render_scale) and scope.render_scale > 0) scope.render_scale else 1;
+
+        c.lua_settop(self.state, 0);
+        defer c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, ref);
+        const widget = try lua_widget.parse(self.widgetHost(), self.state, scope.allocator, scope.allocator, context, .{
+            .icon_cache = &self.icon_cache,
+            .icon_scale = icon_scale,
+        }, -1);
+        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
+        return widget;
+    }
+
     fn reloadScript(self: *App) !void {
         self.stopLifecycleLog();
         self.cancelScriptResources();
@@ -236,7 +424,7 @@ pub const App = struct {
         self.script_dirty = false;
         committed = true;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
-        if (self.event_loop != null and self.runtime != null) try self.startLifecycle();
+        if (self.event_loop != null and self.invalidator != null) try self.startLifecycle();
     }
 
     fn tableFunctionRef(lua_state: *c.lua_State, table_ref: c_int, key: [*:0]const u8) !c_int {
@@ -329,8 +517,8 @@ pub const App = struct {
 
     fn invalidateWidgetState(ptr: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ptr));
-        const runtime = self.runtime orelse return;
-        try runtime.invalidateState();
+        const invalidator = self.invalidator orelse return;
+        try invalidator.invalidateState();
     }
 
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
@@ -487,8 +675,8 @@ fn loopHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
 
 fn loopHostInvalidate(ptr: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ptr));
-    const runtime = app.runtime orelse return;
-    try runtime.invalidate();
+    const invalidator = app.invalidator orelse return;
+    try invalidator.invalidate();
 }
 
 fn loopHostAddFdWatch(ptr: *anyopaque, fd: i32, events: u32) anyerror!*FdWatch {
@@ -564,8 +752,8 @@ fn scriptChanged(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, ma
     const app: *App = @ptrCast(@alignCast(ctx));
     std.log.scoped(.keywork_luajit).info("reload requested for {s} mask=0x{x}", .{ path, mask });
     app.script_dirty = true;
-    const runtime = app.runtime orelse return;
-    try runtime.invalidate();
+    const invalidator = app.invalidator orelse return;
+    try invalidator.invalidate();
 }
 
 /// First byte of a LuaJIT (and PUC Lua) bytecode dump.
@@ -742,7 +930,7 @@ fn luaReload(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     app.script_dirty = true;
-    if (app.runtime) |runtime| runtime.invalidate() catch |err| {
+    if (app.invalidator) |invalidator| invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("reload invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "reload failed");
     };
@@ -833,8 +1021,8 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    const runtime = app.runtime orelse return 0;
-    runtime.invalidate() catch |err| {
+    const invalidator = app.invalidator orelse return 0;
+    invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "invalidate failed");
     };
@@ -1648,7 +1836,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
         .no_preference,
     );
     defer runtime.deinit();
-    app.runtime = &runtime;
+    app.bindRuntime(&runtime);
 
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"0\"") != null);
@@ -1709,7 +1897,7 @@ test "lua stateful widget dispose runs when removed" {
         .no_preference,
     );
     defer runtime.deinit();
-    app.runtime = &runtime;
+    app.bindRuntime(&runtime);
 
     try runtime.repaint();
     try runtime.click(.{ .x = 2, .y = 2 });
@@ -1780,7 +1968,7 @@ test "lua stateful set_state is inert after dispose" {
         .no_preference,
     );
     defer runtime.deinit();
-    app.runtime = &runtime;
+    app.bindRuntime(&runtime);
 
     try runtime.repaint();
     try runtime.click(.{ .x = 2, .y = 2 });

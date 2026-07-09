@@ -15,6 +15,9 @@ pub const Config = struct {
     width: ?f32 = null,
     height: ?f32 = null,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    /// The script declares its window set via a `windows` function, so
+    /// it needs a windowing backend even without app-level layer_shell.
+    has_windows: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.app_id) |value| allocator.free(value);
@@ -47,7 +50,10 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     c.lua_getfield(lua_state, table_index, "child");
     const child_is_widget = c.lua_type(lua_state, -1) == c.LUA_TTABLE and isWidgetTable(lua_state, c.lua_gettop(lua_state));
     pop(lua_state, 1);
-    if (!child_is_widget) return invalidAppRoot("keywork.app requires a widget child", .{});
+    c.lua_getfield(lua_state, table_index, "windows");
+    config.has_windows = c.lua_type(lua_state, -1) == c.LUA_TFUNCTION;
+    pop(lua_state, 1);
+    if (!child_is_widget and !config.has_windows) return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
 
     const app_id = try checkStringField(lua_state, table_index, "app_id");
     const title = try checkStringField(lua_state, table_index, "title");
@@ -61,7 +67,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     return config;
 }
 
-fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !wayland_options.LayerShellOptions {
+pub fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !wayland_options.LayerShellOptions {
     var options: wayland_options.LayerShellOptions = .{};
 
     if (try checkStringField(lua_state, table_index, "layer")) |name| {
@@ -133,14 +139,6 @@ fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !wayland_op
             return invalidAppRoot("unknown keyboard interactivity '{s}' (expected none, exclusive, or on-demand)", .{name});
     }
 
-    if (try checkStringField(lua_state, table_index, "output")) |name| {
-        options.output = if (std.mem.eql(u8, name, "all"))
-            .all
-        else if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "compositor_default"))
-            .compositor_default
-        else
-            return invalidAppRoot("unknown layer-shell output '{s}' (expected default or all)", .{name});
-    }
     return options;
 }
 

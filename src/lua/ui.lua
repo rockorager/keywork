@@ -542,6 +542,23 @@ function ui.anchored(options)
   }
 end
 
+--- Declares one window of the app's window set, returned from the app's
+--- `windows(ctx)` function. Windows are diffed by `id`: a newly declared
+--- id creates a surface, a dropped id destroys it. Fields left nil
+--- inherit the app-level defaults; `output` names the output a
+--- layer-shell window is placed on (see ctx.outputs).
+function ui.window(options)
+  return {
+    id = options.id,
+    title = options.title,
+    width = options.width,
+    height = options.height,
+    output = options.output,
+    layer_shell = options.layer_shell,
+    child = options.child,
+  }
+end
+
 --- Popup declaration for ui.anchored. `content` is a widget table, or a
 --- function receiving the popup's runtime state and returning one.
 --- `on_close` fires when the compositor dismisses the popup (for example

@@ -7,6 +7,7 @@ const desktop_settings = @import("../linux/desktop_settings.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const app_options = @import("options.zig");
+const app_windows = @import("windows.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
@@ -35,7 +36,11 @@ pub const Options = struct {
     layer_shell: ?wayland_options.LayerShellOptions = null,
     log_writer: *std.Io.Writer,
     runtime_context: ?*anyopaque = null,
+    /// Declarative window-set host; when present the SHM backend runs one
+    /// runtime per declared window instead of a single main window.
+    windows_host: ?app_windows.WindowsHost = null,
     bind_runtime: ?*const fn (ctx: *anyopaque, runtime: *runtime_mod.Runtime) void = null,
+    bind_invalidator: ?*const fn (ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void = null,
     unbind_runtime: ?*const fn (ctx: *anyopaque) void = null,
     bind_event_loop: ?*const fn (ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void = null,
     unbind_event_loop: ?*const fn (ctx: *anyopaque) void = null,
@@ -45,16 +50,12 @@ pub const Options = struct {
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
     const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
     const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = options.height };
-    if (options.layer_shell != null and options.layer_shell.?.output == .all) {
-        return switch (options.backend) {
-            .log => runLog(allocator, loop, app, constraints, options),
-            .wayland_shm => runWaylandAllOutputs(allocator, loop, app, constraints, options),
-            .vulkan => error.UnsupportedLayerShellAllOutputs,
-        };
-    }
     return switch (options.backend) {
         .log => runLog(allocator, loop, app, constraints, options),
-        .wayland_shm => runWayland(allocator, loop, app, constraints, options, wayland_shm.Backend),
+        .wayland_shm => if (options.windows_host) |windows_host|
+            runWaylandWindowed(allocator, loop, windows_host, options)
+        else
+            runWayland(allocator, loop, app, constraints, options, wayland_shm.Backend),
         .vulkan => runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
     };
 }
@@ -220,7 +221,6 @@ fn runWayland(
 const QueuedPlatformEvents = struct {
     allocator: std.mem.Allocator,
     runtime: *runtime_mod.Runtime,
-    multi_output: ?*MultiOutputContext = null,
     popup_manager: ?*PopupManager = null,
     suspended_query: ?SuspendedQuery = null,
     events: std.ArrayList(Event) = .empty,
@@ -313,8 +313,8 @@ const QueuedPlatformEvents = struct {
             .pointer_move => |point| try self.runtime.pointerMove(point),
             .scroll => |value| try self.runtime.scrollBy(value.point, value.dx, value.dy),
             .key => |input| try self.runtime.keyInput(input),
-            .configure => |size| if (self.multi_output) |multi| multi.configure(size) else runtime_mod.Runtime.waylandConfigure(self.runtime, size),
-            .frame_done => if (self.multi_output) |multi| MultiOutputContext.frameHandler(multi) else runtime_mod.Runtime.waylandFrameDone(self.runtime),
+            .configure => |size| runtime_mod.Runtime.waylandConfigure(self.runtime, size),
+            .frame_done => runtime_mod.Runtime.waylandFrameDone(self.runtime),
         };
     }
 
@@ -338,60 +338,12 @@ const QueuedPlatformEvents = struct {
         if (self.suspended_query) |query| {
             if (query.func(query.ctx)) return;
         }
-        if (self.multi_output) |multi| {
-            try multi.flush();
-        } else {
-            // Sample dirtiness before the flush clears it: a main-tree
-            // rebuild replaces the popup declarations popup runtimes
-            // borrow, so their content must rebuild too.
-            const content_dirty = self.runtime.rebuild_pending or self.runtime.state_rebuild_pending;
-            try self.runtime.flushPendingRepaint();
-            if (self.popup_manager) |manager| try manager.reconcileAndFlush(content_dirty);
-        }
-    }
-};
-
-const MultiOutputContext = struct {
-    runtime: *runtime_mod.Runtime,
-    windows: []const *wayland_shm.Backend.Window,
-
-    /// Repaints every window with the runtime's single tree, relaid out
-    /// per window size. Iterates in reverse so the runtime's backend ends
-    /// up bound to the first window, keeping text measurement stable
-    /// between repaints.
-    fn repaintAll(self: *MultiOutputContext) !void {
-        var index = self.windows.len;
-        while (index > 0) {
-            index -= 1;
-            const win = self.windows[index];
-            if (win.protocol.closed) continue;
-            self.runtime.backend = win.renderBackend();
-            const size = win.currentSize();
-            self.runtime.constraints = .{ .max_width = size.width, .max_height = size.height };
-            self.runtime.rebuild_pending = true;
-            try self.runtime.repaint();
-        }
-    }
-
-    fn schedule(ctx: *anyopaque) !void {
-        const self: *MultiOutputContext = @ptrCast(@alignCast(ctx));
-        self.runtime.repaint_pending = true;
-    }
-
-    fn configure(self: *MultiOutputContext, _: keywork.Size) void {
-        self.runtime.rebuild_pending = true;
-        self.runtime.repaint_pending = true;
-    }
-
-    fn frameHandler(ctx: *anyopaque) void {
-        const self: *MultiOutputContext = @ptrCast(@alignCast(ctx));
-        runtime_mod.Runtime.waylandFrameDone(self.runtime);
-    }
-
-    fn flush(self: *MultiOutputContext) !void {
-        if (!self.runtime.repaint_pending or self.runtime.frame_pending or self.runtime.rendering) return;
-        try self.repaintAll();
-        self.runtime.repaint_pending = false;
+        // Sample dirtiness before the flush clears it: a main-tree
+        // rebuild replaces the popup declarations popup runtimes
+        // borrow, so their content must rebuild too.
+        const content_dirty = self.runtime.rebuild_pending or self.runtime.state_rebuild_pending;
+        try self.runtime.flushPendingRepaint();
+        if (self.popup_manager) |manager| try manager.reconcileAndFlush(content_dirty);
     }
 };
 
@@ -605,84 +557,54 @@ const PopupManager = struct {
     }
 };
 
-fn runWaylandAllOutputs(
+fn runWaylandWindowed(
     allocator: std.mem.Allocator,
     loop: *event_loop.EventLoop,
-    app: keywork.AppHost,
-    constraints: keywork.Constraints,
+    windows_host: app_windows.WindowsHost,
     options: Options,
 ) !void {
-    // Send the portal color-scheme query before window setup so the dbus
-    // round trip completes while the compositor configures the surfaces.
     var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
         log.warn("desktop settings unavailable: {}", .{err});
         break :blk null;
     };
     defer if (settings_client) |*settings| settings.deinit();
 
-    const backend_width = if (options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try wayland_shm.Backend.create(allocator);
     defer backend.destroy();
-
-    // One real window per output; a compositor-chosen fallback when no
-    // outputs were advertised.
-    const window_count = @max(backend.outputCount(), 1);
-    var windows = try allocator.alloc(*wayland_shm.Backend.Window, window_count);
-    defer allocator.free(windows);
-    for (windows, 0..) |*win, index| win.* = try backend.createWindow(.{
-        .title = options.title,
-        .app_id = options.app_id,
-        .width = backend_width,
-        .height = try positiveU31(constraints.max_height),
-        .layer_shell = options.layer_shell,
-        .output = if (index < backend.outputCount()) backend.outputAt(index) else null,
-    });
-    try backend.waitForAllConfigured();
 
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
-    const first_size = windows[0].currentSize();
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        windows[0].renderBackend(),
-        .{ .max_width = first_size.width, .max_height = first_size.height },
-        app,
-        initial_color_scheme,
-    );
-    defer runtime.deinit();
-    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
+    var manager: WindowManager = .{
+        .allocator = allocator,
+        .backend = backend,
+        .windows_host = windows_host,
+        .options = &options,
+        .color_scheme = initial_color_scheme,
+    };
+    defer manager.deinit();
+    backend.setOutputsChangedHandler(&manager, WindowManager.outputsChanged);
+
+    if (options.bind_invalidator) |bind| bind(options.runtime_context.?, manager.invalidator());
     defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
-    runtime.setFrameBackground(keywork.colors.transparent);
-    runtime.setDeferredRepaint(true);
     if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
     defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
 
-    var multi_context: MultiOutputContext = .{ .runtime = &runtime, .windows = windows };
-    runtime.setRepaintScheduler(&multi_context, MultiOutputContext.schedule);
-
-    var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime, .multi_output = &multi_context };
-    defer queue.deinit();
-    for (windows) |win| {
-        win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
-        win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
-        win.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
-        win.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
-        win.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
-        win.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
-        win.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
-    }
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
-        settings.setChangeHandler(&runtime, desktopSettingsChanged);
+        settings.setChangeHandler(&manager, WindowManager.desktopSettingsChanged);
     }
-    try multi_context.repaintAll();
 
+    try manager.reconcile();
+    if (manager.shouldQuit()) return;
+
+    // Loop lifetime is the manager's decision, not the backend's: zero
+    // live windows is a valid state while the app waits for outputs.
     try loop.setWayland(.{
         .fd = backend.eventLoopFd(),
         .ctx = backend,
         .prepare = wayland_shm.Backend.eventLoopPrepare,
-        .finish = wayland_shm.Backend.eventLoopFinish,
+        .finish = wayland_shm.Backend.eventLoopFinishKeepAlive,
     });
     defer loop.clearWayland();
     try backend.installEventTimers(loop);
@@ -695,12 +617,306 @@ fn runWaylandAllOutputs(
         .ctx = settings,
         .callback = desktop_settings.Client.eventLoopCallback,
     });
-    loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
+    loop.setAfterPlatformHook(&manager, WindowManager.afterPlatformHook);
     defer loop.clearAfterPlatformHook();
-    loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
+    loop.setEndTurnHook(&manager, WindowManager.endTurnHook);
     defer loop.clearEndTurnHook();
     try loop.run();
 }
+
+/// Reconciles the app's declared window set against live surfaces by id:
+/// each managed window owns its surface, runtime, input queue, and popup
+/// manager. Output hotplug, script invalidation, and compositor closes
+/// all mark the set for reconciliation at end of turn.
+const WindowManager = struct {
+    allocator: std.mem.Allocator,
+    backend: *wayland_shm.Backend,
+    windows_host: app_windows.WindowsHost,
+    options: *const Options,
+    color_scheme: runtime_mod.UiColorScheme = .no_preference,
+    windows: std.ArrayList(*ManagedWindow) = .empty,
+    /// Ids the compositor closed while the app still declares them;
+    /// skipped on reconcile so a close is not immediately undone. An id
+    /// is forgotten once its declaration disappears, letting the app
+    /// re-declare it later.
+    closed_ids: std.StringHashMapUnmanaged(void) = .empty,
+    reconcile_pending: bool = false,
+
+    const ManagedWindow = struct {
+        manager: *WindowManager,
+        id: []u8,
+        win: *wayland_shm.Backend.Window,
+        layer_shell: bool,
+        runtime: runtime_mod.Runtime,
+        queue: QueuedPlatformEvents,
+        popups: PopupManager,
+    };
+
+    fn deinit(self: *WindowManager) void {
+        while (self.windows.items.len > 0) self.destroyManaged(self.windows.items.len - 1);
+        self.windows.deinit(self.allocator);
+        var it = self.closed_ids.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.closed_ids.deinit(self.allocator);
+    }
+
+    fn invalidator(self: *WindowManager) runtime_mod.Invalidator {
+        return .{
+            .ptr = self,
+            .invalidate_fn = invalidateAll,
+            .invalidate_state_fn = invalidateStateAll,
+        };
+    }
+
+    fn invalidateAll(ptr: *anyopaque) anyerror!void {
+        const self: *WindowManager = @ptrCast(@alignCast(ptr));
+        self.reconcile_pending = true;
+        for (self.windows.items) |managed| try managed.runtime.invalidate();
+    }
+
+    fn invalidateStateAll(ptr: *anyopaque) anyerror!void {
+        const self: *WindowManager = @ptrCast(@alignCast(ptr));
+        self.reconcile_pending = true;
+        for (self.windows.items) |managed| try managed.runtime.invalidateState();
+    }
+
+    fn outputsChanged(ctx: *anyopaque) void {
+        const self: *WindowManager = @ptrCast(@alignCast(ctx));
+        self.reconcile_pending = true;
+    }
+
+    fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorScheme) void {
+        const self: *WindowManager = @ptrCast(@alignCast(ctx));
+        const scheme = uiColorScheme(color_scheme);
+        self.color_scheme = scheme;
+        // The window set itself may branch on the color scheme.
+        self.reconcile_pending = true;
+        for (self.windows.items) |managed| managed.runtime.setColorScheme(scheme) catch |err| {
+            log.warn("window {s}: color scheme change failed: {}", .{ managed.id, err });
+        };
+    }
+
+    fn afterPlatformHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
+        const self: *WindowManager = @ptrCast(@alignCast(ctx));
+        try self.drainAll();
+    }
+
+    fn endTurnHook(ctx: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *WindowManager = @ptrCast(@alignCast(ctx));
+        // Input repeat and kinetic-scroll timers are ordinary event-loop
+        // sources, so they can enqueue semantic events after the platform
+        // phase. Drain those before presenting the turn's coalesced frame.
+        try self.drainAll();
+        for (self.windows.items) |managed| {
+            if (managed.win.protocol.closed) self.reconcile_pending = true;
+        }
+        if (self.reconcile_pending) {
+            try self.reconcile();
+            if (self.shouldQuit()) {
+                loop.quit();
+                return;
+            }
+        }
+        for (self.windows.items) |managed| {
+            // Layer-shell surfaces never receive xdg_toplevel suspension,
+            // so only regular toplevels pause presentation while hidden.
+            if (!managed.layer_shell and wayland_shm.Backend.Window.suspendedOpaque(managed.win)) continue;
+            // Sample dirtiness before the flush clears it: a main-tree
+            // rebuild replaces the popup declarations popup runtimes
+            // borrow, so their content must rebuild too.
+            const content_dirty = managed.runtime.rebuild_pending or managed.runtime.state_rebuild_pending;
+            try managed.runtime.flushPendingRepaint();
+            try managed.popups.reconcileAndFlush(content_dirty);
+        }
+    }
+
+    fn drainAll(self: *WindowManager) !void {
+        for (self.windows.items) |managed| {
+            try managed.queue.drain();
+            try managed.popups.drainAll();
+        }
+    }
+
+    /// After a reconcile, `closed_ids` holds only ids the app still
+    /// declares but the compositor closed. No live windows plus such an
+    /// id means the user closed the app's last window: quit. Zero
+    /// windows with zero closed ids is the app declaring none — a valid
+    /// state (for example a shell waiting for output hotplug).
+    fn shouldQuit(self: *const WindowManager) bool {
+        return self.windows.items.len == 0 and self.closed_ids.count() > 0;
+    }
+
+    /// Diffs the declared window set against live surfaces: destroys
+    /// closed and dropped windows, creates missing ones. Declarations are
+    /// built into a throwaway arena.
+    fn reconcile(self: *WindowManager) !void {
+        self.reconcile_pending = false;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var outputs: std.ArrayList(wayland_options.OutputInfo) = .empty;
+        for (0..self.backend.outputCount()) |index| {
+            try outputs.append(arena_allocator, self.backend.outputInfoAt(index));
+        }
+        const context: app_windows.WindowsContext = .{
+            .outputs = outputs.items,
+            .color_scheme = self.color_scheme.name(),
+        };
+        const decls = self.windows_host.buildWindows(arena_allocator, context) catch |err| {
+            log.warn("window set build failed: {}", .{err});
+            return;
+        };
+
+        var index: usize = 0;
+        while (index < self.windows.items.len) {
+            const managed = self.windows.items[index];
+            if (managed.win.protocol.closed) {
+                // Remember compositor closes so the still-present
+                // declaration does not resurrect the window.
+                self.rememberClosed(managed.id);
+                self.destroyManaged(index);
+                continue;
+            }
+            if (findDecl(decls, managed.id) == null) {
+                self.destroyManaged(index);
+                continue;
+            }
+            index += 1;
+        }
+
+        var stale_ids: std.ArrayList([]const u8) = .empty;
+        var closed_it = self.closed_ids.iterator();
+        while (closed_it.next()) |entry| {
+            if (findDecl(decls, entry.key_ptr.*) == null) try stale_ids.append(arena_allocator, entry.key_ptr.*);
+        }
+        for (stale_ids.items) |id| {
+            const key = self.closed_ids.getKey(id).?;
+            _ = self.closed_ids.remove(id);
+            self.allocator.free(key);
+        }
+
+        for (decls) |decl| {
+            if (self.closed_ids.contains(decl.id)) continue;
+            if (self.findManaged(decl.id) != null) continue;
+            self.createManaged(decl) catch |err| {
+                log.warn("window {s}: creation failed: {}", .{ decl.id, err });
+            };
+        }
+    }
+
+    fn findDecl(decls: []const app_windows.WindowDeclaration, id: []const u8) ?*const app_windows.WindowDeclaration {
+        for (decls) |*decl| {
+            if (std.mem.eql(u8, decl.id, id)) return decl;
+        }
+        return null;
+    }
+
+    fn findManaged(self: *WindowManager, id: []const u8) ?*ManagedWindow {
+        for (self.windows.items) |managed| {
+            if (std.mem.eql(u8, managed.id, id)) return managed;
+        }
+        return null;
+    }
+
+    fn rememberClosed(self: *WindowManager, id: []const u8) void {
+        if (self.closed_ids.contains(id)) return;
+        const key = self.allocator.dupe(u8, id) catch return;
+        self.closed_ids.put(self.allocator, key, {}) catch self.allocator.free(key);
+    }
+
+    fn createManaged(self: *WindowManager, decl: app_windows.WindowDeclaration) !void {
+        // Null declaration fields inherit the app-level defaults.
+        const layer_shell = decl.layer_shell orelse self.options.layer_shell;
+        const width = decl.width orelse self.options.width;
+        const height = decl.height orelse self.options.height;
+        const output = if (decl.output) |name|
+            self.backend.findOutputByName(name) orelse return error.UnknownOutput
+        else
+            null;
+
+        const win = try self.backend.createWindow(.{
+            .title = decl.title orelse self.options.title,
+            .app_id = self.options.app_id,
+            .width = if (layer_shell != null and width <= 0) 0 else try positiveU31(width),
+            .height = try positiveU31(height),
+            .layer_shell = layer_shell,
+            .output = output,
+        });
+        errdefer self.backend.destroyWindow(win);
+        // Per-window wait: a global wait would clear other windows'
+        // pending frame-done events without routing them to handlers.
+        try self.backend.waitForConfigured(win);
+
+        const managed = try self.allocator.create(ManagedWindow);
+        errdefer self.allocator.destroy(managed);
+        const id = try self.allocator.dupe(u8, decl.id);
+        errdefer self.allocator.free(id);
+
+        const size = win.currentSize();
+        managed.* = .{
+            .manager = self,
+            .id = id,
+            .win = win,
+            .layer_shell = layer_shell != null,
+            .runtime = undefined,
+            .queue = .{ .allocator = self.allocator, .runtime = undefined },
+            .popups = .{
+                .allocator = self.allocator,
+                .backend = self.backend,
+                .parent = win,
+                .runtime = undefined,
+            },
+        };
+        managed.runtime = try runtime_mod.Runtime.init(
+            self.allocator,
+            win.renderBackend(),
+            .{ .max_width = size.width, .max_height = size.height },
+            .{ .ptr = managed, .vtable = &managed_host_vtable },
+            self.color_scheme,
+        );
+        errdefer managed.runtime.deinit();
+        managed.queue.runtime = &managed.runtime;
+        managed.queue.popup_manager = &managed.popups;
+        managed.popups.runtime = &managed.runtime;
+        if (managed.layer_shell) managed.runtime.setFrameBackground(keywork.colors.transparent);
+        managed.runtime.setDeferredRepaint(true);
+
+        win.setPointerButtonHandler(&managed.queue, QueuedPlatformEvents.pointerButton);
+        win.setPointerMoveHandler(&managed.queue, QueuedPlatformEvents.pointerMove);
+        win.setCursorShapeHandler(&managed.runtime, runtime_mod.Runtime.waylandCursorShape);
+        win.setRepaintHandler(&managed.queue, QueuedPlatformEvents.configure);
+        win.setFrameHandler(&managed.queue, QueuedPlatformEvents.frameDone);
+        win.setKeyHandler(&managed.queue, QueuedPlatformEvents.keyInput);
+        win.setScrollHandler(&managed.queue, QueuedPlatformEvents.scroll);
+
+        try self.windows.append(self.allocator, managed);
+        errdefer {
+            _ = self.windows.pop();
+            managed.queue.deinit();
+        }
+        try managed.runtime.repaint();
+    }
+
+    fn destroyManaged(self: *WindowManager, index: usize) void {
+        const managed = self.windows.items[index];
+        _ = self.windows.orderedRemove(index);
+        managed.popups.deinit();
+        managed.runtime.deinit();
+        managed.queue.deinit();
+        self.backend.destroyWindow(managed.win);
+        self.allocator.free(managed.id);
+        self.allocator.destroy(managed);
+    }
+
+    const managed_host_vtable: keywork.AppHost.VTable = .{ .build_widget = managedBuildWidget };
+
+    fn managedBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
+        const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+        return managed.manager.windows_host.buildWindowWidget(managed.id, scope, context);
+    }
+};
 
 fn positiveU31(value: f32) !u31 {
     if (!std.math.isFinite(value) or value <= 0) return error.InvalidFrameSize;
