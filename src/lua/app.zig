@@ -906,6 +906,56 @@ test "reload cancels resources from the previous script load" {
     try std.testing.expect(!app.timers.items[1].canceled);
 }
 
+test "stale handles from a previous script load are inert" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Globals survive reload because the Lua state is reused, so a handle
+    // retained by the first load is observable from the second. The reload
+    // cancels the underlying timer, which must leave the retained handle as
+    // a safe no-op rather than a dangling pointer.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\if stale_timer then
+        \\  stale_canceled = stale_timer:canceled()
+        \\  stale_timer:cancel()
+        \\  stale_timer:cancel()
+        \\  stale_still_canceled = stale_timer:canceled()
+        \\else
+        \\  stale_timer = loop.timer({ interval = 60 }, function() end)
+        \\  fresh_canceled = stale_timer:canceled()
+        \\end
+        \\return kw.app({ child = kw.text("stale") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stale.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stale.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "fresh_canceled");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) == 0);
+    pop(app.state, 1);
+
+    app.script_dirty = true;
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "stale_canceled");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "stale_still_canceled");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    // The stale cancel calls must not have created new resources.
+    try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
+    try std.testing.expect(app.timers.items[0].canceled);
+}
+
 test "application quit is idempotent before the loop starts" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1354,7 +1404,8 @@ test "lua process spawn captures stdout and exit" {
         \\        spawn_done = result.ok and result.code == 0
         \\      end,
         \\    })
-        \\    spawn_cancel = self.proc.cancel
+        \\    local proc = self.proc
+        \\    spawn_cancel = function() proc:cancel() end
         \\  end,
         \\  dispose = function(self)
         \\    if self.proc then

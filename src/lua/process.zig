@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_handle = @import("handle.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -252,14 +253,6 @@ pub const LuaProcess = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
             self.exit_ref = -1;
         }
-        if (self.handle_ref >= 0) {
-            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.handle_ref);
-            c.lua_pushcclosure(lua_state, luaNoop, 0);
-            c.lua_setfield(lua_state, -2, "cancel");
-            pop(lua_state, 1);
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.handle_ref);
-            self.handle_ref = -1;
-        }
     }
 
     pub fn deinit(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -275,6 +268,10 @@ pub const LuaProcess = struct {
         }
         self.closeFds();
         self.clearRefs(lua_state);
+        // The process object is about to be freed; retained Lua handles
+        // become inert no-ops from here on.
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     pub fn destroy(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -322,16 +319,14 @@ pub fn tableFunctionRef(lua_state: *c.lua_State, table: c_int, key: [*:0]const u
     return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
 }
 
+const process_type: [*:0]const u8 = "keywork.process";
+const process_methods = [_]lua_handle.Method{
+    .{ .name = "cancel", .func = luaCancel },
+    .{ .name = "canceled", .func = luaCanceled },
+};
+
 pub fn pushHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
-    c.lua_createtable(lua_state, 0, 2);
-    c.lua_pushlightuserdata(lua_state, process);
-    c.lua_pushcclosure(lua_state, luaCancel, 1);
-    c.lua_setfield(lua_state, -2, "cancel");
-    c.lua_pushlightuserdata(lua_state, process);
-    c.lua_pushcclosure(lua_state, luaCanceled, 1);
-    c.lua_setfield(lua_state, -2, "canceled");
-    c.lua_pushvalue(lua_state, -1);
-    process.handle_ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    process.handle_ref = lua_handle.create(lua_state, process_type, &process_methods, process);
 }
 
 pub fn stringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ![]const u8 {
@@ -355,6 +350,9 @@ fn exitCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     switch (linux.errno(result)) {
         .SUCCESS => {},
         .CHILD => {
+            // Reaped elsewhere; mark exited so a retained handle's cancel()
+            // cannot signal a reused PID.
+            process.exited = true;
             process.closeFds();
             process.clearRefs(process.host.luaState());
             return;
@@ -443,20 +441,19 @@ fn pushResult(lua_state: *c.lua_State, status: u32) void {
 
 fn luaCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const process: *LuaProcess = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse return 0;
     process.cancel(lua_state);
     return 0;
 }
 
 fn luaCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const process: *LuaProcess = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
     c.lua_pushboolean(lua_state, if (process.canceled) 1 else 0);
     return 1;
-}
-
-fn luaNoop(_: ?*c.lua_State) callconv(.c) c_int {
-    return 0;
 }
 
 const PreparedArgv = struct {

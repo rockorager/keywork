@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_handle = @import("handle.zig");
 const c = @import("luajit_c");
 const dbus_c = @import("dbus_c");
 
@@ -126,6 +127,7 @@ fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
 const Subscription = struct {
     bus: *Bus,
     ref: c_int,
+    handle_ref: c_int = -1,
     match_rule: ?[:0]const u8 = null,
     sender: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -144,6 +146,8 @@ const Subscription = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
         }
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     fn deinit(self: *Subscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -157,6 +161,7 @@ const Subscription = struct {
     }
 
     fn destroy(self: *Subscription, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.cancel(lua_state);
         self.deinit(allocator, lua_state);
         allocator.destroy(self);
     }
@@ -190,12 +195,15 @@ const Subscription = struct {
 const OwnedName = struct {
     bus: *Bus,
     name: [:0]const u8,
+    handle_ref: c_int = -1,
     released: bool = false,
 
     fn release(self: *OwnedName) void {
         if (self.released) return;
         self.released = true;
         if (!self.bus.closed) _ = dbus_c.dbus_bus_release_name(self.bus.connection, self.name.ptr, null);
+        lua_handle.invalidate(self.bus.host.luaState(), self.handle_ref);
+        self.handle_ref = -1;
     }
 
     fn destroy(self: *OwnedName, allocator: std.mem.Allocator) void {
@@ -209,6 +217,7 @@ const ExportedObject = struct {
     bus: *Bus,
     path: [:0]const u8,
     ref: c_int,
+    handle_ref: c_int = -1,
     unexported: bool = false,
 
     fn unexport(self: *ExportedObject, lua_state: *c.lua_State) void {
@@ -218,6 +227,8 @@ const ExportedObject = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
         }
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     fn destroy(self: *ExportedObject, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -286,6 +297,7 @@ pub const Bus = struct {
     pending_calls: std.ArrayList(*Call) = .empty,
     owned_names: std.ArrayList(*OwnedName) = .empty,
     exported_objects: std.ArrayList(*ExportedObject) = .empty,
+    handle_ref: c_int = -1,
     registered: bool = false,
     closed: bool = false,
     filter_installed: bool = false,
@@ -382,6 +394,8 @@ pub const Bus = struct {
         dbus_c.dbus_connection_close(self.connection);
         dbus_c.dbus_connection_unref(self.connection);
         self.fd = invalid_fd;
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     fn deinit(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -839,35 +853,29 @@ fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
         std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus bus failed");
     };
-    pushBusHandle(lua_state, bus);
+    bus.handle_ref = lua_handle.create(lua_state, bus_type, &bus_methods, bus);
     return 1;
 }
 
 fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
-    const options_index: c_int = if (c.lua_type(lua_state, 3) == c.LUA_TFUNCTION) 2 else 1;
-    const callback_index: c_int = options_index + 1;
-    c.luaL_checktype(lua_state, options_index, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, callback_index, c.LUA_TFUNCTION);
-    const subscription = bus.subscribe(lua_state, options_index, callback_index) catch |err| {
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
+    const subscription = bus.subscribe(lua_state, 2, 3) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus subscribe failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus subscribe failed");
     };
-    pushSubscriptionHandle(lua_state, subscription);
+    subscription.handle_ref = lua_handle.create(lua_state, subscription_type, &subscription_methods, subscription);
     return 1;
 }
 
 fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
-    const options_index: c_int = if (c.lua_type(lua_state, 3) == c.LUA_TFUNCTION) 2 else 1;
-    const callback_index: c_int = options_index + 1;
-    c.luaL_checktype(lua_state, options_index, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, callback_index, c.LUA_TFUNCTION);
-    bus.call(lua_state, options_index, callback_index) catch |err| {
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
+    bus.call(lua_state, 2, 3) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus call failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus call failed");
     };
@@ -876,46 +884,39 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
-    const name_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
-    const owned = bus.requestName(lua_state, name_index) catch |err| {
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const owned = bus.requestName(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus request_name failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus request_name failed");
     };
-    pushOwnedNameHandle(lua_state, owned);
+    owned.handle_ref = lua_handle.create(lua_state, owned_name_type, &owned_name_methods, owned);
     return 1;
 }
 
 fn luaDbusReleaseName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    const name_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
-    const name = stringFromStack(lua_state, name_index) catch return c.luaL_error(lua_state, "release_name requires a name");
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const name = stringFromStack(lua_state, 2) catch return c.luaL_error(lua_state, "release_name requires a name");
     bus.releaseName(name);
     return 0;
 }
 
 fn luaDbusExport(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
-    const path_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) 2 else 1;
-    const spec_index = path_index + 1;
-    const object = bus.exportObject(lua_state, path_index, spec_index) catch |err| {
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const object = bus.exportObject(lua_state, 2, 3) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus export failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus export failed");
     };
-    pushDbusExportHandle(lua_state, object);
+    object.handle_ref = lua_handle.create(lua_state, export_type, &export_methods, object);
     return 1;
 }
 
 fn luaDbusEmit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    if (bus.closed) return c.luaL_error(lua_state, "dbus bus is closed");
-    const options_index: c_int = if (c.lua_type(lua_state, 2) == c.LUA_TTABLE) 2 else 1;
-    bus.emitSignal(lua_state, options_index) catch |err| {
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    bus.emitSignal(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus emit failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus emit failed");
     };
@@ -924,83 +925,65 @@ fn luaDbusEmit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
     bus.close();
     return 0;
 }
 
 fn luaDbusClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus: *Bus = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
     c.lua_pushboolean(lua_state, if (bus.closed) 1 else 0);
     return 1;
 }
 
-fn pushBusHandle(lua_state: *c.lua_State, bus: *Bus) void {
-    c.lua_createtable(lua_state, 0, 8);
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusSubscribe, 1);
-    c.lua_setfield(lua_state, -2, "subscribe");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaCall, 1);
-    c.lua_setfield(lua_state, -2, "call");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusRequestName, 1);
-    c.lua_setfield(lua_state, -2, "request_name");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusReleaseName, 1);
-    c.lua_setfield(lua_state, -2, "release_name");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusExport, 1);
-    c.lua_setfield(lua_state, -2, "export");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusEmit, 1);
-    c.lua_setfield(lua_state, -2, "emit");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusClose, 1);
-    c.lua_setfield(lua_state, -2, "close");
-    c.lua_pushlightuserdata(lua_state, bus);
-    c.lua_pushcclosure(lua_state, luaDbusClosed, 1);
-    c.lua_setfield(lua_state, -2, "closed");
-}
+const bus_type: [*:0]const u8 = "keywork.dbus_bus";
+const bus_methods = [_]lua_handle.Method{
+    .{ .name = "subscribe", .func = luaDbusSubscribe },
+    .{ .name = "call", .func = luaCall },
+    .{ .name = "request_name", .func = luaDbusRequestName },
+    .{ .name = "release_name", .func = luaDbusReleaseName },
+    .{ .name = "export", .func = luaDbusExport },
+    .{ .name = "emit", .func = luaDbusEmit },
+    .{ .name = "close", .func = luaDbusClose },
+    .{ .name = "closed", .func = luaDbusClosed },
+};
 
-fn pushSubscriptionHandle(lua_state: *c.lua_State, subscription: *Subscription) void {
-    c.lua_createtable(lua_state, 0, 1);
-    c.lua_pushlightuserdata(lua_state, subscription);
-    c.lua_pushcclosure(lua_state, luaCancelSubscription, 1);
-    c.lua_setfield(lua_state, -2, "cancel");
-}
+const subscription_type: [*:0]const u8 = "keywork.dbus_subscription";
+const subscription_methods = [_]lua_handle.Method{
+    .{ .name = "cancel", .func = luaCancelSubscription },
+};
 
-fn pushOwnedNameHandle(lua_state: *c.lua_State, owned: *OwnedName) void {
-    c.lua_createtable(lua_state, 0, 1);
-    c.lua_pushlightuserdata(lua_state, owned);
-    c.lua_pushcclosure(lua_state, luaReleaseOwnedName, 1);
-    c.lua_setfield(lua_state, -2, "release");
-}
+const owned_name_type: [*:0]const u8 = "keywork.dbus_name";
+const owned_name_methods = [_]lua_handle.Method{
+    .{ .name = "release", .func = luaReleaseOwnedName },
+};
 
-fn pushDbusExportHandle(lua_state: *c.lua_State, object: *ExportedObject) void {
-    c.lua_createtable(lua_state, 0, 1);
-    c.lua_pushlightuserdata(lua_state, object);
-    c.lua_pushcclosure(lua_state, luaUnexportDbusObject, 1);
-    c.lua_setfield(lua_state, -2, "unexport");
-}
+const export_type: [*:0]const u8 = "keywork.dbus_export";
+const export_methods = [_]lua_handle.Method{
+    .{ .name = "unexport", .func = luaUnexportDbusObject },
+};
 
 fn luaCancelSubscription(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const subscription: *Subscription = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const subscription = lua_handle.resource(Subscription, lua_state, 1, subscription_type) orelse return 0;
     subscription.cancel(lua_state);
     return 0;
 }
 
 fn luaReleaseOwnedName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const owned: *OwnedName = @ptrCast(@alignCast(c.lua_touserdata(lua_state_optional.?, c.lua_upvalueindex(1)).?));
+    const lua_state = lua_state_optional.?;
+    const owned = lua_handle.resource(OwnedName, lua_state, 1, owned_name_type) orelse return 0;
     owned.release();
     return 0;
 }
 
 fn luaUnexportDbusObject(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const object: *ExportedObject = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const object = lua_handle.resource(ExportedObject, lua_state, 1, export_type) orelse return 0;
     object.unexport(lua_state);
     return 0;
 }

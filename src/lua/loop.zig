@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_handle = @import("handle.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -54,6 +55,7 @@ pub const FdWatch = struct {
     fd: i32,
     events: u32,
     ref: c_int,
+    handle_ref: c_int = -1,
     registered: bool = false,
     canceled: bool = false,
     source_handle: ?event_loop.EventLoop.SourceHandle = null,
@@ -88,6 +90,8 @@ pub const FdWatch = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
         }
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     pub fn destroy(self: *FdWatch, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -100,6 +104,7 @@ pub const FsEvent = struct {
     host: Host,
     path: []const u8,
     ref: c_int,
+    handle_ref: c_int = -1,
     watch: ?*event_loop.EventLoop.FileWatch = null,
     registered: bool = false,
     canceled: bool = false,
@@ -127,6 +132,8 @@ pub const FsEvent = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
         }
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     pub fn destroy(self: *FsEvent, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -141,6 +148,7 @@ pub const LuaTimer = struct {
     delay_ms: u64,
     interval_ms: u64,
     ref: c_int,
+    handle_ref: c_int = -1,
     timer: ?*event_loop.EventLoop.Timer = null,
     registered: bool = false,
     canceled: bool = false,
@@ -169,6 +177,8 @@ pub const LuaTimer = struct {
             c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
             self.ref = -1;
         }
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
     }
 
     pub fn destroy(self: *LuaTimer, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -309,74 +319,83 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+const timer_type: [*:0]const u8 = "keywork.timer";
+const timer_methods = [_]lua_handle.Method{
+    .{ .name = "cancel", .func = luaCancelTimer },
+    .{ .name = "canceled", .func = luaTimerCanceled },
+};
+
+const fd_watch_type: [*:0]const u8 = "keywork.fd";
+const fd_watch_methods = [_]lua_handle.Method{
+    .{ .name = "cancel", .func = luaCancelFdWatch },
+    .{ .name = "canceled", .func = luaFdWatchCanceled },
+};
+
+const fs_event_type: [*:0]const u8 = "keywork.fs_event";
+const fs_event_methods = [_]lua_handle.Method{
+    .{ .name = "cancel", .func = luaCancelFsEvent },
+    .{ .name = "canceled", .func = luaFsEventCanceled },
+};
+
 fn pushTimerHandle(lua_state: *c.lua_State, timer: *LuaTimer) void {
-    c.lua_createtable(lua_state, 0, 2);
-    c.lua_pushlightuserdata(lua_state, timer);
-    c.lua_pushcclosure(lua_state, luaCancelTimer, 1);
-    c.lua_setfield(lua_state, -2, "cancel");
-    c.lua_pushlightuserdata(lua_state, timer);
-    c.lua_pushcclosure(lua_state, luaTimerCanceled, 1);
-    c.lua_setfield(lua_state, -2, "canceled");
+    timer.handle_ref = lua_handle.create(lua_state, timer_type, &timer_methods, timer);
 }
 
 fn pushFdWatchHandle(lua_state: *c.lua_State, watch: *FdWatch) void {
-    c.lua_createtable(lua_state, 0, 2);
-    c.lua_pushlightuserdata(lua_state, watch);
-    c.lua_pushcclosure(lua_state, luaCancelFdWatch, 1);
-    c.lua_setfield(lua_state, -2, "cancel");
-    c.lua_pushlightuserdata(lua_state, watch);
-    c.lua_pushcclosure(lua_state, luaFdWatchCanceled, 1);
-    c.lua_setfield(lua_state, -2, "canceled");
+    watch.handle_ref = lua_handle.create(lua_state, fd_watch_type, &fd_watch_methods, watch);
 }
 
 fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
-    c.lua_createtable(lua_state, 0, 2);
-    c.lua_pushlightuserdata(lua_state, fs_event);
-    c.lua_pushcclosure(lua_state, luaCancelFsEvent, 1);
-    c.lua_setfield(lua_state, -2, "cancel");
-    c.lua_pushlightuserdata(lua_state, fs_event);
-    c.lua_pushcclosure(lua_state, luaFsEventCanceled, 1);
-    c.lua_setfield(lua_state, -2, "canceled");
+    fs_event.handle_ref = lua_handle.create(lua_state, fs_event_type, &fs_event_methods, fs_event);
 }
 
 fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const timer: *LuaTimer = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const timer = lua_handle.resource(LuaTimer, lua_state, 1, timer_type) orelse return 0;
     timer.cancel(lua_state);
     return 0;
 }
 
 fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const watch: *FdWatch = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const watch = lua_handle.resource(FdWatch, lua_state, 1, fd_watch_type) orelse return 0;
     watch.cancel(lua_state);
     return 0;
 }
 
 fn luaCancelFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const fs_event: *FsEvent = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const fs_event = lua_handle.resource(FsEvent, lua_state, 1, fs_event_type) orelse return 0;
     fs_event.cancel(lua_state);
     return 0;
 }
 
 fn luaTimerCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const timer: *LuaTimer = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const timer = lua_handle.resource(LuaTimer, lua_state, 1, timer_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
     c.lua_pushboolean(lua_state, if (timer.canceled) 1 else 0);
     return 1;
 }
 
 fn luaFdWatchCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const watch: *FdWatch = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const watch = lua_handle.resource(FdWatch, lua_state, 1, fd_watch_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
     c.lua_pushboolean(lua_state, if (watch.canceled) 1 else 0);
     return 1;
 }
 
 fn luaFsEventCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const fs_event: *FsEvent = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const fs_event = lua_handle.resource(FsEvent, lua_state, 1, fs_event_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
     c.lua_pushboolean(lua_state, if (fs_event.canceled) 1 else 0);
     return 1;
 }
