@@ -2544,7 +2544,7 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
     pop(app.state, 1);
     try std.testing.expectEqual(@as(usize, 2), app.sockets.items.len);
-    try std.testing.expect(app.sockets.items[0].write_buffer.items.len > 0);
+    try std.testing.expect(app.sockets.items[0].sink.buffer.items.len > 0);
 
     const conn = try testAccept(listener);
     defer _ = linux.close(conn);
@@ -2585,5 +2585,5 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
     pop(app.state, 1);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), context.drained);
-    try std.testing.expectEqual(@as(usize, 0), app.sockets.items[0].write_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.sockets.items[0].sink.buffer.items.len);
 }

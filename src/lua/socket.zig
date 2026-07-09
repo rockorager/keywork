@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
+const lua_sink = @import("sink.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -44,11 +45,8 @@ pub const LuaSocket = struct {
     fd: i32,
     /// Incoming chunks: queued while no reader is parked, like process pipes.
     stream: lua_coro.Stream = .{},
-    /// Bytes accepted by write() but not yet flushed to the kernel. Non-empty
-    /// only while a writer coroutine is parked (or during teardown).
-    write_buffer: std.ArrayList(u8) = .empty,
-    /// Coroutine parked in write() awaiting the flush, if any.
-    writer_ref: c_int = -1,
+    /// Outgoing bytes under backpressure, with the parked writer coroutine.
+    sink: lua_sink.Sink = .{},
     handle_ref: c_int = -1,
     source_handle: ?event_loop.EventLoop.SourceHandle = null,
     registered: bool = false,
@@ -100,7 +98,7 @@ pub const LuaSocket = struct {
 
     fn wantedEvents(self: *const LuaSocket) u32 {
         var events: u32 = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR;
-        if (self.write_buffer.items.len > 0) events |= linux.EPOLL.OUT;
+        if (self.sink.hasPending()) events |= linux.EPOLL.OUT;
         return events;
     }
 
@@ -119,8 +117,7 @@ pub const LuaSocket = struct {
         }
         _ = linux.close(self.fd);
         self.fd = invalid_fd;
-        self.write_buffer.deinit(self.host.allocator());
-        self.write_buffer = .empty;
+        self.sink.clear(self.host.allocator());
     }
 
     /// Ends both directions on EOF or a socket error: the read stream
@@ -129,38 +126,15 @@ pub const LuaSocket = struct {
     fn shutdownFd(self: *LuaSocket, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.fd == invalid_fd) return;
         self.closeFd();
-        self.failWriter(lua_state, mode, "closed");
+        self.sink.fail(lua_state, mode, "closed");
         self.stream.finish(lua_state, mode);
-    }
-
-    /// Resumes a parked writer with `true` (flush complete).
-    fn resolveWriter(self: *LuaSocket, lua_state: *c.lua_State) void {
-        if (self.writer_ref < 0) return;
-        c.lua_pushboolean(lua_state, 1);
-        lua_coro.resumeReaderWith(lua_state, &self.writer_ref, 1);
-    }
-
-    /// Resumes a parked writer with nil, err (or drops it silently).
-    fn failWriter(self: *LuaSocket, lua_state: *c.lua_State, mode: lua_coro.CancelMode, err: []const u8) void {
-        if (self.writer_ref < 0) return;
-        switch (mode) {
-            .resume_reader => {
-                c.lua_pushnil(lua_state);
-                c.lua_pushlstring(lua_state, err.ptr, err.len);
-                lua_coro.resumeReaderWith(lua_state, &self.writer_ref, 2);
-            },
-            .silent => {
-                c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.writer_ref);
-                self.writer_ref = -1;
-            },
-        }
     }
 
     pub fn cancel(self: *LuaSocket, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         self.closeFd();
-        self.failWriter(lua_state, mode, "closed");
+        self.sink.fail(lua_state, mode, "closed");
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
         // End the stream last so a resumed reader observes the socket
@@ -171,22 +145,6 @@ pub const LuaSocket = struct {
     pub fn destroy(self: *LuaSocket, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         self.cancel(lua_state, .silent);
         allocator.destroy(self);
-    }
-
-    /// Writes as much of `write_buffer` as the kernel accepts. Returns true
-    /// when the buffer drained completely.
-    fn flushWriteBuffer(self: *LuaSocket) !bool {
-        while (self.write_buffer.items.len > 0) {
-            const data = self.write_buffer.items;
-            const result = linux.write(self.fd, data.ptr, data.len);
-            switch (linux.errno(result)) {
-                .SUCCESS => self.write_buffer.replaceRangeAssumeCapacity(0, result, &.{}),
-                .AGAIN => return false,
-                .INTR => continue,
-                else => |errno| return unexpectedWriteError(errno),
-            }
-        }
-        return true;
     }
 
     fn drainReadable(self: *LuaSocket) void {
@@ -219,25 +177,18 @@ pub const LuaSocket = struct {
     }
 };
 
-fn unexpectedWriteError(errno: linux.E) anyerror {
-    return switch (errno) {
-        .PIPE, .CONNRESET => error.SocketClosed,
-        else => error.SocketWriteFailed,
-    };
-}
-
 fn socketCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {
     const socket: *LuaSocket = @ptrCast(@alignCast(ctx));
     if (socket.canceled or socket.fd == invalid_fd) return;
     const lua_state = socket.host.luaState();
-    if (events & linux.EPOLL.OUT != 0 and socket.write_buffer.items.len > 0) {
-        const flushed = socket.flushWriteBuffer() catch {
+    if (events & linux.EPOLL.OUT != 0 and socket.sink.hasPending()) {
+        const flushed = socket.sink.flush(socket.fd) catch {
             socket.shutdownFd(lua_state, .resume_reader);
             return;
         };
         if (flushed) {
             socket.updateInterests();
-            socket.resolveWriter(lua_state);
+            socket.sink.resolve(lua_state);
             if (socket.canceled or socket.fd == invalid_fd) return;
         }
     }
@@ -327,28 +278,20 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushliteral(lua_state, "closed");
         return 2;
     }
-    if (socket.writer_ref >= 0) return c.luaL_error(lua_state, "socket already has a waiting writer");
+    if (socket.sink.hasWaiter()) return c.luaL_error(lua_state, "socket already has a waiting writer");
 
     // Fast path: write what the kernel accepts right now. A write that
     // completes synchronously never yields, so it also works from the
     // main state.
-    var offset: usize = 0;
-    while (offset < data_len) {
-        const result = linux.write(socket.fd, data_ptr + offset, data_len - offset);
-        switch (linux.errno(result)) {
-            .SUCCESS => offset += result,
-            .AGAIN => break,
-            .INTR => continue,
-            else => |errno| {
-                socket.shutdownFd(lua_state, .resume_reader);
-                c.lua_pushnil(lua_state);
-                const name = @errorName(unexpectedWriteError(errno));
-                c.lua_pushlstring(lua_state, name.ptr, name.len);
-                return 2;
-            },
-        }
-    }
-    if (offset == data_len) {
+    const data = data_ptr[0..data_len];
+    const written = lua_sink.writeNow(socket.fd, data) catch |err| {
+        socket.shutdownFd(lua_state, .resume_reader);
+        c.lua_pushnil(lua_state);
+        const name = lua_sink.errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
+    };
+    if (written == data.len) {
         c.lua_pushboolean(lua_state, 1);
         return 1;
     }
@@ -356,10 +299,9 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // Backpressure: buffer the remainder and park the caller until the
     // event loop flushes it.
     if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "socket write would block; call write from a coroutine (wrap the caller in loop.spawn)");
-    socket.write_buffer.appendSlice(socket.host.allocator(), data_ptr[offset..data_len]) catch return c.luaL_error(lua_state, "socket write failed");
+    const yielded = socket.sink.park(socket.host.allocator(), lua_state, data[written..]) catch return c.luaL_error(lua_state, "socket write failed");
     socket.updateInterests();
-    socket.writer_ref = lua_coro.refCurrentThread(lua_state);
-    return c.lua_yield(lua_state, 0);
+    return yielded;
 }
 
 fn luaSocketClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
