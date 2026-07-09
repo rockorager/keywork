@@ -183,8 +183,11 @@ fn layoutElementInto(
         .sized => |sized_widget| {
             const child_constraints = constrainSized(constraints, sized_widget);
             const child = try layoutElement(allocator, &element.children[0], child_constraints, origin, measurer);
-            const width = @min(constraints.max_width, @max(sized_widget.min_width, sized_widget.width orelse child.rect.width));
-            const height = @min(constraints.max_height, @max(sized_widget.min_height, sized_widget.height orelse child.rect.height));
+            // Sizes to the child like Flutter's RenderConstrainedBox; the
+            // clamp only corrects children that ignore their constraints.
+            const size_value = child_constraints.clamp(.{ .width = child.rect.width, .height = child.rect.height });
+            const width = size_value.width;
+            const height = size_value.height;
             moveNode(child, origin.x, origin.y);
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
@@ -194,9 +197,15 @@ fn layoutElementInto(
             });
         },
         .box => |box_widget| {
-            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
-            const width = @min(constraints.max_width, @max(box_widget.min_width, child.rect.width));
-            const height = @min(constraints.max_height, @max(box_widget.min_height, child.rect.height));
+            // The box absorbs any min constraint and aligns the loosely
+            // laid-out child within the resulting extent.
+            const child = try layoutElement(allocator, &element.children[0], constraints.loosen(), origin, measurer);
+            const size_value = constraints.clamp(.{
+                .width = @max(box_widget.min_width, child.rect.width),
+                .height = @max(box_widget.min_height, child.rect.height),
+            });
+            const width = size_value.width;
+            const height = size_value.height;
             moveNode(
                 child,
                 origin.x + alignedOffset(box_widget.horizontal_align, width, child.rect.width),
@@ -269,8 +278,9 @@ fn layoutElementInto(
                 .x = origin.x - state.offset_x,
                 .y = origin.y - state.offset_y,
             }, measurer);
-            const width = @min(constraints.max_width, child.rect.width);
-            const height = @min(constraints.max_height, child.rect.height);
+            const viewport = constraints.clamp(.{ .width = child.rect.width, .height = child.rect.height });
+            const width = viewport.width;
+            const height = viewport.height;
             state.offset_x = std.math.clamp(state.offset_x, 0, @max(0, child.rect.width - width));
             state.offset_y = std.math.clamp(state.offset_y, 0, @max(0, child.rect.height - height));
             moveNode(child, origin.x - state.offset_x, origin.y - state.offset_y);
@@ -306,9 +316,10 @@ fn layoutElementInto(
                 content_width = @max(content_width, children[index].rect.width);
             }
             const width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else content_width;
+            const viewport = constraints.clamp(.{ .width = width, .height = height });
             commitRenderNode(node, .{
                 .kind = .list,
-                .rect = .{ .x = origin.x, .y = origin.y, .width = width, .height = height },
+                .rect = .{ .x = origin.x, .y = origin.y, .width = viewport.width, .height = viewport.height },
                 .scroll_id = list_widget.id,
                 .scroll_content = .{ .width = content_width, .height = content_height },
                 .scroll_offset = .{ .x = 0, .y = state.offset },
@@ -357,18 +368,19 @@ fn layoutElementInto(
             children[0] = child;
             commitRenderNode(node, .{
                 .kind = .padding,
-                .rect = .{
-                    .x = origin.x,
-                    .y = origin.y,
-                    .width = @min(child.rect.width + padding_widget.insets.horizontal(), constraints.max_width),
-                    .height = @min(child.rect.height + padding_widget.insets.vertical(), constraints.max_height),
+                .rect = blk: {
+                    const size_value = constraints.clamp(.{
+                        .width = child.rect.width + padding_widget.insets.horizontal(),
+                        .height = child.rect.height + padding_widget.insets.vertical(),
+                    });
+                    break :blk .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height };
                 },
             });
         },
         .flexible => {
             // Outside a row or column a flexible wrapper is a passthrough;
             // inside one, layoutLinearElements supplies the share as the
-            // constraints and enforces tight fit on the result.
+            // constraints, tight on the main axis for a tight fit.
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const children = try ensureChildSlice(allocator, node, 1);
             children[0] = child;
@@ -378,10 +390,10 @@ fn layoutElementInto(
             });
         },
         .center => {
-            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const child = try layoutElement(allocator, &element.children[0], constraints.loosen(), origin, measurer);
             // An unbounded axis centers around the child's own extent.
-            const avail_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else child.rect.width;
-            const avail_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else child.rect.height;
+            const avail_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else @max(constraints.min_width, child.rect.width);
+            const avail_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else @max(constraints.min_height, child.rect.height);
             moveNode(
                 child,
                 origin.x + @max(0, avail_width - child.rect.width) / 2,
@@ -425,12 +437,23 @@ fn crossExtent(comptime kind: RenderNode.Kind, child: *const RenderNode) f32 {
     };
 }
 
+/// Resizes a node in place with damage for both the vacated and the newly
+/// covered region. Returns whether the size actually changed.
+fn resizeNode(node: *RenderNode, width: f32, height: f32) bool {
+    if (node.rect.width == width and node.rect.height == height) return false;
+    node.damage = unionDamage(node.damage, node.rect);
+    node.rect.width = width;
+    node.rect.height = height;
+    node.damage = unionDamage(node.damage, node.rect);
+    return true;
+}
+
 fn setMainExtent(comptime kind: RenderNode.Kind, child: *RenderNode, value: f32) void {
-    switch (kind) {
-        .row => child.rect.width = value,
-        .column => child.rect.height = value,
+    _ = switch (kind) {
+        .row => resizeNode(child, value, child.rect.height),
+        .column => resizeNode(child, child.rect.width, value),
         else => unreachable,
-    }
+    };
 }
 
 fn layoutLinearElements(
@@ -454,6 +477,24 @@ fn layoutLinearElements(
     var cross: f32 = 0;
     var total_flex: f32 = 0;
 
+    // Mirrors Flutter's RenderFlex: intrinsic children get an unbounded
+    // main axis, and stretch turns a bounded cross axis into a tight
+    // constraint so descendants size to it before aligning their content.
+    // An unbounded cross axis cannot stretch through constraints; the
+    // positioning pass falls back to inflating to the tallest sibling.
+    const max_cross = switch (kind) {
+        .row => constraints.max_height,
+        .column => constraints.max_width,
+        else => unreachable,
+    };
+    const fill_cross = cross_align == .stretch and std.math.isFinite(max_cross);
+    const child_min_cross: f32 = if (fill_cross) max_cross else 0;
+    const intrinsic_constraints: Constraints = switch (kind) {
+        .row => .{ .max_width = std.math.inf(f32), .min_height = child_min_cross, .max_height = constraints.max_height },
+        .column => .{ .min_width = child_min_cross, .max_width = constraints.max_width, .max_height = std.math.inf(f32) },
+        else => unreachable,
+    };
+
     // Pass 1: intrinsic children establish the fixed extent; spacers and
     // flexible children only contribute their flex factors.
     for (elements, 0..) |*child_element, index| {
@@ -465,7 +506,7 @@ fn layoutLinearElements(
                     .kind = .spacer,
                     .rect = .{ .x = origin.x, .y = origin.y, .width = 0, .height = 0 },
                 });
-                spacer_node.constraints = constraints;
+                spacer_node.constraints = intrinsic_constraints;
                 children[index] = spacer_node;
             },
             .flexible => |flexible_widget| total_flex += flexible_widget.flex,
@@ -478,7 +519,7 @@ fn layoutLinearElements(
                     .{ .x = existing.rect.x, .y = existing.rect.y }
                 else
                     origin;
-                children[index] = try layoutElement(allocator, child_element, constraints, tentative_origin, measurer);
+                children[index] = try layoutElement(allocator, child_element, intrinsic_constraints, tentative_origin, measurer);
                 fixed_main += mainExtent(kind, children[index]);
                 cross = @max(cross, crossExtent(kind, children[index]));
             },
@@ -494,15 +535,18 @@ fn layoutLinearElements(
     const spare = if (bounded) @max(0, max_main - fixed_main - total_gap) else 0;
 
     // Pass 2: flexible children split the spare space in proportion to
-    // their factors. A tight fit fills its whole share even when the
-    // child lays out smaller, mirroring the cross-axis stretch mechanism.
+    // their factors. A tight fit passes the share as a tight main-axis
+    // constraint so descendants size themselves to it before aligning
+    // their own content; forcing extents after layout would leave that
+    // content aligned against the shrink-wrapped size.
     for (elements, 0..) |*child_element, index| {
         if (child_element.widget != .flexible) continue;
         const flexible_widget = child_element.widget.flexible;
         const share = if (total_flex > 0) spare * flexible_widget.flex / total_flex else 0;
+        const min_main = if (flexible_widget.fit == .tight) share else 0;
         const child_constraints: Constraints = switch (kind) {
-            .row => .{ .max_width = share, .max_height = constraints.max_height },
-            .column => .{ .max_width = constraints.max_width, .max_height = share },
+            .row => .{ .min_width = min_main, .max_width = share, .min_height = child_min_cross, .max_height = constraints.max_height },
+            .column => .{ .min_width = child_min_cross, .max_width = constraints.max_width, .min_height = min_main, .max_height = share },
             else => unreachable,
         };
         const tentative_origin: Point = if (child_element.render_node) |existing|
@@ -510,12 +554,25 @@ fn layoutLinearElements(
         else
             origin;
         children[index] = try layoutElement(allocator, child_element, child_constraints, tentative_origin, measurer);
+        // Children that ignore min constraints (e.g. bare spacers, or
+        // wrappers over them) still occupy their whole share; this is a
+        // no-op for children that honored the tight constraint.
         if (flexible_widget.fit == .tight) {
             setMainExtent(kind, children[index], share);
-            if (children[index].children.len == 1) setMainExtent(kind, children[index].children[0], share);
+            if (children[index].children.len == 1 and mainExtent(kind, children[index].children[0]) < share) {
+                setMainExtent(kind, children[index].children[0], share);
+            }
         }
         cross = @max(cross, crossExtent(kind, children[index]));
     }
+
+    // A cross-axis min constraint (e.g. from an enclosing tight fit)
+    // raises the extent children align and stretch against.
+    cross = @max(cross, switch (kind) {
+        .row => constraints.min_height,
+        .column => constraints.min_width,
+        else => unreachable,
+    });
 
     var content_main: f32 = total_gap;
     for (elements, 0..) |*child_element, index| {
@@ -527,9 +584,15 @@ fn layoutLinearElements(
     }
 
     // Flex children or a non-start alignment claim the whole main axis;
-    // otherwise the container shrink-wraps its content as before.
+    // otherwise the container shrink-wraps its content, though never
+    // below its main-axis min constraint.
+    const min_main = switch (kind) {
+        .row => constraints.min_width,
+        .column => constraints.min_height,
+        else => unreachable,
+    };
     const wants_full = bounded and (total_flex > 0 or main_align != .start);
-    const main_size = if (wants_full) max_main else content_main;
+    const main_size = if (wants_full) max_main else @max(content_main, min_main);
     const leftover = @max(0, main_size - content_main);
 
     var lead: f32 = 0;
@@ -580,11 +643,20 @@ fn layoutLinearElements(
                 else => unreachable,
             };
             moveNode(child, new_x, new_y);
-            if (cross_align == .stretch) switch (kind) {
-                .row => child.rect.height = cross,
-                .column => child.rect.width = cross,
-                else => unreachable,
-            };
+            // Stretch normally happens through tight cross constraints and
+            // this is a no-op. It still fires for an unbounded cross axis
+            // (stretching to the tallest sibling) and for children that
+            // ignore min constraints; such a parent-side mutation is not
+            // represented in the child's constraints, so it must not be
+            // cached as the child's intrinsic size.
+            if (cross_align == .stretch) {
+                const stretched = switch (kind) {
+                    .row => resizeNode(child, child.rect.width, cross),
+                    .column => resizeNode(child, cross, child.rect.height),
+                    else => unreachable,
+                };
+                if (stretched) child.needs_layout = true;
+            }
         }
 
         switch (kind) {
@@ -605,12 +677,19 @@ fn layoutLinearElements(
     });
 }
 
+/// Mirrors Flutter's `BoxConstraints.tightFor(...).enforce(parent)`: an
+/// explicit dimension is tight, and on an unspecified axis the parent's
+/// min and max pass through, each clamped into the parent's range.
 pub fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constraints {
-    const max_width = sized_widget.width orelse sized_widget.max_width orelse parent.max_width;
-    const max_height = sized_widget.height orelse sized_widget.max_height orelse parent.max_height;
+    const min_width = sized_widget.width orelse sized_widget.min_width;
+    const max_width = sized_widget.width orelse sized_widget.max_width orelse std.math.inf(f32);
+    const min_height = sized_widget.height orelse sized_widget.min_height;
+    const max_height = sized_widget.height orelse sized_widget.max_height orelse std.math.inf(f32);
     return .{
-        .max_width = @max(0, @min(parent.max_width, @max(sized_widget.min_width, max_width))),
-        .max_height = @max(0, @min(parent.max_height, @max(sized_widget.min_height, max_height))),
+        .min_width = std.math.clamp(min_width, parent.min_width, parent.max_width),
+        .max_width = std.math.clamp(max_width, parent.min_width, parent.max_width),
+        .min_height = std.math.clamp(min_height, parent.min_height, parent.max_height),
+        .max_height = std.math.clamp(max_height, parent.min_height, parent.max_height),
     };
 }
 

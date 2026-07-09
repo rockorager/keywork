@@ -295,19 +295,30 @@ pub const EdgeInsets = struct {
 pub const Constraints = struct {
     max_width: f32,
     max_height: f32,
+    min_width: f32 = 0,
+    min_height: f32 = 0,
 
     pub fn inset(self: Constraints, padding: EdgeInsets) Constraints {
         return .{
             .max_width = @max(0, self.max_width - padding.horizontal()),
             .max_height = @max(0, self.max_height - padding.vertical()),
+            .min_width = @max(0, self.min_width - padding.horizontal()),
+            .min_height = @max(0, self.min_height - padding.vertical()),
         };
     }
 
     pub fn clamp(self: Constraints, size_value: Size) Size {
+        // Max wins over min so a parent's hard bound is never exceeded.
         return .{
-            .width = @min(size_value.width, self.max_width),
-            .height = @min(size_value.height, self.max_height),
+            .width = @min(@max(size_value.width, self.min_width), self.max_width),
+            .height = @min(@max(size_value.height, self.min_height), self.max_height),
         };
+    }
+
+    /// Drops the min constraints. Containers that align their children
+    /// absorb tightness themselves and lay children out loose.
+    pub fn loosen(self: Constraints) Constraints {
+        return .{ .max_width = self.max_width, .max_height = self.max_height };
     }
 };
 

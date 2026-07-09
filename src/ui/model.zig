@@ -1129,9 +1129,13 @@ pub fn anyListRangeStale(element: *const Element) bool {
 }
 
 pub fn scrollChildConstraints(constraints: Constraints, axes: Widget.ScrollAxes) Constraints {
+    // Content is free along a scrollable axis; mins only carry across
+    // the bounded axis so tight fits still reach the content.
     return .{
         .max_width = if (axes.horizontalUnbounded()) std.math.inf(f32) else constraints.max_width,
         .max_height = if (axes.verticalUnbounded()) std.math.inf(f32) else constraints.max_height,
+        .min_width = if (axes.horizontalUnbounded()) 0 else constraints.min_width,
+        .min_height = if (axes.verticalUnbounded()) 0 else constraints.min_height,
     };
 }
 
@@ -2928,6 +2932,109 @@ test "expanded children split the spare main axis by flex factor" {
     try std.testing.expectEqual(@as(f32, 38), root.children[2].rect.x);
     // Tight fit forces the wrapped child to fill the share too.
     try std.testing.expectEqual(@as(f32, 30), root.children[1].children[0].rect.width);
+}
+
+test "tight flexible box centers its child within the whole share" {
+    const allocator = std.testing.allocator;
+
+    const inner = widgets.text("B");
+    const box: Widget = .{ .box = .{ .child = &inner, .vertical_align = .center } };
+    const expanded = try widgets.expandedFlex(allocator, box, 1);
+    defer allocator.destroy(expanded.flexible.child);
+    const children = [_]Widget{ widgets.text("A"), expanded };
+    const column = try widgets.column(allocator, &children, 0);
+    defer allocator.free(column.column.children);
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &column, .{ .max_width = 100, .max_height = 48 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // Text A is 16 tall; the box must fill the remaining 32px share at
+    // layout time so its 16px child centers in the slack instead of
+    // top-aligning against a shrink-wrapped box.
+    const flexible_node = root.children[1];
+    const box_node = flexible_node.children[0];
+    try std.testing.expectEqual(@as(f32, 32), flexible_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 32), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 16), box_node.rect.y);
+    try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
+}
+
+test "stretch lays out children with tight cross constraints" {
+    const allocator = std.testing.allocator;
+
+    const inner = widgets.text("B");
+    const box: Widget = .{ .box = .{ .child = &inner, .vertical_align = .center } };
+    const children = [_]Widget{ widgets.text("A"), box };
+    const row: Widget = .{ .row = .{ .children = &children, .gap = 0, .cross_align = .stretch } };
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 100, .max_height = 40 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 40 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // Stretch is a tight cross constraint, not a post-layout inflation:
+    // children fill the row's whole 40px cross axis, and the box centers
+    // its 16px child in the slack it knew about at alignment time.
+    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 40), root.children[0].rect.height);
+    try std.testing.expectEqual(@as(f32, 40), root.children[1].rect.height);
+    try std.testing.expectEqual(@as(f32, 12), root.children[1].children[0].rect.y);
+}
+
+test "sized passes parent min constraints through unspecified axes" {
+    const allocator = std.testing.allocator;
+
+    const inner = widgets.text("B");
+    const box: Widget = .{ .box = .{ .child = &inner, .vertical_align = .center } };
+    const sized_box = try widgets.sized(allocator, box, 50, null);
+    defer allocator.destroy(sized_box.sized.child);
+    const expanded = try widgets.expandedFlex(allocator, sized_box, 1);
+    defer allocator.destroy(expanded.flexible.child);
+    const children = [_]Widget{ widgets.text("A"), expanded };
+    const column = try widgets.column(allocator, &children, 0);
+    defer allocator.free(column.column.children);
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &column, .{ .max_width = 100, .max_height = 48 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // The sized wrapper only pins its width; the expanded 32px height min
+    // passes through it so the box still aligns against the whole share.
+    const sized_node = root.children[1].children[0];
+    const box_node = sized_node.children[0];
+    try std.testing.expectEqual(@as(f32, 50), sized_node.rect.width);
+    try std.testing.expectEqual(@as(f32, 32), sized_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 32), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
+}
+
+test "linear intrinsic children get an unbounded main axis" {
+    const allocator = std.testing.allocator;
+
+    const children = [_]Widget{widgets.text("ABCDEF")};
+    const row = try widgets.row(allocator, &children, 0);
+    defer allocator.free(row.row.children);
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 10, .max_height = 20 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 10, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    // The 48px text keeps its intrinsic size and overflows the 10px row
+    // instead of being clamped by the row's own max constraint.
+    try std.testing.expectEqual(@as(f32, 48), root.children[0].rect.width);
+    try std.testing.expectEqual(@as(f32, 10), root.rect.width);
 }
 
 test "loose flexible keeps its intrinsic size" {
