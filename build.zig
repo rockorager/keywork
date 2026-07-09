@@ -1,5 +1,6 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
+const icon_theme = @import("build/icon_theme.zig");
 const luajit = @import("build/luajit.zig");
 const nanosvg = @import("build/nanosvg.zig");
 const stb = @import("build/stb.zig");
@@ -125,7 +126,10 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const icons = icon_theme.add(b);
+
     const run_cmd = b.addRunArtifact(exe);
+    icons.attach(run_cmd);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -135,6 +139,7 @@ pub fn build(b: *std.Build) void {
 
     // Window options come from the script's keywork.window declaration.
     const run_lua_layershell_example_cmd = b.addRunArtifact(exe);
+    icons.attach(run_lua_layershell_example_cmd);
     run_lua_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
     });
@@ -146,6 +151,7 @@ pub fn build(b: *std.Build) void {
     run_lua_layershell_example_step.dependOn(&run_lua_layershell_example_cmd.step);
 
     const run_lua_vulkan_layershell_example_cmd = b.addRunArtifact(exe);
+    icons.attach(run_lua_vulkan_layershell_example_cmd);
     run_lua_vulkan_layershell_example_cmd.addArgs(&.{
         "--script=examples/lua/layershell.lua",
         "--backend=vulkan",
@@ -158,6 +164,7 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_layershell_example_step.dependOn(&run_lua_vulkan_layershell_example_cmd.step);
 
     const run_lua_bar_example_cmd = b.addRunArtifact(exe);
+    icons.attach(run_lua_bar_example_cmd);
     run_lua_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
     });
@@ -169,6 +176,7 @@ pub fn build(b: *std.Build) void {
     run_lua_bar_example_step.dependOn(&run_lua_bar_example_cmd.step);
 
     const run_lua_vulkan_bar_example_cmd = b.addRunArtifact(exe);
+    icons.attach(run_lua_vulkan_bar_example_cmd);
     run_lua_vulkan_bar_example_cmd.addArgs(&.{
         "--script=examples/lua/bar.lua",
         "--backend=vulkan",
@@ -181,6 +189,7 @@ pub fn build(b: *std.Build) void {
     run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
 
     const run_lua_shell_example_cmd = b.addRunArtifact(exe);
+    icons.attach(run_lua_shell_example_cmd);
     run_lua_shell_example_cmd.addArgs(&.{
         "--script=examples/lua/shell.lua",
     });

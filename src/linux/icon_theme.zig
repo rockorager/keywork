@@ -162,6 +162,7 @@ fn lookupInTheme(
 
     if (try lookupInHomeTheme(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
     if (try lookupInDataDirThemes(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
+    if (try lookupInExtraDataRoots(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
 
     for (inherited.items) |parent| {
         if (try lookupInTheme(allocator, name, size, parent, formats, visited, depth + 1)) |path| return path;
@@ -204,6 +205,40 @@ fn lookupInDataDirThemes(
         if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited)) |path| return path;
     }
     return null;
+}
+
+/// Data roots beyond the XDG standard set: KEYWORK_DATA_DIR (exported by
+/// `zig build run` so binaries running from the build cache find the
+/// installed keywork theme) and the share directory next to the
+/// executable's prefix (zig-out or a custom install prefix that is not
+/// listed in XDG_DATA_DIRS).
+fn lookupInExtraDataRoots(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    size: u32,
+    theme_name: []const u8,
+    formats: []const IconFormat,
+    inherited: *std.ArrayList([]u8),
+) !?IconFile {
+    if (env("KEYWORK_DATA_DIR")) |root| {
+        if (root.len != 0) {
+            if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited)) |icon| return icon;
+        }
+    }
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (exeRelativeShare(&buffer)) |root| {
+        return lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited);
+    }
+    return null;
+}
+
+fn exeRelativeShare(buffer: []u8) ?[]const u8 {
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const link_len = linux.readlink("/proc/self/exe", &link_buffer, link_buffer.len);
+    if (linux.errno(link_len) != .SUCCESS) return null;
+    const exe = link_buffer[0..link_len];
+    const bin_dir = std.fs.path.dirname(exe) orelse return null;
+    return std.fmt.bufPrint(buffer, "{s}/../share", .{bin_dir}) catch null;
 }
 
 fn lookupInDataRootTheme(
@@ -421,7 +456,7 @@ fn exists(allocator: std.mem.Allocator, path: []const u8) !bool {
 }
 
 fn preferredTheme() []const u8 {
-    return env("KEYWORK_ICON_THEME") orelse env("GTK_ICON_THEME") orelse "Adwaita";
+    return env("KEYWORK_ICON_THEME") orelse env("GTK_ICON_THEME") orelse "keywork";
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {
