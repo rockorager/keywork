@@ -159,6 +159,13 @@ pub const Backend = struct {
         return self.protocol.closed;
     }
 
+    /// Whether the toplevel is suspended (not visible), so callers can
+    /// pause presentation.
+    pub fn suspendedOpaque(ctx: *anyopaque) bool {
+        const self: *Backend = @ptrCast(@alignCast(ctx));
+        return self.protocol.suspended;
+    }
+
     fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         const protocol = &self.protocol;

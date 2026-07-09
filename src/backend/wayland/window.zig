@@ -44,6 +44,10 @@ pub const Surface = struct {
     shell_role: ShellRole,
     configured: bool = false,
     closed: bool = false,
+    /// The compositor reports the toplevel as not visible (minimized, on a
+    /// hidden workspace, or fully occluded); repainting would be wasted
+    /// work. Requires xdg-shell v6; older compositors never set it.
+    suspended: bool = false,
     width: u31,
     height: u31,
     scale: f32 = 1,
@@ -177,6 +181,7 @@ pub const Surface = struct {
             .configure => |configure| {
                 if (configure.width > 0) self.width = @intCast(configure.width);
                 if (configure.height > 0) self.height = @intCast(configure.height);
+                self.suspended = toplevelHasState(configure.states, .suspended);
             },
             .close => self.closed = true,
             .configure_bounds => {},
@@ -184,6 +189,33 @@ pub const Surface = struct {
         }
     }
 };
+
+/// Whether a toplevel configure lists `needle` in its states array. States
+/// arrive as a wl_array of u32 enum values.
+fn toplevelHasState(states: anytype, needle: xdg.Toplevel.State) bool {
+    const raw_needle: u32 = @intCast(@intFromEnum(needle));
+    for (states.slice(u32)) |state| {
+        if (state == raw_needle) return true;
+    }
+    return false;
+}
+
+test toplevelHasState {
+    const FakeStates = struct {
+        items: []const u32,
+
+        fn slice(self: @This(), comptime T: type) []const T {
+            comptime std.debug.assert(T == u32);
+            return self.items;
+        }
+    };
+    const suspended_raw: u32 = @intCast(@intFromEnum(xdg.Toplevel.State.suspended));
+    const activated_raw: u32 = @intCast(@intFromEnum(xdg.Toplevel.State.activated));
+
+    try std.testing.expect(!toplevelHasState(FakeStates{ .items = &.{} }, .suspended));
+    try std.testing.expect(!toplevelHasState(FakeStates{ .items = &.{activated_raw} }, .suspended));
+    try std.testing.expect(toplevelHasState(FakeStates{ .items = &.{ activated_raw, suspended_raw } }, .suspended));
+}
 
 const OutputRef = struct {
     global_name: u32,

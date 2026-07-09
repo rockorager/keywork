@@ -155,6 +155,11 @@ fn runWayland(
 
     var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime };
     defer queue.deinit();
+    // Layer-shell surfaces never receive xdg_toplevel suspension, so only
+    // regular toplevels pause presentation while hidden.
+    if (options.layer_shell == null) {
+        queue.suspended_query = .{ .ctx = backend, .func = Backend.suspendedOpaque };
+    }
     backend.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
     backend.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
     backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
@@ -196,7 +201,13 @@ const QueuedPlatformEvents = struct {
     allocator: std.mem.Allocator,
     runtime: *runtime_mod.Runtime,
     multi_output: ?*MultiOutputContext = null,
+    suspended_query: ?SuspendedQuery = null,
     events: std.ArrayList(Event) = .empty,
+
+    const SuspendedQuery = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque) bool,
+    };
 
     const Event = union(enum) {
         pointer_button: struct { point: keywork.Point, state: keywork.PointerButtonState },
@@ -297,6 +308,13 @@ const QueuedPlatformEvents = struct {
         // sources, so they can enqueue semantic events after the platform
         // phase. Drain those before presenting the turn's coalesced frame.
         try self.drain();
+        // While the compositor reports the toplevel suspended (minimized,
+        // hidden workspace, fully occluded), skip presentation entirely:
+        // invalidations keep coalescing into repaint_pending, and the
+        // configure that clears the state wakes the loop and flushes them.
+        if (self.suspended_query) |query| {
+            if (query.func(query.ctx)) return;
+        }
         if (self.multi_output) |multi| {
             try multi.flush();
         } else {

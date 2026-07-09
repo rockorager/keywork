@@ -265,6 +265,13 @@ pub const Backend = struct {
         return self.allClosed();
     }
 
+    /// Whether the primary toplevel is suspended (not visible), so callers
+    /// can pause presentation. Layer-shell surfaces never suspend.
+    pub fn suspendedOpaque(ctx: *anyopaque) bool {
+        const self: *Backend = @ptrCast(@alignCast(ctx));
+        return self.protocol.suspended;
+    }
+
     fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (self.allClosed()) return error.WindowClosed;
