@@ -8,6 +8,7 @@ const icon_theme = @import("../linux/icon_theme.zig");
 const lua_config = @import("config.zig");
 const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
+const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_socket = @import("socket.zig");
 const lua_value = @import("value.zig");
@@ -632,6 +633,10 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_pushcclosure(lua_state, logModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.log");
 
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, jsonModuleLoader, 1);
+    c.lua_setfield(lua_state, preload_table, "keywork.json");
+
     pop(lua_state, 2);
 }
 
@@ -674,6 +679,13 @@ fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     app.dbus_host = app.dbusHost();
     lua_dbus.pushModule(lua_state, &app.dbus_host);
+    return 1;
+}
+
+fn jsonModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    lua_json.pushModule(lua_state, &app.allocator);
     return 1;
 }
 

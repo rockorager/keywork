@@ -85,4 +85,5 @@ test {
     _ = @import("app/runner.zig");
     _ = @import("lua/app.zig");
     _ = @import("lua/coro.zig");
+    _ = @import("lua/json.zig");
 }
