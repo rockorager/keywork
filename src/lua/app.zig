@@ -267,7 +267,7 @@ pub const App = struct {
     }
 
     fn cancelScriptResources(self: *App) void {
-        for (self.fd_watches.items) |watch| watch.cancel(self.state);
+        for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state);
         for (self.processes.items) |process| process.cancel(self.state);
@@ -335,11 +335,10 @@ pub const App = struct {
         return err;
     }
 
-    fn addFdWatch(self: *App, fd: i32, events: u32, ref: c_int) !*FdWatch {
-        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+    fn addFdWatch(self: *App, fd: i32, events: u32) !*FdWatch {
         const watch = try self.allocator.create(FdWatch);
         errdefer self.allocator.destroy(watch);
-        watch.* = .{ .host = self.loopHost(), .fd = fd, .events = events, .ref = ref };
+        watch.* = .{ .host = self.loopHost(), .fd = fd, .events = events };
 
         try self.fd_watches.append(self.allocator, watch);
         errdefer _ = self.fd_watches.pop();
@@ -470,9 +469,9 @@ fn loopHostInvalidate(ptr: *anyopaque) anyerror!void {
     try runtime.invalidate();
 }
 
-fn loopHostAddFdWatch(ptr: *anyopaque, fd: i32, events: u32, ref: c_int) anyerror!*FdWatch {
+fn loopHostAddFdWatch(ptr: *anyopaque, fd: i32, events: u32) anyerror!*FdWatch {
     const app: *App = @ptrCast(@alignCast(ptr));
-    return app.addFdWatch(fd, events, ref);
+    return app.addFdWatch(fd, events);
 }
 
 fn loopHostAddFsEvent(ptr: *anyopaque, path: []const u8) anyerror!*FsEvent {
@@ -1485,6 +1484,92 @@ test "lua fs_event cancel resumes a parked reader and ends iteration" {
     var app = try App.init(allocator, script_path);
     defer app.deinit();
     try app.ensureLoaded();
+}
+
+test "lua fd watch cancel resumes a parked reader and ends iteration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // No event loop is bound, so the watch never registers and the reader
+    // parks until cancel resumes it with no value.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local watch = loop.fd(0, { read = true })
+        \\fd_stream_ended = false
+        \\local reader = loop.spawn(function()
+        \\  for _ in watch:events() do end
+        \\  fd_stream_ended = true
+        \\end)
+        \\assert(coroutine.status(reader) == "suspended")
+        \\watch:cancel()
+        \\assert(fd_stream_ended)
+        \\assert(watch:canceled())
+        \\return kw.app({ child = kw.text("fd-cancel") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fd-cancel.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fd-cancel.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua fd watch coalesces readiness and hands it to the next reader" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    // Bind-time registration primes the watch with a read event while no
+    // reader is parked; it must coalesce into pending readiness that the
+    // first next() returns without yielding.
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\watch = loop.fd({d}, {{ read = true }})
+        \\got_read = false
+        \\function start_reader()
+        \\  loop.spawn(function()
+        \\    local ev = watch:next()
+        \\    got_read = ev.read
+        \\    watch:cancel()
+        \\  end)
+        \\end
+        \\return kw.app({{ child = kw.text("fd-pending") }})
+        \\
+    , .{fds[0]});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fd-pending.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fd-pending.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    try std.testing.expectEqual(@as(usize, 1), app.fd_watches.items.len);
+    try std.testing.expect(app.fd_watches.items[0].pending != 0);
+
+    c.lua_getglobal(app.state, "start_reader");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+
+    c.lua_getglobal(app.state, "got_read");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try std.testing.expect(app.fd_watches.items[0].canceled);
 }
 
 test "lua stateful build context includes theme" {

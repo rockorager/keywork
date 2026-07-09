@@ -18,7 +18,7 @@ pub const Host = struct {
         luaState: *const fn (*anyopaque) *c.lua_State,
         eventLoop: *const fn (*anyopaque) ?*event_loop.EventLoop,
         invalidate: *const fn (*anyopaque) anyerror!void,
-        addFdWatch: *const fn (*anyopaque, i32, u32, c_int) anyerror!*FdWatch,
+        addFdWatch: *const fn (*anyopaque, i32, u32) anyerror!*FdWatch,
         addFsEvent: *const fn (*anyopaque, []const u8) anyerror!*FsEvent,
         addTimer: *const fn (*anyopaque, u64, u64, c_int) anyerror!*LuaTimer,
     };
@@ -39,8 +39,8 @@ pub const Host = struct {
         try self.vtable.invalidate(self.ptr);
     }
 
-    fn addFdWatch(self: Host, fd: i32, events: u32, ref: c_int) !*FdWatch {
-        return try self.vtable.addFdWatch(self.ptr, fd, events, ref);
+    fn addFdWatch(self: Host, fd: i32, events: u32) !*FdWatch {
+        return try self.vtable.addFdWatch(self.ptr, fd, events);
     }
 
     fn addFsEvent(self: Host, path: []const u8) !*FsEvent {
@@ -56,7 +56,11 @@ pub const FdWatch = struct {
     host: Host,
     fd: i32,
     events: u32,
-    ref: c_int,
+    reader_ref: c_int = -1,
+    /// Readiness reported while no reader was parked. Level-triggered epoll
+    /// re-reports the same readiness every wakeup, so it coalesces into one
+    /// mask instead of queueing.
+    pending: u32 = 0,
     handle_ref: c_int = -1,
     registered: bool = false,
     canceled: bool = false,
@@ -82,22 +86,27 @@ pub const FdWatch = struct {
         self.registered = false;
     }
 
-    pub fn cancel(self: *FdWatch, lua_state: *c.lua_State) void {
+    pub fn cancel(self: *FdWatch, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         if (self.registered) {
             if (self.host.eventLoop()) |loop| self.unregister(loop);
         }
-        if (self.ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
-            self.ref = -1;
-        }
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
+        self.pending = 0;
+        if (self.reader_ref < 0) return;
+        switch (mode) {
+            .resume_reader => lua_coro.resumeReaderWith(lua_state, &self.reader_ref, 0),
+            .silent => {
+                c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.reader_ref);
+                self.reader_ref = -1;
+            },
+        }
     }
 
     pub fn destroy(self: *FdWatch, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        self.cancel(lua_state);
+        self.cancel(lua_state, .silent);
         allocator.destroy(self);
     }
 };
@@ -219,22 +228,14 @@ fn hostFromLua(lua_state: *c.lua_State) Host {
 
 fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {
     const watch: *FdWatch = @ptrCast(@alignCast(ctx));
-    if (watch.canceled or watch.ref < 0) return;
-    const lua_state = watch.host.luaState();
-    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, watch.ref);
-    c.lua_pushinteger(lua_state, watch.fd);
-    c.lua_pushinteger(lua_state, @intCast(events));
-    if (c.lua_pcall(lua_state, 2, 1, 0) != 0) {
-        var len: usize = 0;
-        const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fd callback failed: {s}", .{message[0..len]});
-        pop(lua_state, 1);
-        watch.cancel(lua_state);
+    if (watch.canceled) return;
+    if (watch.reader_ref >= 0) {
+        const lua_state = watch.host.luaState();
+        pushFdEvents(lua_state, events);
+        lua_coro.resumeReaderWith(lua_state, &watch.reader_ref, 1);
         return;
     }
-    const should_invalidate = c.lua_toboolean(lua_state, -1) != 0;
-    pop(lua_state, 1);
-    if (should_invalidate) try watch.host.invalidate();
+    watch.pending |= events;
 }
 
 fn fsEventCallback(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, name: ?[]const u8) !void {
@@ -322,16 +323,15 @@ fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const host = hostFromLua(lua_state);
     const fd_int = c.luaL_checkinteger(lua_state, 1);
     if (fd_int < 0 or fd_int > std.math.maxInt(i32)) return c.luaL_error(lua_state, "invalid fd");
-    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
     var events: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
-    if (boolField(lua_state, 2, "read")) events |= linux.EPOLL.IN;
-    if (boolField(lua_state, 2, "write")) events |= linux.EPOLL.OUT;
+    if (c.lua_gettop(lua_state) >= 2 and c.lua_type(lua_state, 2) != c.LUA_TNIL) {
+        c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+        if (boolField(lua_state, 2, "read")) events |= linux.EPOLL.IN;
+        if (boolField(lua_state, 2, "write")) events |= linux.EPOLL.OUT;
+    }
     if (events == (linux.EPOLL.HUP | linux.EPOLL.ERR)) events |= linux.EPOLL.IN;
 
-    c.lua_pushvalue(lua_state, 3);
-    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-    const watch = host.addFdWatch(@intCast(fd_int), events, ref) catch |err| {
+    const watch = host.addFdWatch(@intCast(fd_int), events) catch |err| {
         std.log.scoped(.keywork_luajit).warn("loop.fd failed: {}", .{err});
         return c.luaL_error(lua_state, "loop.fd failed");
     };
@@ -364,6 +364,8 @@ const timer_methods = [_]lua_handle.Method{
 
 const fd_watch_type: [*:0]const u8 = "keywork.fd";
 const fd_watch_methods = [_]lua_handle.Method{
+    .{ .name = "next", .func = luaFdWatchNext },
+    .{ .name = "events", .func = luaFdWatchEvents },
     .{ .name = "cancel", .func = luaCancelFdWatch },
     .{ .name = "canceled", .func = luaFdWatchCanceled },
 };
@@ -398,8 +400,29 @@ fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const watch = lua_handle.resource(FdWatch, lua_state, 1, fd_watch_type) orelse return 0;
-    watch.cancel(lua_state);
+    watch.cancel(lua_state, .resume_reader);
     return 0;
+}
+
+fn luaFdWatchNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead handle ends the iteration instead of parking forever.
+    const watch = lua_handle.resource(FdWatch, lua_state, 1, fd_watch_type) orelse return 0;
+    if (watch.pending != 0) {
+        pushFdEvents(lua_state, watch.pending);
+        watch.pending = 0;
+        return 1;
+    }
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "next must be called from a coroutine (wrap the caller in loop.spawn)");
+    if (watch.reader_ref >= 0) return c.luaL_error(lua_state, "fd watch already has a waiting reader");
+    watch.reader_ref = lua_coro.refCurrentThread(lua_state);
+    return c.lua_yield(lua_state, 0);
+}
+
+fn luaFdWatchEvents(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, fd_watch_type);
+    return lua_coro.pushIterator(lua_state, luaFdWatchNext);
 }
 
 fn luaCancelFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -484,6 +507,19 @@ fn secondsToMilliseconds(seconds: f64) !u64 {
     const milliseconds = @ceil(seconds * std.time.ms_per_s);
     if (milliseconds > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.InvalidTimerInterval;
     return @intFromFloat(milliseconds);
+}
+
+fn pushFdEvents(lua_state: *c.lua_State, events: u32) void {
+    c.lua_createtable(lua_state, 0, 4);
+    const table = c.lua_gettop(lua_state);
+    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.IN != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "read");
+    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.OUT != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "write");
+    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.ERR != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "err");
+    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.HUP != 0) 1 else 0);
+    c.lua_setfield(lua_state, table, "hup");
 }
 
 fn pushFsEvent(lua_state: *c.lua_State, path: []const u8, mask: u32, name: ?[]const u8) void {
