@@ -180,6 +180,17 @@ pub fn build(b: *std.Build) void {
     const run_lua_vulkan_bar_example_step = b.step("run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example");
     run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
 
+    const run_lua_shell_example_cmd = b.addRunArtifact(exe);
+    run_lua_shell_example_cmd.addArgs(&.{
+        "--script=examples/lua/shell.lua",
+    });
+    if (b.args) |args| {
+        run_lua_shell_example_cmd.addArgs(args);
+    }
+
+    const run_lua_shell_example_step = b.step("run-lua-shell-example", "Run the Lua desktop shell example");
+    run_lua_shell_example_step.dependOn(&run_lua_shell_example_cmd.step);
+
     const test_step = b.step("test", "Run unit tests");
     const app_tests = b.addTest(.{
         .root_module = app_module,
