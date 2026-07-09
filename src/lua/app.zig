@@ -1144,6 +1144,88 @@ test "a sleeping coroutine tears down cleanly with the app" {
     // coroutine is simply dropped with the state.
 }
 
+test "lua bus:call awaits replies and reports peer errors as nil, err" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\local bus = assert(dbus.session())
+        \\
+        \\-- Awaiting on the main state is programmer misuse and raises.
+        \\local ok, err = pcall(function() return bus:call({}) end)
+        \\assert(not ok and err:find("coroutine", 1, true))
+        \\
+        \\-- A dead handle reports nil, err instead of parking forever.
+        \\local closed = assert(dbus.session())
+        \\closed:close()
+        \\local dead_reply, dead_err = closed:call({})
+        \\assert(dead_reply == nil and dead_err == "BusClosed")
+        \\
+        \\loop.spawn(function()
+        \\  local reply, call_err = bus:call({
+        \\    destination = "org.freedesktop.DBus",
+        \\    path = "/org/freedesktop/DBus",
+        \\    interface = "org.freedesktop.DBus",
+        \\    member = "GetId",
+        \\    timeout_ms = 2000,
+        \\  })
+        \\  got_id = call_err == nil and type(reply.args[1]) == "string"
+        \\  local missing, missing_err = bus:call({
+        \\    destination = "org.keywork.NoSuchService",
+        \\    path = "/",
+        \\    interface = "org.keywork.Nope",
+        \\    member = "Nope",
+        \\    timeout_ms = 2000,
+        \\  })
+        \\  got_error = missing == nil and type(missing_err) == "string"
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("dbus") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-call.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-call.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusCallTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 3000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusCallTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusCallTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "got_id");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "got_error");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+}
+
 test "lua stateful widget set_state rebuilds retained subtree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

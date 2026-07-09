@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
@@ -221,32 +222,41 @@ const ExportedObject = struct {
 
 const Call = struct {
     bus: *Bus,
+    /// Registry ref of the coroutine parked on this call, or -1 while the
+    /// call is still being armed.
     ref: c_int = -1,
     pending: ?*dbus_c.DBusPendingCall = null,
     completed: bool = false,
 
-    fn complete(self: *Call) !void {
+    /// Resumes the parked caller with the reply table, or nil and an error
+    /// name. Destroying an uncompleted call (bus close, teardown) never
+    /// resumes: the await simply never returns and the coroutine becomes
+    /// collectible once the ref is dropped.
+    fn complete(self: *Call) void {
         if (self.completed) return;
         self.completed = true;
+        if (self.ref < 0) return;
 
         const lua_state = self.bus.host.luaState();
         c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        const thread = c.lua_tothread(lua_state, -1).?;
+        pop(lua_state, 1);
 
         const reply = if (self.pending) |pending| dbus_c.dbus_pending_call_steal_reply(pending) else null;
         if (reply) |message| {
             defer dbus_c.dbus_message_unref(message);
             if (dbus_c.dbus_message_get_type(message) == dbus_c.DBUS_MESSAGE_TYPE_ERROR) {
-                c.lua_pushnil(lua_state);
-                pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_error_name(message));
-                if (c.lua_pcall(lua_state, 2, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+                c.lua_pushnil(thread);
+                pushOptionalDbusString(thread, dbus_c.dbus_message_get_error_name(message));
+                lua_coro.resumeThread(thread, 2);
             } else {
-                pushDbusReply(lua_state, message);
-                if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+                pushDbusReply(thread, message);
+                lua_coro.resumeThread(thread, 1);
             }
         } else {
-            c.lua_pushnil(lua_state);
-            c.lua_pushliteral(lua_state, "dbus call failed");
-            if (c.lua_pcall(lua_state, 2, 0, 0) != 0) return failLuaCall(lua_state, "dbus call callback failed");
+            c.lua_pushnil(thread);
+            c.lua_pushliteral(thread, "dbus call failed");
+            lua_coro.resumeThread(thread, 2);
         }
     }
 
@@ -353,9 +363,10 @@ pub const Bus = struct {
         for (self.owned_names.items) |name| name.release();
         for (self.exported_objects.items) |object| object.unexport(lua_state);
 
-        // A call whose completion callback closes this bus is already on the
-        // C stack. Leave that one for dbusCallNotify to remove after the Lua
-        // callback returns; all other pending calls can be canceled now.
+        // A call whose resumed waiter closes this bus is already on the C
+        // stack. Leave that one for dbusCallNotify to remove after the
+        // resume returns; all other pending calls can be canceled now,
+        // which drops their waiters without resuming them.
         var index: usize = 0;
         while (index < self.pending_calls.items.len) {
             const pending_call = self.pending_calls.items[index];
@@ -476,7 +487,10 @@ pub const Bus = struct {
         return null;
     }
 
-    fn call(self: *Bus, lua_state: *c.lua_State, options_index: c_int, callback_index: c_int) !void {
+    /// Sends a method call and arms its completion to resume the coroutine
+    /// behind `thread_ref`. Takes ownership of `thread_ref` even on failure.
+    fn call(self: *Bus, lua_state: *c.lua_State, options_index: c_int, thread_ref: c_int) !void {
+        errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, thread_ref);
         const destination = try stringField(lua_state, options_index, "destination");
         const path = try stringField(lua_state, options_index, "path");
         const interface = try stringField(lua_state, options_index, "interface");
@@ -491,11 +505,7 @@ pub const Bus = struct {
         const timeout_ms = getIntegerField(lua_state, options_index, "timeout_ms", 1000);
         const call_state = try self.host.allocator().create(Call);
         errdefer self.host.allocator().destroy(call_state);
-        c.lua_pushvalue(lua_state, callback_index);
-        call_state.* = .{
-            .bus = self,
-            .ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX),
-        };
+        call_state.* = .{ .bus = self };
         errdefer call_state.deinit(lua_state);
 
         var pending: ?*dbus_c.DBusPendingCall = null;
@@ -505,6 +515,9 @@ pub const Bus = struct {
         try self.pending_calls.append(self.host.allocator(), call_state);
         errdefer _ = self.removePendingCall(call_state);
         if (dbus_c.dbus_pending_call_set_notify(call_state.pending, dbusCallNotify, call_state, null) == 0) return error.OutOfMemory;
+        // The ref transfers only once nothing can fail, so the errdefer
+        // above and the call's deinit never unref twice.
+        call_state.ref = thread_ref;
         dbus_c.dbus_connection_flush(self.connection);
     }
 
@@ -725,9 +738,7 @@ pub const Bus = struct {
 
 fn dbusCallNotify(_: ?*dbus_c.DBusPendingCall, user_data: ?*anyopaque) callconv(.c) void {
     const call: *Call = @ptrCast(@alignCast(user_data orelse return));
-    call.complete() catch |err| {
-        std.log.scoped(.keywork_luajit).warn("dbus call callback failed: {}", .{err});
-    };
+    call.complete();
     _ = call.bus.removePendingCall(call);
     call.destroy(call.bus.host.allocator(), call.bus.host.luaState());
 }
@@ -858,14 +869,20 @@ fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse {
+        // An awaited call needs a distinguishable result, so a dead bus
+        // handle reports nil, err instead of the usual silent no-op.
+        c.lua_pushnil(lua_state);
+        c.lua_pushliteral(lua_state, "BusClosed");
+        return 2;
+    };
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, 3, c.LUA_TFUNCTION);
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "bus:call must be called from a coroutine (wrap the caller in loop.spawn)");
     // Sending on a disconnected bus is an expected runtime condition and
     // reports nil, err; bad options and allocation failures still raise.
-    // Method-call errors from the peer arrive asynchronously as
-    // (nil, error_name) in the callback.
-    bus.call(lua_state, 2, 3) catch |err| {
+    // Method-call errors from the peer resume the caller as nil, error_name.
+    const ref = lua_coro.refCurrentThread(lua_state);
+    bus.call(lua_state, 2, ref) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus call failed: {}", .{err});
         if (err != error.DBusCallFailed) return c.luaL_error(lua_state, "dbus call failed");
         c.lua_pushnil(lua_state);
@@ -873,7 +890,7 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
-    return 0;
+    return c.lua_yield(lua_state, 0);
 }
 
 fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
