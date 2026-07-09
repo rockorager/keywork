@@ -270,7 +270,7 @@ pub const App = struct {
         for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state);
-        for (self.processes.items) |process| process.cancel(self.state);
+        for (self.processes.items) |process| process.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
     }
 
@@ -372,9 +372,8 @@ pub const App = struct {
         return timer;
     }
 
-    fn addProcess(self: *App, spec: lua_process.SpawnSpec, callbacks: *lua_process.Callbacks) !*LuaProcess {
-        var spawned = try LuaProcess.spawn(self.processHost(), spec, callbacks.*);
-        callbacks.* = .{};
+    fn addProcess(self: *App, spec: lua_process.SpawnSpec) !*LuaProcess {
+        var spawned = try LuaProcess.spawn(self.processHost(), spec);
         var moved = false;
         errdefer if (!moved) spawned.cleanup(self.state);
 
@@ -742,18 +741,12 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
-    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
 
     const argv = lua_process.parseArgv(lua_state, app.allocator, 1) catch |err| {
         std.log.scoped(.keywork_luajit).warn("spawn argv failed: {}", .{err});
         return c.luaL_error(lua_state, "invalid spawn argv");
     };
     defer lua_process.freeArgv(app.allocator, argv);
-
-    var callbacks: lua_process.Callbacks = .{};
-    callbacks.stdout_ref = lua_process.tableFunctionRef(lua_state, 2, "stdout") catch -1;
-    callbacks.stderr_ref = lua_process.tableFunctionRef(lua_state, 2, "stderr") catch -1;
-    callbacks.exit_ref = lua_process.tableFunctionRef(lua_state, 2, "exit") catch -1;
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
@@ -762,8 +755,7 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     };
     // A missing executable or exhausted system resources are expected
     // runtime failures, so spawn reports nil, err instead of raising.
-    const process = app.addProcess(spec, &callbacks) catch |err| {
-        callbacks.unref(lua_state);
+    const process = app.addProcess(spec) catch |err| {
         std.log.scoped(.keywork_luajit).warn("process.spawn failed: {}", .{err});
         c.lua_pushnil(lua_state);
         const name = @errorName(err);
@@ -1896,6 +1888,7 @@ test "lua process spawn captures stdout and exit" {
     const script =
         \\local kw = require("keywork")
         \\local process = require("keywork.process")
+        \\local loop = require("keywork.loop")
         \\
         \\spawn_done = false
         \\spawn_output = ""
@@ -1905,15 +1898,15 @@ test "lua process spawn captures stdout and exit" {
         \\      argv = { "/usr/bin/printf", "hello" },
         \\      stdout = "pipe",
         \\      stderr = "ignore",
-        \\    }, {
-        \\      stdout = function(chunk)
-        \\        spawn_output = spawn_output .. chunk
-        \\      end,
-        \\      exit = function(result)
-        \\        spawn_done = result.ok and result.code == 0
-        \\      end,
         \\    })
         \\    local proc = self.proc
+        \\    loop.spawn(function()
+        \\      for chunk in proc:stdout() do
+        \\        spawn_output = spawn_output .. chunk
+        \\      end
+        \\      local result = proc:wait()
+        \\      spawn_done = result ~= nil and result.ok and result.code == 0
+        \\    end)
         \\    spawn_cancel = function() proc:cancel() end
         \\  end,
         \\  dispose = function(self)
@@ -1998,7 +1991,7 @@ test "lua process spawn reports a missing executable as nil, err" {
         \\local process = require("keywork.process")
         \\spawn_result, spawn_err = process.spawn({
         \\  argv = { "keywork-test-no-such-binary" },
-        \\}, {})
+        \\})
         \\return kw.app({ child = kw.text("spawn") })
         \\
     ;
@@ -2055,30 +2048,33 @@ test "lua fs_event reports a missing path as nil, err" {
     try std.testing.expectEqual(@as(usize, 0), app.fs_events.items.len);
 }
 
-test "lua process survives failed event loop bind" {
+test "lua process output produced before bind is queued for readers" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // The child writes before an event loop exists; bind-time registration
+    // drains the pipe into the stream queue, and a reader started after the
+    // bind must still receive every chunk.
     const script =
         \\local kw = require("keywork")
         \\local process = require("keywork.process")
-        \\local first_chunk = true
+        \\local loop = require("keywork.loop")
         \\spawn_done = false
-        \\process.spawn({
+        \\spawn_output = ""
+        \\proc = process.spawn({
         \\  argv = { "/usr/bin/printf", "hello" },
         \\  stdout = "pipe",
-        \\}, {
-        \\  stdout = function(chunk)
-        \\    if first_chunk then
-        \\      first_chunk = false
-        \\      error("fail initial bind")
-        \\    end
-        \\  end,
-        \\  exit = function(result)
-        \\    spawn_done = result.ok and result.code == 0
-        \\  end,
         \\})
+        \\function start_reader()
+        \\  loop.spawn(function()
+        \\    for chunk in proc:stdout() do
+        \\      spawn_output = spawn_output .. chunk
+        \\    end
+        \\    local result = proc:wait()
+        \\    spawn_done = result ~= nil and result.ok and result.code == 0
+        \\  end)
+        \\end
         \\return kw.app({ child = kw.text("spawn") })
         \\
     ;
@@ -2105,8 +2101,14 @@ test "lua process survives failed event loop bind" {
     defer app.unbindEventLoop();
     try std.testing.expect(app.event_loop != null);
     try std.testing.expect(process.registered);
+    // printf exits immediately, so bind-time drain reached EOF and queued
+    // the output with no reader parked.
     try std.testing.expect(process.stdout_pipe.fd == invalid_fd);
+    try std.testing.expect(process.stdout_pipe.stream.queue.items.len > 0);
     try std.testing.expect(process.pidfd != invalid_fd);
+
+    c.lua_getglobal(app.state, "start_reader");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
 
     const SpawnTest = struct {
         app: *App,
@@ -2126,6 +2128,10 @@ test "lua process survives failed event loop bind" {
     try loop.run();
 
     c.lua_getglobal(app.state, "spawn_done");
-    defer pop(app.state, 1);
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "spawn_output");
+    defer pop(app.state, 1);
+    const value = try stringFromStack(app.state, -1);
+    try std.testing.expectEqualStrings("hello", value);
 }

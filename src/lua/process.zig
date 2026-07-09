@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
@@ -40,41 +41,14 @@ pub const SpawnSpec = struct {
     stderr_pipe: bool,
 };
 
-pub const Callbacks = struct {
-    stdout_ref: c_int = -1,
-    stderr_ref: c_int = -1,
-    exit_ref: c_int = -1,
-
-    pub fn unref(self: *Callbacks, lua_state: *c.lua_State) void {
-        if (self.stdout_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stdout_ref);
-            self.stdout_ref = -1;
-        }
-        if (self.stderr_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stderr_ref);
-            self.stderr_ref = -1;
-        }
-        if (self.exit_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
-            self.exit_ref = -1;
-        }
-    }
-};
-
 const PipeKind = enum { stdout, stderr };
 
 const Pipe = struct {
     process: *LuaProcess = undefined,
     kind: PipeKind,
     fd: i32 = invalid_fd,
+    stream: lua_coro.Stream = .{},
     source_handle: ?event_loop.EventLoop.SourceHandle = null,
-
-    fn callbackRef(self: *Pipe) c_int {
-        return switch (self.kind) {
-            .stdout => self.process.stdout_ref,
-            .stderr => self.process.stderr_ref,
-        };
-    }
 };
 
 pub const LuaProcess = struct {
@@ -84,15 +58,15 @@ pub const LuaProcess = struct {
     pidfd_source_handle: ?event_loop.EventLoop.SourceHandle = null,
     stdout_pipe: Pipe = .{ .kind = .stdout },
     stderr_pipe: Pipe = .{ .kind = .stderr },
-    stdout_ref: c_int = -1,
-    stderr_ref: c_int = -1,
-    exit_ref: c_int = -1,
+    /// Coroutine parked in wait(), if any.
+    waiter_ref: c_int = -1,
+    exit_status: ?u32 = null,
     handle_ref: c_int = -1,
     registered: bool = false,
     canceled: bool = false,
     exited: bool = false,
 
-    pub fn spawn(host: Host, spec: SpawnSpec, callbacks: Callbacks) !LuaProcess {
+    pub fn spawn(host: Host, spec: SpawnSpec) !LuaProcess {
         const allocator = host.allocator();
         var stdout_pipe: ?[2]i32 = null;
         var stderr_pipe: ?[2]i32 = null;
@@ -132,9 +106,6 @@ pub const LuaProcess = struct {
             .host = host,
             .pid = pid,
             .pidfd = try linuxFd(linux.pidfd_open(pid, 0)),
-            .stdout_ref = callbacks.stdout_ref,
-            .stderr_ref = callbacks.stderr_ref,
-            .exit_ref = callbacks.exit_ref,
         };
         errdefer {
             if (result.pidfd != invalid_fd) _ = linux.close(result.pidfd);
@@ -176,29 +147,42 @@ pub const LuaProcess = struct {
         if (self.stderr_pipe.fd != invalid_fd) try drainPipe(&self.stderr_pipe);
     }
 
-    pub fn cancel(self: *LuaProcess, lua_state: *c.lua_State) void {
+    pub fn cancel(self: *LuaProcess, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled or self.exited) return;
         self.canceled = true;
         _ = linux.kill(self.pid, .TERM);
-        self.closeOutputFds();
-        self.clearRefs(lua_state);
+        self.closeOutputFds(lua_state, mode);
+        self.finishWaiter(lua_state, mode);
+    }
+
+    /// Resolves a parked wait() with no value (canceled or reaped
+    /// elsewhere); a normal exit resumes it with the result in complete().
+    fn finishWaiter(self: *LuaProcess, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
+        if (self.waiter_ref < 0) return;
+        switch (mode) {
+            .resume_reader => lua_coro.resumeReaderWith(lua_state, &self.waiter_ref, 0),
+            .silent => {
+                c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.waiter_ref);
+                self.waiter_ref = -1;
+            },
+        }
     }
 
     fn complete(self: *LuaProcess, lua_state: *c.lua_State, status: u32) !void {
         if (self.exited) return;
         self.exited = true;
+        self.exit_status = status;
+        // Drain before resolving the waiter so output readers observe their
+        // streams end before wait() returns.
         try drainPipe(&self.stdout_pipe);
         try drainPipe(&self.stderr_pipe);
-        if (!self.canceled and self.exit_ref >= 0) {
-            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
+        if (self.waiter_ref >= 0) {
             pushResult(lua_state, status);
-            if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
-                failLuaCall(lua_state, "process exit callback failed") catch {};
-            }
+            lua_coro.resumeReaderWith(lua_state, &self.waiter_ref, 1);
         }
     }
 
-    pub fn closeFds(self: *LuaProcess) void {
+    pub fn closeFds(self: *LuaProcess, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.host.eventLoop()) |loop| {
             self.unregister(loop);
         } else {
@@ -207,7 +191,7 @@ pub const LuaProcess = struct {
             self.stderr_pipe.source_handle = null;
             self.pidfd_source_handle = null;
         }
-        self.closeOutputFds();
+        self.closeOutputFds(lua_state, mode);
         if (self.pidfd != invalid_fd) {
             _ = linux.close(self.pidfd);
             self.pidfd = invalid_fd;
@@ -224,36 +208,9 @@ pub const LuaProcess = struct {
         self.registered = false;
     }
 
-    fn closeOutputFds(self: *LuaProcess) void {
-        if (self.host.eventLoop()) |loop| {
-            if (self.stdout_pipe.source_handle) |handle| loop.removeSource(handle);
-            if (self.stderr_pipe.source_handle) |handle| loop.removeSource(handle);
-        }
-        self.stdout_pipe.source_handle = null;
-        self.stderr_pipe.source_handle = null;
-        if (self.stdout_pipe.fd != invalid_fd) {
-            _ = linux.close(self.stdout_pipe.fd);
-            self.stdout_pipe.fd = invalid_fd;
-        }
-        if (self.stderr_pipe.fd != invalid_fd) {
-            _ = linux.close(self.stderr_pipe.fd);
-            self.stderr_pipe.fd = invalid_fd;
-        }
-    }
-
-    pub fn clearRefs(self: *LuaProcess, lua_state: *c.lua_State) void {
-        if (self.stdout_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stdout_ref);
-            self.stdout_ref = -1;
-        }
-        if (self.stderr_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.stderr_ref);
-            self.stderr_ref = -1;
-        }
-        if (self.exit_ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.exit_ref);
-            self.exit_ref = -1;
-        }
+    fn closeOutputFds(self: *LuaProcess, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
+        closePipeFd(&self.stdout_pipe, lua_state, mode);
+        closePipeFd(&self.stderr_pipe, lua_state, mode);
     }
 
     pub fn deinit(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -267,8 +224,11 @@ pub const LuaProcess = struct {
             var status: u32 = 0;
             _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
         }
-        self.closeFds();
-        self.clearRefs(lua_state);
+        self.closeFds(lua_state, .silent);
+        // Free queued output that no reader will consume.
+        self.stdout_pipe.stream.cancel(self.host.allocator(), lua_state, .silent);
+        self.stderr_pipe.stream.cancel(self.host.allocator(), lua_state, .silent);
+        self.finishWaiter(lua_state, .silent);
         // The process object is about to be freed; retained Lua handles
         // become inert no-ops from here on.
         lua_handle.invalidate(lua_state, self.handle_ref);
@@ -276,7 +236,7 @@ pub const LuaProcess = struct {
     }
 
     pub fn destroy(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        self.cancel(lua_state);
+        self.cancel(lua_state, .silent);
         if (!self.exited) {
             var status: u32 = 0;
             _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
@@ -307,21 +267,11 @@ pub fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
     allocator.free(argv);
 }
 
-pub fn tableFunctionRef(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_int {
-    c.lua_getfield(lua_state, table, key);
-    if (c.lua_isnil(lua_state, -1)) {
-        pop(lua_state, 1);
-        return -1;
-    }
-    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) {
-        pop(lua_state, 1);
-        return error.ExpectedLuaFunction;
-    }
-    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-}
-
 const process_type: [*:0]const u8 = "keywork.process";
 const process_methods = [_]lua_handle.Method{
+    .{ .name = "stdout", .func = luaStdout },
+    .{ .name = "stderr", .func = luaStderr },
+    .{ .name = "wait", .func = luaWait },
     .{ .name = "cancel", .func = luaCancel },
     .{ .name = "canceled", .func = luaCanceled },
 };
@@ -340,82 +290,65 @@ fn exitCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     if (process.exited) return;
     var status: u32 = 0;
     const result = linux.waitpid(process.pid, &status, linux.W.NOHANG);
+    const lua_state = process.host.luaState();
     switch (linux.errno(result)) {
         .SUCCESS => {},
         .CHILD => {
             // Reaped elsewhere; mark exited so a retained handle's cancel()
-            // cannot signal a reused PID.
+            // cannot signal a reused PID. The exit status is unknown, so a
+            // parked wait() resumes with no value.
             process.exited = true;
-            process.closeFds();
-            process.clearRefs(process.host.luaState());
+            process.closeFds(lua_state, .resume_reader);
+            process.finishWaiter(lua_state, .resume_reader);
             return;
         },
         else => return error.WaitPidFailed,
     }
     if (result == 0) return;
 
-    const host = process.host;
-    const lua_state = host.luaState();
     process.complete(lua_state, status) catch |err| {
-        process.closeFds();
-        process.clearRefs(lua_state);
+        process.closeFds(lua_state, .resume_reader);
         return err;
     };
-    process.closeFds();
-    process.clearRefs(lua_state);
+    process.closeFds(lua_state, .resume_reader);
 }
 
 fn drainPipe(pipe: *Pipe) !void {
     if (pipe.fd == invalid_fd) return;
+    const lua_state = pipe.process.host.luaState();
     var buffer: [4096]u8 = undefined;
-    while (true) {
+    while (pipe.fd != invalid_fd) {
         const result = linux.read(pipe.fd, &buffer, buffer.len);
         switch (linux.errno(result)) {
             .SUCCESS => {
                 if (result == 0) {
-                    closePipeFd(pipe);
+                    closePipeFd(pipe, lua_state, .resume_reader);
                     return;
                 }
-                try callChunk(pipe, buffer[0..result]);
+                c.lua_pushlstring(lua_state, &buffer, result);
+                pipe.stream.deliver(pipe.process.host.allocator(), lua_state) catch |err| {
+                    std.log.scoped(.keywork_luajit).warn("process output delivery failed: {}", .{err});
+                };
             },
             .AGAIN => return,
             else => {
-                closePipeFd(pipe);
+                closePipeFd(pipe, lua_state, .resume_reader);
                 return;
             },
         }
     }
 }
 
-fn callChunk(pipe: *Pipe, chunk: []const u8) !void {
-    const ref = pipe.callbackRef();
-    if (ref < 0 or pipe.process.canceled) return;
-    const lua_state = pipe.process.host.luaState();
-    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
-    c.lua_pushlstring(lua_state, chunk.ptr, chunk.len);
-    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
-        failLuaCall(lua_state, "process output callback failed") catch {};
-        switch (pipe.kind) {
-            .stdout => {
-                if (pipe.process.stdout_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, pipe.process.stdout_ref);
-                pipe.process.stdout_ref = -1;
-            },
-            .stderr => {
-                if (pipe.process.stderr_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, pipe.process.stderr_ref);
-                pipe.process.stderr_ref = -1;
-            },
-        }
-        closePipeFd(pipe);
-        return;
-    }
-}
-
-fn closePipeFd(pipe: *Pipe) void {
+/// Closes the pipe and ends its stream. Chunks already queued stay readable;
+/// `mode` decides whether a parked reader resumes (event/Lua context) or is
+/// dropped (bulk teardown).
+fn closePipeFd(pipe: *Pipe, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
     if (pipe.fd == invalid_fd) return;
     if (pipe.process.host.eventLoop()) |loop| if (pipe.source_handle) |handle| loop.removeSource(handle);
     pipe.source_handle = null;
     _ = linux.close(pipe.fd);
     pipe.fd = invalid_fd;
+    pipe.stream.finish(lua_state, mode);
 }
 
 fn pushResult(lua_state: *c.lua_State, status: u32) void {
@@ -435,8 +368,61 @@ fn pushResult(lua_state: *c.lua_State, status: u32) void {
 fn luaCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse return 0;
-    process.cancel(lua_state);
+    process.cancel(lua_state, .resume_reader);
     return 0;
+}
+
+fn pipeNext(lua_state: *c.lua_State, comptime kind: PipeKind) c_int {
+    // A dead handle ends the iteration instead of parking forever.
+    const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse return 0;
+    const pipe = switch (kind) {
+        .stdout => &process.stdout_pipe,
+        .stderr => &process.stderr_pipe,
+    };
+    // A closed (or never-piped) fd means no more chunks can arrive; queued
+    // chunks are still returned first by awaitNext.
+    return pipe.stream.awaitNext(lua_state, pipe.fd == invalid_fd);
+}
+
+fn luaStdoutNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pipeNext(lua_state_optional.?, .stdout);
+}
+
+fn luaStderrNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return pipeNext(lua_state_optional.?, .stderr);
+}
+
+fn luaStdout(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, process_type);
+    return lua_coro.pushIterator(lua_state, luaStdoutNext);
+}
+
+fn luaStderr(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, process_type);
+    return lua_coro.pushIterator(lua_state, luaStderrNext);
+}
+
+fn luaWait(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead or canceled handle reports nil instead of parking forever.
+    const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse {
+        c.lua_pushnil(lua_state);
+        return 1;
+    };
+    if (process.exit_status) |status| {
+        pushResult(lua_state, status);
+        return 1;
+    }
+    if (process.canceled or process.exited) {
+        c.lua_pushnil(lua_state);
+        return 1;
+    }
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "wait must be called from a coroutine (wrap the caller in loop.spawn)");
+    if (process.waiter_ref >= 0) return c.luaL_error(lua_state, "process already has a waiting reader");
+    process.waiter_ref = lua_coro.refCurrentThread(lua_state);
+    return c.lua_yield(lua_state, 0);
 }
 
 fn luaCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -543,4 +529,3 @@ const absoluteIndex = lua_value.absoluteIndex;
 const expectType = lua_value.expectType;
 const dupeStringFromStack = lua_value.dupeStringFromStack;
 const pop = lua_value.pop;
-const failLuaCall = lua_value.failLuaCall;

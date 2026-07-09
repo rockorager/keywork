@@ -103,6 +103,24 @@ pub const Stream = struct {
         return c.lua_yield(lua_state, 0);
     }
 
+    /// Marks the natural end of the stream (EOF): finishes a parked reader
+    /// according to `mode` but keeps queued values readable, so consumers
+    /// can drain what was delivered before the end. The resource's `ended`
+    /// flag passed to awaitNext terminates iteration after the queue empties.
+    pub fn finish(self: *Stream, main_state: *c.lua_State, mode: CancelMode) void {
+        if (self.reader_ref < 0) return;
+        // A parked reader implies an empty queue: deliver would have resumed
+        // it instead of queueing.
+        std.debug.assert(self.queue.items.len == 0);
+        switch (mode) {
+            .resume_reader => resumeReaderWith(main_state, &self.reader_ref, 0),
+            .silent => {
+                c.luaL_unref(main_state, c.LUA_REGISTRYINDEX, self.reader_ref);
+                self.reader_ref = -1;
+            },
+        }
+    }
+
     /// Ends the stream: drops queued values and finishes a parked reader
     /// according to `mode`. Idempotent.
     pub fn cancel(self: *Stream, allocator: std.mem.Allocator, main_state: *c.lua_State, mode: CancelMode) void {
