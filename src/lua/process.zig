@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
+const lua_sink = @import("sink.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
@@ -37,6 +38,7 @@ pub const Host = struct {
 
 pub const SpawnSpec = struct {
     argv: []const []const u8,
+    stdin_pipe: bool,
     stdout_pipe: bool,
     stderr_pipe: bool,
 };
@@ -58,6 +60,14 @@ pub const LuaProcess = struct {
     pidfd_source_handle: ?event_loop.EventLoop.SourceHandle = null,
     stdout_pipe: Pipe = .{ .kind = .stdout },
     stderr_pipe: Pipe = .{ .kind = .stderr },
+    /// Write end of the child's stdin pipe, when spawned with stdin = "pipe".
+    stdin_fd: i32 = invalid_fd,
+    /// Distinguishes "stdin was never a pipe" (write is misuse) from
+    /// "stdin was a pipe and is now closed" (write reports nil, "closed").
+    stdin_piped: bool = false,
+    /// Outgoing stdin bytes under backpressure, with the parked writer.
+    stdin_sink: lua_sink.Sink = .{},
+    stdin_source_handle: ?event_loop.EventLoop.SourceHandle = null,
     /// Coroutine parked in wait(), if any.
     waiter_ref: c_int = -1,
     exit_status: ?u32 = null,
@@ -68,8 +78,11 @@ pub const LuaProcess = struct {
 
     pub fn spawn(host: Host, spec: SpawnSpec) !LuaProcess {
         const allocator = host.allocator();
+        var stdin_pipe: ?[2]i32 = null;
         var stdout_pipe: ?[2]i32 = null;
         var stderr_pipe: ?[2]i32 = null;
+        if (spec.stdin_pipe) stdin_pipe = try createPipe();
+        errdefer if (stdin_pipe) |pipe| closePipe(pipe);
         if (spec.stdout_pipe) stdout_pipe = try createPipe();
         errdefer if (stdout_pipe) |pipe| closePipe(pipe);
         if (spec.stderr_pipe) stderr_pipe = try createPipe();
@@ -88,6 +101,10 @@ pub const LuaProcess = struct {
         }
 
         if (fork_result == 0) {
+            if (stdin_pipe) |pipe| {
+                _ = linux.close(pipe[1]);
+                dupTo(pipe[0], posix.STDIN_FILENO) catch linux.exit(127);
+            }
             if (stdout_pipe) |pipe| {
                 _ = linux.close(pipe[0]);
                 dupTo(pipe[1], posix.STDOUT_FILENO) catch linux.exit(127);
@@ -111,6 +128,15 @@ pub const LuaProcess = struct {
             if (result.pidfd != invalid_fd) _ = linux.close(result.pidfd);
         }
 
+        if (stdin_pipe) |pipe| {
+            _ = linux.close(pipe[0]);
+            result.stdin_fd = pipe[1];
+            result.stdin_piped = true;
+            errdefer {
+                if (result.stdin_fd != invalid_fd) _ = linux.close(result.stdin_fd);
+            }
+            try setNonblocking(result.stdin_fd);
+        }
         if (stdout_pipe) |pipe| {
             _ = linux.close(pipe[1]);
             result.stdout_pipe.fd = pipe[0];
@@ -141,6 +167,7 @@ pub const LuaProcess = struct {
         errdefer self.unregister(loop);
         if (self.stdout_pipe.fd != invalid_fd) self.stdout_pipe.source_handle = try loop.addFd(.{ .fd = self.stdout_pipe.fd, .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR, .ctx = &self.stdout_pipe, .callback = pipeCallback });
         if (self.stderr_pipe.fd != invalid_fd) self.stderr_pipe.source_handle = try loop.addFd(.{ .fd = self.stderr_pipe.fd, .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR, .ctx = &self.stderr_pipe, .callback = pipeCallback });
+        if (self.stdin_fd != invalid_fd) self.stdin_source_handle = try loop.addFd(.{ .fd = self.stdin_fd, .events = self.wantedStdinEvents(), .ctx = self, .callback = stdinCallback });
         self.pidfd_source_handle = try loop.addFd(.{ .fd = self.pidfd, .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR, .ctx = self, .callback = exitCallback });
         self.registered = true;
         if (self.stdout_pipe.fd != invalid_fd) try drainPipe(&self.stdout_pipe);
@@ -151,8 +178,34 @@ pub const LuaProcess = struct {
         if (self.canceled or self.exited) return;
         self.canceled = true;
         _ = linux.kill(self.pid, .TERM);
+        self.closeStdin(lua_state, mode);
         self.closeOutputFds(lua_state, mode);
         self.finishWaiter(lua_state, mode);
+    }
+
+    /// Epoll interest for the stdin write end: writability only matters
+    /// while flushing buffered bytes for a parked writer.
+    fn wantedStdinEvents(self: *const LuaProcess) u32 {
+        var events: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
+        if (self.stdin_sink.hasPending()) events |= linux.EPOLL.OUT;
+        return events;
+    }
+
+    fn updateStdinInterests(self: *LuaProcess) void {
+        const loop = self.host.eventLoop() orelse return;
+        if (self.stdin_source_handle) |handle| loop.modifySource(handle, self.wantedStdinEvents());
+    }
+
+    /// Closes the child's stdin (EOF to the child), drops unflushed bytes,
+    /// and fails a parked writer with nil, "closed". Idempotent.
+    fn closeStdin(self: *LuaProcess, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
+        if (self.stdin_fd == invalid_fd) return;
+        if (self.host.eventLoop()) |loop| if (self.stdin_source_handle) |handle| loop.removeSource(handle);
+        self.stdin_source_handle = null;
+        _ = linux.close(self.stdin_fd);
+        self.stdin_fd = invalid_fd;
+        self.stdin_sink.clear(self.host.allocator());
+        self.stdin_sink.fail(lua_state, mode, "closed");
     }
 
     /// Resolves a parked wait() with no value (canceled or reaped
@@ -189,8 +242,10 @@ pub const LuaProcess = struct {
             self.registered = false;
             self.stdout_pipe.source_handle = null;
             self.stderr_pipe.source_handle = null;
+            self.stdin_source_handle = null;
             self.pidfd_source_handle = null;
         }
+        self.closeStdin(lua_state, mode);
         self.closeOutputFds(lua_state, mode);
         if (self.pidfd != invalid_fd) {
             _ = linux.close(self.pidfd);
@@ -201,9 +256,11 @@ pub const LuaProcess = struct {
     pub fn unregister(self: *LuaProcess, loop: *event_loop.EventLoop) void {
         if (self.stdout_pipe.source_handle) |handle| loop.removeSource(handle);
         if (self.stderr_pipe.source_handle) |handle| loop.removeSource(handle);
+        if (self.stdin_source_handle) |handle| loop.removeSource(handle);
         if (self.pidfd_source_handle) |handle| loop.removeSource(handle);
         self.stdout_pipe.source_handle = null;
         self.stderr_pipe.source_handle = null;
+        self.stdin_source_handle = null;
         self.pidfd_source_handle = null;
         self.registered = false;
     }
@@ -271,6 +328,8 @@ const process_type: [*:0]const u8 = "keywork.process";
 const process_methods = [_]lua_handle.Method{
     .{ .name = "stdout", .func = luaStdout },
     .{ .name = "stderr", .func = luaStderr },
+    .{ .name = "write", .func = luaWrite },
+    .{ .name = "close_stdin", .func = luaCloseStdin },
     .{ .name = "wait", .func = luaWait },
     .{ .name = "cancel", .func = luaCancel },
     .{ .name = "canceled", .func = luaCanceled },
@@ -283,6 +342,28 @@ pub fn pushHandle(lua_state: *c.lua_State, process: *LuaProcess) void {
 fn pipeCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
     const pipe: *Pipe = @ptrCast(@alignCast(ctx));
     try drainPipe(pipe);
+}
+
+fn stdinCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {
+    const process: *LuaProcess = @ptrCast(@alignCast(ctx));
+    if (process.stdin_fd == invalid_fd) return;
+    const lua_state = process.host.luaState();
+    if (events & linux.EPOLL.OUT != 0 and process.stdin_sink.hasPending()) {
+        const flushed = process.stdin_sink.flush(process.stdin_fd) catch {
+            process.closeStdin(lua_state, .resume_reader);
+            return;
+        };
+        if (flushed) {
+            process.updateStdinInterests();
+            process.stdin_sink.resolve(lua_state);
+            if (process.stdin_fd == invalid_fd) return;
+        }
+    }
+    // ERR on a pipe write end means the child closed its stdin (or died);
+    // no write can ever succeed again.
+    if (events & (linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) {
+        process.closeStdin(lua_state, .resume_reader);
+    }
 }
 
 fn exitCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
@@ -402,6 +483,59 @@ fn luaStderr(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     _ = c.luaL_checkudata(lua_state, 1, process_type);
     return lua_coro.pushIterator(lua_state, luaStderrNext);
+}
+
+fn luaWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead or closed handle reports nil, err: writes need a
+    // distinguishable result, so this is not a silent no-op.
+    const process_or_dead = lua_handle.resource(LuaProcess, lua_state, 1, process_type);
+    var data_len: usize = 0;
+    const data_ptr = c.luaL_checklstring(lua_state, 2, &data_len).?;
+    const process = process_or_dead orelse {
+        c.lua_pushnil(lua_state);
+        c.lua_pushliteral(lua_state, "closed");
+        return 2;
+    };
+    // Writing to a process spawned without a stdin pipe can never succeed,
+    // so it is misuse rather than a runtime failure.
+    if (!process.stdin_piped) return c.luaL_error(lua_state, "process stdin is not a pipe (spawn with stdin = \"pipe\")");
+    if (process.canceled or process.stdin_fd == invalid_fd) {
+        c.lua_pushnil(lua_state);
+        c.lua_pushliteral(lua_state, "closed");
+        return 2;
+    }
+    if (process.stdin_sink.hasWaiter()) return c.luaL_error(lua_state, "process stdin already has a waiting writer");
+
+    // Fast path: write what the pipe accepts right now. A write that
+    // completes synchronously never yields, so it also works from the
+    // main state.
+    const data = data_ptr[0..data_len];
+    const written = lua_sink.writeNow(process.stdin_fd, data) catch |err| {
+        process.closeStdin(lua_state, .resume_reader);
+        c.lua_pushnil(lua_state);
+        const name = lua_sink.errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
+    };
+    if (written == data.len) {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    }
+
+    // Backpressure: buffer the remainder and park the caller until the
+    // event loop flushes it.
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "process write would block; call write from a coroutine (wrap the caller in loop.spawn)");
+    const yielded = process.stdin_sink.park(process.host.allocator(), lua_state, data[written..]) catch return c.luaL_error(lua_state, "process write failed");
+    process.updateStdinInterests();
+    return yielded;
+}
+
+fn luaCloseStdin(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const process = lua_handle.resource(LuaProcess, lua_state, 1, process_type) orelse return 0;
+    process.closeStdin(lua_state, .resume_reader);
+    return 0;
 }
 
 fn luaWait(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

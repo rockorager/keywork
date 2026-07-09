@@ -805,6 +805,7 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
+        .stdin_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdin") catch "ignore", "pipe"),
         .stdout_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
         .stderr_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
     };
@@ -2586,4 +2587,135 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     pop(app.state, 1);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), context.drained);
     try std.testing.expectEqual(@as(usize, 0), app.sockets.items[0].sink.buffer.items.len);
+}
+
+test "lua process stdin roundtrips through cat under backpressure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 1 MiB exceeds the pipe buffer, so the writer coroutine parks at spawn
+    // time (no event loop yet) and the flush happens after the loop binds.
+    const script =
+        \\local kw = require("keywork")
+        \\local process = require("keywork.process")
+        \\local loop = require("keywork.loop")
+        \\local total = 1024 * 1024
+        \\local proc = assert(process.spawn({
+        \\  argv = { "/usr/bin/cat" },
+        \\  stdin = "pipe",
+        \\  stdout = "pipe",
+        \\}))
+        \\write_ok = false
+        \\received = 0
+        \\done = false
+        \\loop.spawn(function()
+        \\  write_ok = proc:write(string.rep("x", total))
+        \\  proc:close_stdin()
+        \\end)
+        \\loop.spawn(function()
+        \\  for chunk in proc:stdout() do
+        \\    received = received + #chunk
+        \\  end
+        \\  local result = proc:wait()
+        \\  done = result ~= nil and result.ok and received == total
+        \\end)
+        \\return kw.app({ child = kw.text("stdin") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stdin-roundtrip.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stdin-roundtrip.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.processes.items.len);
+    // The writer parked with unflushed bytes buffered before the loop bound.
+    try std.testing.expect(app.processes.items[0].stdin_sink.buffer.items.len > 0);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const StdinTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: StdinTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, StdinTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "done");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "write_ok");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    try std.testing.expectEqual(invalid_fd, app.processes.items[0].stdin_fd);
+    try std.testing.expectEqual(@as(usize, 0), app.processes.items[0].stdin_sink.buffer.items.len);
+}
+
+test "lua process stdin write semantics without an event loop" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // sleep never reads stdin, so the pipe fills and a large main-state
+    // write must raise instead of parking; everything here runs
+    // synchronously at load time.
+    const script =
+        \\local kw = require("keywork")
+        \\local process = require("keywork.process")
+        \\local proc = assert(process.spawn({
+        \\  argv = { "/usr/bin/sleep", "5" },
+        \\  stdin = "pipe",
+        \\}))
+        \\-- A small write completes synchronously even on the main state.
+        \\assert(proc:write("hello"))
+        \\local ok, err = pcall(proc.write, proc, string.rep("x", 4 * 1024 * 1024))
+        \\main_write_raised = not ok and err:find("coroutine", 1, true) ~= nil
+        \\proc:close_stdin()
+        \\proc:close_stdin() -- idempotent
+        \\local ok2, err2 = proc:write("late")
+        \\closed_write = ok2 == nil and err2 == "closed"
+        \\-- Writing to a process spawned without stdin = "pipe" is misuse.
+        \\local proc2 = assert(process.spawn({ argv = { "/usr/bin/sleep", "5" } }))
+        \\local ok3, err3 = pcall(proc2.write, proc2, "data")
+        \\nopipe_raised = not ok3 and err3:find("stdin", 1, true) ~= nil
+        \\proc2:close_stdin() -- no-op without a stdin pipe
+        \\proc:cancel()
+        \\proc2:cancel()
+        \\-- write on a canceled (dead) handle reports nil, err.
+        \\local ok4, err4 = proc:write("dead")
+        \\dead_write = ok4 == nil and err4 == "closed"
+        \\return kw.app({ child = kw.text("stdin-sync") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stdin-sync.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stdin-sync.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    for ([_][:0]const u8{ "main_write_raised", "closed_write", "nopipe_raised", "dead_write" }) |global| {
+        c.lua_getglobal(app.state, global.ptr);
+        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
+            std.debug.print("failed global: {s}\n", .{global});
+            return err;
+        };
+        pop(app.state, 1);
+    }
 }
