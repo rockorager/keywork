@@ -1033,6 +1033,117 @@ test "timer callback errors cancel only the timer" {
     try std.testing.expect(app.timers.items[0].canceled);
 }
 
+test "lua loop.spawn awaits loop.sleep" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\order = ""
+        \\loop.spawn(function()
+        \\  order = order .. "a"
+        \\  loop.sleep(1)
+        \\  order = order .. "c"
+        \\end)
+        \\order = order .. "b"
+        \\return kw.app({ child = kw.text("sleep") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    // The spawned coroutine runs synchronously until the sleep parks it.
+    c.lua_getglobal(app.state, "order");
+    try std.testing.expectEqualStrings("ab", try stringFromStack(app.state, -1));
+    pop(app.state, 1);
+    try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
+    try std.testing.expect(app.timers.items[0].waiter);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const SleepTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "order");
+            const done = std.mem.eql(u8, stringFromStack(self.app.state, -1) catch "", "abc");
+            pop(self.app.state, 1);
+            if (done or self.ticks > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: SleepTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, SleepTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "order");
+    defer pop(app.state, 1);
+    try std.testing.expectEqualStrings("abc", try stringFromStack(app.state, -1));
+    // The waiter timer is one-shot and spends itself after resuming.
+    try std.testing.expect(app.timers.items[0].canceled);
+}
+
+test "loop.sleep on the main state raises" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local ok, err = pcall(loop.sleep, 1)
+        \\assert(not ok)
+        \\assert(err:find("coroutine", 1, true))
+        \\return kw.app({ child = kw.text("main") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep-main.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep-main.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 0), app.timers.items.len);
+}
+
+test "a sleeping coroutine tears down cleanly with the app" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\loop.spawn(function() loop.sleep(3600000) end)
+        \\return kw.app({ child = kw.text("sleep") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep-teardown.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep-teardown.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
+    try std.testing.expect(!app.timers.items[0].canceled);
+    // deinit cancels the waiter timer without resuming; the parked
+    // coroutine is simply dropped with the state.
+}
+
 test "lua stateful widget set_state rebuilds retained subtree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

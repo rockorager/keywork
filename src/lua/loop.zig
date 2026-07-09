@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
@@ -148,8 +149,15 @@ pub const LuaTimer = struct {
     host: Host,
     delay_ms: u64,
     interval_ms: u64,
+    /// Registry ref of the callback function, or of the parked coroutine
+    /// when this timer backs a loop.sleep.
     ref: c_int,
     handle_ref: c_int = -1,
+    /// A waiter timer resumes the coroutine behind `ref` instead of calling
+    /// a function. Cancelling one without firing (app teardown) drops the
+    /// ref without resuming, so the sleep simply never returns and the
+    /// coroutine becomes collectible.
+    waiter: bool = false,
     timer: ?*event_loop.EventLoop.Timer = null,
     registered: bool = false,
     canceled: bool = false,
@@ -198,6 +206,11 @@ pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Ho
     c.lua_pushlightuserdata(lua_state, host);
     c.lua_pushcclosure(lua_state, luaFsEvent, 1);
     c.lua_setfield(lua_state, loop_table, "fs_event");
+    c.lua_pushcclosure(lua_state, lua_coro.luaSpawn, 0);
+    c.lua_setfield(lua_state, loop_table, "spawn");
+    c.lua_pushlightuserdata(lua_state, host);
+    c.lua_pushcclosure(lua_state, luaSleep, 1);
+    c.lua_setfield(lua_state, loop_table, "sleep");
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
@@ -248,6 +261,18 @@ fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64)
     const timer: *LuaTimer = @ptrCast(@alignCast(ctx));
     if (timer.canceled or timer.ref < 0 or expirations == 0) return;
     const lua_state = timer.host.luaState();
+    if (timer.waiter) {
+        std.debug.assert(timer.interval_ms == 0);
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, timer.ref);
+        const thread = c.lua_tothread(lua_state, -1).?;
+        pop(lua_state, 1);
+        // Resume before cancel: the timer's ref is what anchors the parked
+        // coroutine against collection, and cancel drops it. If the resumed
+        // code awaits again, the new resource takes its own ref.
+        lua_coro.resumeThread(thread, 0);
+        timer.cancel(lua_state);
+        return;
+    }
     c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, timer.ref);
     c.lua_pushinteger(lua_state, @intCast(expirations));
     if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
@@ -280,6 +305,26 @@ fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     };
     pushTimerHandle(lua_state, timer);
     return 1;
+}
+
+/// loop.sleep(ms) parks the calling coroutine on a one-shot waiter timer;
+/// the timer's expiry resumes it. Only coroutines can sleep, so calling
+/// from the main state is programmer misuse and raises.
+fn luaSleep(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const host = hostFromLua(lua_state);
+    const duration = c.luaL_checknumber(lua_state, 1);
+    if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "loop.sleep must be called from a coroutine (wrap the caller in loop.spawn)");
+    const delay_ms = millisecondsFromNumber(duration) catch return c.luaL_error(lua_state, "invalid sleep duration");
+
+    const ref = lua_coro.refCurrentThread(lua_state);
+    const timer = host.addTimer(delay_ms, 0, ref) catch |err| {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        std.log.scoped(.keywork_luajit).warn("loop.sleep failed: {}", .{err});
+        return c.luaL_error(lua_state, "loop.sleep failed");
+    };
+    timer.waiter = true;
+    return c.lua_yield(lua_state, 0);
 }
 
 fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -424,6 +469,13 @@ fn fsEventPath(lua_state: *c.lua_State, index: c_int) ![]const u8 {
     const absolute = absoluteIndex(lua_state, index);
     if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) return try stringField(lua_state, absolute, "path");
     return try stringFromStack(lua_state, absolute);
+}
+
+fn millisecondsFromNumber(milliseconds: f64) !u64 {
+    if (!std.math.isFinite(milliseconds) or milliseconds <= 0) return error.InvalidTimerInterval;
+    const whole = @ceil(milliseconds);
+    if (whole > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.InvalidTimerInterval;
+    return @intFromFloat(whole);
 }
 
 fn secondsToMilliseconds(seconds: f64) !u64 {

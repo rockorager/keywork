@@ -84,4 +84,5 @@ test {
     _ = @import("app/application.zig");
     _ = @import("app/runner.zig");
     _ = @import("lua/app.zig");
+    _ = @import("lua/coro.zig");
 }
