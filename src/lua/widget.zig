@@ -90,6 +90,14 @@ const FocusOptions = struct {
     can_request_focus: bool = true,
 };
 
+const PopupOptions = struct {
+    edge: keywork.Widget.PopupPlacement.Edge = .bottom,
+    alignment: keywork.Widget.Alignment = .start,
+    gap: f32 = 0,
+    width: ?f32 = null,
+    height: ?f32 = null,
+};
+
 const FocusScopeOptions = struct {
     modal: bool = false,
 };
@@ -457,6 +465,64 @@ const LuaStatefulState = struct {
     dirty: bool = false,
 };
 
+/// Popup content held as a registry ref: either a widget table parsed as-is
+/// on every popup build, or a function called with the popup's runtime
+/// state that returns one.
+const LuaPopupBuilder = struct {
+    allocator: std.mem.Allocator,
+    host: Host,
+    lua_state: *c.lua_State,
+    content_ref: c_int,
+    parse_context: ParseContext,
+
+    fn popupBuilder(self: *LuaPopupBuilder) keywork.Widget.PopupBuilder {
+        return .{
+            .ptr = self,
+            .build_fn = buildContent,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn buildContent(ptr: *const anyopaque, scope: *BuildScope, context: keywork.Widget.BuildContext) anyerror!keywork.Widget {
+        const self: *const LuaPopupBuilder = @ptrCast(@alignCast(ptr));
+        if (self.content_ref < 0) return error.LuaPopupBuilderAlreadyMoved;
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
+        if (c.lua_isfunction(self.lua_state, -1)) {
+            pushRuntimeState(self.lua_state, context.app_context);
+            if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "popup build failed");
+        }
+        defer pop(self.lua_state, 1);
+        return try parse(self.host, self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
+    }
+
+    /// Transfers the registry ref like LuaCallback.clone: parse-tree
+    /// builders are moved into the element tree, not shared.
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
+        const self: *LuaPopupBuilder = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.content_ref < 0) return error.LuaPopupBuilderAlreadyMoved;
+        const content_ref = try cloneRegistryRef(self.lua_state, self.content_ref);
+        errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, content_ref);
+        c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
+        self.content_ref = -2;
+        const result = try allocator.create(LuaPopupBuilder);
+        result.* = .{
+            .allocator = allocator,
+            .host = self.host,
+            .lua_state = self.lua_state,
+            .content_ref = content_ref,
+            .parse_context = self.parse_context,
+        };
+        return result;
+    }
+
+    fn destroy(_: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *LuaPopupBuilder = @ptrCast(@alignCast(@constCast(ptr)));
+        if (self.content_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
+        self.allocator.destroy(self);
+    }
+};
+
 pub fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_createtable(lua_state, 0, 3);
     const table = c.lua_gettop(lua_state);
@@ -579,6 +645,53 @@ pub fn parse(
             .on_tap_up = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_up"),
             .on_tap_cancel = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_cancel"),
             .hover_style = options.hoverStyle(),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "anchored")) {
+        const id = try dupeStringField(lua_state, allocator, table, "id");
+        const child = try allocator.create(keywork.Widget);
+        {
+            c.lua_getfield(lua_state, table, "child");
+            defer pop(lua_state, 1);
+            child.* = try parse(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
+        }
+
+        c.lua_getfield(lua_state, table, "popup");
+        defer pop(lua_state, 1);
+        if (c.lua_isnil(lua_state, -1)) {
+            return .{ .anchored = .{ .id = id, .child = child, .popup = null } };
+        }
+        const popup_table = absoluteIndex(lua_state, -1);
+        try expectType(lua_state, popup_table, c.LUA_TTABLE);
+        const options = try lua_codec.decode(PopupOptions, lua_state, popup_table, allocator);
+
+        c.lua_getfield(lua_state, popup_table, "content");
+        if (c.lua_isnil(lua_state, -1)) {
+            pop(lua_state, 1);
+            return error.PopupContentMissing;
+        }
+        const content_ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+        errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, content_ref);
+        const builder = try callback_allocator.create(LuaPopupBuilder);
+        builder.* = .{
+            .allocator = callback_allocator,
+            .host = host,
+            .lua_state = lua_state,
+            .content_ref = content_ref,
+            .parse_context = parse_context,
+        };
+        const on_close = try getOptionalCallbackField(lua_state, callback_allocator, popup_table, "on_close");
+
+        return .{ .anchored = .{
+            .id = id,
+            .child = child,
+            .popup = .{
+                .builder = builder.popupBuilder(),
+                .placement = .{ .edge = options.edge, .alignment = options.alignment, .gap = options.gap },
+                .width = options.width,
+                .height = options.height,
+                .on_close = on_close,
+            },
         } };
     }
     if (std.mem.eql(u8, kind, "focus")) {

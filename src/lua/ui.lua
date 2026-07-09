@@ -529,6 +529,35 @@ function ui.gesture(options)
   }
 end
 
+--- Declares that a popup may hang off this widget's laid-out rect. The
+--- child renders inline; when `popup` is set (see ui.popup) the runtime
+--- realizes it as a separate surface anchored to this widget. Popup
+--- existence is state-driven: builds that omit `popup` dismiss it.
+function ui.anchored(options)
+  return {
+    type = "anchored",
+    id = options.id,
+    child = options.child,
+    popup = options.popup,
+  }
+end
+
+--- Popup declaration for ui.anchored. `content` is a widget table, or a
+--- function receiving the popup's runtime state and returning one.
+--- `on_close` fires when the compositor dismisses the popup (for example
+--- a click elsewhere), so app state can stop declaring it.
+function ui.popup(options)
+  return {
+    content = options.content,
+    edge = options.edge,
+    alignment = options.alignment,
+    gap = options.gap,
+    width = options.width,
+    height = options.height,
+    on_close = options.on_close,
+  }
+end
+
 function ui.focus(options)
   options = options or {}
   return {
