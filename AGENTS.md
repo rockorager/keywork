@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Read VISION.md for what Keywork is and its design priorities.
+
 ## Zig Development
 
 Use `zigdoc` to discover current APIs for the Zig standard library and any third-party dependencies before coding.
