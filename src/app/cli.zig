@@ -58,6 +58,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
             result.height = std.fmt.parseFloat(f32, arg["--height=".len..]) catch result.height;
         } else if (std.mem.startsWith(u8, arg, "--script=")) {
             result.script_path = arg["--script=".len..];
+            script_seen = true;
         }
     }
     if (result.script_path.len == 0) return error.MissingScriptPath;
