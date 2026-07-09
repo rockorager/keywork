@@ -18,6 +18,7 @@ pub fn buildScope(self: anytype, state: @TypeOf(self.*).State) keywork.BuildScop
         .theme = keywork.Theme.fromColorScheme(state.color_scheme),
         .interaction = .{ .hovered_id = self.hovered_id, .pressed_id = self.pressed_id, .focused_id = self.focused_id },
         .app_context = state,
+        .render_scale = self.renderScale(),
     };
 }
 

@@ -566,6 +566,9 @@ pub const BuildScope = struct {
     interaction: InteractionState = .{},
     actions: ?*const ActionScope = null,
     app_context: AppContext = .{},
+    /// Render scale of the runtime driving this build, so scale-dependent
+    /// asset choices (e.g. icon rasterization) match the target window.
+    render_scale: f32 = 1,
 };
 
 pub const ActionScope = struct {

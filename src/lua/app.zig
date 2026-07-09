@@ -180,14 +180,10 @@ pub const App = struct {
         return false;
     }
 
-    pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State) !keywork.Widget {
+    pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State, render_scale: f32) !keywork.Widget {
         try self.ensureLoaded();
 
-        const icon_scale: f32 = blk: {
-            const runtime = self.runtime orelse break :blk 1;
-            const value = runtime.renderScale();
-            break :blk if (std.math.isFinite(value) and value > 0) value else 1;
-        };
+        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
 
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
@@ -324,7 +320,7 @@ pub const App = struct {
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
         const self: *App = @ptrCast(@alignCast(ptr));
-        return self.buildWidget(scope.allocator, runtime_state);
+        return self.buildWidget(scope.allocator, runtime_state, scope.render_scale);
     }
 
     fn widgetHost(self: *App) lua_widget.Host {
