@@ -38,6 +38,41 @@ pub const UiColorScheme = enum {
     }
 };
 
+/// Rebuild-request interface an app host holds instead of a concrete
+/// runtime, so hosts work unchanged whether one runtime or a whole
+/// window set sits behind it.
+pub const Invalidator = struct {
+    ptr: *anyopaque,
+    invalidate_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    invalidate_state_fn: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn invalidate(self: Invalidator) !void {
+        try self.invalidate_fn(self.ptr);
+    }
+
+    pub fn invalidateState(self: Invalidator) !void {
+        try self.invalidate_state_fn(self.ptr);
+    }
+
+    pub fn fromRuntime(runtime: *Runtime) Invalidator {
+        return .{
+            .ptr = runtime,
+            .invalidate_fn = runtimeInvalidate,
+            .invalidate_state_fn = runtimeInvalidateState,
+        };
+    }
+
+    fn runtimeInvalidate(ptr: *anyopaque) anyerror!void {
+        const runtime: *Runtime = @ptrCast(@alignCast(ptr));
+        try runtime.invalidate();
+    }
+
+    fn runtimeInvalidateState(ptr: *anyopaque) anyerror!void {
+        const runtime: *Runtime = @ptrCast(@alignCast(ptr));
+        try runtime.invalidateState();
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     backend: RenderBackend,
