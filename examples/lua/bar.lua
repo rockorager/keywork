@@ -7,9 +7,6 @@ local bit = require("bit")
 
 local has_unix_socket, unix_socket = pcall(require, "socket.unix")
 
-local EPOLLIN = 1
-local EPOLLERR = 8
-local EPOLLHUP = 16
 local IPC_COMMAND = 0
 local IPC_GET_WORKSPACES = 1
 local IPC_SUBSCRIBE = 2
@@ -174,13 +171,16 @@ local function connect_sway(on_change)
     connected = true,
   }
 
-  client.watch = loop.fd(client.fd, { read = true }, function(_, events)
-    if bit.band(events, bit.bor(EPOLLERR, EPOLLHUP)) ~= 0 then
-      client.connected = false
-    end
-    if bit.band(events, EPOLLIN) ~= 0 then
-      if drain_sway(client) then
-        on_change()
+  client.watch = loop.fd(client.fd, { read = true })
+  loop.spawn(function()
+    for ev in client.watch:events() do
+      if ev.err or ev.hup then
+        client.connected = false
+      end
+      if ev.read then
+        if drain_sway(client) then
+          on_change()
+        end
       end
     end
   end)
@@ -190,25 +190,31 @@ local function connect_sway(on_change)
 end
 
 local function capture(argv, callback)
-  local stdout = {}
-  local stderr = {}
-  return process.spawn({
+  local proc = process.spawn({
     argv = argv,
     stdout = "pipe",
     stderr = "pipe",
-  }, {
-    stdout = function(chunk)
+  })
+  if not proc then
+    return nil
+  end
+  loop.spawn(function()
+    local stdout = {}
+    for chunk in proc:stdout() do
       table.insert(stdout, chunk)
-    end,
-    stderr = function(chunk)
+    end
+    local stderr = {}
+    for chunk in proc:stderr() do
       table.insert(stderr, chunk)
-    end,
-    exit = function(result)
+    end
+    local result = proc:wait()
+    if result then
       result.stdout = table.concat(stdout)
       result.stderr = table.concat(stderr)
       callback(result)
-    end,
-  })
+    end
+  end)
+  return proc
 end
 
 local function label(value, palette, color)
@@ -426,14 +432,15 @@ local function create_tray_host(on_change)
   end
 
   function host:read_item(item)
-    self.bus:call({
-      destination = item.service,
-      path = item.path,
-      interface = DBUS_PROPERTIES,
-      member = "GetAll",
-      args = { dbus.string(SNI_ITEM) },
-      timeout_ms = 1000,
-    }, function(reply, err)
+    loop.spawn(function()
+      local reply, err = self.bus:call({
+        destination = item.service,
+        path = item.path,
+        interface = DBUS_PROPERTIES,
+        member = "GetAll",
+        args = { dbus.string(SNI_ITEM) },
+        timeout_ms = 1000,
+      })
       if not reply then
         log.warn("tray item GetAll failed", item.id, err or "unknown")
         self:remove_item(item.id)
@@ -474,14 +481,17 @@ local function create_tray_host(on_change)
       sender = service,
       path = path,
       interface = SNI_ITEM,
-    }, function(signal)
-      if signal.member == "NewTitle"
-        or signal.member == "NewIcon"
-        or signal.member == "NewAttentionIcon"
-        or signal.member == "NewOverlayIcon"
-        or signal.member == "NewToolTip"
-        or signal.member == "NewStatus" then
-        self:read_item(item)
+    })
+    loop.spawn(function()
+      for signal in item.signal_sub:events() do
+        if signal.member == "NewTitle"
+          or signal.member == "NewIcon"
+          or signal.member == "NewAttentionIcon"
+          or signal.member == "NewOverlayIcon"
+          or signal.member == "NewToolTip"
+          or signal.member == "NewStatus" then
+          self:read_item(item)
+        end
       end
     end)
 
@@ -490,18 +500,20 @@ local function create_tray_host(on_change)
       path = path,
       interface = DBUS_PROPERTIES,
       member = "PropertiesChanged",
-    }, function(signal)
-      if (signal.args or {})[1] ~= SNI_ITEM then
-        return
+    })
+    loop.spawn(function()
+      for signal in item.properties_sub:events() do
+        if (signal.args or {})[1] == SNI_ITEM then
+          local changed = dbus_entries_to_table((signal.args or {})[2] or {})
+          if changed.Status ~= nil then item.status = changed.Status end
+          if changed.IconName ~= nil then item.icon_name = changed.IconName end
+          if changed.IconPixmap ~= nil then item.icon_pixmap = changed.IconPixmap end
+          if changed.Title ~= nil then item.title = changed.Title end
+          if changed.ToolTip ~= nil then item.tooltip = changed.ToolTip end
+          if changed.Menu ~= nil then item.menu = changed.Menu end
+          self:changed()
+        end
       end
-      local changed = dbus_entries_to_table((signal.args or {})[2] or {})
-      if changed.Status ~= nil then item.status = changed.Status end
-      if changed.IconName ~= nil then item.icon_name = changed.IconName end
-      if changed.IconPixmap ~= nil then item.icon_pixmap = changed.IconPixmap end
-      if changed.Title ~= nil then item.title = changed.Title end
-      if changed.ToolTip ~= nil then item.tooltip = changed.ToolTip end
-      if changed.Menu ~= nil then item.menu = changed.Menu end
-      self:changed()
     end)
 
     self:read_item(item)
@@ -529,14 +541,15 @@ local function create_tray_host(on_change)
   end
 
   function host:activate(item)
-    self.bus:call({
-      destination = item.service,
-      path = item.path,
-      interface = SNI_ITEM,
-      member = "Activate",
-      args = { dbus.int32(0), dbus.int32(0) },
-      timeout_ms = 1000,
-    }, function(reply, err)
+    loop.spawn(function()
+      local reply, err = self.bus:call({
+        destination = item.service,
+        path = item.path,
+        interface = SNI_ITEM,
+        member = "Activate",
+        args = { dbus.int32(0), dbus.int32(0) },
+        timeout_ms = 1000,
+      })
       if not reply then
         log.warn("tray item Activate failed", item.id, err or "unknown")
       end
@@ -615,17 +628,19 @@ local function create_tray_host(on_change)
     path = "/org/freedesktop/DBus",
     interface = DBUS,
     member = "NameOwnerChanged",
-  }, function(signal)
-    local args = signal.args or {}
-    local name = args[1]
-    local old_owner = args[2]
-    local new_owner = args[3]
-    if old_owner == "" or new_owner ~= "" then
-      return
-    end
-    for id, item in pairs(host.items) do
-      if item.service == name or item.service == old_owner then
-        host:remove_item(id)
+  })
+  loop.spawn(function()
+    for signal in host.owner_sub:events() do
+      local args = signal.args or {}
+      local name = args[1]
+      local old_owner = args[2]
+      local new_owner = args[3]
+      if old_owner ~= "" and new_owner == "" then
+        for id, item in pairs(host.items) do
+          if item.service == name or item.service == old_owner then
+            host:remove_item(id)
+          end
+        end
       end
     end
   end)
@@ -765,13 +780,18 @@ local StatusItems = kw.stateful({
       return
     end
 
-    local buffer = ""
     self.volume_sub = process.spawn({
       argv = { "pactl", "subscribe" },
       stdout = "pipe",
       stderr = "pipe",
-    }, {
-      stdout = function(chunk)
+    })
+    if not self.volume_sub then
+      return
+    end
+    local proc = self.volume_sub
+    loop.spawn(function()
+      local buffer = ""
+      for chunk in proc:stdout() do
         buffer = buffer .. chunk
         while true do
           local newline = buffer:find("\n", 1, true)
@@ -790,14 +810,13 @@ local StatusItems = kw.stateful({
             end)
           end
         end
-      end,
-      exit = function(result)
-        self.volume_sub = nil
-        if not result.ok then
-          log.warn("volume subscribe exited")
-        end
-      end,
-    })
+      end
+      local result = proc:wait()
+      self.volume_sub = nil
+      if not (result and result.ok) then
+        log.warn("volume subscribe exited")
+      end
+    end)
   end,
 
   update_network = function(self)
@@ -836,27 +855,32 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
     self.network_bus = bus
     self.network_sub = bus:subscribe({
       path_namespace = "/org/freedesktop/NetworkManager",
-    }, function(signal)
-      if signal.member == "PropertiesChanged"
-        or signal.member == "StateChanged"
-        or signal.member == "DeviceAdded"
-        or signal.member == "DeviceRemoved" then
-        self:set_state(function(state)
-          state:update_network()
-        end)
+    })
+    local sub = self.network_sub
+    loop.spawn(function()
+      for signal in sub:events() do
+        if signal.member == "PropertiesChanged"
+          or signal.member == "StateChanged"
+          or signal.member == "DeviceAdded"
+          or signal.member == "DeviceRemoved" then
+          self:set_state(function(state)
+            state:update_network()
+          end)
+        end
       end
     end)
   end,
 
   read_upower_properties = function(self, path)
-    self.battery_bus:call({
-      destination = UPOWER,
-      path = path,
-      interface = DBUS_PROPERTIES,
-      member = "GetAll",
-      args = { UPOWER_DEVICE },
-      timeout_ms = 1000,
-    }, function(reply, err)
+    loop.spawn(function()
+      local reply, err = self.battery_bus:call({
+        destination = UPOWER,
+        path = path,
+        interface = DBUS_PROPERTIES,
+        member = "GetAll",
+        args = { UPOWER_DEVICE },
+        timeout_ms = 1000,
+      })
       if not reply then
         log.warn("battery dbus properties failed", err or path)
         return
@@ -901,13 +925,14 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       return
     end
     self:read_upower_properties("/org/freedesktop/UPower/devices/DisplayDevice")
-    self.battery_bus:call({
-      destination = UPOWER,
-      path = "/org/freedesktop/UPower",
-      interface = UPOWER,
-      member = "EnumerateDevices",
-      timeout_ms = 1000,
-    }, function(reply, err)
+    loop.spawn(function()
+      local reply, err = self.battery_bus:call({
+        destination = UPOWER,
+        path = "/org/freedesktop/UPower",
+        interface = UPOWER,
+        member = "EnumerateDevices",
+        timeout_ms = 1000,
+      })
       if not reply then
         log.warn("battery dbus enumerate failed", err or "unknown")
         return
@@ -939,16 +964,19 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
       local sub_ok, sub = pcall(function()
         return bus:subscribe({
           path_namespace = "/org/freedesktop/UPower",
-        }, function(signal)
-          if signal.member == "PropertiesChanged" or signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" or signal.member == "Changed" then
-            self:set_state(function(state)
-              state:apply_battery_signal(signal)
-            end)
-          end
-        end)
+        })
       end)
       if sub_ok then
         self.battery_sub = sub
+        loop.spawn(function()
+          for signal in sub:events() do
+            if signal.member == "PropertiesChanged" or signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" or signal.member == "Changed" then
+              self:set_state(function(state)
+                state:apply_battery_signal(signal)
+              end)
+            end
+          end
+        end)
       else
         log.warn("battery dbus subscribe failed")
         self.battery_bus:close()
