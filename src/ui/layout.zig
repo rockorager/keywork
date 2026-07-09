@@ -228,6 +228,15 @@ fn layoutElementInto(
                 .click_activation = clickable_widget.activation,
             });
         },
+        .anchored => {
+            const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
+            const children = try ensureChildSlice(allocator, node, 1);
+            children[0] = child;
+            commitRenderNode(node, .{
+                .kind = .anchored,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = child.rect.width, .height = child.rect.height },
+            });
+        },
         .focus => |focus_widget| {
             const child = try layoutElement(allocator, &element.children[0], constraints, origin, measurer);
             const children = try ensureChildSlice(allocator, node, 1);

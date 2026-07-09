@@ -33,6 +33,7 @@ pub const Widget = union(enum) {
     text: Text,
     box: Box,
     clickable: Clickable,
+    anchored: Anchored,
     focus: Focus,
     focus_scope: FocusScope,
     scroll: Scroll,
@@ -120,6 +121,91 @@ pub const Widget = union(enum) {
     pub const ClickActivation = enum {
         release,
         press,
+    };
+
+    /// Declares that a popup surface may hang off this widget's laid-out
+    /// rect. The inline child renders normally; when `popup` is non-null
+    /// the host is expected to realize it as a separate surface anchored
+    /// to this widget. Popup existence is state-driven: builds that omit
+    /// `popup` dismiss it.
+    pub const Anchored = struct {
+        id: []const u8,
+        child: *const Widget,
+        popup: ?Popup = null,
+    };
+
+    pub const Popup = struct {
+        builder: PopupBuilder,
+        placement: PopupPlacement = .{},
+        /// Explicit size overrides; content is measured when null.
+        width: ?f32 = null,
+        height: ?f32 = null,
+        /// Fired when the host dismisses the popup (for example a
+        /// compositor grab break), so app state can drop the declaration.
+        on_close: ?Callback = null,
+
+        pub fn clone(self: Popup, allocator: std.mem.Allocator) !Popup {
+            const builder = try self.builder.clone(allocator);
+            errdefer builder.destroy(allocator);
+            const on_close = if (self.on_close) |callback| try callback.clone(allocator) else null;
+            return .{
+                .builder = builder,
+                .placement = self.placement,
+                .width = self.width,
+                .height = self.height,
+                .on_close = on_close,
+            };
+        }
+
+        pub fn destroy(self: Popup, allocator: std.mem.Allocator) void {
+            if (self.on_close) |callback| callback.destroy(allocator);
+            self.builder.destroy(allocator);
+        }
+    };
+
+    pub const PopupPlacement = struct {
+        /// Edge of the anchor rect the popup attaches to.
+        edge: Edge = .bottom,
+        /// How the popup lines up along that edge.
+        alignment: Alignment = .start,
+        /// Gap in logical pixels between the anchor edge and the popup.
+        gap: f32 = 0,
+
+        pub const Edge = enum {
+            top,
+            bottom,
+            left,
+            right,
+        };
+    };
+
+    /// Builds popup content on demand so each realization of the popup
+    /// (initial surface creation and subsequent rebuilds) gets a fresh
+    /// widget tree instead of sharing one retained subtree.
+    pub const PopupBuilder = struct {
+        ptr: *const anyopaque,
+        build_fn: *const fn (ptr: *const anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror!*const anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *const anyopaque) void = null,
+
+        pub fn build(self: PopupBuilder, scope: *BuildScope, context: BuildContext) !Widget {
+            return self.build_fn(self.ptr, scope, context);
+        }
+
+        pub fn clone(self: PopupBuilder, allocator: std.mem.Allocator) !PopupBuilder {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .build_fn = self.build_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: PopupBuilder, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
+        }
     };
 
     pub const Focus = struct {
@@ -724,6 +810,7 @@ pub const Element = struct {
         text,
         box,
         clickable,
+        anchored,
         focus,
         focus_scope,
         scroll,
@@ -905,6 +992,7 @@ pub const RenderNode = struct {
         text,
         box,
         clickable,
+        anchored,
         focus,
         focus_scope,
         scroll,
@@ -1145,6 +1233,19 @@ pub fn buildElementTreeScoped(
             children[0] = try buildClickableChildElement(allocator, scope, clickable_widget, constraints);
             initialized = true;
             return .{ .kind = .clickable, .widget = element_widget, .children = children };
+        },
+        .anchored => |anchored_widget| {
+            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            errdefer destroyElementWidget(allocator, &element_widget);
+            const children = try allocator.alloc(Element, 1);
+            var initialized = false;
+            errdefer {
+                if (initialized) destroyElementTree(allocator, &children[0]);
+                allocator.free(children);
+            }
+            children[0] = try buildElementTreeScoped(allocator, scope, anchored_widget.child, constraints);
+            initialized = true;
+            return .{ .kind = .anchored, .widget = element_widget, .children = children };
         },
         .focus => |focus_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1397,6 +1498,36 @@ fn buildLinearElementTree(
     return .{ .kind = kind, .widget = element_widget, .children = children };
 }
 
+/// A popup declared by an anchored element in the current element tree,
+/// paired with the anchor's laid-out rect in window coordinates.
+pub const PopupRequest = struct {
+    id: []const u8,
+    anchor_rect: Rect,
+    popup: *const Widget.Popup,
+};
+
+/// Collects popups declared by anchored elements, in tree order. The
+/// borrowed ids and popup declarations stay valid until the element tree
+/// is next updated or destroyed.
+pub fn collectPopupRequests(
+    allocator: std.mem.Allocator,
+    element: *const Element,
+    out: *std.ArrayList(PopupRequest),
+) !void {
+    if (element.kind == .anchored) {
+        if (element.widget.anchored.popup) |*popup_decl| {
+            if (element.render_node) |node| {
+                try out.append(allocator, .{
+                    .id = element.widget.anchored.id,
+                    .anchor_rect = node.rect,
+                    .popup = popup_decl,
+                });
+            }
+        }
+    }
+    for (element.children) |*child| try collectPopupRequests(allocator, child, out);
+}
+
 pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void {
     if (element.render_node) |node| {
         allocator.free(node.children);
@@ -1471,6 +1602,9 @@ pub fn updateElementTreeScoped(
         },
         .clickable => |clickable_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, clickable_widget.child, constraints);
+        },
+        .anchored => |anchored_widget| {
+            try updateSingleChildElement(allocator, scope, element, widget.*, anchored_widget.child, constraints);
         },
         .focus => |focus_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, focus_widget.child, constraints);
@@ -1584,6 +1718,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .box,
         .sized,
         .clickable,
+        .anchored,
         .focus,
         .focus_scope,
         .center,
@@ -1740,6 +1875,7 @@ pub fn refreshInteractionElements(
         .keyed,
         .box,
         .sized,
+        .anchored,
         .focus,
         .focus_scope,
         .center,
@@ -1845,6 +1981,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .text => .text,
         .box => .box,
         .clickable => .clickable,
+        .anchored => .anchored,
         .focus => .focus,
         .focus_scope => .focus_scope,
         .scroll => .scroll,
@@ -2134,6 +2271,16 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .hover_style = clickableHoverStyle(clickable_widget),
             } };
         },
+        .anchored => |anchored_widget| blk: {
+            const id = try allocator.dupe(u8, anchored_widget.id);
+            errdefer allocator.free(id);
+            const popup = if (anchored_widget.popup) |popup_decl| try popup_decl.clone(allocator) else null;
+            break :blk .{ .anchored = .{
+                .id = id,
+                .child = anchored_widget.child,
+                .popup = popup,
+            } };
+        },
         .focus => |focus_widget| blk: {
             const focus_id = try allocator.dupe(u8, focus_widget.node.id);
             errdefer allocator.free(focus_id);
@@ -2234,6 +2381,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (clickable_widget.on_tap_up) |callback| callback.destroy(allocator);
             if (clickable_widget.on_tap_cancel) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
+        },
+        .anchored => |anchored_widget| {
+            if (anchored_widget.popup) |popup_decl| popup_decl.destroy(allocator);
+            allocator.free(anchored_widget.id);
         },
         .focus => |focus_widget| {
             if (focus_widget.on_focus_change) |callback| callback.destroy(allocator);
@@ -3327,6 +3478,69 @@ test "clickable hover refresh updates painted background" {
     try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
     root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(colors.blue9, root.children[0].background);
+}
+
+test "anchored elements declare popups with laid-out anchor rects" {
+    const popup_builder = struct {
+        fn build(_: *const anyopaque, _: *BuildScope, _: Widget.BuildContext) anyerror!Widget {
+            return .{ .text = .{ .value = "menu" } };
+        }
+    };
+    const label: Widget = .{ .text = .{ .value = "Clock" } };
+    const anchored: Widget = .{ .anchored = .{
+        .id = "clock",
+        .child = &label,
+        .popup = .{
+            .builder = .{ .ptr = undefined, .build_fn = popup_builder.build },
+            .placement = .{ .edge = .top, .alignment = .center, .gap = 4 },
+        },
+    } };
+    const padded: Widget = .{ .padding = .{ .insets = .{ .left = 10, .top = 5 }, .child = &anchored } };
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &padded, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    _ = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    var requests: std.ArrayList(PopupRequest) = .empty;
+    defer requests.deinit(std.testing.allocator);
+    try collectPopupRequests(std.testing.allocator, &built_element, &requests);
+
+    try std.testing.expectEqual(@as(usize, 1), requests.items.len);
+    const request = requests.items[0];
+    try std.testing.expectEqualStrings("clock", request.id);
+    try std.testing.expectEqual(@as(f32, 10), request.anchor_rect.x);
+    try std.testing.expectEqual(@as(f32, 5), request.anchor_rect.y);
+    try std.testing.expectEqual(Widget.PopupPlacement.Edge.top, request.popup.placement.edge);
+    try std.testing.expectEqual(Widget.Alignment.center, request.popup.placement.alignment);
+    try std.testing.expectEqual(@as(f32, 4), request.popup.placement.gap);
+}
+
+test "anchored without popup declares nothing and stays hit-testable" {
+    const inner_label: Widget = .{ .text = .{ .value = "Clock" } };
+    const clickable: Widget = .{ .clickable = .{
+        .id = "clock-tap",
+        .child = &inner_label,
+        .on_click = testCallback(),
+    } };
+    const anchored: Widget = .{ .anchored = .{ .id = "clock", .child = &clickable } };
+
+    var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(std.testing.allocator, &build_scope, &anchored, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &built_element);
+    const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    var requests: std.ArrayList(PopupRequest) = .empty;
+    defer requests.deinit(std.testing.allocator);
+    try collectPopupRequests(std.testing.allocator, &built_element, &requests);
+    try std.testing.expectEqual(@as(usize, 0), requests.items.len);
+
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
+    try std.testing.expectEqualStrings("clock-tap", hit.id);
 }
 
 test "clickable hit testing carries activation mode" {

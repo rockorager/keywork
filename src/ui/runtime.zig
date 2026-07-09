@@ -159,6 +159,15 @@ pub const Runtime = struct {
         try backend_behavior.invalidateState(self);
     }
 
+    /// Popups declared by anchored elements in the current tree, with
+    /// anchor rects from the last layout. Results borrow from the element
+    /// tree and are invalidated by the next rebuild.
+    pub fn collectPopupRequests(self: *const Runtime, allocator: std.mem.Allocator, out: *std.ArrayList(keywork.PopupRequest)) !void {
+        if (self.element_root) |*element_root| {
+            try keywork.collectPopupRequests(allocator, element_root, out);
+        }
+    }
+
     fn presentFrame(self: *Runtime) !void {
         try backend_behavior.presentFrame(self);
     }
