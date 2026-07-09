@@ -116,7 +116,7 @@ pub const App = struct {
         // cancel just that watch instead of failing the whole bind.
         for (self.fs_events.items) |fs_event| fs_event.register() catch |err| {
             std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ fs_event.path, err });
-            fs_event.cancel(self.state);
+            fs_event.cancel(self.state, .silent);
         };
         for (self.timers.items) |timer| try timer.register();
         for (self.processes.items) |process| try self.registerProcess(process);
@@ -268,7 +268,7 @@ pub const App = struct {
 
     fn cancelScriptResources(self: *App) void {
         for (self.fd_watches.items) |watch| watch.cancel(self.state);
-        for (self.fs_events.items) |fs_event| fs_event.cancel(self.state);
+        for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state);
         for (self.processes.items) |process| process.cancel(self.state);
         for (self.dbus_buses.items) |bus| bus.close();
@@ -347,14 +347,12 @@ pub const App = struct {
         return watch;
     }
 
-    fn addFsEvent(self: *App, path: []const u8, ref: c_int) !*FsEvent {
-        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+    fn addFsEvent(self: *App, path: []const u8) !*FsEvent {
         const fs_event = try self.allocator.create(FsEvent);
         errdefer self.allocator.destroy(fs_event);
         fs_event.* = .{
             .host = self.loopHost(),
             .path = try self.allocator.dupe(u8, path),
-            .ref = ref,
         };
         errdefer self.allocator.free(fs_event.path);
         try self.fs_events.append(self.allocator, fs_event);
@@ -477,9 +475,9 @@ fn loopHostAddFdWatch(ptr: *anyopaque, fd: i32, events: u32, ref: c_int) anyerro
     return app.addFdWatch(fd, events, ref);
 }
 
-fn loopHostAddFsEvent(ptr: *anyopaque, path: []const u8, ref: c_int) anyerror!*FsEvent {
+fn loopHostAddFsEvent(ptr: *anyopaque, path: []const u8) anyerror!*FsEvent {
     const app: *App = @ptrCast(@alignCast(ptr));
-    return app.addFsEvent(path, ref);
+    return app.addFsEvent(path);
 }
 
 fn loopHostAddTimer(ptr: *anyopaque, delay_ms: u64, interval_ms: u64, ref: c_int) anyerror!*LuaTimer {
@@ -1428,7 +1426,7 @@ test "event loop bind survives a vanished fs_event path" {
     const script =
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\watch = loop.fs_event("/nonexistent/keywork/test/path", function() end)
+        \\watch = loop.fs_event("/nonexistent/keywork/test/path")
         \\return kw.app({ child = kw.text("bind") })
         \\
     ;
@@ -1448,6 +1446,45 @@ test "event loop bind survives a vanished fs_event path" {
     defer app.unbindEventLoop();
 
     try std.testing.expect(app.fs_events.items[0].canceled);
+}
+
+test "lua fs_event cancel resumes a parked reader and ends iteration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Cancel must resume the coroutine parked in next() with no value so
+    // the events() iteration terminates, all synchronously (no event loop).
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local watch = loop.fs_event("/tmp")
+        \\stream_ended = false
+        \\local reader = loop.spawn(function()
+        \\  for _ in watch:events() do end
+        \\  stream_ended = true
+        \\end)
+        \\assert(coroutine.status(reader) == "suspended")
+        \\watch:cancel()
+        \\assert(stream_ended)
+        \\assert(coroutine.status(reader) == "dead")
+        \\assert(watch:canceled())
+        \\-- next() on a dead handle ends iteration instead of parking.
+        \\loop.spawn(function()
+        \\  assert(watch:next() == nil)
+        \\  dead_next_ok = true
+        \\end)
+        \\assert(dead_next_ok)
+        \\return kw.app({ child = kw.text("cancel") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event-cancel.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event-cancel.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
 }
 
 test "lua stateful build context includes theme" {
@@ -1613,9 +1650,13 @@ test "lua loop fs_event observes file changes" {
         \\fs_event_path = ""
         \\local App = kw.stateful({{
         \\  init = function(self)
-        \\    self.watch = loop.fs_event({{ path = "{s}" }}, function(event)
-        \\      fs_event_seen = event.change
-        \\      fs_event_path = event.path
+        \\    self.watch = loop.fs_event({{ path = "{s}" }})
+        \\    loop.spawn(function()
+        \\      for event in self.watch:events() do
+        \\        fs_event_seen = event.change
+        \\        fs_event_path = event.path
+        \\      end
+        \\      fs_event_stream_ended = true
         \\    end)
         \\  end,
         \\  dispose = function(self)
@@ -1828,7 +1869,7 @@ test "lua fs_event reports a missing path as nil, err" {
     const script =
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\watch_result, watch_err = loop.fs_event("/nonexistent/keywork/test/path", function() end)
+        \\watch_result, watch_err = loop.fs_event("/nonexistent/keywork/test/path")
         \\return kw.app({ child = kw.text("fs_event") })
         \\
     ;

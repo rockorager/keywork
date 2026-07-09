@@ -19,7 +19,7 @@ pub const Host = struct {
         eventLoop: *const fn (*anyopaque) ?*event_loop.EventLoop,
         invalidate: *const fn (*anyopaque) anyerror!void,
         addFdWatch: *const fn (*anyopaque, i32, u32, c_int) anyerror!*FdWatch,
-        addFsEvent: *const fn (*anyopaque, []const u8, c_int) anyerror!*FsEvent,
+        addFsEvent: *const fn (*anyopaque, []const u8) anyerror!*FsEvent,
         addTimer: *const fn (*anyopaque, u64, u64, c_int) anyerror!*LuaTimer,
     };
 
@@ -43,8 +43,8 @@ pub const Host = struct {
         return try self.vtable.addFdWatch(self.ptr, fd, events, ref);
     }
 
-    fn addFsEvent(self: Host, path: []const u8, ref: c_int) !*FsEvent {
-        return try self.vtable.addFsEvent(self.ptr, path, ref);
+    fn addFsEvent(self: Host, path: []const u8) !*FsEvent {
+        return try self.vtable.addFsEvent(self.ptr, path);
     }
 
     fn addTimer(self: Host, delay_ms: u64, interval_ms: u64, ref: c_int) !*LuaTimer {
@@ -105,7 +105,7 @@ pub const FdWatch = struct {
 pub const FsEvent = struct {
     host: Host,
     path: []const u8,
-    ref: c_int,
+    stream: lua_coro.Stream = .{},
     handle_ref: c_int = -1,
     watch: ?*event_loop.EventLoop.FileWatch = null,
     registered: bool = false,
@@ -124,22 +124,21 @@ pub const FsEvent = struct {
         self.registered = false;
     }
 
-    pub fn cancel(self: *FsEvent, lua_state: *c.lua_State) void {
+    pub fn cancel(self: *FsEvent, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         if (self.registered) {
             if (self.host.eventLoop()) |loop| self.unregister(loop);
         }
-        if (self.ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
-            self.ref = -1;
-        }
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
+        // End the stream last so a resumed reader observes the fs_event
+        // already canceled and its handle dead.
+        self.stream.cancel(self.host.allocator(), lua_state, mode);
     }
 
     pub fn destroy(self: *FsEvent, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
-        self.cancel(lua_state);
+        self.cancel(lua_state, .silent);
         allocator.free(self.path);
         allocator.destroy(self);
     }
@@ -240,21 +239,12 @@ fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void
 
 fn fsEventCallback(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, name: ?[]const u8) !void {
     const fs_event: *FsEvent = @ptrCast(@alignCast(ctx));
-    if (fs_event.canceled or fs_event.ref < 0) return;
+    if (fs_event.canceled) return;
     const lua_state = fs_event.host.luaState();
-    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, fs_event.ref);
     pushFsEvent(lua_state, path, mask, name);
-    if (c.lua_pcall(lua_state, 1, 1, 0) != 0) {
-        var len: usize = 0;
-        const message_ptr = c.lua_tolstring(lua_state, -1, &len);
-        if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("fs_event callback failed: {s}", .{message[0..len]});
-        pop(lua_state, 1);
-        fs_event.cancel(lua_state);
-        return;
-    }
-    const should_invalidate = c.lua_toboolean(lua_state, -1) != 0;
-    pop(lua_state, 1);
-    if (should_invalidate) try fs_event.host.invalidate();
+    fs_event.stream.deliver(fs_event.host.allocator(), lua_state) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("fs_event delivery failed: {}", .{err});
+    };
 }
 
 fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
@@ -353,13 +343,9 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
     const path = fsEventPath(lua_state, 1) catch return c.luaL_error(lua_state, "fs_event requires a path");
-    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
     // Watching a not-yet-existing path is an expected runtime failure, so it
     // reports nil, err instead of raising.
-
-    c.lua_pushvalue(lua_state, 2);
-    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-    const fs_event = host.addFsEvent(path, ref) catch |err| {
+    const fs_event = host.addFsEvent(path) catch |err| {
         std.log.scoped(.keywork_luajit).warn("loop.fs_event failed: {}", .{err});
         c.lua_pushnil(lua_state);
         const name = @errorName(err);
@@ -384,6 +370,8 @@ const fd_watch_methods = [_]lua_handle.Method{
 
 const fs_event_type: [*:0]const u8 = "keywork.fs_event";
 const fs_event_methods = [_]lua_handle.Method{
+    .{ .name = "next", .func = luaFsEventNext },
+    .{ .name = "events", .func = luaFsEventEvents },
     .{ .name = "cancel", .func = luaCancelFsEvent },
     .{ .name = "canceled", .func = luaFsEventCanceled },
 };
@@ -417,8 +405,21 @@ fn luaCancelFdWatch(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaCancelFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const fs_event = lua_handle.resource(FsEvent, lua_state, 1, fs_event_type) orelse return 0;
-    fs_event.cancel(lua_state);
+    fs_event.cancel(lua_state, .resume_reader);
     return 0;
+}
+
+fn luaFsEventNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead handle ends the iteration instead of parking forever.
+    const fs_event = lua_handle.resource(FsEvent, lua_state, 1, fs_event_type) orelse return 0;
+    return fs_event.stream.awaitNext(lua_state, fs_event.canceled);
+}
+
+fn luaFsEventEvents(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, fs_event_type);
+    return lua_coro.pushIterator(lua_state, luaFsEventNext);
 }
 
 fn luaTimerCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
