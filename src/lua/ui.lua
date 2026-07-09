@@ -771,7 +771,9 @@ end
 
 function ui.icon_label(icon_name, text, options)
   options = options or {}
-  local children = { ui.icon({ name = icon_name, size = options.size or 18, color = options.color }) }
+  -- No size default here: a nil size falls through to the enclosing
+  -- icon_theme context or the bridge's base 16px default.
+  local children = { ui.icon({ name = icon_name, size = options.size, color = options.color }) }
   if text and text ~= "" then
     table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
   end
