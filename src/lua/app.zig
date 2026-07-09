@@ -112,7 +112,12 @@ pub const App = struct {
             break :blk null;
         };
         for (self.fd_watches.items) |watch| try watch.register();
-        for (self.fs_events.items) |fs_event| try fs_event.register();
+        // A watched path may have vanished since the fs_event was created;
+        // cancel just that watch instead of failing the whole bind.
+        for (self.fs_events.items) |fs_event| fs_event.register() catch |err| {
+            std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ fs_event.path, err });
+            fs_event.cancel(self.state);
+        };
         for (self.timers.items) |timer| try timer.register();
         for (self.processes.items) |process| try self.registerProcess(process);
         for (self.dbus_buses.items) |bus| try bus.register();
@@ -1217,6 +1222,39 @@ test "lua stateful set_state is inert after dispose" {
     c.lua_getglobal(app.state, "stale_set_state");
     try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+}
+
+test "event loop bind survives a vanished fs_event path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Registration is deferred until the loop binds, so the script can
+    // watch a path that never exists; the bind must cancel that watch
+    // instead of failing.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\watch = loop.fs_event("/nonexistent/keywork/test/path", function() end)
+        \\return kw.app({ child = kw.text("bind") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bind-vanished.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "bind-vanished.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.fs_events.items.len);
+    try std.testing.expect(!app.fs_events.items[0].canceled);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    try std.testing.expect(app.fs_events.items[0].canceled);
 }
 
 test "lua stateful build context includes theme" {
