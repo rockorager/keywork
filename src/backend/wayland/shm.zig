@@ -18,24 +18,8 @@ pub const Backend = struct {
     allocator: std.mem.Allocator,
     connection: *window.Connection,
     input: WaylandInput,
-    protocol: window.Surface,
-    buffers: std.ArrayList(*Buffer),
-    /// The buffer holding the most recently rendered frame; the source for
-    /// partial redraws when the compositor hands us a different buffer.
-    last_rendered: ?*Buffer = null,
-    /// Monotonic count of frames committed on the primary surface. Each
-    /// buffer records the frame it last held, so a reused stale buffer can
-    /// be repaired with only the pixels that changed while the compositor
-    /// held it.
-    frame_counter: u64 = 0,
-    history: DamageHistory = .{},
     text_renderer: TextRenderer,
-
-    repaint_handler: ?RepaintHandler,
-    repaint_context: ?*anyopaque,
-    frame_handler: ?FrameHandler,
-    frame_context: ?*anyopaque,
-    extra_surfaces: std.ArrayList(ExtraSurface),
+    windows: std.ArrayList(*Window),
 
     pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -45,65 +29,26 @@ pub const Backend = struct {
     pub const RepaintHandler = *const fn (ctx: *anyopaque, size: keywork.Size) void;
     pub const FrameHandler = *const fn (ctx: *anyopaque) void;
 
-    pub const Options = struct {
+    pub const WindowOptions = struct {
         title: [:0]const u8 = "Keywork",
         app_id: [:0]const u8 = "dev.keywork.Keywork",
         width: u31 = 640,
         height: u31 = 480,
         layer_shell: ?wayland_options.LayerShellOptions = null,
+        /// Output a layer-shell surface is placed on; null lets the
+        /// compositor choose.
+        output: ?*wl.Output = null,
     };
 
-    const ExtraSurface = struct {
-        protocol: window.Surface,
-        buffers: std.ArrayList(*Buffer) = .empty,
-        last_rendered: ?*Buffer = null,
-
-        fn destroy(self: *ExtraSurface, allocator: std.mem.Allocator) void {
-            for (self.buffers.items) |buffer| buffer.destroy(allocator);
-            self.buffers.deinit(allocator);
-            self.protocol.deinit();
-        }
-    };
-
-    pub fn create(allocator: std.mem.Allocator, options: Options) !*Backend {
+    pub fn create(allocator: std.mem.Allocator) !*Backend {
         const connection = try window.Connection.init(allocator, .{ .shm = true, .outputs = true });
         errdefer connection.deinit();
 
-        const all_outputs = if (options.layer_shell) |layer_options| layer_options.output == .all else false;
-        if (all_outputs and connection.outputs.items.len == 0) return error.NoWlOutput;
-        const primary_output = if (all_outputs) connection.outputs.items[0].output else null;
-
-        var protocol = try window.Surface.init(connection, primary_output, options);
-        errdefer protocol.deinit();
-
-        var extra_surfaces: std.ArrayList(ExtraSurface) = .empty;
-        errdefer {
-            for (extra_surfaces.items) |*extra| extra.destroy(allocator);
-            extra_surfaces.deinit(allocator);
-        }
-        if (all_outputs) {
-            for (connection.outputs.items[1..]) |output_ref| {
-                const extra = try createExtraSurface(
-                    output_ref.output,
-                    connection,
-                    options,
-                );
-                try extra_surfaces.append(allocator, extra);
-            }
-        }
-
-        // Commit and flush now so the compositor prepares the initial
-        // configure while fonts and input are initialized below. Events
-        // queue until the first dispatch, which happens after listeners
-        // are attached.
-        protocol.surface.commit();
-        for (extra_surfaces.items) |*extra| extra.protocol.surface.commit();
-        _ = connection.display.flush();
-
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
+
         const seat = connection.takeSeat();
-        var input = WaylandInput.init(protocol.surface, seat, connection.cursor_shape_manager) catch |err| {
+        var input = WaylandInput.init(allocator, seat, connection.cursor_shape_manager) catch |err| {
             if (seat) |wl_seat| wl_seat.release();
             return err;
         };
@@ -115,114 +60,68 @@ pub const Backend = struct {
             .allocator = allocator,
             .connection = connection,
             .input = input,
-            .protocol = protocol,
-            .buffers = .empty,
             .text_renderer = text_renderer_instance,
-            .repaint_handler = null,
-            .repaint_context = null,
-            .frame_handler = null,
-            .frame_context = null,
-            .extra_surfaces = extra_surfaces,
+            .windows = .empty,
         };
 
         window.installWmBaseListener(self.connection.wm_base);
-        self.protocol.attachListeners();
-        for (self.extra_surfaces.items) |*extra| extra.protocol.attachListeners();
         self.input.attachListeners();
-
         return self;
     }
 
     pub fn destroy(self: *Backend) void {
-        for (self.buffers.items) |buffer| buffer.destroy(self.allocator);
-        self.buffers.deinit(self.allocator);
-        for (self.extra_surfaces.items) |*extra| extra.destroy(self.allocator);
-        self.extra_surfaces.deinit(self.allocator);
+        while (self.windows.items.len > 0) {
+            self.destroyWindow(self.windows.items[self.windows.items.len - 1]);
+        }
+        self.windows.deinit(self.allocator);
         self.text_renderer.deinit();
         self.input.deinit();
-        self.protocol.deinit();
         self.connection.deinit();
         self.allocator.destroy(self);
     }
 
-    pub fn renderBackend(self: *Backend) keywork.RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
+    pub fn createWindow(self: *Backend, options: WindowOptions) !*Window {
+        var protocol = try window.Surface.init(self.connection, options.output, options);
+        errdefer protocol.deinit();
+
+        const win = try self.allocator.create(Window);
+        errdefer self.allocator.destroy(win);
+        win.* = .{
+            .backend = self,
+            .protocol = protocol,
+            .input_target = .{ .surface = protocol.surface },
+        };
+        try self.windows.append(self.allocator, win);
+        errdefer _ = self.windows.pop();
+        try self.input.registerTarget(&win.input_target);
+
+        // Listener contexts must point at the window's final storage.
+        win.protocol.attachListeners();
+        // Commit and flush now so the compositor prepares the initial
+        // configure while the caller finishes setup. Events queue until
+        // the first dispatch.
+        win.protocol.surface.commit();
+        _ = self.connection.display.flush();
+        return win;
+    }
+
+    pub fn destroyWindow(self: *Backend, win: *Window) void {
+        self.input.unregisterTarget(&win.input_target);
+        for (self.windows.items, 0..) |existing, index| {
+            if (existing != win) continue;
+            _ = self.windows.orderedRemove(index);
+            break;
+        }
+        win.deinitResources();
+        self.allocator.destroy(win);
     }
 
     pub fn outputCount(self: *const Backend) usize {
-        return 1 + self.extra_surfaces.items.len;
+        return self.connection.outputs.items.len;
     }
 
-    pub fn outputSize(self: *const Backend, index: usize) keywork.Size {
-        if (index == 0) return self.currentSize();
-        const extra = &self.extra_surfaces.items[index - 1];
-        return extra.protocol.currentSize();
-    }
-
-    pub fn renderBackendForOutput(self: *Backend, index: usize) OutputRenderBackend {
-        return .{ .backend = self, .index = index };
-    }
-
-    pub const OutputRenderBackend = struct {
-        backend: *Backend,
-        index: usize,
-
-        pub fn backendInterface(self: *OutputRenderBackend) keywork.RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = presentOutput, .measure_text = measureTextOutput, .scale = scaleOutput } };
-        }
-
-        fn presentOutput(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
-            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
-            while (!self.backend.allConfigured() and !self.backend.allClosed()) {
-                if (self.backend.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
-            }
-            if (self.index == 0) {
-                if (self.backend.protocol.closed) return false;
-                const pending = try self.backend.presentPrimary(frame);
-                _ = self.backend.connection.display.flush();
-                return pending;
-            }
-            const extra = &self.backend.extra_surfaces.items[self.index - 1];
-            if (extra.protocol.closed) return false;
-            const pending = try self.backend.presentExtra(extra, frame);
-            _ = self.backend.connection.display.flush();
-            return pending;
-        }
-
-        fn measureTextOutput(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
-            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
-            return self.backend.text_renderer.measure(self.scale(), value, style);
-        }
-
-        fn scaleOutput(ptr: *anyopaque) f32 {
-            const self: *OutputRenderBackend = @ptrCast(@alignCast(ptr));
-            return self.scale();
-        }
-
-        fn scale(self: *const OutputRenderBackend) f32 {
-            if (self.index == 0) return self.backend.protocol.scale;
-            return self.backend.extra_surfaces.items[self.index - 1].protocol.scale;
-        }
-    };
-
-    pub fn setPointerButtonHandler(self: *Backend, context: *anyopaque, handler: PointerButtonHandler) void {
-        self.input.setPointerButtonHandler(context, handler);
-    }
-
-    pub fn setPointerMoveHandler(self: *Backend, context: *anyopaque, handler: PointerMoveHandler) void {
-        self.input.setPointerMoveHandler(context, handler);
-    }
-
-    pub fn setCursorShapeHandler(self: *Backend, context: *anyopaque, handler: CursorShapeHandler) void {
-        self.input.setCursorShapeHandler(context, handler);
-    }
-
-    pub fn setKeyHandler(self: *Backend, context: *anyopaque, handler: KeyHandler) void {
-        self.input.setKeyHandler(context, handler);
-    }
-
-    pub fn setScrollHandler(self: *Backend, context: *anyopaque, handler: ScrollHandler) void {
-        self.input.setScrollHandler(context, handler);
+    pub fn outputAt(self: *const Backend, index: usize) *wl.Output {
+        return self.connection.outputs.items[index].output;
     }
 
     pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {
@@ -233,27 +132,20 @@ pub const Backend = struct {
         self.input.uninstallEventTimers();
     }
 
-    pub fn setRepaintHandler(self: *Backend, context: *anyopaque, handler: RepaintHandler) void {
-        self.repaint_context = context;
-        self.repaint_handler = handler;
-    }
-
-    pub fn setFrameHandler(self: *Backend, context: *anyopaque, handler: FrameHandler) void {
-        self.frame_context = context;
-        self.frame_handler = handler;
-    }
-
     pub fn eventLoopFd(self: *Backend) i32 {
         return self.connection.display.getFd();
     }
 
-    pub fn waitForInitialConfigure(self: *Backend) !keywork.Size {
+    /// Dispatch until every window received its initial configure. Call
+    /// after creating the initial set of windows and before rendering.
+    pub fn waitForAllConfigured(self: *Backend) !void {
         while (!self.allConfigured() and !self.allClosed()) {
             if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
         }
         if (self.allClosed()) return error.WindowClosed;
-        self.flushPending();
-        return self.currentSize();
+        // Configure marks a repaint pending, but repaint handlers are not
+        // installed yet; the caller paints the initial frame explicitly.
+        for (self.windows.items) |win| _ = win.protocol.flushPending();
     }
 
     pub fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
@@ -276,213 +168,207 @@ pub const Backend = struct {
         return self.allClosed();
     }
 
-    /// Whether the primary toplevel is suspended (not visible), so callers
-    /// can pause presentation. Layer-shell surfaces never suspend.
-    pub fn suspendedOpaque(ctx: *anyopaque) bool {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        return self.protocol.suspended;
-    }
-
-    fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
-        const self: *Backend = @ptrCast(@alignCast(ptr));
-        if (self.allClosed()) return error.WindowClosed;
-
-        while (!self.allConfigured() and !self.allClosed()) {
-            if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
-        }
-        if (self.allClosed()) return error.WindowClosed;
-
-        var frame_pending = false;
-        if (!self.protocol.closed) frame_pending = try self.presentPrimary(frame) or frame_pending;
-        for (self.extra_surfaces.items) |*extra| {
-            if (!extra.protocol.closed) frame_pending = try self.presentExtra(extra, frame) or frame_pending;
-        }
-        _ = self.connection.display.flush();
-        return frame_pending;
-    }
-
-    fn presentPrimary(self: *Backend, frame: keywork.RenderBackend.Frame) !bool {
-        const protocol = &self.protocol;
-        const logical_width = try window.frameLogicalWidth(frame, protocol.width);
-        const logical_height = try window.frameLogicalHeight(frame, protocol.height);
-        const width = try window.scaledFrameDimension(logical_width, protocol.scale);
-        const height = try window.scaledFrameDimension(logical_height, protocol.scale);
-        const buffer = try self.acquireBuffer(width, height);
-        const damage_clip = self.partialDamageClip(frame, buffer, width, height);
-        try rasterize(&self.text_renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, damage_clip);
-        self.last_rendered = buffer;
-
-        try protocol.armFrameCallback();
-        protocol.surface.attach(buffer.wl_buffer, 0, 0);
-        if (damage_clip) |clip| {
-            const x0: i32 = @max(0, clip.x0);
-            const y0: i32 = @max(0, clip.y0);
-            const x1: i32 = @min(@as(i32, width), clip.x1);
-            const y1: i32 = @min(@as(i32, height), clip.y1);
-            protocol.surface.damageBuffer(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
-        } else {
-            protocol.surface.damageBuffer(0, 0, width, height);
-        }
-        protocol.surface.setBufferScale(1);
-        if (protocol.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
-        protocol.surface.commit();
-        buffer.busy = true;
-        self.frame_counter += 1;
-        buffer.frame = self.frame_counter;
-        self.history.record(
-            self.frame_counter,
-            width,
-            height,
-            damage_clip orelse .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height },
-        );
-        return true;
-    }
-
-    fn presentExtra(self: *Backend, extra: *ExtraSurface, frame: keywork.RenderBackend.Frame) !bool {
-        const protocol = &extra.protocol;
-        const logical_width = try window.frameLogicalWidth(frame, protocol.width);
-        const logical_height = try window.frameLogicalHeight(frame, protocol.height);
-        const width = try window.scaledFrameDimension(logical_width, protocol.scale);
-        const height = try window.scaledFrameDimension(logical_height, protocol.scale);
-        const buffer = try self.acquireExtraBuffer(extra, width, height);
-        try rasterize(&self.text_renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, null);
-        extra.last_rendered = buffer;
-
-        try protocol.armFrameCallback();
-        protocol.surface.attach(buffer.wl_buffer, 0, 0);
-        protocol.surface.damageBuffer(0, 0, width, height);
-        protocol.surface.setBufferScale(1);
-        if (protocol.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
-        protocol.surface.commit();
-        buffer.busy = true;
-        return true;
-    }
-
-    fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
-        const self: *Backend = @ptrCast(@alignCast(ptr));
-        return self.text_renderer.measure(self.protocol.scale, value, style);
-    }
-
-    fn renderScale(ptr: *anyopaque) f32 {
-        const self: *Backend = @ptrCast(@alignCast(ptr));
-        return self.protocol.scale;
-    }
-
-    fn notifyRepaint(self: *Backend) void {
-        if (self.repaint_handler) |handler| handler(self.repaint_context.?, self.currentSize());
-    }
-
-    fn currentSize(self: *const Backend) keywork.Size {
-        return self.protocol.currentSize();
-    }
-
     fn flushPending(self: *Backend) void {
-        const primary = self.protocol.flushPending();
-        var repaint = primary.repaint;
-        if (primary.frame_done) self.notifyFrameDone();
-        for (self.extra_surfaces.items) |*extra| {
-            const pending = extra.protocol.flushPending();
-            repaint = repaint or pending.repaint;
-            if (pending.frame_done) self.notifyFrameDone();
-        }
-        if (repaint) self.notifyRepaint();
-    }
-
-    fn notifyFrameDone(self: *Backend) void {
-        if (self.frame_handler) |handler| handler(self.frame_context.?);
+        for (self.windows.items) |win| win.flushPending();
     }
 
     fn allConfigured(self: *const Backend) bool {
-        if (!self.protocol.closed and !self.protocol.configured) return false;
-        for (self.extra_surfaces.items) |*extra| {
-            if (!extra.protocol.closed and !extra.protocol.configured) return false;
+        for (self.windows.items) |win| {
+            if (!win.protocol.closed and !win.protocol.configured) return false;
         }
         return true;
     }
 
     fn allClosed(self: *const Backend) bool {
-        if (!self.protocol.closed) return false;
-        for (self.extra_surfaces.items) |*extra| {
-            if (!extra.protocol.closed) return false;
+        for (self.windows.items) |win| {
+            if (!win.protocol.closed) return false;
         }
         return true;
     }
 
-    /// Returns the pixel region that must be re-rasterized, or null when a
-    /// full redraw is required. Partial redraw needs the previous frame's
-    /// content: either the acquired buffer already holds it, or it is
-    /// copied over from the buffer that does.
-    fn partialDamageClip(self: *Backend, frame: keywork.RenderBackend.Frame, buffer: *Buffer, width: u31, height: u31) ?TextRenderer.PixelClip {
-        if (frame.damage.len != 1) return null;
-        const clip = TextRenderer.PixelClip.fromRect(frame.damage[0], self.protocol.scale);
-        if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
+    /// One Wayland surface with its own buffers, damage history, frame
+    /// state, and input target. Created and destroyed through the owning
+    /// `Backend`; all windows share one connection, seat, and text
+    /// renderer.
+    pub const Window = struct {
+        backend: *Backend,
+        protocol: window.Surface,
+        input_target: WaylandInput.Target,
+        buffers: std.ArrayList(*Buffer) = .empty,
+        last_rendered: ?*Buffer = null,
+        /// Monotonic per-window frame number; `Buffer.frame` refers to it.
+        frame_counter: u64 = 0,
+        history: DamageHistory = .{},
+        repaint_handler: ?RepaintHandler = null,
+        repaint_context: ?*anyopaque = null,
+        frame_handler: ?FrameHandler = null,
+        frame_context: ?*anyopaque = null,
 
-        const last = self.last_rendered orelse return null;
-        if (last == buffer) return clip;
-        if (last.width != width or last.height != height) return null;
-        if (self.history.canRepair(buffer.frame, width, height)) {
-            repairRegions(
-                buffer.pixels(),
-                last.pixels(),
+        pub fn renderBackend(self: *Window) keywork.RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale } };
+        }
+
+        pub fn setPointerButtonHandler(self: *Window, context: *anyopaque, handler: PointerButtonHandler) void {
+            self.input_target.setPointerButtonHandler(context, handler);
+        }
+
+        pub fn setPointerMoveHandler(self: *Window, context: *anyopaque, handler: PointerMoveHandler) void {
+            self.input_target.setPointerMoveHandler(context, handler);
+        }
+
+        pub fn setCursorShapeHandler(self: *Window, context: *anyopaque, handler: CursorShapeHandler) void {
+            self.input_target.setCursorShapeHandler(context, handler);
+        }
+
+        pub fn setKeyHandler(self: *Window, context: *anyopaque, handler: KeyHandler) void {
+            self.input_target.setKeyHandler(context, handler);
+        }
+
+        pub fn setScrollHandler(self: *Window, context: *anyopaque, handler: ScrollHandler) void {
+            self.input_target.setScrollHandler(context, handler);
+        }
+
+        pub fn setRepaintHandler(self: *Window, context: *anyopaque, handler: RepaintHandler) void {
+            self.repaint_context = context;
+            self.repaint_handler = handler;
+        }
+
+        pub fn setFrameHandler(self: *Window, context: *anyopaque, handler: FrameHandler) void {
+            self.frame_context = context;
+            self.frame_handler = handler;
+        }
+
+        pub fn currentSize(self: *const Window) keywork.Size {
+            return self.protocol.currentSize();
+        }
+
+        /// Whether the compositor reports this toplevel as suspended (not
+        /// visible), so callers can pause presentation. Layer-shell
+        /// surfaces never suspend.
+        pub fn suspendedOpaque(ctx: *anyopaque) bool {
+            const self: *Window = @ptrCast(@alignCast(ctx));
+            return self.protocol.suspended;
+        }
+
+        fn deinitResources(self: *Window) void {
+            for (self.buffers.items) |buffer| buffer.destroy(self.backend.allocator);
+            self.buffers.deinit(self.backend.allocator);
+            self.protocol.deinit();
+        }
+
+        fn flushPending(self: *Window) void {
+            const pending = self.protocol.flushPending();
+            if (pending.repaint) {
+                if (self.repaint_handler) |handler| handler(self.repaint_context.?, self.currentSize());
+            }
+            if (pending.frame_done) {
+                if (self.frame_handler) |handler| handler(self.frame_context.?);
+            }
+        }
+
+        fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
+            const self: *Window = @ptrCast(@alignCast(ptr));
+            const protocol = &self.protocol;
+            while (!protocol.configured and !protocol.closed) {
+                if (self.backend.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            }
+            if (protocol.closed) return error.WindowClosed;
+
+            const logical_width = try window.frameLogicalWidth(frame, protocol.width);
+            const logical_height = try window.frameLogicalHeight(frame, protocol.height);
+            const width = try window.scaledFrameDimension(logical_width, protocol.scale);
+            const height = try window.scaledFrameDimension(logical_height, protocol.scale);
+            const buffer = try self.acquireBuffer(width, height);
+            const damage_clip = self.partialDamageClip(frame, buffer, width, height);
+            try rasterize(&self.backend.text_renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, damage_clip);
+            self.last_rendered = buffer;
+
+            try protocol.armFrameCallback();
+            protocol.surface.attach(buffer.wl_buffer, 0, 0);
+            if (damage_clip) |clip| {
+                const x0: i32 = @max(0, clip.x0);
+                const y0: i32 = @max(0, clip.y0);
+                const x1: i32 = @min(@as(i32, width), clip.x1);
+                const y1: i32 = @min(@as(i32, height), clip.y1);
+                protocol.surface.damageBuffer(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
+            } else {
+                protocol.surface.damageBuffer(0, 0, width, height);
+            }
+            protocol.surface.setBufferScale(1);
+            if (protocol.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
+            protocol.surface.commit();
+            buffer.busy = true;
+            self.frame_counter += 1;
+            buffer.frame = self.frame_counter;
+            self.history.record(
+                self.frame_counter,
                 width,
                 height,
-                self.history.entries[0..self.history.len],
-                buffer.frame,
-                clip,
+                damage_clip orelse .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height },
             );
-        } else {
-            copyPixels(buffer.pixels(), last.pixels());
+            _ = self.backend.connection.display.flush();
+            return true;
         }
-        return clip;
-    }
 
-    fn acquireBuffer(self: *Backend, width: u31, height: u31) !*Buffer {
-        var index: usize = 0;
-        while (index < self.buffers.items.len) {
-            const buffer = self.buffers.items[index];
-            if (buffer.busy) {
-                index += 1;
-                continue;
+        fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
+            const self: *Window = @ptrCast(@alignCast(ptr));
+            return self.backend.text_renderer.measure(self.protocol.scale, value, style);
+        }
+
+        fn renderScale(ptr: *anyopaque) f32 {
+            const self: *Window = @ptrCast(@alignCast(ptr));
+            return self.protocol.scale;
+        }
+
+        /// Returns the pixel region that must be re-rasterized, or null
+        /// when a full redraw is required. Partial redraw needs the
+        /// previous frame's content: either the acquired buffer already
+        /// holds it, or it is copied over from the buffer that does.
+        fn partialDamageClip(self: *Window, frame: keywork.RenderBackend.Frame, buffer: *Buffer, width: u31, height: u31) ?TextRenderer.PixelClip {
+            if (frame.damage.len != 1) return null;
+            const clip = TextRenderer.PixelClip.fromRect(frame.damage[0], self.protocol.scale);
+            if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
+
+            const last = self.last_rendered orelse return null;
+            if (last == buffer) return clip;
+            if (last.width != width or last.height != height) return null;
+            if (self.history.canRepair(buffer.frame, width, height)) {
+                repairRegions(
+                    buffer.pixels(),
+                    last.pixels(),
+                    width,
+                    height,
+                    self.history.entries[0..self.history.len],
+                    buffer.frame,
+                    clip,
+                );
+            } else {
+                copyPixels(buffer.pixels(), last.pixels());
             }
-            if (buffer.width == width and buffer.height == height) return buffer;
-            if (self.last_rendered == buffer) self.last_rendered = null;
-            buffer.destroy(self.allocator);
-            _ = self.buffers.swapRemove(index);
+            return clip;
         }
 
-        const buffer = try Buffer.create(self.allocator, self.connection.shm.?, width, height);
-        errdefer buffer.destroy(self.allocator);
-        try self.buffers.append(self.allocator, buffer);
-        return buffer;
-    }
-
-    fn acquireExtraBuffer(self: *Backend, extra: *ExtraSurface, width: u31, height: u31) !*Buffer {
-        var index: usize = 0;
-        while (index < extra.buffers.items.len) {
-            const buffer = extra.buffers.items[index];
-            if (buffer.busy) {
-                index += 1;
-                continue;
+        fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
+            const allocator = self.backend.allocator;
+            var index: usize = 0;
+            while (index < self.buffers.items.len) {
+                const buffer = self.buffers.items[index];
+                if (buffer.busy) {
+                    index += 1;
+                    continue;
+                }
+                if (buffer.width == width and buffer.height == height) return buffer;
+                if (self.last_rendered == buffer) self.last_rendered = null;
+                buffer.destroy(allocator);
+                _ = self.buffers.swapRemove(index);
             }
-            if (buffer.width == width and buffer.height == height) return buffer;
-            if (extra.last_rendered == buffer) extra.last_rendered = null;
-            buffer.destroy(self.allocator);
-            _ = extra.buffers.swapRemove(index);
+
+            const buffer = try Buffer.create(allocator, self.backend.connection.shm.?, width, height);
+            errdefer buffer.destroy(allocator);
+            try self.buffers.append(allocator, buffer);
+            return buffer;
         }
-
-        const buffer = try Buffer.create(self.allocator, self.connection.shm.?, width, height);
-        errdefer buffer.destroy(self.allocator);
-        try extra.buffers.append(self.allocator, buffer);
-        return buffer;
-    }
-
-    fn createExtraSurface(
-        output: *wl.Output,
-        connection: *const window.Connection,
-        options: Options,
-    ) !ExtraSurface {
-        return .{ .protocol = try window.Surface.init(connection, output, options) };
-    }
+    };
 };
 
 const Buffer = struct {

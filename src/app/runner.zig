@@ -45,8 +45,12 @@ pub const Options = struct {
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
     const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
     const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = options.height };
-    if (options.backend == .wayland_shm and options.layer_shell != null and options.layer_shell.?.output == .all) {
-        return runWaylandAllOutputs(allocator, loop, app, constraints, options);
+    if (options.layer_shell != null and options.layer_shell.?.output == .all) {
+        return switch (options.backend) {
+            .log => runLog(allocator, loop, app, constraints, options),
+            .wayland_shm => runWaylandAllOutputs(allocator, loop, app, constraints, options),
+            .vulkan => error.UnsupportedLayerShellAllOutputs,
+        };
     }
     return switch (options.backend) {
         .log => runLog(allocator, loop, app, constraints, options),
@@ -128,15 +132,17 @@ fn runWayland(
 
     var initial_constraints = constraints;
     const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
-    var backend = try Backend.create(allocator, .{
+    var backend = try Backend.create(allocator);
+    defer backend.destroy();
+    const win = try backend.createWindow(.{
         .title = options.title,
         .app_id = options.app_id,
         .width = backend_width,
         .height = try positiveU31(constraints.max_height),
         .layer_shell = options.layer_shell,
     });
-    defer backend.destroy();
-    const configured_size = try backend.waitForInitialConfigure();
+    try backend.waitForAllConfigured();
+    const configured_size = win.currentSize();
     initial_constraints = .{ .max_width = configured_size.width, .max_height = configured_size.height };
 
     if (settings_client) |*settings| settings.finishColorSchemeRead();
@@ -144,7 +150,7 @@ fn runWayland(
 
     var runtime = try runtime_mod.Runtime.init(
         allocator,
-        backend.renderBackend(),
+        win.renderBackend(),
         initial_constraints,
         app,
         initial_color_scheme,
@@ -162,15 +168,15 @@ fn runWayland(
     // Layer-shell surfaces never receive xdg_toplevel suspension, so only
     // regular toplevels pause presentation while hidden.
     if (options.layer_shell == null) {
-        queue.suspended_query = .{ .ctx = backend, .func = Backend.suspendedOpaque };
+        queue.suspended_query = .{ .ctx = win, .func = Backend.Window.suspendedOpaque };
     }
-    backend.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
-    backend.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
-    backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
-    backend.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
-    backend.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
-    backend.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
-    backend.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
+    win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
+    win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
+    win.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
+    win.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
+    win.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
+    win.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
+    win.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
         settings.setChangeHandler(&runtime, desktopSettingsChanged);
@@ -329,15 +335,20 @@ const QueuedPlatformEvents = struct {
 
 const MultiOutputContext = struct {
     runtime: *runtime_mod.Runtime,
-    backend: *wayland_shm.Backend,
-    output_backends: []wayland_shm.Backend.OutputRenderBackend,
+    windows: []const *wayland_shm.Backend.Window,
 
+    /// Repaints every window with the runtime's single tree, relaid out
+    /// per window size. Iterates in reverse so the runtime's backend ends
+    /// up bound to the first window, keeping text measurement stable
+    /// between repaints.
     fn repaintAll(self: *MultiOutputContext) !void {
-        var index = self.output_backends.len;
+        var index = self.windows.len;
         while (index > 0) {
             index -= 1;
-            self.runtime.backend = self.output_backends[index].backendInterface();
-            const size = self.backend.outputSize(index);
+            const win = self.windows[index];
+            if (win.protocol.closed) continue;
+            self.runtime.backend = win.renderBackend();
+            const size = win.currentSize();
             self.runtime.constraints = .{ .max_width = size.width, .max_height = size.height };
             self.runtime.rebuild_pending = true;
             try self.runtime.repaint();
@@ -382,28 +393,31 @@ fn runWaylandAllOutputs(
     defer if (settings_client) |*settings| settings.deinit();
 
     const backend_width = if (options.width <= 0) 0 else try positiveU31(constraints.max_width);
-    var backend = try wayland_shm.Backend.create(allocator, .{
+    var backend = try wayland_shm.Backend.create(allocator);
+    defer backend.destroy();
+
+    // One real window per output; a compositor-chosen fallback when no
+    // outputs were advertised.
+    const window_count = @max(backend.outputCount(), 1);
+    var windows = try allocator.alloc(*wayland_shm.Backend.Window, window_count);
+    defer allocator.free(windows);
+    for (windows, 0..) |*win, index| win.* = try backend.createWindow(.{
         .title = options.title,
         .app_id = options.app_id,
         .width = backend_width,
         .height = try positiveU31(constraints.max_height),
         .layer_shell = options.layer_shell,
+        .output = if (index < backend.outputCount()) backend.outputAt(index) else null,
     });
-    defer backend.destroy();
-    _ = try backend.waitForInitialConfigure();
-
-    const output_count = backend.outputCount();
-    var output_backends = try allocator.alloc(wayland_shm.Backend.OutputRenderBackend, output_count);
-    defer allocator.free(output_backends);
-    for (output_backends, 0..) |*output_backend, index| output_backend.* = backend.renderBackendForOutput(index);
+    try backend.waitForAllConfigured();
 
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
-    const first_size = backend.outputSize(0);
+    const first_size = windows[0].currentSize();
     var runtime = try runtime_mod.Runtime.init(
         allocator,
-        output_backends[0].backendInterface(),
+        windows[0].renderBackend(),
         .{ .max_width = first_size.width, .max_height = first_size.height },
         app,
         initial_color_scheme,
@@ -416,18 +430,20 @@ fn runWaylandAllOutputs(
     if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
     defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
 
-    var multi_context: MultiOutputContext = .{ .runtime = &runtime, .backend = backend, .output_backends = output_backends };
+    var multi_context: MultiOutputContext = .{ .runtime = &runtime, .windows = windows };
     runtime.setRepaintScheduler(&multi_context, MultiOutputContext.schedule);
 
     var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime, .multi_output = &multi_context };
     defer queue.deinit();
-    backend.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
-    backend.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
-    backend.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
-    backend.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
-    backend.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
-    backend.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
-    backend.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
+    for (windows) |win| {
+        win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
+        win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
+        win.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
+        win.setRepaintHandler(&queue, QueuedPlatformEvents.configure);
+        win.setFrameHandler(&queue, QueuedPlatformEvents.frameDone);
+        win.setKeyHandler(&queue, QueuedPlatformEvents.keyInput);
+        win.setScrollHandler(&queue, QueuedPlatformEvents.scroll);
+    }
     if (settings_client) |*settings| {
         try settings.installSignalFilter();
         settings.setChangeHandler(&runtime, desktopSettingsChanged);

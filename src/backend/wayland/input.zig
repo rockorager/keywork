@@ -15,7 +15,15 @@ const wl = wayland.client.wl;
 
 const log = std.log.scoped(.keywork_wayland_input);
 
-surface: *wl.Surface,
+allocator: std.mem.Allocator,
+/// Registered per-window input targets. Pointer and keyboard focus route
+/// events to the target whose surface the seat entered.
+targets: std.ArrayList(*Target) = .empty,
+pointer_target: ?*Target = null,
+keyboard_target: ?*Target = null,
+/// Target captured when a fling starts, so kinetic scrolling keeps
+/// affecting the window it began on even after the pointer leaves.
+fling_target: ?*Target = null,
 seat: ?*wl.Seat = null,
 pointer: ?*wl.Pointer = null,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
@@ -51,16 +59,47 @@ repeat_text_buffer: [64]u8 = undefined,
 key_text_buffer: [64]u8 = undefined,
 repeat_delay_ms: u64 = 0,
 repeat_interval_ms: u64 = 0,
-pointer_button_handler: ?PointerButtonHandler = null,
-pointer_button_context: ?*anyopaque = null,
-pointer_move_handler: ?PointerMoveHandler = null,
-pointer_move_context: ?*anyopaque = null,
-cursor_shape_handler: ?CursorShapeHandler = null,
-cursor_shape_context: ?*anyopaque = null,
-key_handler: ?KeyHandler = null,
-key_context: ?*anyopaque = null,
-scroll_handler: ?ScrollHandler = null,
-scroll_context: ?*anyopaque = null,
+
+/// Per-window input handlers, registered with the seat-level input state
+/// and selected by pointer/keyboard focus. Owned by the backend window.
+pub const Target = struct {
+    surface: *wl.Surface,
+    pointer_button_handler: ?PointerButtonHandler = null,
+    pointer_button_context: ?*anyopaque = null,
+    pointer_move_handler: ?PointerMoveHandler = null,
+    pointer_move_context: ?*anyopaque = null,
+    cursor_shape_handler: ?CursorShapeHandler = null,
+    cursor_shape_context: ?*anyopaque = null,
+    key_handler: ?KeyHandler = null,
+    key_context: ?*anyopaque = null,
+    scroll_handler: ?ScrollHandler = null,
+    scroll_context: ?*anyopaque = null,
+
+    pub fn setPointerButtonHandler(self: *Target, context: *anyopaque, handler: PointerButtonHandler) void {
+        self.pointer_button_context = context;
+        self.pointer_button_handler = handler;
+    }
+
+    pub fn setPointerMoveHandler(self: *Target, context: *anyopaque, handler: PointerMoveHandler) void {
+        self.pointer_move_context = context;
+        self.pointer_move_handler = handler;
+    }
+
+    pub fn setCursorShapeHandler(self: *Target, context: *anyopaque, handler: CursorShapeHandler) void {
+        self.cursor_shape_context = context;
+        self.cursor_shape_handler = handler;
+    }
+
+    pub fn setKeyHandler(self: *Target, context: *anyopaque, handler: KeyHandler) void {
+        self.key_context = context;
+        self.key_handler = handler;
+    }
+
+    pub fn setScrollHandler(self: *Target, context: *anyopaque, handler: ScrollHandler) void {
+        self.scroll_context = context;
+        self.scroll_handler = handler;
+    }
+};
 
 /// Multiplier for finger and continuous axis deltas. libinput's touchpad
 /// deltas track finger travel 1:1, which feels sluggish for scrolling
@@ -103,7 +142,7 @@ pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point)
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
 pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void;
 
-pub fn init(surface: *wl.Surface, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
+pub fn init(allocator: std.mem.Allocator, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
     const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
     const pointer = if (seat) |wl_seat| pointer: {
         break :pointer wl_seat.getPointer() catch null;
@@ -113,7 +152,7 @@ pub fn init(surface: *wl.Surface, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.Cu
     } else null;
 
     var self: Self = .{
-        .surface = surface,
+        .allocator = allocator,
         .seat = seat,
         .pointer = pointer,
         .cursor_shape_manager = cursor_shape_manager,
@@ -125,6 +164,7 @@ pub fn init(surface: *wl.Surface, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.Cu
 }
 
 pub fn deinit(self: *Self) void {
+    self.targets.deinit(self.allocator);
     self.clearXkbKeymap();
     if (self.xkb_context) |context| xkb.xkb_context_unref(context);
     self.destroyCursorShapeDevice();
@@ -139,29 +179,39 @@ pub fn attachListeners(self: *Self) void {
     if (self.keyboard) |keyboard| keyboard.setListener(*Self, keyboardListener, self);
 }
 
-pub fn setPointerButtonHandler(self: *Self, context: *anyopaque, handler: PointerButtonHandler) void {
-    self.pointer_button_context = context;
-    self.pointer_button_handler = handler;
+/// Register a window's input target. The target's surface identifies the
+/// window in seat enter events; the caller owns the target's storage and
+/// must unregister it before destroying the surface.
+pub fn registerTarget(self: *Self, target: *Target) !void {
+    for (self.targets.items) |existing| std.debug.assert(existing != target);
+    try self.targets.append(self.allocator, target);
 }
 
-pub fn setPointerMoveHandler(self: *Self, context: *anyopaque, handler: PointerMoveHandler) void {
-    self.pointer_move_context = context;
-    self.pointer_move_handler = handler;
+pub fn unregisterTarget(self: *Self, target: *Target) void {
+    for (self.targets.items, 0..) |existing, index| {
+        if (existing != target) continue;
+        _ = self.targets.orderedRemove(index);
+        break;
+    }
+    if (self.pointer_target == target) {
+        self.pointer_target = null;
+        self.pointer_position = null;
+        self.pointer_enter_serial = null;
+        self.cursor_shape = null;
+    }
+    if (self.keyboard_target == target) {
+        self.keyboard_target = null;
+        self.stopKeyRepeat();
+    }
+    if (self.fling_target == target) self.stopFling();
 }
 
-pub fn setCursorShapeHandler(self: *Self, context: *anyopaque, handler: CursorShapeHandler) void {
-    self.cursor_shape_context = context;
-    self.cursor_shape_handler = handler;
-}
-
-pub fn setKeyHandler(self: *Self, context: *anyopaque, handler: KeyHandler) void {
-    self.key_context = context;
-    self.key_handler = handler;
-}
-
-pub fn setScrollHandler(self: *Self, context: *anyopaque, handler: ScrollHandler) void {
-    self.scroll_context = context;
-    self.scroll_handler = handler;
+fn findTarget(self: *Self, surface: ?*wl.Surface) ?*Target {
+    const wanted = surface orelse return null;
+    for (self.targets.items) |target| {
+        if (target.surface == wanted) return target;
+    }
+    return null;
 }
 
 pub fn installEventTimers(self: *Self, loop: *event_loop.EventLoop) !void {
@@ -214,7 +264,11 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
 fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) void {
     switch (event) {
         .enter => |enter| {
-            if (enter.surface != self.surface) return;
+            // Flush any group pending for the previous window before
+            // switching focus, so its events do not leak across targets.
+            if (self.pointer_target != null) self.flushPointerFrame();
+            self.pointer_target = self.findTarget(enter.surface);
+            if (self.pointer_target == null) return;
             self.pointer_enter_serial = enter.serial;
             self.cursor_shape = null;
             self.pointer_position = .{ .x = @floatCast(enter.surface_x.toDouble()), .y = @floatCast(enter.surface_y.toDouble()) };
@@ -227,6 +281,7 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
             self.pending_pointer.left = true;
         },
         .motion => |motion| {
+            if (self.pointer_target == null) return;
             self.pointer_position = .{ .x = @floatCast(motion.surface_x.toDouble()), .y = @floatCast(motion.surface_y.toDouble()) };
             self.pending_pointer.moved = true;
         },
@@ -270,6 +325,12 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
 fn flushPointerFrame(self: *Self) void {
     const pending = self.pending_pointer;
     self.pending_pointer = .{};
+    if (self.pointer_target == null) return;
+    // The leave notification below is the last event for this window;
+    // focus stays cleared until the next enter selects a target.
+    defer if (pending.left) {
+        self.pointer_target = null;
+    };
 
     if (pending.left and self.pointer_position == null) {
         self.dispatchPointerMove(null);
@@ -292,7 +353,7 @@ fn flushPointerFrame(self: *Self) void {
             };
             const dx = pending.scroll_dx * speed;
             const dy = pending.scroll_dy * speed;
-            self.dispatchScroll(point, dx, dy);
+            dispatchScroll(self.pointer_target, point, dx, dy);
             if (pending.scroll_source == .finger) {
                 self.trackScrollVelocity(dx, dy, pending.scroll_time_ms);
             } else {
@@ -326,17 +387,20 @@ fn resetScrollVelocity(self: *Self) void {
 
 fn startFling(self: *Self, point: keywork.Point) void {
     const timer = self.fling_timer orelse return;
+    const target = self.pointer_target orelse return;
     const vx = std.math.clamp(self.scroll_velocity_x, -fling_max_velocity, fling_max_velocity);
     const vy = std.math.clamp(self.scroll_velocity_y, -fling_max_velocity, fling_max_velocity);
     if (@abs(vx) < fling_start_velocity and @abs(vy) < fling_start_velocity) return;
     self.fling_velocity_x = vx;
     self.fling_velocity_y = vy;
     self.fling_point = point;
+    self.fling_target = target;
     timer.arm(fling_interval_ms, fling_interval_ms) catch return;
     self.fling_active = true;
 }
 
 fn stopFling(self: *Self) void {
+    self.fling_target = null;
     if (!self.fling_active) return;
     self.fling_active = false;
     if (self.fling_timer) |timer| timer.disarm();
@@ -346,7 +410,8 @@ fn flingTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u6
     const self: *Self = @ptrCast(@alignCast(ctx));
     if (!self.fling_active) return;
     const dt_ms: f32 = @floatFromInt(fling_interval_ms * @max(1, expirations));
-    self.dispatchScroll(
+    dispatchScroll(
+        self.fling_target,
         self.fling_point,
         self.fling_velocity_x * dt_ms / 1000.0,
         self.fling_velocity_y * dt_ms / 1000.0,
@@ -360,15 +425,18 @@ fn flingTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u6
 }
 
 fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
-    if (self.pointer_move_handler) |handler| handler(self.pointer_move_context.?, point);
+    const target = self.pointer_target orelse return;
+    if (target.pointer_move_handler) |handler| handler(target.pointer_move_context.?, point);
 }
 
-fn dispatchScroll(self: *Self, point: keywork.Point, dx: f32, dy: f32) void {
-    if (self.scroll_handler) |handler| handler(self.scroll_context.?, point, dx, dy);
+fn dispatchScroll(target: ?*Target, point: keywork.Point, dx: f32, dy: f32) void {
+    const resolved = target orelse return;
+    if (resolved.scroll_handler) |handler| handler(resolved.scroll_context.?, point, dx, dy);
 }
 
 fn dispatchPointerButton(self: *Self, point: keywork.Point, state: keywork.PointerButtonState) void {
-    if (self.pointer_button_handler) |handler| handler(self.pointer_button_context.?, point, state);
+    const target = self.pointer_target orelse return;
+    if (target.pointer_button_handler) |handler| handler(target.pointer_button_context.?, point, state);
 }
 
 fn createCursorShapeDevice(self: *Self) void {
@@ -387,10 +455,11 @@ fn destroyCursorShapeDevice(self: *Self) void {
 }
 
 fn updateCursorShape(self: *Self, point: keywork.Point) void {
-    const handler = self.cursor_shape_handler orelse return;
+    const target = self.pointer_target orelse return;
+    const handler = target.cursor_shape_handler orelse return;
     const serial = self.pointer_enter_serial orelse return;
     const device = self.cursor_shape_device orelse return;
-    const shape = handler(self.cursor_shape_context.?, point);
+    const shape = handler(target.cursor_shape_context.?, point);
     if (self.cursor_shape == shape) return;
     device.setShape(serial, waylandCursorShape(shape));
     self.cursor_shape = shape;
@@ -408,12 +477,12 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void
     switch (event) {
         .keymap => |keymap| self.installXkbKeymap(keymap),
         .enter => |enter| {
-            if (enter.surface != self.surface) {
-                self.shift_down = false;
-                self.stopKeyRepeat();
-            }
+            self.keyboard_target = self.findTarget(enter.surface);
+            self.shift_down = false;
+            self.stopKeyRepeat();
         },
         .leave => {
+            self.keyboard_target = null;
             self.shift_down = false;
             self.stopKeyRepeat();
         },
@@ -554,7 +623,8 @@ fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
 }
 
 fn dispatchKeyInput(self: *Self, input: keywork.KeyInput) void {
-    if (self.key_handler) |handler| handler(self.key_context.?, input);
+    const target = self.keyboard_target orelse return;
+    if (target.key_handler) |handler| handler(target.key_context.?, input);
 }
 
 fn startKeyRepeat(self: *Self, key: u32, input: keywork.KeyInput) void {
