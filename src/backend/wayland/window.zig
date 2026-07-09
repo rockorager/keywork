@@ -22,6 +22,10 @@ const ShellRole = union(enum) {
     layer: struct {
         surface: *zwlr.LayerSurfaceV1,
     },
+    popup: struct {
+        surface: *xdg.Surface,
+        popup: *xdg.Popup,
+    },
 
     pub fn destroy(self: ShellRole) void {
         switch (self) {
@@ -30,8 +34,26 @@ const ShellRole = union(enum) {
                 role.surface.destroy();
             },
             .layer => |role| role.surface.destroy(),
+            .popup => |role| {
+                role.popup.destroy();
+                role.surface.destroy();
+            },
         }
     }
+};
+
+/// Placement request for a popup surface, in the parent surface's
+/// logical coordinate space.
+pub const PopupOptions = struct {
+    width: u31,
+    height: u31,
+    anchor_x: i32,
+    anchor_y: i32,
+    anchor_width: i32,
+    anchor_height: i32,
+    edge: keywork.Widget.PopupPlacement.Edge = .bottom,
+    alignment: keywork.Widget.Alignment = .start,
+    gap: i32 = 0,
 };
 
 /// Protocol state shared by every renderer targeting a Wayland surface.
@@ -82,6 +104,56 @@ pub const Surface = struct {
         };
     }
 
+    /// Creates a popup surface anchored to `parent`. The compositor may
+    /// reposition or resize the popup; the final geometry arrives in the
+    /// xdg_popup configure event.
+    pub fn initPopup(connection: *const Connection, parent: *const Surface, options: PopupOptions) !Surface {
+        const compositor = connection.compositor orelse return error.NoWlCompositor;
+        const wm_base = connection.wm_base orelse return error.NoXdgWmBase;
+        std.debug.assert(options.width > 0 and options.height > 0);
+
+        const surface = try compositor.createSurface();
+        errdefer surface.destroy();
+        const xdg_surface = try wm_base.getXdgSurface(surface);
+        errdefer xdg_surface.destroy();
+
+        const positioner = try wm_base.createPositioner();
+        defer positioner.destroy();
+        positioner.setSize(options.width, options.height);
+        positioner.setAnchorRect(options.anchor_x, options.anchor_y, @max(options.anchor_width, 1), @max(options.anchor_height, 1));
+        positioner.setAnchor(popupAnchor(options.edge, options.alignment));
+        positioner.setGravity(popupGravity(options.edge, options.alignment));
+        positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_x = true, .flip_y = true });
+        const offset = popupOffset(options.edge, options.gap);
+        positioner.setOffset(offset.x, offset.y);
+
+        const parent_xdg_surface: ?*xdg.Surface = switch (parent.shell_role) {
+            .xdg => |role| role.surface,
+            .popup => |role| role.surface,
+            .layer => null,
+        };
+        const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
+        errdefer popup.destroy();
+        // Layer surfaces adopt the popup through the layer-shell protocol
+        // instead of an xdg parent.
+        if (parent.shell_role == .layer) parent.shell_role.layer.surface.getPopup(popup);
+
+        const viewport = if (connection.viewporter) |manager| try manager.getViewport(surface) else null;
+        errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
+        const fractional_scale = if (connection.fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
+        errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+
+        return .{
+            .surface = surface,
+            .viewport = viewport,
+            .fractional_scale = fractional_scale,
+            .shell_role = .{ .popup = .{ .surface = xdg_surface, .popup = popup } },
+            .width = options.width,
+            .height = options.height,
+            .scale = parent.scale,
+        };
+    }
+
     pub fn deinit(self: *Surface) void {
         if (self.frame_callback) |callback| callback.destroy();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
@@ -99,10 +171,23 @@ pub const Surface = struct {
                 role.toplevel.setListener(*Surface, toplevelListener, self);
             },
             .layer => |role| role.surface.setListener(*Surface, layerSurfaceListener, self),
+            .popup => |role| {
+                role.surface.setListener(*Surface, xdgSurfaceListener, self);
+                role.popup.setListener(*Surface, popupListener, self);
+            },
         }
         if (self.fractional_scale) |fractional_scale| {
             fractional_scale.setListener(*Surface, fractionalScaleListener, self);
         }
+    }
+
+    /// Requests an explicit pointer/keyboard grab so the compositor
+    /// dismisses the popup when the user clicks elsewhere. Must be called
+    /// before the initial commit, with the serial of the input event that
+    /// opened the popup.
+    pub fn grabPopup(self: *Surface, seat: *wl.Seat, serial: u32) void {
+        std.debug.assert(self.shell_role == .popup);
+        self.shell_role.popup.popup.grab(seat, serial);
     }
 
     pub fn currentSize(self: *const Surface) keywork.Size {
@@ -173,6 +258,17 @@ pub const Surface = struct {
                 self.repaint_pending = true;
             },
             .closed => self.closed = true,
+        }
+    }
+
+    fn popupListener(_: *xdg.Popup, event: xdg.Popup.Event, self: *Surface) void {
+        switch (event) {
+            .configure => |configure| {
+                if (configure.width > 0) self.width = @intCast(configure.width);
+                if (configure.height > 0) self.height = @intCast(configure.height);
+            },
+            .popup_done => self.closed = true,
+            .repositioned => {},
         }
     }
 
@@ -382,6 +478,69 @@ fn createShellRole(
     toplevel.setAppId(options.app_id);
     toplevel.setTitle(options.title);
     return .{ .xdg = .{ .surface = xdg_surface, .toplevel = toplevel } };
+}
+
+/// The positioner anchor is the point on the anchor rect the popup
+/// attaches to: the requested edge, adjusted along it by the alignment.
+fn popupAnchor(edge: keywork.Widget.PopupPlacement.Edge, alignment: keywork.Widget.Alignment) xdg.Positioner.Anchor {
+    return switch (edge) {
+        .bottom => switch (alignment) {
+            .start => .bottom_left,
+            .center => .bottom,
+            .end => .bottom_right,
+        },
+        .top => switch (alignment) {
+            .start => .top_left,
+            .center => .top,
+            .end => .top_right,
+        },
+        .right => switch (alignment) {
+            .start => .top_right,
+            .center => .right,
+            .end => .bottom_right,
+        },
+        .left => switch (alignment) {
+            .start => .top_left,
+            .center => .left,
+            .end => .bottom_left,
+        },
+    };
+}
+
+/// Gravity is the direction the popup extends away from the anchor
+/// point; the cross-axis component keeps the aligned edges flush.
+fn popupGravity(edge: keywork.Widget.PopupPlacement.Edge, alignment: keywork.Widget.Alignment) xdg.Positioner.Gravity {
+    return switch (edge) {
+        .bottom => switch (alignment) {
+            .start => .bottom_right,
+            .center => .bottom,
+            .end => .bottom_left,
+        },
+        .top => switch (alignment) {
+            .start => .top_right,
+            .center => .top,
+            .end => .top_left,
+        },
+        .right => switch (alignment) {
+            .start => .bottom_right,
+            .center => .right,
+            .end => .top_right,
+        },
+        .left => switch (alignment) {
+            .start => .bottom_left,
+            .center => .left,
+            .end => .top_left,
+        },
+    };
+}
+
+fn popupOffset(edge: keywork.Widget.PopupPlacement.Edge, gap: i32) struct { x: i32, y: i32 } {
+    return switch (edge) {
+        .bottom => .{ .x = 0, .y = gap },
+        .top => .{ .x = 0, .y = -gap },
+        .right => .{ .x = gap, .y = 0 },
+        .left => .{ .x = -gap, .y = 0 },
+    };
 }
 
 fn layer(value: wayland_options.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
