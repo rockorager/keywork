@@ -22,6 +22,15 @@ pub const Method = struct {
 pub fn create(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: []const Method, resource_ptr: *anyopaque) c_int {
     const slot: *?*anyopaque = @ptrCast(@alignCast(c.lua_newuserdata(lua_state, @sizeOf(?*anyopaque)).?));
     slot.* = resource_ptr;
+    ensureMetatable(lua_state, type_name, methods);
+    _ = c.lua_setmetatable(lua_state, -2);
+    c.lua_pushvalue(lua_state, -1);
+    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+/// Pushes the shared metatable for `type_name`, creating it (with an
+/// `__index` table of `methods`) on first use.
+fn ensureMetatable(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: []const Method) void {
     if (c.luaL_newmetatable(lua_state, type_name) != 0) {
         c.lua_createtable(lua_state, 0, @intCast(methods.len));
         for (methods) |method| {
@@ -30,9 +39,15 @@ pub fn create(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: []cons
         }
         c.lua_setfield(lua_state, -2, "__index");
     }
-    _ = c.lua_setmetatable(lua_state, -2);
-    c.lua_pushvalue(lua_state, -1);
-    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+}
+
+/// Pushes the shared `__index` methods table for `type_name`, creating the
+/// metatable if needed, so owners can extend a handle type with
+/// Lua-implemented methods before any handle exists.
+pub fn pushMethodsTable(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: []const Method) void {
+    ensureMetatable(lua_state, type_name, methods);
+    c.lua_getfield(lua_state, -1, "__index");
+    c.lua_remove(lua_state, -2);
 }
 
 /// Pushes a bare slot userdata for use as a closure upvalue and returns a

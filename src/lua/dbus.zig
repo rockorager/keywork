@@ -81,7 +81,120 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_setfield(lua_state, dbus_table, "array");
     c.lua_pushcclosure(lua_state, luaDbusVariant, 0);
     c.lua_setfield(lua_state, dbus_table, "variant");
+
+    // The property and proxy sugar must suspend through bus:call, so it is
+    // implemented as Lua closures layered on the bus methods table rather
+    // than as C functions, which cannot yield across lua_call.
+    if (c.luaL_loadstring(lua_state, bus_sugar_lua) != 0) {
+        _ = c.lua_error(lua_state);
+        unreachable;
+    }
+    lua_handle.pushMethodsTable(lua_state, bus_type, &bus_methods);
+    c.lua_pushvalue(lua_state, dbus_table);
+    c.lua_call(lua_state, 2, 0);
 }
+
+/// Generic client-side sugar over bus:call: typed Properties access and
+/// proxy objects whose member accesses become method calls. Kept small and
+/// orthogonal; everything routes through bus:call and inherits its
+/// coroutine, timeout, and error semantics.
+const bus_sugar_lua =
+    \\local methods, dbus = ...
+    \\local unpack = unpack or table.unpack
+    \\local maxn = table.maxn
+    \\
+    \\local properties_iface = "org.freedesktop.DBus.Properties"
+    \\
+    \\local basic_signatures = {
+    \\  string = "s",
+    \\  object_path = "o",
+    \\  boolean = "b",
+    \\  int32 = "i",
+    \\  uint32 = "u",
+    \\  double = "d",
+    \\}
+    \\
+    \\-- Properties.Set requires a variant; plain scalars infer s/b/d,
+    \\-- dbus.* typed values carry their own signature, and anything else is
+    \\-- programmer misuse without an explicit signature.
+    \\local function to_variant(value, signature)
+    \\  if signature then return dbus.variant(signature, value) end
+    \\  local t = type(value)
+    \\  if t == "string" then return dbus.variant("s", value) end
+    \\  if t == "boolean" then return dbus.variant("b", value) end
+    \\  if t == "number" then return dbus.variant("d", value) end
+    \\  if t == "table" then
+    \\    local dbus_type = value.__dbus_type
+    \\    if dbus_type == "variant" then return value end
+    \\    local basic = basic_signatures[dbus_type]
+    \\    if basic then return dbus.variant(basic, value.value) end
+    \\    if dbus_type == "array" then
+    \\      return dbus.variant("a" .. value.signature, value.value)
+    \\    end
+    \\  end
+    \\  error("set_property cannot infer a signature; pass options.signature or a dbus.* typed value", 3)
+    \\end
+    \\
+    \\function methods.get_property(bus, options)
+    \\  local reply, err = bus:call({
+    \\    destination = options.destination,
+    \\    path = options.path,
+    \\    interface = properties_iface,
+    \\    member = "Get",
+    \\    args = { options.interface, options.name },
+    \\    timeout_ms = options.timeout_ms,
+    \\  })
+    \\  if not reply then return nil, err end
+    \\  return reply.args[1]
+    \\end
+    \\
+    \\function methods.set_property(bus, options)
+    \\  local value = to_variant(options.value, options.signature)
+    \\  local reply, err = bus:call({
+    \\    destination = options.destination,
+    \\    path = options.path,
+    \\    interface = properties_iface,
+    \\    member = "Set",
+    \\    args = { options.interface, options.name, value },
+    \\    timeout_ms = options.timeout_ms,
+    \\  })
+    \\  if not reply then return nil, err end
+    \\  return true
+    \\end
+    \\
+    \\-- Unknown keys on a proxy become method-call stubs, memoized on first
+    \\-- access. The bus/destination/path/interface fields are reserved.
+    \\function methods.proxy(bus, destination, path, interface, options)
+    \\  assert(type(destination) == "string", "proxy requires a destination string")
+    \\  assert(type(path) == "string", "proxy requires a path string")
+    \\  assert(type(interface) == "string", "proxy requires an interface string")
+    \\  local timeout_ms = options and options.timeout_ms
+    \\  local proxy = {
+    \\    bus = bus,
+    \\    destination = destination,
+    \\    path = path,
+    \\    interface = interface,
+    \\  }
+    \\  return setmetatable(proxy, {
+    \\    __index = function(self, member)
+    \\      local call = function(_, ...)
+    \\        local reply, err = bus:call({
+    \\          destination = destination,
+    \\          path = path,
+    \\          interface = interface,
+    \\          member = member,
+    \\          args = { ... },
+    \\          timeout_ms = timeout_ms,
+    \\        })
+    \\        if not reply then return nil, err end
+    \\        return unpack(reply.args, 1, maxn(reply.args))
+    \\      end
+    \\      rawset(self, member, call)
+    \\      return call
+    \\    end,
+    \\  })
+    \\end
+;
 
 const pop = lua_value.pop;
 const absoluteIndex = lua_value.absoluteIndex;
@@ -620,6 +733,12 @@ pub const Bus = struct {
                 return;
             };
             try self.replyPropertiesGetAll(object, message, interface);
+        } else if (std.mem.eql(u8, member, "Set")) {
+            const pair = methodCallStringPair(message) orelse {
+                try self.replyError(message, "org.freedesktop.DBus.Error.InvalidArgs", "Set requires interface, property, and value");
+                return;
+            };
+            try self.replyPropertySet(object, message, pair.interface, pair.property);
         } else {
             try self.replyError(message, "org.freedesktop.DBus.Error.UnknownMethod", "unsupported Properties method");
         }
@@ -675,6 +794,44 @@ pub const Bus = struct {
         if (dbus_c.dbus_message_iter_close_container(&iter, &variant) == 0) return error.OutOfMemory;
         if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
         dbus_c.dbus_connection_flush(self.connection);
+    }
+
+    /// Handles org.freedesktop.DBus.Properties.Set: unwraps the variant
+    /// into a Lua value, invokes the exported property's `set` function,
+    /// and replies with an empty method return. Properties without a `set`
+    /// function are read-only.
+    fn replyPropertySet(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, property: []const u8) !void {
+        const lua_state = self.host.luaState();
+        const original_top = c.lua_gettop(lua_state);
+        defer c.lua_settop(lua_state, original_top);
+
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
+        c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
+        if (c.lua_isnil(lua_state, -1)) {
+            try self.replyError(message, "org.freedesktop.DBus.Error.UnknownInterface", "unknown interface");
+            return;
+        }
+        c.lua_getfield(lua_state, -1, "properties");
+        if (!c.lua_isnil(lua_state, -1)) c.lua_getfield(lua_state, -1, tryZTemp(property).ptr);
+        if (c.lua_isnil(lua_state, -1)) {
+            try self.replyError(message, "org.freedesktop.DBus.Error.UnknownProperty", "unknown property");
+            return;
+        }
+        c.lua_getfield(lua_state, -1, "set");
+        if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) {
+            try self.replyError(message, "org.freedesktop.DBus.Error.PropertyReadOnly", "property is read-only");
+            return;
+        }
+        if (!pushMethodCallArg(lua_state, message, 2)) {
+            try self.replyError(message, "org.freedesktop.DBus.Error.InvalidArgs", "Set requires a value");
+            return;
+        }
+        if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
+            const error_message = stringFromStack(lua_state, -1) catch "Lua property setter failed";
+            try self.replyError(message, "org.keywork.LuaError", error_message);
+            return;
+        }
+        try self.replyValues(message, lua_state, original_top, 0);
     }
 
     fn replyPropertiesGetAll(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8) !void {
@@ -1288,6 +1445,21 @@ fn methodCallString(message: *dbus_c.DBusMessage, wanted_index: usize) ?[]const 
         if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
     }
     return null;
+}
+
+/// Pushes method-call argument `wanted_index` (0-based) as a Lua value, or
+/// returns false when the message has too few arguments. Variants decode
+/// transparently like all other incoming values.
+fn pushMethodCallArg(lua_state: *c.lua_State, message: *dbus_c.DBusMessage, wanted_index: usize) bool {
+    var iter: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_init(message, &iter) == 0) return false;
+    var index: usize = 0;
+    while (index < wanted_index) : (index += 1) {
+        if (dbus_c.dbus_message_iter_next(&iter) == 0) return false;
+    }
+    if (dbus_c.dbus_message_iter_get_arg_type(&iter) == dbus_c.DBUS_TYPE_INVALID) return false;
+    pushDbusIterValue(lua_state, &iter);
+    return true;
 }
 
 fn propertySignature(lua_state: *c.lua_State, object: *ExportedObject, interface: []const u8, property: []const u8) ![]const u8 {

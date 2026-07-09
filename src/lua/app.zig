@@ -1475,6 +1475,138 @@ test "lua bus:subscribe streams signals to a coroutine reader" {
     pop(app.state, 1);
 }
 
+test "lua dbus property sugar and proxies drive exported objects" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The bus exports an object and calls it through its own well-known
+    // name: the daemon routes calls and replies back over the same
+    // connection, so no second peer is needed.
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\local bus = assert(dbus.session())
+        \\
+        \\-- Programmer misuse raises: bad proxy arguments, uninferable value.
+        \\assert(not pcall(function() return bus:proxy(nil, "/", "org.keywork.Nope") end))
+        \\assert(not pcall(function()
+        \\  return bus:set_property({
+        \\    destination = "org.keywork.Nope", path = "/",
+        \\    interface = "org.keywork.Nope", name = "X", value = {},
+        \\  })
+        \\end))
+        \\
+        \\local value = "initial"
+        \\local count = 0
+        \\assert(bus:request_name("org.keywork.test.Properties"))
+        \\bus:export("/org/keywork/prop_test", {
+        \\  ["org.keywork.PropTest"] = {
+        \\    methods = {
+        \\      Echo = { call = function(call, text) return text end },
+        \\    },
+        \\    properties = {
+        \\      Value = {
+        \\        signature = "s",
+        \\        access = "readwrite",
+        \\        get = function() return value end,
+        \\        set = function(v) value = v end,
+        \\      },
+        \\      Count = {
+        \\        signature = "u",
+        \\        access = "readwrite",
+        \\        get = function() return dbus.uint32(count) end,
+        \\        set = function(v) count = v end,
+        \\      },
+        \\      Fixed = {
+        \\        signature = "s",
+        \\        get = function() return "fixed" end,
+        \\      },
+        \\    },
+        \\  },
+        \\})
+        \\
+        \\loop.spawn(function()
+        \\  local target = {
+        \\    destination = "org.keywork.test.Properties",
+        \\    path = "/org/keywork/prop_test",
+        \\    interface = "org.keywork.PropTest",
+        \\    timeout_ms = 2000,
+        \\  }
+        \\  local function options(extra)
+        \\    local merged = {}
+        \\    for key, entry in pairs(target) do merged[key] = entry end
+        \\    for key, entry in pairs(extra) do merged[key] = entry end
+        \\    return merged
+        \\  end
+        \\
+        \\  got_initial = bus:get_property(options({ name = "Value" })) == "initial"
+        \\  set_ok = bus:set_property(options({ name = "Value", value = "updated" })) == true
+        \\  got_updated = bus:get_property(options({ name = "Value" })) == "updated" and value == "updated"
+        \\
+        \\  -- Typed values carry their own wire signature through the variant.
+        \\  typed_set = bus:set_property(options({ name = "Count", value = dbus.uint32(7) })) == true
+        \\  typed_get = bus:get_property(options({ name = "Count" })) == 7 and count == 7
+        \\
+        \\  -- A property without a setter is read-only on the wire.
+        \\  local denied, denied_err = bus:set_property(options({ name = "Fixed", value = "nope" }))
+        \\  read_only = denied == nil and denied_err == "org.freedesktop.DBus.Error.PropertyReadOnly"
+        \\
+        \\  local proxy = bus:proxy(target.destination, target.path, target.interface, { timeout_ms = 2000 })
+        \\  proxy_echo = proxy:Echo("hello") == "hello"
+        \\  local nope, nope_err = proxy:NoSuchMethod()
+        \\  proxy_error = nope == nil and type(nope_err) == "string"
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("dbus-props") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-properties.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-properties.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusPropertiesTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusPropertiesTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusPropertiesTest.callback);
+    try loop.run();
+
+    const expected_true = [_][:0]const u8{
+        "got_initial", "set_ok",    "got_updated", "typed_set",
+        "typed_get",   "read_only", "proxy_echo",  "proxy_error",
+    };
+    for (expected_true) |global| {
+        c.lua_getglobal(app.state, global.ptr);
+        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
+            std.debug.print("expected global '{s}' to be true\n", .{global});
+            return err;
+        };
+        pop(app.state, 1);
+    }
+}
+
 test "lua stateful widget set_state rebuilds retained subtree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
