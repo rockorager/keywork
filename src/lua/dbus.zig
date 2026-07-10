@@ -237,6 +237,27 @@ const ExportedObject = struct {
     }
 };
 
+/// One consumer's claim on a shared bus connection. dbus.session() and
+/// dbus.system() hand out a lease per call over a per-kind pooled Bus;
+/// bus:close() (or cancellation of the acquiring task) releases only that
+/// lease, and the connection closes when the last lease goes. Lease memory
+/// is owned by the Bus and freed at Bus deinit.
+const BusLease = struct {
+    bus: *Bus,
+    handle_ref: c_int = -1,
+    released: bool = false,
+
+    fn release(self: *BusLease, lua_state: *c.lua_State) void {
+        if (self.released) return;
+        self.released = true;
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
+        std.debug.assert(self.bus.refs > 0);
+        self.bus.refs -= 1;
+        if (self.bus.refs == 0) self.bus.close();
+    }
+};
+
 /// An unanswered incoming method call. Created when an exported method is
 /// dispatched to its handler task and completed by the task through the
 /// handle's reply/fail methods, whenever the handler finishes. Bus close
@@ -325,9 +346,16 @@ pub const Bus = struct {
     pending_replies: std.ArrayList(*PendingReply) = .empty,
     owned_names: std.ArrayList(*OwnedName) = .empty,
     exported_objects: std.ArrayList(*ExportedObject) = .empty,
-    handle_ref: c_int = -1,
+    leases: std.ArrayList(*BusLease) = .empty,
+    /// Count of unreleased leases; the connection closes when it hits zero.
+    refs: usize = 0,
     registered: bool = false,
     closed: bool = false,
+    /// True while dbus_connection_dispatch is on the C stack.
+    dispatching: bool = false,
+    /// Set when close() ran during dispatch; dispatch() finishes the
+    /// connection teardown once libdbus unwinds.
+    pending_close: bool = false,
     filter_installed: bool = false,
     source_handle: ?event_loop.EventLoop.SourceHandle = null,
 
@@ -428,15 +456,39 @@ pub const Bus = struct {
             self.filter_installed = false;
         }
         self.closed = true;
+
+        // Close may come from teardown rather than the last lease release;
+        // kill surviving lease handles so their methods no-op, and stop
+        // handing this bus out of the pool.
+        for (self.leases.items) |lease| {
+            lease.released = true;
+            lua_handle.invalidate(lua_state, lease.handle_ref);
+            lease.handle_ref = -1;
+        }
+        self.refs = 0;
+        clearSharedBus(lua_state, self);
+
+        // When close is triggered by a coroutine resumed from inside
+        // dbus_connection_dispatch, the connection must stay alive until
+        // libdbus unwinds; dispatch() finishes the job.
+        if (self.dispatching) {
+            self.pending_close = true;
+            return;
+        }
+        self.finishClose();
+    }
+
+    fn finishClose(self: *Bus) void {
+        self.pending_close = false;
         dbus_c.dbus_connection_close(self.connection);
         dbus_c.dbus_connection_unref(self.connection);
         self.fd = invalid_fd;
-        lua_handle.invalidate(lua_state, self.handle_ref);
-        self.handle_ref = -1;
     }
 
     fn deinit(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         self.close();
+        for (self.leases.items) |lease| allocator.destroy(lease);
+        self.leases.deinit(allocator);
         for (self.exported_objects.items) |object| object.destroy(allocator, lua_state);
         self.exported_objects.deinit(allocator);
         for (self.owned_names.items) |name| name.destroy(allocator);
@@ -575,8 +627,18 @@ pub const Bus = struct {
     }
 
     fn dispatch(self: *Bus) void {
+        // A dispatched message may resume a coroutine that closes this bus
+        // (e.g. releasing the last lease); close() then defers the real
+        // connection teardown to here, after libdbus is off the C stack.
+        self.dispatching = true;
+        defer {
+            self.dispatching = false;
+            if (self.pending_close) self.finishClose();
+        }
         _ = dbus_c.dbus_connection_read_write(self.connection, 0);
-        while (dbus_c.dbus_connection_dispatch(self.connection) == dbus_c.DBUS_DISPATCH_DATA_REMAINS) {}
+        while (!self.pending_close and
+            dbus_c.dbus_connection_dispatch(self.connection) == dbus_c.DBUS_DISPATCH_DATA_REMAINS)
+        {}
     }
 
     fn emitSignal(self: *Bus, lua_state: *c.lua_State, options_index: c_int) !void {
@@ -952,34 +1014,96 @@ fn luaDbusSystem(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return luaBus(lua_state_optional, .system);
 }
 
+fn sharedBusRegistryKey(kind: Kind) [*:0]const u8 {
+    return switch (kind) {
+        .session => "keywork.dbus.shared_session",
+        .system => "keywork.dbus.shared_system",
+    };
+}
+
+/// Returns the pooled bus for `kind`, or null when none is open.
+fn sharedBus(lua_state: *c.lua_State, kind: Kind) ?*Bus {
+    c.lua_getfield(lua_state, c.LUA_REGISTRYINDEX, sharedBusRegistryKey(kind));
+    defer pop(lua_state, 1);
+    const ptr = c.lua_touserdata(lua_state, -1) orelse return null;
+    const bus: *Bus = @ptrCast(@alignCast(ptr));
+    if (bus.closed) return null;
+    return bus;
+}
+
+fn setSharedBus(lua_state: *c.lua_State, kind: Kind, bus: *Bus) void {
+    c.lua_pushlightuserdata(lua_state, bus);
+    c.lua_setfield(lua_state, c.LUA_REGISTRYINDEX, sharedBusRegistryKey(kind));
+}
+
+/// Removes `bus` from the pool if it is the one being handed out.
+fn clearSharedBus(lua_state: *c.lua_State, bus: *Bus) void {
+    const key = sharedBusRegistryKey(bus.kind);
+    c.lua_getfield(lua_state, c.LUA_REGISTRYINDEX, key);
+    const current = c.lua_touserdata(lua_state, -1);
+    pop(lua_state, 1);
+    if (current != @as(*anyopaque, bus)) return;
+    c.lua_pushnil(lua_state);
+    c.lua_setfield(lua_state, c.LUA_REGISTRYINDEX, key);
+}
+
 fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
     lua_task.raiseIfCanceled(lua_state);
     // A missing session or system bus is an expected runtime condition, so
     // connection failure reports nil, err instead of raising.
-    const bus = host.addBus(kind) catch |err| {
-        std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
+    const bus = sharedBus(lua_state, kind) orelse blk: {
+        const created = host.addBus(kind) catch |err| {
+            std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
+            c.lua_pushnil(lua_state);
+            const name = @errorName(err);
+            c.lua_pushlstring(lua_state, name.ptr, name.len);
+            return 2;
+        };
+        setSharedBus(lua_state, kind, created);
+        break :blk created;
+    };
+
+    const allocator = host.allocator();
+    const lease = allocator.create(BusLease) catch |err| {
         c.lua_pushnil(lua_state);
         const name = @errorName(err);
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
-    lua_task.adopt(lua_state, .{ .ptr = bus, .cancel_fn = cancelBusResource });
-    bus.handle_ref = lua_handle.create(lua_state, bus_type, &bus_methods, bus);
+    lease.* = .{ .bus = bus };
+    bus.leases.append(allocator, lease) catch |err| {
+        allocator.destroy(lease);
+        c.lua_pushnil(lua_state);
+        const name = @errorName(err);
+        c.lua_pushlstring(lua_state, name.ptr, name.len);
+        return 2;
+    };
+    bus.refs += 1;
+    lua_task.adopt(lua_state, .{ .ptr = lease, .cancel_fn = cancelBusLease });
+    lease.handle_ref = lua_handle.create(lua_state, bus_type, &bus_methods, lease);
     return 1;
 }
 
-/// Task-cancel hook: closing the bus never resumes parked readers, so both
+/// Task-cancel hook: releasing a lease never resumes parked readers (a
+/// last-lease release closes the bus, which drops them silently), so both
 /// cancel modes are safe here.
-fn cancelBusResource(ptr: *anyopaque, _: *c.lua_State, _: lua_coro.CancelMode) void {
-    const bus: *Bus = @ptrCast(@alignCast(ptr));
-    bus.close();
+fn cancelBusLease(ptr: *anyopaque, lua_state: *c.lua_State, _: lua_coro.CancelMode) void {
+    const lease: *BusLease = @ptrCast(@alignCast(ptr));
+    lease.release(lua_state);
+}
+
+/// Derefs a lease handle at `index` to its bus, or null when the lease was
+/// released or the bus closed.
+fn leasedBus(lua_state: *c.lua_State, index: c_int) ?*Bus {
+    const lease = lua_handle.resource(BusLease, lua_state, index, bus_type) orelse return null;
+    return lease.bus;
 }
 
 fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = leasedBus(lua_state, 1) orelse return 0;
     lua_task.raiseIfCanceled(lua_state);
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     const subscription = bus.subscribe(lua_state, 2) catch |err| {
@@ -993,7 +1117,7 @@ fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse {
+    const bus = leasedBus(lua_state, 1) orelse {
         // An awaited call needs a distinguishable result, so a dead bus
         // handle reports nil, err instead of the usual silent no-op.
         c.lua_pushnil(lua_state);
@@ -1019,7 +1143,7 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = leasedBus(lua_state, 1) orelse return 0;
     _ = c.luaL_checklstring(lua_state, 2, null);
     // Losing the race for a bus name is an expected runtime condition, so
     // an unavailable name reports nil, err instead of raising.
@@ -1037,7 +1161,7 @@ fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusReleaseName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = leasedBus(lua_state, 1) orelse return 0;
     const name = stringFromStack(lua_state, 2) catch return c.luaL_error(lua_state, "release_name requires a name");
     bus.releaseName(name);
     return 0;
@@ -1045,7 +1169,7 @@ fn luaDbusReleaseName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusExport(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = leasedBus(lua_state, 1) orelse return 0;
     const object = bus.exportObject(lua_state, 2, 3) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus export failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus export failed");
@@ -1056,7 +1180,7 @@ fn luaDbusExport(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusEmit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    const bus = leasedBus(lua_state, 1) orelse return 0;
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     bus.emitSignal(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus emit failed: {}", .{err});
@@ -1067,14 +1191,14 @@ fn luaDbusEmit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
-    bus.close();
+    const lease = lua_handle.resource(BusLease, lua_state, 1, bus_type) orelse return 0;
+    lease.release(lua_state);
     return 0;
 }
 
 fn luaDbusClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse {
+    const bus = leasedBus(lua_state, 1) orelse {
         c.lua_pushboolean(lua_state, 1);
         return 1;
     };

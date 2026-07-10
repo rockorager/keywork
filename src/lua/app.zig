@@ -102,6 +102,13 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.stopLifecycleLog();
+        // Scopes and tasks go first: destroying a task cancels the
+        // resources it adopted, which must still be alive. The per-type
+        // destroy loops below then reclaim whatever remains.
+        for (self.scopes.items) |scope| scope.destroy(self.allocator, self.state);
+        self.scopes.deinit(self.allocator);
+        for (self.tasks.items) |task| task.destroy(self.allocator, self.state);
+        self.tasks.deinit(self.allocator);
         for (self.fd_watches.items) |watch| watch.destroy(self.allocator, self.state);
         self.fd_watches.deinit(self.allocator);
         for (self.fs_events.items) |fs_event| fs_event.destroy(self.allocator, self.state);
@@ -116,10 +123,6 @@ pub const App = struct {
         self.sockets.deinit(self.allocator);
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
-        for (self.scopes.items) |scope| scope.destroy(self.allocator, self.state);
-        self.scopes.deinit(self.allocator);
-        for (self.tasks.items) |task| task.destroy(self.allocator, self.state);
-        self.tasks.deinit(self.allocator);
         self.pending_scope_cancels.deinit(self.allocator);
         self.releaseWindowChildren(&self.window_children);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
@@ -2411,6 +2414,94 @@ test "lua exported methods can yield before replying" {
     try loop.run();
 
     const expected_true = [_][:0]const u8{ "slow_ok", "boom_ok", "done" };
+    for (expected_true) |global| {
+        c.lua_getglobal(app.state, global.ptr);
+        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
+            std.debug.print("expected global '{s}' to be true\n", .{global});
+            return err;
+        };
+        pop(app.state, 1);
+    }
+}
+
+test "lua dbus session buses are pooled and refcounted" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Names are owned by the connection, so a name requested through one
+    // lease surviving that lease's close proves the connection is shared,
+    // and the name vanishing after the last close proves it really closed.
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\
+        \\local NAME = "org.keywork.test.Pool"
+        \\local b1 = assert(dbus.session())
+        \\local b2 = assert(dbus.session())
+        \\assert(b1:request_name(NAME))
+        \\
+        \\loop.spawn(function()
+        \\  local function owner_of(bus, name)
+        \\    local reply = bus:call({
+        \\      destination = "org.freedesktop.DBus",
+        \\      path = "/org/freedesktop/DBus",
+        \\      interface = "org.freedesktop.DBus",
+        \\      member = "GetNameOwner",
+        \\      args = { name },
+        \\      timeout_ms = 2000,
+        \\    })
+        \\    return reply and (reply.args or {})[1] or nil
+        \\  end
+        \\
+        \\  local before = owner_of(b2, NAME)
+        \\  b1:close()
+        \\  closed_ok = b1:closed() and not b2:closed()
+        \\  local after = owner_of(b2, NAME)
+        \\  shared_ok = before ~= nil and after == before
+        \\  b2:close()
+        \\  fully_closed_ok = b2:closed()
+        \\  local b3 = assert(dbus.session())
+        \\  reacquire_ok = not b3:closed() and owner_of(b3, NAME) == nil
+        \\  b3:close()
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("pool") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-pool.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-pool.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusPoolTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusPoolTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusPoolTest.callback);
+    try loop.run();
+
+    const expected_true = [_][:0]const u8{ "closed_ok", "shared_ok", "fully_closed_ok", "reacquire_ok", "done" };
     for (expected_true) |global| {
         c.lua_getglobal(app.state, global.ptr);
         std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
