@@ -6,6 +6,7 @@ const icon_theme = @import("../linux/icon_theme.zig");
 const lua_codec = @import("codec.zig");
 const lua_handle = @import("handle.zig");
 const lua_image = @import("image.zig");
+const lua_task = @import("task.zig");
 const lua_theme = @import("theme.zig");
 const lua_value = @import("value.zig");
 const svg_icon = @import("../graphics/svg_icon.zig");
@@ -28,9 +29,19 @@ const tableRefField = lua_value.tableRefField;
 pub const Host = struct {
     ptr: *anyopaque,
     invalidate_state_fn: *const fn (*anyopaque) anyerror!void,
+    create_scope_fn: *const fn (*anyopaque) anyerror!*lua_task.LuaScope,
+    dispose_scope_fn: *const fn (*anyopaque, *lua_task.LuaScope) void,
 
     pub fn invalidateState(self: Host) !void {
         try self.invalidate_state_fn(self.ptr);
+    }
+
+    pub fn createScope(self: Host) !*lua_task.LuaScope {
+        return self.create_scope_fn(self.ptr);
+    }
+
+    pub fn disposeScope(self: Host, scope: *lua_task.LuaScope) void {
+        self.dispose_scope_fn(self.ptr, scope);
     }
 };
 
@@ -442,7 +453,9 @@ const LuaStatefulWidget = struct {
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         const spec = c.lua_gettop(self.lua_state);
         c.lua_createtable(self.lua_state, 0, 1);
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.slot_ref);
         c.lua_pushvalue(self.lua_state, spec);
+        c.lua_pushcclosure(self.lua_state, luaStateIndex, 2);
         c.lua_setfield(self.lua_state, -2, "__index");
         _ = c.lua_setmetatable(self.lua_state, state_table);
         c.lua_getfield(self.lua_state, spec, "init");
@@ -517,6 +530,7 @@ const LuaStatefulWidget = struct {
             pop(self.lua_state, 1);
         }
 
+        if (state.scope) |state_scope| self.host.disposeScope(state_scope);
         if (state.state_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
         lua_handle.invalidate(self.lua_state, state.slot_ref);
         allocator.destroy(state);
@@ -571,6 +585,8 @@ const LuaStatefulState = struct {
     state_ref: c_int,
     slot_ref: c_int = -1,
     dirty: bool = false,
+    /// Lazily created on first self.scope access; canceled on dispose.
+    scope: ?*lua_task.LuaScope = null,
 };
 
 /// Popup content held as a registry ref: either a widget table parsed as-is
@@ -1112,6 +1128,10 @@ test "gesture buttons parse names and reject invalid values" {
 test "failed gesture parse destroys callbacks it already captured" {
     const TestHost = struct {
         fn invalidate(_: *anyopaque) anyerror!void {}
+        fn createScope(_: *anyopaque) anyerror!*lua_task.LuaScope {
+            return error.Unsupported;
+        }
+        fn disposeScope(_: *anyopaque, _: *lua_task.LuaScope) void {}
     };
 
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
@@ -1121,7 +1141,12 @@ test "failed gesture parse destroys callbacks it already captured" {
     defer arena.deinit();
 
     var host_ctx: u8 = 0;
-    const host: Host = .{ .ptr = &host_ctx, .invalidate_state_fn = TestHost.invalidate };
+    const host: Host = .{
+        .ptr = &host_ctx,
+        .invalidate_state_fn = TestHost.invalidate,
+        .create_scope_fn = TestHost.createScope,
+        .dispose_scope_fn = TestHost.disposeScope,
+    };
 
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
@@ -1242,6 +1267,41 @@ fn installStateMethods(lua_state: *c.lua_State, state: *LuaStatefulState, state_
     state.slot_ref = lua_handle.createSlot(lua_state, state);
     c.lua_pushcclosure(lua_state, luaSetState, 1);
     c.lua_setfield(lua_state, state_table, "set_state");
+}
+
+/// __index for stateful widget state tables. Resolves "scope" to the
+/// widget's lifecycle scope — created on first access, canceled by the
+/// runtime when the widget is disposed — and everything else through the
+/// spec table. Upvalues: 1 = state slot, 2 = spec table.
+fn luaStateIndex(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.lua_type(lua_state, 2) == c.LUA_TSTRING) {
+        var len: usize = 0;
+        const key = c.lua_tolstring(lua_state, 2, &len);
+        if (std.mem.eql(u8, key[0..len], "scope")) return pushStateScope(lua_state);
+    }
+    c.lua_pushvalue(lua_state, 2);
+    c.lua_gettable(lua_state, c.lua_upvalueindex(2));
+    return 1;
+}
+
+fn pushStateScope(lua_state: *c.lua_State) c_int {
+    const state = lua_handle.slotResource(LuaStatefulState, lua_state, c.lua_upvalueindex(1)) orelse {
+        c.lua_pushnil(lua_state);
+        return 1;
+    };
+    if (state.scope == null) {
+        state.scope = state.host.createScope() catch |err| {
+            std.log.scoped(.keywork_luajit).warn("widget scope creation failed: {}", .{err});
+            return c.luaL_error(lua_state, "widget scope creation failed");
+        };
+    }
+    lua_task.pushScopeHandle(lua_state, state.scope.?);
+    // Cache the handle on the state table so later accesses skip __index.
+    c.lua_pushvalue(lua_state, 2);
+    c.lua_pushvalue(lua_state, -2);
+    c.lua_rawset(lua_state, 1);
+    return 1;
 }
 
 fn setStateProps(lua_state: *c.lua_State, state_table: c_int, props_ref: c_int) void {

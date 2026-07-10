@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
+const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 const dbus_c = @import("dbus_c");
@@ -230,7 +231,7 @@ const Subscription = struct {
     member: ?[]const u8 = null,
     canceled: bool = false,
 
-    fn cancel(self: *Subscription, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
+    pub fn cancel(self: *Subscription, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
         if (self.match_rule) |rule| {
@@ -990,6 +991,7 @@ fn luaDbusSystem(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
     // A missing session or system bus is an expected runtime condition, so
     // connection failure reports nil, err instead of raising.
     const bus = host.addBus(kind) catch |err| {
@@ -999,18 +1001,28 @@ fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
+    lua_task.adopt(lua_state, .{ .ptr = bus, .cancel_fn = cancelBusResource });
     bus.handle_ref = lua_handle.create(lua_state, bus_type, &bus_methods, bus);
     return 1;
+}
+
+/// Task-cancel hook: closing the bus never resumes parked readers, so both
+/// cancel modes are safe here.
+fn cancelBusResource(ptr: *anyopaque, _: *c.lua_State, _: lua_coro.CancelMode) void {
+    const bus: *Bus = @ptrCast(@alignCast(ptr));
+    bus.close();
 }
 
 fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const bus = lua_handle.resource(Bus, lua_state, 1, bus_type) orelse return 0;
+    lua_task.raiseIfCanceled(lua_state);
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     const subscription = bus.subscribe(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus subscribe failed: {}", .{err});
         return c.luaL_error(lua_state, "dbus subscribe failed");
     };
+    lua_task.adoptResource(Subscription, lua_state, subscription);
     subscription.handle_ref = lua_handle.create(lua_state, subscription_type, &subscription_methods, subscription);
     return 1;
 }

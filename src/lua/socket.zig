@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
+const lua_task = @import("task.zig");
 const lua_sink = @import("sink.zig");
 const c = @import("luajit_c");
 
@@ -221,6 +222,7 @@ const socket_methods = [_]lua_handle.Method{
 fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
     var path_len: usize = 0;
     const path_ptr = c.luaL_checklstring(lua_state, 1, &path_len).?;
     const path = path_ptr[0..path_len];
@@ -242,6 +244,7 @@ fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
+    lua_task.adoptResource(LuaSocket, lua_state, socket);
     socket.handle_ref = lua_handle.create(lua_state, socket_type, &socket_methods, socket);
     return 1;
 }

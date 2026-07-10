@@ -4,6 +4,7 @@ const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
+const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
@@ -21,9 +22,11 @@ pub const Host = struct {
         addFdWatch: *const fn (*anyopaque, i32, u32) anyerror!*FdWatch,
         addFsEvent: *const fn (*anyopaque, []const u8) anyerror!*FsEvent,
         addTimer: *const fn (*anyopaque, u64, u64, c_int) anyerror!*LuaTimer,
+        addTask: *const fn (*anyopaque, *c.lua_State, c_int) anyerror!*lua_task.LuaTask,
+        addScope: *const fn (*anyopaque) anyerror!*lua_task.LuaScope,
     };
 
-    fn allocator(self: Host) std.mem.Allocator {
+    pub fn allocator(self: Host) std.mem.Allocator {
         return self.vtable.allocator(self.ptr);
     }
 
@@ -49,6 +52,14 @@ pub const Host = struct {
 
     fn addTimer(self: Host, delay_ms: u64, interval_ms: u64, ref: c_int) !*LuaTimer {
         return try self.vtable.addTimer(self.ptr, delay_ms, interval_ms, ref);
+    }
+
+    pub fn addTask(self: Host, thread: *c.lua_State, thread_ref: c_int) !*lua_task.LuaTask {
+        return try self.vtable.addTask(self.ptr, thread, thread_ref);
+    }
+
+    pub fn addScope(self: Host) !*lua_task.LuaScope {
+        return try self.vtable.addScope(self.ptr);
     }
 };
 
@@ -164,9 +175,9 @@ pub const LuaTimer = struct {
     ref: c_int,
     handle_ref: c_int = -1,
     /// A waiter timer resumes the coroutine behind `ref` instead of
-    /// delivering ticks. Cancelling one without firing (app teardown) drops
-    /// the ref without resuming, so the sleep simply never returns and the
-    /// coroutine becomes collectible.
+    /// delivering ticks. Cancelling one without firing resumes the sleeper
+    /// early (task cancellation) or, on silent teardown, drops the ref
+    /// without resuming so the coroutine becomes collectible.
     waiter: bool = false,
     /// Coroutine parked in next(), if any.
     reader_ref: c_int = -1,
@@ -206,8 +217,14 @@ pub const LuaTimer = struct {
         self.canceled = true;
         if (self.timer) |_| if (self.host.eventLoop()) |loop| self.unregister(loop);
         if (self.ref >= 0) {
-            c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
-            self.ref = -1;
+            if (self.waiter and mode == .resume_reader) {
+                // A canceled sleep returns early; a canceled task then
+                // raises on its next await.
+                lua_coro.resumeReaderWith(lua_state, &self.ref, 0);
+            } else {
+                c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
+                self.ref = -1;
+            }
         }
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
@@ -238,8 +255,12 @@ pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Ho
     c.lua_pushlightuserdata(lua_state, host);
     c.lua_pushcclosure(lua_state, luaFsEvent, 1);
     c.lua_setfield(lua_state, loop_table, "fs_event");
-    c.lua_pushcclosure(lua_state, lua_coro.luaSpawn, 0);
+    c.lua_pushlightuserdata(lua_state, host);
+    c.lua_pushcclosure(lua_state, lua_task.luaSpawn, 1);
     c.lua_setfield(lua_state, loop_table, "spawn");
+    c.lua_pushlightuserdata(lua_state, host);
+    c.lua_pushcclosure(lua_state, lua_task.luaScope, 1);
+    c.lua_setfield(lua_state, loop_table, "scope");
     c.lua_pushlightuserdata(lua_state, host);
     c.lua_pushcclosure(lua_state, luaSleep, 1);
     c.lua_setfield(lua_state, loop_table, "sleep");
@@ -306,6 +327,7 @@ fn luaTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u64)
 fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
     const interval = optionalSecondsField(lua_state, 1, "interval");
     const wall = boolField(lua_state, 1, "wall");
@@ -329,6 +351,7 @@ fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
             return c.luaL_error(lua_state, "timer failed");
         };
     }
+    lua_task.adoptResource(LuaTimer, lua_state, timer);
     pushTimerHandle(lua_state, timer);
     return 1;
 }
@@ -350,12 +373,15 @@ fn luaSleep(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         return c.luaL_error(lua_state, "loop.sleep failed");
     };
     timer.waiter = true;
+    // Adopting the waiter lets a task cancel wake its own sleeper.
+    lua_task.adoptResource(LuaTimer, lua_state, timer);
     return c.lua_yield(lua_state, 0);
 }
 
 fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
     const fd_int = c.luaL_checkinteger(lua_state, 1);
     if (fd_int < 0 or fd_int > std.math.maxInt(i32)) return c.luaL_error(lua_state, "invalid fd");
     var events: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
@@ -370,6 +396,7 @@ fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         std.log.scoped(.keywork_luajit).warn("loop.fd failed: {}", .{err});
         return c.luaL_error(lua_state, "loop.fd failed");
     };
+    lua_task.adoptResource(FdWatch, lua_state, watch);
     pushFdWatchHandle(lua_state, watch);
     return 1;
 }
@@ -377,6 +404,7 @@ fn luaWatchFd(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
     const path = fsEventPath(lua_state, 1) catch return c.luaL_error(lua_state, "fs_event requires a path");
     // Watching a not-yet-existing path is an expected runtime failure, so it
     // reports nil, err instead of raising.
@@ -387,6 +415,7 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
+    lua_task.adoptResource(FsEvent, lua_state, fs_event);
     pushFsEventHandle(lua_state, fs_event);
     return 1;
 }

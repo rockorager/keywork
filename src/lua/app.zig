@@ -12,6 +12,7 @@ const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_socket = @import("socket.zig");
+const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const lua_widget = @import("widget.zig");
 const runtime_mod = @import("../ui/runtime.zig");
@@ -28,6 +29,8 @@ const DbusBus = lua_dbus.Bus;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
 const LuaTimer = lua_loop.LuaTimer;
+const LuaTask = lua_task.LuaTask;
+const LuaScope = lua_task.LuaScope;
 const pop = lua_value.pop;
 const stringFromStack = lua_value.stringFromStack;
 
@@ -53,6 +56,12 @@ pub const App = struct {
     processes: std.ArrayList(*LuaProcess) = .empty,
     sockets: std.ArrayList(*LuaSocket) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
+    tasks: std.ArrayList(*LuaTask) = .empty,
+    scopes: std.ArrayList(*LuaScope) = .empty,
+    /// Widget scopes whose cancellation is deferred to the next loop turn,
+    /// so disposing a widget never re-enters Lua mid-reconciliation.
+    pending_scope_cancels: std.ArrayList(*LuaScope) = .empty,
+    scope_cancel_timer: ?*event_loop.EventLoop.Timer = null,
     dbus_host: lua_dbus.Host = undefined,
     loop_host: lua_loop.Host = undefined,
     socket_host: lua_socket.Host = undefined,
@@ -103,6 +112,11 @@ pub const App = struct {
         self.sockets.deinit(self.allocator);
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
+        for (self.scopes.items) |scope| scope.destroy(self.allocator, self.state);
+        self.scopes.deinit(self.allocator);
+        for (self.tasks.items) |task| task.destroy(self.allocator, self.state);
+        self.tasks.deinit(self.allocator);
+        self.pending_scope_cancels.deinit(self.allocator);
         self.releaseWindowChildren(&self.window_children);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
@@ -134,6 +148,7 @@ pub const App = struct {
         for (self.processes.items) |process| try self.registerProcess(process);
         for (self.sockets.items) |socket| try socket.register();
         for (self.dbus_buses.items) |bus| try bus.register();
+        if (self.pending_scope_cancels.items.len > 0) try self.armScopeCancelTimer(loop);
         if (self.invalidator != null) try self.startLifecycle();
         if (self.quit_requested) {
             self.quit_requested = false;
@@ -159,6 +174,8 @@ pub const App = struct {
         self.stopLifecycleLog();
         if (self.script_watch) |watch| loop.removeFileWatch(watch);
         self.script_watch = null;
+        if (self.scope_cancel_timer) |timer| loop.removeTimer(timer);
+        self.scope_cancel_timer = null;
         for (self.fd_watches.items) |watch| watch.unregister(loop);
         for (self.fs_events.items) |fs_event| fs_event.unregister(loop);
         for (self.timers.items) |timer| timer.unregister(loop);
@@ -461,6 +478,8 @@ pub const App = struct {
     }
 
     fn cancelScriptResources(self: *App) void {
+        for (self.scopes.items) |scope| scope.cancel(self.state, .silent);
+        for (self.tasks.items) |task| task.cancel(self.state, .silent);
         for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state, .silent);
@@ -512,13 +531,28 @@ pub const App = struct {
     }
 
     fn widgetHost(self: *App) lua_widget.Host {
-        return .{ .ptr = self, .invalidate_state_fn = invalidateWidgetState };
+        return .{
+            .ptr = self,
+            .invalidate_state_fn = invalidateWidgetState,
+            .create_scope_fn = createWidgetScope,
+            .dispose_scope_fn = disposeWidgetScope,
+        };
     }
 
     fn invalidateWidgetState(ptr: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ptr));
         const invalidator = self.invalidator orelse return;
         try invalidator.invalidateState();
+    }
+
+    fn createWidgetScope(ptr: *anyopaque) anyerror!*LuaScope {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.addScope();
+    }
+
+    fn disposeWidgetScope(ptr: *anyopaque, scope: *LuaScope) void {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        self.scheduleScopeCancel(scope);
     }
 
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
@@ -625,6 +659,57 @@ pub const App = struct {
     fn dbusHost(self: *App) lua_dbus.Host {
         return .{ .ptr = self, .vtable = &dbus_host_vtable };
     }
+
+    fn addTask(self: *App, thread: *c.lua_State, thread_ref: c_int) !*LuaTask {
+        const task = try self.allocator.create(LuaTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{ .allocator = self.allocator, .thread = thread, .thread_ref = thread_ref };
+        try self.tasks.append(self.allocator, task);
+        return task;
+    }
+
+    fn addScope(self: *App) !*LuaScope {
+        const scope = try self.allocator.create(LuaScope);
+        errdefer self.allocator.destroy(scope);
+        scope.* = .{ .host = self.loopHost() };
+        try self.scopes.append(self.allocator, scope);
+        return scope;
+    }
+
+    /// Cancels a widget scope on the next loop turn. Widget disposal runs
+    /// inside reconciliation, where resuming coroutines could re-enter the
+    /// build; without a loop (teardown) the scope is canceled silently.
+    fn scheduleScopeCancel(self: *App, scope: *LuaScope) void {
+        if (scope.canceled) return;
+        const loop = self.event_loop orelse {
+            scope.cancel(self.state, .silent);
+            return;
+        };
+        self.pending_scope_cancels.append(self.allocator, scope) catch {
+            scope.cancel(self.state, .silent);
+            return;
+        };
+        self.armScopeCancelTimer(loop) catch |err| {
+            std.log.scoped(.keywork_luajit).warn("scope cancel deferral failed: {}", .{err});
+            _ = self.pending_scope_cancels.pop();
+            scope.cancel(self.state, .silent);
+        };
+    }
+
+    fn armScopeCancelTimer(self: *App, loop: *event_loop.EventLoop) !void {
+        if (self.scope_cancel_timer != null) return;
+        const timer = try loop.addTimer(self, scopeCancelFired);
+        errdefer loop.removeTimer(timer);
+        try timer.arm(1, 0);
+        self.scope_cancel_timer = timer;
+    }
+
+    fn scopeCancelFired(ctx: *anyopaque, loop: *event_loop.EventLoop, _: u64) !void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (self.scope_cancel_timer) |timer| loop.removeTimer(timer);
+        self.scope_cancel_timer = null;
+        while (self.pending_scope_cancels.pop()) |scope| scope.cancel(self.state, .resume_reader);
+    }
 };
 
 const process_host_vtable: lua_process.Host.VTable = .{
@@ -656,6 +741,8 @@ const loop_host_vtable: lua_loop.Host.VTable = .{
     .addFdWatch = loopHostAddFdWatch,
     .addFsEvent = loopHostAddFsEvent,
     .addTimer = loopHostAddTimer,
+    .addTask = loopHostAddTask,
+    .addScope = loopHostAddScope,
 };
 
 fn loopHostAllocator(ptr: *anyopaque) std.mem.Allocator {
@@ -692,6 +779,16 @@ fn loopHostAddFsEvent(ptr: *anyopaque, path: []const u8) anyerror!*FsEvent {
 fn loopHostAddTimer(ptr: *anyopaque, delay_ms: u64, interval_ms: u64, ref: c_int) anyerror!*LuaTimer {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addTimerWithDelay(delay_ms, interval_ms, ref);
+}
+
+fn loopHostAddTask(ptr: *anyopaque, thread: *c.lua_State, thread_ref: c_int) anyerror!*LuaTask {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addTask(thread, thread_ref);
+}
+
+fn loopHostAddScope(ptr: *anyopaque) anyerror!*LuaScope {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addScope();
 }
 
 const socket_host_vtable: lua_socket.Host.VTable = .{
@@ -991,6 +1088,7 @@ fn tryLuaToString(lua_state: *c.lua_State, index: c_int, writer: *std.Io.Writer)
 fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    lua_task.raiseIfCanceled(lua_state);
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
 
     const argv = lua_process.parseArgv(lua_state, app.allocator, 1) catch |err| {
@@ -1014,6 +1112,7 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushlstring(lua_state, name.ptr, name.len);
         return 2;
     };
+    lua_task.adoptResource(LuaProcess, lua_state, process);
     lua_process.pushHandle(lua_state, process);
     return 1;
 }
@@ -1504,6 +1603,193 @@ test "a sleeping coroutine tears down cleanly with the app" {
     // coroutine is simply dropped with the state.
 }
 
+test "loop.spawn returns a task handle with status, join, and cancel" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // No event loop is bound, so sleeps park forever and every wake-up
+    // below is driven synchronously by cancel.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local task = loop.spawn(function()
+        \\  loop.sleep(3600000)
+        \\  woke = true
+        \\  loop.sleep(3600000) -- raises "task canceled" and unwinds
+        \\  unreachable = true
+        \\end)
+        \\assert(task:status() == "running")
+        \\join_result = nil
+        \\loop.spawn(function()
+        \\  join_result = task:join()
+        \\end)
+        \\assert(join_result == nil)
+        \\task:cancel()
+        \\-- Cancel resumed the sleep so the body could unwind, but the next
+        \\-- await raised instead of parking again.
+        \\assert(woke)
+        \\assert(unreachable == nil)
+        \\assert(task:status() == "canceled")
+        \\assert(join_result == "canceled")
+        \\-- Joining a settled task returns at once, even from the main state.
+        \\local settled = loop.spawn(function() end)
+        \\assert(settled:status() == "completed")
+        \\assert(settled:join() == "completed")
+        \\-- Joining an unsettled task from the main state is misuse.
+        \\local parked = loop.spawn(function() loop.sleep(3600000) end)
+        \\local ok, err = pcall(function() return parked:join() end)
+        \\assert(not ok and err:find("coroutine", 1, true))
+        \\-- A task cannot join itself; cancel wakes the sleep so the body
+        \\-- reaches the self-join while still running.
+        \\local self_join_err
+        \\local selfish
+        \\selfish = loop.spawn(function()
+        \\  loop.sleep(3600000)
+        \\  local _, join_err = pcall(function() return selfish:join() end)
+        \\  self_join_err = join_err
+        \\end)
+        \\selfish:cancel()
+        \\assert(self_join_err:find("cannot join itself", 1, true))
+        \\return kw.app({ child = kw.text("task") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "task.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "task.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    // The parked tasks are torn down silently with the app.
+}
+
+test "scope cancel unwinds member tasks and inherited children" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local scope = loop.scope()
+        \\parent_woke = false
+        \\child_woke = false
+        \\scope:spawn(function()
+        \\  -- A plain loop.spawn from inside a scoped task inherits the scope.
+        \\  loop.spawn(function()
+        \\    loop.sleep(3600000)
+        \\    child_woke = true
+        \\  end)
+        \\  loop.sleep(3600000)
+        \\  parent_woke = true
+        \\end)
+        \\assert(not scope:canceled())
+        \\scope:cancel()
+        \\assert(scope:canceled())
+        \\assert(parent_woke and child_woke)
+        \\-- Spawning on a canceled scope raises.
+        \\local ok, err = pcall(function() return scope:spawn(function() end) end)
+        \\assert(not ok and err:find("scope canceled", 1, true))
+        \\return kw.app({ child = kw.text("scope") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scope.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "scope.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.scopes.items.len);
+    try std.testing.expect(app.scopes.items[0].canceled);
+    for (app.tasks.items) |task| {
+        try std.testing.expectEqual(lua_task.Status.canceled, task.status);
+    }
+}
+
+test "task cancel cancels resources the task created" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The timer is created while the task's coroutine runs, so the task
+    // owns it ambiently: task:cancel() cancels the timer, which ends the
+    // ticks() iteration so the body unwinds.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\stream_ended = false
+        \\local task = loop.spawn(function()
+        \\  local t = loop.timer({ interval = 60 })
+        \\  for _ in t:ticks() do end
+        \\  stream_ended = true
+        \\end)
+        \\assert(task:status() == "running")
+        \\task:cancel()
+        \\assert(stream_ended)
+        \\assert(task:status() == "canceled")
+        \\return kw.app({ child = kw.text("owned") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "owned.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "owned.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
+    try std.testing.expect(app.timers.items[0].canceled);
+}
+
+test "reload cancels tasks and scopes from the previous load" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Globals survive reload, so handles retained by the first load are
+    // observable from the second; the canceled originals must be inert.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\if not first_load then
+        \\  first_load = true
+        \\  task = loop.spawn(function() loop.sleep(3600000) end)
+        \\  scope = loop.scope()
+        \\  scope:spawn(function() loop.sleep(3600000) end)
+        \\else
+        \\  stale_task_status = task:status()
+        \\  stale_scope_canceled = scope:canceled()
+        \\end
+        \\return kw.app({ child = kw.text("reload-tasks") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reload-tasks.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "reload-tasks.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 2), app.tasks.items.len);
+    try std.testing.expectEqual(lua_task.Status.running, app.tasks.items[0].status);
+
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    for (app.tasks.items) |task| {
+        try std.testing.expectEqual(lua_task.Status.canceled, task.status);
+    }
+    try std.testing.expect(app.scopes.items[0].canceled);
+
+    c.lua_getglobal(app.state, "stale_task_status");
+    try std.testing.expectEqualStrings("canceled", try stringFromStack(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "stale_scope_canceled");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+}
+
 test "lua bus:call awaits replies and reports peer errors as nil, err" {
     if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1982,6 +2268,108 @@ test "lua stateful set_state is inert after dispose" {
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
 }
 
+test "widget scope is canceled on the loop turn after dispose" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // self.scope lazily creates the widget's lifecycle scope; removing the
+    // widget must cancel it, but deferred to the next loop turn because
+    // dispose runs inside reconciliation where resuming coroutines could
+    // re-enter the build.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\scope_task_woke = false
+        \\local Child = kw.stateful({
+        \\  init = function(self)
+        \\    self.scope:spawn(function()
+        \\      loop.sleep(3600000)
+        \\      scope_task_woke = true
+        \\    end)
+        \\  end,
+        \\  build = function(self, state)
+        \\    return kw.gesture({ id = "remove", child = kw.text("remove"), on_tap = self.props.on_remove })
+        \\  end,
+        \\})
+        \\local App = kw.stateful({
+        \\  init = function(self)
+        \\    self.show = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    if self.show then
+        \\      return Child({ key = "child", on_remove = function()
+        \\        self:set_state(function(s)
+        \\          s.show = false
+        \\        end)
+        \\      end })
+        \\    end
+        \\    return kw.text("gone")
+        \\  end,
+        \\})
+        \\return kw.app({ child = App({ key = "app" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "widget-scope.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "widget-scope.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(usize, 1), app.scopes.items.len);
+    try std.testing.expect(!app.scopes.items[0].canceled);
+
+    // Removing the widget schedules the cancel instead of running it
+    // inside reconciliation.
+    try runtime.click(.{ .x = 2, .y = 2 });
+    try std.testing.expect(!app.scopes.items[0].canceled);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_scope_cancels.items.len);
+
+    const ScopeTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "scope_task_woke");
+            const woke = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (woke or self.rounds > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: ScopeTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, ScopeTest.callback);
+    try loop.run();
+
+    try std.testing.expect(app.scopes.items[0].canceled);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_scope_cancels.items.len);
+    c.lua_getglobal(app.state, "scope_task_woke");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try std.testing.expectEqual(lua_task.Status.canceled, app.tasks.items[0].status);
+}
+
 test "event loop bind survives a vanished fs_event path" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2031,10 +2419,10 @@ test "lua fs_event cancel resumes a parked reader and ends iteration" {
         \\  for _ in watch:events() do end
         \\  stream_ended = true
         \\end)
-        \\assert(coroutine.status(reader) == "suspended")
+        \\assert(reader:status() == "running")
         \\watch:cancel()
         \\assert(stream_ended)
-        \\assert(coroutine.status(reader) == "dead")
+        \\assert(reader:status() == "completed")
         \\assert(watch:canceled())
         \\-- next() on a dead handle ends iteration instead of parking.
         \\loop.spawn(function()
@@ -2070,7 +2458,7 @@ test "lua fd watch cancel resumes a parked reader and ends iteration" {
         \\  for _ in watch:events() do end
         \\  fd_stream_ended = true
         \\end)
-        \\assert(coroutine.status(reader) == "suspended")
+        \\assert(reader:status() == "running")
         \\watch:cancel()
         \\assert(fd_stream_ended)
         \\assert(watch:canceled())
@@ -2798,10 +3186,10 @@ test "lua socket close resumes a parked reader and ends iteration" {
         \\  for _ in sock:chunks() do end
         \\  stream_ended = true
         \\end)
-        \\assert(coroutine.status(reader) == "suspended")
+        \\assert(reader:status() == "running")
         \\sock:close()
         \\assert(stream_ended)
-        \\assert(coroutine.status(reader) == "dead")
+        \\assert(reader:status() == "completed")
         \\assert(sock:closed())
         \\-- Writing to a dead handle reports nil, err.
         \\local ok, err = sock:write("late")
