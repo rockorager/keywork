@@ -223,6 +223,7 @@ const PopupHooks = struct {
     ctx: *anyopaque,
     drain_all: *const fn (ctx: *anyopaque) anyerror!void,
     reconcile_and_flush: *const fn (ctx: *anyopaque, content_dirty: bool) anyerror!void,
+    parent_pointer_down: *const fn (ctx: *anyopaque, point: keywork.Point) anyerror!bool,
 };
 
 const QueuedPlatformEvents = struct {
@@ -316,7 +317,17 @@ const QueuedPlatformEvents = struct {
         if (self.events.items.len == 0) return;
         defer self.clear();
         for (self.events.items) |event| switch (event) {
-            .pointer_button => |value| try self.runtime.pointerButton(value.point, value.state),
+            .pointer_button => |value| {
+                // A press on the parent surface outside every live popup's
+                // anchor dismisses the popups and is consumed, so clicking
+                // "through" an open menu never activates what's beneath.
+                if (value.state == .pressed) {
+                    if (self.popup_manager) |manager| {
+                        if (try manager.parent_pointer_down(manager.ctx, value.point)) continue;
+                    }
+                }
+                try self.runtime.pointerButton(value.point, value.state);
+            },
             .pointer_move => |point| try self.runtime.pointerMove(point),
             .scroll => |value| try self.runtime.scrollBy(value.point, value.dx, value.dy),
             .key => |input| try self.runtime.keyInput(input),
@@ -379,7 +390,31 @@ fn PopupManager(comptime Backend: type) type {
                 .ctx = self,
                 .drain_all = drainAllOpaque,
                 .reconcile_and_flush = reconcileAndFlushOpaque,
+                .parent_pointer_down = parentPointerDownOpaque,
             };
+        }
+
+        fn parentPointerDownOpaque(ctx: *anyopaque, point: keywork.Point) anyerror!bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.parentPointerDown(point);
+        }
+
+        /// A press on the parent window outside every live popup's anchor
+        /// dismisses those popups through on_close — like compositor
+        /// dismissal — and consumes the press, matching desktop menu
+        /// conventions. Presses on an anchor pass through so the anchor's
+        /// own gesture can toggle its popup.
+        fn parentPointerDown(self: *Self, point: keywork.Point) !bool {
+            if (self.popups.items.len == 0) return false;
+            for (self.popups.items) |popup| {
+                if (popup.anchor_rect.contains(point)) return false;
+            }
+            for (self.popups.items) |popup| {
+                if (popup.popup.on_close) |on_close| {
+                    on_close.call() catch |err| log.warn("popup on_close failed: {}", .{err});
+                }
+            }
+            return true;
         }
 
         fn drainAllOpaque(ctx: *anyopaque) anyerror!void {
@@ -395,6 +430,9 @@ fn PopupManager(comptime Backend: type) type {
         const PopupSurface = struct {
             id: []u8,
             win: *Backend.Window,
+            /// Anchor rect in parent-window coordinates; refreshed on every
+            /// reconcile pass so parent-press hit-testing tracks layout.
+            anchor_rect: keywork.Rect,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             /// Borrowed from the main element tree; refreshed on every
@@ -442,6 +480,7 @@ fn PopupManager(comptime Backend: type) type {
             for (requests.items) |request| {
                 if (self.findPopup(request.id)) |popup| {
                     popup.popup = request.popup;
+                    popup.anchor_rect = request.anchor_rect;
                     if (content_dirty) {
                         popup.runtime.rebuild_pending = true;
                         popup.runtime.repaint_pending = true;
@@ -493,6 +532,7 @@ fn PopupManager(comptime Backend: type) type {
             surface.* = .{
                 .id = id,
                 .win = win,
+                .anchor_rect = request.anchor_rect,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined },
                 .popup = request.popup,
