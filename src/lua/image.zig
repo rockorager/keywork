@@ -140,38 +140,142 @@ pub fn parse(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int
     return image.widget();
 }
 
+/// PNG-backed icon that defers pixel decoding to paint time. Widget parsing
+/// happens on every rebuild (every scroll frame for visible list rows), so
+/// it must stay free of decode work: only the header is read here for the
+/// intrinsic aspect ratio. Paint decodes once per path+target size and the
+/// pixels then live in the display list's color cache.
+const PngIcon = struct {
+    path: []const u8,
+    size: f32,
+    source_width: u32,
+    source_height: u32,
+
+    const vtable: keywork.Widget.RenderObject.VTable = .{
+        .layout = layout,
+        .paint = paint,
+    };
+
+    fn widget(self: *PngIcon) keywork.Widget {
+        return .{ .render_object = .{
+            .ptr = self,
+            .vtable = &vtable,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        } };
+    }
+
+    fn layout(ptr: *const anyopaque, context: keywork.Widget.RenderObject.LayoutContext) !keywork.Size {
+        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
+        const longest: f32 = @floatFromInt(@max(self.source_width, self.source_height));
+        const width = self.size * @as(f32, @floatFromInt(self.source_width)) / longest;
+        const height = self.size * @as(f32, @floatFromInt(self.source_height)) / longest;
+        return .{
+            .width = @min(width, context.constraints.max_width),
+            .height = @min(height, context.constraints.max_height),
+        };
+    }
+
+    fn paint(ptr: *const anyopaque, context: keywork.Widget.RenderObject.PaintContext) !void {
+        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
+        if (context.rect.width <= 0 or context.rect.height <= 0) return;
+
+        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
+        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.width * render_scale))));
+        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.height * render_scale))));
+
+        var path_hasher = std.hash.Wyhash.init(0);
+        path_hasher.update(self.path);
+        var hasher = std.hash.Wyhash.init(path_hasher.final());
+        hasher.update(std.mem.asBytes(&target_width));
+        hasher.update(std.mem.asBytes(&target_height));
+        const cache_key = hasher.final();
+
+        if (context.display_list.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+            try context.display_list.colorImage(
+                context.allocator,
+                context.rect,
+                target_width,
+                target_height,
+                @constCast(cached),
+                cache_key,
+            );
+            return;
+        }
+
+        const path_z = try context.allocator.dupeZ(u8, self.path);
+        defer context.allocator.free(path_z);
+        var source_width: c_int = 0;
+        var source_height: c_int = 0;
+        var source_channels: c_int = 0;
+        const source_bytes = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
+        defer image_c.stbi_image_free(source_bytes);
+        if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
+
+        const pixel_count: usize = @intCast(source_width * source_height);
+        const source_pixels = try context.allocator.alloc(keywork.Color, pixel_count);
+        defer context.allocator.free(source_pixels);
+        fillRgbaPixels(source_pixels, source_bytes[0 .. pixel_count * 4]);
+
+        const pixels = try resampledPixels(
+            context.allocator,
+            source_pixels,
+            @intCast(source_width),
+            @intCast(source_height),
+            target_width,
+            target_height,
+        );
+        try context.display_list.colorImage(
+            context.allocator,
+            context.rect,
+            target_width,
+            target_height,
+            pixels,
+            cache_key,
+        );
+    }
+
+    fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*anyopaque {
+        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(PngIcon);
+        errdefer allocator.destroy(result);
+        result.* = .{
+            .path = try allocator.dupe(u8, self.path),
+            .size = self.size,
+            .source_width = self.source_width,
+            .source_height = self.source_height,
+        };
+        return result;
+    }
+
+    fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
+        const self: *PngIcon = @ptrCast(@alignCast(@constCast(ptr)));
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+};
+
 pub fn pngIcon(allocator: std.mem.Allocator, path: []const u8, size: f32) !keywork.Widget {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
+    // Only the header is read for the intrinsic dimensions; the pixels
+    // are decoded lazily at paint.
     var source_width: c_int = 0;
     var source_height: c_int = 0;
     var source_channels: c_int = 0;
-    const source_pixels = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
-    defer image_c.stbi_image_free(source_pixels);
+    if (image_c.stbi_info(path_z.ptr, &source_width, &source_height, &source_channels) == 0) return error.InvalidPng;
     if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
 
-    // Keep the source at native resolution; paint resamples straight to
-    // the physical target so the pixels are only interpolated once.
-    const pixel_count: usize = @intCast(source_width * source_height);
-    const pixels = try allocator.alloc(keywork.Color, pixel_count);
-    errdefer allocator.free(pixels);
-    fillRgbaPixels(pixels, source_pixels[0 .. pixel_count * 4]);
-
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(path);
-
-    const image = try allocator.create(Image);
-    errdefer allocator.destroy(image);
-    image.* = .{
-        .width = @intCast(source_width),
-        .height = @intCast(source_height),
+    const icon = try allocator.create(PngIcon);
+    errdefer allocator.destroy(icon);
+    icon.* = .{
+        .path = try allocator.dupe(u8, path),
         .size = @floatFromInt(positiveImageSize(size)),
-        .preserve_aspect = true,
-        .pixels = pixels,
-        .cache_key = hasher.final(),
+        .source_width = @intCast(source_width),
+        .source_height = @intCast(source_height),
     };
-    return image.widget();
+    return icon.widget();
 }
 
 fn parseArgb32Pixels(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int, width: u32, height: u32) ![]keywork.Color {
