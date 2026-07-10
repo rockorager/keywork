@@ -338,16 +338,6 @@ local SNI_WATCHER = "org.kde.StatusNotifierWatcher"
 local SNI_WATCHER_PATH = "/StatusNotifierWatcher"
 local SNI_ITEM = "org.kde.StatusNotifierItem"
 
-local function dbus_entries_to_table(entries)
-  local result = {}
-  for _, entry in ipairs(entries or {}) do
-    if type(entry) == "table" and entry[1] ~= nil then
-      result[entry[1]] = entry[2]
-    end
-  end
-  return result
-end
-
 local function canonical_tray_item(sender, service_or_path)
   service_or_path = tostring(service_or_path or "")
   if service_or_path == "" then
@@ -451,7 +441,7 @@ local function create_tray_host(on_change)
         self:remove_item(item.id)
         return
       end
-      local props = dbus_entries_to_table((reply.args or {})[1] or {})
+      local props = (reply.args or {})[1] or {}
       item.category = props.Category
       item.title = props.Title
       item.status = props.Status or item.status
@@ -509,7 +499,7 @@ local function create_tray_host(on_change)
     loop.spawn(function()
       for signal in item.properties_sub:events() do
         if (signal.args or {})[1] == SNI_ITEM then
-          local changed = dbus_entries_to_table((signal.args or {})[2] or {})
+          local changed = (signal.args or {})[2] or {}
           if changed.Status ~= nil then item.status = changed.Status end
           if changed.IconName ~= nil then item.icon_name = changed.IconName end
           if changed.IconPixmap ~= nil then item.icon_pixmap = changed.IconPixmap end
@@ -895,7 +885,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
         return
       end
       self:set_state(function(state)
-        state:apply_battery_properties(path, dbus_entries_to_table((reply.args or {})[1]))
+        state:apply_battery_properties(path, (reply.args or {})[1] or {})
         state:update_battery_widget()
       end)
     end)
@@ -954,7 +944,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
 
   apply_battery_signal = function(self, signal)
     if signal.member == "PropertiesChanged" and (signal.args or {})[1] == UPOWER_DEVICE then
-      self:apply_battery_properties(signal.path or "", dbus_entries_to_table(signal.args[2]))
+      self:apply_battery_properties(signal.path or "", signal.args[2] or {})
       self:update_battery_widget()
     elseif signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" or signal.member == "Changed" then
       self:update_battery()

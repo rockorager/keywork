@@ -1695,8 +1695,41 @@ fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) voi
             dbus_c.dbus_message_iter_recurse(iter, &child);
             pushDbusIterValue(lua_state, &child);
         },
-        dbus_c.DBUS_TYPE_ARRAY, dbus_c.DBUS_TYPE_STRUCT, dbus_c.DBUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, iter),
+        dbus_c.DBUS_TYPE_ARRAY => {
+            if (dbus_c.dbus_message_iter_get_element_type(iter) == dbus_c.DBUS_TYPE_DICT_ENTRY) {
+                pushDbusIterDict(lua_state, iter);
+            } else {
+                pushDbusIterSequence(lua_state, iter);
+            }
+        },
+        dbus_c.DBUS_TYPE_STRUCT, dbus_c.DBUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, iter),
         else => c.lua_pushnil(lua_state),
+    }
+}
+
+/// Decodes a D-Bus dictionary (an array of dict entries, e.g. `a{sv}`)
+/// into a Lua map keyed by the entry keys instead of a positional array
+/// of `{key, value}` pairs.
+fn pushDbusIterDict(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+    c.lua_createtable(lua_state, 0, 0);
+    const table = c.lua_gettop(lua_state);
+    var entries: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_recurse(iter, &entries);
+    while (dbus_c.dbus_message_iter_get_arg_type(&entries) != dbus_c.DBUS_TYPE_INVALID) {
+        var entry: dbus_c.DBusMessageIter = undefined;
+        dbus_c.dbus_message_iter_recurse(&entries, &entry);
+        pushDbusIterValue(lua_state, &entry);
+        // Keys are basic D-Bus types, so nil only appears on malformed
+        // input; nil keys are illegal in Lua tables, so drop the entry.
+        if (c.lua_isnil(lua_state, -1)) {
+            pop(lua_state, 1);
+        } else if (dbus_c.dbus_message_iter_next(&entry) != 0) {
+            pushDbusIterValue(lua_state, &entry);
+            c.lua_settable(lua_state, table);
+        } else {
+            pop(lua_state, 1);
+        }
+        if (dbus_c.dbus_message_iter_next(&entries) == 0) break;
     }
 }
 
@@ -1729,4 +1762,115 @@ fn tryZTemp(value: []const u8) [:0]const u8 {
     @memcpy(dbus_temp_z_buffers[slot][0..value.len], value);
     dbus_temp_z_buffers[slot][value.len] = 0;
     return dbus_temp_z_buffers[slot][0..value.len :0];
+}
+
+fn testAppendVariantString(entry: *dbus_c.DBusMessageIter, value: [*:0]const u8) !void {
+    var variant: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(entry, dbus_c.DBUS_TYPE_VARIANT, "s", &variant) == 0) return error.OutOfMemory;
+    var ptr = value;
+    try appendDbusBasic(&variant, dbus_c.DBUS_TYPE_STRING, &ptr);
+    if (dbus_c.dbus_message_iter_close_container(entry, &variant) == 0) return error.OutOfMemory;
+}
+
+fn testAppendDictEntryString(array: *dbus_c.DBusMessageIter, key: [*:0]const u8, value: [*:0]const u8) !void {
+    var entry: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+    var key_ptr = key;
+    try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key_ptr);
+    try testAppendVariantString(&entry, value);
+    if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+}
+
+test "dbus dicts decode to Lua maps, arrays and structs to sequences" {
+    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
+    defer dbus_c.dbus_message_unref(message);
+
+    var iter: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_init_append(message, &iter);
+
+    // arg 1: a{sv} with a string, an int32, and a nested a{sv}.
+    {
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
+        try testAppendDictEntryString(&array, "name", "keywork");
+        {
+            var entry: dbus_c.DBusMessageIter = undefined;
+            if (dbus_c.dbus_message_iter_open_container(&array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+            var key: [*:0]const u8 = "count";
+            try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key);
+            var variant: dbus_c.DBusMessageIter = undefined;
+            if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, "i", &variant) == 0) return error.OutOfMemory;
+            var count: i32 = 7;
+            try appendDbusBasic(&variant, dbus_c.DBUS_TYPE_INT32, &count);
+            if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
+            if (dbus_c.dbus_message_iter_close_container(&array, &entry) == 0) return error.OutOfMemory;
+        }
+        {
+            var entry: dbus_c.DBusMessageIter = undefined;
+            if (dbus_c.dbus_message_iter_open_container(&array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+            var key: [*:0]const u8 = "nested";
+            try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key);
+            var variant: dbus_c.DBusMessageIter = undefined;
+            if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, "a{sv}", &variant) == 0) return error.OutOfMemory;
+            var nested: dbus_c.DBusMessageIter = undefined;
+            if (dbus_c.dbus_message_iter_open_container(&variant, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &nested) == 0) return error.OutOfMemory;
+            try testAppendDictEntryString(&nested, "inner", "value");
+            if (dbus_c.dbus_message_iter_close_container(&variant, &nested) == 0) return error.OutOfMemory;
+            if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
+            if (dbus_c.dbus_message_iter_close_container(&array, &entry) == 0) return error.OutOfMemory;
+        }
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+    }
+
+    // arg 2: plain string array stays a sequence.
+    {
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "s", &array) == 0) return error.OutOfMemory;
+        var first: [*:0]const u8 = "x";
+        var second: [*:0]const u8 = "y";
+        try appendDbusBasic(&array, dbus_c.DBUS_TYPE_STRING, &first);
+        try appendDbusBasic(&array, dbus_c.DBUS_TYPE_STRING, &second);
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+    }
+
+    // arg 3: struct stays a positional sequence.
+    {
+        var strukt: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_STRUCT, null, &strukt) == 0) return error.OutOfMemory;
+        var number: i32 = 5;
+        var text: [*:0]const u8 = "s";
+        try appendDbusBasic(&strukt, dbus_c.DBUS_TYPE_INT32, &number);
+        try appendDbusBasic(&strukt, dbus_c.DBUS_TYPE_STRING, &text);
+        if (dbus_c.dbus_message_iter_close_container(&iter, &strukt) == 0) return error.OutOfMemory;
+    }
+
+    // arg 4: empty dict decodes to an empty table.
+    {
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+    }
+
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    c.luaL_openlibs(lua_state);
+
+    pushDbusArgsTable(lua_state, message);
+    c.lua_setglobal(lua_state, "args");
+
+    const script =
+        \\assert(args[1].name == "keywork")
+        \\assert(args[1].count == 7)
+        \\assert(args[1].nested.inner == "value")
+        \\assert(args[2][1] == "x" and args[2][2] == "y")
+        \\assert(args[3][1] == 5 and args[3][2] == "s")
+        \\assert(type(args[4]) == "table" and next(args[4]) == nil)
+    ;
+    if (c.luaL_loadstring(lua_state, script) != 0) return error.LoadFailed;
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {
+        var len: usize = 0;
+        const message_ptr = c.lua_tolstring(lua_state, -1, &len);
+        if (message_ptr) |text| std.debug.print("script failed: {s}\n", .{text[0..len]});
+        return error.ScriptFailed;
+    }
 }

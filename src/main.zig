@@ -87,5 +87,6 @@ test {
     _ = @import("backend/wayland/window.zig");
     _ = @import("lua/app.zig");
     _ = @import("lua/coro.zig");
+    _ = @import("lua/dbus.zig");
     _ = @import("lua/json.zig");
 }
