@@ -913,6 +913,7 @@ const embedded_ui_source = @embedFile("ui.lua");
 const embedded_service_source = @embedFile("service.lua");
 const embedded_process_source = @embedFile("process.lua");
 const embedded_stream_source = @embedFile("stream.lua");
+const embedded_xdg_applications_source = @embedFile("xdg_applications.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
@@ -948,6 +949,9 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 
     c.lua_pushcclosure(lua_state, streamModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.stream");
+
+    c.lua_pushcclosure(lua_state, xdgApplicationsModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.xdg.applications");
 
     pop(lua_state, 2);
 }
@@ -1000,6 +1004,13 @@ fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn streamModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     if (c.luaL_loadbuffer(lua_state, embedded_stream_source.ptr, embedded_stream_source.len, "@keywork/stream.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn xdgApplicationsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_xdg_applications_source.ptr, embedded_xdg_applications_source.len, "@keywork/xdg_applications.lua") != 0) return c.lua_error(lua_state);
     if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     return 1;
 }
@@ -3593,6 +3604,116 @@ test "lua stream.lines splits chunks and yields the unterminated tail" {
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lines.lua", .data = script });
     const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "lines.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua xdg.applications parses entries, looks up ids, and expands exec" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "share/applications/org/example");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/applications/editor.desktop",
+        .data =
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Editor
+        \\Name[de]=Bearbeiter
+        \\GenericName=Text Editor
+        \\Comment=Edit text files
+        \\Keywords=semi\;colon;plain;
+        \\Categories=Utility;TextEditor;
+        \\Icon=editor-icon
+        \\Exec=editor --title %c %%x %F --icon-args %i
+        \\Terminal=false
+        \\Actions=new-window;
+        \\MimeType=text/plain;
+        \\
+        \\[Desktop Action new-window]
+        \\Name=New Window
+        \\Exec=editor --new-window
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/applications/org/example/Viewer.desktop",
+        .data =
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Viewer
+        \\Exec=viewer %U
+        \\
+        ,
+    });
+
+    const data_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "share" });
+    defer allocator.free(data_dir);
+
+    const script_body =
+        \\local kw = require("keywork")
+        \\local apps = require("keywork.xdg.applications")
+        \\local dirs = { data_dir }
+        \\
+        \\-- locale-aware parse: Name[de] wins for de_DE, lists and actions parse
+        \\local entry = assert(apps.lookup("editor", { dirs = dirs, locale = "de_DE" }))
+        \\assert(entry.name == "Bearbeiter")
+        \\assert(entry.generic_name == "Text Editor")
+        \\assert(entry.icon == "editor-icon")
+        \\assert(#entry.keywords == 2)
+        \\assert(entry.keywords[1] == "semi;colon")
+        \\assert(entry.keywords[2] == "plain")
+        \\assert(entry.categories[2] == "TextEditor")
+        \\assert(#entry.actions == 1)
+        \\assert(entry.actions[1].id == "new-window")
+        \\assert(entry.actions[1].name == "New Window")
+        \\
+        \\-- unmatched locale falls back to the plain key
+        \\local plain = assert(apps.lookup("editor.desktop", { dirs = dirs, locale = "C" }))
+        \\assert(plain.name == "Editor")
+        \\
+        \\-- desktop-id dashes map to subdirectories
+        \\local viewer = assert(apps.lookup("org-example-Viewer", { dirs = dirs }))
+        \\assert(viewer.name == "Viewer")
+        \\
+        \\-- missing entries report an error
+        \\local missing, err = apps.lookup("nope", { dirs = dirs })
+        \\assert(missing == nil and err ~= nil)
+        \\
+        \\-- exec expansion: %c name, %% literal, %F file list, %i icon pair
+        \\local argv = assert(apps.exec_argv(plain, { files = { "/tmp/a b.txt", "/tmp/c.txt" } }))
+        \\assert(argv[1] == "editor")
+        \\assert(argv[2] == "--title")
+        \\assert(argv[3] == "Editor")
+        \\assert(argv[4] == "%x")
+        \\assert(argv[5] == "/tmp/a b.txt")
+        \\assert(argv[6] == "/tmp/c.txt")
+        \\assert(argv[7] == "--icon-args")
+        \\assert(argv[8] == "--icon")
+        \\assert(argv[9] == "editor-icon")
+        \\
+        \\-- files convert to escaped file:// URIs for %U
+        \\local uris = assert(apps.exec_argv(viewer, { files = { "/tmp/a b.txt" } }))
+        \\assert(uris[1] == "viewer")
+        \\assert(uris[2] == "file:///tmp/a%20b.txt")
+        \\
+        \\-- action Exec replaces the entry Exec
+        \\local action_argv = assert(apps.exec_argv(plain, { action = "new-window" }))
+        \\assert(action_argv[1] == "editor")
+        \\assert(action_argv[2] == "--new-window")
+        \\
+        \\return kw.app({ child = kw.text("xdg") })
+        \\
+    ;
+    const script = try std.mem.concat(allocator, u8, &.{ "local data_dir = \"", data_dir, "\"\n", script_body });
+    defer allocator.free(script);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "xdg.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "xdg.lua" });
     defer allocator.free(script_path);
 
     var app = try App.init(allocator, script_path);
