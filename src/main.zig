@@ -89,4 +89,5 @@ test {
     _ = @import("lua/coro.zig");
     _ = @import("lua/dbus.zig");
     _ = @import("lua/json.zig");
+    _ = @import("linux/event_loop.zig");
 }

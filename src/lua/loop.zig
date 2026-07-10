@@ -157,6 +157,8 @@ pub const LuaTimer = struct {
     host: Host,
     delay_ms: u64,
     interval_ms: u64,
+    /// Align repeating expirations to Unix-epoch wall-clock boundaries.
+    wall: bool = false,
     /// Registry ref of the coroutine parked in loop.sleep when this timer
     /// backs a sleep; unused (-1) for stream timers.
     ref: c_int,
@@ -180,9 +182,15 @@ pub const LuaTimer = struct {
     pub fn register(self: *LuaTimer) !void {
         if (self.registered or self.canceled or self.expired) return;
         const loop = self.host.eventLoop() orelse return;
-        const event_timer = try loop.addTimer(self, luaTimerCallback);
+        const event_timer = if (self.wall)
+            try loop.addWallTimer(self, luaTimerCallback)
+        else
+            try loop.addTimer(self, luaTimerCallback);
         errdefer loop.removeTimer(event_timer);
-        try event_timer.arm(self.delay_ms, self.interval_ms);
+        if (self.wall)
+            try event_timer.armWall(self.interval_ms)
+        else
+            try event_timer.arm(self.delay_ms, self.interval_ms);
         self.timer = event_timer;
         self.registered = true;
     }
@@ -300,6 +308,9 @@ fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const host = hostFromLua(lua_state);
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
     const interval = optionalSecondsField(lua_state, 1, "interval");
+    const wall = boolField(lua_state, 1, "wall");
+    if (wall and interval == null) return c.luaL_error(lua_state, "wall timer requires interval");
+    if (wall and optionalSecondsField(lua_state, 1, "delay") != null) return c.luaL_error(lua_state, "wall timer does not support delay");
     const delay = optionalSecondsField(lua_state, 1, "delay") orelse interval;
     const delay_seconds = delay orelse return c.luaL_error(lua_state, "timer requires delay or interval");
     const delay_ms = secondsToMilliseconds(delay_seconds) catch return c.luaL_error(lua_state, "invalid timer delay");
@@ -309,6 +320,15 @@ fn luaLoopTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         std.log.scoped(.keywork_luajit).warn("timer failed: {}", .{err});
         return c.luaL_error(lua_state, "timer failed");
     };
+    if (wall) {
+        if (timer.host.eventLoop()) |loop| timer.unregister(loop);
+        timer.wall = true;
+        timer.register() catch |err| {
+            timer.cancel(lua_state, .silent);
+            std.log.scoped(.keywork_luajit).warn("wall timer failed: {}", .{err});
+            return c.luaL_error(lua_state, "timer failed");
+        };
+    }
     pushTimerHandle(lua_state, timer);
     return 1;
 }

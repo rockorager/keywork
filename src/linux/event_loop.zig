@@ -92,6 +92,7 @@ pub const EventLoop = struct {
         source_handle: ?SourceHandle,
         ctx: *anyopaque,
         callback: TimerCallback,
+        wall_interval_ms: u64 = 0,
         destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
         removed: bool = false,
 
@@ -101,6 +102,20 @@ pub const EventLoop = struct {
                 .it_value = try milliseconds(delay_ms),
             };
             try linuxVoid(linux.timerfd_settime(self.fd, .{ .ABSTIME = false }, &spec, null));
+        }
+
+        pub fn armWall(self: *Timer, interval_ms: u64) !void {
+            var now: linux.timespec = undefined;
+            try linuxVoid(linux.clock_gettime(.REALTIME, &now));
+            const spec: linux.itimerspec = .{
+                .it_interval = try milliseconds(interval_ms),
+                .it_value = try nextAlignedExpiration(now, interval_ms),
+            };
+            try linuxVoid(linux.timerfd_settime(self.fd, .{
+                .ABSTIME = true,
+                .CANCEL_ON_SET = true,
+            }, &spec, null));
+            self.wall_interval_ms = interval_ms;
         }
 
         pub fn disarm(self: *Timer) void {
@@ -263,7 +278,15 @@ pub const EventLoop = struct {
     }
 
     pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
-        const fd = try linuxFd(linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true }));
+        return self.addTimerWithClock(.MONOTONIC, ctx, callback);
+    }
+
+    pub fn addWallTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
+        return self.addTimerWithClock(.REALTIME, ctx, callback);
+    }
+
+    fn addTimerWithClock(self: *EventLoop, clock: linux.timerfd_clockid_t, ctx: *anyopaque, callback: TimerCallback) !*Timer {
+        const fd = try linuxFd(linux.timerfd_create(clock, .{ .CLOEXEC = true, .NONBLOCK = true }));
         errdefer _ = linux.close(fd);
 
         const timer = try self.allocator.create(Timer);
@@ -499,7 +522,16 @@ pub const EventLoop = struct {
 fn timerSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
     const timer: *EventLoop.Timer = @ptrCast(@alignCast(ctx));
     if (timer.removed) return;
-    const expirations = try drainTimer(timer.fd);
+    const expirations = drainTimer(timer.fd) catch |err| switch (err) {
+        error.TimerCanceled => blk: {
+            // CANCEL_ON_SET reports discontinuous realtime changes. Deliver
+            // one immediate tick, then continue at the new wall boundaries.
+            if (timer.wall_interval_ms == 0) return err;
+            try timer.armWall(timer.wall_interval_ms);
+            break :blk 1;
+        },
+        else => return err,
+    };
     if (expirations > 0 and !timer.removed) try timer.callback(timer.ctx, loop, expirations);
 }
 
@@ -542,6 +574,7 @@ fn drainTimer(fd: i32) !u64 {
             return expirations;
         },
         .AGAIN => return 0,
+        .CANCELED => return error.TimerCanceled,
         else => return error.TimerReadFailed,
     }
 }
@@ -605,6 +638,25 @@ fn millisecondsAllowZero(value: u64) !linux.timespec {
         .sec = @intCast(seconds),
         .nsec = @intCast(millis * std.time.ns_per_ms),
     };
+}
+
+fn nextAlignedExpiration(now: linux.timespec, interval_ms: u64) !linux.timespec {
+    if (interval_ms == 0 or now.sec < 0 or now.nsec < 0) return error.InvalidTimerInterval;
+    const interval_ns = @as(u128, interval_ms) * std.time.ns_per_ms;
+    const now_ns = @as(u128, @intCast(now.sec)) * std.time.ns_per_s + @as(u128, @intCast(now.nsec));
+    const next_ns = (now_ns / interval_ns + 1) * interval_ns;
+    const next_sec = next_ns / std.time.ns_per_s;
+    if (next_sec > std.math.maxInt(isize)) return error.InvalidTimerInterval;
+    return .{
+        .sec = @intCast(next_sec),
+        .nsec = @intCast(next_ns % std.time.ns_per_s),
+    };
+}
+
+test "wall timer expiration aligns to the next epoch interval" {
+    try std.testing.expectEqual(linux.timespec{ .sec = 120, .nsec = 0 }, try nextAlignedExpiration(.{ .sec = 61, .nsec = 500_000_000 }, 60_000));
+    try std.testing.expectEqual(linux.timespec{ .sec = 61, .nsec = 0 }, try nextAlignedExpiration(.{ .sec = 60, .nsec = 0 }, 1_000));
+    try std.testing.expectEqual(linux.timespec{ .sec = 60, .nsec = 500_000_000 }, try nextAlignedExpiration(.{ .sec = 60, .nsec = 499_000_000 }, 500));
 }
 
 test "repeating timer fires and can quit the loop" {
