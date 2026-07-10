@@ -2895,15 +2895,16 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
     try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_x);
     try std.testing.expectEqual(@as(f32, -160), root.children[0].rect.x);
 
-    // A horizontal thumb is painted along the bottom edge.
+    // The horizontal thumb shows along the bottom edge as a rounded pill
+    // (an alpha mask tinted with the scrollbar color).
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
     try paintScaled(retained_allocator, root, &display_list, 1);
     var saw_thumb = false;
     for (display_list.commands.items) |command| {
         switch (command) {
-            .fill_rect => |fill| {
-                if (std.meta.eql(fill.color, scrollbar_color) and fill.rect.height == scrollbar_thickness) saw_thumb = true;
+            .alpha_image => |image| {
+                if (std.meta.eql(image.color, scrollbar_color) and image.rect.height == scrollbar_thickness) saw_thumb = true;
             },
             else => {},
         }

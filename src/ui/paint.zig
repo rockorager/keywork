@@ -93,19 +93,18 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
     }
 
     if (node.kind.isViewport()) {
-        try paintScrollbars(allocator, node, display_list);
+        try paintScrollbars(allocator, node, display_list, scale);
         try display_list.popClip(allocator);
     }
 }
 
-pub const scrollbar_thickness: f32 = 4;
-const scrollbar_margin: f32 = 2;
+pub const scrollbar_thickness: f32 = 6;
+const scrollbar_margin: f32 = 3;
 const scrollbar_min_thumb: f32 = 12;
-pub const scrollbar_color: Color = Color.argb(0x60, 0x80, 0x80, 0x88);
+pub const scrollbar_color: Color = Color.argb(0xb4, 0x80, 0x80, 0x88);
 /// Extra pointer slop around the painted thumb so the thin bar is
 /// grabbable.
 const scrollbar_hit_slop: f32 = 4;
-
 pub const ScrollbarAxis = enum { vertical, horizontal };
 
 const ScrollbarGeometry = struct {
@@ -163,12 +162,13 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
 }
 
 /// Paints proportional scrollbar thumbs for axes whose content overflows
-/// the viewport, from the geometry recorded during layout.
-fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
+/// the viewport, from the geometry recorded during layout. Thumbs are
+/// pill-shaped overlays painted over the content's edge.
+fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
     std.debug.assert(node.kind.isViewport());
     inline for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
         if (scrollbarGeometry(node, axis)) |geometry| {
-            try display_list.fillRect(allocator, geometry.thumb, scrollbar_color);
+            try paintRoundedBox(allocator, display_list, geometry.thumb, scrollbar_color, null, 0, scrollbar_thickness / 2, scale);
         }
     }
 }

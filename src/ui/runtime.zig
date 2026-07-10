@@ -913,12 +913,13 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     defer runtime.deinit();
 
     // 20 rows at 16px in a 120px viewport: content 320, scroll range 200.
-    // Thumb: track 116, length max(12, 116*120/320) = 43.5, travel 72.5.
-    const drag_scale: f32 = 200.0 / 72.5;
+    // Thumb: track 114 (120 minus a 3px margin each end), length
+    // max(12, 114*120/320) = 42.75, travel 71.25.
+    const drag_scale: f32 = 200.0 / 71.25;
     // The viewport shrink-wraps its child's width; the thumb hugs its
     // right edge.
     const viewport = runtime.root.?.rect;
-    const thumb_x = viewport.x + viewport.width - 4;
+    const thumb_x = viewport.x + viewport.width - 6;
 
     // Press on the thumb; this starts a drag, not a click.
     try runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
@@ -988,7 +989,7 @@ test "non-left buttons do not start scrollbar drags" {
     defer runtime.deinit();
 
     const viewport = runtime.root.?.rect;
-    const thumb_x = viewport.x + viewport.width - 4;
+    const thumb_x = viewport.x + viewport.width - 6;
 
     // A right press on the thumb neither starts a drag nor scrolls.
     try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
