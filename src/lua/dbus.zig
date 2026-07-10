@@ -83,10 +83,10 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_pushcclosure(lua_state, luaDbusVariant, 0);
     c.lua_setfield(lua_state, dbus_table, "variant");
 
-    // The property and proxy sugar must suspend through bus:call, so it is
-    // implemented as Lua closures layered on the bus methods table rather
+    // The property/proxy/observe sugar must suspend through bus:call, so it
+    // is implemented as Lua closures layered on the bus methods table rather
     // than as C functions, which cannot yield across lua_call.
-    if (c.luaL_loadstring(lua_state, bus_sugar_lua) != 0) {
+    if (c.luaL_loadbuffer(lua_state, embedded_dbus_source.ptr, embedded_dbus_source.len, "@keywork/dbus.lua") != 0) {
         _ = c.lua_error(lua_state);
         unreachable;
     }
@@ -95,107 +95,7 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_call(lua_state, 2, 0);
 }
 
-/// Generic client-side sugar over bus:call: typed Properties access and
-/// proxy objects whose member accesses become method calls. Kept small and
-/// orthogonal; everything routes through bus:call and inherits its
-/// coroutine, timeout, and error semantics.
-const bus_sugar_lua =
-    \\local methods, dbus = ...
-    \\local unpack = unpack or table.unpack
-    \\local maxn = table.maxn
-    \\
-    \\local properties_iface = "org.freedesktop.DBus.Properties"
-    \\
-    \\local basic_signatures = {
-    \\  string = "s",
-    \\  object_path = "o",
-    \\  boolean = "b",
-    \\  int32 = "i",
-    \\  uint32 = "u",
-    \\  double = "d",
-    \\}
-    \\
-    \\-- Properties.Set requires a variant; plain scalars infer s/b/d,
-    \\-- dbus.* typed values carry their own signature, and anything else is
-    \\-- programmer misuse without an explicit signature.
-    \\local function to_variant(value, signature)
-    \\  if signature then return dbus.variant(signature, value) end
-    \\  local t = type(value)
-    \\  if t == "string" then return dbus.variant("s", value) end
-    \\  if t == "boolean" then return dbus.variant("b", value) end
-    \\  if t == "number" then return dbus.variant("d", value) end
-    \\  if t == "table" then
-    \\    local dbus_type = value.__dbus_type
-    \\    if dbus_type == "variant" then return value end
-    \\    local basic = basic_signatures[dbus_type]
-    \\    if basic then return dbus.variant(basic, value.value) end
-    \\    if dbus_type == "array" then
-    \\      return dbus.variant("a" .. value.signature, value.value)
-    \\    end
-    \\  end
-    \\  error("set_property cannot infer a signature; pass options.signature or a dbus.* typed value", 3)
-    \\end
-    \\
-    \\function methods.get_property(bus, options)
-    \\  local reply, err = bus:call({
-    \\    destination = options.destination,
-    \\    path = options.path,
-    \\    interface = properties_iface,
-    \\    member = "Get",
-    \\    args = { options.interface, options.name },
-    \\    timeout_ms = options.timeout_ms,
-    \\  })
-    \\  if not reply then return nil, err end
-    \\  return reply.args[1]
-    \\end
-    \\
-    \\function methods.set_property(bus, options)
-    \\  local value = to_variant(options.value, options.signature)
-    \\  local reply, err = bus:call({
-    \\    destination = options.destination,
-    \\    path = options.path,
-    \\    interface = properties_iface,
-    \\    member = "Set",
-    \\    args = { options.interface, options.name, value },
-    \\    timeout_ms = options.timeout_ms,
-    \\  })
-    \\  if not reply then return nil, err end
-    \\  return true
-    \\end
-    \\
-    \\-- Unknown keys on a proxy become method-call stubs, memoized on first
-    \\-- access. The bus/destination/path/interface fields are reserved.
-    \\function methods.proxy(bus, destination, path, interface, options)
-    \\  assert(type(destination) == "string", "proxy requires a destination string")
-    \\  assert(type(path) == "string", "proxy requires a path string")
-    \\  assert(type(interface) == "string", "proxy requires an interface string")
-    \\  local timeout_ms = options and options.timeout_ms
-    \\  local proxy = {
-    \\    bus = bus,
-    \\    destination = destination,
-    \\    path = path,
-    \\    interface = interface,
-    \\  }
-    \\  return setmetatable(proxy, {
-    \\    __index = function(self, member)
-    \\      local call = function(_, ...)
-    \\        local reply, err = bus:call({
-    \\          destination = destination,
-    \\          path = path,
-    \\          interface = interface,
-    \\          member = member,
-    \\          args = { ... },
-    \\          timeout_ms = timeout_ms,
-    \\        })
-    \\        if not reply then return nil, err end
-    \\        return unpack(reply.args, 1, maxn(reply.args))
-    \\      end
-    \\      rawset(self, member, call)
-    \\      return call
-    \\    end,
-    \\  })
-    \\end
-;
+const embedded_dbus_source = @embedFile("dbus.lua");
 
 const pop = lua_value.pop;
 const absoluteIndex = lua_value.absoluteIndex;

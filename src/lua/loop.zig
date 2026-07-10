@@ -24,6 +24,7 @@ pub const Host = struct {
         addTimer: *const fn (*anyopaque, u64, u64, c_int) anyerror!*LuaTimer,
         addTask: *const fn (*anyopaque, *c.lua_State, c_int) anyerror!*lua_task.LuaTask,
         addScope: *const fn (*anyopaque) anyerror!*lua_task.LuaScope,
+        addChannel: *const fn (*anyopaque) anyerror!*Channel,
     };
 
     pub fn allocator(self: Host) std.mem.Allocator {
@@ -60,6 +61,37 @@ pub const Host = struct {
 
     pub fn addScope(self: Host) !*lua_task.LuaScope {
         return try self.vtable.addScope(self.ptr);
+    }
+
+    fn addChannel(self: Host) !*Channel {
+        return try self.vtable.addChannel(self.ptr);
+    }
+};
+
+/// An in-process value stream fed from Lua: producers push values, one
+/// consumer iterates. Exists so Lua code can merge several native streams
+/// (or synthesize its own) into a single iterator; a coroutine can only
+/// park on one stream at a time.
+pub const Channel = struct {
+    host: Host,
+    stream: lua_coro.Stream = .{},
+    handle_ref: c_int = -1,
+    /// Producer-side EOF: queued values stay readable, then iteration ends.
+    closed: bool = false,
+    canceled: bool = false,
+
+    pub fn cancel(self: *Channel, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
+        if (self.canceled) return;
+        self.canceled = true;
+        self.closed = true;
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
+        self.stream.cancel(self.host.allocator(), lua_state, mode);
+    }
+
+    pub fn destroy(self: *Channel, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        self.cancel(lua_state, .silent);
+        allocator.destroy(self);
     }
 };
 
@@ -264,6 +296,9 @@ pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Ho
     c.lua_pushlightuserdata(lua_state, host);
     c.lua_pushcclosure(lua_state, luaSleep, 1);
     c.lua_setfield(lua_state, loop_table, "sleep");
+    c.lua_pushlightuserdata(lua_state, host);
+    c.lua_pushcclosure(lua_state, luaChannel, 1);
+    c.lua_setfield(lua_state, loop_table, "channel");
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
@@ -420,6 +455,19 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaChannel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const host = hostFromLua(lua_state);
+    lua_task.raiseIfCanceled(lua_state);
+    const channel = host.addChannel() catch |err| {
+        std.log.scoped(.keywork_luajit).warn("loop.channel failed: {}", .{err});
+        return c.luaL_error(lua_state, "channel allocation failed");
+    };
+    lua_task.adoptResource(Channel, lua_state, channel);
+    pushChannelHandle(lua_state, channel);
+    return 1;
+}
+
 const timer_type: [*:0]const u8 = "keywork.timer";
 const timer_methods = [_]lua_handle.Method{
     .{ .name = "next", .func = luaTimerNext },
@@ -444,6 +492,16 @@ const fs_event_methods = [_]lua_handle.Method{
     .{ .name = "canceled", .func = luaFsEventCanceled },
 };
 
+const channel_type: [*:0]const u8 = "keywork.channel";
+const channel_methods = [_]lua_handle.Method{
+    .{ .name = "push", .func = luaChannelPush },
+    .{ .name = "next", .func = luaChannelNext },
+    .{ .name = "events", .func = luaChannelEvents },
+    .{ .name = "close", .func = luaChannelClose },
+    .{ .name = "cancel", .func = luaCancelChannel },
+    .{ .name = "canceled", .func = luaChannelCanceled },
+};
+
 fn pushTimerHandle(lua_state: *c.lua_State, timer: *LuaTimer) void {
     timer.handle_ref = lua_handle.create(lua_state, timer_type, &timer_methods, timer);
 }
@@ -454,6 +512,64 @@ fn pushFdWatchHandle(lua_state: *c.lua_State, watch: *FdWatch) void {
 
 fn pushFsEventHandle(lua_state: *c.lua_State, fs_event: *FsEvent) void {
     fs_event.handle_ref = lua_handle.create(lua_state, fs_event_type, &fs_event_methods, fs_event);
+}
+
+fn pushChannelHandle(lua_state: *c.lua_State, channel: *Channel) void {
+    channel.handle_ref = lua_handle.create(lua_state, channel_type, &channel_methods, channel);
+}
+
+fn luaChannelPush(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const channel = lua_handle.resource(Channel, lua_state, 1, channel_type) orelse return 0;
+    c.luaL_checkany(lua_state, 2);
+    // Pushing after close is tolerated so a producer racing teardown does
+    // not blow up; the value is simply dropped.
+    if (channel.closed or channel.canceled) return 0;
+    c.lua_settop(lua_state, 2);
+    channel.stream.deliver(channel.host.allocator(), lua_state) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("channel delivery failed: {}", .{err});
+    };
+    return 0;
+}
+
+fn luaChannelNext(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    // A dead handle ends the iteration instead of parking forever.
+    const channel = lua_handle.resource(Channel, lua_state, 1, channel_type) orelse return 0;
+    return channel.stream.awaitNext(lua_state, channel.closed or channel.canceled);
+}
+
+fn luaChannelEvents(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    _ = c.luaL_checkudata(lua_state, 1, channel_type);
+    return lua_coro.pushIterator(lua_state, luaChannelNext);
+}
+
+fn luaChannelClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const channel = lua_handle.resource(Channel, lua_state, 1, channel_type) orelse return 0;
+    if (channel.closed or channel.canceled) return 0;
+    channel.closed = true;
+    // EOF, not cancel: queued values stay readable; a parked reader ends.
+    channel.stream.finish(lua_state, .resume_reader);
+    return 0;
+}
+
+fn luaCancelChannel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const channel = lua_handle.resource(Channel, lua_state, 1, channel_type) orelse return 0;
+    channel.cancel(lua_state, .resume_reader);
+    return 0;
+}
+
+fn luaChannelCanceled(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const channel = lua_handle.resource(Channel, lua_state, 1, channel_type) orelse {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    };
+    c.lua_pushboolean(lua_state, if (channel.canceled) 1 else 0);
+    return 1;
 }
 
 fn luaCancelTimer(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

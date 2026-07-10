@@ -29,6 +29,7 @@ const DbusBus = lua_dbus.Bus;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
 const LuaTimer = lua_loop.LuaTimer;
+const Channel = lua_loop.Channel;
 const LuaTask = lua_task.LuaTask;
 const LuaScope = lua_task.LuaScope;
 const pop = lua_value.pop;
@@ -53,6 +54,7 @@ pub const App = struct {
     fd_watches: std.ArrayList(*FdWatch) = .empty,
     fs_events: std.ArrayList(*FsEvent) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
+    channels: std.ArrayList(*Channel) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
     sockets: std.ArrayList(*LuaSocket) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
@@ -106,6 +108,8 @@ pub const App = struct {
         self.fs_events.deinit(self.allocator);
         for (self.timers.items) |timer| timer.destroy(self.allocator, self.state);
         self.timers.deinit(self.allocator);
+        for (self.channels.items) |channel| channel.destroy(self.allocator, self.state);
+        self.channels.deinit(self.allocator);
         for (self.processes.items) |process| process.destroy(self.allocator, self.state);
         self.processes.deinit(self.allocator);
         for (self.sockets.items) |socket| socket.destroy(self.allocator, self.state);
@@ -483,6 +487,7 @@ pub const App = struct {
         for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state, .silent);
+        for (self.channels.items) |channel| channel.cancel(self.state, .silent);
         for (self.processes.items) |process| process.cancel(self.state, .silent);
         for (self.sockets.items) |socket| socket.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
@@ -587,6 +592,14 @@ pub const App = struct {
         errdefer _ = self.fs_events.pop();
         try fs_event.register();
         return fs_event;
+    }
+
+    fn addChannel(self: *App) !*Channel {
+        const channel = try self.allocator.create(Channel);
+        errdefer self.allocator.destroy(channel);
+        channel.* = .{ .host = self.loopHost() };
+        try self.channels.append(self.allocator, channel);
+        return channel;
     }
 
     fn addTimerWithDelay(self: *App, delay_ms: u64, interval_ms: u64, ref: c_int) !*LuaTimer {
@@ -743,6 +756,7 @@ const loop_host_vtable: lua_loop.Host.VTable = .{
     .addTimer = loopHostAddTimer,
     .addTask = loopHostAddTask,
     .addScope = loopHostAddScope,
+    .addChannel = loopHostAddChannel,
 };
 
 fn loopHostAllocator(ptr: *anyopaque) std.mem.Allocator {
@@ -784,6 +798,11 @@ fn loopHostAddTimer(ptr: *anyopaque, delay_ms: u64, interval_ms: u64, ref: c_int
 fn loopHostAddTask(ptr: *anyopaque, thread: *c.lua_State, thread_ref: c_int) anyerror!*LuaTask {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addTask(thread, thread_ref);
+}
+
+fn loopHostAddChannel(ptr: *anyopaque) anyerror!*Channel {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addChannel();
 }
 
 fn loopHostAddScope(ptr: *anyopaque) anyerror!*LuaScope {
@@ -2109,6 +2128,178 @@ test "lua bus:subscribe streams signals to a coroutine reader" {
     c.lua_getglobal(app.state, "sub_ended");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
     pop(app.state, 1);
+}
+
+test "lua loop.channel delivers pushed values to a coroutine reader" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\
+        \\-- Values pushed before a reader exists queue up; close is EOF, so
+        \\-- queued values stay readable and iteration ends after the drain.
+        \\local pre = loop.channel()
+        \\pre:push("x")
+        \\pre:push("y")
+        \\pre:close()
+        \\pre:push("dropped")
+        \\local pre_results = {}
+        \\loop.spawn(function()
+        \\  for value in pre:events() do
+        \\    table.insert(pre_results, value)
+        \\  end
+        \\end)
+        \\assert(#pre_results == 2)
+        \\assert(pre_results[1] == "x")
+        \\assert(pre_results[2] == "y")
+        \\
+        \\-- A parked reader resumes synchronously on push, including pushes
+        \\-- from the main thread.
+        \\local live = loop.channel()
+        \\local live_results = {}
+        \\live_done = false
+        \\loop.spawn(function()
+        \\  for value in live:events() do
+        \\    table.insert(live_results, value.n)
+        \\  end
+        \\  live_done = true
+        \\end)
+        \\live:push({ n = 1 })
+        \\live:push({ n = 2 })
+        \\live:close()
+        \\assert(live_done)
+        \\assert(#live_results == 2)
+        \\assert(live_results[1] == 1)
+        \\assert(live_results[2] == 2)
+        \\
+        \\return kw.app({ child = kw.text("channel") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "channel.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "channel.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The bus observes an object exported on its own connection: the daemon
+    // routes GetAll calls and signals back, so no second peer is needed.
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\local bus = assert(dbus.session())
+        \\
+        \\local value = "initial"
+        \\assert(bus:request_name("org.keywork.test.Observe"))
+        \\bus:export("/org/keywork/observe_test", {
+        \\  ["org.keywork.ObserveTest"] = {
+        \\    properties = {
+        \\      Value = {
+        \\        signature = "s",
+        \\        access = "readwrite",
+        \\        get = function() return value end,
+        \\        set = function(v) value = v end,
+        \\      },
+        \\    },
+        \\  },
+        \\})
+        \\
+        \\local stage = 0
+        \\loop.spawn(function()
+        \\  local obs = bus:observe({
+        \\    destination = "org.keywork.test.Observe",
+        \\    path = "/org/keywork/observe_test",
+        \\    interface = "org.keywork.ObserveTest",
+        \\    timeout_ms = 2000,
+        \\  })
+        \\  for event in obs:changes() do
+        \\    if stage == 0 then
+        \\      initial_ok = event.available
+        \\        and event.props.Value == "initial"
+        \\        and event.changed.Value == "initial"
+        \\      stage = 1
+        \\      -- Invalidated properties carry no value; observe must
+        \\      -- recover with a fresh GetAll.
+        \\      value = "updated"
+        \\      bus:emit({
+        \\        path = "/org/keywork/observe_test",
+        \\        interface = "org.freedesktop.DBus.Properties",
+        \\        member = "PropertiesChanged",
+        \\        args = {
+        \\          "org.keywork.ObserveTest",
+        \\          dbus.array("{sv}", {}),
+        \\          dbus.array("s", { "Value" }),
+        \\        },
+        \\      })
+        \\    elseif stage == 1 then
+        \\      resync_ok = event.available and event.props.Value == "updated"
+        \\      stage = 2
+        \\      bus:release_name("org.keywork.test.Observe")
+        \\    elseif stage == 2 then
+        \\      vanish_ok = event.available == false and event.props.Value == nil
+        \\      stage = 3
+        \\      assert(bus:request_name("org.keywork.test.Observe"))
+        \\    elseif stage == 3 then
+        \\      recover_ok = event.available and event.props.Value == "updated"
+        \\      obs:cancel()
+        \\    end
+        \\  end
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("observe") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-observe.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-observe.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusObserveTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusObserveTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusObserveTest.callback);
+    try loop.run();
+
+    const expected_true = [_][:0]const u8{ "initial_ok", "resync_ok", "vanish_ok", "recover_ok", "done" };
+    for (expected_true) |global| {
+        c.lua_getglobal(app.state, global.ptr);
+        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
+            std.debug.print("expected global '{s}' to be true\n", .{global});
+            return err;
+        };
+        pop(app.state, 1);
+    }
 }
 
 test "lua dbus property sugar and proxies drive exported objects" {
