@@ -37,7 +37,7 @@ pub const Backend = struct {
     };
 
     pub fn create(allocator: std.mem.Allocator) !*Backend {
-        const connection = try window.Connection.init(allocator, .{});
+        const connection = try window.Connection.init(allocator, .{ .outputs = true });
         errdefer connection.deinit();
 
         const seat = connection.takeSeat();
@@ -158,6 +158,26 @@ pub const Backend = struct {
         _ = self.connection.display.flush();
     }
 
+    pub fn outputCount(self: *const Backend) usize {
+        return self.connection.outputs.items.len;
+    }
+
+    pub fn outputAt(self: *const Backend, index: usize) *wl.Output {
+        return self.connection.outputs.items[index].output;
+    }
+
+    pub fn outputInfoAt(self: *const Backend, index: usize) window.OutputInfo {
+        return self.connection.outputInfoAt(index);
+    }
+
+    pub fn findOutputByName(self: *const Backend, name: []const u8) ?*wl.Output {
+        return self.connection.findOutputByName(name);
+    }
+
+    pub fn setOutputsChangedHandler(self: *Backend, ctx: *anyopaque, handler: *const fn (ctx: *anyopaque) void) void {
+        self.connection.setOutputsChangedHandler(ctx, handler);
+    }
+
     pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {
         try self.input.installEventTimers(loop);
     }
@@ -182,6 +202,20 @@ pub const Backend = struct {
         for (self.windows.items) |win| _ = win.protocol.flushPending();
     }
 
+    /// Dispatches until `win` receives its initial configure (or closes).
+    /// Only the new window's pending protocol state is cleared; events
+    /// dispatched for other windows stay queued for their handlers, so
+    /// this is safe to call while other windows are live.
+    pub fn waitForConfigured(self: *Backend, win: *Window) !void {
+        while (!win.protocol.configured and !win.protocol.closed) {
+            if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        }
+        if (win.protocol.closed) return error.WindowClosed;
+        // Configure marked a repaint pending, but the window's handlers
+        // are not installed yet; the caller paints the initial frame.
+        _ = win.protocol.flushPending();
+    }
+
     pub fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
         const self: *Backend = @ptrCast(@alignCast(ctx));
         return window.eventLoopPrepare(self.connection.display, self, flushPendingOpaque);
@@ -192,6 +226,15 @@ pub const Backend = struct {
         return window.eventLoopFinish(self.connection.display, self, flushPendingOpaque, allClosedOpaque, events);
     }
 
+    /// Like `eventLoopFinish`, but never stops the loop when the window
+    /// list is empty or all windows closed. Used by window-managed apps
+    /// where the manager decides quit semantics: zero live windows is a
+    /// valid state (for example a shell waiting for output hotplug).
+    pub fn eventLoopFinishKeepAlive(ctx: *anyopaque, events: u32) !bool {
+        const self: *Backend = @ptrCast(@alignCast(ctx));
+        return window.eventLoopFinish(self.connection.display, self, flushPendingOpaque, neverClosedOpaque, events);
+    }
+
     fn flushPendingOpaque(ctx: *anyopaque) void {
         const self: *Backend = @ptrCast(@alignCast(ctx));
         self.flushPending();
@@ -200,6 +243,10 @@ pub const Backend = struct {
     fn allClosedOpaque(ctx: *anyopaque) bool {
         const self: *Backend = @ptrCast(@alignCast(ctx));
         return self.allClosed();
+    }
+
+    fn neverClosedOpaque(_: *anyopaque) bool {
+        return false;
     }
 
     fn flushPending(self: *Backend) void {
