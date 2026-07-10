@@ -2230,6 +2230,13 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
         \\        and event.props.Value == "initial"
         \\        and event.changed.Value == "initial"
         \\      stage = 1
+        \\      -- Services like StatusNotifierItem change silently and
+        \\      -- signal with custom members; refresh must re-snapshot.
+        \\      value = "refreshed"
+        \\      obs:refresh()
+        \\    elseif stage == 1 then
+        \\      refresh_ok = event.available and event.props.Value == "refreshed"
+        \\      stage = 2
         \\      -- Invalidated properties carry no value; observe must
         \\      -- recover with a fresh GetAll.
         \\      value = "updated"
@@ -2243,15 +2250,15 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
         \\          dbus.array("s", { "Value" }),
         \\        },
         \\      })
-        \\    elseif stage == 1 then
-        \\      resync_ok = event.available and event.props.Value == "updated"
-        \\      stage = 2
-        \\      bus:release_name("org.keywork.test.Observe")
         \\    elseif stage == 2 then
-        \\      vanish_ok = event.available == false and event.props.Value == nil
+        \\      resync_ok = event.available and event.props.Value == "updated"
         \\      stage = 3
-        \\      assert(bus:request_name("org.keywork.test.Observe"))
+        \\      bus:release_name("org.keywork.test.Observe")
         \\    elseif stage == 3 then
+        \\      vanish_ok = event.available == false and event.props.Value == nil
+        \\      stage = 4
+        \\      assert(bus:request_name("org.keywork.test.Observe"))
+        \\    elseif stage == 4 then
         \\      recover_ok = event.available and event.props.Value == "updated"
         \\      obs:cancel()
         \\    end
@@ -2291,7 +2298,7 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
     try loop.addRepeatingTimer(1, &context, DbusObserveTest.callback);
     try loop.run();
 
-    const expected_true = [_][:0]const u8{ "initial_ok", "resync_ok", "vanish_ok", "recover_ok", "done" };
+    const expected_true = [_][:0]const u8{ "initial_ok", "refresh_ok", "resync_ok", "vanish_ok", "recover_ok", "done" };
     for (expected_true) |global| {
         c.lua_getglobal(app.state, global.ptr);
         std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {

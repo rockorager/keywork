@@ -250,6 +250,17 @@ function methods.observe(bus, options)
     return channel:events()
   end
 
+  -- Some services (StatusNotifierItem) announce changes with custom
+  -- signals instead of PropertiesChanged; refresh forces a fresh GetAll
+  -- snapshot. Fire-and-forget: the result arrives via changes().
+  function obs:refresh()
+    loop.spawn(function()
+      if owner then
+        resync()
+      end
+    end)
+  end
+
   function obs:cancel()
     props_sub:cancel()
     owner_sub:cancel()
