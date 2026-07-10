@@ -171,16 +171,15 @@ fn runWayland(
     if (options.layer_shell == null) {
         queue.suspended_query = .{ .ctx = win, .func = Backend.Window.suspendedOpaque };
     }
-    // Popup surfaces render on the CPU path only for now.
-    const popups_supported = Backend == wayland_shm.Backend;
-    var popup_manager: if (popups_supported) PopupManager else void = if (popups_supported) .{
+    const popups_supported = @hasDecl(Backend, "createPopup");
+    var popup_manager: if (popups_supported) PopupManager(Backend) else void = if (popups_supported) .{
         .allocator = allocator,
         .backend = backend,
         .parent = win,
         .runtime = &runtime,
     } else {};
     defer if (popups_supported) popup_manager.deinit();
-    if (popups_supported) queue.popup_manager = &popup_manager;
+    if (popups_supported) queue.popup_manager = popup_manager.hooks();
     win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
     win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
     win.setCursorShapeHandler(&runtime, runtime_mod.Runtime.waylandCursorShape);
@@ -218,10 +217,18 @@ fn runWayland(
     try loop.run();
 }
 
+/// Type-erased handle to a backend-specific popup manager, so the shared
+/// event queue can drive popups without knowing the backend type.
+const PopupHooks = struct {
+    ctx: *anyopaque,
+    drain_all: *const fn (ctx: *anyopaque) anyerror!void,
+    reconcile_and_flush: *const fn (ctx: *anyopaque, content_dirty: bool) anyerror!void,
+};
+
 const QueuedPlatformEvents = struct {
     allocator: std.mem.Allocator,
     runtime: *runtime_mod.Runtime,
-    popup_manager: ?*PopupManager = null,
+    popup_manager: ?PopupHooks = null,
     suspended_query: ?SuspendedQuery = null,
     events: std.ArrayList(Event) = .empty,
 
@@ -321,7 +328,7 @@ const QueuedPlatformEvents = struct {
     fn afterPlatformHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
         const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
         try self.drain();
-        if (self.popup_manager) |manager| try manager.drainAll();
+        if (self.popup_manager) |manager| try manager.drain_all(manager.ctx);
     }
 
     fn endTurnHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
@@ -330,7 +337,7 @@ const QueuedPlatformEvents = struct {
         // sources, so they can enqueue semantic events after the platform
         // phase. Drain those before presenting the turn's coalesced frame.
         try self.drain();
-        if (self.popup_manager) |manager| try manager.drainAll();
+        if (self.popup_manager) |manager| try manager.drain_all(manager.ctx);
         // While the compositor reports the toplevel suspended (minimized,
         // hidden workspace, fully occluded), skip presentation entirely:
         // invalidations keep coalescing into repaint_pending, and the
@@ -343,7 +350,7 @@ const QueuedPlatformEvents = struct {
         // borrow, so their content must rebuild too.
         const content_dirty = self.runtime.rebuild_pending or self.runtime.state_rebuild_pending;
         try self.runtime.flushPendingRepaint();
-        if (self.popup_manager) |manager| try manager.reconcileAndFlush(content_dirty);
+        if (self.popup_manager) |manager| try manager.reconcile_and_flush(manager.ctx, content_dirty);
     }
 };
 
@@ -352,213 +359,236 @@ const QueuedPlatformEvents = struct {
 /// state-driven: every turn the declared popups are diffed against live
 /// surfaces, creating missing ones and closing dropped or
 /// compositor-dismissed ones.
-const PopupManager = struct {
-    allocator: std.mem.Allocator,
-    backend: *wayland_shm.Backend,
-    parent: *wayland_shm.Backend.Window,
-    runtime: *runtime_mod.Runtime,
-    popups: std.ArrayList(*PopupSurface) = .empty,
+fn PopupManager(comptime Backend: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        backend: *Backend,
+        parent: *Backend.Window,
+        runtime: *runtime_mod.Runtime,
+        popups: std.ArrayList(*PopupSurface) = .empty,
 
-    /// Bound applied to a measured axis when the popup declares no
-    /// explicit size for it.
-    const default_max_size: f32 = 512;
+        const Self = @This();
 
-    const PopupSurface = struct {
-        id: []u8,
-        win: *wayland_shm.Backend.Window,
-        runtime: runtime_mod.Runtime,
-        queue: QueuedPlatformEvents,
-        /// Borrowed from the main element tree; refreshed on every
-        /// reconcile pass before any popup rebuild can observe it.
-        popup: *const keywork.Widget.Popup,
-    };
+        /// Bound applied to a measured axis when the popup declares no
+        /// explicit size for it.
+        const default_max_size: f32 = 512;
 
-    fn deinit(self: *PopupManager) void {
-        while (self.popups.items.len > 0) self.destroyPopup(self.popups.items.len - 1);
-        self.popups.deinit(self.allocator);
-    }
-
-    fn drainAll(self: *PopupManager) !void {
-        for (self.popups.items) |popup| try popup.queue.drain();
-    }
-
-    /// Diffs popups declared by the main tree against live surfaces.
-    /// Runs after the main runtime's flush so anchor rects and borrowed
-    /// popup declarations come from the freshly built tree.
-    fn reconcileAndFlush(self: *PopupManager, content_dirty: bool) !void {
-        var requests: std.ArrayList(keywork.PopupRequest) = .empty;
-        defer requests.deinit(self.allocator);
-        try self.runtime.collectPopupRequests(self.allocator, &requests);
-
-        var index: usize = 0;
-        while (index < self.popups.items.len) {
-            const popup = self.popups.items[index];
-            const request = findRequest(requests.items, popup.id);
-            if (popup.win.protocol.closed) {
-                // Compositor dismissal (grab break) reaches the app via
-                // on_close so state stops declaring the popup.
-                if (request) |req| if (req.popup.on_close) |on_close| {
-                    on_close.call() catch |err| log.warn("popup on_close failed: {}", .{err});
-                };
-                self.destroyPopup(index);
-                continue;
-            }
-            if (request == null) {
-                self.destroyPopup(index);
-                continue;
-            }
-            index += 1;
+        /// Type-erased entry points for the shared event queue.
+        fn hooks(self: *Self) PopupHooks {
+            return .{
+                .ctx = self,
+                .drain_all = drainAllOpaque,
+                .reconcile_and_flush = reconcileAndFlushOpaque,
+            };
         }
 
-        for (requests.items) |request| {
-            if (self.findPopup(request.id)) |popup| {
-                popup.popup = request.popup;
-                if (content_dirty) {
-                    popup.runtime.rebuild_pending = true;
-                    popup.runtime.repaint_pending = true;
+        fn drainAllOpaque(ctx: *anyopaque) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try self.drainAll();
+        }
+
+        fn reconcileAndFlushOpaque(ctx: *anyopaque, content_dirty: bool) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try self.reconcileAndFlush(content_dirty);
+        }
+
+        const PopupSurface = struct {
+            id: []u8,
+            win: *Backend.Window,
+            runtime: runtime_mod.Runtime,
+            queue: QueuedPlatformEvents,
+            /// Borrowed from the main element tree; refreshed on every
+            /// reconcile pass before any popup rebuild can observe it.
+            popup: *const keywork.Widget.Popup,
+        };
+
+        fn deinit(self: *Self) void {
+            while (self.popups.items.len > 0) self.destroyPopup(self.popups.items.len - 1);
+            self.popups.deinit(self.allocator);
+        }
+
+        fn drainAll(self: *Self) !void {
+            for (self.popups.items) |popup| try popup.queue.drain();
+        }
+
+        /// Diffs popups declared by the main tree against live surfaces.
+        /// Runs after the main runtime's flush so anchor rects and borrowed
+        /// popup declarations come from the freshly built tree.
+        fn reconcileAndFlush(self: *Self, content_dirty: bool) !void {
+            var requests: std.ArrayList(keywork.PopupRequest) = .empty;
+            defer requests.deinit(self.allocator);
+            try self.runtime.collectPopupRequests(self.allocator, &requests);
+
+            var index: usize = 0;
+            while (index < self.popups.items.len) {
+                const popup = self.popups.items[index];
+                const request = findRequest(requests.items, popup.id);
+                if (popup.win.protocol.closed) {
+                    // Compositor dismissal (grab break) reaches the app via
+                    // on_close so state stops declaring the popup.
+                    if (request) |req| if (req.popup.on_close) |on_close| {
+                        on_close.call() catch |err| log.warn("popup on_close failed: {}", .{err});
+                    };
+                    self.destroyPopup(index);
+                    continue;
                 }
-            } else {
-                self.createPopup(request) catch |err| log.warn("popup {s} creation failed: {}", .{ request.id, err });
+                if (request == null) {
+                    self.destroyPopup(index);
+                    continue;
+                }
+                index += 1;
             }
+
+            for (requests.items) |request| {
+                if (self.findPopup(request.id)) |popup| {
+                    popup.popup = request.popup;
+                    if (content_dirty) {
+                        popup.runtime.rebuild_pending = true;
+                        popup.runtime.repaint_pending = true;
+                    }
+                } else {
+                    self.createPopup(request) catch |err| log.warn("popup {s} creation failed: {}", .{ request.id, err });
+                }
+            }
+
+            for (self.popups.items) |popup| try popup.runtime.flushPendingRepaint();
         }
 
-        for (self.popups.items) |popup| try popup.runtime.flushPendingRepaint();
-    }
-
-    fn findPopup(self: *PopupManager, id: []const u8) ?*PopupSurface {
-        for (self.popups.items) |popup| {
-            if (std.mem.eql(u8, popup.id, id)) return popup;
+        fn findPopup(self: *Self, id: []const u8) ?*PopupSurface {
+            for (self.popups.items) |popup| {
+                if (std.mem.eql(u8, popup.id, id)) return popup;
+            }
+            return null;
         }
-        return null;
-    }
 
-    fn findRequest(requests: []const keywork.PopupRequest, id: []const u8) ?keywork.PopupRequest {
-        for (requests) |request| {
-            if (std.mem.eql(u8, request.id, id)) return request;
+        fn findRequest(requests: []const keywork.PopupRequest, id: []const u8) ?keywork.PopupRequest {
+            for (requests) |request| {
+                if (std.mem.eql(u8, request.id, id)) return request;
+            }
+            return null;
         }
-        return null;
-    }
 
-    fn createPopup(self: *PopupManager, request: keywork.PopupRequest) !void {
-        const size = try self.measureContent(request.popup);
-        const rect = request.anchor_rect;
+        fn createPopup(self: *Self, request: keywork.PopupRequest) !void {
+            const size = try self.measureContent(request.popup);
+            const rect = request.anchor_rect;
 
-        const surface = try self.allocator.create(PopupSurface);
-        errdefer self.allocator.destroy(surface);
-        const id = try self.allocator.dupe(u8, request.id);
-        errdefer self.allocator.free(id);
+            const surface = try self.allocator.create(PopupSurface);
+            errdefer self.allocator.destroy(surface);
+            const id = try self.allocator.dupe(u8, request.id);
+            errdefer self.allocator.free(id);
 
-        const win = try self.backend.createPopup(self.parent, .{
-            .width = try positiveU31(size.width),
-            .height = try positiveU31(size.height),
-            .anchor_x = @intFromFloat(@floor(rect.x)),
-            .anchor_y = @intFromFloat(@floor(rect.y)),
-            .anchor_width = @intFromFloat(@max(1, @ceil(rect.width))),
-            .anchor_height = @intFromFloat(@max(1, @ceil(rect.height))),
-            .edge = request.popup.placement.edge,
-            .alignment = request.popup.placement.alignment,
-            .gap = @intFromFloat(@round(request.popup.placement.gap)),
-        });
-        errdefer self.backend.destroyWindow(win);
+            const win = try self.backend.createPopup(self.parent, .{
+                .width = try positiveU31(size.width),
+                .height = try positiveU31(size.height),
+                .anchor_x = @intFromFloat(@floor(rect.x)),
+                .anchor_y = @intFromFloat(@floor(rect.y)),
+                .anchor_width = @intFromFloat(@max(1, @ceil(rect.width))),
+                .anchor_height = @intFromFloat(@max(1, @ceil(rect.height))),
+                .edge = request.popup.placement.edge,
+                .alignment = request.popup.placement.alignment,
+                .gap = @intFromFloat(@round(request.popup.placement.gap)),
+            });
+            errdefer self.backend.destroyWindow(win);
 
-        surface.* = .{
-            .id = id,
-            .win = win,
-            .runtime = undefined,
-            .queue = .{ .allocator = self.allocator, .runtime = undefined },
-            .popup = request.popup,
-        };
-        surface.runtime = try runtime_mod.Runtime.init(
-            self.allocator,
-            win.renderBackend(),
-            .{ .max_width = size.width, .max_height = size.height },
-            .{ .ptr = surface, .vtable = &popup_host_vtable },
-            self.runtime.color_scheme,
-        );
-        errdefer surface.runtime.deinit();
-        surface.queue.runtime = &surface.runtime;
-        // Popups clear to transparent like layer-shell surfaces: the content
-        // paints its own background, so rounded corners stay see-through.
-        surface.runtime.setFrameBackground(keywork.colors.transparent);
-        surface.runtime.setDeferredRepaint(true);
-        surface.runtime.repaint_pending = true;
+            surface.* = .{
+                .id = id,
+                .win = win,
+                .runtime = undefined,
+                .queue = .{ .allocator = self.allocator, .runtime = undefined },
+                .popup = request.popup,
+            };
+            surface.runtime = try runtime_mod.Runtime.init(
+                self.allocator,
+                win.renderBackend(),
+                .{ .max_width = size.width, .max_height = size.height },
+                .{ .ptr = surface, .vtable = &popup_host_vtable },
+                self.runtime.color_scheme,
+            );
+            errdefer surface.runtime.deinit();
+            surface.queue.runtime = &surface.runtime;
+            // Popups clear to transparent like layer-shell surfaces: the content
+            // paints its own background, so rounded corners stay see-through.
+            surface.runtime.setFrameBackground(keywork.colors.transparent);
+            surface.runtime.setDeferredRepaint(true);
+            surface.runtime.repaint_pending = true;
 
-        win.setPointerButtonHandler(&surface.queue, QueuedPlatformEvents.pointerButton);
-        win.setPointerMoveHandler(&surface.queue, QueuedPlatformEvents.pointerMove);
-        win.setCursorShapeHandler(&surface.runtime, runtime_mod.Runtime.waylandCursorShape);
-        win.setRepaintHandler(&surface.queue, QueuedPlatformEvents.configure);
-        win.setFrameHandler(&surface.queue, QueuedPlatformEvents.frameDone);
-        win.setKeyHandler(&surface.queue, QueuedPlatformEvents.keyInput);
-        win.setScrollHandler(&surface.queue, QueuedPlatformEvents.scroll);
+            win.setPointerButtonHandler(&surface.queue, QueuedPlatformEvents.pointerButton);
+            win.setPointerMoveHandler(&surface.queue, QueuedPlatformEvents.pointerMove);
+            win.setCursorShapeHandler(&surface.runtime, runtime_mod.Runtime.waylandCursorShape);
+            win.setRepaintHandler(&surface.queue, QueuedPlatformEvents.configure);
+            win.setFrameHandler(&surface.queue, QueuedPlatformEvents.frameDone);
+            win.setKeyHandler(&surface.queue, QueuedPlatformEvents.keyInput);
+            win.setScrollHandler(&surface.queue, QueuedPlatformEvents.scroll);
 
-        try self.popups.append(self.allocator, surface);
-    }
+            try self.popups.append(self.allocator, surface);
+        }
 
-    fn destroyPopup(self: *PopupManager, index: usize) void {
-        const popup = self.popups.items[index];
-        _ = self.popups.orderedRemove(index);
-        popup.runtime.deinit();
-        popup.queue.deinit();
-        self.backend.destroyWindow(popup.win);
-        self.allocator.free(popup.id);
-        self.allocator.destroy(popup);
-    }
+        fn destroyPopup(self: *Self, index: usize) void {
+            const popup = self.popups.items[index];
+            _ = self.popups.orderedRemove(index);
+            popup.runtime.deinit();
+            popup.queue.deinit();
+            self.backend.destroyWindow(popup.win);
+            self.allocator.free(popup.id);
+            self.allocator.destroy(popup);
+        }
 
-    /// Builds the popup content in a throwaway arena and lays it out to
-    /// learn its natural size, so the surface can be created at the right
-    /// dimensions before the popup runtime exists.
-    fn measureContent(self: *PopupManager, popup: *const keywork.Widget.Popup) !keywork.Size {
-        if (popup.width) |width| if (popup.height) |height| {
-            return .{ .width = width, .height = height };
-        };
+        /// Builds the popup content in a throwaway arena and lays it out to
+        /// learn its natural size, so the surface can be created at the right
+        /// dimensions before the popup runtime exists.
+        fn measureContent(self: *Self, popup: *const keywork.Widget.Popup) !keywork.Size {
+            if (popup.width) |width| if (popup.height) |height| {
+                return .{ .width = width, .height = height };
+            };
 
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const arena_allocator = arena.allocator();
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
 
-        const constraints: keywork.Constraints = .{
-            .max_width = popup.width orelse default_max_size,
-            .max_height = popup.height orelse default_max_size,
-        };
-        const app_context: keywork.AppContext = .{
-            .window_width = constraints.max_width,
-            .window_height = constraints.max_height,
-            .color_scheme = self.runtime.color_scheme.name(),
-        };
-        var scope: keywork.BuildScope = .{
-            .allocator = arena_allocator,
-            .theme = keywork.Theme.fromColorScheme(app_context.color_scheme),
-            .app_context = app_context,
-            .render_scale = self.runtime.renderScale(),
-        };
-        const widget = try popup.builder.build(&scope, .{
-            .constraints = constraints,
-            .theme = scope.theme,
-            .default_text_style = scope.default_text_style,
-            .app_context = app_context,
-        });
-        var element = try keywork.buildElementTreeScoped(arena_allocator, &scope, &widget, constraints);
-        defer keywork.destroyElementTree(arena_allocator, &element);
-        const root = try keywork.buildRenderTreeFromElement(arena_allocator, &element, constraints, self.parent.renderBackend());
-        return .{
-            .width = popup.width orelse @min(root.rect.width, constraints.max_width),
-            .height = popup.height orelse @min(root.rect.height, constraints.max_height),
-        };
-    }
+            const constraints: keywork.Constraints = .{
+                .max_width = popup.width orelse default_max_size,
+                .max_height = popup.height orelse default_max_size,
+            };
+            const app_context: keywork.AppContext = .{
+                .window_width = constraints.max_width,
+                .window_height = constraints.max_height,
+                .color_scheme = self.runtime.color_scheme.name(),
+            };
+            var scope: keywork.BuildScope = .{
+                .allocator = arena_allocator,
+                .theme = keywork.Theme.fromColorScheme(app_context.color_scheme),
+                .app_context = app_context,
+                .render_scale = self.runtime.renderScale(),
+            };
+            const widget = try popup.builder.build(&scope, .{
+                .constraints = constraints,
+                .theme = scope.theme,
+                .default_text_style = scope.default_text_style,
+                .app_context = app_context,
+            });
+            var element = try keywork.buildElementTreeScoped(arena_allocator, &scope, &widget, constraints);
+            defer keywork.destroyElementTree(arena_allocator, &element);
+            const root = try keywork.buildRenderTreeFromElement(arena_allocator, &element, constraints, self.parent.renderBackend());
+            return .{
+                .width = popup.width orelse @min(root.rect.width, constraints.max_width),
+                .height = popup.height orelse @min(root.rect.height, constraints.max_height),
+            };
+        }
 
-    const popup_host_vtable: keywork.AppHost.VTable = .{ .build_widget = popupBuildWidget };
+        const popup_host_vtable: keywork.AppHost.VTable = .{ .build_widget = popupBuildWidget };
 
-    fn popupBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
-        const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
-        return surface.popup.builder.build(scope, .{
-            .constraints = .{ .max_width = context.window_width, .max_height = context.window_height },
-            .theme = scope.theme,
-            .default_text_style = scope.default_text_style,
-            .interaction = scope.interaction,
-            .app_context = context,
-        });
-    }
-};
+        fn popupBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
+            const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
+            return surface.popup.builder.build(scope, .{
+                .constraints = .{ .max_width = context.window_width, .max_height = context.window_height },
+                .theme = scope.theme,
+                .default_text_style = scope.default_text_style,
+                .interaction = scope.interaction,
+                .app_context = context,
+            });
+        }
+    };
+}
 
 fn runWaylandWindowed(
     allocator: std.mem.Allocator,
@@ -652,7 +682,7 @@ const WindowManager = struct {
         layer_shell: bool,
         runtime: runtime_mod.Runtime,
         queue: QueuedPlatformEvents,
-        popups: PopupManager,
+        popups: PopupManager(wayland_shm.Backend),
     };
 
     fn deinit(self: *WindowManager) void {
@@ -881,7 +911,7 @@ const WindowManager = struct {
         );
         errdefer managed.runtime.deinit();
         managed.queue.runtime = &managed.runtime;
-        managed.queue.popup_manager = &managed.popups;
+        managed.queue.popup_manager = managed.popups.hooks();
         managed.popups.runtime = &managed.runtime;
         if (managed.layer_shell) managed.runtime.setFrameBackground(keywork.colors.transparent);
         managed.runtime.setDeferredRepaint(true);

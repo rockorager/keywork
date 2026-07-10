@@ -101,6 +101,39 @@ pub const Backend = struct {
         return win;
     }
 
+    /// Creates a popup window anchored to `parent`. The popup grabs the
+    /// seat when an input serial is available, so the compositor dismisses
+    /// it (closing the window) when the user clicks elsewhere.
+    pub fn createPopup(self: *Backend, parent: *Window, options: window.PopupOptions) !*Window {
+        var protocol = try window.Surface.initPopup(self.connection, &parent.protocol, options);
+        errdefer protocol.deinit();
+
+        // The grab must precede the initial commit, so unlike createWindow
+        // the renderer initializes before the surface is committed.
+        var renderer = try VulkanRenderer.init(self.allocator, self.connection.display, protocol.surface);
+        errdefer renderer.deinit();
+
+        const win = try self.allocator.create(Window);
+        errdefer self.allocator.destroy(win);
+        win.* = .{
+            .backend = self,
+            .protocol = protocol,
+            .renderer = renderer,
+            .input_target = .{ .surface = protocol.surface },
+        };
+        try self.windows.append(self.allocator, win);
+        errdefer _ = self.windows.pop();
+        try self.input.registerTarget(&win.input_target);
+
+        win.protocol.attachListeners();
+        if (self.input.seat) |seat| {
+            if (self.input.last_button_serial) |serial| win.protocol.grabPopup(seat, serial);
+        }
+        win.protocol.surface.commit();
+        _ = self.connection.display.flush();
+        return win;
+    }
+
     pub fn destroyWindow(self: *Backend, win: *Window) void {
         self.input.unregisterTarget(&win.input_target);
         for (self.windows.items, 0..) |existing, index| {
