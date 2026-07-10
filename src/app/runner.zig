@@ -224,6 +224,7 @@ const PopupHooks = struct {
     drain_all: *const fn (ctx: *anyopaque) anyerror!void,
     reconcile_and_flush: *const fn (ctx: *anyopaque, content_dirty: bool) anyerror!void,
     parent_pointer_down: *const fn (ctx: *anyopaque, point: keywork.Point) anyerror!bool,
+    escape_pressed: *const fn (ctx: *anyopaque) bool,
 };
 
 const QueuedPlatformEvents = struct {
@@ -330,7 +331,15 @@ const QueuedPlatformEvents = struct {
             },
             .pointer_move => |point| try self.runtime.pointerMove(point),
             .scroll => |value| try self.runtime.scrollBy(value.point, value.dx, value.dy),
-            .key => |input| try self.runtime.keyInput(input),
+            .key => |input| switch (input) {
+                .escape => {
+                    if (self.popup_manager) |manager| {
+                        if (manager.escape_pressed(manager.ctx)) continue;
+                    }
+                    try self.runtime.keyInput(input);
+                },
+                else => try self.runtime.keyInput(input),
+            },
             .configure => |size| runtime_mod.Runtime.waylandConfigure(self.runtime, size),
             .frame_done => runtime_mod.Runtime.waylandFrameDone(self.runtime),
         };
@@ -391,6 +400,7 @@ fn PopupManager(comptime Backend: type) type {
                 .drain_all = drainAllOpaque,
                 .reconcile_and_flush = reconcileAndFlushOpaque,
                 .parent_pointer_down = parentPointerDownOpaque,
+                .escape_pressed = escapePressedOpaque,
             };
         }
 
@@ -409,6 +419,16 @@ fn PopupManager(comptime Backend: type) type {
             for (self.popups.items) |popup| {
                 if (popup.anchor_rect.contains(point)) return false;
             }
+            return self.dismissAll();
+        }
+
+        fn escapePressedOpaque(ctx: *anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.dismissAll();
+        }
+
+        fn dismissAll(self: *Self) bool {
+            if (self.popups.items.len == 0) return false;
             for (self.popups.items) |popup| {
                 if (popup.popup.on_close) |on_close| {
                     on_close.call() catch |err| log.warn("popup on_close failed: {}", .{err});
@@ -546,6 +566,7 @@ fn PopupManager(comptime Backend: type) type {
             );
             errdefer surface.runtime.deinit();
             surface.queue.runtime = &surface.runtime;
+            surface.queue.popup_manager = self.hooks();
             // Popups clear to transparent like layer-shell surfaces: the content
             // paints its own background, so rounded corners stay see-through.
             surface.runtime.setFrameBackground(keywork.colors.transparent);
@@ -1010,4 +1031,39 @@ test "queued key text is copied" {
     try std.testing.expectEqual(@as(usize, 1), queue.events.items.len);
     const input = queue.events.items[0].key;
     try std.testing.expectEqualStrings("ab", input.text);
+}
+
+test "queued escape dismisses an open popup" {
+    const Hooks = struct {
+        fn drainAll(_: *anyopaque) anyerror!void {}
+        fn reconcileAndFlush(_: *anyopaque, _: bool) anyerror!void {}
+        fn parentPointerDown(_: *anyopaque, _: keywork.Point) anyerror!bool {
+            return false;
+        }
+        fn escapePressed(ctx: *anyopaque) bool {
+            const dismissed: *bool = @ptrCast(@alignCast(ctx));
+            dismissed.* = true;
+            return true;
+        }
+    };
+
+    var dismissed = false;
+    var runtime: runtime_mod.Runtime = undefined;
+    var queue: QueuedPlatformEvents = .{
+        .allocator = std.testing.allocator,
+        .runtime = &runtime,
+        .popup_manager = .{
+            .ctx = &dismissed,
+            .drain_all = Hooks.drainAll,
+            .reconcile_and_flush = Hooks.reconcileAndFlush,
+            .parent_pointer_down = Hooks.parentPointerDown,
+            .escape_pressed = Hooks.escapePressed,
+        },
+    };
+    defer queue.deinit();
+
+    QueuedPlatformEvents.keyInput(&queue, .escape);
+    try queue.drain();
+
+    try std.testing.expect(dismissed);
 }

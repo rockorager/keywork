@@ -604,8 +604,8 @@ end
 
 --- Popup declaration for ui.anchored. `content` is a widget table, or a
 --- function receiving the popup's runtime state and returning one.
---- `on_close` fires when the compositor dismisses the popup (for example
---- a click elsewhere), so app state can stop declaring it.
+--- `on_close` fires when Escape is pressed or the compositor dismisses the
+--- popup (for example a click elsewhere), so app state can stop declaring it.
 function ui.popup(options)
   return {
     content = options.content,

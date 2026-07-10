@@ -146,7 +146,7 @@ pub const Widget = union(enum) {
         /// Explicit size overrides; content is measured when null.
         width: ?f32 = null,
         height: ?f32 = null,
-        /// Fired when the host dismisses the popup (for example a
+        /// Fired when the host dismisses the popup (for example Escape or a
         /// compositor grab break), so app state can drop the declaration.
         on_close: ?Callback = null,
 
