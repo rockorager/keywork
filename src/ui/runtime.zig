@@ -1375,6 +1375,79 @@ test "scrolling a virtualized list converges its window in one frame" {
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 }
 
+test "wheel scroll reaches a selected list nested in a flexible column slot" {
+    const TestApp = struct {
+        var dummy: u8 = 0;
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        // Mirrors the launcher: column { header, expanded(box(padding(list))), footer }.
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const allocator = scope.allocator;
+            var list_widget = keywork.widgets.list("results", 64, 44, .{ .ptr = &dummy, .build_fn = buildItem });
+            list_widget.list.selected = 0;
+            const padded = try keywork.widgets.padding(allocator, .{ .left = 6, .right = 6, .top = 6, .bottom = 6 }, list_widget);
+            const boxed: keywork.Widget = .{ .box = .{ .child = try keywork.Widget.alloc(allocator, padded) } };
+            const children = [_]keywork.Widget{
+                keywork.widgets.text("header"),
+                try keywork.widgets.expandedFlex(allocator, boxed, 1),
+                keywork.widgets.text("footer"),
+            };
+            return try keywork.widgets.column(allocator, &children, 0);
+        }
+
+        fn buildItem(_: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
+            const label = try std.fmt.allocPrint(scope.allocator, "row {d}", .{index});
+            return .{ .text = .{ .value = label } };
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 640, .max_height = 470 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const list_element = keywork.dirtyScrollElement(&runtime.element_root.?, "results").?;
+    const state = keywork.listState(list_element);
+    try std.testing.expectEqual(@as(f32, 0), state.offset);
+    // The flexible slot bounds the viewport to the remaining window height.
+    try std.testing.expect(state.viewport_height < 470);
+
+    // A wheel event over the list scrolls it.
+    try runtime.scrollBy(.{ .position = .{ .x = 320, .y = 200 }, .dx = 0, .dy = 100 });
+    try std.testing.expectEqual(@as(f32, 100), state.offset);
+
+    // The unchanged selection does not snap the free scroll back.
+    try std.testing.expectEqual(@as(f32, 100), keywork.listState(list_element).offset);
+}
+
 test "typing edits element-owned input state without rebuilding" {
     const TestApp = struct {
         builds: usize = 0,

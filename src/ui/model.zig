@@ -284,6 +284,10 @@ pub const Widget = union(enum) {
         item_count: usize,
         item_extent: f32,
         build_item: ItemBuilder,
+        /// Controlled selection: when set and changed since the last
+        /// layout, the list scrolls the minimum distance to bring the
+        /// item fully into view. Selection state itself lives in the app.
+        selected: ?usize = null,
     };
 
     pub const ItemBuilder = struct {
@@ -1186,6 +1190,10 @@ pub const ListState = struct {
     first: usize = 0,
     built: usize = 0,
     range_stale: bool = false,
+    /// The selection the list last followed; a differing widget value
+    /// triggers the follow scroll, so free scrolling in between is left
+    /// alone.
+    last_selected: ?usize = null,
 };
 
 pub fn listState(element: *Element) *ListState {
@@ -1233,6 +1241,73 @@ fn buildListChildren(
         initialized += 1;
     }
     return children;
+}
+
+/// How reconcileListWindow treats rows whose item index stayed inside the
+/// window: .rebuild re-runs the item builder and reconciles the result into
+/// the retained element (item data may have changed), .reuse keeps the
+/// element untouched (pure scroll, nothing changed).
+const RetainedRows = enum { rebuild, reuse };
+
+/// Reconciles a list's built row window against a new visible range keyed
+/// by absolute item index. Retained rows keep their element identity —
+/// render nodes, text measurements, and row state survive — while rows
+/// entering the window are built fresh and rows leaving it are destroyed.
+/// Takes ownership of element.children and returns the new window; the
+/// caller stores it back along with the range bookkeeping.
+fn reconcileListWindow(
+    allocator: std.mem.Allocator,
+    scope: *BuildScope,
+    element: *Element,
+    list_widget: Widget.List,
+    range: ListRange,
+    constraints: Constraints,
+    retained: RetainedRows,
+) ![]Element {
+    std.debug.assert(element.kind == .list);
+    const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+    const old_first = listState(element).first;
+    const old_children = element.children;
+    element.children = &.{};
+
+    const moved = try allocator.alloc(bool, old_children.len);
+    defer allocator.free(moved);
+    @memset(moved, false);
+
+    const new_children = try allocator.alloc(Element, range.count);
+    var initialized: usize = 0;
+    errdefer {
+        for (new_children[0..initialized]) |*child| destroyElementTree(allocator, child);
+        allocator.free(new_children);
+        for (old_children, 0..) |*old_child, index| {
+            if (!moved[index]) destroyElementTree(allocator, old_child);
+        }
+        allocator.free(old_children);
+    }
+
+    for (new_children, 0..) |*slot, index| {
+        const item_index = range.first + index;
+        if (item_index >= old_first and item_index - old_first < old_children.len) {
+            const old_index = item_index - old_first;
+            slot.* = old_children[old_index];
+            moved[old_index] = true;
+            initialized += 1;
+            if (retained == .rebuild) {
+                const item = try list_widget.build_item.build(scope, item_index);
+                try updateElementTreeScoped(allocator, scope, slot, &item, item_constraints);
+            }
+            continue;
+        }
+        const item = try list_widget.build_item.build(scope, item_index);
+        slot.* = try buildElementTreeScoped(allocator, scope, &item, item_constraints);
+        initialized += 1;
+    }
+
+    for (old_children, 0..) |*old_child, index| {
+        if (!moved[index]) destroyElementTree(allocator, old_child);
+    }
+    allocator.free(old_children);
+    return new_children;
 }
 
 /// Reports whether any list's built window drifted from its offset and
@@ -1754,9 +1829,7 @@ pub fn updateElementTreeScoped(
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = listState(element);
             const range = listVisibleRange(element_widget.list, state.offset, state.viewport_height);
-            const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
-            for (element.children) |*child| destroyElementTree(allocator, child);
-            allocator.free(element.children);
+            const children = try reconcileListWindow(allocator, scope, element, element_widget.list, range, constraints, .rebuild);
             element.children = children;
             state.first = range.first;
             state.built = range.count;
@@ -1874,9 +1947,7 @@ pub fn rebuildDirtyElementTreeScoped(
                 return rebuilt_children;
             }
             const range = listVisibleRange(list_widget, state.offset, state.viewport_height);
-            const children = try buildListChildren(allocator, scope, list_widget, range, constraints);
-            for (element.children) |*child| destroyElementTree(allocator, child);
-            allocator.free(element.children);
+            const children = try reconcileListWindow(allocator, scope, element, list_widget, range, constraints, .reuse);
             element.children = children;
             state.first = range.first;
             state.built = range.count;
@@ -2461,6 +2532,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .item_count = list_widget.item_count,
                 .item_extent = list_widget.item_extent,
                 .build_item = builder,
+                .selected = list_widget.selected,
             } };
         },
         .text_input => |input_widget| blk: {
@@ -2892,6 +2964,125 @@ test "virtualized list builds only the visible window and follows scroll" {
     try std.testing.expectEqualStrings(expected, element.children[0].widget.text.value);
     // The first built row sits just above the viewport.
     try std.testing.expect(root.children[0].rect.y <= 0);
+}
+
+test "list window reconciles rows across scroll and update" {
+    const Items = struct {
+        var builds: usize = 0;
+
+        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
+            builds += 1;
+            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
+            return .{ .text = .{ .value = label } };
+        }
+
+        fn builder() Widget.ItemBuilder {
+            return .{ .ptr = &builds, .build_fn = build };
+        }
+    };
+    Items.builds = 0;
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    // 1000 items at 16px in a 48px viewport.
+    const list_widget = widgets.list("reconcile-list", 1000, 16, Items.builder());
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    const window = element.children.len;
+    try std.testing.expectEqual(window, Items.builds);
+    // Item 1's render node, tracked across the scroll below.
+    const item_one_node = element.children[1].render_node.?;
+
+    // Scroll three items down: the window shifts by one (buffer rows
+    // absorb the rest), so exactly one row enters and one leaves.
+    listState(&element).offset = 48;
+    _ = dirtyScrollElement(&element, "reconcile-list");
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    var rebuild_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(retained_allocator, &rebuild_scope, &element, constraints));
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    // Only the entering row was built; retained rows kept their elements.
+    try std.testing.expectEqual(@as(usize, 1), listState(&element).first);
+    try std.testing.expectEqual(window + 1, Items.builds);
+    try std.testing.expectEqual(item_one_node, element.children[0].render_node.?);
+    try std.testing.expectEqualStrings("item 1", element.children[0].widget.text.value);
+
+    // A widget update re-runs the builder for every visible row but
+    // reconciles into the retained elements instead of rebuilding them.
+    const builds_before_update = Items.builds;
+    var updated_widget = widgets.list("reconcile-list", 1000, 16, Items.builder());
+    updated_widget.list.selected = 2;
+    var update_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try updateElementTreeScoped(retained_allocator, &update_scope, &element, &updated_widget, constraints);
+
+    try std.testing.expectEqual(builds_before_update + window, Items.builds);
+    try std.testing.expectEqual(item_one_node, element.children[0].render_node.?);
+}
+
+test "list follows controlled selection and leaves free scrolling alone" {
+    const Items = struct {
+        var dummy: u8 = 0;
+
+        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
+            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
+            return .{ .text = .{ .value = label } };
+        }
+
+        fn builder() Widget.ItemBuilder {
+            return .{ .ptr = &dummy, .build_fn = build };
+        }
+    };
+
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    // 100 items at 16px in a 48px viewport (3 fully visible).
+    var list_widget = widgets.list("select-list", 100, 16, Items.builder());
+    list_widget.list.selected = 10;
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+
+    // The initial selection scrolls into view on the first layout: item
+    // 10's bottom lands at the viewport bottom.
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    const state = listState(&element);
+    try std.testing.expectEqual(@as(f32, 11 * 16 - 48), state.offset);
+
+    // Unchanged selection leaves free scrolling alone.
+    state.offset = 40;
+    markElementLayoutDirty(&element);
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 40), state.offset);
+
+    // Selection above the viewport snaps its top to the viewport top.
+    element.widget.list.selected = 1;
+    markElementLayoutDirty(&element);
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 16), state.offset);
+
+    // An already fully visible selection does not move the viewport.
+    element.widget.list.selected = 2;
+    markElementLayoutDirty(&element);
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 16), state.offset);
+
+    // Clearing the selection changes nothing until one appears again.
+    element.widget.list.selected = null;
+    markElementLayoutDirty(&element);
+    _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 16), state.offset);
 }
 
 test "flex spacers collapse under unbounded scroll constraints" {

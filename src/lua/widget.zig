@@ -904,6 +904,7 @@ pub fn parse(
         const ListOptions = struct {
             count: usize = 0,
             item_height: f32 = 16,
+            selected: ?usize = null,
         };
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const options = try lua_codec.decode(ListOptions, lua_state, table, allocator);
@@ -915,7 +916,12 @@ pub fn parse(
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
         const builder = try callback_allocator.create(LuaItemBuilder);
         builder.* = .{ .allocator = callback_allocator, .host = host, .lua_state = lua_state, .ref = ref };
-        return keywork.widgets.list(id, options.count, options.item_height, builder.itemBuilder());
+        var list_widget = keywork.widgets.list(id, options.count, options.item_height, builder.itemBuilder());
+        // Lua indices are 1-based; 0 or nil means no selection.
+        if (options.selected) |selected| {
+            if (selected >= 1) list_widget.list.selected = selected - 1;
+        }
+        return list_widget;
     }
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);

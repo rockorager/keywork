@@ -398,6 +398,25 @@ fn layoutElementInto(
             const available_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else content_height;
             const height = @min(available_height, content_height);
             state.viewport_height = height;
+
+            // Follow the controlled selection: when it changes (or first
+            // appears), scroll the minimum distance to bring the item
+            // fully into view. Free scrolling in between is left alone.
+            if (list_widget.selected) |selected| {
+                if (state.last_selected != selected and selected < list_widget.item_count) {
+                    const top = list_widget.item_extent * @as(f32, @floatFromInt(selected));
+                    const bottom = top + list_widget.item_extent;
+                    if (top < state.offset) {
+                        state.offset = top;
+                    } else if (bottom > state.offset + height) {
+                        state.offset = bottom - height;
+                    }
+                }
+                state.last_selected = selected;
+            } else {
+                state.last_selected = null;
+            }
+
             state.offset = std.math.clamp(state.offset, 0, @max(0, content_height - height));
 
             // A drifted window is rebuilt by the next dirty-state pass; this

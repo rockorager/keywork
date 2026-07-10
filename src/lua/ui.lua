@@ -684,6 +684,7 @@ function ui.list(options)
     id = options.id,
     count = options.count,
     item_height = options.item_height,
+    selected = options.selected,
     build_item = options.build_item,
   }
 end
