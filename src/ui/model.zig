@@ -1616,7 +1616,10 @@ pub fn updateElementTreeScoped(
             try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
         },
         .clickable => |clickable_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, clickable_widget.child, constraints);
+            // Match buildClickableChildElement: keep the hover style applied
+            // when the tree is rebuilt while the pointer rests on the target.
+            const styled_child = clickableStyledChild(clickable_widget, scope.interaction);
+            try updateSingleChildElement(allocator, scope, element, widget.*, &styled_child, constraints);
         },
         .anchored => |anchored_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, anchored_widget.child, constraints);
@@ -3598,6 +3601,36 @@ test "clickable hover refresh updates painted background" {
     try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
     root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(colors.blue9, root.children[0].background);
+}
+
+test "clickable keeps hover background through tree update" {
+    const allocator = std.testing.allocator;
+    const label = widgets.text("chip");
+    const box: Widget = .{ .box = .{
+        .child = &label,
+        .background = colors.transparent,
+    } };
+    const chip: Widget = .{ .clickable = .{
+        .id = "chip",
+        .child = &box,
+        .hover_style = .{ .background = colors.blue9 },
+    } };
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 80 };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{
+        .allocator = built_arena.allocator(),
+        .interaction = .{ .hovered_id = "chip" },
+    };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &chip, constraints);
+    defer destroyElementTree(allocator, &built_element);
+    try std.testing.expectEqual(colors.blue9, built_element.children[0].widget.box.background);
+
+    // A rebuild while the pointer rests on the target must not drop the
+    // hover style (regression: status updates wiped hover highlights).
+    try updateElementTreeScoped(allocator, &build_scope, &built_element, &chip, constraints);
+    try std.testing.expectEqual(colors.blue9, built_element.children[0].widget.box.background);
 }
 
 test "anchored elements declare popups with laid-out anchor rects" {
