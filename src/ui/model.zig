@@ -128,9 +128,15 @@ pub const Widget = union(enum) {
         on_tap_up: ?TapCallback = null,
         on_tap_cancel: ?TapCallback = null,
         on_scroll: ?ScrollEventCallback = null,
+        /// Fires with true when the pointer enters this widget and false
+        /// when it leaves. Driven only by real pointer motion, so content
+        /// scrolling beneath a stationary pointer does not re-fire it.
+        on_hover_change: ?FocusChangeCallback = null,
         buttons: PointerButtons = .{},
         activation: ClickActivation = .release,
         hover_style: ?ClickableStyle = null,
+        pressed_style: ?ClickableStyle = null,
+        focused_border: ?Color = null,
         cursor: CursorShape = .default,
     };
 
@@ -1075,6 +1081,7 @@ pub const RenderNode = struct {
     tap_up_callback: ?Widget.TapCallback = null,
     tap_cancel_callback: ?Widget.TapCallback = null,
     scroll_event_callback: ?Widget.ScrollEventCallback = null,
+    hover_change_callback: ?Widget.FocusChangeCallback = null,
     click_buttons: PointerButtons = .{},
     click_activation: Widget.ClickActivation = .release,
     click_cursor: CursorShape = .default,
@@ -2072,8 +2079,8 @@ pub fn refreshInteractionElements(
             for (ids) |id| {
                 if (std.mem.eql(u8, clickable_widget.id, id)) matched = true;
             }
-            if (matched and clickable_widget.hover_style != null) {
-                applyClickableHoverStyle(&element.children[0], clickable_widget, scope.interaction);
+            if (matched and (clickable_widget.hover_style != null or clickable_widget.pressed_style != null)) {
+                applyClickableStateStyle(&element.children[0], clickable_widget, scope.interaction);
                 markElementLayoutDirty(&element.children[0]);
                 markElementLayoutDirty(element);
                 return true;
@@ -2396,34 +2403,64 @@ fn buildClickableChildElement(
 
 fn clickableStyledChild(clickable_widget: Widget.Clickable, interaction: InteractionState) Widget {
     var child = clickable_widget.child.*;
-    const style = clickableActiveStyle(clickable_widget, interaction) orelse return child;
-    const background = style.background orelse return child;
-    switch (child) {
-        .box => child.box.background = background,
-        else => {},
+    if (clickableActiveBackground(clickable_widget, interaction)) |background| {
+        switch (child) {
+            .box => child.box.background = background,
+            else => {},
+        }
+    }
+    if (clickable_widget.focused_border) |border| {
+        if (interaction.isFocused(.named(clickable_widget.id))) {
+            switch (child) {
+                .box => child.box.border = border,
+                else => {},
+            }
+        }
     }
     return child;
 }
 
-fn applyClickableHoverStyle(element: *Element, clickable_widget: Widget.Clickable, interaction: InteractionState) void {
-    const style = clickable_widget.hover_style orelse return;
-    const background = if (interaction.isHovered(clickable_widget.id)) style.background else style.base_background;
-    const value = background orelse return;
+fn applyClickableStateStyle(element: *Element, clickable_widget: Widget.Clickable, interaction: InteractionState) void {
+    const value = clickableActiveBackground(clickable_widget, interaction) orelse
+        clickableBaseBackground(clickable_widget) orelse return;
     switch (element.widget) {
         .box => element.widget.box.background = value,
         else => {},
     }
 }
 
-fn clickableActiveStyle(clickable_widget: Widget.Clickable, interaction: InteractionState) ?Widget.ClickableStyle {
-    if (!interaction.isHovered(clickable_widget.id)) return null;
-    return clickable_widget.hover_style;
+/// Background for the clickable's active interaction state; pressed wins
+/// over hover. Null when neither state is active or styled.
+fn clickableActiveBackground(clickable_widget: Widget.Clickable, interaction: InteractionState) ?Color {
+    if (interaction.isPressed(clickable_widget.id)) {
+        if (clickable_widget.pressed_style) |style| {
+            if (style.background) |background| return background;
+        }
+    }
+    if (interaction.isHovered(clickable_widget.id)) {
+        if (clickable_widget.hover_style) |style| {
+            if (style.background) |background| return background;
+        }
+    }
+    return null;
 }
 
-fn clickableHoverStyle(clickable_widget: Widget.Clickable) ?Widget.ClickableStyle {
-    var style = clickable_widget.hover_style orelse return null;
+/// The child's original background, captured into the state styles when
+/// the widget was cloned for retention, so leaving hover/press restores it.
+fn clickableBaseBackground(clickable_widget: Widget.Clickable) ?Color {
+    if (clickable_widget.hover_style) |style| {
+        if (style.base_background) |base| return base;
+    }
+    if (clickable_widget.pressed_style) |style| {
+        if (style.base_background) |base| return base;
+    }
+    return null;
+}
+
+fn clickableStateStyle(style_value: ?Widget.ClickableStyle, child: *const Widget) ?Widget.ClickableStyle {
+    var style = style_value orelse return null;
     if (style.background != null and style.base_background == null) {
-        style.base_background = clickableChildBackground(clickable_widget.child);
+        style.base_background = clickableChildBackground(child);
     }
     return style;
 }
@@ -2477,6 +2514,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer if (tap_cancel) |on_tap_cancel| on_tap_cancel.destroy(allocator);
             const scroll = if (clickable_widget.on_scroll) |on_scroll| try on_scroll.clone(allocator) else null;
             errdefer if (scroll) |on_scroll| on_scroll.destroy(allocator);
+            const hover_change = if (clickable_widget.on_hover_change) |on_hover_change| try on_hover_change.clone(allocator) else null;
+            errdefer if (hover_change) |on_hover_change| on_hover_change.destroy(allocator);
             break :blk .{ .clickable = .{
                 .id = id,
                 .child = clickable_widget.child,
@@ -2485,9 +2524,12 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .on_tap_up = tap_up,
                 .on_tap_cancel = tap_cancel,
                 .on_scroll = scroll,
+                .on_hover_change = hover_change,
                 .buttons = clickable_widget.buttons,
                 .activation = clickable_widget.activation,
-                .hover_style = clickableHoverStyle(clickable_widget),
+                .hover_style = clickableStateStyle(clickable_widget.hover_style, clickable_widget.child),
+                .pressed_style = clickableStateStyle(clickable_widget.pressed_style, clickable_widget.child),
+                .focused_border = clickable_widget.focused_border,
                 .cursor = clickable_widget.cursor,
             } };
         },
@@ -2605,6 +2647,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (clickable_widget.on_tap_up) |callback| callback.destroy(allocator);
             if (clickable_widget.on_tap_cancel) |callback| callback.destroy(allocator);
             if (clickable_widget.on_scroll) |callback| callback.destroy(allocator);
+            if (clickable_widget.on_hover_change) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
         },
         .anchored => |anchored_widget| {
@@ -3969,6 +4012,68 @@ test "clickable keeps hover background through tree update" {
     // hover style (regression: status updates wiped hover highlights).
     try updateElementTreeScoped(allocator, &build_scope, &built_element, &chip, constraints);
     try std.testing.expectEqual(colors.blue9, built_element.children[0].widget.box.background);
+}
+
+test "clickable pressed style wins over hover and releases back to base" {
+    const allocator = std.testing.allocator;
+    const label = widgets.text("chip");
+    const box: Widget = .{ .box = .{
+        .child = &label,
+        .background = colors.transparent,
+    } };
+    const chip: Widget = .{ .clickable = .{
+        .id = "chip",
+        .child = &box,
+        .hover_style = .{ .background = colors.blue9 },
+        .pressed_style = .{ .background = colors.red9 },
+    } };
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 80 };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &chip, constraints);
+    defer destroyElementTree(allocator, &built_element);
+
+    build_scope.interaction = .{ .hovered_id = "chip", .pressed_id = "chip" };
+    try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
+    var root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(colors.red9, root.children[0].background);
+
+    build_scope.interaction = .{ .hovered_id = "chip" };
+    try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
+    root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(colors.blue9, root.children[0].background);
+
+    build_scope.interaction = .{};
+    try std.testing.expect(try refreshInteractionElements(allocator, &build_scope, &built_element, constraints, &.{"chip"}));
+    root = try layoutElement(allocator, &built_element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(colors.transparent, root.children[0].background);
+}
+
+test "clickable focused border applies to box child" {
+    const allocator = std.testing.allocator;
+    const label = widgets.text("chip");
+    const box: Widget = .{ .box = .{
+        .child = &label,
+        .background = colors.transparent,
+    } };
+    const chip: Widget = .{ .clickable = .{
+        .id = "chip",
+        .child = &box,
+        .focused_border = colors.blue9,
+    } };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{
+        .allocator = built_arena.allocator(),
+        .interaction = .{ .focused_id = "chip" },
+    };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &chip, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+
+    try std.testing.expectEqual(colors.blue9, built_element.children[0].widget.box.border.?);
 }
 
 test "anchored elements declare popups with laid-out anchor rects" {

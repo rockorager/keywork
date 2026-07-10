@@ -330,6 +330,7 @@ fn layoutElementInto(
                 .tap_up_callback = clickable_widget.on_tap_up,
                 .tap_cancel_callback = clickable_widget.on_tap_cancel,
                 .scroll_event_callback = clickable_widget.on_scroll,
+                .hover_change_callback = clickable_widget.on_hover_change,
                 .click_buttons = clickable_widget.buttons,
                 .click_activation = clickable_widget.activation,
                 .click_cursor = clickable_widget.cursor,

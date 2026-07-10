@@ -88,11 +88,18 @@ const BoxOptions = struct {
 
 const GestureOptions = struct {
     hover_background: ?keywork.Color = null,
+    pressed_background: ?keywork.Color = null,
+    focused_border: ?keywork.Color = null,
     cursor: keywork.CursorShape = .default,
 
     fn hoverStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
         if (self.hover_background == null) return null;
         return .{ .background = self.hover_background };
+    }
+
+    fn pressedStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
+        if (self.pressed_background == null) return null;
+        return .{ .background = self.pressed_background };
     }
 };
 
@@ -778,6 +785,8 @@ pub fn parse(
         errdefer if (on_tap_cancel) |callback| callback.destroy(callback_allocator);
         const on_scroll = try getOptionalScrollCallbackField(lua_state, callback_allocator, table, "on_scroll");
         errdefer if (on_scroll) |callback| callback.destroy(callback_allocator);
+        const on_hover = try getOptionalFocusChangeCallbackField(lua_state, callback_allocator, table, "on_hover");
+        errdefer if (on_hover) |callback| callback.destroy(callback_allocator);
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
@@ -790,8 +799,11 @@ pub fn parse(
             .on_tap_up = on_tap_up,
             .on_tap_cancel = on_tap_cancel,
             .on_scroll = on_scroll,
+            .on_hover_change = on_hover,
             .buttons = buttons,
             .hover_style = options.hoverStyle(),
+            .pressed_style = options.pressedStyle(),
+            .focused_border = options.focused_border,
             .cursor = options.cursor,
         } };
     }

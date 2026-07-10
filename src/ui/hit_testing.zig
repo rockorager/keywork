@@ -27,6 +27,7 @@ pub const ClickHit = struct {
     tap_down: ?Widget.TapCallback = null,
     tap_up: ?Widget.TapCallback = null,
     tap_cancel: ?Widget.TapCallback = null,
+    hover_change: ?Widget.FocusChangeCallback = null,
     rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     activation: Widget.ClickActivation = .release,
     cursor: CursorShape = .default,
@@ -140,6 +141,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point, button: model.Pointer
             .tap_down = node.tap_down_callback,
             .tap_up = node.tap_up_callback,
             .tap_cancel = node.tap_cancel_callback,
+            .hover_change = node.hover_change_callback,
             .rect = node.rect,
             .activation = node.click_activation,
             .cursor = node.click_cursor,
@@ -201,6 +203,7 @@ pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
                 .tap_down = node.tap_down_callback,
                 .tap_up = node.tap_up_callback,
                 .tap_cancel = node.tap_cancel_callback,
+                .hover_change = node.hover_change_callback,
                 .rect = node.rect,
                 .activation = node.click_activation,
             };
@@ -216,7 +219,8 @@ fn nodeHasTapCallback(node: *const RenderNode) bool {
     return node.click_callback != null or
         node.tap_down_callback != null or
         node.tap_up_callback != null or
-        node.tap_cancel_callback != null;
+        node.tap_cancel_callback != null or
+        node.hover_change_callback != null;
 }
 
 pub fn hitTestTextInput(node: *const RenderNode, point: Point) ?[]const u8 {

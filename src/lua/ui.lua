@@ -571,6 +571,35 @@ function ui.gesture(options)
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
     on_tap_cancel = options.on_tap_cancel,
+    on_hover = options.on_hover,
+    buttons = options.buttons,
+    on_scroll = options.on_scroll,
+  }
+end
+
+--- Composable press primitive: hover/pressed backgrounds, a focused
+--- border, cursor shape, and tap callbacks around any child. The child
+--- should be a box/container so state backgrounds and borders have
+--- somewhere to paint. A pressable with `on_tap` participates in focus
+--- traversal, so Enter/Space activate it and `focused_border` marks
+--- keyboard focus. Hover and press restyle in place without rebuilding
+--- the app. `on_hover(hovered)` fires on pointer enter/leave, driven only
+--- by real pointer motion (content scrolling beneath a stationary
+--- pointer does not re-fire it).
+function ui.pressable(options)
+  return {
+    type = "gesture",
+    id = options.id,
+    child = options.child,
+    hover_background = options.hover_background,
+    pressed_background = options.pressed_background,
+    focused_border = options.focused_border,
+    cursor = options.cursor,
+    on_tap = options.on_tap,
+    on_tap_down = options.on_tap_down,
+    on_tap_up = options.on_tap_up,
+    on_tap_cancel = options.on_tap_cancel,
+    on_hover = options.on_hover,
     buttons = options.buttons,
     on_scroll = options.on_scroll,
   }

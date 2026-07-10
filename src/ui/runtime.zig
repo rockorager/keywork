@@ -1636,6 +1636,78 @@ test "pointer hover restyles buttons without a full rebuild" {
     try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
 }
 
+test "pointer motion fires clickable hover callbacks on enter and leave" {
+    const TestApp = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const label: keywork.Widget = .{ .text = .{ .value = "row" } };
+            const child = try keywork.Widget.alloc(scope.allocator, label);
+            return .{ .clickable = .{
+                .id = "row",
+                .child = child,
+                .on_click = .{ .ptr = self, .call_fn = noopTap },
+                .on_hover_change = .{ .ptr = self, .call_fn = hoverChanged },
+            } };
+        }
+
+        fn noopTap(_: *anyopaque, _: keywork.TapEvent) !void {}
+
+        fn hoverChanged(ptr: *anyopaque, hovered: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (hovered) self.enters += 1 else self.leaves += 1;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.pointerMove(.{ .x = 5, .y = 5 });
+    try std.testing.expectEqual(@as(usize, 1), app.enters);
+    try std.testing.expectEqual(@as(usize, 0), app.leaves);
+
+    // Motion within the same target must not re-fire.
+    try runtime.pointerMove(.{ .x = 6, .y = 5 });
+    try std.testing.expectEqual(@as(usize, 1), app.enters);
+
+    try runtime.pointerMove(null);
+    try std.testing.expectEqual(@as(usize, 1), app.enters);
+    try std.testing.expectEqual(@as(usize, 1), app.leaves);
+}
+
 test "intent button callbacks survive dirty-state restyles" {
     const TestApp = struct {
         first_actions: usize = 0,

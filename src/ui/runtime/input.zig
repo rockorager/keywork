@@ -216,11 +216,24 @@ pub fn pointerMove(self: anytype, point: ?keywork.Point) !void {
         }
         return;
     }
-    const hit_id = if (point) |position| blk: {
+    const hit = if (point) |position| blk: {
         const root = self.root orelse return error.NotBuilt;
-        break :blk if (keywork.hitTestClick(root, position, .left)) |hit| hit.id else null;
+        break :blk keywork.hitTestClick(root, position, .left);
+    } else null;
+    const hit_id = if (hit) |click_hit| click_hit.id else null;
+    // Capture the previous target's hover callback before setHoveredId
+    // frees the old id. Hover callbacks fire only here, from real pointer
+    // motion, so content scrolling beneath a stationary pointer cannot
+    // re-trigger them.
+    const left_hover_change = if (self.hovered_id) |old_id| blk: {
+        const root = self.root orelse break :blk null;
+        break :blk if (keywork.findClickHitById(root, old_id)) |old_hit| old_hit.hover_change else null;
     } else null;
     if (!try setHoveredId(self, hit_id)) return;
+    if (left_hover_change) |callback| try callback.call(false);
+    if (hit) |click_hit| {
+        if (click_hit.hover_change) |callback| try callback.call(true);
+    }
     try self.invalidateState();
 }
 
