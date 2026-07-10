@@ -64,6 +64,7 @@ pub const Surface = struct {
     viewport: ?*wp.Viewport,
     fractional_scale: ?*wp.FractionalScaleV1,
     shell_role: ShellRole,
+    layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
     configured: bool = false,
     closed: bool = false,
     /// The compositor reports the toplevel as not visible (minimized, on a
@@ -99,6 +100,10 @@ pub const Surface = struct {
             .viewport = viewport,
             .fractional_scale = fractional_scale,
             .shell_role = shell_role,
+            .layer_keyboard_interactivity = if (options.layer_shell) |layer_options|
+                layer_options.keyboard_interactivity
+            else
+                null,
             .width = options.width,
             .height = options.height,
         };
@@ -188,6 +193,20 @@ pub const Surface = struct {
     pub fn grabPopup(self: *Surface, seat: *wl.Seat, serial: u32) void {
         std.debug.assert(self.shell_role == .popup);
         self.shell_role.popup.popup.grab(seat, serial);
+    }
+
+    /// Temporarily makes a normally non-interactive layer surface focusable
+    /// while it owns a popup. Exclusive mode lets Sway focus it after the
+    /// opening click has already been handled; restoring none returns focus
+    /// without leaving the idle panel focusable on pointer hover.
+    pub fn setPopupKeyboardFocus(self: *Surface, focused: bool) void {
+        if (self.layer_keyboard_interactivity != .none) return;
+        const layer_surface = switch (self.shell_role) {
+            .layer => |role| role.surface,
+            else => return,
+        };
+        layer_surface.setKeyboardInteractivity(if (focused) .exclusive else .none);
+        self.surface.commit();
     }
 
     pub fn currentSize(self: *const Surface) keywork.Size {

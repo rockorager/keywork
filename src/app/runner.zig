@@ -231,6 +231,7 @@ const QueuedPlatformEvents = struct {
     allocator: std.mem.Allocator,
     runtime: *runtime_mod.Runtime,
     popup_manager: ?PopupHooks = null,
+    popup_surface: bool = false,
     suspended_query: ?SuspendedQuery = null,
     events: std.ArrayList(Event) = .empty,
 
@@ -322,7 +323,7 @@ const QueuedPlatformEvents = struct {
                 // A press on the parent surface outside every live popup's
                 // anchor dismisses the popups and is consumed, so clicking
                 // "through" an open menu never activates what's beneath.
-                if (value.state == .pressed) {
+                if (!self.popup_surface and value.state == .pressed) {
                     if (self.popup_manager) |manager| {
                         if (try manager.parent_pointer_down(manager.ctx, value.point)) continue;
                     }
@@ -473,6 +474,7 @@ fn PopupManager(comptime Backend: type) type {
         /// Runs after the main runtime's flush so anchor rects and borrowed
         /// popup declarations come from the freshly built tree.
         fn reconcileAndFlush(self: *Self, content_dirty: bool) !void {
+            const had_popups = self.popups.items.len > 0;
             var requests: std.ArrayList(keywork.PopupRequest) = .empty;
             defer requests.deinit(self.allocator);
             try self.runtime.collectPopupRequests(self.allocator, &requests);
@@ -511,6 +513,9 @@ fn PopupManager(comptime Backend: type) type {
             }
 
             for (self.popups.items) |popup| try popup.runtime.flushPendingRepaint();
+            if (had_popups and self.popups.items.len == 0) {
+                self.backend.setPopupKeyboardFocus(self.parent, false);
+            }
         }
 
         fn findPopup(self: *Self, id: []const u8) ?*PopupSurface {
@@ -536,6 +541,10 @@ fn PopupManager(comptime Backend: type) type {
             const id = try self.allocator.dupe(u8, request.id);
             errdefer self.allocator.free(id);
 
+            const first_popup = self.popups.items.len == 0;
+            if (first_popup) self.backend.setPopupKeyboardFocus(self.parent, true);
+            errdefer if (first_popup) self.backend.setPopupKeyboardFocus(self.parent, false);
+
             const win = try self.backend.createPopup(self.parent, .{
                 .width = try positiveU31(size.width),
                 .height = try positiveU31(size.height),
@@ -554,7 +563,7 @@ fn PopupManager(comptime Backend: type) type {
                 .win = win,
                 .anchor_rect = request.anchor_rect,
                 .runtime = undefined,
-                .queue = .{ .allocator = self.allocator, .runtime = undefined },
+                .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
             };
             surface.runtime = try runtime_mod.Runtime.init(

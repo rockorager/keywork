@@ -130,7 +130,7 @@ pub const Backend = struct {
 
         win.protocol.attachListeners();
         if (self.input.seat) |seat| {
-            if (self.input.last_button_serial) |serial| win.protocol.grabPopup(seat, serial);
+            if (self.input.last_button_press_serial) |serial| win.protocol.grabPopup(seat, serial);
         }
         win.protocol.surface.commit();
         _ = self.connection.display.flush();
@@ -146,6 +146,11 @@ pub const Backend = struct {
         }
         win.deinitResources();
         self.allocator.destroy(win);
+    }
+
+    pub fn setPopupKeyboardFocus(self: *Backend, win: *Window, focused: bool) void {
+        win.protocol.setPopupKeyboardFocus(focused);
+        _ = self.connection.display.flush();
     }
 
     pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {

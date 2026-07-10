@@ -38,9 +38,9 @@ xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
-/// Serial of the most recent pointer button event; popup grabs must
-/// reference the input event that opened them.
-last_button_serial: ?u32 = null,
+/// Serial of the most recent pointer button press; xdg_popup.grab rejects
+/// release serials even when the popup opens from an on-tap callback.
+last_button_press_serial: ?u32 = null,
 /// Pointer events accumulated until the wl_pointer.frame marker so one
 /// logical group (e.g. a diagonal scroll or enter+motion) dispatches
 /// once, with the group's final position.
@@ -320,7 +320,7 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
             self.pending_pointer.moved = true;
         },
         .button => |button| {
-            self.last_button_serial = button.serial;
+            if (button.state == .pressed) self.last_button_press_serial = button.serial;
             if (button.button != 272) return;
             const state: keywork.PointerButtonState = switch (button.state) {
                 .pressed => .pressed,
