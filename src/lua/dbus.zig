@@ -85,15 +85,20 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
 
     // The property/proxy/observe sugar must suspend through bus:call, so it
     // is implemented as Lua closures layered on the bus methods table rather
-    // than as C functions, which cannot yield across lua_call.
+    // than as C functions, which cannot yield across lua_call. The chunk
+    // returns the exported-method dispatcher, which must be pure Lua for the
+    // same reason: handlers yield inside the task it spawns.
     if (c.luaL_loadbuffer(lua_state, embedded_dbus_source.ptr, embedded_dbus_source.len, "@keywork/dbus.lua") != 0) {
         _ = c.lua_error(lua_state);
         unreachable;
     }
     lua_handle.pushMethodsTable(lua_state, bus_type, &bus_methods);
     c.lua_pushvalue(lua_state, dbus_table);
-    c.lua_call(lua_state, 2, 0);
+    c.lua_call(lua_state, 2, 1);
+    c.lua_setfield(lua_state, c.LUA_REGISTRYINDEX, method_dispatch_registry_key);
 }
+
+const method_dispatch_registry_key: [*:0]const u8 = "keywork.dbus.method_dispatch";
 
 const embedded_dbus_source = @embedFile("dbus.lua");
 
@@ -232,6 +237,25 @@ const ExportedObject = struct {
     }
 };
 
+/// An unanswered incoming method call. Created when an exported method is
+/// dispatched to its handler task and completed by the task through the
+/// handle's reply/fail methods, whenever the handler finishes. Bus close
+/// invalidates the handle, so a late completion is a no-op.
+const PendingReply = struct {
+    bus: *Bus,
+    /// The incoming call message, ref'd for the lifetime of the handler.
+    message: *dbus_c.DBusMessage,
+    handle_ref: c_int = -1,
+
+    /// Drops the handle and message without sending anything.
+    fn destroy(self: *PendingReply, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
+        lua_handle.invalidate(lua_state, self.handle_ref);
+        self.handle_ref = -1;
+        dbus_c.dbus_message_unref(self.message);
+        allocator.destroy(self);
+    }
+};
+
 const Call = struct {
     bus: *Bus,
     /// Registry ref of the coroutine parked on this call, or -1 while the
@@ -298,6 +322,7 @@ pub const Bus = struct {
     fd: i32,
     subscriptions: std.ArrayList(*Subscription) = .empty,
     pending_calls: std.ArrayList(*Call) = .empty,
+    pending_replies: std.ArrayList(*PendingReply) = .empty,
     owned_names: std.ArrayList(*OwnedName) = .empty,
     exported_objects: std.ArrayList(*ExportedObject) = .empty,
     handle_ref: c_int = -1,
@@ -392,6 +417,12 @@ pub const Bus = struct {
             pending_call.destroy(self.host.allocator(), lua_state);
         }
 
+        // Handler tasks still running keep dead handles; their eventual
+        // reply/fail calls become no-ops instead of touching a closed
+        // connection.
+        for (self.pending_replies.items) |pending| pending.destroy(self.host.allocator(), lua_state);
+        self.pending_replies.clearRetainingCapacity();
+
         if (self.filter_installed) {
             dbus_c.dbus_connection_remove_filter(self.connection, dbusFilter, self);
             self.filter_installed = false;
@@ -414,6 +445,8 @@ pub const Bus = struct {
         self.subscriptions.deinit(allocator);
         for (self.pending_calls.items) |pending_call| pending_call.destroy(allocator, lua_state);
         self.pending_calls.deinit(allocator);
+        for (self.pending_replies.items) |pending| pending.destroy(allocator, lua_state);
+        self.pending_replies.deinit(allocator);
     }
 
     pub fn destroy(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -605,20 +638,51 @@ pub const Bus = struct {
         if (c.lua_isnil(lua_state, -1)) return false;
         c.lua_getfield(lua_state, -1, "call");
         if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return false;
+        const handler_index = c.lua_gettop(lua_state);
 
         std.log.scoped(.keywork_luajit).info("dbus method call {s}.{s}", .{ interface, member });
+
+        // The handler runs on its own task so it can yield; the pending
+        // reply completes whenever the task finishes. loop.spawn is eager,
+        // so a handler that never yields replies before dispatch returns.
+        const allocator = self.host.allocator();
+        const pending = try allocator.create(PendingReply);
+        _ = dbus_c.dbus_message_ref(message);
+        pending.* = .{ .bus = self, .message = message };
+        self.pending_replies.append(allocator, pending) catch |err| {
+            dbus_c.dbus_message_unref(message);
+            allocator.destroy(pending);
+            return err;
+        };
+
+        c.lua_getfield(lua_state, c.LUA_REGISTRYINDEX, method_dispatch_registry_key);
+        pending.handle_ref = lua_handle.create(lua_state, pending_reply_type, &pending_reply_methods, pending);
+        c.lua_pushvalue(lua_state, handler_index);
         pushCallTable(lua_state, message);
         const arg_count = pushDbusMessageArgs(lua_state, message);
-        const return_base = c.lua_gettop(lua_state) - @as(c_int, @intCast(arg_count)) - 1;
-        if (c.lua_pcall(lua_state, @intCast(arg_count + 1), c.LUA_MULTRET, 0) != 0) {
-            const error_message = stringFromStack(lua_state, -1) catch "Lua D-Bus method failed";
+        if (c.lua_pcall(lua_state, @intCast(arg_count + 3), 0, 0) != 0) {
+            const error_message = stringFromStack(lua_state, -1) catch "Lua D-Bus method dispatch failed";
+            // The handler task may already have completed (and destroyed)
+            // the pending reply before the dispatcher failed; only a
+            // still-listed pending is ours to clean up. The caller's own
+            // message ref keeps `message` valid past the destroy.
+            if (self.removePendingReply(pending)) pending.destroy(allocator, lua_state);
             try self.replyError(message, "org.keywork.LuaError", error_message);
             return true;
         }
-        const after_top = c.lua_gettop(lua_state);
-        const return_count: usize = if (after_top < return_base) 0 else @intCast(after_top - return_base + 1);
-        try self.replyValues(message, lua_state, return_base, return_count);
         return true;
+    }
+
+    /// Unlinks a pending reply from the bus; returns false when it was
+    /// already completed and destroyed.
+    fn removePendingReply(self: *Bus, pending: *PendingReply) bool {
+        for (self.pending_replies.items, 0..) |item, index| {
+            if (item == pending) {
+                _ = self.pending_replies.swapRemove(index);
+                return true;
+            }
+        }
+        return false;
     }
 
     fn handlePropertiesMethod(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, member: []const u8) !void {
@@ -1046,6 +1110,46 @@ const export_type: [*:0]const u8 = "keywork.dbus_export";
 const export_methods = [_]lua_handle.Method{
     .{ .name = "unexport", .func = luaUnexportDbusObject },
 };
+
+const pending_reply_type: [*:0]const u8 = "keywork.dbus_pending_reply";
+const pending_reply_methods = [_]lua_handle.Method{
+    .{ .name = "reply", .func = luaPendingReplySend },
+    .{ .name = "fail", .func = luaPendingReplyFail },
+};
+
+/// Sends the method return built from the call's stack values (index 2
+/// onward) and retires the pending reply. No-op on a dead handle.
+fn luaPendingReplySend(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const pending = lua_handle.resource(PendingReply, lua_state, 1, pending_reply_type) orelse return 0;
+    const bus = pending.bus;
+    const top = c.lua_gettop(lua_state);
+    const count: usize = if (top > 1) @intCast(top - 1) else 0;
+    bus.replyValues(pending.message, lua_state, 2, count) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus method reply failed: {}", .{err});
+        // The values did not encode; an error reply keeps the caller from
+        // hanging until its timeout.
+        bus.replyError(pending.message, "org.keywork.LuaError", "failed to encode method reply") catch {};
+    };
+    _ = bus.removePendingReply(pending);
+    pending.destroy(bus.host.allocator(), lua_state);
+    return 0;
+}
+
+/// Sends an org.keywork.LuaError reply carrying the handler's error text
+/// and retires the pending reply. No-op on a dead handle.
+fn luaPendingReplyFail(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const pending = lua_handle.resource(PendingReply, lua_state, 1, pending_reply_type) orelse return 0;
+    const bus = pending.bus;
+    const text = stringFromStack(lua_state, 2) catch "Lua D-Bus method failed";
+    bus.replyError(pending.message, "org.keywork.LuaError", text) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus method error reply failed: {}", .{err});
+    };
+    _ = bus.removePendingReply(pending);
+    pending.destroy(bus.host.allocator(), lua_state);
+    return 0;
+}
 
 fn luaCancelSubscription(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;

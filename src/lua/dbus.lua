@@ -269,3 +269,23 @@ function methods.observe(bus, options)
 
   return obs
 end
+
+-- Exported method dispatch: every handler runs on its own task so it can
+-- yield through bus:call and friends. loop.spawn runs the body eagerly, so
+-- a handler that never yields replies in the same dispatch turn. Return
+-- values become the reply; a raised error becomes org.keywork.LuaError.
+local function dispatch_method(completion, handler, call, ...)
+  local n = select("#", ...)
+  local args = { ... }
+  local loop = require("keywork.loop")
+  loop.spawn(function()
+    local results = { pcall(handler, call, unpack(args, 1, n)) }
+    if results[1] then
+      completion:reply(unpack(results, 2, maxn(results)))
+    else
+      completion:fail(tostring(results[2]))
+    end
+  end)
+end
+
+return dispatch_method

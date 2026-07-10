@@ -2309,6 +2309,118 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
     }
 }
 
+test "lua exported methods can yield before replying" {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Slow yields through a nested bus:call to Echo on the same connection
+    // before replying, so the bus must keep dispatching while a handler is
+    // parked. Boom proves handler errors still surface as LuaError.
+    const script =
+        \\local kw = require("keywork")
+        \\local dbus = require("keywork.dbus")
+        \\local loop = require("keywork.loop")
+        \\local bus = assert(dbus.session())
+        \\
+        \\local NAME = "org.keywork.test.AsyncMethods"
+        \\local PATH = "/org/keywork/async_test"
+        \\local IFACE = "org.keywork.AsyncTest"
+        \\assert(bus:request_name(NAME))
+        \\bus:export(PATH, {
+        \\  [IFACE] = {
+        \\    methods = {
+        \\      Echo = {
+        \\        in_signature = "s",
+        \\        call = function(_, text) return "echo:" .. text end,
+        \\      },
+        \\      Slow = {
+        \\        in_signature = "s",
+        \\        call = function(_, text)
+        \\          local reply = assert(bus:call({
+        \\            destination = NAME,
+        \\            path = PATH,
+        \\            interface = IFACE,
+        \\            member = "Echo",
+        \\            args = { text },
+        \\            timeout_ms = 2000,
+        \\          }))
+        \\          return "slow:" .. ((reply.args or {})[1] or "?")
+        \\        end,
+        \\      },
+        \\      Boom = {
+        \\        in_signature = "",
+        \\        call = function() error("kaboom") end,
+        \\      },
+        \\    },
+        \\  },
+        \\})
+        \\
+        \\loop.spawn(function()
+        \\  local reply = bus:call({
+        \\    destination = NAME,
+        \\    path = PATH,
+        \\    interface = IFACE,
+        \\    member = "Slow",
+        \\    args = { "hi" },
+        \\    timeout_ms = 2000,
+        \\  })
+        \\  slow_ok = reply ~= nil and (reply.args or {})[1] == "slow:echo:hi"
+        \\  local failed, err = bus:call({
+        \\    destination = NAME,
+        \\    path = PATH,
+        \\    interface = IFACE,
+        \\    member = "Boom",
+        \\    timeout_ms = 2000,
+        \\  })
+        \\  boom_ok = failed == nil and err == "org.keywork.LuaError"
+        \\  done = true
+        \\end)
+        \\return kw.app({ child = kw.text("async methods") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-async-methods.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-async-methods.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    const DbusAsyncMethodTest = struct {
+        app: *App,
+        ticks: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 5000) event_loop_instance.quit();
+        }
+    };
+    var context: DbusAsyncMethodTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, DbusAsyncMethodTest.callback);
+    try loop.run();
+
+    const expected_true = [_][:0]const u8{ "slow_ok", "boom_ok", "done" };
+    for (expected_true) |global| {
+        c.lua_getglobal(app.state, global.ptr);
+        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
+            std.debug.print("expected global '{s}' to be true\n", .{global});
+            return err;
+        };
+        pop(app.state, 1);
+    }
+}
+
 test "lua dbus property sugar and proxies drive exported objects" {
     if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
     const allocator = std.testing.allocator;
