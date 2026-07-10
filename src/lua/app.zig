@@ -888,6 +888,7 @@ test "scriptChunk handles a shebang-only file" {
 }
 
 const embedded_ui_source = @embedFile("ui.lua");
+const embedded_service_source = @embedFile("service.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
@@ -918,7 +919,17 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_pushcclosure(lua_state, jsonModuleLoader, 1);
     c.lua_setfield(lua_state, preload_table, "keywork.json");
 
+    c.lua_pushcclosure(lua_state, serviceModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.service");
+
     pop(lua_state, 2);
+}
+
+fn serviceModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_service_source.ptr, embedded_service_source.len, "@keywork/service.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
 }
 
 fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -1790,6 +1801,102 @@ test "reload cancels tasks and scopes from the previous load" {
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
 }
 
+test "shared service starts once, fans out, and stops with its last subscriber" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local service = require("keywork.service")
+        \\starts = 0
+        \\local svc = service.define("monitor", function(self)
+        \\  starts = starts + 1
+        \\  self:publish("ready")
+        \\  loop.sleep(3600000)
+        \\end)
+        \\local s1 = loop.scope()
+        \\local s2 = loop.scope()
+        \\local got1, got2 = nil, nil
+        \\local first = svc:use(s1, function(v) got1 = v end)
+        \\local second = svc:use(s2, function(v) got2 = v end)
+        \\assert(starts == 1)
+        \\assert(first == "ready" and second == "ready")
+        \\-- publish fans out to every subscriber
+        \\svc:publish("update")
+        \\assert(got1 == "update" and got2 == "update")
+        \\-- scope cancel releases one subscription
+        \\s1:cancel()
+        \\svc:publish("late")
+        \\assert(got1 == "update" and got2 == "late")
+        \\-- the last release stops the service
+        \\s2:cancel()
+        \\assert(svc.scope:canceled())
+        \\assert(svc.task:status() == "canceled")
+        \\-- the next use restarts it
+        \\local s3 = loop.scope()
+        \\local third = svc:use(s3, function() end)
+        \\assert(starts == 2)
+        \\assert(third == "ready")
+        \\return kw.app({ child = kw.text("service") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "reload resets stale service entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The registry survives reload via the module cache, but reload
+    // cancels the service's scope; the next use must detect the dead
+    // entry and start fresh instead of returning stale state.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local service = require("keywork.service")
+        \\starts = starts or 0
+        \\local svc = service.define("reloaded", function(self)
+        \\  starts = starts + 1
+        \\  self:publish(starts)
+        \\  loop.sleep(3600000)
+        \\end)
+        \\local scope = loop.scope()
+        \\snapshot = svc:use(scope, function() end)
+        \\return kw.app({ child = kw.text("service-reload") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service-reload.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service-reload.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "snapshot");
+    try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+
+    app.script_dirty = true;
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "starts");
+    try std.testing.expectEqual(@as(c.lua_Integer, 2), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "snapshot");
+    defer pop(app.state, 1);
+    try std.testing.expectEqual(@as(c.lua_Integer, 2), c.lua_tointeger(app.state, -1));
+}
+
 test "lua bus:call awaits replies and reports peer errors as nil, err" {
     if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -2367,6 +2474,110 @@ test "widget scope is canceled on the loop turn after dispose" {
     c.lua_getglobal(app.state, "scope_task_woke");
     defer pop(app.state, 1);
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try std.testing.expectEqual(lua_task.Status.canceled, app.tasks.items[0].status);
+}
+
+test "widget dispose releases its service subscription" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The widget subscribes through self.scope; removing the widget must
+    // release the subscription on the deferred scope cancel, and as the
+    // last subscriber that stops the service, unwinding its body.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local service = require("keywork.service")
+        \\starts = 0
+        \\service_unwound = false
+        \\local svc = service.define("widget-monitor", function(self)
+        \\  starts = starts + 1
+        \\  self:publish("ready")
+        \\  loop.sleep(3600000)
+        \\  service_unwound = true
+        \\end)
+        \\local Child = kw.stateful({
+        \\  init = function(self)
+        \\    self.snapshot = svc:use(self.scope, function(v)
+        \\      self:set_state(function(s) s.snapshot = v end)
+        \\    end)
+        \\  end,
+        \\  build = function(self, state)
+        \\    return kw.gesture({ id = "remove", child = kw.text(self.snapshot or "none"), on_tap = self.props.on_remove })
+        \\  end,
+        \\})
+        \\local App = kw.stateful({
+        \\  init = function(self)
+        \\    self.show = true
+        \\  end,
+        \\  build = function(self, state)
+        \\    if self.show then
+        \\      return Child({ key = "child", on_remove = function()
+        \\        self:set_state(function(s)
+        \\          s.show = false
+        \\        end)
+        \\      end })
+        \\    end
+        \\    return kw.text("gone")
+        \\  end,
+        \\})
+        \\return kw.app({ child = App({ key = "app" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "widget-service.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "widget-service.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "ready") != null);
+
+    try runtime.click(.{ .x = 2, .y = 2 });
+
+    const ServiceTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "service_unwound");
+            const unwound = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (unwound or self.rounds > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: ServiceTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, ServiceTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "service_unwound");
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    pop(app.state, 1);
+    // Both the widget scope and the service scope are canceled, and the
+    // service task settled as canceled.
+    for (app.scopes.items) |scope| try std.testing.expect(scope.canceled);
     try std.testing.expectEqual(lua_task.Status.canceled, app.tasks.items[0].status);
 }
 

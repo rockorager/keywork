@@ -130,12 +130,28 @@ pub const LuaScope = struct {
     handle_ref: c_int = -1,
     canceled: bool = false,
     tasks: std.ArrayList(*LuaTask) = .empty,
+    /// Lua callbacks registered via scope:on_cancel, run on interactive
+    /// cancel so Lua code can release resources tied to the scope's life.
+    cancel_refs: std.ArrayList(c_int) = .empty,
 
     pub fn cancel(self: *LuaScope, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         self.canceled = true;
         // Pop before cancelling: an unwinding member may spawn into the
         // scope while we drain (its own cancel then raises on await).
         while (self.tasks.pop()) |task| task.requestCancel(lua_state, mode);
+        // Callbacks run after members settle, so cleanup observes a fully
+        // canceled scope. Bulk teardown never re-enters Lua, so the refs
+        // are simply dropped.
+        while (self.cancel_refs.pop()) |ref| {
+            switch (mode) {
+                .resume_reader => {
+                    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
+                    c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+                    callCancelCallback(lua_state);
+                },
+                .silent => c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref),
+            }
+        }
         if (mode == .silent) {
             lua_handle.invalidate(lua_state, self.handle_ref);
             self.handle_ref = -1;
@@ -145,9 +161,21 @@ pub const LuaScope = struct {
     pub fn destroy(self: *LuaScope, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         self.cancel(lua_state, .silent);
         self.tasks.deinit(allocator);
+        self.cancel_refs.deinit(allocator);
         allocator.destroy(self);
     }
 };
+
+/// Calls the function on top of the stack, logging instead of propagating
+/// failures: one broken cleanup callback must not stop the rest.
+fn callCancelCallback(lua_state: *c.lua_State) void {
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {
+        var len: usize = 0;
+        const message = c.lua_tolstring(lua_state, -1, &len);
+        if (message) |text| log.warn("scope on_cancel callback failed: {s}", .{text[0..len]});
+        c.lua_settop(lua_state, -2);
+    }
+}
 
 /// Registry table mapping live task coroutines to their LuaTask pointer
 /// (lightuserdata). Entries are removed when a task settles, so the map
@@ -255,6 +283,7 @@ const scope_methods = [_]lua_handle.Method{
     .{ .name = "spawn", .func = luaScopeSpawn },
     .{ .name = "cancel", .func = luaScopeCancel },
     .{ .name = "canceled", .func = luaScopeCanceled },
+    .{ .name = "on_cancel", .func = luaScopeOnCancel },
 };
 
 fn pushTaskHandle(lua_state: *c.lua_State, task: *LuaTask) void {
@@ -380,6 +409,29 @@ fn luaScopeCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const scope = lua_handle.resource(LuaScope, lua_state, 1, scope_type) orelse return 0;
     scope.cancel(lua_state, .resume_reader);
+    return 0;
+}
+
+/// scope:on_cancel(fn) runs `fn` once when the scope is canceled
+/// interactively. Registering on an already-canceled scope runs the
+/// callback immediately, so cleanup never silently fails to happen; a
+/// scope torn down in bulk (dead handle) drops the callback because
+/// everything it would release dies with the load anyway.
+fn luaScopeOnCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.luaL_checktype(lua_state, 2, c.LUA_TFUNCTION);
+    const scope = lua_handle.resource(LuaScope, lua_state, 1, scope_type) orelse return 0;
+    if (scope.canceled) {
+        c.lua_pushvalue(lua_state, 2);
+        callCancelCallback(lua_state);
+        return 0;
+    }
+    c.lua_pushvalue(lua_state, 2);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    scope.cancel_refs.append(scope.host.allocator(), ref) catch {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        return c.luaL_error(lua_state, "on_cancel failed");
+    };
     return 0;
 }
 
