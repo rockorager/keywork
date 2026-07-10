@@ -14,7 +14,6 @@ const Element = keywork.Element;
 const CursorShape = keywork.CursorShape;
 const KeyInput = keywork.KeyInput;
 const Point = keywork.Point;
-const PointerButtonState = keywork.PointerButtonState;
 const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
@@ -84,6 +83,7 @@ pub const Runtime = struct {
     autofocus_suppressed: bool = false,
     hovered_id: ?[]u8 = null,
     pressed_id: ?[]u8 = null,
+    pressed_button: ?keywork.PointerButton = null,
     /// Active scrollbar thumb drag. The pointer stays captured by the
     /// drag until release, so motion keeps scrolling even after leaving
     /// the thumb or the viewport.
@@ -215,8 +215,8 @@ pub const Runtime = struct {
         try input_behavior.click(self, point);
     }
 
-    pub fn pointerButton(self: *Runtime, point: Point, state: PointerButtonState) !void {
-        try input_behavior.pointerButton(self, point, state);
+    pub fn pointerButton(self: *Runtime, event: keywork.PointerButtonEvent) !void {
+        try input_behavior.pointerButton(self, event);
     }
 
     pub const ScrollbarDrag = focus_scroll.ScrollbarDrag;
@@ -281,8 +281,8 @@ pub const Runtime = struct {
         return focus_scroll.sameOptionalString(a, b);
     }
 
-    fn activateClick(self: *Runtime, hit: keywork.ClickHit) !bool {
-        return input_behavior.activateClick(self, hit);
+    fn activateClick(self: *Runtime, hit: keywork.ClickHit, event: keywork.TapEvent) !bool {
+        return input_behavior.activateClick(self, hit, event);
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
@@ -309,24 +309,24 @@ pub const Runtime = struct {
         try lifecycle_reconciliation.flushInteractionRefresh(self);
     }
 
-    pub fn waylandPointerButton(ctx: *anyopaque, point: Point, state: PointerButtonState) void {
-        input_behavior.waylandPointerButton(Runtime, ctx, point, state);
+    pub fn waylandPointerButton(ctx: *anyopaque, event: keywork.PointerButtonEvent) void {
+        input_behavior.waylandPointerButton(Runtime, ctx, event);
     }
 
     pub fn waylandCursorShape(ctx: *anyopaque, point: Point) CursorShape {
         return input_behavior.waylandCursorShape(Runtime, ctx, point);
     }
 
-    pub fn scrollBy(self: *Runtime, point: Point, dx: f32, dy: f32) !void {
-        try focus_scroll.scrollBy(self, point, dx, dy);
+    pub fn scrollBy(self: *Runtime, event: keywork.ScrollEvent) !void {
+        try focus_scroll.scrollBy(self, event);
     }
 
     fn scrollElementById(self: *Runtime, id: []const u8, dx: f32, dy: f32) !void {
         try focus_scroll.scrollElementById(self, id, dx, dy);
     }
 
-    pub fn waylandScroll(ctx: *anyopaque, point: Point, dx: f32, dy: f32) void {
-        focus_scroll.waylandScroll(Runtime, ctx, point, dx, dy);
+    pub fn waylandScroll(ctx: *anyopaque, event: keywork.ScrollEvent) void {
+        focus_scroll.waylandScroll(Runtime, ctx, event);
     }
 
     pub fn waylandPointerMove(ctx: *anyopaque, point: ?Point) void {
@@ -580,8 +580,10 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
             return keywork.widgets.column(scope.allocator, &children, 4);
         }
 
-        fn increment(ptr: *anyopaque) !void {
+        fn increment(ptr: *anyopaque, event: keywork.TapEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(keywork.TapSource.keyboard, event.source);
+            try std.testing.expectEqual(@as(?keywork.PointerButton, null), event.button);
             self.clicks += 1;
         }
     };
@@ -632,6 +634,167 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
     try runtime.keyInput(.space);
     try std.testing.expectEqualStrings("a ", renderedInputText(runtime.root.?).?);
+}
+
+test "accepted non-left buttons tap with event details, filtered buttons do nothing" {
+    const TestApp = struct {
+        clicks: usize = 0,
+        last_button: ?keywork.PointerButton = null,
+        last_source: ?keywork.TapSource = null,
+        had_local: bool = false,
+        accept_any: bool,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var widget = try keywork.widgets.clickable(
+                scope.allocator,
+                "target",
+                keywork.widgets.text("Target"),
+                .{ .ptr = self, .call_fn = record },
+            );
+            if (self.accept_any) widget.clickable.buttons = .any;
+            return widget;
+        }
+
+        fn record(ptr: *anyopaque, event: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clicks += 1;
+            self.last_button = event.button;
+            self.last_source = event.source;
+            self.had_local = event.local != null;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var backend: TestBackend = .{};
+    const point: keywork.Point = .{ .x = 5, .y = 5 };
+
+    var any_app: TestApp = .{ .accept_any = true };
+    var any_runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        any_app.host(),
+        .no_preference,
+    );
+    defer any_runtime.deinit();
+
+    try any_runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = point });
+    try any_runtime.pointerButton(.{ .button = .right, .state = .released, .position = point });
+    try std.testing.expectEqual(@as(usize, 1), any_app.clicks);
+    try std.testing.expectEqual(@as(?keywork.PointerButton, .right), any_app.last_button);
+    try std.testing.expectEqual(@as(?keywork.TapSource, .pointer), any_app.last_source);
+    try std.testing.expect(any_app.had_local);
+
+    var plain_app: TestApp = .{ .accept_any = false };
+    var plain_runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        plain_app.host(),
+        .no_preference,
+    );
+    defer plain_runtime.deinit();
+
+    try plain_runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = point });
+    try plain_runtime.pointerButton(.{ .button = .right, .state = .released, .position = point });
+    try std.testing.expectEqual(@as(usize, 0), plain_app.clicks);
+
+    try plain_runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = point });
+    try plain_runtime.pointerButton(.{ .button = .left, .state = .released, .position = point });
+    try std.testing.expectEqual(@as(usize, 1), plain_app.clicks);
+    try std.testing.expectEqual(@as(?keywork.PointerButton, .left), plain_app.last_button);
+}
+
+test "in-flight press ignores other buttons until the initiating button releases" {
+    const TestApp = struct {
+        clicks: usize = 0,
+        last_button: ?keywork.PointerButton = null,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var widget = try keywork.widgets.clickable(
+                scope.allocator,
+                "target",
+                keywork.widgets.text("Target"),
+                .{ .ptr = self, .call_fn = record },
+            );
+            widget.clickable.buttons = .any;
+            return widget;
+        }
+
+        fn record(ptr: *anyopaque, event: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clicks += 1;
+            self.last_button = event.button;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const point: keywork.Point = .{ .x = 5, .y = 5 };
+    try runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = point });
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = point });
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = point });
+    try std.testing.expectEqual(@as(usize, 0), app.clicks);
+
+    try runtime.pointerButton(.{ .button = .left, .state = .released, .position = point });
+    try std.testing.expectEqual(@as(usize, 1), app.clicks);
+    try std.testing.expectEqual(@as(?keywork.PointerButton, .left), app.last_button);
 }
 
 test "wheel scroll moves viewport content without rebuilding" {
@@ -685,19 +848,19 @@ test "wheel scroll moves viewport content without rebuilding" {
     // 20 rows at 16px in a 120px viewport: 200px of scroll range.
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 30);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 30 });
     try std.testing.expectEqual(@as(f32, -30), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
     // Scrolling past the edges clamps.
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 10_000);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 10_000 });
     try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -10_000);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = -10_000 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
     // Scrolling outside any viewport is a no-op.
-    try runtime.scrollBy(.{ .x = 5, .y = 500 }, 0, 30);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 500 }, .dx = 0, .dy = 30 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 }
 
@@ -758,7 +921,7 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     const thumb_x = viewport.x + viewport.width - 4;
 
     // Press on the thumb; this starts a drag, not a click.
-    try runtime.pointerButton(.{ .x = thumb_x, .y = 10 }, .pressed);
+    try runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
     try std.testing.expect(runtime.scrollbar_drag != null);
 
     // Dragging down moves the content proportionally without rebuilding.
@@ -773,11 +936,293 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 
     // Release ends the drag; further motion no longer scrolls.
-    try runtime.pointerButton(.{ .x = 500, .y = -1000 }, .released);
+    try runtime.pointerButton(.{ .button = .left, .state = .released, .position = .{ .x = 500, .y = -1000 } });
     try std.testing.expect(runtime.scrollbar_drag == null);
     try runtime.pointerMove(.{ .x = thumb_x, .y = 60 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
+}
+
+test "non-left buttons do not start scrollbar drags" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            var rows: [20]keywork.Widget = undefined;
+            for (&rows) |*row| row.* = keywork.widgets.text("row");
+            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
+            return keywork.widgets.scroll(scope.allocator, "list", column);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const viewport = runtime.root.?.rect;
+    const thumb_x = viewport.x + viewport.width - 4;
+
+    // A right press on the thumb neither starts a drag nor scrolls.
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
+    try std.testing.expect(runtime.scrollbar_drag == null);
+    try runtime.pointerMove(.{ .x = thumb_x, .y = 39 });
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = .{ .x = thumb_x, .y = 39 } });
+
+    // The left button still starts a drag afterwards, and a right release
+    // mid-drag does not end the capture; only the initiating button does.
+    try runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
+    try std.testing.expect(runtime.scrollbar_drag != null);
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = .{ .x = thumb_x, .y = 10 } });
+    try std.testing.expect(runtime.scrollbar_drag != null);
+    try runtime.pointerButton(.{ .button = .left, .state = .released, .position = .{ .x = thumb_x, .y = 10 } });
+    try std.testing.expect(runtime.scrollbar_drag == null);
+}
+
+test "non-left buttons do not move text-input focus" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const input = keywork.widgets.textInput("input", "", "placeholder");
+            const label = keywork.widgets.text("label");
+            const children = [_]keywork.Widget{ input, label };
+            return try keywork.widgets.column(scope.allocator, &children, 4);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const input_point: keywork.Point = .{ .x = 5, .y = 5 };
+    const empty_point: keywork.Point = .{ .x = 150, .y = 100 };
+
+    // A right click on the input does not focus it.
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = input_point });
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = input_point });
+    try std.testing.expect(runtime.focused_id == null);
+
+    // A left click focuses; a right click on empty space keeps that focus.
+    try runtime.click(input_point);
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = empty_point });
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = empty_point });
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+
+    // A left click on empty space clears the focus.
+    try runtime.click(empty_point);
+    try std.testing.expect(runtime.focused_id == null);
+}
+
+test "right click on a text input bubbles to a button-accepting ancestor" {
+    const TestApp = struct {
+        clicks: usize = 0,
+        last_button: ?keywork.PointerButton = null,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var widget = try keywork.widgets.clickable(
+                scope.allocator,
+                "wrapper",
+                keywork.widgets.textInput("input", "", "placeholder"),
+                .{ .ptr = self, .call_fn = record },
+            );
+            widget.clickable.buttons = .any;
+            return widget;
+        }
+
+        fn record(ptr: *anyopaque, event: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clicks += 1;
+            self.last_button = event.button;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    const input_point: keywork.Point = .{ .x = 5, .y = 5 };
+
+    // A right click over the input reaches the wrapping clickable, which
+    // takes the click (and focus) instead of the input.
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = input_point });
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = input_point });
+    try std.testing.expectEqual(@as(usize, 1), app.clicks);
+    try std.testing.expectEqual(@as(?keywork.PointerButton, .right), app.last_button);
+    try std.testing.expectEqualStrings("wrapper", runtime.focused_id.?);
+
+    // A left click still focuses the input instead of clicking the wrapper.
+    try runtime.click(input_point);
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+    try std.testing.expectEqual(@as(usize, 1), app.clicks);
+}
+
+test "releasing a non-left press outside the target fires tap_cancel" {
+    const TestApp = struct {
+        clicks: usize = 0,
+        ups: usize = 0,
+        cancels: usize = 0,
+        cancel_button: ?keywork.PointerButton = null,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var widget = try keywork.widgets.clickable(
+                scope.allocator,
+                "target",
+                keywork.widgets.text("Target"),
+                .{ .ptr = self, .call_fn = recordClick },
+            );
+            widget.clickable.buttons = .any;
+            widget.clickable.on_tap_up = .{ .ptr = self, .call_fn = recordUp };
+            widget.clickable.on_tap_cancel = .{ .ptr = self, .call_fn = recordCancel };
+            return widget;
+        }
+
+        fn recordClick(ptr: *anyopaque, _: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.clicks += 1;
+        }
+
+        fn recordUp(ptr: *anyopaque, _: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ups += 1;
+        }
+
+        fn recordCancel(ptr: *anyopaque, event: keywork.TapEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancels += 1;
+            self.cancel_button = event.button;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = .{ .x = 5, .y = 5 } });
+    try runtime.pointerButton(.{ .button = .right, .state = .released, .position = .{ .x = 150, .y = 100 } });
+    try std.testing.expectEqual(@as(usize, 0), app.clicks);
+    try std.testing.expectEqual(@as(usize, 0), app.ups);
+    try std.testing.expectEqual(@as(usize, 1), app.cancels);
+    try std.testing.expectEqual(@as(?keywork.PointerButton, .right), app.cancel_button);
 }
 
 test "keyboard focus scrolls its viewport to reveal the target" {
@@ -921,11 +1366,11 @@ test "scrolling a virtualized list converges its window in one frame" {
 
     // A deep scroll rebuilds the window through the frame loop's
     // convergence pass, with no app rebuild.
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, 8000);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 8000 });
     try std.testing.expectEqualStrings("row 498", TestApp.firstRowText(runtime.root.?).?);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
-    try runtime.scrollBy(.{ .x = 5, .y = 5 }, 0, -100_000);
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = -100_000 });
     try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 }
@@ -1051,7 +1496,7 @@ test "pointer hover restyles buttons without a full rebuild" {
             return keywork.widgets.theme(scope.allocator, theme, column);
         }
 
-        fn noop(_: *anyopaque) !void {}
+        fn noop(_: *anyopaque, _: keywork.TapEvent) !void {}
 
         fn collectBoxBackgrounds(node: *const keywork.RenderNode, out: []keywork.Color, count: *usize) void {
             if (node.kind == .box) {
@@ -1115,6 +1560,92 @@ test "pointer hover restyles buttons without a full rebuild" {
     TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
     try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
     try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
+}
+
+test "intent button callbacks survive dirty-state restyles" {
+    const TestApp = struct {
+        first_actions: usize = 0,
+        second_actions: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const theme: keywork.Theme = .{
+                .color_scheme = .light,
+                .button_theme = .{
+                    .background = keywork.colors.white,
+                    .foreground = keywork.colors.ink,
+                    .hover_background = keywork.colors.black,
+                    .padding_x = 0,
+                    .padding_y = 0,
+                },
+            };
+            const first = try keywork.widgets.actionButton(scope.allocator, "first", "First", "one");
+            const second = try keywork.widgets.actionButton(scope.allocator, "second", "Second", "two");
+            const children = [_]keywork.Widget{ first, second };
+            const column = try keywork.widgets.column(scope.allocator, &children, 4);
+            const action_bindings = [_]keywork.Widget.ActionBinding{
+                .{ .id = "one", .callback = .{ .ptr = self, .call_fn = incrementFirst } },
+                .{ .id = "two", .callback = .{ .ptr = self, .call_fn = incrementSecond } },
+            };
+            const actions = try keywork.widgets.actions(scope.allocator, &action_bindings, column);
+            return keywork.widgets.theme(scope.allocator, theme, actions);
+        }
+
+        fn incrementFirst(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.first_actions += 1;
+        }
+
+        fn incrementSecond(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.second_actions += 1;
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    // Hovering restyles the first button through the dirty-state arena;
+    // retained subtrees are cloned and must own their adapted action
+    // callbacks rather than borrow arena memory that the reset frees.
+    try runtime.pointerMove(.{ .x = 5, .y = 5 });
+    try runtime.pointerMove(null);
+
+    try runtime.click(.{ .x = 5, .y = 5 });
+    try runtime.click(.{ .x = 5, .y = 25 });
+    try std.testing.expectEqual(@as(usize, 1), app.first_actions);
+    try std.testing.expectEqual(@as(usize, 1), app.second_actions);
 }
 
 test "shortcut invokes ambient action outside text input focus" {

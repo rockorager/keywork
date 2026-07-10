@@ -117,6 +117,41 @@ const IconOptions = struct {
     color: ?keywork.Color = null,
 };
 
+const SeparatorOptions = struct {
+    color: ?keywork.Color = null,
+    thickness: f32 = 1,
+    axis: keywork.Widget.Separator.Axis = .horizontal,
+    margin: f32 = 0,
+};
+
+const TextInputOptions = struct {
+    variant: ?[]const u8 = null,
+    background: ?keywork.Color = null,
+    foreground: ?keywork.Color = null,
+    placeholder_color: ?keywork.Color = null,
+    border: ?keywork.Color = null,
+    focused_border: ?keywork.Color = null,
+    padding_x: ?f32 = null,
+    padding_y: ?f32 = null,
+    radius: ?f32 = null,
+    font_size: ?f32 = null,
+
+    fn style(self: TextInputOptions) keywork.Widget.TextInput.Style {
+        const plain = if (self.variant) |variant| std.mem.eql(u8, variant, "plain") else false;
+        return .{
+            .background = self.background orelse if (plain) keywork.colors.transparent else null,
+            .foreground = self.foreground,
+            .placeholder_foreground = self.placeholder_color,
+            .border = self.border orelse if (plain) keywork.colors.transparent else null,
+            .focused_border = self.focused_border orelse if (plain) keywork.colors.transparent else null,
+            .padding_x = self.padding_x orelse if (plain) 0 else null,
+            .padding_y = self.padding_y orelse if (plain) 0 else null,
+            .radius = self.radius orelse if (plain) 0 else null,
+            .font_size = self.font_size,
+        };
+    }
+};
+
 const ParseContext = struct {
     icon: IconOptions = .{},
     icon_cache: ?*icon_theme.Cache = null,
@@ -211,6 +246,10 @@ const LuaCallback = struct {
         };
     }
 
+    fn keyworkTapCallback(self: *LuaCallback) keywork.Widget.TapCallback {
+        return .{ .ptr = self, .call_fn = callTapEvent, .clone_fn = clone, .destroy_fn = destroy };
+    }
+
     fn keyworkFocusChangeCallback(self: *LuaCallback) keywork.Widget.FocusChangeCallback {
         return .{
             .ptr = self,
@@ -227,6 +266,74 @@ const LuaCallback = struct {
             .clone_fn = clone,
             .destroy_fn = destroy,
         };
+    }
+
+    fn keyworkScrollEventCallback(self: *LuaCallback) keywork.Widget.ScrollEventCallback {
+        return .{ .ptr = self, .call_fn = callScrollEvent, .clone_fn = clone, .destroy_fn = destroy };
+    }
+
+    fn pushModifiers(lua_state: *c.lua_State, modifiers: keywork.Modifiers) void {
+        c.lua_createtable(lua_state, 0, 4);
+        inline for (.{ .{ "shift", modifiers.shift }, .{ "ctrl", modifiers.ctrl }, .{ "alt", modifiers.alt }, .{ "super", modifiers.super } }) |field| {
+            c.lua_pushboolean(lua_state, if (field[1]) 1 else 0);
+            c.lua_setfield(lua_state, -2, field[0]);
+        }
+    }
+
+    fn pushPosition(lua_state: *c.lua_State, position: keywork.Point, window_position: keywork.Point) void {
+        inline for (.{ .{ "x", position.x }, .{ "y", position.y }, .{ "window_x", window_position.x }, .{ "window_y", window_position.y } }) |field| {
+            c.lua_pushnumber(lua_state, field[1]);
+            c.lua_setfield(lua_state, -2, field[0]);
+        }
+    }
+
+    fn callTapEvent(ptr: *anyopaque, event: keywork.TapEvent) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        c.lua_createtable(self.lua_state, 0, 8);
+        const source = @tagName(event.source);
+        c.lua_pushlstring(self.lua_state, source.ptr, source.len);
+        c.lua_setfield(self.lua_state, -2, "source");
+        if (event.button) |value| {
+            const button = @tagName(value);
+            c.lua_pushlstring(self.lua_state, button.ptr, button.len);
+        } else c.lua_pushnil(self.lua_state);
+        c.lua_setfield(self.lua_state, -2, "button");
+        if (event.local) |local| {
+            pushPosition(self.lua_state, local, event.position.?);
+        } else {
+            inline for (.{ "x", "y", "window_x", "window_y" }) |field| {
+                c.lua_pushnil(self.lua_state);
+                c.lua_setfield(self.lua_state, -2, field);
+            }
+        }
+        pushModifiers(self.lua_state, event.modifiers);
+        c.lua_setfield(self.lua_state, -2, "modifiers");
+        try self.pcallEvent("tap");
+    }
+
+    fn callScrollEvent(ptr: *anyopaque, event: keywork.ScrollEvent) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        c.lua_createtable(self.lua_state, 0, 7);
+        pushPosition(self.lua_state, event.position, event.window_position orelse event.position);
+        c.lua_pushnumber(self.lua_state, event.dx);
+        c.lua_setfield(self.lua_state, -2, "dx");
+        c.lua_pushnumber(self.lua_state, event.dy);
+        c.lua_setfield(self.lua_state, -2, "dy");
+        pushModifiers(self.lua_state, event.modifiers);
+        c.lua_setfield(self.lua_state, -2, "modifiers");
+        try self.pcallEvent("scroll");
+    }
+
+    fn pcallEvent(self: *LuaCallback, kind: []const u8) !void {
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
+            var len: usize = 0;
+            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
+            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s} callback failed: {s}", .{ kind, message[0..len] });
+            pop(self.lua_state, 1);
+            return error.LuaCallbackFailed;
+        }
     }
 
     fn callTextChange(ptr: *anyopaque, text: []const u8) !void {
@@ -558,7 +665,15 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "text")) {
         const value = try dupeStringField(lua_state, allocator, table, "value");
         const options = try lua_codec.decode(TextOptions, lua_state, table, allocator);
-        return .{ .text = .{ .value = value, .color = options.color, .font_size = options.resolvedFontSize(), .role = options.role orelse .body } };
+        if (options.max_lines == 0) return error.InvalidMaxLines;
+        return .{ .text = .{
+            .value = value,
+            .color = options.color,
+            .font_size = options.resolvedFontSize(),
+            .role = options.role orelse .body,
+            .max_lines = options.max_lines,
+            .overflow = options.overflow orelse .ellipsis,
+        } };
     }
     if (std.mem.eql(u8, kind, "keyed")) {
         const key = try dupeStringField(lua_state, allocator, table, "key");
@@ -634,6 +749,19 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "gesture")) {
         const options = try lua_codec.decode(GestureOptions, lua_state, table, allocator);
         const id = try dupeStringField(lua_state, allocator, table, "id");
+        // Validate buttons before taking any registry refs so an invalid
+        // option cannot leak callback refs (see parse's doc comment).
+        const buttons = try getPointerButtons(lua_state, table);
+        const on_click = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_tap");
+        errdefer if (on_click) |callback| callback.destroy(callback_allocator);
+        const on_tap_down = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_tap_down");
+        errdefer if (on_tap_down) |callback| callback.destroy(callback_allocator);
+        const on_tap_up = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_tap_up");
+        errdefer if (on_tap_up) |callback| callback.destroy(callback_allocator);
+        const on_tap_cancel = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_tap_cancel");
+        errdefer if (on_tap_cancel) |callback| callback.destroy(callback_allocator);
+        const on_scroll = try getOptionalScrollCallbackField(lua_state, callback_allocator, table, "on_scroll");
+        errdefer if (on_scroll) |callback| callback.destroy(callback_allocator);
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
@@ -641,10 +769,12 @@ pub fn parse(
         return .{ .clickable = .{
             .id = id,
             .child = child,
-            .on_click = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap"),
-            .on_tap_down = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_down"),
-            .on_tap_up = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_up"),
-            .on_tap_cancel = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_cancel"),
+            .on_click = on_click,
+            .on_tap_down = on_tap_down,
+            .on_tap_up = on_tap_up,
+            .on_tap_cancel = on_tap_cancel,
+            .on_scroll = on_scroll,
+            .buttons = buttons,
             .hover_style = options.hoverStyle(),
             .cursor = options.cursor,
         } };
@@ -725,7 +855,7 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "button")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const label = try dupeStringField(lua_state, allocator, table, "label");
-        const on_pressed = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_pressed");
+        const on_pressed = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_pressed");
         const intent = try getOptionalIntentField(lua_state, allocator, table, "action_id");
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed, .intent = intent } };
     }
@@ -735,6 +865,8 @@ pub fn parse(
         const value = dupeStringField(lua_state, allocator, table, "value") catch try allocator.dupe(u8, "");
         const on_change = try getOptionalTextChangeCallbackField(lua_state, callback_allocator, table, "on_change");
         var widget = keywork.widgets.textInput(id, value, placeholder);
+        const options = try lua_codec.decode(TextInputOptions, lua_state, table, allocator);
+        widget.text_input.style = options.style();
         widget.text_input.on_change = on_change;
         widget.text_input.autofocus = boolField(lua_state, table, "autofocus");
         return widget;
@@ -773,6 +905,15 @@ pub fn parse(
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
         return keywork.widgets.spacer(options.flex);
     }
+    if (std.mem.eql(u8, kind, "separator")) {
+        const options = try lua_codec.decode(SeparatorOptions, lua_state, table, allocator);
+        return .{ .separator = .{
+            .color = options.color,
+            .thickness = @max(0, options.thickness),
+            .axis = options.axis,
+            .margin = @max(0, options.margin),
+        } };
+    }
     if (std.mem.eql(u8, kind, "sized")) {
         const options = try lua_codec.decode(SizedOptions, lua_state, table, allocator);
         const child = try allocator.create(keywork.Widget);
@@ -807,6 +948,7 @@ pub fn parse(
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
         const name = try stringField(lua_state, table, "name");
+        if (isAbsolutePath(name)) return lua_image.pngIcon(allocator, name, icon.size);
         const fallback_color = icon.color orelse keywork.colors.ink;
         // Select the icon file for the physical pixel size so HiDPI
         // outputs get the sharper large variant; widgets stay logical.
@@ -886,6 +1028,130 @@ pub fn parse(
     }
 
     return error.UnknownWidgetType;
+}
+
+fn isAbsolutePath(name: []const u8) bool {
+    return name.len > 0 and name[0] == '/';
+}
+
+test "absolute icon paths bypass icon theme lookup" {
+    try std.testing.expect(isAbsolutePath("/tmp/icon.png"));
+    try std.testing.expect(!isAbsolutePath("document-open"));
+    try std.testing.expect(!isAbsolutePath(""));
+}
+
+test "plain text input defaults are chromeless and explicit values win" {
+    const plain: TextInputOptions = .{ .variant = "plain", .padding_x = 3, .border = keywork.colors.ink };
+    const style = plain.style();
+    try std.testing.expectEqual(keywork.colors.transparent, style.background.?);
+    try std.testing.expectEqual(keywork.colors.ink, style.border.?);
+    try std.testing.expectEqual(keywork.colors.transparent, style.focused_border.?);
+    try std.testing.expectEqual(@as(f32, 3), style.padding_x.?);
+    try std.testing.expectEqual(@as(f32, 0), style.padding_y.?);
+    try std.testing.expectEqual(@as(f32, 0), style.radius.?);
+}
+
+test "gesture buttons parse names and reject invalid values" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+
+    // Absent buttons default to left-only.
+    const default_buttons: keywork.PointerButtons = .{};
+    try std.testing.expectEqual(default_buttons, try getPointerButtons(lua_state, table));
+
+    // "any" enables every button; other strings are rejected.
+    c.lua_pushstring(lua_state, "any");
+    c.lua_setfield(lua_state, table, "buttons");
+    try std.testing.expectEqual(keywork.PointerButtons.any, try getPointerButtons(lua_state, table));
+    c.lua_pushstring(lua_state, "primary");
+    c.lua_setfield(lua_state, table, "buttons");
+    try std.testing.expectError(error.InvalidPointerButtons, getPointerButtons(lua_state, table));
+
+    // Arrays of names enable exactly the listed buttons.
+    c.lua_newtable(lua_state);
+    c.lua_pushstring(lua_state, "right");
+    c.lua_rawseti(lua_state, -2, 1);
+    c.lua_pushstring(lua_state, "middle");
+    c.lua_rawseti(lua_state, -2, 2);
+    c.lua_setfield(lua_state, table, "buttons");
+    const right_middle: keywork.PointerButtons = .{ .left = false, .right = true, .middle = true };
+    try std.testing.expectEqual(right_middle, try getPointerButtons(lua_state, table));
+
+    // Non-string array entries and unknown names are rejected.
+    c.lua_newtable(lua_state);
+    c.lua_pushinteger(lua_state, 42);
+    c.lua_rawseti(lua_state, -2, 1);
+    c.lua_setfield(lua_state, table, "buttons");
+    try std.testing.expectError(error.InvalidPointerButton, getPointerButtons(lua_state, table));
+    c.lua_newtable(lua_state);
+    c.lua_pushstring(lua_state, "primary");
+    c.lua_rawseti(lua_state, -2, 1);
+    c.lua_setfield(lua_state, table, "buttons");
+    try std.testing.expectError(error.InvalidPointerButton, getPointerButtons(lua_state, table));
+
+    // Non-table, non-string values are rejected.
+    c.lua_pushboolean(lua_state, 1);
+    c.lua_setfield(lua_state, table, "buttons");
+    try std.testing.expectError(error.InvalidPointerButtons, getPointerButtons(lua_state, table));
+
+    // Tap callback fields must hold functions.
+    c.lua_pushinteger(lua_state, 7);
+    c.lua_setfield(lua_state, table, "on_tap");
+    try std.testing.expectError(
+        error.ExpectedLuaFunction,
+        getOptionalTapCallbackField(lua_state, std.testing.allocator, table, "on_tap"),
+    );
+
+    // Every path above must leave the stack balanced.
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+}
+
+test "failed gesture parse destroys callbacks it already captured" {
+    const TestHost = struct {
+        fn invalidate(_: *anyopaque) anyerror!void {}
+    };
+
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    var host_ctx: u8 = 0;
+    const host: Host = .{ .ptr = &host_ctx, .invalidate_state_fn = TestHost.invalidate };
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+    c.lua_pushstring(lua_state, "gesture");
+    c.lua_setfield(lua_state, table, "type");
+    c.lua_pushstring(lua_state, "g");
+    c.lua_setfield(lua_state, table, "id");
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return 1"));
+    c.lua_setfield(lua_state, table, "on_tap");
+
+    // A non-function later callback fails the parse after on_tap was
+    // captured; the errdefer chain must release on_tap's registry ref and
+    // its wrapper. The testing callback allocator reports a missed destroy.
+    c.lua_pushinteger(lua_state, 42);
+    c.lua_setfield(lua_state, table, "on_tap_down");
+    try std.testing.expectError(
+        error.ExpectedLuaFunction,
+        parse(host, lua_state, arena.allocator(), std.testing.allocator, .{}, .{}, table),
+    );
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+
+    // Valid callbacks followed by a malformed child must also unwind both
+    // captured callbacks.
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return 1"));
+    c.lua_setfield(lua_state, table, "on_tap_down");
+    try std.testing.expectError(
+        error.UnexpectedLuaType,
+        parse(host, lua_state, arena.allocator(), std.testing.allocator, .{}, .{}, table),
+    );
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
 }
 
 // Callers log the miss; the cache path warns only once per name+size.
@@ -1006,6 +1272,63 @@ fn getOptionalCallbackField(
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return null;
     return try callbackFromStack(lua_state, allocator, -1);
+}
+
+fn getOptionalTapCallbackField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, field: [*:0]const u8) !?keywork.Widget.TapCallback {
+    c.lua_getfield(lua_state, table, field);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+    c.lua_pushvalue(lua_state, -1);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+    const callback = try allocator.create(LuaCallback);
+    callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
+    return callback.keyworkTapCallback();
+}
+
+fn getPointerButtons(lua_state: *c.lua_State, table: c_int) !keywork.PointerButtons {
+    c.lua_getfield(lua_state, table, "buttons");
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return .{};
+    if (c.lua_isstring(lua_state, -1) != 0) {
+        if (std.mem.eql(u8, try stringFromStack(lua_state, -1), "any")) return .any;
+        return error.InvalidPointerButtons;
+    }
+    if (!c.lua_istable(lua_state, -1)) return error.InvalidPointerButtons;
+    var result: keywork.PointerButtons = .{ .left = false };
+    var index: c_int = 1;
+    while (true) : (index += 1) {
+        c.lua_rawgeti(lua_state, -1, index);
+        if (c.lua_isnil(lua_state, -1)) {
+            pop(lua_state, 1);
+            break;
+        }
+        if (c.lua_isstring(lua_state, -1) == 0) {
+            pop(lua_state, 1);
+            return error.InvalidPointerButton;
+        }
+        const name = try stringFromStack(lua_state, -1);
+        if (std.mem.eql(u8, name, "left")) result.left = true else if (std.mem.eql(u8, name, "right")) result.right = true else if (std.mem.eql(u8, name, "middle")) result.middle = true else if (std.mem.eql(u8, name, "back")) result.back = true else if (std.mem.eql(u8, name, "forward")) result.forward = true else {
+            pop(lua_state, 1);
+            return error.InvalidPointerButton;
+        }
+        pop(lua_state, 1);
+    }
+    return result;
+}
+
+fn getOptionalScrollCallbackField(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int, field: [*:0]const u8) !?keywork.Widget.ScrollEventCallback {
+    c.lua_getfield(lua_state, table, field);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return null;
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;
+    c.lua_pushvalue(lua_state, -1);
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+    const callback = try allocator.create(LuaCallback);
+    callback.* = .{ .allocator = allocator, .lua_state = lua_state, .ref = ref };
+    return callback.keyworkScrollEventCallback();
 }
 
 fn getOptionalTextChangeCallbackField(

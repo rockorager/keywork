@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const model = @import("model.zig");
+const uucode = @import("uucode");
 
 const Widget = model.Widget;
 const Element = model.Element;
@@ -36,6 +37,7 @@ fn ensureRenderNode(allocator: std.mem.Allocator, element: *Element) !*RenderNod
 fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     std.debug.assert(value.children.len == 0);
     const children = node.children;
+    const text_buffer = node.text_buffer;
     const constraints = node.constraints;
     // Non-painting wrappers only damage when their bounds change (covering
     // vacated regions); painted nodes always damage since their payload may
@@ -43,7 +45,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     // geometry and must not inflate the damage to their full bounds.
     const rect_changed = !std.meta.eql(node.rect, value.rect);
     const paints = switch (value.kind) {
-        .box, .text, .text_input, .render_object => true,
+        .box, .text, .text_input, .separator, .render_object => true,
         else => false,
     };
     var damage = node.damage;
@@ -52,6 +54,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     }
     node.* = value;
     node.children = children;
+    node.text_buffer = text_buffer;
     node.constraints = constraints;
     node.damage = damage;
     node.needs_layout = false;
@@ -65,6 +68,93 @@ fn unionDamage(damage: ?Rect, rect: Rect) ?Rect {
     const x1 = @max(existing.x + existing.width, rect.x + rect.width);
     const y1 = @max(existing.y + existing.height, rect.y + rect.height);
     return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
+const ellipsis = "…";
+
+/// Returns the last cluster boundary whose cumulative shaped width fits.
+/// Keeping this independent of shaping makes the truncation decision easy to
+/// test; callers obtain widths by measuring whole prefixes so kerning and
+/// shaping clusters are respected.
+fn fittingBoundary(boundaries: []const usize, widths: []const f32, available_width: f32) usize {
+    std.debug.assert(boundaries.len == widths.len);
+    var result: usize = 0;
+    for (boundaries, widths) |boundary, width| {
+        if (width > available_width) break;
+        result = boundary;
+    }
+    return result;
+}
+
+fn measuredFittingEnd(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!usize {
+    var boundaries: std.ArrayList(usize) = .empty;
+    defer boundaries.deinit(allocator);
+    var widths: std.ArrayList(f32) = .empty;
+    defer widths.deinit(allocator);
+
+    var it = uucode.grapheme.utf8Iterator(value);
+    while (it.nextGrapheme()) |cluster| {
+        try boundaries.append(allocator, cluster.end);
+        const measured = try measurer.measureText(value[0..cluster.end], style);
+        try widths.append(allocator, measured.width);
+    }
+    return fittingBoundary(boundaries.items, widths.items, available_width);
+}
+
+fn constrainText(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    max_lines: u32,
+    overflow: Widget.TextOverflow,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    std.debug.assert(max_lines >= 1);
+    var source_start: usize = 0;
+    var line: u32 = 0;
+    while (line < max_lines and source_start < value.len) : (line += 1) {
+        const newline = std.mem.indexOfScalarPos(u8, value, source_start, '\n');
+        const source_end = newline orelse value.len;
+        const source_line = value[source_start..source_end];
+        const fitting_end = try measuredFittingEnd(allocator, source_line, available_width, style, measurer);
+        const line_fits = fitting_end == source_line.len;
+        const has_more = !line_fits or newline != null;
+        const final_line = line + 1 == max_lines;
+
+        var visible_end = fitting_end;
+        var add_ellipsis = false;
+        if (final_line and has_more and overflow == .ellipsis) {
+            const ellipsis_width = (try measurer.measureText(ellipsis, style)).width;
+            // An ellipsis wider than the line is omitted rather than painted
+            // outside the promised bounds.
+            if (ellipsis_width <= available_width) {
+                visible_end = try measuredFittingEnd(allocator, source_line, available_width - ellipsis_width, style, measurer);
+                add_ellipsis = true;
+            } else visible_end = 0;
+        }
+
+        try output.appendSlice(allocator, source_line[0..visible_end]);
+        if (add_ellipsis) try output.appendSlice(allocator, ellipsis);
+        if (final_line or !has_more) break;
+        try output.append(allocator, '\n');
+
+        if (line_fits) {
+            source_start = source_end + 1;
+        } else if (fitting_end > 0) {
+            source_start += fitting_end;
+        } else {
+            var it = uucode.grapheme.utf8Iterator(source_line);
+            source_start += (it.nextGrapheme() orelse break).end;
+        }
+    }
 }
 
 /// Collects and clears the damage accumulated across the tree since the
@@ -162,13 +252,18 @@ fn layoutElementInto(
         .element => try layoutWrapper(allocator, element, node, .element, constraints, origin, measurer),
         .text => |text_widget| {
             const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
-            const measured = try measurer.measureText(text_widget.value, style);
+            node.text_buffer.clearRetainingCapacity();
+            const visible_text = if (text_widget.max_lines) |max_lines| blk: {
+                try constrainText(allocator, &node.text_buffer, text_widget.value, max_lines, text_widget.overflow, constraints.max_width, style, measurer);
+                break :blk node.text_buffer.items;
+            } else text_widget.value;
+            const measured = try measurer.measureText(visible_text, style);
             const size_value = constraints.clamp(measured);
             _ = try ensureChildSlice(allocator, node, 0);
             commitRenderNode(node, .{
                 .kind = .text,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .text = text_widget.value,
+                .text = visible_text,
                 .text_style = style,
                 .foreground = style.color,
             });
@@ -234,6 +329,8 @@ fn layoutElementInto(
                 .tap_down_callback = clickable_widget.on_tap_down,
                 .tap_up_callback = clickable_widget.on_tap_up,
                 .tap_cancel_callback = clickable_widget.on_tap_cancel,
+                .scroll_event_callback = clickable_widget.on_scroll,
+                .click_buttons = clickable_widget.buttons,
                 .click_activation = clickable_widget.activation,
                 .click_cursor = clickable_widget.cursor,
             });
@@ -358,6 +455,22 @@ fn layoutElementInto(
                 .box_radius = input_widget.radius,
                 .focused = element.focused,
                 .caret_x = origin.x + input_widget.padding_x + value_size.width,
+            });
+        },
+        .separator => |separator| {
+            const horizontal = separator.axis == .horizontal;
+            const requested: Size = if (horizontal)
+                .{ .width = constraints.max_width, .height = separator.thickness + separator.margin * 2 }
+            else
+                .{ .width = separator.thickness + separator.margin * 2, .height = constraints.max_height };
+            const size_value = constraints.clamp(requested);
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
+                .kind = .separator,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
+                .background = separator.color.?,
+                .separator_axis = separator.axis,
+                .separator_margin = separator.margin,
             });
         },
         .padding => |padding_widget| {
@@ -745,4 +858,45 @@ fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
         child.rect.y += dy;
         translateChildren(child, dx, dy);
     }
+}
+
+test "fitting boundary chooses the last measured cluster that fits" {
+    const boundaries = [_]usize{ 1, 3, 4 };
+    const widths = [_]f32{ 5, 12, 20 };
+    try std.testing.expectEqual(@as(usize, 3), fittingBoundary(&boundaries, &widths, 12));
+    try std.testing.expectEqual(@as(usize, 0), fittingBoundary(&boundaries, &widths, 2));
+}
+
+test "constrained text preserves fitting text and ellipsizes one line" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try constrainText(allocator, &output, "abc", 1, .ellipsis, 40, style, .fixed);
+    try std.testing.expectEqualStrings("abc", output.items);
+
+    output.clearRetainingCapacity();
+    try constrainText(allocator, &output, "abcdef", 1, .ellipsis, 40, style, .fixed);
+    try std.testing.expectEqualStrings("ab…", output.items);
+}
+
+test "constrained text omits an ellipsis that cannot fit" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try constrainText(allocator, &output, "abc", 1, .ellipsis, 16, style, .fixed);
+    try std.testing.expectEqualStrings("", output.items);
+}
+
+test "constrained text wraps and ellipsizes at two lines" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try constrainText(allocator, &output, "abcdefg", 2, .ellipsis, 24, style, .fixed);
+    try std.testing.expectEqualStrings("abc\n…", output.items);
 }

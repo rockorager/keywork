@@ -448,12 +448,14 @@ function ui.text(value, style)
     size = style.size,
     font_size = style.font_size,
     role = style.role,
+    max_lines = style.max_lines,
+    overflow = style.overflow,
   }
 end
 
 function ui.label(value, options)
   options = options or {}
-  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, role = options.role or "label" })
+  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, role = options.role or "label", max_lines = options.max_lines, overflow = options.overflow })
 end
 
 function ui.keyed(key, child)
@@ -569,6 +571,8 @@ function ui.gesture(options)
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
     on_tap_cancel = options.on_tap_cancel,
+    buttons = options.buttons,
+    on_scroll = options.on_scroll,
   }
 end
 
@@ -650,6 +654,16 @@ function ui.text_input(options)
     value = options.value,
     on_change = options.on_change,
     autofocus = options.autofocus or false,
+    variant = options.variant,
+    background = options.background,
+    foreground = options.foreground,
+    placeholder_color = options.placeholder_color,
+    border = options.border,
+    focused_border = options.focused_border,
+    padding_x = options.padding_x,
+    padding_y = options.padding_y,
+    radius = options.radius,
+    font_size = options.font_size,
   }
 end
 
@@ -728,6 +742,17 @@ function ui.sized(options, child)
     min_height = options.min_height,
     max_width = options.max_width,
     max_height = options.max_height,
+  }
+end
+
+function ui.separator(options)
+  options = options or {}
+  return {
+    type = "separator",
+    color = options.color,
+    thickness = options.thickness,
+    axis = options.axis,
+    margin = options.margin,
   }
 end
 

@@ -23,6 +23,7 @@ const Image = struct {
     width: u32,
     height: u32,
     size: f32,
+    preserve_aspect: bool = false,
     pixels: []keywork.Color,
     cache_key: u64,
 
@@ -42,9 +43,12 @@ const Image = struct {
 
     fn layout(ptr: *const anyopaque, context: keywork.Widget.RenderObject.LayoutContext) !keywork.Size {
         const self: *const Image = @ptrCast(@alignCast(ptr));
+        const longest: f32 = @floatFromInt(@max(self.width, self.height));
+        const width = if (self.preserve_aspect and longest > 0) self.size * @as(f32, @floatFromInt(self.width)) / longest else self.size;
+        const height = if (self.preserve_aspect and longest > 0) self.size * @as(f32, @floatFromInt(self.height)) / longest else self.size;
         return .{
-            .width = @min(self.size, context.constraints.max_width),
-            .height = @min(self.size, context.constraints.max_height),
+            .width = @min(width, context.constraints.max_width),
+            .height = @min(height, context.constraints.max_height),
         };
     }
 
@@ -95,6 +99,7 @@ const Image = struct {
             .width = self.width,
             .height = self.height,
             .size = self.size,
+            .preserve_aspect = self.preserve_aspect,
             .pixels = try allocator.dupe(keywork.Color, self.pixels),
             .cache_key = self.cache_key,
         };
@@ -162,6 +167,7 @@ pub fn pngIcon(allocator: std.mem.Allocator, path: []const u8, size: f32) !keywo
         .width = @intCast(source_width),
         .height = @intCast(source_height),
         .size = @floatFromInt(positiveImageSize(size)),
+        .preserve_aspect = true,
         .pixels = pixels,
         .cache_key = hasher.final(),
     };

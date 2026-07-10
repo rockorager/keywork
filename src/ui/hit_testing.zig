@@ -18,15 +18,16 @@ const DisplayList = model.DisplayList;
 const ResolvedTextStyle = model.ResolvedTextStyle;
 
 pub fn hitTestButton(node: *const RenderNode, point: Point) ?[]const u8 {
-    return if (hitTestClick(node, point)) |hit| hit.id else null;
+    return if (hitTestClick(node, point, .left)) |hit| hit.id else null;
 }
 
 pub const ClickHit = struct {
     id: []const u8,
-    callback: ?Widget.Callback = null,
-    tap_down: ?Widget.Callback = null,
-    tap_up: ?Widget.Callback = null,
-    tap_cancel: ?Widget.Callback = null,
+    callback: ?Widget.TapCallback = null,
+    tap_down: ?Widget.TapCallback = null,
+    tap_up: ?Widget.TapCallback = null,
+    tap_cancel: ?Widget.TapCallback = null,
+    rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     activation: Widget.ClickActivation = .release,
     cursor: CursorShape = .default,
 };
@@ -34,7 +35,7 @@ pub const ClickHit = struct {
 pub const FocusTarget = struct {
     id: []const u8,
     kind: Kind,
-    callback: ?Widget.Callback = null,
+    callback: ?Widget.TapCallback = null,
     scope_id: ?[]const u8 = null,
     modal_scope_id: ?[]const u8 = null,
     autofocus: bool = false,
@@ -123,15 +124,15 @@ fn findFocusTargetScoped(node: *const RenderNode, id: []const u8, scope_id: ?[]c
     return null;
 }
 
-pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
+pub fn hitTestClick(node: *const RenderNode, point: Point, button: model.PointerButton) ?ClickHit {
     if (node.kind.isViewport() and !node.rect.contains(point)) return null;
     var index = node.children.len;
     while (index > 0) {
         index -= 1;
-        if (hitTestClick(node.children[index], point)) |hit| return hit;
+        if (hitTestClick(node.children[index], point, button)) |hit| return hit;
     }
 
-    if (node.kind == .clickable and node.rect.contains(point)) {
+    if (node.kind == .clickable and node.rect.contains(point) and node.click_buttons.accepts(button)) {
         if (!nodeHasTapCallback(node)) return null;
         return .{
             .id = node.clickable_id orelse return null,
@@ -139,6 +140,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
             .tap_down = node.tap_down_callback,
             .tap_up = node.tap_up_callback,
             .tap_cancel = node.tap_cancel_callback,
+            .rect = node.rect,
             .activation = node.click_activation,
             .cursor = node.click_cursor,
         };
@@ -151,6 +153,45 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
     return null;
 }
 
+test "right click skips left-only child and hits accepting ancestor" {
+    const Callback = struct {
+        fn call(_: *anyopaque, _: model.TapEvent) !void {}
+    };
+    var state: u8 = 0;
+    const callback: Widget.TapCallback = .{ .ptr = &state, .call_fn = Callback.call };
+    var child: RenderNode = .{
+        .kind = .clickable,
+        .rect = .{ .x = 2, .y = 2, .width = 10, .height = 10 },
+        .clickable_id = "child",
+        .click_callback = callback,
+    };
+    var children = [_]*RenderNode{&child};
+    const root: RenderNode = .{
+        .kind = .clickable,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .clickable_id = "ancestor",
+        .click_callback = callback,
+        .click_buttons = .{ .right = true },
+        .children = &children,
+    };
+
+    try std.testing.expectEqualStrings("ancestor", hitTestClick(&root, .{ .x = 5, .y = 5 }, .right).?.id);
+    try std.testing.expectEqualStrings("child", hitTestClick(&root, .{ .x = 5, .y = 5 }, .left).?.id);
+}
+
+pub const ScrollHit = struct { callback: Widget.ScrollEventCallback, rect: Rect };
+
+pub fn hitTestScrollCallback(node: *const RenderNode, point: Point) ?ScrollHit {
+    if (node.kind.isViewport() and !node.rect.contains(point)) return null;
+    var index = node.children.len;
+    while (index > 0) {
+        index -= 1;
+        if (hitTestScrollCallback(node.children[index], point)) |hit| return hit;
+    }
+    if (node.rect.contains(point)) if (node.scroll_event_callback) |callback| return .{ .callback = callback, .rect = node.rect };
+    return null;
+}
+
 pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
     if (node.kind == .clickable) {
         if (node.clickable_id) |clickable_id| {
@@ -160,6 +201,7 @@ pub fn findClickHitById(node: *const RenderNode, id: []const u8) ?ClickHit {
                 .tap_down = node.tap_down_callback,
                 .tap_up = node.tap_up_callback,
                 .tap_cancel = node.tap_cancel_callback,
+                .rect = node.rect,
                 .activation = node.click_activation,
             };
         }
@@ -256,6 +298,6 @@ fn revealDelta(start: f32, extent: f32, viewport_start: f32, viewport_extent: f3
 
 pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
     if (hitTestTextInput(node, point) != null) return .text;
-    if (hitTestClick(node, point)) |hit| return hit.cursor;
+    if (hitTestClick(node, point, .left)) |hit| return hit.cursor;
     return .default;
 }

@@ -22,6 +22,11 @@ pub const EdgeInsets = types.EdgeInsets;
 pub const Constraints = types.Constraints;
 pub const KeyInput = types.KeyInput;
 pub const CursorShape = types.CursorShape;
+pub const PointerButtonEvent = types.PointerButtonEvent;
+pub const PointerButton = types.PointerButton;
+pub const PointerButtons = types.PointerButtons;
+pub const TapEvent = types.TapEvent;
+pub const ScrollEvent = types.ScrollEvent;
 pub const DisplayList = display.DisplayList;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
@@ -44,6 +49,7 @@ pub const Widget = union(enum) {
     scroll: Scroll,
     list: List,
     text_input: TextInput,
+    separator: Separator,
     row: Children,
     column: Children,
     spacer: Spacer,
@@ -86,12 +92,19 @@ pub const Widget = union(enum) {
         color: ?Color = null,
         font_size: ?f32 = null,
         role: TextRole = .body,
+        max_lines: ?u32 = null,
+        overflow: TextOverflow = .ellipsis,
+    };
+
+    pub const TextOverflow = enum {
+        ellipsis,
+        clip,
     };
 
     pub const Button = struct {
         id: []const u8,
         label: []const u8,
-        on_pressed: ?Callback = null,
+        on_pressed: ?TapCallback = null,
         intent: ?Intent = null,
     };
 
@@ -110,10 +123,12 @@ pub const Widget = union(enum) {
     pub const Clickable = struct {
         id: []const u8,
         child: *const Widget,
-        on_click: ?Callback = null,
-        on_tap_down: ?Callback = null,
-        on_tap_up: ?Callback = null,
-        on_tap_cancel: ?Callback = null,
+        on_click: ?TapCallback = null,
+        on_tap_down: ?TapCallback = null,
+        on_tap_up: ?TapCallback = null,
+        on_tap_cancel: ?TapCallback = null,
+        on_scroll: ?ScrollEventCallback = null,
+        buttons: PointerButtons = .{},
         activation: ClickActivation = .release,
         hover_style: ?ClickableStyle = null,
         cursor: CursorShape = .default,
@@ -329,6 +344,28 @@ pub const Widget = union(enum) {
         radius: f32 = default_input_theme.radius,
         font_size: f32 = default_input_theme.font_size,
         autofocus: bool = false,
+        style: Style = .{},
+
+        pub const Style = struct {
+            foreground: ?Color = null,
+            background: ?Color = null,
+            border: ?Color = null,
+            focused_border: ?Color = null,
+            placeholder_foreground: ?Color = null,
+            padding_x: ?f32 = null,
+            padding_y: ?f32 = null,
+            radius: ?f32 = null,
+            font_size: ?f32 = null,
+        };
+    };
+
+    pub const Separator = struct {
+        color: ?Color = null,
+        thickness: f32 = 1,
+        margin: f32 = 0,
+        axis: Axis = .horizontal,
+
+        pub const Axis = enum { horizontal, vertical };
     };
 
     pub const Children = struct {
@@ -460,6 +497,42 @@ pub const Widget = union(enum) {
         pub fn destroy(self: FocusChangeCallback, allocator: std.mem.Allocator) void {
             const destroy_fn = self.destroy_fn orelse return;
             destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    pub const TapCallback = struct {
+        ptr: *anyopaque,
+        call_fn: *const fn (ptr: *anyopaque, event: TapEvent) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
+
+        pub fn call(self: TapCallback, event: TapEvent) !void {
+            try self.call_fn(self.ptr, event);
+        }
+        pub fn clone(self: TapCallback, allocator: std.mem.Allocator) !TapCallback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{ .ptr = try clone_fn(allocator, self.ptr), .call_fn = self.call_fn, .clone_fn = self.clone_fn, .destroy_fn = self.destroy_fn };
+        }
+        pub fn destroy(self: TapCallback, allocator: std.mem.Allocator) void {
+            if (self.destroy_fn) |destroy_fn| destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    pub const ScrollEventCallback = struct {
+        ptr: *anyopaque,
+        call_fn: *const fn (ptr: *anyopaque, event: ScrollEvent) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
+
+        pub fn call(self: ScrollEventCallback, event: ScrollEvent) !void {
+            try self.call_fn(self.ptr, event);
+        }
+        pub fn clone(self: ScrollEventCallback, allocator: std.mem.Allocator) !ScrollEventCallback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{ .ptr = try clone_fn(allocator, self.ptr), .call_fn = self.call_fn, .clone_fn = self.clone_fn, .destroy_fn = self.destroy_fn };
+        }
+        pub fn destroy(self: ScrollEventCallback, allocator: std.mem.Allocator) void {
+            if (self.destroy_fn) |destroy_fn| destroy_fn(allocator, self.ptr);
         }
     };
 
@@ -679,7 +752,7 @@ pub const widgets = struct {
         return .{ .text = .{ .value = value } };
     }
 
-    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.Callback) !Widget {
+    pub fn clickable(allocator: std.mem.Allocator, id: []const u8, child: Widget, on_click: ?Widget.TapCallback) !Widget {
         return .{ .clickable = .{ .id = id, .child = try Widget.alloc(allocator, child), .on_click = on_click } };
     }
 
@@ -725,7 +798,7 @@ pub const widgets = struct {
         return .{ .list = .{ .id = id, .item_count = item_count, .item_extent = item_extent, .build_item = build_item } };
     }
 
-    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.Callback) !Widget {
+    pub fn button(allocator: std.mem.Allocator, id: []const u8, label: []const u8, on_pressed: ?Widget.TapCallback) !Widget {
         _ = allocator;
         return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed } };
     }
@@ -828,6 +901,7 @@ pub const Element = struct {
         scroll,
         list,
         text_input,
+        separator,
         row,
         column,
         spacer,
@@ -854,7 +928,23 @@ fn buildButtonWidget(
     actions: ?*const ActionScope,
     button_widget: Widget.Button,
 ) !Widget {
-    const on_pressed = button_widget.on_pressed orelse if (button_widget.intent) |intent| findActionForIntent(actions, intent) else null;
+    const on_pressed: ?Widget.TapCallback = if (button_widget.on_pressed) |pressed|
+        borrowedCallback(pressed)
+    else if (button_widget.intent) |intent| blk: {
+        const action = findActionForIntent(actions, intent) orelse break :blk null;
+        const stored = try allocator.create(Widget.Callback);
+        stored.* = action;
+        // The adapter wrapper is arena-backed; retained element clones must
+        // own their own copy so a dirty-state arena reset cannot leave a
+        // surviving subtree pointing at freed memory. The underlying action
+        // is borrowed: the actions widget outlives its children.
+        break :blk Widget.TapCallback{
+            .ptr = stored,
+            .call_fn = callActionAsTap,
+            .clone_fn = cloneActionAdapter,
+            .destroy_fn = destroyActionAdapter,
+        };
+    } else null;
     const enabled = on_pressed != null;
     const hovered = enabled and interaction.isHovered(button_widget.id);
     const pressed = enabled and interaction.isPressed(button_widget.id);
@@ -875,10 +965,27 @@ fn buildButtonWidget(
     } };
     if (!enabled) return surface;
     const surface_child = try Widget.alloc(allocator, surface);
-    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = borrowedCallback(on_pressed.?) } };
+    return .{ .clickable = .{ .id = button_widget.id, .child = surface_child, .on_click = on_pressed.? } };
 }
 
-fn borrowedCallback(callback: Widget.Callback) Widget.Callback {
+fn callActionAsTap(ptr: *anyopaque, _: TapEvent) !void {
+    const callback: *Widget.Callback = @ptrCast(@alignCast(ptr));
+    try callback.call();
+}
+
+fn cloneActionAdapter(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
+    const original: *Widget.Callback = @ptrCast(@alignCast(ptr));
+    const copy = try allocator.create(Widget.Callback);
+    copy.* = original.*;
+    return copy;
+}
+
+fn destroyActionAdapter(allocator: std.mem.Allocator, ptr: *anyopaque) void {
+    const stored: *Widget.Callback = @ptrCast(@alignCast(ptr));
+    allocator.destroy(stored);
+}
+
+fn borrowedCallback(callback: Widget.TapCallback) Widget.TapCallback {
     return .{ .ptr = callback.ptr, .call_fn = callback.call_fn };
 }
 
@@ -956,12 +1063,15 @@ pub const RenderNode = struct {
     kind: Kind,
     rect: Rect,
     text: ?[]const u8 = null,
+    text_buffer: std.ArrayList(u8) = .empty,
     text_style: ResolvedTextStyle = defaultResolvedTextStyle(),
     clickable_id: ?[]const u8 = null,
-    click_callback: ?Widget.Callback = null,
-    tap_down_callback: ?Widget.Callback = null,
-    tap_up_callback: ?Widget.Callback = null,
-    tap_cancel_callback: ?Widget.Callback = null,
+    click_callback: ?Widget.TapCallback = null,
+    tap_down_callback: ?Widget.TapCallback = null,
+    tap_up_callback: ?Widget.TapCallback = null,
+    tap_cancel_callback: ?Widget.TapCallback = null,
+    scroll_event_callback: ?Widget.ScrollEventCallback = null,
+    click_buttons: PointerButtons = .{},
     click_activation: Widget.ClickActivation = .release,
     click_cursor: CursorShape = .default,
     text_input_id: ?[]const u8 = null,
@@ -981,6 +1091,8 @@ pub const RenderNode = struct {
     box_border: ?Color = null,
     box_border_width: f32 = 1,
     box_radius: f32 = 0,
+    separator_axis: Widget.Separator.Axis = .horizontal,
+    separator_margin: f32 = 0,
     placeholder: ?[]const u8 = null,
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
@@ -1011,6 +1123,7 @@ pub const RenderNode = struct {
         scroll,
         list,
         text_input,
+        separator,
         row,
         column,
         spacer,
@@ -1224,6 +1337,7 @@ pub fn buildElementTreeScoped(
                 .focused = scope.interaction.isFocused(element_widget.text_input.focus_node),
             };
         },
+        .separator => return .{ .kind = .separator, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .box => |box_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1547,6 +1661,7 @@ pub fn collectPopupRequests(
 
 pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void {
     if (element.render_node) |node| {
+        node.text_buffer.deinit(allocator);
         allocator.free(node.children);
         allocator.destroy(node);
         element.render_node = null;
@@ -1613,6 +1728,7 @@ pub fn updateElementTreeScoped(
             try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style);
             element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
         },
+        .separator => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
         .render_object => try replaceElementWidget(allocator, element, widget.*),
         .box => |box_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
@@ -1730,6 +1846,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .text,
         .spacer,
         .text_input,
+        .separator,
         .render_object,
         .button,
         => return false,
@@ -1863,6 +1980,7 @@ pub fn refreshInteractionElements(
         .text,
         .spacer,
         .text_input,
+        .separator,
         .render_object,
         => return false,
 
@@ -2007,6 +2125,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .scroll => .scroll,
         .list => .list,
         .text_input => .text_input,
+        .separator => .separator,
         .row => .row,
         .column => .column,
         .spacer => .spacer,
@@ -2178,16 +2297,17 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             text_widget.font_size = style.font_size;
         },
         .text_input => |*input_widget| {
-            input_widget.foreground = inputForeground(theme);
-            input_widget.background = inputBackground(theme);
-            input_widget.border = inputBorder(theme);
-            input_widget.focused_border = inputFocusedBorder(theme);
-            input_widget.placeholder_foreground = inputPlaceholder(theme);
-            input_widget.padding_x = theme.input_theme.padding_x;
-            input_widget.padding_y = theme.input_theme.padding_y;
-            input_widget.radius = theme.input_theme.radius;
-            input_widget.font_size = theme.input_theme.font_size;
+            input_widget.foreground = input_widget.style.foreground orelse inputForeground(theme);
+            input_widget.background = input_widget.style.background orelse inputBackground(theme);
+            input_widget.border = input_widget.style.border orelse inputBorder(theme);
+            input_widget.focused_border = input_widget.style.focused_border orelse inputFocusedBorder(theme);
+            input_widget.placeholder_foreground = input_widget.style.placeholder_foreground orelse inputPlaceholder(theme);
+            input_widget.padding_x = input_widget.style.padding_x orelse theme.input_theme.padding_x;
+            input_widget.padding_y = input_widget.style.padding_y orelse theme.input_theme.padding_y;
+            input_widget.radius = input_widget.style.radius orelse theme.input_theme.radius;
+            input_widget.font_size = input_widget.style.font_size orelse theme.input_theme.font_size;
         },
+        .separator => |*separator| separator.color = separator.color orelse theme.color_scheme.border,
         else => {},
     }
     return result;
@@ -2255,8 +2375,11 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .color = text_widget.color,
             .font_size = text_widget.font_size,
             .role = text_widget.role,
+            .max_lines = text_widget.max_lines,
+            .overflow = text_widget.overflow,
         } },
         .spacer => |spacer_widget| .{ .spacer = spacer_widget },
+        .separator => |separator| .{ .separator = separator },
         .sized => |sized_widget| .{ .sized = sized_widget },
         .button => |button_widget| blk: {
             const id = try allocator.dupe(u8, button_widget.id);
@@ -2281,6 +2404,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             errdefer if (tap_up) |on_tap_up| on_tap_up.destroy(allocator);
             const tap_cancel = if (clickable_widget.on_tap_cancel) |on_tap_cancel| try on_tap_cancel.clone(allocator) else null;
             errdefer if (tap_cancel) |on_tap_cancel| on_tap_cancel.destroy(allocator);
+            const scroll = if (clickable_widget.on_scroll) |on_scroll| try on_scroll.clone(allocator) else null;
+            errdefer if (scroll) |on_scroll| on_scroll.destroy(allocator);
             break :blk .{ .clickable = .{
                 .id = id,
                 .child = clickable_widget.child,
@@ -2288,6 +2413,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .on_tap_down = tap_down,
                 .on_tap_up = tap_up,
                 .on_tap_cancel = tap_cancel,
+                .on_scroll = scroll,
+                .buttons = clickable_widget.buttons,
                 .activation = clickable_widget.activation,
                 .hover_style = clickableHoverStyle(clickable_widget),
                 .cursor = clickable_widget.cursor,
@@ -2362,6 +2489,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .radius = input_widget.radius,
                 .font_size = input_widget.font_size,
                 .autofocus = input_widget.autofocus,
+                .style = input_widget.style,
             } };
         },
         .row => |row_widget| .{ .row = .{ .children = &.{}, .gap = row_widget.gap, .cross_align = row_widget.cross_align, .main_align = row_widget.main_align } },
@@ -2391,6 +2519,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .keyed => |keyed_widget| destroyKey(allocator, keyed_widget.key),
         .text => |text_widget| allocator.free(text_widget.value),
         .spacer => {},
+        .separator => {},
         .sized => {},
         .button => |button_widget| {
             if (button_widget.on_pressed) |callback| callback.destroy(allocator);
@@ -2403,6 +2532,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
             if (clickable_widget.on_tap_down) |callback| callback.destroy(allocator);
             if (clickable_widget.on_tap_up) |callback| callback.destroy(allocator);
             if (clickable_widget.on_tap_cancel) |callback| callback.destroy(allocator);
+            if (clickable_widget.on_scroll) |callback| callback.destroy(allocator);
             allocator.free(clickable_widget.id);
         },
         .anchored => |anchored_widget| {
@@ -2537,6 +2667,8 @@ pub const FocusTarget = hit_testing_model.FocusTarget;
 pub const collectFocusTargets = hit_testing_model.collectFocusTargets;
 pub const findFocusTarget = hit_testing_model.findFocusTarget;
 pub const hitTestClick = hit_testing_model.hitTestClick;
+pub const ScrollHit = hit_testing_model.ScrollHit;
+pub const hitTestScrollCallback = hit_testing_model.hitTestScrollCallback;
 pub const findClickHitById = hit_testing_model.findClickHitById;
 pub const hitTestTextInput = hit_testing_model.hitTestTextInput;
 pub const hitTestScroll = hit_testing_model.hitTestScroll;
@@ -2560,11 +2692,11 @@ pub const collectDamage = layout_model.collectDamage;
 
 var test_callback_state: u8 = 0;
 
-fn testCallback() Widget.Callback {
+fn testTapCallback() Widget.TapCallback {
     return .{ .ptr = &test_callback_state, .call_fn = testCallbackCall };
 }
 
-fn testCallbackCall(_: *anyopaque) !void {}
+fn testCallbackCall(_: *anyopaque, _: TapEvent) !void {}
 
 const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
 
@@ -2614,7 +2746,7 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     var rows: [10]Widget = undefined;
     for (&rows, 0..) |*row, index| {
         row.* = if (index == 9)
-            try widgets.clickable(build_allocator, "last-row", widgets.text("row"), testCallback())
+            try widgets.clickable(build_allocator, "last-row", widgets.text("row"), testTapCallback())
         else
             widgets.text("row");
     }
@@ -2633,7 +2765,7 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
 
     // The clickable in the last row sits below the viewport; the clip
     // blocks hits at its laid-out position.
-    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 5, .y = 150 }));
+    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 5, .y = 150 }, .left));
     try std.testing.expectEqualStrings("list", hitTestScroll(root, .{ .x = 5, .y = 20 }).?);
 
     // An absurd offset clamps to content minus viewport.
@@ -2645,7 +2777,7 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
 
     // Scrolled to the bottom, the last row is inside the viewport and
     // clickable again.
-    try std.testing.expectEqualStrings("last-row", hitTestClick(root, .{ .x = 5, .y = 30 }).?.id);
+    try std.testing.expectEqualStrings("last-row", hitTestClick(root, .{ .x = 5, .y = 30 }, .left).?.id);
 
     // Paint clips the content to the viewport rect.
     var display_list: DisplayList = .{};
@@ -2848,7 +2980,7 @@ test "layout, paint, and hit test a padded column" {
     const label: Widget = .{ .text = .{ .value = "OK", .color = colors.white } };
     const button_padding: Widget = .{ .padding = .{ .insets = EdgeInsets.all(8), .child = &label } };
     const button_box: Widget = .{ .box = .{ .background = colors.accent, .child = &button_padding } };
-    const button: Widget = .{ .clickable = .{ .id = "ok", .child = &button_box, .on_click = testCallback() } };
+    const button: Widget = .{ .clickable = .{ .id = "ok", .child = &button_box, .on_click = testTapCallback() } };
     const children = [_]Widget{ title, button };
     const column: Widget = .{ .column = .{ .children = &children, .gap = 4 } };
     const padded: Widget = .{ .padding = .{ .insets = EdgeInsets.all(10), .child = &column } };
@@ -2878,7 +3010,7 @@ test "button widget composes styled clickable content" {
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
 
-    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", testCallback());
+    const button_widget = try widgets.button(build_arena.allocator(), "confirm", "Confirm", testTapCallback());
     var scope: BuildScope = .{ .allocator = build_arena.allocator(), .interaction = .{ .pressed_id = "confirm" } };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &button_widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(retained_allocator, &element);
@@ -3234,6 +3366,17 @@ test "box aligns child inside its minimum size" {
     try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
 }
 
+test "separator fills its cross axis and reserves main-axis margins" {
+    const allocator = std.testing.allocator;
+    const widget: Widget = .{ .separator = .{ .thickness = 2, .margin = 3 } };
+    var element = try buildElementTree(allocator, &widget, .{ .max_width = 80, .max_height = 20 });
+    defer destroyElementTree(allocator, &element);
+    const node = try layoutElement(allocator, &element, .{ .max_width = 80, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
+    try std.testing.expectEqual(@as(f32, 80), node.rect.width);
+    try std.testing.expectEqual(@as(f32, 8), node.rect.height);
+    try std.testing.expectEqual(Widget.Separator.Axis.horizontal, node.separator_axis);
+}
+
 test "theme selects light and dark defaults from color scheme" {
     try std.testing.expectEqual(Theme.light.color_scheme.primary, Theme.fromColorScheme("light").color_scheme.primary);
     try std.testing.expectEqual(Theme.dark.color_scheme.primary, Theme.fromColorScheme("dark").color_scheme.primary);
@@ -3255,7 +3398,7 @@ test "theme widget provides ambient button styling" {
             .padding_y = 4,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testCallback());
+    const button_widget = try widgets.button(build_arena.allocator(), "themed", "Themed", testTapCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &themed, .{ .max_width = 200, .max_height = 80 });
@@ -3285,7 +3428,7 @@ test "button uses ambient hover styling" {
             .hover_foreground = colors.panel,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", testCallback());
+    const button_widget = try widgets.button(build_arena.allocator(), "hovered", "Hover", testTapCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -3313,7 +3456,7 @@ test "button uses ambient pressed styling" {
             .pressed_background = colors.ink,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", testCallback());
+    const button_widget = try widgets.button(build_arena.allocator(), "pressed", "Press", testTapCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -3339,7 +3482,7 @@ test "button uses ambient focused border" {
             .focused_border = colors.black,
         },
     };
-    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", testCallback());
+    const button_widget = try widgets.button(build_arena.allocator(), "focused", "Focus", testTapCallback());
     const themed = try widgets.theme(build_arena.allocator(), theme, button_widget);
     var scope: BuildScope = .{
         .allocator = build_arena.allocator(),
@@ -3406,8 +3549,8 @@ test "action button resolves nearest ambient action" {
     defer destroyElementTree(retained_allocator, &element);
     const root = try layoutElement(retained_allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try hit.callback.?.call();
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
+    try hit.callback.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
 
@@ -3461,7 +3604,7 @@ test "focus targets are collected in render tree order" {
     const build_allocator = build_arena.allocator();
 
     const input = widgets.textInput("input", "", "placeholder");
-    const button = try widgets.button(build_allocator, "button", "Button", testCallback());
+    const button = try widgets.button(build_allocator, "button", "Button", testTapCallback());
     const children = [_]Widget{ input, button };
     const column = try widgets.column(build_allocator, &children, 4);
     var scope: BuildScope = .{ .allocator = build_allocator };
@@ -3506,7 +3649,7 @@ test "center moves descendants" {
     const allocator = std.testing.allocator;
 
     const label: Widget = .{ .text = .{ .value = "Run" } };
-    const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label, .on_click = testCallback() } };
+    const button: Widget = .{ .clickable = .{ .id = "centered", .child = &label, .on_click = testTapCallback() } };
     const center: Widget = .{ .center = .{ .child = &button } };
 
     var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3525,7 +3668,7 @@ test "clickable carries opaque callback handles through hit testing" {
     const Counter = struct {
         value: usize = 0,
 
-        fn increment(ptr: *anyopaque) !void {
+        fn increment(ptr: *anyopaque, _: TapEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.value += 1;
         }
@@ -3546,9 +3689,9 @@ test "clickable carries opaque callback handles through hit testing" {
     defer destroyElementTree(std.testing.allocator, &built_element);
     const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
     try std.testing.expectEqualStrings("counter", hit.id);
-    try hit.callback.?.call();
+    try hit.callback.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
 
@@ -3679,7 +3822,7 @@ test "anchored without popup declares nothing and stays hit-testable" {
     const clickable: Widget = .{ .clickable = .{
         .id = "clock-tap",
         .child = &inner_label,
-        .on_click = testCallback(),
+        .on_click = testTapCallback(),
     } };
     const anchored: Widget = .{ .anchored = .{ .id = "clock", .child = &clickable } };
 
@@ -3695,7 +3838,7 @@ test "anchored without popup declares nothing and stays hit-testable" {
     try collectPopupRequests(std.testing.allocator, &built_element, &requests);
     try std.testing.expectEqual(@as(usize, 0), requests.items.len);
 
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
     try std.testing.expectEqualStrings("clock-tap", hit.id);
 }
 
@@ -3704,7 +3847,7 @@ test "clickable hit testing carries activation mode" {
     const button: Widget = .{ .clickable = .{
         .id = "pressable",
         .child = &label,
-        .on_click = testCallback(),
+        .on_click = testTapCallback(),
         .activation = .press,
     } };
 
@@ -3715,7 +3858,7 @@ test "clickable hit testing carries activation mode" {
     defer destroyElementTree(std.testing.allocator, &built_element);
     const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
     try std.testing.expectEqual(Widget.ClickActivation.press, hit.activation);
 }
 
@@ -3724,9 +3867,9 @@ test "clickable hit testing carries gesture callbacks" {
     const button: Widget = .{ .clickable = .{
         .id = "gesture",
         .child = &label,
-        .on_tap_down = testCallback(),
-        .on_tap_up = testCallback(),
-        .on_tap_cancel = testCallback(),
+        .on_tap_down = testTapCallback(),
+        .on_tap_up = testTapCallback(),
+        .on_tap_cancel = testTapCallback(),
     } };
 
     var built_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3736,7 +3879,7 @@ test "clickable hit testing carries gesture callbacks" {
     defer destroyElementTree(std.testing.allocator, &built_element);
     const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
     try std.testing.expect(hit.tap_down != null);
     try std.testing.expect(hit.tap_up != null);
     try std.testing.expect(hit.tap_cancel != null);
@@ -3753,7 +3896,7 @@ test "clickable without callback is inert" {
     defer destroyElementTree(std.testing.allocator, &built_element);
     const root = try layoutElement(std.testing.allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 2, .y = 2 }));
+    try std.testing.expectEqual(@as(?ClickHit, null), hitTestClick(root, .{ .x = 2, .y = 2 }, .left));
     const targets = try collectFocusTargets(std.testing.allocator, root);
     defer std.testing.allocator.free(targets);
     try std.testing.expectEqual(@as(usize, 0), targets.len);
@@ -3820,8 +3963,8 @@ test "button and shortcut can share an intent" {
     const root = try layoutElement(allocator, &element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try findShortcutAction(&element, .enter).?.call();
-    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }).?;
-    try hit.callback.?.call();
+    const hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
+    try hit.callback.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 2), counter.value);
 }
 
@@ -3917,7 +4060,7 @@ test "element tree retains cloned callbacks beyond build scope" {
         clones: *usize,
         destroys: *usize,
 
-        fn callback(self: *@This()) Widget.Callback {
+        fn callback(self: *@This()) Widget.TapCallback {
             return .{
                 .ptr = self,
                 .call_fn = call,
@@ -3926,7 +4069,7 @@ test "element tree retains cloned callbacks beyond build scope" {
             };
         }
 
-        fn call(ptr: *anyopaque) !void {
+        fn call(ptr: *anyopaque, _: TapEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls.* += 1;
         }
@@ -3970,7 +4113,7 @@ test "element tree retains cloned callbacks beyond build scope" {
     try std.testing.expectEqual(@as(usize, 0), destroys);
 
     try std.testing.expect(build_arena.reset(.free_all));
-    try element.widget.clickable.on_click.?.call();
+    try element.widget.clickable.on_click.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqualStrings("arena-button", element.widget.clickable.id);
     try std.testing.expectEqualStrings("arena label", element.children[0].widget.text.value);
@@ -3985,7 +4128,7 @@ test "button composed clickable borrows retained action callback" {
         clones: *usize,
         destroys: *usize,
 
-        fn callback(self: *@This()) Widget.Callback {
+        fn callback(self: *@This()) Widget.TapCallback {
             return .{
                 .ptr = self,
                 .call_fn = call,
@@ -3994,7 +4137,7 @@ test "button composed clickable borrows retained action callback" {
             };
         }
 
-        fn call(ptr: *anyopaque) !void {
+        fn call(ptr: *anyopaque, _: TapEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls.* += 1;
         }
@@ -4031,7 +4174,7 @@ test "button composed clickable borrows retained action callback" {
     try std.testing.expectEqual(element.widget.button.on_pressed.?.ptr, element.children[0].widget.clickable.on_click.?.ptr);
 
     try std.testing.expect(build_arena.reset(.free_all));
-    try element.children[0].widget.clickable.on_click.?.call();
+    try element.children[0].widget.clickable.on_click.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 1), calls);
 
     destroyElementTree(retained_allocator, &element);
@@ -4627,6 +4770,48 @@ test "stateful widget destroys state on element destruction and replacement" {
     var second_element = try buildElementTree(std.testing.allocator, &second_widget, .{ .max_width = 200, .max_height = 80 });
     destroyElementTree(std.testing.allocator, &second_element);
     try std.testing.expectEqual(@as(usize, 1), destroyed_on_deinit);
+}
+
+test "element clone preserves text max_lines and overflow" {
+    const widget: Widget = .{ .text = .{ .value = "song title", .max_lines = 2, .overflow = .clip } };
+    var element = try buildElementTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    try std.testing.expectEqual(@as(?u32, 2), element.widget.text.max_lines);
+    try std.testing.expectEqual(Widget.TextOverflow.clip, element.widget.text.overflow);
+}
+
+test "element clone preserves text_input style overrides" {
+    const widget: Widget = .{ .text_input = .{
+        .id = "search",
+        .focus_node = .named("search"),
+        .value = "",
+        .placeholder = "type…",
+        .style = .{ .padding_x = 0, .padding_y = 0, .radius = 0 },
+    } };
+    var element = try buildElementTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &element);
+
+    const style = element.widget.text_input.style;
+    try std.testing.expectEqual(@as(?f32, 0), style.padding_x);
+    try std.testing.expectEqual(@as(?f32, 0), style.padding_y);
+    try std.testing.expectEqual(@as(?f32, 0), style.radius);
+}
+
+test "element clone preserves clickable buttons" {
+    const child: Widget = widgets.text("buttons");
+    const widget: Widget = .{ .clickable = .{
+        .id = "buttons",
+        .child = &child,
+        .on_click = testTapCallback(),
+        .buttons = .{ .left = false, .right = true, .back = true },
+    } };
+    var clone = try cloneWidgetForElement(std.testing.allocator, widget);
+    defer destroyElementWidget(std.testing.allocator, &clone);
+
+    try std.testing.expect(!clone.clickable.buttons.left);
+    try std.testing.expect(clone.clickable.buttons.right);
+    try std.testing.expect(clone.clickable.buttons.back);
 }
 
 test "custom element widget builds an element subtree" {

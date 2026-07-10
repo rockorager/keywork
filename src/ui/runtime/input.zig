@@ -13,47 +13,64 @@ pub const TextEdit = union(enum) {
 };
 
 pub fn click(self: anytype, point: keywork.Point) !void {
-    try pointerButton(self, point, .pressed);
-    try pointerButton(self, point, .released);
+    try pointerButton(self, .{ .button = .left, .state = .pressed, .position = point });
+    try pointerButton(self, .{ .button = .left, .state = .released, .position = point });
 }
 
-pub fn pointerButton(self: anytype, point: keywork.Point, state: keywork.PointerButtonState) !void {
-    switch (state) {
-        .pressed => try pointerDown(self, point),
-        .released => try pointerUp(self, point),
+pub fn pointerButton(self: anytype, event: keywork.PointerButtonEvent) !void {
+    _ = self.root orelse return error.NotBuilt;
+    if (self.pressed_button) |button| if (button != event.button) return;
+    switch (event.state) {
+        .pressed => try pointerDown(self, event),
+        .released => try pointerUp(self, event),
     }
 }
 
-pub fn pointerDown(self: anytype, point: keywork.Point) !void {
+fn tapEvent(event: keywork.PointerButtonEvent, rect: keywork.Rect) keywork.TapEvent {
+    return .{ .source = .pointer, .button = event.button, .position = event.position, .local = .{
+        .x = event.position.x - rect.x,
+        .y = event.position.y - rect.y,
+    }, .modifiers = event.modifiers };
+}
+
+pub fn pointerDown(self: anytype, event: keywork.PointerButtonEvent) !void {
+    const point = event.position;
     const root = self.root orelse return error.NotBuilt;
-    if (keywork.hitTestScrollbarThumb(root, point)) |hit| {
-        try focus_scroll.beginScrollbarDrag(self, hit, point);
-        return;
-    }
-    if (keywork.hitTestTextInput(root, point)) |id| {
-        const focus_changed = try focus_scroll.setFocused(self, id);
-        _ = try setPressedId(self, null);
-        if (focus_changed) try self.invalidate() else try self.invalidateState();
-        return;
+    // Scrollbar drags and text-input focus are primary-button interactions;
+    // other buttons fall through so a button-accepting ancestor can win the
+    // click hit test instead.
+    if (event.button == .left) {
+        if (keywork.hitTestScrollbarThumb(root, point)) |hit| {
+            try focus_scroll.beginScrollbarDrag(self, hit, point);
+            self.pressed_button = .left;
+            return;
+        }
+        if (keywork.hitTestTextInput(root, point)) |id| {
+            const focus_changed = try focus_scroll.setFocused(self, id);
+            _ = try setPressedId(self, null);
+            if (focus_changed) try self.invalidate() else try self.invalidateState();
+            return;
+        }
     }
 
-    if (keywork.hitTestClick(root, point)) |hit| {
+    if (keywork.hitTestClick(root, point, event.button)) |hit| {
         const focus_changed = try focus_scroll.setFocused(self, hit.id);
         var needs_update = try setPressedId(self, hit.id);
+        self.pressed_button = event.button;
         if (hit.tap_down) |callback| {
-            try callback.call();
+            try callback.call(tapEvent(event, hit.rect));
             needs_update = true;
         }
         if (hit.activation == .press) {
             log.info("clicked button {s} at {d},{d}", .{ hit.id, point.x, point.y });
-            if (try activateClick(self, hit)) needs_update = true;
+            if (try activateClick(self, hit, tapEvent(event, hit.rect))) needs_update = true;
         }
         if (focus_changed) {
             try self.invalidate();
         } else if (needs_update) {
             try self.invalidateState();
         }
-    } else {
+    } else if (event.button == .left) {
         self.autofocus_suppressed = true;
         const focus_changed = try focus_scroll.setFocused(self, null);
         log.info("pointer down on empty space at {d},{d}", .{ point.x, point.y });
@@ -62,13 +79,15 @@ pub fn pointerDown(self: anytype, point: keywork.Point) !void {
     }
 }
 
-pub fn pointerUp(self: anytype, point: keywork.Point) !void {
+pub fn pointerUp(self: anytype, event: keywork.PointerButtonEvent) !void {
+    const point = event.position;
     if (self.scrollbar_drag != null) {
         focus_scroll.clearScrollbarDrag(self);
+        self.pressed_button = null;
         return;
     }
     const root = self.root orelse return error.NotBuilt;
-    const hit = keywork.hitTestClick(root, point);
+    const hit = keywork.hitTestClick(root, point, event.button);
     const pressed_hit = if (self.pressed_id) |pressed_id| keywork.findClickHitById(root, pressed_id) else null;
     const should_activate = if (self.pressed_id) |pressed_id| blk: {
         const hit_id = if (hit) |click_hit| click_hit.id else break :blk false;
@@ -76,19 +95,20 @@ pub fn pointerUp(self: anytype, point: keywork.Point) !void {
     } else false;
 
     var needs_update = try setPressedId(self, null);
+    self.pressed_button = null;
     if (should_activate) {
         const click_hit = hit.?;
         if (click_hit.tap_up) |callback| {
-            try callback.call();
+            try callback.call(tapEvent(event, click_hit.rect));
             needs_update = true;
         }
         if (click_hit.activation == .release) {
             log.info("clicked button {s} at {d},{d}", .{ click_hit.id, point.x, point.y });
-            if (try activateClick(self, click_hit)) needs_update = true;
+            if (try activateClick(self, click_hit, tapEvent(event, click_hit.rect))) needs_update = true;
         }
     } else if (pressed_hit) |cancel_hit| {
         if (cancel_hit.tap_cancel) |callback| {
-            try callback.call();
+            try callback.call(tapEvent(event, cancel_hit.rect));
             needs_update = true;
         }
     }
@@ -114,7 +134,7 @@ pub fn keyInput(self: anytype, input: keywork.KeyInput) !void {
             switch (target.kind) {
                 .text_input => try editFocusedTextInput(self, .{ .append = " " }),
                 .clickable => {
-                    _ = try activateClick(self, .{ .id = target.id, .callback = target.callback });
+                    _ = try activateClick(self, .{ .id = target.id, .callback = target.callback }, .{ .source = .keyboard });
                     try self.invalidateState();
                 },
                 .focus => {},
@@ -129,7 +149,7 @@ pub fn keyInput(self: anytype, input: keywork.KeyInput) !void {
                     try self.invalidate();
                 },
                 .clickable => {
-                    _ = try activateClick(self, .{ .id = target.id, .callback = target.callback });
+                    _ = try activateClick(self, .{ .id = target.id, .callback = target.callback }, .{ .source = .keyboard });
                     try self.invalidateState();
                 },
                 .focus => {},
@@ -165,10 +185,10 @@ pub fn activateShortcut(self: anytype, input: keywork.KeyInput) !bool {
     return true;
 }
 
-pub fn activateClick(self: anytype, hit: keywork.ClickHit) !bool {
+pub fn activateClick(self: anytype, hit: keywork.ClickHit, event: keywork.TapEvent) !bool {
     _ = self;
     if (hit.callback) |callback| {
-        try callback.call();
+        try callback.call(event);
         return true;
     }
     return false;
@@ -198,7 +218,7 @@ pub fn pointerMove(self: anytype, point: ?keywork.Point) !void {
     }
     const hit_id = if (point) |position| blk: {
         const root = self.root orelse return error.NotBuilt;
-        break :blk if (keywork.hitTestClick(root, position)) |hit| hit.id else null;
+        break :blk if (keywork.hitTestClick(root, position, .left)) |hit| hit.id else null;
     } else null;
     if (!try setHoveredId(self, hit_id)) return;
     try self.invalidateState();
@@ -236,9 +256,9 @@ pub fn queueInteractionRefresh(self: anytype, id: []const u8) !void {
     try self.pending_interaction_ids.append(self.allocator, owned);
 }
 
-pub fn waylandPointerButton(comptime Runtime: type, ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void {
+pub fn waylandPointerButton(comptime Runtime: type, ctx: *anyopaque, event: keywork.PointerButtonEvent) void {
     const self: *Runtime = @ptrCast(@alignCast(ctx));
-    pointerButton(self, point, state) catch |err| log.err("pointer button handling failed: {}", .{err});
+    pointerButton(self, event) catch |err| log.err("pointer button handling failed: {}", .{err});
 }
 
 pub fn waylandCursorShape(comptime Runtime: type, ctx: *anyopaque, point: keywork.Point) keywork.CursorShape {

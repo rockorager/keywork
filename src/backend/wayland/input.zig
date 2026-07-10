@@ -131,7 +131,7 @@ const PendingPointer = struct {
     moved: bool = false,
     /// The pointer left the surface.
     left: bool = false,
-    buttons: [4]keywork.PointerButtonState = undefined,
+    buttons: [4]struct { button: keywork.PointerButton, state: keywork.PointerButtonState } = undefined,
     button_count: usize = 0,
     scroll_dx: f32 = 0,
     scroll_dy: f32 = 0,
@@ -143,11 +143,11 @@ const PendingPointer = struct {
     scroll_stopped: bool = false,
 };
 
-pub const PointerButtonHandler = *const fn (ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void;
+pub const PointerButtonHandler = *const fn (ctx: *anyopaque, event: keywork.PointerButtonEvent) void;
 pub const PointerMoveHandler = *const fn (ctx: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point) keywork.CursorShape;
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
-pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void;
+pub const ScrollHandler = *const fn (ctx: *anyopaque, event: keywork.ScrollEvent) void;
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -321,7 +321,14 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
         },
         .button => |button| {
             if (button.state == .pressed) self.last_button_press_serial = button.serial;
-            if (button.button != 272) return;
+            const pointer_button: keywork.PointerButton = switch (button.button) {
+                272 => .left,
+                273 => .right,
+                274 => .middle,
+                275 => .back,
+                276 => .forward,
+                else => return,
+            };
             const state: keywork.PointerButtonState = switch (button.state) {
                 .pressed => .pressed,
                 .released => .released,
@@ -330,7 +337,7 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
             if (state == .pressed) self.stopFling();
             const pending = &self.pending_pointer;
             if (pending.button_count < pending.buttons.len) {
-                pending.buttons[pending.button_count] = state;
+                pending.buttons[pending.button_count] = .{ .button = pointer_button, .state = state };
                 pending.button_count += 1;
             }
         },
@@ -376,8 +383,8 @@ fn flushPointerFrame(self: *Self) void {
         }
     }
     if (self.pointer_position) |point| {
-        for (pending.buttons[0..pending.button_count]) |state| {
-            self.dispatchPointerButton(point, state);
+        for (pending.buttons[0..pending.button_count]) |button| {
+            self.dispatchPointerButton(.{ .button = button.button, .state = button.state, .position = point, .modifiers = self.currentModifiers() });
         }
         if (pending.scrolled) {
             // Direct scrolling always overrides a running fling.
@@ -388,7 +395,7 @@ fn flushPointerFrame(self: *Self) void {
             };
             const dx = pending.scroll_dx * speed;
             const dy = pending.scroll_dy * speed;
-            dispatchScroll(self.pointer_target, point, dx, dy);
+            dispatchScroll(self.pointer_target, .{ .position = point, .dx = dx, .dy = dy, .modifiers = self.currentModifiers() });
             if (pending.scroll_source == .finger) {
                 self.trackScrollVelocity(dx, dy, pending.scroll_time_ms);
             } else {
@@ -447,9 +454,12 @@ fn flingTimerCallback(ctx: *anyopaque, _: *event_loop.EventLoop, expirations: u6
     const dt_ms: f32 = @floatFromInt(fling_interval_ms * @max(1, expirations));
     dispatchScroll(
         self.fling_target,
-        self.fling_point,
-        self.fling_velocity_x * dt_ms / 1000.0,
-        self.fling_velocity_y * dt_ms / 1000.0,
+        .{
+            .position = self.fling_point,
+            .dx = self.fling_velocity_x * dt_ms / 1000.0,
+            .dy = self.fling_velocity_y * dt_ms / 1000.0,
+            .modifiers = .{},
+        },
     );
     const decay = std.math.pow(f32, fling_decay_per_ms, dt_ms);
     self.fling_velocity_x *= decay;
@@ -464,14 +474,25 @@ fn dispatchPointerMove(self: *Self, point: ?keywork.Point) void {
     if (target.pointer_move_handler) |handler| handler(target.pointer_move_context.?, point);
 }
 
-fn dispatchScroll(target: ?*Target, point: keywork.Point, dx: f32, dy: f32) void {
+fn dispatchScroll(target: ?*Target, event: keywork.ScrollEvent) void {
     const resolved = target orelse return;
-    if (resolved.scroll_handler) |handler| handler(resolved.scroll_context.?, point, dx, dy);
+    if (resolved.scroll_handler) |handler| handler(resolved.scroll_context.?, event);
 }
 
-fn dispatchPointerButton(self: *Self, point: keywork.Point, state: keywork.PointerButtonState) void {
+fn dispatchPointerButton(self: *Self, event: keywork.PointerButtonEvent) void {
     const target = self.pointer_target orelse return;
-    if (target.pointer_button_handler) |handler| handler(target.pointer_button_context.?, point, state);
+    if (target.pointer_button_handler) |handler| handler(target.pointer_button_context.?, event);
+}
+
+fn currentModifiers(self: *const Self) keywork.Modifiers {
+    const state = self.xkb_state orelse return .{ .shift = self.shift_down };
+    const effective = xkb.XKB_STATE_MODS_EFFECTIVE;
+    return .{
+        .shift = xkb.xkb_state_mod_name_is_active(state, xkb.XKB_MOD_NAME_SHIFT, effective) != 0,
+        .ctrl = xkb.xkb_state_mod_name_is_active(state, xkb.XKB_MOD_NAME_CTRL, effective) != 0,
+        .alt = xkb.xkb_state_mod_name_is_active(state, xkb.XKB_VMOD_NAME_ALT, effective) != 0,
+        .super = xkb.xkb_state_mod_name_is_active(state, xkb.XKB_MOD_NAME_MOD4, effective) != 0,
+    };
 }
 
 fn createCursorShapeDevice(self: *Self) void {

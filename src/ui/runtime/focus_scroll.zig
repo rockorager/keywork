@@ -113,10 +113,20 @@ pub fn revealFocused(self: anytype) !void {
     }
 }
 
-pub fn scrollBy(self: anytype, point: keywork.Point, dx: f32, dy: f32) !void {
+pub fn scrollBy(self: anytype, event: keywork.ScrollEvent) !void {
     const root = self.root orelse return error.NotBuilt;
-    const id = keywork.hitTestScroll(root, point) orelse return;
-    try scrollElementById(self, id, dx, dy);
+    if (try dispatchScrollCallback(root, event)) return;
+    const id = keywork.hitTestScroll(root, event.position) orelse return;
+    try scrollElementById(self, id, event.dx, event.dy);
+}
+
+fn dispatchScrollCallback(root: *const keywork.RenderNode, event: keywork.ScrollEvent) !bool {
+    const hit = keywork.hitTestScrollCallback(root, event.position) orelse return false;
+    var local_event = event;
+    local_event.window_position = event.position;
+    local_event.position = .{ .x = event.position.x - hit.rect.x, .y = event.position.y - hit.rect.y };
+    try hit.callback.call(local_event);
+    return true;
 }
 
 pub fn scrollElementById(self: anytype, id: []const u8, dx: f32, dy: f32) !void {
@@ -137,9 +147,9 @@ pub fn scrollElementById(self: anytype, id: []const u8, dx: f32, dy: f32) !void 
     try self.invalidateState();
 }
 
-pub fn waylandScroll(comptime Runtime: type, ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void {
+pub fn waylandScroll(comptime Runtime: type, ctx: *anyopaque, event: keywork.ScrollEvent) void {
     const self: *Runtime = @ptrCast(@alignCast(ctx));
-    scrollBy(self, point, dx, dy) catch |err| {
+    scrollBy(self, event) catch |err| {
         log.err("scroll failed: {}", .{err});
     };
 }
@@ -149,6 +159,25 @@ pub fn findCollectedFocusTarget(targets: []const keywork.FocusTarget, id: []cons
         if (std.mem.eql(u8, target.id, id)) return target;
     }
     return null;
+}
+
+test "scroll callback consumes scrolling" {
+    const State = struct {
+        calls: usize = 0,
+        fn scroll(ptr: *anyopaque, event: keywork.ScrollEvent) !void {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            try std.testing.expectEqual(@as(f32, 3), event.position.x);
+        }
+    };
+    var state: State = .{};
+    var root: keywork.RenderNode = .{
+        .kind = .clickable,
+        .rect = .{ .x = 10, .y = 20, .width = 30, .height = 30 },
+        .scroll_event_callback = .{ .ptr = &state, .call_fn = State.scroll },
+    };
+    try std.testing.expect(try dispatchScrollCallback(&root, .{ .position = .{ .x = 13, .y = 24 }, .dx = 1, .dy = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
 }
 
 pub fn nextFocusTargetIndex(targets: []const keywork.FocusTarget, focused_id: ?[]const u8, scope_id: ?[]const u8, modal_scope_id: ?[]const u8, reverse: bool) ?usize {

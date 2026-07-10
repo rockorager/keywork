@@ -36,6 +36,23 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
                 if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border, node.box_border_width);
             }
         },
+        .separator => {
+            const rect: Rect = switch (node.separator_axis) {
+                .horizontal => .{
+                    .x = node.rect.x,
+                    .y = node.rect.y + node.separator_margin,
+                    .width = node.rect.width,
+                    .height = @max(0, node.rect.height - node.separator_margin * 2),
+                },
+                .vertical => .{
+                    .x = node.rect.x + node.separator_margin,
+                    .y = node.rect.y,
+                    .width = @max(0, node.rect.width - node.separator_margin * 2),
+                    .height = node.rect.height,
+                },
+            };
+            if (node.background.a > 0) try display_list.fillRect(allocator, rect, node.background);
+        },
         .text_input => {
             const border = if (node.focused) node.focused_border else node.border;
             if (node.box_radius > 0) {

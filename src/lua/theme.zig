@@ -14,6 +14,8 @@ pub const TextOptions = struct {
     size: ?f32 = null,
     font_size: ?f32 = null,
     role: ?keywork.TextRole = null,
+    max_lines: ?u32 = null,
+    overflow: ?keywork.Widget.TextOverflow = null,
 
     pub fn resolvedFontSize(self: TextOptions) ?f32 {
         return self.font_size orelse self.size;

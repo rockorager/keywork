@@ -83,6 +83,7 @@ pub fn reconcileInteractionAfterRebuild(self: anytype) void {
         if (keywork.findClickHitById(root, id) == null) {
             self.allocator.free(id);
             self.pressed_id = null;
+            self.pressed_button = null;
         }
     }
 }

@@ -241,9 +241,9 @@ const QueuedPlatformEvents = struct {
     };
 
     const Event = union(enum) {
-        pointer_button: struct { point: keywork.Point, state: keywork.PointerButtonState },
+        pointer_button: keywork.PointerButtonEvent,
         pointer_move: ?keywork.Point,
-        scroll: struct { point: keywork.Point, dx: f32, dy: f32 },
+        scroll: keywork.ScrollEvent,
         key: keywork.KeyInput,
         configure: keywork.Size,
         frame_done,
@@ -278,9 +278,9 @@ const QueuedPlatformEvents = struct {
         };
     }
 
-    fn pointerButton(ctx: *anyopaque, point: keywork.Point, state: keywork.PointerButtonState) void {
+    fn pointerButton(ctx: *anyopaque, event: keywork.PointerButtonEvent) void {
         const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
-        self.append(.{ .pointer_button = .{ .point = point, .state = state } });
+        self.append(.{ .pointer_button = event });
     }
 
     fn pointerMove(ctx: *anyopaque, point: ?keywork.Point) void {
@@ -288,9 +288,9 @@ const QueuedPlatformEvents = struct {
         self.append(.{ .pointer_move = point });
     }
 
-    fn scroll(ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void {
+    fn scroll(ctx: *anyopaque, event: keywork.ScrollEvent) void {
         const self: *QueuedPlatformEvents = @ptrCast(@alignCast(ctx));
-        self.append(.{ .scroll = .{ .point = point, .dx = dx, .dy = dy } });
+        self.append(.{ .scroll = event });
     }
 
     fn keyInput(ctx: *anyopaque, input: keywork.KeyInput) void {
@@ -323,15 +323,15 @@ const QueuedPlatformEvents = struct {
                 // A press on the parent surface outside every live popup's
                 // anchor dismisses the popups and is consumed, so clicking
                 // "through" an open menu never activates what's beneath.
-                if (!self.popup_surface and value.state == .pressed) {
+                if (!self.popup_surface and value.button == .left and value.state == .pressed) {
                     if (self.popup_manager) |manager| {
-                        if (try manager.parent_pointer_down(manager.ctx, value.point)) continue;
+                        if (try manager.parent_pointer_down(manager.ctx, value.position)) continue;
                     }
                 }
-                try self.runtime.pointerButton(value.point, value.state);
+                try self.runtime.pointerButton(value);
             },
             .pointer_move => |point| try self.runtime.pointerMove(point),
-            .scroll => |value| try self.runtime.scrollBy(value.point, value.dx, value.dy),
+            .scroll => |value| try self.runtime.scrollBy(value),
             .key => |input| switch (input) {
                 .escape => {
                     if (self.popup_manager) |manager| {

@@ -210,6 +210,51 @@ pub const PointerButtonState = enum {
     released,
 };
 
+pub const PointerButton = enum {
+    left,
+    right,
+    middle,
+    back,
+    forward,
+};
+
+pub const PointerButtons = struct {
+    left: bool = true,
+    right: bool = false,
+    middle: bool = false,
+    back: bool = false,
+    forward: bool = false,
+
+    pub fn accepts(self: PointerButtons, button: PointerButton) bool {
+        return switch (button) {
+            .left => self.left,
+            .right => self.right,
+            .middle => self.middle,
+            .back => self.back,
+            .forward => self.forward,
+        };
+    }
+
+    pub const any: PointerButtons = .{ .left = true, .right = true, .middle = true, .back = true, .forward = true };
+};
+
+pub const Modifiers = struct {
+    shift: bool = false,
+    ctrl: bool = false,
+    alt: bool = false,
+    super: bool = false,
+};
+
+pub const TapSource = enum { pointer, keyboard };
+
+pub const TapEvent = struct {
+    source: TapSource,
+    button: ?PointerButton = null,
+    position: ?Point = null,
+    local: ?Point = null,
+    modifiers: Modifiers = .{},
+};
+
 pub const ShortcutKey = enum {
     enter,
     space,
@@ -243,6 +288,22 @@ pub const Size = struct {
 pub const Point = struct {
     x: f32,
     y: f32,
+};
+
+pub const PointerButtonEvent = struct {
+    button: PointerButton,
+    state: PointerButtonState,
+    position: Point,
+    window_position: ?Point = null,
+    modifiers: Modifiers = .{},
+};
+
+pub const ScrollEvent = struct {
+    dx: f32,
+    dy: f32,
+    position: Point,
+    window_position: ?Point = null,
+    modifiers: Modifiers = .{},
 };
 
 pub const Rect = struct {
