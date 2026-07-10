@@ -25,6 +25,10 @@ keyboard_target: ?*Target = null,
 /// affecting the window it began on even after the pointer leaves.
 fling_target: ?*Target = null,
 seat: ?*wl.Seat = null,
+/// True once attachListeners has run; capability-driven device creation
+/// installs pointer/keyboard listeners only after this is set so init and
+/// attachListeners do not double-register (wl_proxy allows one dispatcher).
+listeners_attached: bool = false,
 pointer: ?*wl.Pointer = null,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
 cursor_shape_device: ?*wp.CursorShapeDeviceV1 = null,
@@ -145,24 +149,24 @@ pub const CursorShapeHandler = *const fn (ctx: *anyopaque, point: keywork.Point)
 pub const KeyHandler = *const fn (ctx: *anyopaque, input: keywork.KeyInput) void;
 pub const ScrollHandler = *const fn (ctx: *anyopaque, point: keywork.Point, dx: f32, dy: f32) void;
 
-pub fn init(allocator: std.mem.Allocator, seat: ?*wl.Seat, cursor_shape_manager: ?*wp.CursorShapeManagerV1) !Self {
+pub fn init(
+    allocator: std.mem.Allocator,
+    seat: ?*wl.Seat,
+    capabilities: wl.Seat.Capability,
+    cursor_shape_manager: ?*wp.CursorShapeManagerV1,
+) !Self {
     const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
-    const pointer = if (seat) |wl_seat| pointer: {
-        break :pointer wl_seat.getPointer() catch null;
-    } else null;
-    const keyboard = if (seat) |wl_seat| keyboard: {
-        break :keyboard wl_seat.getKeyboard() catch null;
-    } else null;
 
     var self: Self = .{
         .allocator = allocator,
         .seat = seat,
-        .pointer = pointer,
         .cursor_shape_manager = cursor_shape_manager,
-        .keyboard = keyboard,
         .xkb_context = xkb_context,
     };
-    self.createCursorShapeDevice();
+    // Only bind devices the seat has advertised. Calling get_pointer on a
+    // seat that has never had the pointer capability is a protocol error
+    // (e.g. headless sway with no input devices).
+    self.applySeatCapabilities(capabilities);
     return self;
 }
 
@@ -177,9 +181,24 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn attachListeners(self: *Self) void {
-    if (self.seat) |seat| seat.setListener(*Self, seatListener, self);
+    // The seat listener lives on Connection (installed at bind time) so the
+    // initial capabilities event is not dropped. Capability updates are
+    // forwarded via handleSeatCapabilities.
+    self.listeners_attached = true;
     if (self.pointer) |pointer| pointer.setListener(*Self, pointerListener, self);
     if (self.keyboard) |keyboard| keyboard.setListener(*Self, keyboardListener, self);
+}
+
+/// Apply a `wl_seat.capabilities` update from the connection-owned seat
+/// listener. Safe to call before or after attachListeners.
+pub fn handleSeatCapabilities(self: *Self, capabilities: wl.Seat.Capability) void {
+    self.applySeatCapabilities(capabilities);
+}
+
+/// Opaque callback for Connection.setSeatCapabilitiesHandler.
+pub fn seatCapabilitiesCallback(ctx: *anyopaque, capabilities: wl.Seat.Capability) void {
+    const self: *Self = @ptrCast(@alignCast(ctx));
+    self.handleSeatCapabilities(capabilities);
 }
 
 /// Register a window's input target. The target's surface identifies the
@@ -234,33 +253,45 @@ pub fn uninstallEventTimers(self: *Self) void {
     self.timer_loop = null;
 }
 
-fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
-    switch (event) {
-        .capabilities => |caps| {
-            if (caps.capabilities.pointer and self.pointer == null) {
-                self.pointer = seat.getPointer() catch null;
+/// Bind or release pointer/keyboard to match the seat's advertised
+/// capabilities. Safe to call with no seat (no-op). Listeners are installed
+/// only after attachListeners so init does not race with the first attach.
+fn applySeatCapabilities(self: *Self, capabilities: wl.Seat.Capability) void {
+    const seat = self.seat orelse return;
+
+    if (capabilities.pointer) {
+        if (self.pointer == null) {
+            self.pointer = seat.getPointer() catch null;
+            if (self.listeners_attached) {
                 if (self.pointer) |pointer| pointer.setListener(*Self, pointerListener, self);
-                self.createCursorShapeDevice();
-            } else if (!caps.capabilities.pointer and self.pointer != null) {
-                self.destroyCursorShapeDevice();
-                self.pointer.?.release();
-                self.pointer = null;
-                self.pointer_position = null;
-                self.pointer_enter_serial = null;
-                self.cursor_shape = null;
             }
-            if (caps.capabilities.keyboard and self.keyboard == null) {
-                self.keyboard = seat.getKeyboard() catch null;
+            self.createCursorShapeDevice();
+        }
+    } else if (self.pointer != null) {
+        self.destroyCursorShapeDevice();
+        self.pointer.?.release();
+        self.pointer = null;
+        self.pointer_target = null;
+        self.pointer_position = null;
+        self.pointer_enter_serial = null;
+        self.cursor_shape = null;
+        self.pending_pointer = .{};
+    }
+
+    if (capabilities.keyboard) {
+        if (self.keyboard == null) {
+            self.keyboard = seat.getKeyboard() catch null;
+            if (self.listeners_attached) {
                 if (self.keyboard) |keyboard| keyboard.setListener(*Self, keyboardListener, self);
-            } else if (!caps.capabilities.keyboard and self.keyboard != null) {
-                self.keyboard.?.release();
-                self.keyboard = null;
-                self.shift_down = false;
-                self.stopKeyRepeat();
-                self.clearXkbKeymap();
             }
-        },
-        .name => {},
+        }
+    } else if (self.keyboard != null) {
+        self.keyboard.?.release();
+        self.keyboard = null;
+        self.keyboard_target = null;
+        self.shift_down = false;
+        self.stopKeyRepeat();
+        self.clearXkbKeymap();
     }
 }
 

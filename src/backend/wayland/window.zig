@@ -334,9 +334,12 @@ const GlobalNeeds = struct {
     outputs: bool = false,
 };
 
-/// Owns the Wayland connection and all registry globals. Seats are moved to
-/// the input subsystem after its initialization succeeds; every other proxy
-/// remains connection-owned for its full lifetime.
+/// Owns the Wayland connection and all registry globals. Single-seat: only
+/// the first advertised `wl_seat` is bound; later seat globals are ignored.
+/// The seat proxy is moved to the input subsystem after its initialization
+/// succeeds, but the seat event listener stays connection-owned (wl_proxy
+/// allows only one dispatcher) so the initial capabilities event is not
+/// dropped. Every other proxy remains connection-owned for its full lifetime.
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     needs: GlobalNeeds,
@@ -350,6 +353,18 @@ pub const Connection = struct {
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     seat: ?*wl.Seat = null,
+    /// True once the first seat global has been bound. Survives takeSeat()
+    /// so a later seat advertisement cannot overwrite selection or forward
+    /// another seat's capabilities into the single WaylandInput.
+    seat_selected: bool = false,
+    /// Last `wl_seat.capabilities` observed on the selected seat. Input must
+    /// not call get_pointer/get_keyboard until this reports the matching
+    /// capability.
+    seat_capabilities: wl.Seat.Capability = .{},
+    /// Forwarded on each capabilities event after the initial bind so input
+    /// can bind/release devices without owning the seat listener.
+    seat_capabilities_ctx: ?*anyopaque = null,
+    seat_capabilities_fn: ?*const fn (ctx: *anyopaque, capabilities: wl.Seat.Capability) void = null,
     outputs: std.ArrayList(OutputRef) = .empty,
     /// Fired when the output set or an output's properties change:
     /// hotplug adds (after the initial done), removals, and mode/scale
@@ -377,10 +392,11 @@ pub const Connection = struct {
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         if (self.compositor == null) return error.NoWlCompositor;
         if (needs.shm and self.shm == null) return error.NoWlShm;
-        // Output listeners were installed during the first roundtrip; a
-        // second collects the initial name/mode/scale bursts so output
-        // info is complete before the caller reads it.
-        if (needs.outputs and self.outputs.items.len > 0) {
+        // Seat and output listeners were installed during the first
+        // roundtrip; their bind requests are only flushed after that
+        // roundtrip ends. A second collects the initial seat capabilities
+        // and output name/mode/scale bursts so callers see complete state.
+        if (self.seat_selected or (needs.outputs and self.outputs.items.len > 0)) {
             if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         }
         return self;
@@ -409,6 +425,23 @@ pub const Connection = struct {
         const seat = self.seat;
         self.seat = null;
         return seat;
+    }
+
+    /// Capabilities from the seat's initial (and any subsequent) events.
+    /// Valid to read after init and after takeSeat.
+    pub fn seatCapabilities(self: *const Connection) wl.Seat.Capability {
+        return self.seat_capabilities;
+    }
+
+    /// Register a handler for later `wl_seat.capabilities` changes. The seat
+    /// listener is installed at bind time and cannot be reassigned.
+    pub fn setSeatCapabilitiesHandler(
+        self: *Connection,
+        ctx: *anyopaque,
+        handler: *const fn (ctx: *anyopaque, capabilities: wl.Seat.Capability) void,
+    ) void {
+        self.seat_capabilities_ctx = ctx;
+        self.seat_capabilities_fn = handler;
     }
 
     pub fn setOutputsChangedHandler(self: *Connection, ctx: *anyopaque, handler: *const fn (ctx: *anyopaque) void) void {
@@ -467,6 +500,30 @@ fn outputListener(output: *wl.Output, event: wl.Output.Event, connection: *Conne
     }
 }
 
+/// Single-seat registry policy: bind a seat global only before one has been
+/// selected. Independent of the seat proxy pointer so takeSeat() can transfer
+/// ownership without reopening selection.
+fn shouldBindSeat(seat_selected: bool) bool {
+    return !seat_selected;
+}
+
+test shouldBindSeat {
+    try std.testing.expect(shouldBindSeat(false));
+    try std.testing.expect(!shouldBindSeat(true));
+}
+
+fn connectionSeatListener(_: *wl.Seat, event: wl.Seat.Event, self: *Connection) void {
+    switch (event) {
+        .capabilities => |caps| {
+            self.seat_capabilities = caps.capabilities;
+            if (self.seat_capabilities_fn) |handler| {
+                handler(self.seat_capabilities_ctx.?, caps.capabilities);
+            }
+        },
+        .name => {},
+    }
+}
+
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Connection) void {
     switch (event) {
         .global => |global| {
@@ -485,7 +542,16 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
                 self.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
-                self.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+                // Single-seat: bind only the first seat. seat_selected outlives
+                // takeSeat() (which nulls self.seat) so later seats stay unbound
+                // and cannot feed capabilities into WaylandInput.
+                if (!shouldBindSeat(self.seat_selected)) return;
+                // Install the listener before the roundtrip continues so the
+                // compositor's initial capabilities event is not dropped.
+                const seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+                self.seat = seat;
+                self.seat_selected = true;
+                seat.setListener(*Connection, connectionSeatListener, self);
             } else if (self.needs.outputs and std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
                 const output = registry.bind(global.name, wl.Output, @min(global.version, 4)) catch return;
                 self.outputs.append(self.allocator, .{ .global_name = global.name, .output = output }) catch {

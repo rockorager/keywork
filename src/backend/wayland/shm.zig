@@ -48,7 +48,7 @@ pub const Backend = struct {
         errdefer text_renderer_instance.deinit();
 
         const seat = connection.takeSeat();
-        var input = WaylandInput.init(allocator, seat, connection.cursor_shape_manager) catch |err| {
+        var input = WaylandInput.init(allocator, seat, connection.seatCapabilities(), connection.cursor_shape_manager) catch |err| {
             if (seat) |wl_seat| wl_seat.release();
             return err;
         };
@@ -65,6 +65,9 @@ pub const Backend = struct {
         };
 
         window.installWmBaseListener(self.connection.wm_base);
+        // Seat listener stays on the connection; forward capability changes
+        // into input once it lives at its final address.
+        self.connection.setSeatCapabilitiesHandler(&self.input, WaylandInput.seatCapabilitiesCallback);
         self.input.attachListeners();
         return self;
     }
