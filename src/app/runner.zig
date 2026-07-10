@@ -477,6 +477,9 @@ const PopupManager = struct {
         );
         errdefer surface.runtime.deinit();
         surface.queue.runtime = &surface.runtime;
+        // Popups clear to transparent like layer-shell surfaces: the content
+        // paints its own background, so rounded corners stay see-through.
+        surface.runtime.setFrameBackground(keywork.colors.transparent);
         surface.runtime.setDeferredRepaint(true);
         surface.runtime.repaint_pending = true;
 
