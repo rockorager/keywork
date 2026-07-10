@@ -100,6 +100,11 @@ pub const Runtime = struct {
     frame_pending: bool = false,
     rendering: bool = false,
     defer_repaint_until_flush: bool = false,
+    /// Size and scale of the last presented frame. A repaint whose rebuild
+    /// passes produced no damage at an unchanged size and scale presents
+    /// nothing, so app-wide state invalidations don't repaint clean windows.
+    presented_size: ?keywork.Size = null,
+    presented_scale: f32 = 0,
     repaint_scheduler: ?RepaintScheduler = null,
     repaint_scheduler_context: ?*anyopaque = null,
 
@@ -554,6 +559,57 @@ test "rebuild passes that never stabilize return an error" {
     app.runtime = &runtime;
 
     try std.testing.expectError(error.RebuildDidNotStabilize, runtime.invalidate());
+}
+
+test "state invalidation that changes nothing presents nothing" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            return keywork.widgets.text("hello");
+        }
+    };
+
+    const TestBackend = struct {
+        presents: usize = 0,
+
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.presents += 1;
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    defer runtime.deinit();
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(usize, 1), backend.presents);
+
+    // App-wide state invalidations reach every window; one that dirties no
+    // scope here must relayout nothing and skip the present entirely.
+    try runtime.invalidateState();
+    try std.testing.expectEqual(@as(usize, 1), backend.presents);
+
+    // A full rebuild lays out a fresh tree and still presents.
+    try runtime.invalidate();
+    try std.testing.expectEqual(@as(usize, 2), backend.presents);
 }
 
 fn renderedInputText(node: *const RenderNode) ?[]const u8 {

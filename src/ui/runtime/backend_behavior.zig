@@ -51,16 +51,25 @@ pub fn presentFrame(self: anytype) !void {
     self.repaint_pending = false;
 
     const root = self.root orelse return error.NotBuilt;
-    self.display_list.clearRetainingCapacity(self.allocator);
     const frame_size = self.frameSize();
+    const render_scale = self.renderScale();
     const full_frame: keywork.Rect = .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height };
-    // Damage accumulated by relayout since the last collection; a
-    // repaint without any layout change (e.g. a scale change) reports
-    // the full frame.
-    const damage = if (keywork.collectDamage(root)) |dirty| dirty.intersect(full_frame) else full_frame;
+    // Damage accumulated by relayout since the last collection. Painted
+    // nodes damage whenever they re-lay out, so no damage at an unchanged
+    // size and scale means the frame is pixel-identical to the last
+    // present: skip it, so app-wide state invalidations don't repaint
+    // clean windows. A size or scale change (or first frame) still
+    // repaints the full frame conservatively.
+    const collected = keywork.collectDamage(root);
+    if (collected == null) {
+        if (self.presented_size) |presented| {
+            if (std.meta.eql(presented, frame_size) and self.presented_scale == render_scale) return;
+        }
+    }
+    const damage = if (collected) |dirty| dirty.intersect(full_frame) else full_frame;
+    self.display_list.clearRetainingCapacity(self.allocator);
     const background = self.frameBackground();
     if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
-    const render_scale = self.renderScale();
     try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
     self.frame_pending = try self.backend.present(.{
         .size = frame_size,
@@ -68,6 +77,8 @@ pub fn presentFrame(self: anytype) !void {
         .damage = &.{damage},
         .display_list = self.display_list.commands.items,
     });
+    self.presented_size = frame_size;
+    self.presented_scale = render_scale;
 }
 
 pub fn frameDone(self: anytype) !void {
