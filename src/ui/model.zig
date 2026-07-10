@@ -116,6 +116,7 @@ pub const Widget = union(enum) {
         on_tap_cancel: ?Callback = null,
         activation: ClickActivation = .release,
         hover_style: ?ClickableStyle = null,
+        cursor: CursorShape = .default,
     };
 
     pub const ClickableStyle = struct {
@@ -962,6 +963,7 @@ pub const RenderNode = struct {
     tap_up_callback: ?Widget.Callback = null,
     tap_cancel_callback: ?Widget.Callback = null,
     click_activation: Widget.ClickActivation = .release,
+    click_cursor: CursorShape = .default,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,
     focus_scope_id: ?[]const u8 = null,
@@ -2288,6 +2290,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .on_tap_cancel = tap_cancel,
                 .activation = clickable_widget.activation,
                 .hover_style = clickableHoverStyle(clickable_widget),
+                .cursor = clickable_widget.cursor,
             } };
         },
         .anchored => |anchored_widget| blk: {

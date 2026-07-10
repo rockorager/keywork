@@ -28,6 +28,7 @@ pub const ClickHit = struct {
     tap_up: ?Widget.Callback = null,
     tap_cancel: ?Widget.Callback = null,
     activation: Widget.ClickActivation = .release,
+    cursor: CursorShape = .default,
 };
 
 pub const FocusTarget = struct {
@@ -139,6 +140,7 @@ pub fn hitTestClick(node: *const RenderNode, point: Point) ?ClickHit {
             .tap_up = node.tap_up_callback,
             .tap_cancel = node.tap_cancel_callback,
             .activation = node.click_activation,
+            .cursor = node.click_cursor,
         };
     }
     if (node.kind == .render_object) {
@@ -254,6 +256,6 @@ fn revealDelta(start: f32, extent: f32, viewport_start: f32, viewport_extent: f3
 
 pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
     if (hitTestTextInput(node, point) != null) return .text;
-    if (hitTestClick(node, point) != null) return .pointer;
+    if (hitTestClick(node, point)) |hit| return hit.cursor;
     return .default;
 }

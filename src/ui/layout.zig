@@ -235,6 +235,7 @@ fn layoutElementInto(
                 .tap_up_callback = clickable_widget.on_tap_up,
                 .tap_cancel_callback = clickable_widget.on_tap_cancel,
                 .click_activation = clickable_widget.activation,
+                .click_cursor = clickable_widget.cursor,
             });
         },
         .anchored => {

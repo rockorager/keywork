@@ -77,6 +77,7 @@ const BoxOptions = struct {
 
 const GestureOptions = struct {
     hover_background: ?keywork.Color = null,
+    cursor: keywork.CursorShape = .default,
 
     fn hoverStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
         if (self.hover_background == null) return null;
@@ -645,6 +646,7 @@ pub fn parse(
             .on_tap_up = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_up"),
             .on_tap_cancel = try getOptionalCallbackField(lua_state, callback_allocator, table, "on_tap_cancel"),
             .hover_style = options.hoverStyle(),
+            .cursor = options.cursor,
         } };
     }
     if (std.mem.eql(u8, kind, "anchored")) {
