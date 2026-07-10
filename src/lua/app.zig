@@ -889,6 +889,8 @@ test "scriptChunk handles a shebang-only file" {
 
 const embedded_ui_source = @embedFile("ui.lua");
 const embedded_service_source = @embedFile("service.lua");
+const embedded_process_source = @embedFile("process.lua");
+const embedded_stream_source = @embedFile("stream.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
@@ -921,6 +923,9 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 
     c.lua_pushcclosure(lua_state, serviceModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.service");
+
+    c.lua_pushcclosure(lua_state, streamModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.stream");
 
     pop(lua_state, 2);
 }
@@ -959,10 +964,21 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    c.lua_createtable(lua_state, 0, 1);
+    c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaSpawn, 1);
     c.lua_setfield(lua_state, -2, "spawn");
+    // The embedded Lua layer augments the native table in place (capture, ...).
+    if (c.luaL_loadbuffer(lua_state, embedded_process_source.ptr, embedded_process_source.len, "@keywork/process.lua") != 0) return c.lua_error(lua_state);
+    c.lua_pushvalue(lua_state, -2);
+    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn streamModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_stream_source.ptr, embedded_stream_source.len, "@keywork/stream.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     return 1;
 }
 
@@ -3126,6 +3142,158 @@ test "lua process spawn captures stdout and exit" {
     c.lua_getglobal(app.state, "spawn_cancel");
     try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+}
+
+test "lua stream.lines splits chunks and yields the unterminated tail" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local stream = require("keywork.stream")
+        \\
+        \\local function chunks(list)
+        \\  local index = 0
+        \\  return function()
+        \\    index = index + 1
+        \\    return list[index]
+        \\  end
+        \\end
+        \\
+        \\local function collect(iter)
+        \\  local lines = {}
+        \\  for line in iter do
+        \\    table.insert(lines, line)
+        \\  end
+        \\  return lines
+        \\end
+        \\
+        \\-- lines split across chunk boundaries, plus an unterminated tail
+        \\local got = collect(stream.lines(chunks({ "al", "pha\nbe", "ta\ngam", "ma" })))
+        \\assert(#got == 3)
+        \\assert(got[1] == "alpha")
+        \\assert(got[2] == "beta")
+        \\assert(got[3] == "gamma")
+        \\
+        \\-- empty lines survive; trailing newline yields no phantom line
+        \\got = collect(stream.lines(chunks({ "a\n\nb\n" })))
+        \\assert(#got == 3)
+        \\assert(got[1] == "a")
+        \\assert(got[2] == "")
+        \\assert(got[3] == "b")
+        \\
+        \\-- empty stream yields nothing
+        \\got = collect(stream.lines(chunks({})))
+        \\assert(#got == 0)
+        \\
+        \\return kw.app({ child = kw.text("lines") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lines.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "lines.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua process.capture collects output and exit status" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local process = require("keywork.process")
+        \\local loop = require("keywork.loop")
+        \\
+        \\capture_done = false
+        \\capture_ok = false
+        \\local App = kw.stateful({
+        \\  init = function(self)
+        \\    loop.spawn(function()
+        \\      local result = process.capture({
+        \\        argv = { "/bin/sh", "-c", "printf out; printf err >&2; exit 3" },
+        \\      })
+        \\      capture_ok = result ~= nil
+        \\        and result.stdout == "out"
+        \\        and result.stderr == "err"
+        \\        and result.ok == false
+        \\        and result.code == 3
+        \\      -- plain argv array form
+        \\      local hello = process.capture({ "/usr/bin/printf", "hello" })
+        \\      capture_ok = capture_ok
+        \\        and hello ~= nil
+        \\        and hello.stdout == "hello"
+        \\        and hello.stderr == ""
+        \\        and hello.ok
+        \\        and hello.code == 0
+        \\      -- missing executable reports nil, err
+        \\      local missing, err = process.capture({ "keywork-test-no-such-binary" })
+        \\      capture_ok = capture_ok and missing == nil and type(err) == "string"
+        \\      capture_done = true
+        \\    end)
+        \\  end,
+        \\  build = function(self, state)
+        \\    return kw.text("capture")
+        \\  end,
+        \\})
+        \\return kw.app({ child = App({ key = "app" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "capture.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "capture.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.repaint();
+
+    const CaptureTest = struct {
+        app: *App,
+        ticks: usize = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            c.lua_getglobal(self.app.state, "capture_done");
+            const done = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (done or self.ticks > 1000) event_loop_instance.quit();
+        }
+    };
+
+    app.bindRuntime(&runtime);
+    defer app.unbindRuntime();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+    var context: CaptureTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, CaptureTest.callback);
+    try loop.run();
+
+    c.lua_getglobal(app.state, "capture_done");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    c.lua_getglobal(app.state, "capture_ok");
+    defer pop(app.state, 1);
+    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
 }
 
 test "lua process spawn reports a missing executable as nil, err" {
