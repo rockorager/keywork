@@ -1851,6 +1851,49 @@ test "shared service starts once, fans out, and stops with its last subscriber" 
     try app.ensureLoaded();
 }
 
+test "restarting a settled service body tears down its old scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A body that returns while children it spawned are still running
+    // must not be respawned next to them: restart cancels the old scope
+    // first, so the service's work is never duplicated.
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local service = require("keywork.service")
+        \\starts = 0
+        \\children = {}
+        \\local svc = service.define("settling", function(self)
+        \\  starts = starts + 1
+        \\  table.insert(children, loop.spawn(function()
+        \\    loop.sleep(3600000)
+        \\  end))
+        \\  self:publish(starts)
+        \\end)
+        \\local s1 = loop.scope()
+        \\svc:use(s1, function() end)
+        \\assert(starts == 1)
+        \\assert(svc.task:status() == "completed")
+        \\assert(children[1]:status() == "running")
+        \\local s2 = loop.scope()
+        \\svc:use(s2, function() end)
+        \\assert(starts == 2)
+        \\assert(children[1]:status() == "canceled")
+        \\assert(children[2]:status() == "running")
+        \\return kw.app({ child = kw.text("service-restart") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service-restart.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service-restart.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
 test "reload resets stale service entries" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

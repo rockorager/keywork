@@ -51,6 +51,11 @@ function Service:use(scope, on_change)
     self.scope = loop.scope()
     self.task = self.scope:spawn(self.start, self)
   elseif self.task and self.task:status() ~= "running" then
+    -- A settled body may have left spawned children in its scope;
+    -- respawning next to them would duplicate the service's work, so a
+    -- restart is a full teardown: cancel the old scope and start fresh.
+    self.scope:cancel()
+    self.scope = loop.scope()
     self.task = self.scope:spawn(self.start, self)
   end
 
