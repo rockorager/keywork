@@ -153,6 +153,11 @@ pub const Backend = struct {
         _ = self.connection.display.flush();
     }
 
+    pub fn repositionPopup(self: *Backend, win: *Window, options: window.PopupOptions, token: u32) !void {
+        try win.protocol.repositionPopup(self.connection, options, token);
+        _ = self.connection.display.flush();
+    }
+
     pub fn installEventTimers(self: *Backend, loop: *event_loop.EventLoop) !void {
         try self.input.installEventTimers(loop);
     }

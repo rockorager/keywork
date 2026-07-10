@@ -124,13 +124,7 @@ pub const Surface = struct {
 
         const positioner = try wm_base.createPositioner();
         defer positioner.destroy();
-        positioner.setSize(options.width, options.height);
-        positioner.setAnchorRect(options.anchor_x, options.anchor_y, @max(options.anchor_width, 1), @max(options.anchor_height, 1));
-        positioner.setAnchor(popupAnchor(options.edge, options.alignment));
-        positioner.setGravity(popupGravity(options.edge, options.alignment));
-        positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_x = true, .flip_y = true });
-        const offset = popupOffset(options.edge, options.gap);
-        positioner.setOffset(offset.x, offset.y);
+        configurePopupPositioner(positioner, options);
 
         const parent_xdg_surface: ?*xdg.Surface = switch (parent.shell_role) {
             .xdg => |role| role.surface,
@@ -157,6 +151,24 @@ pub const Surface = struct {
             .height = options.height,
             .scale = parent.scale,
         };
+    }
+
+    /// Requests new geometry for an already mapped popup. xdg-shell v3
+    /// added reposition specifically for replacing all of a popup's
+    /// positioner state, including its desired size.
+    pub fn repositionPopup(self: *Surface, connection: *const Connection, options: PopupOptions, token: u32) !void {
+        const role = switch (self.shell_role) {
+            .popup => |role| role,
+            else => return error.NotPopup,
+        };
+        if (role.popup.getVersion() < 3) return error.PopupRepositionUnsupported;
+        const wm_base = connection.wm_base orelse return error.NoXdgWmBase;
+        std.debug.assert(options.width > 0 and options.height > 0);
+
+        const positioner = try wm_base.createPositioner();
+        defer positioner.destroy();
+        configurePopupPositioner(positioner, options);
+        role.popup.reposition(positioner, token);
     }
 
     pub fn deinit(self: *Surface) void {
@@ -709,6 +721,16 @@ fn popupOffset(edge: keywork.Widget.PopupPlacement.Edge, gap: i32) struct { x: i
         .right => .{ .x = gap, .y = 0 },
         .left => .{ .x = -gap, .y = 0 },
     };
+}
+
+fn configurePopupPositioner(positioner: *xdg.Positioner, options: PopupOptions) void {
+    positioner.setSize(options.width, options.height);
+    positioner.setAnchorRect(options.anchor_x, options.anchor_y, @max(options.anchor_width, 1), @max(options.anchor_height, 1));
+    positioner.setAnchor(popupAnchor(options.edge, options.alignment));
+    positioner.setGravity(popupGravity(options.edge, options.alignment));
+    positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_x = true, .flip_y = true });
+    const offset = popupOffset(options.edge, options.gap);
+    positioner.setOffset(offset.x, offset.y);
 }
 
 fn layer(value: wayland_options.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {

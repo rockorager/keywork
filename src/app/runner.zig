@@ -387,6 +387,7 @@ fn PopupManager(comptime Backend: type) type {
         parent: *Backend.Window,
         runtime: *runtime_mod.Runtime,
         popups: std.ArrayList(*PopupSurface) = .empty,
+        next_reposition_token: u32 = 1,
 
         const Self = @This();
 
@@ -454,6 +455,11 @@ fn PopupManager(comptime Backend: type) type {
             /// Anchor rect in parent-window coordinates; refreshed on every
             /// reconcile pass so parent-press hit-testing tracks layout.
             anchor_rect: keywork.Rect,
+            /// Last natural dimensions requested from the compositor.
+            /// The configured size can be smaller when screen constraints
+            /// force the compositor to resize the popup.
+            requested_width: u31,
+            requested_height: u31,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             /// Borrowed from the main element tree; refreshed on every
@@ -503,6 +509,14 @@ fn PopupManager(comptime Backend: type) type {
                 if (self.findPopup(request.id)) |popup| {
                     popup.popup = request.popup;
                     popup.anchor_rect = request.anchor_rect;
+                    // measureContent builds a fresh tree, so it reflects
+                    // updated parent-owned popup declarations but not state
+                    // retained only inside the popup runtime.
+                    if (content_dirty) {
+                        self.resizePopup(popup, request) catch |err| {
+                            log.warn("popup {s} resize failed: {}", .{ request.id, err });
+                        };
+                    }
                     if (content_dirty) {
                         popup.runtime.rebuild_pending = true;
                         popup.runtime.repaint_pending = true;
@@ -534,6 +548,8 @@ fn PopupManager(comptime Backend: type) type {
 
         fn createPopup(self: *Self, request: keywork.PopupRequest) !void {
             const size = try self.measureContent(request.popup);
+            const width = try positiveU31(size.width);
+            const height = try positiveU31(size.height);
             const rect = request.anchor_rect;
 
             const surface = try self.allocator.create(PopupSurface);
@@ -546,8 +562,8 @@ fn PopupManager(comptime Backend: type) type {
             errdefer if (first_popup) self.backend.setPopupKeyboardFocus(self.parent, false);
 
             const win = try self.backend.createPopup(self.parent, .{
-                .width = try positiveU31(size.width),
-                .height = try positiveU31(size.height),
+                .width = width,
+                .height = height,
                 .anchor_x = @intFromFloat(@floor(rect.x)),
                 .anchor_y = @intFromFloat(@floor(rect.y)),
                 .anchor_width = @intFromFloat(@max(1, @ceil(rect.width))),
@@ -562,6 +578,8 @@ fn PopupManager(comptime Backend: type) type {
                 .id = id,
                 .win = win,
                 .anchor_rect = request.anchor_rect,
+                .requested_width = width,
+                .requested_height = height,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
@@ -591,6 +609,35 @@ fn PopupManager(comptime Backend: type) type {
             win.setScrollHandler(&surface.queue, QueuedPlatformEvents.scroll);
 
             try self.popups.append(self.allocator, surface);
+        }
+
+        /// Re-measures dirty popup content and asks xdg-shell to replace the
+        /// live popup's positioner when its natural dimensions changed.
+        /// The compositor's configure event then updates the runtime
+        /// constraints used for subsequent frames.
+        fn resizePopup(self: *Self, popup: *PopupSurface, request: keywork.PopupRequest) !void {
+            const size = try self.measureContent(request.popup);
+            const width = try positiveU31(size.width);
+            const height = try positiveU31(size.height);
+            if (width == popup.requested_width and height == popup.requested_height) return;
+
+            const rect = request.anchor_rect;
+            const token = self.next_reposition_token;
+            self.next_reposition_token +%= 1;
+            if (self.next_reposition_token == 0) self.next_reposition_token = 1;
+            try self.backend.repositionPopup(popup.win, .{
+                .width = width,
+                .height = height,
+                .anchor_x = @intFromFloat(@floor(rect.x)),
+                .anchor_y = @intFromFloat(@floor(rect.y)),
+                .anchor_width = @intFromFloat(@max(1, @ceil(rect.width))),
+                .anchor_height = @intFromFloat(@max(1, @ceil(rect.height))),
+                .edge = request.popup.placement.edge,
+                .alignment = request.popup.placement.alignment,
+                .gap = @intFromFloat(@round(request.popup.placement.gap)),
+            }, token);
+            popup.requested_width = width;
+            popup.requested_height = height;
         }
 
         fn destroyPopup(self: *Self, index: usize) void {

@@ -151,6 +151,11 @@ pub const Backend = struct {
         _ = self.connection.display.flush();
     }
 
+    pub fn repositionPopup(self: *Backend, win: *Window, options: window.PopupOptions, token: u32) !void {
+        try win.protocol.repositionPopup(self.connection, options, token);
+        _ = self.connection.display.flush();
+    }
+
     pub fn outputCount(self: *const Backend) usize {
         return self.connection.outputs.items.len;
     }
