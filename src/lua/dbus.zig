@@ -1844,11 +1844,20 @@ fn writeDbusIntrospectionArgs(writer: *std.Io.Writer, lua_state: *c.lua_State, t
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return;
     const signature = try stringFromStack(lua_state, -1);
-    if (signature.len == 0) return;
-    if (direction) |dir| {
-        try writer.print("      <arg type=\"{s}\" direction=\"{s}\"/>\n", .{ signature, dir });
-    } else {
-        try writer.print("      <arg type=\"{s}\"/>\n", .{signature});
+    try writeDbusSignatureArgs(writer, signature, direction);
+}
+
+fn writeDbusSignatureArgs(writer: *std.Io.Writer, signature: []const u8, direction: ?[]const u8) !void {
+    var offset: usize = 0;
+    while (offset < signature.len) {
+        const length = try signatureElementLength(signature[offset..]);
+        const arg_signature = signature[offset..][0..length];
+        if (direction) |dir| {
+            try writer.print("      <arg type=\"{s}\" direction=\"{s}\"/>\n", .{ arg_signature, dir });
+        } else {
+            try writer.print("      <arg type=\"{s}\"/>\n", .{arg_signature});
+        }
+        offset += length;
     }
 }
 
@@ -1934,12 +1943,27 @@ fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) voi
         dbus_c.DBUS_TYPE_ARRAY => {
             if (dbus_c.dbus_message_iter_get_element_type(iter) == dbus_c.DBUS_TYPE_DICT_ENTRY) {
                 pushDbusIterDict(lua_state, iter);
+            } else if (dbus_c.dbus_message_iter_get_element_type(iter) == dbus_c.DBUS_TYPE_BYTE) {
+                pushDbusIterByteArray(lua_state, iter);
             } else {
                 pushDbusIterSequence(lua_state, iter);
             }
         },
         dbus_c.DBUS_TYPE_STRUCT, dbus_c.DBUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, iter),
         else => c.lua_pushnil(lua_state),
+    }
+}
+
+fn pushDbusIterByteArray(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+    var elements: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_recurse(iter, &elements);
+    var bytes: [*c]const u8 = null;
+    var count: c_int = 0;
+    dbus_c.dbus_message_iter_get_fixed_array(&elements, @ptrCast(&bytes), &count);
+    if (count <= 0) {
+        c.lua_pushliteral(lua_state, "");
+    } else {
+        c.lua_pushlstring(lua_state, bytes, @intCast(count));
     }
 }
 
@@ -2024,6 +2048,24 @@ test signatureElementLength {
     try std.testing.expectEqual(@as(usize, 4), try signatureElementLength("{sv}x"));
     try std.testing.expectError(error.InvalidDbusSignature, signatureElementLength("(s"));
     try std.testing.expectError(error.InvalidDbusSignature, signatureElementLength(""));
+}
+
+test "dbus introspection writes one argument per complete type" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try writeDbusSignatureArgs(&output.writer, "susssasa{sv}i", "in");
+    try std.testing.expectEqualStrings(
+        \\      <arg type="s" direction="in"/>
+        \\      <arg type="u" direction="in"/>
+        \\      <arg type="s" direction="in"/>
+        \\      <arg type="s" direction="in"/>
+        \\      <arg type="s" direction="in"/>
+        \\      <arg type="as" direction="in"/>
+        \\      <arg type="a{sv}" direction="in"/>
+        \\      <arg type="i" direction="in"/>
+        \\
+    , output.written());
 }
 
 test "dbus dict and struct arguments encode from Lua tables" {
@@ -2153,6 +2195,24 @@ test "dbus dicts decode to Lua maps, arrays and structs to sequences" {
         if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
     }
 
+    // arg 5: byte arrays decode to strings rather than one Lua number per byte.
+    {
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "y", &array) == 0) return error.OutOfMemory;
+        for ([_]u8{ 0, 127, 255 }) |byte| {
+            var value = byte;
+            try appendDbusBasic(&array, dbus_c.DBUS_TYPE_BYTE, &value);
+        }
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+    }
+
+    // arg 6: empty byte arrays are empty strings, not null pointers.
+    {
+        var array: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "y", &array) == 0) return error.OutOfMemory;
+        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+    }
+
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);
     c.luaL_openlibs(lua_state);
@@ -2167,6 +2227,8 @@ test "dbus dicts decode to Lua maps, arrays and structs to sequences" {
         \\assert(args[2][1] == "x" and args[2][2] == "y")
         \\assert(args[3][1] == 5 and args[3][2] == "s")
         \\assert(type(args[4]) == "table" and next(args[4]) == nil)
+        \\assert(args[5] == "\0\127\255")
+        \\assert(args[6] == "")
     ;
     if (c.luaL_loadstring(lua_state, script) != 0) return error.LoadFailed;
     if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {
