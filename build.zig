@@ -1,7 +1,6 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 const luajit = @import("build/luajit.zig");
-const nanosvg = @import("build/nanosvg.zig");
 const stb = @import("build/stb.zig");
 
 pub fn build(b: *std.Build) void {
@@ -35,7 +34,6 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zxdg_decoration_manager_v1", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
-    const nanosvg_lib = nanosvg.add(b, target, optimize);
     const stb_lib = stb.add(b, target, optimize);
 
     const image_c = b.addTranslateC(.{
@@ -43,8 +41,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    image_c.addSystemIncludePath(nanosvg_lib.include_dir);
     image_c.addSystemIncludePath(stb_lib.include_dir);
+    addPkgConfigIncludePaths(b, image_c, &.{"resvg >= 0.47.0"});
     const image_c_module = image_c.createModule();
 
     const vulkan_mod = b.dependency("vulkan_zig", .{
@@ -98,8 +96,8 @@ pub fn build(b: *std.Build) void {
     });
     app_module.addImport("wayland", wayland_mod);
     app_module.addImport("image_c", image_c_module);
-    app_module.linkLibrary(nanosvg_lib.library);
     app_module.linkLibrary(stb_lib.library);
+    app_module.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
     app_module.addImport("vulkan", vulkan_mod);
     app_module.addImport("uucode", uucode_module);
     app_module.addImport("z2d", z2d_module);

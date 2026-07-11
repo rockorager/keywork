@@ -3,7 +3,6 @@
 const std = @import("std");
 const keywork = @import("../ui.zig");
 const c = @import("image_c");
-const svg_use = @import("svg_use.zig");
 
 const log = std.log.scoped(.keywork_svg);
 
@@ -91,13 +90,11 @@ const SvgIcon = struct {
         // Parse failure degrades to a cached transparent tombstone
         // instead of failing the frame: the file may be malformed or
         // gone, and later repaints must not reopen it or warn again.
-        const image = parseSvgFile(context.allocator, self.path) orelse {
+        const tree = parseSvgFile(context.allocator, self.path) orelse {
             log.warn("svg parse failed: {s}", .{self.path});
             return self.paintTombstone(context, width, height, cache_key);
         };
-        defer c.nsvgDelete(image);
-        const rasterizer = c.nsvgCreateRasterizer() orelse return error.OutOfMemory;
-        defer c.nsvgDeleteRasterizer(rasterizer);
+        defer c.resvg_tree_destroy(tree);
 
         const raster_width = width * icon_supersample;
         const raster_height = height * icon_supersample;
@@ -105,14 +102,21 @@ const SvgIcon = struct {
         defer context.allocator.free(pixels);
         @memset(pixels, 0);
 
-        const image_width = if (image.*.width > 0) image.*.width else context.rect.width;
-        const image_height = if (image.*.height > 0) image.*.height else context.rect.height;
+        const image_size = c.resvg_get_image_size(tree);
+        const image_width = image_size.width;
+        const image_height = image_size.height;
         const scale = @min(@as(f32, @floatFromInt(raster_width)) / image_width, @as(f32, @floatFromInt(raster_height)) / image_height);
         const scaled_width = image_width * scale;
         const scaled_height = image_height * scale;
         const tx = (@as(f32, @floatFromInt(raster_width)) - scaled_width) / 2;
         const ty = (@as(f32, @floatFromInt(raster_height)) - scaled_height) / 2;
-        c.nsvgRasterize(rasterizer, image, tx, ty, scale, pixels.ptr, @intCast(raster_width), @intCast(raster_height), @intCast(raster_width * 4));
+        c.resvg_render(
+            tree,
+            .{ .a = scale, .b = 0, .c = 0, .d = scale, .e = tx, .f = ty },
+            @intCast(raster_width),
+            @intCast(raster_height),
+            pixels.ptr,
+        );
 
         if (self.color) |tint| {
             const alpha = try context.allocator.alloc(u8, width * height);
@@ -128,7 +132,7 @@ const SvgIcon = struct {
             );
         } else {
             const colors = try context.allocator.alloc(keywork.Color, width * height);
-            downsampleColor(colors, pixels, width, height, icon_supersample);
+            downsamplePremultipliedColor(colors, pixels, width, height, icon_supersample);
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
@@ -204,21 +208,18 @@ const SvgIcon = struct {
     }
 };
 
-/// Reads and parses an SVG file, expanding `<use>` elements first
-/// because nanosvg drops them silently (GNOME icons clone repeated
-/// shapes with them). Returns null on any failure; the caller treats
-/// that as a broken file.
-fn parseSvgFile(allocator: std.mem.Allocator, path: []const u8) ?*c.NSVGimage {
+/// Reads and parses a bounded SVG file. Returns null on any failure; the
+/// caller treats that as a broken file.
+fn parseSvgFile(allocator: std.mem.Allocator, path: []const u8) ?*c.resvg_render_tree {
     const contents = readSvgFile(allocator, path) orelse return null;
     defer allocator.free(contents);
-    // Failed expansion (oversized or hostile input) falls back to
-    // parsing the document as-is, matching the old behavior.
-    const expanded = svg_use.expandUses(allocator, contents) catch null;
-    defer if (expanded) |value| allocator.free(value);
-    // nsvgParse mutates its input and needs a terminator.
-    const buffer = allocator.dupeZ(u8, expanded orelse contents) catch return null;
-    defer allocator.free(buffer);
-    return c.nsvgParse(buffer.ptr, "px", 96);
+
+    const options = c.resvg_options_create() orelse return null;
+    defer c.resvg_options_destroy(options);
+
+    var tree: ?*c.resvg_render_tree = null;
+    if (c.resvg_parse_tree_from_data(contents.ptr, contents.len, options, &tree) != c.RESVG_OK) return null;
+    return tree;
 }
 
 fn readSvgFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
@@ -237,9 +238,9 @@ fn readSvgFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     return result.toOwnedSlice(allocator) catch null;
 }
 
-/// Box-filters straight-alpha RGBA with alpha-weighted color averaging,
-/// so transparent samples cannot darken edge colors.
-fn downsampleColor(dst: []keywork.Color, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
+/// Box-filters premultiplied RGBA, then converts to the display list's
+/// straight-alpha Color representation.
+fn downsamplePremultipliedColor(dst: []keywork.Color, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
     const raster_width = width * supersample;
     for (0..height) |y| {
         for (0..width) |x| {
@@ -252,22 +253,25 @@ fn downsampleColor(dst: []keywork.Color, src_rgba: []const u8, width: usize, hei
                     const src_x = x * supersample + sx;
                     const src_y = y * supersample + sy;
                     const texel = src_rgba[(src_y * raster_width + src_x) * 4 ..][0..4];
-                    const alpha: usize = texel[3];
-                    sum_r += @as(usize, texel[0]) * alpha;
-                    sum_g += @as(usize, texel[1]) * alpha;
-                    sum_b += @as(usize, texel[2]) * alpha;
-                    sum_a += alpha;
+                    sum_r += texel[0];
+                    sum_g += texel[1];
+                    sum_b += texel[2];
+                    sum_a += texel[3];
                 }
             }
             const samples = supersample * supersample;
             dst[y * width + x] = if (sum_a == 0) keywork.colors.transparent else .{
-                .r = @intCast((sum_r + sum_a / 2) / sum_a),
-                .g = @intCast((sum_g + sum_a / 2) / sum_a),
-                .b = @intCast((sum_b + sum_a / 2) / sum_a),
+                .r = unpremultiply(sum_r, sum_a),
+                .g = unpremultiply(sum_g, sum_a),
+                .b = unpremultiply(sum_b, sum_a),
                 .a = @intCast((sum_a + samples / 2) / samples),
             };
         }
     }
+}
+
+fn unpremultiply(channel_sum: usize, alpha_sum: usize) u8 {
+    return @intCast(@min(255, (channel_sum * 255 + alpha_sum / 2) / alpha_sum));
 }
 
 fn downsampleAlpha(dst: []u8, src_rgba: []const u8, width: usize, height: usize, comptime supersample: usize) void {
@@ -286,6 +290,46 @@ fn downsampleAlpha(dst: []u8, src_rgba: []const u8, width: usize, height: usize,
             dst[y * width + x] = @intCast((sum + samples / 2) / samples);
         }
     }
+}
+
+test "premultiplied SVG pixels become straight-alpha colors" {
+    var src: [icon_supersample * icon_supersample * 4]u8 = undefined;
+    for (0..icon_supersample * icon_supersample) |index| {
+        src[index * 4 + 0] = 128;
+        src[index * 4 + 1] = 32;
+        src[index * 4 + 2] = 0;
+        src[index * 4 + 3] = 128;
+    }
+    var dst: [1]keywork.Color = undefined;
+
+    downsamplePremultipliedColor(&dst, &src, 1, 1, icon_supersample);
+
+    try std.testing.expectEqual(keywork.Color.argb(128, 255, 64, 0), dst[0]);
+}
+
+test "resvg renders use references" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "use.svg",
+        .data =
+        \\<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4" viewBox="0 0 4 4">
+        \\  <defs><rect id="bar" width="2" height="4" fill="#ff0000"/></defs>
+        \\  <use href="#bar" x="2"/>
+        \\</svg>
+        ,
+    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "use.svg", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    const tree = parseSvgFile(std.testing.allocator, path) orelse return error.TestUnexpectedResult;
+    defer c.resvg_tree_destroy(tree);
+    var pixels: [4 * 4 * 4]u8 = @splat(0);
+
+    c.resvg_render(tree, c.resvg_transform_identity(), 4, 4, &pixels);
+
+    try std.testing.expectEqual(@as(u8, 0), pixels[(1 * 4 + 0) * 4 + 3]);
+    try std.testing.expectEqual(@as(u8, 255), pixels[(1 * 4 + 3) * 4 + 3]);
 }
 
 pub fn icon(allocator: std.mem.Allocator, path: []const u8, size: f32, color: ?keywork.Color) !keywork.Widget {
