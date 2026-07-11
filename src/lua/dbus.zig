@@ -1196,6 +1196,26 @@ fn luaDbusClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// The connection's unique bus name (e.g. ":1.42"). Needed by protocols
+/// that derive object paths from the caller's name, such as the XDG
+/// desktop portal request pattern.
+fn luaDbusUniqueName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const bus = leasedBus(lua_state, 1) orelse {
+        c.lua_pushnil(lua_state);
+        c.lua_pushlstring(lua_state, "closed", "closed".len);
+        return 2;
+    };
+    const name = dbus_c.dbus_bus_get_unique_name(bus.connection) orelse {
+        c.lua_pushnil(lua_state);
+        c.lua_pushlstring(lua_state, "no unique name", "no unique name".len);
+        return 2;
+    };
+    const span = std.mem.span(name);
+    c.lua_pushlstring(lua_state, span.ptr, span.len);
+    return 1;
+}
+
 fn luaDbusClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const bus = leasedBus(lua_state, 1) orelse {
@@ -1216,6 +1236,7 @@ const bus_methods = [_]lua_handle.Method{
     .{ .name = "emit", .func = luaDbusEmit },
     .{ .name = "close", .func = luaDbusClose },
     .{ .name = "closed", .func = luaDbusClosed },
+    .{ .name = "unique_name", .func = luaDbusUniqueName },
 };
 
 const subscription_type: [*:0]const u8 = "keywork.dbus_subscription";
@@ -1402,6 +1423,7 @@ fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature:
         pop(lua_state, 1);
     }
     if (signature[0] == 'a') return appendArrayWithSignature(lua_state, index, signature[1..], iter);
+    if (signature[0] == '(') return appendStructWithSignature(lua_state, index, signature, iter);
     switch (signature[0]) {
         's' => {
             var value = tryZTemp(try stringFromStack(lua_state, index));
@@ -1449,17 +1471,91 @@ fn appendArrayWithSignature(lua_state: *c.lua_State, index: c_int, element_signa
     var array: dbus_c.DBusMessageIter = undefined;
     if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_ARRAY, tryZTemp(element_signature).ptr, &array) == 0) return error.OutOfMemory;
     const table = absoluteIndex(lua_state, index);
-    var item_index: c_int = 1;
-    while (true) : (item_index += 1) {
-        c.lua_rawgeti(lua_state, table, item_index);
-        if (c.lua_isnil(lua_state, -1)) {
+    if (element_signature.len > 0 and element_signature[0] == '{') {
+        try appendDictEntries(lua_state, table, element_signature, &array);
+    } else {
+        var item_index: c_int = 1;
+        while (true) : (item_index += 1) {
+            c.lua_rawgeti(lua_state, table, item_index);
+            if (c.lua_isnil(lua_state, -1)) {
+                pop(lua_state, 1);
+                break;
+            }
+            try appendLuaValueWithSignature(lua_state, -1, element_signature, &array);
             pop(lua_state, 1);
-            break;
         }
-        try appendLuaValueWithSignature(lua_state, -1, element_signature, &array);
-        pop(lua_state, 1);
     }
     if (dbus_c.dbus_message_iter_close_container(iter, &array) == 0) return error.OutOfMemory;
+}
+
+/// Appends a Lua map as D-Bus dict entries. `element_signature` is the
+/// full entry signature including braces (e.g. `{sv}`).
+fn appendDictEntries(lua_state: *c.lua_State, table: c_int, element_signature: []const u8, array: *dbus_c.DBusMessageIter) !void {
+    if (element_signature.len < 4 or element_signature[element_signature.len - 1] != '}') return error.InvalidDbusSignature;
+    const inner = element_signature[1 .. element_signature.len - 1];
+    const key_length = try signatureElementLength(inner);
+    const key_signature = inner[0..key_length];
+    const value_signature = inner[key_length..];
+    if (value_signature.len != try signatureElementLength(value_signature)) return error.InvalidDbusSignature;
+
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, table) != 0) {
+        var entry: dbus_c.DBusMessageIter = undefined;
+        if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+        // Append a copy of the key: serializing may lua_tolstring it,
+        // and converting the original in place would corrupt lua_next.
+        c.lua_pushvalue(lua_state, -2);
+        try appendLuaValueWithSignature(lua_state, -1, key_signature, &entry);
+        pop(lua_state, 1);
+        try appendLuaValueWithSignature(lua_state, -1, value_signature, &entry);
+        if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+        pop(lua_state, 1);
+    }
+}
+
+/// Appends a positional Lua sequence as a D-Bus struct. `signature`
+/// includes the surrounding parentheses (e.g. `(sa(us))`).
+fn appendStructWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+    if (signature.len < 3 or signature[signature.len - 1] != ')') return error.InvalidDbusSignature;
+    try expectType(lua_state, index, c.LUA_TTABLE);
+    const table = absoluteIndex(lua_state, index);
+    var strukt: dbus_c.DBusMessageIter = undefined;
+    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_STRUCT, null, &strukt) == 0) return error.OutOfMemory;
+    const fields = signature[1 .. signature.len - 1];
+    var offset: usize = 0;
+    var item_index: c_int = 1;
+    while (offset < fields.len) : (item_index += 1) {
+        const field_length = try signatureElementLength(fields[offset..]);
+        c.lua_rawgeti(lua_state, table, item_index);
+        defer pop(lua_state, 1);
+        try appendLuaValueWithSignature(lua_state, -1, fields[offset..][0..field_length], &strukt);
+        offset += field_length;
+    }
+    if (dbus_c.dbus_message_iter_close_container(iter, &strukt) == 0) return error.OutOfMemory;
+}
+
+/// Length of the first complete single type in a D-Bus signature.
+fn signatureElementLength(signature: []const u8) error{InvalidDbusSignature}!usize {
+    if (signature.len == 0) return error.InvalidDbusSignature;
+    return switch (signature[0]) {
+        'a' => 1 + try signatureElementLength(signature[1..]),
+        '(' => try matchedContainerLength(signature, '(', ')'),
+        '{' => try matchedContainerLength(signature, '{', '}'),
+        else => 1,
+    };
+}
+
+fn matchedContainerLength(signature: []const u8, open: u8, close: u8) error{InvalidDbusSignature}!usize {
+    var depth: usize = 0;
+    for (signature, 0..) |char, char_index| {
+        if (char == open) depth += 1;
+        if (char == close) {
+            if (depth == 0) return error.InvalidDbusSignature;
+            depth -= 1;
+            if (depth == 0) return char_index + 1;
+        }
+    }
+    return error.InvalidDbusSignature;
 }
 
 fn appendPropertyDictEntry(lua_state: *c.lua_State, array: *dbus_c.DBusMessageIter, name: []const u8, signature: []const u8, value_index: c_int) !void {
@@ -1919,6 +2015,72 @@ fn testAppendDictEntryString(array: *dbus_c.DBusMessageIter, key: [*:0]const u8,
     try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key_ptr);
     try testAppendVariantString(&entry, value);
     if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+}
+
+test signatureElementLength {
+    try std.testing.expectEqual(@as(usize, 1), try signatureElementLength("s"));
+    try std.testing.expectEqual(@as(usize, 2), try signatureElementLength("as"));
+    try std.testing.expectEqual(@as(usize, 8), try signatureElementLength("(sa(us))"));
+    try std.testing.expectEqual(@as(usize, 4), try signatureElementLength("{sv}x"));
+    try std.testing.expectError(error.InvalidDbusSignature, signatureElementLength("(s"));
+    try std.testing.expectError(error.InvalidDbusSignature, signatureElementLength(""));
+}
+
+test "dbus dict and struct arguments encode from Lua tables" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    c.luaL_openlibs(lua_state);
+
+    // Tables shaped as dbus.variant/dbus.array produce them, covering
+    // the dict ({sv}) and struct ((sa(us))) paths portals and
+    // notifications rely on.
+    const build_script =
+        \\local function variant(sig, value)
+        \\  return { __dbus_type = "variant", signature = sig, value = value }
+        \\end
+        \\payload = {
+        \\  args = {
+        \\    { __dbus_type = "array", signature = "{sv}", value = {
+        \\      name = variant("s", "keywork"),
+        \\      count = variant("i", 7),
+        \\      level = variant("y", 2),
+        \\    } },
+        \\    { __dbus_type = "array", signature = "(sa(us))", value = {
+        \\      { "Images", { { 0, "*.png" }, { 0, "*.svg" } } },
+        \\    } },
+        \\  },
+        \\}
+    ;
+    if (c.luaL_loadstring(lua_state, build_script) != 0) return error.LoadFailed;
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) return error.ScriptFailed;
+
+    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
+    defer dbus_c.dbus_message_unref(message);
+    var iter: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_init_append(message, &iter);
+
+    c.lua_getglobal(lua_state, "payload");
+    try appendDbusLuaArgs(lua_state, absoluteIndex(lua_state, -1), &iter);
+    pop(lua_state, 1);
+
+    pushDbusArgsTable(lua_state, message);
+    c.lua_setglobal(lua_state, "args");
+
+    const check_script =
+        \\assert(args[1].name == "keywork")
+        \\assert(args[1].count == 7)
+        \\assert(args[1].level == 2)
+        \\assert(args[2][1][1] == "Images")
+        \\assert(args[2][1][2][1][1] == 0 and args[2][1][2][1][2] == "*.png")
+        \\assert(args[2][1][2][2][2] == "*.svg")
+    ;
+    if (c.luaL_loadstring(lua_state, check_script) != 0) return error.LoadFailed;
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {
+        var len: usize = 0;
+        const message_ptr = c.lua_tolstring(lua_state, -1, &len);
+        if (message_ptr) |text| std.debug.print("script failed: {s}\n", .{text[0..len]});
+        return error.ScriptFailed;
+    }
 }
 
 test "dbus dicts decode to Lua maps, arrays and structs to sequences" {
