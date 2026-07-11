@@ -37,8 +37,12 @@ const DirectoryType = enum {
 const Directory = struct {
     path: []u8,
     size: u32 = 16,
-    min_size: u32 = 16,
-    max_size: u32 = 16,
+    // MinSize and MaxSize default to Size, but only once parsing is
+    // done: index.theme key order is arbitrary (hicolor writes MinSize
+    // before Size), so the fallback is resolved at use time instead of
+    // being baked in while parsing.
+    min_size: ?u32 = null,
+    max_size: ?u32 = null,
     threshold: u32 = 2,
     type: DirectoryType = .threshold,
 
@@ -46,10 +50,18 @@ const Directory = struct {
         allocator.free(self.path);
     }
 
+    fn minSize(self: Directory) u32 {
+        return self.min_size orelse self.size;
+    }
+
+    fn maxSize(self: Directory) u32 {
+        return self.max_size orelse self.size;
+    }
+
     fn matchesSize(self: Directory, size: u32) bool {
         return switch (self.type) {
             .fixed => self.size == size,
-            .scalable => self.min_size <= size and size <= self.max_size,
+            .scalable => self.minSize() <= size and size <= self.maxSize(),
             .threshold => self.size >= self.threshold and self.size - self.threshold <= size and size <= self.size + self.threshold,
         };
     }
@@ -57,7 +69,7 @@ const Directory = struct {
     fn distance(self: Directory, size: u32) u32 {
         return switch (self.type) {
             .fixed => distanceToPoint(self.size, size),
-            .scalable => if (size < self.min_size) self.min_size - size else if (size > self.max_size) size - self.max_size else 0,
+            .scalable => if (size < self.minSize()) self.minSize() - size else if (size > self.maxSize()) size - self.maxSize() else 0,
             .threshold => if (size < self.size -| self.threshold) self.size - self.threshold - size else if (size > self.size + self.threshold) size - (self.size + self.threshold) else 0,
         };
     }
@@ -338,12 +350,10 @@ fn parseInherits(allocator: std.mem.Allocator, theme: *Theme, value: []const u8)
 fn parseDirectoryField(directory: *Directory, key: []const u8, value: []const u8) void {
     if (std.mem.eql(u8, key, "Size")) {
         directory.size = parseU32(value) orelse directory.size;
-        directory.min_size = directory.size;
-        directory.max_size = directory.size;
     } else if (std.mem.eql(u8, key, "MinSize")) {
-        directory.min_size = parseU32(value) orelse directory.min_size;
+        if (parseU32(value)) |min_size| directory.min_size = min_size;
     } else if (std.mem.eql(u8, key, "MaxSize")) {
-        directory.max_size = parseU32(value) orelse directory.max_size;
+        if (parseU32(value)) |max_size| directory.max_size = max_size;
     } else if (std.mem.eql(u8, key, "Threshold")) {
         directory.threshold = parseU32(value) orelse directory.threshold;
     } else if (std.mem.eql(u8, key, "Type")) {
@@ -580,4 +590,39 @@ test "parse index theme directories and inherited themes" {
     try std.testing.expect(theme.directories.items[0].matchesSize(16));
     try std.testing.expect(theme.directories.items[1].matchesSize(128));
     try std.testing.expectEqual(@as(usize, 2), theme.inherits.items.len);
+}
+
+test "scalable directory size range survives any key order" {
+    // hicolor writes MinSize before Size; Size must not clobber an
+    // already-parsed MinSize/MaxSize (they only default to Size when
+    // absent). This is why hicolor scalable/apps was skipped and app
+    // icons fell through to their symbolic variants.
+    var theme = try parseIndexTheme(std.testing.allocator,
+        \\[Icon Theme]
+        \\Directories=scalable/apps,scalable/status
+        \\
+        \\[scalable/apps]
+        \\MinSize=1
+        \\Size=128
+        \\MaxSize=256
+        \\Type=Scalable
+        \\
+        \\[scalable/status]
+        \\Size=24
+        \\Type=Scalable
+    );
+    defer theme.deinit(std.testing.allocator);
+
+    const apps = theme.directories.items[0];
+    try std.testing.expect(apps.matchesSize(1));
+    try std.testing.expect(apps.matchesSize(64));
+    try std.testing.expect(apps.matchesSize(256));
+    try std.testing.expect(!apps.matchesSize(257));
+    try std.testing.expectEqual(@as(u32, 64), apps.distance(320));
+
+    // Without MinSize/MaxSize, the range collapses to Size.
+    const status = theme.directories.items[1];
+    try std.testing.expect(status.matchesSize(24));
+    try std.testing.expect(!status.matchesSize(23));
+    try std.testing.expect(!status.matchesSize(25));
 }
