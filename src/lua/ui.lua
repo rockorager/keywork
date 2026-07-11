@@ -623,17 +623,23 @@ end
 --- id creates a surface, a dropped id destroys it. Fields left nil
 --- inherit the app-level defaults; `output` names the output a
 --- layer-shell window is placed on (see ctx.outputs).
-function ui.window(options)
-  return {
-    id = options.id,
-    title = options.title,
-    width = options.width,
-    height = options.height,
-    output = options.output,
-    layer_shell = options.layer_shell,
-    child = options.child,
-  }
-end
+---
+--- A callable table rather than a function: the runtime attaches
+--- window-level operations (start_move, start_resize,
+--- request_activation_token) to it.
+ui.window = setmetatable({}, {
+  __call = function(_, options)
+    return {
+      id = options.id,
+      title = options.title,
+      width = options.width,
+      height = options.height,
+      output = options.output,
+      layer_shell = options.layer_shell,
+      child = options.child,
+    }
+  end,
+})
 
 --- Popup declaration for ui.anchored. `content` is a widget table, or a
 --- function receiving the popup's runtime state and returning one.

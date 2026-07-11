@@ -17,6 +17,7 @@ const lua_value = @import("value.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
+const platform_mod = @import("../app/platform.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
 
@@ -71,6 +72,10 @@ pub const App = struct {
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
+    /// Desktop services (clipboard, activation tokens, interactive
+    /// move/resize) bridged from the windowing backend; null on
+    /// headless backends.
+    platform: ?platform_mod.Platform = null,
     /// Registry refs of the child widget tables from the last window-set
     /// build, keyed by window id (keys owned by `allocator`).
     window_children: std.StringHashMapUnmanaged(c_int) = .empty,
@@ -177,6 +182,14 @@ pub const App = struct {
 
     pub fn bindInvalidator(self: *App, invalidator: runtime_mod.Invalidator) void {
         self.invalidator = invalidator;
+    }
+
+    pub fn bindPlatform(self: *App, platform: platform_mod.Platform) void {
+        self.platform = platform;
+    }
+
+    pub fn unbindPlatform(self: *App) void {
+        self.platform = null;
     }
 
     pub fn unbindRuntime(self: *App) void {
@@ -1017,6 +1030,131 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     pushAppNamespace(lua_state, app);
     c.lua_setfield(lua_state, keywork_table, "app");
+
+    pushClipboardNamespace(lua_state, app);
+    c.lua_setfield(lua_state, keywork_table, "clipboard");
+    installWindowOperations(lua_state, keywork_table, app);
+    return 1;
+}
+
+/// Attaches window-level operations to the `kw.window` callable table
+/// declared in ui.lua.
+fn installWindowOperations(lua_state: *c.lua_State, keywork_table: c_int, app: *App) void {
+    c.lua_getfield(lua_state, keywork_table, "window");
+    std.debug.assert(c.lua_type(lua_state, -1) == c.LUA_TTABLE);
+    const window_table = c.lua_gettop(lua_state);
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaWindowStartMove, 1);
+    c.lua_setfield(lua_state, window_table, "start_move");
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaWindowStartResize, 1);
+    c.lua_setfield(lua_state, window_table, "start_resize");
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaWindowRequestActivationToken, 1);
+    c.lua_setfield(lua_state, window_table, "request_activation_token");
+    pop(lua_state, 1);
+}
+
+fn pushClipboardNamespace(lua_state: *c.lua_State, app: *App) void {
+    c.lua_createtable(lua_state, 0, 2);
+    const clipboard_table = c.lua_gettop(lua_state);
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaClipboardRead, 1);
+    c.lua_setfield(lua_state, clipboard_table, "read");
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, luaClipboardWrite, 1);
+    c.lua_setfield(lua_state, clipboard_table, "write");
+}
+
+fn pushPlatformError(lua_state: *c.lua_State, err: anyerror) c_int {
+    c.lua_pushnil(lua_state);
+    const name = @errorName(err);
+    c.lua_pushlstring(lua_state, name.ptr, name.len);
+    return 2;
+}
+
+/// kw.clipboard.read() -> text | nil [, err]. Nil without an error means
+/// the clipboard is empty or holds no text.
+fn luaClipboardRead(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+    const text = platform.clipboardRead(app.allocator) catch |err| return pushPlatformError(lua_state, err);
+    const value = text orelse {
+        c.lua_pushnil(lua_state);
+        return 1;
+    };
+    defer app.allocator.free(value);
+    c.lua_pushlstring(lua_state, value.ptr, value.len);
+    return 1;
+}
+
+/// kw.clipboard.write(text) -> true | nil, err. Call from an input
+/// handler: compositors reject selection claims without a recent input
+/// serial.
+fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    var len: usize = 0;
+    const ptr = c.luaL_checklstring(lua_state, 1, &len);
+    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+    platform.clipboardWrite(ptr[0..len]) catch |err| return pushPlatformError(lua_state, err);
+    c.lua_pushboolean(lua_state, 1);
+    return 1;
+}
+
+/// kw.window.start_move() -> true | nil, err. Starts a compositor-driven
+/// interactive move of the window the most recent pointer press landed
+/// in; call from a press handler.
+fn luaWindowStartMove(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+    platform.startMove() catch |err| return pushPlatformError(lua_state, err);
+    c.lua_pushboolean(lua_state, 1);
+    return 1;
+}
+
+/// kw.window.start_resize(edge) -> true | nil, err. Edge names mirror
+/// xdg_toplevel ("top", "bottom_left" / "bottom-left", ...).
+fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    var len: usize = 0;
+    const ptr = c.luaL_checklstring(lua_state, 1, &len);
+    const edge = platform_mod.resizeEdgeFromName(ptr[0..len]) orelse
+        return c.luaL_error(lua_state, "invalid resize edge (expected top, bottom, left, right, or a corner)");
+    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+    platform.startResize(edge) catch |err| return pushPlatformError(lua_state, err);
+    c.lua_pushboolean(lua_state, 1);
+    return 1;
+}
+
+/// kw.window.request_activation_token(opts?) -> token | nil [, err].
+/// `opts.app_id` hints which application will be activated; pass the
+/// token to xdg.applications.launch as opts.activation_token. Nil
+/// without an error means the compositor lacks xdg-activation.
+fn luaWindowRequestActivationToken(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+
+    var app_id: ?[:0]u8 = null;
+    defer if (app_id) |value| app.allocator.free(value);
+    if (c.lua_type(lua_state, 1) == c.LUA_TTABLE) {
+        if (lua_value.stringField(lua_state, 1, "app_id")) |value| {
+            app_id = app.allocator.dupeZ(u8, value) catch return c.luaL_error(lua_state, "out of memory");
+        } else |_| {}
+    }
+
+    const token = platform.activationToken(app.allocator, if (app_id) |value| value.ptr else null) catch |err|
+        return pushPlatformError(lua_state, err);
+    const value = token orelse {
+        c.lua_pushnil(lua_state);
+        return 1;
+    };
+    defer app.allocator.free(value);
+    c.lua_pushlstring(lua_state, value.ptr, value.len);
     return 1;
 }
 

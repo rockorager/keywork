@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
+    scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
@@ -28,6 +30,9 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 1);
     scanner.generate("zwp_tablet_manager_v2", 1);
+    scanner.generate("wl_data_device_manager", 3);
+    scanner.generate("xdg_activation_v1", 1);
+    scanner.generate("zxdg_decoration_manager_v1", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const nanosvg_lib = nanosvg.add(b, target, optimize);

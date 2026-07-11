@@ -8,6 +8,7 @@ const event_loop = @import("../linux/event_loop.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const app_options = @import("options.zig");
 const app_windows = @import("windows.zig");
+const platform_mod = @import("platform.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
@@ -33,6 +34,7 @@ pub const Options = struct {
     width: f32 = 640,
     height: f32 = 480,
     backend: app_options.BackendKind = .log,
+    decorations: wayland_options.Decorations = .server,
     layer_shell: ?wayland_options.LayerShellOptions = null,
     log_writer: *std.Io.Writer,
     runtime_context: ?*anyopaque = null,
@@ -41,6 +43,8 @@ pub const Options = struct {
     windows_host: ?app_windows.WindowsHost = null,
     bind_runtime: ?*const fn (ctx: *anyopaque, runtime: *runtime_mod.Runtime) void = null,
     bind_invalidator: ?*const fn (ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void = null,
+    bind_platform: ?*const fn (ctx: *anyopaque, platform: platform_mod.Platform) void = null,
+    unbind_platform: ?*const fn (ctx: *anyopaque) void = null,
     unbind_runtime: ?*const fn (ctx: *anyopaque) void = null,
     bind_event_loop: ?*const fn (ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void = null,
     unbind_event_loop: ?*const fn (ctx: *anyopaque) void = null,
@@ -138,11 +142,14 @@ fn runWayland(
     const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator);
     defer backend.destroy();
+    if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
+    defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
     const win = try backend.createWindow(.{
         .title = options.title,
         .app_id = options.app_id,
         .width = backend_width,
         .height = try positiveU31(constraints.max_height),
+        .decorations = options.decorations,
         .layer_shell = options.layer_shell,
     });
     try backend.waitForAllConfigured();
@@ -727,6 +734,8 @@ fn runWaylandWindowed(
 
     var backend = try Backend.create(allocator);
     defer backend.destroy();
+    if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
+    defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
 
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
@@ -1000,6 +1009,7 @@ fn WindowManager(comptime Backend: type) type {
                 .app_id = self.options.app_id,
                 .width = if (layer_shell != null and width <= 0) 0 else try positiveU31(width),
                 .height = try positiveU31(height),
+                .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
                 .output = output,
             });

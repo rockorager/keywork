@@ -36,6 +36,29 @@ pub const LayerShellOptions = struct {
     };
 };
 
+/// Preferred decoration policy for xdg toplevels. `server` asks the
+/// compositor to draw the title bar and borders (the default for
+/// desktop applications); `client` keeps the surface undecorated so the
+/// app draws its own chrome. Compositors without xdg-decoration ignore
+/// the preference.
+pub const Decorations = enum {
+    server,
+    client,
+};
+
+/// Edge or corner an interactive resize starts from, mirroring
+/// xdg_toplevel resize edges.
+pub const ResizeEdge = enum {
+    top,
+    bottom,
+    left,
+    right,
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
+};
+
 /// Snapshot of one output's identity and geometry for window placement
 /// and app-side output iteration.
 pub const OutputInfo = struct {

@@ -41,6 +41,14 @@ pointer_enter_serial: ?u32 = null,
 /// Serial of the most recent pointer button press; xdg_popup.grab rejects
 /// release serials even when the popup opens from an on-tap callback.
 last_button_press_serial: ?u32 = null,
+/// Target that had pointer focus at the most recent button press, so
+/// interactive move/resize acts on the window the press happened in.
+/// Cleared when that target unregisters.
+last_button_press_target: ?*Target = null,
+/// Serial of the most recent user input (pointer press, key press, or
+/// focus enter). Compositors validate clipboard set_selection and
+/// xdg-activation requests against a recent input serial.
+last_input_serial: ?u32 = null,
 /// Pointer events accumulated until the wl_pointer.frame marker so one
 /// logical group (e.g. a diagonal scroll or enter+motion) dispatches
 /// once, with the group's final position.
@@ -225,6 +233,7 @@ pub fn unregisterTarget(self: *Self, target: *Target) void {
         self.keyboard_target = null;
         self.stopKeyRepeat();
     }
+    if (self.last_button_press_target == target) self.last_button_press_target = null;
     if (self.fling_target == target) self.stopFling();
 }
 
@@ -320,7 +329,11 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
             self.pending_pointer.moved = true;
         },
         .button => |button| {
-            if (button.state == .pressed) self.last_button_press_serial = button.serial;
+            if (button.state == .pressed) {
+                self.last_button_press_serial = button.serial;
+                self.last_button_press_target = self.pointer_target;
+                self.last_input_serial = button.serial;
+            }
             const pointer_button: keywork.PointerButton = switch (button.button) {
                 272 => .left,
                 273 => .right,
@@ -534,6 +547,7 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void
         .keymap => |keymap| self.installXkbKeymap(keymap),
         .enter => |enter| {
             self.keyboard_target = self.findTarget(enter.surface);
+            self.last_input_serial = enter.serial;
             self.shift_down = false;
             self.stopKeyRepeat();
         },
@@ -544,6 +558,7 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void
         },
         .key => |key| {
             const pressed = key.state == .pressed;
+            if (pressed) self.last_input_serial = key.serial;
             switch (key.key) {
                 42, 54 => {
                     self.shift_down = pressed;

@@ -11,6 +11,7 @@ const wp = wayland.client.wp;
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const zwlr = wayland.client.zwlr;
+const zxdg = wayland.client.zxdg;
 
 const log = std.log.scoped(.keywork_wayland_window);
 
@@ -64,6 +65,10 @@ pub const Surface = struct {
     viewport: ?*wp.Viewport,
     fractional_scale: ?*wp.FractionalScaleV1,
     shell_role: ShellRole,
+    /// xdg-decoration object for toplevels; must be destroyed before the
+    /// toplevel it decorates. Null on layer/popup roles or when the
+    /// compositor lacks the protocol.
+    decoration: ?*zxdg.ToplevelDecorationV1 = null,
     layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
     configured: bool = false,
     closed: bool = false,
@@ -90,6 +95,8 @@ pub const Surface = struct {
         errdefer surface.destroy();
         const shell_role = try createShellRole(surface, output, connection.wm_base, connection.layer_shell, options);
         errdefer shell_role.destroy();
+        const decoration = try createDecoration(connection.decoration_manager, shell_role, options.decorations);
+        errdefer if (decoration) |toplevel_decoration| toplevel_decoration.destroy();
         const viewport = if (connection.viewporter) |manager| try manager.getViewport(surface) else null;
         errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
         const fractional_scale = if (connection.fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
@@ -100,6 +107,7 @@ pub const Surface = struct {
             .viewport = viewport,
             .fractional_scale = fractional_scale,
             .shell_role = shell_role,
+            .decoration = decoration,
             .layer_keyboard_interactivity = if (options.layer_shell) |layer_options|
                 layer_options.keyboard_interactivity
             else
@@ -175,8 +183,26 @@ pub const Surface = struct {
         if (self.frame_callback) |callback| callback.destroy();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
+        if (self.decoration) |decoration| decoration.destroy();
         self.shell_role.destroy();
         self.surface.destroy();
+    }
+
+    /// Starts a compositor-driven interactive move. `serial` must come
+    /// from the input event (typically a pointer press) that triggered it.
+    pub fn startMove(self: *Surface, seat: *wl.Seat, serial: u32) !void {
+        switch (self.shell_role) {
+            .xdg => |role| role.toplevel.move(seat, serial),
+            else => return error.NotToplevel,
+        }
+    }
+
+    /// Starts a compositor-driven interactive resize from `edge`.
+    pub fn startResize(self: *Surface, seat: *wl.Seat, serial: u32, edge: wayland_options.ResizeEdge) !void {
+        switch (self.shell_role) {
+            .xdg => |role| role.toplevel.resize(seat, serial, resizeEdge(edge)),
+            else => return error.NotToplevel,
+        }
     }
 
     /// Listener installation is separate from initialization because the
@@ -317,6 +343,41 @@ pub const Surface = struct {
     }
 };
 
+/// Requests the preferred decoration mode for xdg toplevels. Without the
+/// manager (or on layer/popup roles) the compositor's default applies,
+/// which on most desktops means the client is expected to decorate
+/// itself.
+fn createDecoration(
+    manager: ?*zxdg.DecorationManagerV1,
+    shell_role: ShellRole,
+    preference: wayland_options.Decorations,
+) !?*zxdg.ToplevelDecorationV1 {
+    const decoration_manager = manager orelse return null;
+    const toplevel = switch (shell_role) {
+        .xdg => |role| role.toplevel,
+        else => return null,
+    };
+    const decoration = try decoration_manager.getToplevelDecoration(toplevel);
+    decoration.setMode(switch (preference) {
+        .server => .server_side,
+        .client => .client_side,
+    });
+    return decoration;
+}
+
+fn resizeEdge(edge: wayland_options.ResizeEdge) xdg.Toplevel.ResizeEdge {
+    return switch (edge) {
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+        .top_left => .top_left,
+        .top_right => .top_right,
+        .bottom_left => .bottom_left,
+        .bottom_right => .bottom_right,
+    };
+}
+
 /// Whether a toplevel configure lists `needle` in its states array. States
 /// arrive as a wl_array of u32 enum values.
 fn toplevelHasState(states: anytype, needle: xdg.Toplevel.State) bool {
@@ -383,6 +444,9 @@ pub const Connection = struct {
     viewporter: ?*wp.Viewporter = null,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
+    data_device_manager: ?*wl.DataDeviceManager = null,
+    activation: ?*xdg.ActivationV1 = null,
+    decoration_manager: ?*zxdg.DecorationManagerV1 = null,
     seat: ?*wl.Seat = null,
     /// True once the first seat global has been bound. Survives takeSeat()
     /// so a later seat advertisement cannot overwrite selection or forward
@@ -443,6 +507,9 @@ pub const Connection = struct {
     fn deinitGlobals(self: *Connection) void {
         if (self.seat) |seat| seat.release();
         releaseOutputs(self.allocator, &self.outputs);
+        if (self.decoration_manager) |manager| manager.destroy();
+        if (self.activation) |activation| activation.destroy();
+        if (self.data_device_manager) |manager| manager.destroy();
         if (self.cursor_shape_manager) |manager| manager.destroy();
         if (self.fractional_scale_manager) |manager| manager.destroy();
         if (self.viewporter) |viewporter| viewporter.destroy();
@@ -572,6 +639,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
                 self.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
                 self.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wl.DataDeviceManager.interface.name) == .eq) {
+                self.data_device_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, xdg.ActivationV1.interface.name) == .eq) {
+                self.activation = registry.bind(global.name, xdg.ActivationV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
+                self.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                 // Single-seat: bind only the first seat. seat_selected outlives
                 // takeSeat() (which nulls self.seat) so later seats stay unbound
@@ -614,6 +687,55 @@ fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRe
         output_ref.output.release();
     }
     outputs.deinit(allocator);
+}
+
+const TokenRequest = struct {
+    allocator: std.mem.Allocator,
+    token: ?[]u8 = null,
+    done: bool = false,
+
+    fn listener(_: *xdg.ActivationTokenV1, event: xdg.ActivationTokenV1.Event, self: *TokenRequest) void {
+        switch (event) {
+            .done => |done| {
+                self.token = self.allocator.dupe(u8, std.mem.span(done.token)) catch null;
+                self.done = true;
+            },
+        }
+    }
+};
+
+/// Requests an xdg-activation token for handing focus to another client.
+/// Blocks on roundtrips until the compositor answers. Returns null when
+/// the compositor lacks xdg-activation; the caller frees the token.
+pub fn requestActivationToken(
+    connection: *Connection,
+    allocator: std.mem.Allocator,
+    seat: ?*wl.Seat,
+    serial: ?u32,
+    surface: ?*wl.Surface,
+    app_id: ?[*:0]const u8,
+) !?[]u8 {
+    const activation = connection.activation orelse return null;
+    const token_object = try activation.getActivationToken();
+    defer token_object.destroy();
+
+    var request: TokenRequest = .{ .allocator = allocator };
+    token_object.setListener(*TokenRequest, TokenRequest.listener, &request);
+    if (seat) |wl_seat| {
+        if (serial) |value| token_object.setSerial(value, wl_seat);
+    }
+    if (surface) |wl_surface| token_object.setSurface(wl_surface);
+    if (app_id) |id| token_object.setAppId(id);
+    token_object.commit();
+
+    // The done event answers the commit, so one roundtrip normally
+    // suffices; the bound guards against a misbehaving compositor.
+    var attempts: usize = 0;
+    while (!request.done) : (attempts += 1) {
+        if (attempts >= 8) return error.ActivationTokenTimeout;
+        if (connection.display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    }
+    return request.token;
 }
 
 pub fn installWmBaseListener(wm_base: ?*xdg.WmBase) void {

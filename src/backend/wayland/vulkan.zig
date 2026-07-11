@@ -5,6 +5,7 @@ const event_loop = @import("../../linux/event_loop.zig");
 const keywork = @import("../../ui.zig");
 const VulkanRenderer = @import("vulkan/renderer.zig").Renderer;
 const WaylandInput = @import("input.zig");
+const data_device = @import("data_device.zig");
 const wayland_options = @import("options.zig");
 const window = @import("window.zig");
 const wayland = @import("wayland");
@@ -16,6 +17,7 @@ pub const Backend = struct {
     connection: *window.Connection,
     input: WaylandInput,
     windows: std.ArrayList(*Window),
+    clipboard: ?*data_device.Clipboard = null,
 
     pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
     pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -30,6 +32,7 @@ pub const Backend = struct {
         app_id: [:0]const u8 = "dev.keywork.Keywork",
         width: u31 = 640,
         height: u31 = 480,
+        decorations: wayland_options.Decorations = .server,
         layer_shell: ?wayland_options.LayerShellOptions = null,
         /// Output a layer-shell surface is placed on; null lets the
         /// compositor choose.
@@ -61,6 +64,7 @@ pub const Backend = struct {
         // into input once it lives at its final address.
         self.connection.setSeatCapabilitiesHandler(&self.input, WaylandInput.seatCapabilitiesCallback);
         self.input.attachListeners();
+        self.clipboard = data_device.Clipboard.init(allocator, connection.display, connection.data_device_manager, self.input.seat);
         return self;
     }
 
@@ -69,6 +73,7 @@ pub const Backend = struct {
             self.destroyWindow(self.windows.items[self.windows.items.len - 1]);
         }
         self.windows.deinit(self.allocator);
+        if (self.clipboard) |clipboard| clipboard.destroy();
         self.input.deinit();
         self.connection.deinit();
         self.allocator.destroy(self);

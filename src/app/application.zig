@@ -3,6 +3,7 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const app_options = @import("options.zig");
+const platform_mod = @import("platform.zig");
 const runner = @import("runner.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_module = @import("../lua/app.zig");
@@ -51,12 +52,15 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .width = run_options.width orelse window.width orelse 640,
         .height = run_options.height orelse window.height orelse 480,
         .backend = backend,
+        .decorations = window.decorations orelse .server,
         .layer_shell = layer_shell,
         .log_writer = &stdout_writer.interface,
         .runtime_context = &self.lua,
         .windows_host = self.lua.windowsHost(),
         .bind_runtime = bindLuaRuntime,
         .bind_invalidator = bindLuaInvalidator,
+        .bind_platform = bindLuaPlatform,
+        .unbind_platform = unbindLuaPlatform,
         .unbind_runtime = unbindLuaRuntime,
         .bind_event_loop = bindLuaEventLoop,
         .unbind_event_loop = unbindLuaEventLoop,
@@ -72,6 +76,16 @@ fn bindLuaRuntime(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
 fn bindLuaInvalidator(ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void {
     const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
     lua.bindInvalidator(invalidator);
+}
+
+fn bindLuaPlatform(ctx: *anyopaque, platform: platform_mod.Platform) void {
+    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
+    lua.bindPlatform(platform);
+}
+
+fn unbindLuaPlatform(ctx: *anyopaque) void {
+    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
+    lua.unbindPlatform();
 }
 
 fn unbindLuaRuntime(ctx: *anyopaque) void {

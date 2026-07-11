@@ -14,6 +14,9 @@ pub const Config = struct {
     backend: ?app_options.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
+    /// Preferred toplevel decoration policy; null means the runner's
+    /// default (server-side).
+    decorations: ?wayland_options.Decorations = null,
     layer_shell: ?wayland_options.LayerShellOptions = null,
     /// The script declares its window set via a `windows` function, so
     /// it needs a windowing backend even without app-level layer_shell.
@@ -38,6 +41,14 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     }
     if (try checkNumberField(lua_state, table_index, "width")) |value| config.width = @floatCast(value);
     if (try checkNumberField(lua_state, table_index, "height")) |value| config.height = @floatCast(value);
+    if (try checkStringField(lua_state, table_index, "decorations")) |name| {
+        config.decorations = if (std.mem.eql(u8, name, "server"))
+            .server
+        else if (std.mem.eql(u8, name, "client"))
+            .client
+        else
+            return invalidAppRoot("unknown decorations '{s}' (expected server or client)", .{name});
+    }
 
     c.lua_getfield(lua_state, table_index, "layer_shell");
     switch (c.lua_type(lua_state, -1)) {
