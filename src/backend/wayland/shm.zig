@@ -730,6 +730,18 @@ fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Re
     }
     if (x0 >= x1 or y0 >= y1) return;
 
+    if (color.a == 0) return;
+    if (color.a < 255) {
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) blendPixel(pixels, width, x, y, color, 255);
+        }
+        return;
+    }
+
+    // Opaque source-over is replacement, so the common background path
+    // keeps its row-fill fast path.
     const value: u32 = @bitCast(color);
     var y = y0;
     while (y < y1) : (y += 1) {
@@ -839,6 +851,25 @@ fn clampPixel(value: f32, max_value: u31) usize {
     const limit: f32 = @floatFromInt(max_value);
     if (value >= limit) return max_value;
     return @intFromFloat(value);
+}
+
+test "translucent rectangle blends without lowering destination alpha" {
+    const width: u31 = 2;
+    const height: u31 = 2;
+    var pixels: [width * height]u32 = @splat(@bitCast(keywork.colors.black));
+
+    fillRect(
+        &pixels,
+        width,
+        height,
+        1,
+        .{ .x = 0, .y = 0, .width = width, .height = height },
+        keywork.Color.argb(128, 255, 255, 255),
+        null,
+    );
+
+    const expected: u32 = @bitCast(keywork.Color.argb(255, 128, 128, 128));
+    try std.testing.expectEqualSlices(u32, &@as([width * height]u32, @splat(expected)), &pixels);
 }
 
 test "damage history covers only retained consecutive frames" {
