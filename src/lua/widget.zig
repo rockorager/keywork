@@ -175,6 +175,9 @@ const ParseContext = struct {
     icon_cache: ?*icon_theme.Cache = null,
     /// Render scale used to select icon files at physical resolution.
     icon_scale: f32 = 1,
+    /// Intrinsic image dimensions per path, so raster icons skip the
+    /// stbi_info header read on every rebuild.
+    png_dims: ?*lua_image.DimsCache = null,
 
     fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
         return .{
@@ -192,6 +195,7 @@ const ParseContext = struct {
             },
             .icon_cache = self.icon_cache,
             .icon_scale = self.icon_scale,
+            .png_dims = self.png_dims,
         };
     }
 };
@@ -933,7 +937,7 @@ pub fn parse(
         const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
         const builder = try callback_allocator.create(LuaItemBuilder);
-        builder.* = .{ .allocator = callback_allocator, .host = host, .lua_state = lua_state, .ref = ref };
+        builder.* = .{ .allocator = callback_allocator, .host = host, .lua_state = lua_state, .ref = ref, .parse_context = parse_context };
         var list_widget = keywork.widgets.list(id, options.count, options.item_height, builder.itemBuilder());
         // Lua indices are 1-based; 0 or nil means no selection.
         if (options.selected) |selected| {
@@ -995,9 +999,27 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);
         const icon = parse_context.resolveIcon(options);
-        const name = try stringField(lua_state, table, "name");
-        if (isAbsolutePath(name)) return lua_image.pngIcon(allocator, name, icon.size);
+        const raw_name = try stringField(lua_state, table, "name");
         const fallback_color = icon.color orelse keywork.colors.ink;
+        const name = blk: {
+            if (isAbsolutePath(raw_name)) {
+                // Desktop entries may name absolute icon files: .svg goes
+                // to the SVG rasterizer; anything else is probed by stb,
+                // which decodes supported rasters regardless of extension.
+                if (std.ascii.endsWithIgnoreCase(raw_name, ".svg")) return svg_icon.icon(allocator, raw_name, icon.size, icon.color);
+                if (lua_image.pngIcon(allocator, parse_context.png_dims, raw_name, icon.size)) |widget| {
+                    return widget;
+                } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+                // Unsupported format (XPM etc.): fall back to a theme
+                // lookup by basename, which may find a themed variant.
+                break :blk std.fs.path.stem(raw_name);
+            }
+            // Legacy desktop entries carry a stray extension on theme
+            // names ("firefox.png"); the icon-theme spec says to strip
+            // known extensions before lookup.
+            break :blk stripLegacyIconExtension(raw_name);
+        };
+        if (name.len == 0) return missingIconWidget(allocator, fallback_color);
         // Select the icon file for the physical pixel size so HiDPI
         // outputs get the sharper large variant; widgets stay logical.
         const lookup_size = icon.size * parse_context.icon_scale;
@@ -1007,7 +1029,7 @@ pub fn parse(
             const icon_file = try cache.lookup(name, lookup_size) orelse return missingIconWidget(allocator, fallback_color);
             return switch (icon_file.format) {
                 .svg => svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
-                .png => lua_image.pngIcon(allocator, icon_file.path, icon.size),
+                .png => pngIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
             };
         }
         const icon_file = try icon_theme.lookupIconSized(allocator, name, lookup_size) orelse {
@@ -1022,7 +1044,7 @@ pub fn parse(
                 icon.size,
                 icon.color,
             ),
-            .png => lua_image.pngIcon(allocator, icon_file.path, icon.size),
+            .png => pngIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
         };
     }
     if (std.mem.eql(u8, kind, "row")) {
@@ -1214,6 +1236,41 @@ test "failed gesture parse destroys callbacks it already captured" {
 // Callers log the miss; the cache path warns only once per name+size.
 fn missingIconWidget(allocator: std.mem.Allocator, color: keywork.Color) !keywork.Widget {
     return .{ .text = .{ .value = try allocator.dupe(u8, "□"), .color = color } };
+}
+
+/// Raster icon or the missing-icon glyph: a broken or oversized file
+/// degrades to □ instead of failing the whole widget build. The dims
+/// cache warns once per path; only OOM propagates.
+fn pngIconOrMissing(
+    allocator: std.mem.Allocator,
+    parse_context: ParseContext,
+    path: []const u8,
+    size: f32,
+    fallback_color: keywork.Color,
+) !keywork.Widget {
+    return lua_image.pngIcon(allocator, parse_context.png_dims, path, size) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => missingIconWidget(allocator, fallback_color),
+    };
+}
+
+/// Legacy desktop entries carry a stray extension on theme names
+/// ("firefox.png"); the icon-theme spec says to strip known image
+/// extensions before lookup.
+fn stripLegacyIconExtension(name: []const u8) []const u8 {
+    inline for (.{ ".png", ".svg", ".xpm" }) |ext| {
+        if (std.ascii.endsWithIgnoreCase(name, ext)) return name[0 .. name.len - ext.len];
+    }
+    return name;
+}
+
+test "stripLegacyIconExtension strips known image extensions" {
+    try std.testing.expectEqualStrings("firefox", stripLegacyIconExtension("firefox.png"));
+    try std.testing.expectEqualStrings("firefox", stripLegacyIconExtension("firefox.SVG"));
+    try std.testing.expectEqualStrings("firefox", stripLegacyIconExtension("firefox.xpm"));
+    try std.testing.expectEqualStrings("firefox", stripLegacyIconExtension("firefox"));
+    try std.testing.expectEqualStrings("org.gnome.Maps", stripLegacyIconExtension("org.gnome.Maps"));
+    try std.testing.expectEqualStrings("icon.tar", stripLegacyIconExtension("icon.tar"));
 }
 
 fn parseChildren(
@@ -1441,6 +1498,10 @@ const LuaItemBuilder = struct {
     host: Host,
     lua_state: *c.lua_State,
     ref: c_int,
+    // Captured at parse time so deferred row builds keep the icon cache,
+    // icon scale, and ambient icon options; without it every row entering
+    // the window re-walks the icon theme directories at scale 1.
+    parse_context: ParseContext,
 
     fn itemBuilder(self: *LuaItemBuilder) keywork.Widget.ItemBuilder {
         return .{
@@ -1464,7 +1525,7 @@ const LuaItemBuilder = struct {
             return error.LuaCallbackFailed;
         }
         defer pop(self.lua_state, 1);
-        return parse(self.host, self.lua_state, scope.allocator, scope.allocator, .{}, .{}, -1);
+        return parse(self.host, self.lua_state, scope.allocator, scope.allocator, scope.app_context, self.parse_context, -1);
     }
 
     /// Transfers the registry ref like LuaCallback.clone: parse-tree
@@ -1474,7 +1535,7 @@ const LuaItemBuilder = struct {
         const self: *LuaItemBuilder = @ptrCast(@alignCast(@constCast(ptr)));
         if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
         const copy = try allocator.create(LuaItemBuilder);
-        copy.* = .{ .allocator = allocator, .host = self.host, .lua_state = self.lua_state, .ref = self.ref };
+        copy.* = .{ .allocator = allocator, .host = self.host, .lua_state = self.lua_state, .ref = self.ref, .parse_context = self.parse_context };
         self.ref = -2;
         return copy;
     }

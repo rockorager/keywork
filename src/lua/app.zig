@@ -14,6 +14,7 @@ const lua_loop = @import("loop.zig");
 const lua_socket = @import("socket.zig");
 const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
+const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
@@ -74,6 +75,7 @@ pub const App = struct {
     window_children: std.StringHashMapUnmanaged(c_int) = .empty,
     script_watch: ?*event_loop.EventLoop.FileWatch = null,
     icon_cache: icon_theme.Cache,
+    png_dims: lua_image.DimsCache,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
@@ -97,6 +99,7 @@ pub const App = struct {
             .chunk_name = chunk_name,
             .state = lua_state,
             .icon_cache = .init(allocator),
+            .png_dims = .init(allocator),
         };
     }
 
@@ -130,6 +133,7 @@ pub const App = struct {
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
         c.lua_close(self.state);
         self.icon_cache.deinit();
+        self.png_dims.deinit();
         self.window_config.deinit(self.allocator);
         self.allocator.free(self.path);
         self.allocator.free(self.chunk_name);
@@ -224,6 +228,7 @@ pub const App = struct {
         const widget = try lua_widget.parse(self.widgetHost(), self.state, allocator, allocator, runtime_state, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
+            .png_dims = &self.png_dims,
         }, -1);
         c.lua_settop(self.state, 0);
         // A bounded incremental step keeps garbage from widget-table churn
@@ -408,6 +413,7 @@ pub const App = struct {
         const widget = try lua_widget.parse(self.widgetHost(), self.state, scope.allocator, scope.allocator, context, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
+            .png_dims = &self.png_dims,
         }, -1);
         _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;

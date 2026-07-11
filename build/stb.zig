@@ -17,7 +17,9 @@ pub fn add(
 
     const source = b.addWriteFiles().add("stb.c",
         \\#define STBI_ONLY_PNG
-        \\#define STBI_MAX_DIMENSIONS 131072
+        \\#define STBI_ONLY_JPEG
+        \\#define STBI_ONLY_BMP
+        \\#define STBI_MAX_DIMENSIONS 16384
         \\#define STB_IMAGE_IMPLEMENTATION
         \\#include <stb_image.h>
         \\

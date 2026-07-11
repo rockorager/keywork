@@ -100,6 +100,12 @@ pub const Cache = struct {
     /// until deinit; null means the icon is known to be missing.
     pub fn lookup(self: *Cache, name: []const u8, logical_size: f32) !?IconFile {
         const size = positiveIconSize(logical_size);
+        // Hits are the hot path (every icon widget on every rebuild):
+        // probe with a stack-formatted key so they stay allocation-free.
+        var buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{d}\x00{s}", .{ size, name })) |probe| {
+            if (self.entries.get(probe)) |cached| return cached;
+        } else |_| {}
         const key = try std.fmt.allocPrint(self.allocator, "{d}\x00{s}", .{ size, name });
         errdefer self.allocator.free(key);
         if (self.entries.get(key)) |cached| {
@@ -121,6 +127,10 @@ pub fn lookupIconSized(allocator: std.mem.Allocator, name: []const u8, logical_s
 fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, logical_size: f32, formats: []const IconFormat) !?IconFile {
     if (name.len == 0) return null;
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        // Only absolute paths bypass theme lookup (the spec allows them
+        // in desktop entries); relative names with slashes are neither
+        // valid icon names nor paths we want to resolve from the cwd.
+        if (name[0] != '/') return null;
         if (formatFromPath(name, formats)) |format| {
             if (try exists(allocator, name)) return .{ .path = try allocator.dupe(u8, name), .format = format };
         }
@@ -152,6 +162,7 @@ fn lookupInTheme(
     depth: usize,
 ) !?IconFile {
     if (depth >= max_theme_depth or visitedContains(visited.items, theme_name)) return null;
+    if (!safeSubpath(theme_name)) return null;
     try visited.append(allocator, try allocator.dupe(u8, theme_name));
 
     var inherited: std.ArrayList([]u8) = .empty;
@@ -310,7 +321,7 @@ fn parseDirectories(allocator: std.mem.Allocator, theme: *Theme, value: []const 
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |raw_directory| {
         const directory = trim(raw_directory);
-        if (directory.len == 0 or findDirectory(theme.directories.items, directory) != null) continue;
+        if (!safeSubpath(directory) or findDirectory(theme.directories.items, directory) != null) continue;
         try theme.directories.append(allocator, .{ .path = try allocator.dupe(u8, directory) });
     }
 }
@@ -319,7 +330,7 @@ fn parseInherits(allocator: std.mem.Allocator, theme: *Theme, value: []const u8)
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |raw_parent| {
         const parent = trim(raw_parent);
-        if (parent.len == 0 or visitedContains(theme.inherits.items, parent)) continue;
+        if (!safeSubpath(parent) or visitedContains(theme.inherits.items, parent)) continue;
         try theme.inherits.append(allocator, try allocator.dupe(u8, parent));
     }
 }
@@ -436,6 +447,18 @@ fn findDirectory(directories: []const Directory, path: []const u8) ?usize {
     return null;
 }
 
+/// Theme names and index.theme directory values are interpolated into
+/// filesystem paths under the icons roots; reject anything that could
+/// escape them (absolute paths, ".." components, empty values).
+fn safeSubpath(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '/') return false;
+    var it = std.mem.splitScalar(u8, value, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
 fn visitedContains(items: []const []u8, value: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item, value)) return true;
@@ -462,6 +485,37 @@ fn trim(value: []const u8) []const u8 {
 
 test "lookup returns null for a missing icon" {
     try std.testing.expect(try lookupIconSized(std.testing.allocator, "keywork-definitely-missing-icon", 16) == null);
+}
+
+test "lookup rejects relative slash names as direct paths" {
+    // A relative name with slashes is neither a theme icon name nor a
+    // path we resolve from the cwd; traversal must not escape lookup.
+    try std.testing.expect(try lookupIconSized(std.testing.allocator, "../etc/icon.png", 16) == null);
+    try std.testing.expect(try lookupIconSized(std.testing.allocator, "icons/foo.svg", 16) == null);
+}
+
+test "safeSubpath rejects traversal and absolute values" {
+    try std.testing.expect(safeSubpath("16x16/actions"));
+    try std.testing.expect(safeSubpath("scalable"));
+    try std.testing.expect(!safeSubpath(""));
+    try std.testing.expect(!safeSubpath("/etc"));
+    try std.testing.expect(!safeSubpath(".."));
+    try std.testing.expect(!safeSubpath("../theme"));
+    try std.testing.expect(!safeSubpath("16x16/../../escape"));
+}
+
+test "index theme parsing drops unsafe directories and inherits" {
+    var theme = try parseIndexTheme(std.testing.allocator,
+        \\[Icon Theme]
+        \\Directories=16x16/actions,../../escape,/abs
+        \\Inherits=../evil,hicolor
+    );
+    defer theme.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), theme.directories.items.len);
+    try std.testing.expectEqualStrings("16x16/actions", theme.directories.items[0].path);
+    try std.testing.expectEqual(@as(usize, 1), theme.inherits.items.len);
+    try std.testing.expectEqualStrings("hicolor", theme.inherits.items[0]);
 }
 
 test "cache tombstones missing icons and serves repeat lookups" {

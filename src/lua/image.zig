@@ -12,6 +12,13 @@ const expectType = lua_value.expectType;
 const pop = lua_value.pop;
 const stringFromStack = lua_value.stringFromStack;
 
+const log = std.log.scoped(.keywork_image);
+
+// stb's own dimension cap (131072) still allows multi-GiB decodes;
+// reject absurd raster sources before any pixel allocation.
+const max_image_dim = 16384;
+const max_image_pixels = 16 << 20;
+
 const Options = struct {
     width: u32 = 0,
     height: u32 = 0,
@@ -116,6 +123,8 @@ const Image = struct {
 pub fn parse(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) !keywork.Widget {
     const options = try lua_codec.decode(Options, lua_state, table, allocator);
     if (options.width == 0 or options.height == 0) return error.InvalidImageSize;
+    if (options.width > max_image_dim or options.height > max_image_dim) return error.InvalidImageSize;
+    if (@as(u64, options.width) * options.height > max_image_pixels) return error.InvalidImageSize;
     if (!std.mem.eql(u8, options.format, "argb32")) return error.UnsupportedImageFormat;
 
     c.lua_getfield(lua_state, table, "pixels");
@@ -208,11 +217,21 @@ const PngIcon = struct {
         var source_width: c_int = 0;
         var source_height: c_int = 0;
         var source_channels: c_int = 0;
-        const source_bytes = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse return error.InvalidPng;
+        // Decode failure degrades to a cached transparent tombstone
+        // instead of failing the frame: the file may have changed or
+        // vanished since the header probe, and later repaints must not
+        // reopen it or warn again.
+        const source_bytes = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse {
+            log.warn("image decode failed: {s}", .{self.path});
+            return paintTombstone(context, target_width, target_height, cache_key);
+        };
         defer image_c.stbi_image_free(source_bytes);
-        if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
+        const dims = checkedDims(source_width, source_height) catch {
+            log.warn("image rejected ({d}x{d}): {s}", .{ source_width, source_height, self.path });
+            return paintTombstone(context, target_width, target_height, cache_key);
+        };
 
-        const pixel_count: usize = @intCast(source_width * source_height);
+        const pixel_count = @as(usize, dims.width) * dims.height;
         const source_pixels = try context.allocator.alloc(keywork.Color, pixel_count);
         defer context.allocator.free(source_pixels);
         fillRgbaPixels(source_pixels, source_bytes[0 .. pixel_count * 4]);
@@ -220,8 +239,8 @@ const PngIcon = struct {
         const pixels = try resampledPixels(
             context.allocator,
             source_pixels,
-            @intCast(source_width),
-            @intCast(source_height),
+            dims.width,
+            dims.height,
             target_width,
             target_height,
         );
@@ -255,25 +274,88 @@ const PngIcon = struct {
     }
 };
 
-pub fn pngIcon(allocator: std.mem.Allocator, path: []const u8, size: f32) !keywork.Widget {
+/// Caches a fully transparent image under the icon's key so later paints
+/// hit the cache instead of reopening the broken file; the backends skip
+/// zero-alpha pixels, so it draws nothing.
+fn paintTombstone(
+    context: keywork.Widget.RenderObject.PaintContext,
+    width: u32,
+    height: u32,
+    cache_key: u64,
+) !void {
+    const pixels = try context.allocator.alloc(keywork.Color, @as(usize, width) * height);
+    @memset(pixels, keywork.colors.transparent);
+    try context.display_list.colorImage(context.allocator, context.rect, width, height, pixels, cache_key);
+}
+
+/// Caches intrinsic image dimensions per path so widget parsing (every
+/// rebuild of a visible list row) skips the stbi_info header read.
+/// Probe failures tombstone like the icon-theme cache: a broken file
+/// stays broken until the process restarts, and warns only once.
+pub const DimsCache = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMapUnmanaged(?Dims) = .empty,
+
+    pub const Dims = struct { width: u32, height: u32 };
+
+    pub fn init(allocator: std.mem.Allocator) DimsCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *DimsCache) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.entries.deinit(self.allocator);
+    }
+
+    fn lookup(self: *DimsCache, path: []const u8) !?Dims {
+        if (self.entries.get(path)) |cached| return cached;
+        const dims: ?Dims = probeDims(self.allocator, path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        if (dims == null) log.warn("unreadable image: {s}", .{path});
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        try self.entries.put(self.allocator, key, dims);
+        return dims;
+    }
+};
+
+fn probeDims(allocator: std.mem.Allocator, path: []const u8) !DimsCache.Dims {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-
-    // Only the header is read for the intrinsic dimensions; the pixels
-    // are decoded lazily at paint.
     var source_width: c_int = 0;
     var source_height: c_int = 0;
     var source_channels: c_int = 0;
-    if (image_c.stbi_info(path_z.ptr, &source_width, &source_height, &source_channels) == 0) return error.InvalidPng;
-    if (source_width <= 0 or source_height <= 0) return error.InvalidPng;
+    if (image_c.stbi_info(path_z.ptr, &source_width, &source_height, &source_channels) == 0) return error.InvalidImage;
+    return checkedDims(source_width, source_height);
+}
+
+fn checkedDims(width: c_int, height: c_int) !DimsCache.Dims {
+    if (width <= 0 or height <= 0) return error.InvalidImage;
+    const w: u32 = @intCast(width);
+    const h: u32 = @intCast(height);
+    if (w > max_image_dim or h > max_image_dim) return error.ImageTooLarge;
+    if (@as(u64, w) * h > max_image_pixels) return error.ImageTooLarge;
+    return .{ .width = w, .height = h };
+}
+
+pub fn pngIcon(allocator: std.mem.Allocator, dims_cache: ?*DimsCache, path: []const u8, size: f32) !keywork.Widget {
+    // Only the header is read for the intrinsic dimensions; the pixels
+    // are decoded lazily at paint.
+    const dims = if (dims_cache) |cache|
+        (try cache.lookup(path)) orelse return error.InvalidImage
+    else
+        try probeDims(allocator, path);
 
     const icon = try allocator.create(PngIcon);
     errdefer allocator.destroy(icon);
     icon.* = .{
         .path = try allocator.dupe(u8, path),
         .size = @floatFromInt(positiveImageSize(size)),
-        .source_width = @intCast(source_width),
-        .source_height = @intCast(source_height),
+        .source_width = dims.width,
+        .source_height = dims.height,
     };
     return icon.widget();
 }
@@ -370,4 +452,29 @@ fn imageByteField(lua_state: *c.lua_State, table: c_int, index: c_int) !u8 {
     const value = c.lua_tointeger(lua_state, -1);
     if (value < 0 or value > 255) return error.InvalidImagePixels;
     return @intCast(value);
+}
+
+test "checkedDims rejects invalid and oversized sources" {
+    try std.testing.expectError(error.InvalidImage, checkedDims(0, 16));
+    try std.testing.expectError(error.InvalidImage, checkedDims(16, -1));
+    try std.testing.expectError(error.ImageTooLarge, checkedDims(max_image_dim + 1, 1));
+    try std.testing.expectError(error.ImageTooLarge, checkedDims(1, max_image_dim + 1));
+    // Both dimensions in range, but the pixel count blows the budget.
+    try std.testing.expectError(error.ImageTooLarge, checkedDims(8192, 8192));
+    const dims = try checkedDims(4096, 4096);
+    try std.testing.expectEqual(@as(u32, 4096), dims.width);
+    try std.testing.expectEqual(@as(u32, 4096), dims.height);
+}
+
+test "dims cache tombstones unreadable files" {
+    // The first probe failure per path logs a warning by design.
+    std.testing.log_level = .err;
+    var cache: DimsCache = .init(std.testing.allocator);
+    defer cache.deinit();
+
+    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png") == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    // The tombstone answers without a second probe or a new entry.
+    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png") == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
 }

@@ -46,7 +46,10 @@ const GpuImage = struct {
 
 const AtlasKey = union(enum) {
     glyph: Glyph,
-    image: u64,
+    // Alpha and color images can share a display-list cache key (an SVG
+    // painted both tinted and untinted), so the atlas must namespace them.
+    color_image: u64,
+    alpha_image: u64,
     solid,
 
     const Glyph = struct {
@@ -996,7 +999,7 @@ pub const Renderer = struct {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
         if (image.pixels.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
 
-        const key: AtlasKey = .{ .image = image.cache_key };
+        const key: AtlasKey = .{ .color_image = image.cache_key };
         if (self.atlas_slots.get(key)) |slot| return slot;
 
         const slot = try self.allocateAtlasSlot(image.width, image.height);
@@ -1043,7 +1046,7 @@ pub const Renderer = struct {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
         if (image.alpha.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
 
-        const key: AtlasKey = .{ .image = image.cache_key };
+        const key: AtlasKey = .{ .alpha_image = image.cache_key };
         if (self.atlas_slots.get(key)) |slot| return slot;
 
         const slot = try self.allocateAtlasSlot(image.width, image.height);

@@ -4,7 +4,13 @@ const std = @import("std");
 const keywork = @import("../ui.zig");
 const c = @import("image_c");
 
+const log = std.log.scoped(.keywork_svg);
+
 const icon_supersample = 4;
+// The supersampled raster buffer costs 64 bytes per output pixel, so the
+// clamp bounds the transient allocation at 256 MiB; anything beyond
+// icon-scale targets is either a layout bug or hostile input.
+const max_raster_dim = 2048;
 
 const SvgIcon = struct {
     path: []const u8,
@@ -40,8 +46,19 @@ const SvgIcon = struct {
         if (context.rect.width <= 0 or context.rect.height <= 0) return;
 
         const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
-        const width = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.width * render_scale))));
-        const height = @max(1, @as(usize, @intFromFloat(@ceil(context.rect.height * render_scale))));
+        const req_width = @ceil(context.rect.width * render_scale);
+        const req_height = @ceil(context.rect.height * render_scale);
+        // Backends blit images 1:1 into the rect, so a capped raster
+        // can't be drawn scaled up; skip the draw instead of blitting a
+        // truncated corner. No file IO happens on this path, and the
+        // repeated warn flags what is either a layout bug or hostile
+        // input.
+        if (req_width > max_raster_dim or req_height > max_raster_dim) {
+            log.warn("svg raster target {d:.0}x{d:.0} exceeds {d}: {s}", .{ req_width, req_height, max_raster_dim, self.path });
+            return;
+        }
+        const width = @max(1, @as(usize, @intFromFloat(req_width)));
+        const height = @max(1, @as(usize, @intFromFloat(req_height)));
         const cache_key = cacheKey(self.path, width, height, icon_supersample);
         if (self.color) |tint| {
             if (context.display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |alpha| {
@@ -70,7 +87,13 @@ const SvgIcon = struct {
 
         const path_z = try context.allocator.dupeZ(u8, self.path);
         defer context.allocator.free(path_z);
-        const image = c.nsvgParseFromFile(path_z.ptr, "px", 96) orelse return error.InvalidSvg;
+        // Parse failure degrades to a cached transparent tombstone
+        // instead of failing the frame: the file may be malformed or
+        // gone, and later repaints must not reopen it or warn again.
+        const image = c.nsvgParseFromFile(path_z.ptr, "px", 96) orelse {
+            log.warn("svg parse failed: {s}", .{self.path});
+            return self.paintTombstone(context, width, height, cache_key);
+        };
         defer c.nsvgDelete(image);
         const rasterizer = c.nsvgCreateRasterizer() orelse return error.OutOfMemory;
         defer c.nsvgDeleteRasterizer(rasterizer);
@@ -105,6 +128,42 @@ const SvgIcon = struct {
         } else {
             const colors = try context.allocator.alloc(keywork.Color, width * height);
             downsampleColor(colors, pixels, width, height, icon_supersample);
+            try context.display_list.colorImage(
+                context.allocator,
+                context.rect,
+                @intCast(width),
+                @intCast(height),
+                colors,
+                cache_key,
+            );
+        }
+    }
+
+    /// Caches a fully transparent image under the icon's key so later
+    /// paints hit the cache instead of reopening the broken file; both
+    /// backends skip zero-alpha pixels, so it draws nothing.
+    fn paintTombstone(
+        self: *const SvgIcon,
+        context: keywork.Widget.RenderObject.PaintContext,
+        width: usize,
+        height: usize,
+        cache_key: u64,
+    ) !void {
+        if (self.color) |tint| {
+            const alpha = try context.allocator.alloc(u8, width * height);
+            @memset(alpha, 0);
+            try context.display_list.alphaImage(
+                context.allocator,
+                context.rect,
+                @intCast(width),
+                @intCast(height),
+                alpha,
+                tint,
+                cache_key,
+            );
+        } else {
+            const colors = try context.allocator.alloc(keywork.Color, width * height);
+            @memset(colors, keywork.colors.transparent);
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
