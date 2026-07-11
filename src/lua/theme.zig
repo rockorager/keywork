@@ -17,6 +17,7 @@ pub const TextOptions = struct {
     role: ?keywork.TextRole = null,
     max_lines: ?u32 = null,
     overflow: ?keywork.Widget.TextOverflow = null,
+    line_break: keywork.Widget.LineBreakStrategy = .greedy,
 
     pub fn resolvedFontSize(self: TextOptions) ?f32 {
         return self.font_size orelse self.size;

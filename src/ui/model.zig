@@ -98,11 +98,17 @@ pub const Widget = union(enum) {
         role: TextRole = .body,
         max_lines: ?u32 = null,
         overflow: TextOverflow = .ellipsis,
+        line_break: LineBreakStrategy = .greedy,
     };
 
     pub const TextOverflow = enum {
         ellipsis,
         clip,
+    };
+
+    pub const LineBreakStrategy = enum {
+        greedy,
+        knuth_plass,
     };
 
     pub const Button = struct {
@@ -2690,7 +2696,8 @@ fn widgetLayoutEqual(a: Widget, b: Widget) bool {
                 a_text.font_size == b_text.font_size and
                 a_text.line_height == b_text.line_height and
                 a_text.max_lines == b_text.max_lines and
-                a_text.overflow == b_text.overflow;
+                a_text.overflow == b_text.overflow and
+                a_text.line_break == b_text.line_break;
         },
         .box => |a_box| blk: {
             const b_box = b.box;
@@ -2748,7 +2755,8 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
                 a_text.font_size == b_text.font_size and
                 a_text.line_height == b_text.line_height and
                 a_text.max_lines == b_text.max_lines and
-                a_text.overflow == b_text.overflow;
+                a_text.overflow == b_text.overflow and
+                a_text.line_break == b_text.line_break;
         },
         .box => |a_box| blk: {
             const b_box = b.box;
@@ -2946,6 +2954,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .role = text_widget.role,
             .max_lines = text_widget.max_lines,
             .overflow = text_widget.overflow,
+            .line_break = text_widget.line_break,
         } },
         .spacer => |spacer_widget| .{ .spacer = spacer_widget },
         .separator => |separator| .{ .separator = separator },
@@ -5807,13 +5816,19 @@ test "stateful widget destroys state on element destruction and replacement" {
     try std.testing.expectEqual(@as(usize, 1), destroyed_on_deinit);
 }
 
-test "element clone preserves text max_lines and overflow" {
-    const widget: Widget = .{ .text = .{ .value = "song title", .max_lines = 2, .overflow = .clip } };
+test "element clone preserves text wrapping options" {
+    const widget: Widget = .{ .text = .{
+        .value = "song title",
+        .max_lines = 2,
+        .overflow = .clip,
+        .line_break = .knuth_plass,
+    } };
     var element = try buildElementTree(std.testing.allocator, &widget, .{ .max_width = 200, .max_height = 80 });
     defer destroyElementTree(std.testing.allocator, &element);
 
     try std.testing.expectEqual(@as(?u32, 2), element.widget.text.max_lines);
     try std.testing.expectEqual(Widget.TextOverflow.clip, element.widget.text.overflow);
+    try std.testing.expectEqual(Widget.LineBreakStrategy.knuth_plass, element.widget.text.line_break);
 }
 
 test "element clone preserves text_input style overrides" {

@@ -716,6 +716,7 @@ pub fn parse(
             .role = options.role orelse .body,
             .max_lines = options.max_lines,
             .overflow = options.overflow orelse .ellipsis,
+            .line_break = options.line_break,
         } };
     }
     if (std.mem.eql(u8, kind, "keyed")) {
@@ -1219,6 +1220,30 @@ test "gesture activation parses release and defaults to press" {
     );
 
     // Every path above must leave the stack balanced.
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+}
+
+test "text line breaking parses Knuth-Plass and defaults to greedy" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+
+    const defaults = try lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator);
+    try std.testing.expectEqual(keywork.Widget.LineBreakStrategy.greedy, defaults.line_break);
+
+    c.lua_pushstring(lua_state, "knuth_plass");
+    c.lua_setfield(lua_state, table, "line_break");
+    const options = try lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator);
+    try std.testing.expectEqual(keywork.Widget.LineBreakStrategy.knuth_plass, options.line_break);
+
+    c.lua_pushstring(lua_state, "optimal");
+    c.lua_setfield(lua_state, table, "line_break");
+    try std.testing.expectError(
+        error.UnknownLuaEnumValue,
+        lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator),
+    );
     try std.testing.expectEqual(table, c.lua_gettop(lua_state));
 }
 

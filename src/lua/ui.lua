@@ -464,12 +464,13 @@ function ui.text(value, style)
     role = style.role,
     max_lines = style.max_lines,
     overflow = style.overflow,
+    line_break = style.line_break,
   }
 end
 
 function ui.label(value, options)
   options = options or {}
-  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, line_height = options.line_height, role = options.role or "label", max_lines = options.max_lines, overflow = options.overflow })
+  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, line_height = options.line_height, role = options.role or "label", max_lines = options.max_lines, overflow = options.overflow, line_break = options.line_break })
 end
 
 function ui.keyed(key, child)

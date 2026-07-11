@@ -119,6 +119,30 @@ const FittedTextLine = struct {
     hard_break: bool,
 };
 
+const BreakCandidate = struct {
+    line: FittedTextLine,
+    emergency: bool = false,
+};
+
+const BreakFitness = enum(u2) {
+    tight,
+    normal,
+    loose,
+    very_loose,
+};
+
+const break_fitness_count = @typeInfo(BreakFitness).@"enum".fields.len;
+
+const BreakPoint = struct {
+    candidate: usize,
+    fitness: BreakFitness,
+};
+
+const BreakPath = struct {
+    demerits: f64 = std.math.inf(f64),
+    previous: ?BreakPoint = null,
+};
+
 fn previousScalarStart(value: []const u8, start: usize, end: usize) usize {
     std.debug.assert(start < end);
     var result = end - 1;
@@ -205,6 +229,219 @@ fn fitTextLine(
     unreachable;
 }
 
+fn appendEmergencyBreaks(
+    allocator: std.mem.Allocator,
+    candidates: *std.ArrayList(BreakCandidate),
+    value: []const u8,
+    start: usize,
+    end: usize,
+) LayoutError!void {
+    var graphemes = uucode.grapheme.utf8Iterator(value[start..end]);
+    while (graphemes.nextGrapheme()) |grapheme| {
+        const boundary = start + grapheme.end;
+        if (boundary == end) break;
+        try candidates.append(allocator, .{
+            .line = .{
+                .content_end = boundary,
+                .next_start = boundary,
+                .hard_break = false,
+            },
+            .emergency = true,
+        });
+    }
+}
+
+fn collectParagraphBreaks(
+    allocator: std.mem.Allocator,
+    candidates: *std.ArrayList(BreakCandidate),
+    value: []const u8,
+    source_start: usize,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    var breaks = try unicode_linebreak.Iterator.init(value[source_start..]);
+    var segment_start = source_start;
+
+    while (breaks.next()) |line_break| {
+        const next_start = source_start + line_break.end;
+        const terminal = next_start == value.len;
+        const content_end = breakContentEnd(value, source_start, next_start, line_break.hard);
+
+        // Emergency opportunities are only introduced inside a UAX #14
+        // segment that cannot fit by itself. This keeps paragraph optimization
+        // from preferring arbitrary grapheme breaks merely to improve color.
+        if (content_end > segment_start) {
+            const measured = try measurer.measureText(value[segment_start..content_end], style);
+            if (measured.width > available_width) {
+                try appendEmergencyBreaks(allocator, candidates, value, segment_start, content_end);
+            }
+        }
+
+        try candidates.append(allocator, .{ .line = .{
+            .content_end = content_end,
+            .next_start = next_start,
+            .hard_break = line_break.hard,
+        } });
+        if (line_break.hard or terminal) return;
+        segment_start = next_start;
+    }
+    unreachable;
+}
+
+const LineDemerits = struct {
+    value: f64,
+    fitness: BreakFitness,
+};
+
+fn lineDemerits(width: f32, available_width: f32, final_line: bool, emergency: bool) LineDemerits {
+    const target: f64 = @floatCast(@max(available_width, 1));
+    const natural: f64 = @floatCast(width);
+    const ratio = if (natural < target) (target - natural) / target else 0;
+    const fitness: BreakFitness = if (ratio < 0.1)
+        .tight
+    else if (ratio < 0.25)
+        .normal
+    else if (ratio < 0.5)
+        .loose
+    else
+        .very_loose;
+
+    // Knuth-Plass normally derives badness from glue stretch or shrink. The
+    // renderer is ragged-right and does not stretch spaces, so remaining line
+    // width is the adjustment ratio that produces the visible result.
+    const badness = if (final_line) 0 else 100 * ratio * ratio * ratio;
+    var value = (1 + badness) * (1 + badness);
+    if (emergency) value += 10_000;
+    if (natural > target) {
+        const overflow = (natural - target) / target;
+        value += 1_000_000 * (1 + overflow * overflow);
+    }
+    return .{ .value = value, .fitness = fitness };
+}
+
+fn relaxBreak(
+    paths: [][break_fitness_count]BreakPath,
+    target: usize,
+    score: LineDemerits,
+    base_demerits: f64,
+    previous: ?BreakPoint,
+) void {
+    var demerits = base_demerits + score.value;
+    if (previous) |point| {
+        const previous_fitness: i8 = @intCast(@intFromEnum(point.fitness));
+        const current_fitness: i8 = @intCast(@intFromEnum(score.fitness));
+        if (@abs(previous_fitness - current_fitness) > 1) demerits += 100;
+    }
+
+    const fitness_index = @intFromEnum(score.fitness);
+    if (demerits < paths[target][fitness_index].demerits) {
+        paths[target][fitness_index] = .{
+            .demerits = demerits,
+            .previous = previous,
+        };
+    }
+}
+
+fn fitTextParagraph(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList(FittedTextLine),
+    candidates: []const BreakCandidate,
+    value: []const u8,
+    source_start: usize,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    std.debug.assert(source_start < value.len);
+    std.debug.assert(std.math.isFinite(available_width));
+
+    std.debug.assert(candidates.len > 0);
+
+    const paths = try allocator.alloc([break_fitness_count]BreakPath, candidates.len);
+    defer allocator.free(paths);
+    for (paths) |*candidate_paths| {
+        for (candidate_paths) |*path| path.* = .{};
+    }
+
+    // Each candidate is a graph vertex. Edges connect every pair whose text
+    // fits on one line; demerits make this the Knuth-Plass shortest-path
+    // formulation rather than a locally greedy choice.
+    var from_slot: usize = 0;
+    while (from_slot < candidates.len) : (from_slot += 1) {
+        const line_start = if (from_slot == 0)
+            source_start
+        else
+            candidates[from_slot - 1].line.next_start;
+
+        var reachable = from_slot == 0;
+        if (!reachable) {
+            for (paths[from_slot - 1]) |path| {
+                if (std.math.isFinite(path.demerits)) {
+                    reachable = true;
+                    break;
+                }
+            }
+        }
+        if (!reachable) continue;
+
+        var found_fitting = false;
+        var target = from_slot;
+        while (target < candidates.len) : (target += 1) {
+            const candidate = candidates[target];
+            if (candidate.line.content_end < line_start) continue;
+            const measured = try measurer.measureText(value[line_start..candidate.line.content_end], style);
+            const overfull = measured.width > available_width;
+            if (overfull and found_fitting) break;
+            if (!overfull) found_fitting = true;
+
+            const score = lineDemerits(
+                measured.width,
+                available_width,
+                target + 1 == candidates.len,
+                candidate.emergency,
+            );
+            if (from_slot == 0) {
+                relaxBreak(paths, target, score, 0, null);
+            } else {
+                for (paths[from_slot - 1], 0..) |path, fitness_index| {
+                    if (!std.math.isFinite(path.demerits)) continue;
+                    const point: BreakPoint = .{
+                        .candidate = from_slot - 1,
+                        .fitness = @enumFromInt(fitness_index),
+                    };
+                    relaxBreak(paths, target, score, path.demerits, point);
+                }
+            }
+            // If even the first grapheme is wider than the constraint, that
+            // one overfull edge is retained to guarantee forward progress.
+            if (overfull) break;
+        }
+    }
+
+    const final_candidate = candidates.len - 1;
+    var final_fitness: usize = 0;
+    for (paths[final_candidate], 0..) |path, fitness_index| {
+        if (path.demerits < paths[final_candidate][final_fitness].demerits) {
+            final_fitness = fitness_index;
+        }
+    }
+    if (!std.math.isFinite(paths[final_candidate][final_fitness].demerits)) return error.NoLineBreakPath;
+
+    var reversed: std.ArrayList(FittedTextLine) = .empty;
+    defer reversed.deinit(allocator);
+    var point: BreakPoint = .{
+        .candidate = final_candidate,
+        .fitness = @enumFromInt(final_fitness),
+    };
+    while (true) {
+        try reversed.append(allocator, candidates[point.candidate].line);
+        point = paths[point.candidate][@intFromEnum(point.fitness)].previous orelse break;
+    }
+    std.mem.reverse(FittedTextLine, reversed.items);
+    try lines.appendSlice(allocator, reversed.items);
+}
+
 fn appendEllipsizedLine(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -223,7 +460,7 @@ fn appendEllipsizedLine(
     try output.appendSlice(allocator, ellipsis);
 }
 
-fn wrapText(
+fn wrapTextGreedy(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     value: []const u8,
@@ -264,6 +501,76 @@ fn wrapText(
         std.debug.assert(line.next_start > source_start);
         source_start = line.next_start;
     }
+}
+
+fn wrapTextKnuthPlass(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    max_lines: ?u32,
+    overflow: Widget.TextOverflow,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    if (!std.math.isFinite(available_width)) {
+        return wrapTextGreedy(allocator, output, value, max_lines, overflow, available_width, style, measurer);
+    }
+    if (max_lines) |limit| std.debug.assert(limit >= 1);
+    if (value.len == 0) return;
+    const line_limit: usize = if (max_lines) |limit| limit else std.math.maxInt(usize);
+    var source_start: usize = 0;
+    var line_count: usize = 0;
+
+    while (source_start < value.len) {
+        var candidates: std.ArrayList(BreakCandidate) = .empty;
+        defer candidates.deinit(allocator);
+        try collectParagraphBreaks(allocator, &candidates, value, source_start, available_width, style, measurer);
+        const first = candidates.items[0].line;
+        if (!first.hard_break and first.content_end == source_start and first.next_start > source_start) {
+            source_start = first.next_start;
+            continue;
+        }
+
+        var paragraph_lines: std.ArrayList(FittedTextLine) = .empty;
+        defer paragraph_lines.deinit(allocator);
+        try fitTextParagraph(allocator, &paragraph_lines, candidates.items, value, source_start, available_width, style, measurer);
+        for (paragraph_lines.items) |line| {
+            line_count += 1;
+            const has_more = line.next_start < value.len or line.hard_break;
+            if (line_count == line_limit and has_more) {
+                if (overflow == .ellipsis) {
+                    try appendEllipsizedLine(allocator, output, value, source_start, line.content_end, available_width, style, measurer);
+                } else {
+                    try output.appendSlice(allocator, value[source_start..line.content_end]);
+                }
+                return;
+            }
+
+            try output.appendSlice(allocator, value[source_start..line.content_end]);
+            if (!has_more) return;
+            try output.append(allocator, '\n');
+            std.debug.assert(line.next_start > source_start);
+            source_start = line.next_start;
+        }
+    }
+}
+
+fn wrapText(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    max_lines: ?u32,
+    overflow: Widget.TextOverflow,
+    line_break: Widget.LineBreakStrategy,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    return switch (line_break) {
+        .greedy => wrapTextGreedy(allocator, output, value, max_lines, overflow, available_width, style, measurer),
+        .knuth_plass => wrapTextKnuthPlass(allocator, output, value, max_lines, overflow, available_width, style, measurer),
+    };
 }
 
 /// Accumulates damage on a retained node outside of layout, for changes
@@ -383,7 +690,7 @@ fn layoutElementInto(
             node.text_buffer.clearRetainingCapacity();
             const should_wrap = text_widget.max_lines != null or std.math.isFinite(constraints.max_width);
             const visible_text = if (should_wrap) blk: {
-                try wrapText(allocator, &node.text_buffer, text_widget.value, text_widget.max_lines, text_widget.overflow, constraints.max_width, style, measurer);
+                try wrapText(allocator, &node.text_buffer, text_widget.value, text_widget.max_lines, text_widget.overflow, text_widget.line_break, constraints.max_width, style, measurer);
                 break :blk node.text_buffer.items;
             } else text_widget.value;
             const measured = try measurer.measureText(visible_text, style);
@@ -1107,11 +1414,11 @@ test "wrapped text preserves fitting text and ellipsizes one line" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try wrapText(allocator, &output, "abc", 1, .ellipsis, 40, style, .fixed);
+    try wrapText(allocator, &output, "abc", 1, .ellipsis, .greedy, 40, style, .fixed);
     try std.testing.expectEqualStrings("abc", output.items);
 
     output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "abcdef", 1, .ellipsis, 40, style, .fixed);
+    try wrapText(allocator, &output, "abcdef", 1, .ellipsis, .greedy, 40, style, .fixed);
     try std.testing.expectEqualStrings("ab…", output.items);
 }
 
@@ -1121,7 +1428,7 @@ test "wrapped text omits an ellipsis that cannot fit" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try wrapText(allocator, &output, "abc", 1, .ellipsis, 16, style, .fixed);
+    try wrapText(allocator, &output, "abc", 1, .ellipsis, .greedy, 16, style, .fixed);
     try std.testing.expectEqualStrings("", output.items);
 }
 
@@ -1131,7 +1438,7 @@ test "wrapped text uses Unicode opportunities and ellipsizes at two lines" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try wrapText(allocator, &output, "hello world again", 2, .ellipsis, 48, style, .fixed);
+    try wrapText(allocator, &output, "hello world again", 2, .ellipsis, .greedy, 48, style, .fixed);
     try std.testing.expectEqualStrings("hello\nwor…", output.items);
 }
 
@@ -1141,19 +1448,19 @@ test "wrapped text prefers word boundaries and emergency breaks long words" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try wrapText(allocator, &output, "hello world", null, .ellipsis, 48, style, .fixed);
+    try wrapText(allocator, &output, "hello world", null, .ellipsis, .greedy, 48, style, .fixed);
     try std.testing.expectEqualStrings("hello\nworld", output.items);
 
     output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, 24, style, .fixed);
+    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, .greedy, 24, style, .fixed);
     try std.testing.expectEqualStrings("abc\ndef\ng", output.items);
 
     output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "hello   ", null, .ellipsis, 48, style, .fixed);
+    try wrapText(allocator, &output, "hello   ", null, .ellipsis, .greedy, 48, style, .fixed);
     try std.testing.expectEqualStrings("hello", output.items);
 
     output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "   abc", null, .ellipsis, 16, style, .fixed);
+    try wrapText(allocator, &output, "   abc", null, .ellipsis, .greedy, 16, style, .fixed);
     try std.testing.expectEqualStrings("ab\nc", output.items);
 }
 
@@ -1163,10 +1470,47 @@ test "wrapped text normalizes hard breaks and preserves graphemes" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, 100, style, .fixed);
+    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, .greedy, 100, style, .fixed);
     try std.testing.expectEqualStrings("one\ntwo", output.items);
 
     output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, 8, style, .fixed);
+    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, .greedy, 8, style, .fixed);
+    try std.testing.expectEqualStrings("e\u{301}\nx", output.items);
+}
+
+test "Knuth-Plass chooses lower paragraph demerits than greedy wrapping" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    const value = "aaaaaa bbb ccccc ddddd";
+    try wrapText(allocator, &output, value, null, .ellipsis, .greedy, 80, style, .fixed);
+    try std.testing.expectEqualStrings("aaaaaa bbb\nccccc\nddddd", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, value, null, .ellipsis, .knuth_plass, 80, style, .fixed);
+    try std.testing.expectEqualStrings("aaaaaa\nbbb ccccc\nddddd", output.items);
+}
+
+test "Knuth-Plass preserves hard breaks and emergency grapheme wrapping" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, .knuth_plass, 24, style, .fixed);
+    try std.testing.expectEqualStrings("abc\ndef\ng", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, .knuth_plass, 100, style, .fixed);
+    try std.testing.expectEqualStrings("one\ntwo", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "   abc", null, .ellipsis, .knuth_plass, 16, style, .fixed);
+    try std.testing.expectEqualStrings("ab\nc", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, .knuth_plass, 8, style, .fixed);
     try std.testing.expectEqualStrings("e\u{301}\nx", output.items);
 }
