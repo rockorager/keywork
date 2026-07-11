@@ -327,6 +327,49 @@ function M.lookup(desktop_id, opts)
   return nil, "no desktop entry for " .. desktop_id
 end
 
+--- Enumerates every desktop entry across the data dirs (or opts.dirs),
+--- highest priority first. Entries with the same desktop-file id in a
+--- later dir are shadowed, matching the spec's precedence — including
+--- NoDisplay overrides, so callers filter no_display/hidden themselves.
+--- Entries that fail to parse are skipped. opts.locale passes through
+--- to parse.
+function M.list(opts)
+  opts = opts or {}
+  local xdg = require("keywork.xdg")
+  local entries = {}
+  local claimed = {}
+  local function scan(base, rel)
+    local dir = rel == "" and base or (base .. "/" .. rel)
+    local items = xdg.read_dir(dir)
+    if not items then
+      return
+    end
+    for _, item in ipairs(items) do
+      local child = rel == "" and item.name or (rel .. "/" .. item.name)
+      -- Symlinked subdirectories are followed (read_dir reports the
+      -- link itself, so probe it as a directory first).
+      if item.type == "dir" or (item.type == "symlink" and not item.name:match("%.desktop$")) then
+        scan(base, child)
+      elseif item.name:match("%.desktop$") then
+        local id = child:gsub("/", "-")
+        -- First dir wins, and a shadowing entry claims the id even
+        -- when it fails to parse.
+        if not claimed[id] then
+          claimed[id] = true
+          local entry = M.parse(base .. "/" .. child, { locale = opts.locale, id = id })
+          if entry then
+            table.insert(entries, entry)
+          end
+        end
+      end
+    end
+  end
+  for _, dir in ipairs(opts.dirs or M.data_dirs()) do
+    scan(dir .. "/applications", "")
+  end
+  return entries
+end
+
 -- Expands one token's inline field codes. Standalone list codes are
 -- handled by the caller; here %f/%u fall back to the first value so
 -- lenient files still work.
@@ -458,7 +501,12 @@ local function dbus_activate(entry, opts, uris)
   end
   local app_id = (entry.id or basename(entry.path)):gsub("%.desktop$", "")
   local object_path = "/" .. app_id:gsub("%-", "_"):gsub("%.", "/")
-  local platform_data = dbus.array("{sv}", {})
+  local platform = {}
+  if opts.activation_token then
+    platform["activation-token"] = dbus.variant("s", opts.activation_token)
+    platform["desktop-startup-id"] = dbus.variant("s", opts.activation_token)
+  end
+  local platform_data = dbus.array("{sv}", platform)
   local call = {
     destination = app_id,
     path = object_path,
@@ -491,6 +539,9 @@ end
 ---    Terminal=true entries (opts.terminal_argv or $TERMINAL -e), then
 ---    passed through opts.wrap(argv, entry) — the hook for detached or
 ---    scoped launchers (systemd-run and friends) — and spawned.
+--- opts.activation_token (from keywork.window focus-passing) reaches the
+--- app as XDG_ACTIVATION_TOKEN/DESKTOP_STARTUP_ID in its environment, or
+--- as activation-token platform data over D-Bus.
 --- Returns the process handle (true for D-Bus activation), or nil, err.
 function M.launch(entry, opts)
   opts = opts or {}
@@ -544,8 +595,16 @@ function M.launch(entry, opts)
     end
   end
 
+  local env
+  if opts.activation_token then
+    env = {
+      XDG_ACTIVATION_TOKEN = opts.activation_token,
+      DESKTOP_STARTUP_ID = opts.activation_token,
+    }
+  end
+
   local process = require("keywork.process")
-  return process.spawn({ argv = argv })
+  return process.spawn({ argv = argv, env = env })
 end
 
 return M

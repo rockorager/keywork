@@ -16,6 +16,7 @@ const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
+const lua_xdg = @import("xdg.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
 
@@ -944,7 +945,10 @@ const embedded_ui_source = @embedFile("ui.lua");
 const embedded_service_source = @embedFile("service.lua");
 const embedded_process_source = @embedFile("process.lua");
 const embedded_stream_source = @embedFile("stream.lua");
+const embedded_xdg_source = @embedFile("xdg.lua");
 const embedded_xdg_applications_source = @embedFile("xdg_applications.lua");
+const embedded_notify_source = @embedFile("notify.lua");
+const embedded_portal_source = @embedFile("portal.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
@@ -981,8 +985,18 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_pushcclosure(lua_state, streamModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.stream");
 
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, xdgModuleLoader, 1);
+    c.lua_setfield(lua_state, preload_table, "keywork.xdg");
+
     c.lua_pushcclosure(lua_state, xdgApplicationsModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.xdg.applications");
+
+    c.lua_pushcclosure(lua_state, notifyModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.notify");
+
+    c.lua_pushcclosure(lua_state, portalModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.portal");
 
     pop(lua_state, 2);
 }
@@ -1042,6 +1056,32 @@ fn streamModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn xdgApplicationsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     if (c.luaL_loadbuffer(lua_state, embedded_xdg_applications_source.ptr, embedded_xdg_applications_source.len, "@keywork/xdg_applications.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn xdgModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    c.lua_createtable(lua_state, 0, 12);
+    lua_xdg.installApi(lua_state, -1, &app.allocator);
+    // The embedded Lua layer adds the base-directory functions in place.
+    if (c.luaL_loadbuffer(lua_state, embedded_xdg_source.ptr, embedded_xdg_source.len, "@keywork/xdg.lua") != 0) return c.lua_error(lua_state);
+    c.lua_pushvalue(lua_state, -2);
+    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn notifyModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_notify_source.ptr, embedded_notify_source.len, "@keywork/notify.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn portalModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_portal_source.ptr, embedded_portal_source.len, "@keywork/portal.lua") != 0) return c.lua_error(lua_state);
     if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     return 1;
 }
