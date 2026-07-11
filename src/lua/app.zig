@@ -1187,12 +1187,18 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         return c.luaL_error(lua_state, "invalid spawn argv");
     };
     defer lua_process.freeArgv(app.allocator, argv);
+    const env = lua_process.parseEnv(lua_state, app.allocator, 1) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("spawn env failed: {}", .{err});
+        return c.luaL_error(lua_state, "invalid spawn env (string names to string values)");
+    };
+    defer lua_process.freeEnv(app.allocator, env);
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
         .stdin_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdin") catch "ignore", "pipe"),
         .stdout_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
         .stderr_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
+        .env = env,
     };
     // A missing executable or exhausted system resources are expected
     // runtime failures, so spawn reports nil, err instead of raising.

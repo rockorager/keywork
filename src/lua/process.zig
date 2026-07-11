@@ -36,11 +36,19 @@ pub const Host = struct {
     }
 };
 
+pub const EnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const SpawnSpec = struct {
     argv: []const []const u8,
     stdin_pipe: bool,
     stdout_pipe: bool,
     stderr_pipe: bool,
+    /// Additional environment variables for the child, merged over the
+    /// inherited environment (additions win on name collisions).
+    env: []const EnvVar = &.{},
 };
 
 const PipeKind = enum { stdout, stderr };
@@ -92,6 +100,9 @@ pub const LuaProcess = struct {
         defer argv.deinit(allocator);
         const executable = try resolveExecutable(allocator, spec.argv[0]);
         defer allocator.free(executable);
+        // Built before fork: the child must not allocate.
+        var envp: ?PreparedArgv = if (spec.env.len > 0) try prepareEnvp(allocator, spec.env) else null;
+        defer if (envp) |*prepared| prepared.deinit(allocator);
 
         const fork_result = linux.fork();
         switch (linux.errno(fork_result)) {
@@ -113,7 +124,7 @@ pub const LuaProcess = struct {
                 _ = linux.close(pipe[0]);
                 dupTo(pipe[1], posix.STDERR_FILENO) catch linux.exit(127);
             }
-            _ = linux.execve(executable.ptr, argv.ptr(), std.c.environ);
+            _ = linux.execve(executable.ptr, argv.ptr(), if (envp) |prepared| prepared.ptr() else std.c.environ);
             linux.exit(127);
         }
 
@@ -322,6 +333,46 @@ pub fn parseArgv(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c
 pub fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
     for (argv) |arg| allocator.free(arg);
     allocator.free(argv);
+}
+
+/// Parses the spec's optional `env` field: a table of string names to
+/// string values. Missing field yields an empty slice.
+pub fn parseEnv(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) ![]const EnvVar {
+    c.lua_getfield(lua_state, table, "env");
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return &.{};
+    const env_table = absoluteIndex(lua_state, -1);
+    try expectType(lua_state, env_table, c.LUA_TTABLE);
+
+    var env: std.ArrayList(EnvVar) = .empty;
+    errdefer {
+        for (env.items) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.value);
+        }
+        env.deinit(allocator);
+    }
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, env_table) != 0) {
+        defer pop(lua_state, 1);
+        if (c.lua_type(lua_state, -2) != c.LUA_TSTRING) return error.InvalidEnvName;
+        const name = try dupeStringFromStack(lua_state, allocator, -2);
+        errdefer allocator.free(name);
+        if (std.mem.indexOfScalar(u8, name, '=') != null) return error.InvalidEnvName;
+        if (c.lua_type(lua_state, -1) != c.LUA_TSTRING) return error.InvalidEnvValue;
+        const value = try dupeStringFromStack(lua_state, allocator, -1);
+        errdefer allocator.free(value);
+        try env.append(allocator, .{ .name = name, .value = value });
+    }
+    return env.toOwnedSlice(allocator);
+}
+
+pub fn freeEnv(allocator: std.mem.Allocator, env: []const EnvVar) void {
+    for (env) |entry| {
+        allocator.free(entry.name);
+        allocator.free(entry.value);
+    }
+    allocator.free(env);
 }
 
 const process_type: [*:0]const u8 = "keywork.process";
@@ -597,6 +648,52 @@ fn prepareArgv(allocator: std.mem.Allocator, argv: []const []const u8) !Prepared
         values[index] = strings[index].ptr;
     }
     return .{ .values = values, .strings = strings };
+}
+
+/// Merges `additions` over the inherited environment into an execve-ready
+/// envp. Inherited entries whose name collides with an addition are dropped.
+fn prepareEnvp(allocator: std.mem.Allocator, additions: []const EnvVar) !PreparedArgv {
+    var inherited_count: usize = 0;
+    while (std.c.environ[inherited_count]) |_| inherited_count += 1;
+
+    var strings: std.ArrayList([:0]u8) = .empty;
+    errdefer {
+        for (strings.items) |value| allocator.free(value);
+        strings.deinit(allocator);
+    }
+
+    var index: usize = 0;
+    while (index < inherited_count) : (index += 1) {
+        const entry = std.mem.span(std.c.environ[index].?);
+        if (envNameOverridden(entry, additions)) continue;
+        try strings.append(allocator, try allocator.dupeZ(u8, entry));
+    }
+    for (additions) |addition| {
+        std.debug.assert(std.mem.indexOfScalar(u8, addition.name, '=') == null);
+        try strings.append(allocator, try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ addition.name, addition.value }, 0));
+    }
+
+    const values = try allocator.allocSentinel(?[*:0]const u8, strings.items.len, null);
+    errdefer allocator.free(values);
+    for (strings.items, 0..) |value, value_index| values[value_index] = value.ptr;
+    return .{ .values = values, .strings = try strings.toOwnedSlice(allocator) };
+}
+
+fn envNameOverridden(entry: []const u8, additions: []const EnvVar) bool {
+    const separator = std.mem.indexOfScalar(u8, entry, '=') orelse entry.len;
+    const name = entry[0..separator];
+    for (additions) |addition| {
+        if (std.mem.eql(u8, name, addition.name)) return true;
+    }
+    return false;
+}
+
+test envNameOverridden {
+    const additions: []const EnvVar = &.{.{ .name = "FOO", .value = "1" }};
+    try std.testing.expect(envNameOverridden("FOO=old", additions));
+    try std.testing.expect(envNameOverridden("FOO", additions));
+    try std.testing.expect(!envNameOverridden("FOOBAR=1", additions));
+    try std.testing.expect(!envNameOverridden("BAR=FOO", additions));
 }
 
 fn resolveExecutable(allocator: std.mem.Allocator, name: []const u8) ![:0]u8 {
