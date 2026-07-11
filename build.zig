@@ -87,6 +87,13 @@ pub fn build(b: *std.Build) void {
     addPkgConfigIncludePaths(b, dbus_c, &.{"dbus-1"});
     const dbus_c_module = dbus_c.createModule();
 
+    const pipewire_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ffi/pipewire_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pipewire_c_module = pipewire_c.createModule();
+
     const text_c = b.addTranslateC(.{
         .root_source_file = b.path("src/ffi/text_c.h"),
         .target = target,
@@ -113,6 +120,9 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("z2d", z2d_module);
     app_module.addImport("xkb_c", xkb_c_module);
     app_module.addImport("dbus_c", dbus_c_module);
+    app_module.addImport("pipewire_c", pipewire_c_module);
+    app_module.addCSourceFile(.{ .file = b.path("src/ffi/pipewire_c.c") });
+    app_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
     app_module.addImport("text_c", text_c_module);
     linkKeyworkSystemLibraries(app_module);
 

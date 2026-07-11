@@ -9,8 +9,8 @@ to full desktop applications.
 
 Beyond the UI engine, Keywork provides an asynchronous runtime and standard
 library for application code: common utilities desktop applications need —
-D-Bus, XDG integration, processes, timers, robust client-side networking —
-built on the same event loop that drives the UI.
+D-Bus, PipeWire, XDG integration, processes, timers, robust client-side
+networking — built on the same event loop that drives the UI.
 
 ## Principles
 

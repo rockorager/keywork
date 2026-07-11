@@ -11,6 +11,7 @@ const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
+const lua_pipewire = @import("pipewire.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
@@ -30,6 +31,7 @@ const invalid_fd: i32 = -1;
 const LuaProcess = lua_process.LuaProcess;
 const LuaSocket = lua_socket.LuaSocket;
 const DbusBus = lua_dbus.Bus;
+const PipeWireConnection = lua_pipewire.Connection;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
 const LuaTimer = lua_loop.LuaTimer;
@@ -72,6 +74,7 @@ pub const App = struct {
     processes: std.ArrayList(*LuaProcess) = .empty,
     sockets: std.ArrayList(*LuaSocket) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
+    pipewire_connections: std.ArrayList(*PipeWireConnection) = .empty,
     tasks: std.ArrayList(*LuaTask) = .empty,
     scopes: std.ArrayList(*LuaScope) = .empty,
     /// Widget scopes whose cancellation is deferred to the next loop turn,
@@ -80,6 +83,7 @@ pub const App = struct {
     scope_cancel_timer: ?*event_loop.EventLoop.Timer = null,
     dbus_host: lua_dbus.Host = undefined,
     loop_host: lua_loop.Host = undefined,
+    pipewire_host: lua_pipewire.Host = undefined,
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
@@ -158,6 +162,8 @@ pub const App = struct {
         self.sockets.deinit(self.allocator);
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
+        for (self.pipewire_connections.items) |connection| connection.destroy(self.allocator, self.state);
+        self.pipewire_connections.deinit(self.allocator);
         self.pending_scope_cancels.deinit(self.allocator);
         self.releaseWindowChildren(&self.window_children);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
@@ -194,6 +200,7 @@ pub const App = struct {
         for (self.processes.items) |process| try self.registerProcess(process);
         for (self.sockets.items) |socket| try socket.register();
         for (self.dbus_buses.items) |bus| try bus.register();
+        for (self.pipewire_connections.items) |connection| try connection.register();
         if (self.pending_scope_cancels.items.len > 0) try self.armScopeCancelTimer(loop);
         if (self.invalidator != null) try self.startLifecycle();
         if (self.quit_requested) {
@@ -236,6 +243,7 @@ pub const App = struct {
         for (self.processes.items) |process| process.unregister(loop);
         for (self.sockets.items) |socket| socket.unregister(loop);
         for (self.dbus_buses.items) |bus| bus.unregister();
+        for (self.pipewire_connections.items) |connection| connection.unregister(loop);
         self.event_loop = null;
     }
 
@@ -257,6 +265,7 @@ pub const App = struct {
         for (self.processes.items) |process| if (!process.canceled and !process.exited) return true;
         for (self.sockets.items) |socket| if (!socket.canceled and socket.fd != invalid_fd) return true;
         for (self.dbus_buses.items) |bus| if (!bus.closed) return true;
+        for (self.pipewire_connections.items) |connection| if (!connection.closed) return true;
         return false;
     }
 
@@ -654,6 +663,7 @@ pub const App = struct {
         for (self.processes.items) |process| process.cancel(self.state, .silent);
         for (self.sockets.items) |socket| socket.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
+        for (self.pipewire_connections.items) |connection| connection.cancel(self.state, .silent);
     }
 
     fn readScriptFile(self: *App) ![]u8 {
@@ -834,6 +844,19 @@ pub const App = struct {
 
     fn dbusHost(self: *App) lua_dbus.Host {
         return .{ .ptr = self, .vtable = &dbus_host_vtable };
+    }
+
+    fn addPipeWireConnection(self: *App) !*PipeWireConnection {
+        const connection = try PipeWireConnection.create(self.pipewireHost());
+        errdefer connection.destroy(self.allocator, self.state);
+        try self.pipewire_connections.append(self.allocator, connection);
+        errdefer _ = self.pipewire_connections.pop();
+        try connection.register();
+        return connection;
+    }
+
+    fn pipewireHost(self: *App) lua_pipewire.Host {
+        return .{ .ptr = self, .vtable = &pipewire_host_vtable };
     }
 
     fn addTask(self: *App, thread: *c.lua_State, thread_ref: c_int) !*LuaTask {
@@ -1022,6 +1045,33 @@ fn dbusHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
     return app.event_loop;
 }
 
+const pipewire_host_vtable: lua_pipewire.Host.VTable = .{
+    .allocator = pipewireHostAllocator,
+    .luaState = pipewireHostLuaState,
+    .eventLoop = pipewireHostEventLoop,
+    .addConnection = pipewireHostAddConnection,
+};
+
+fn pipewireHostAllocator(ptr: *anyopaque) std.mem.Allocator {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.allocator;
+}
+
+fn pipewireHostLuaState(ptr: *anyopaque) *c.lua_State {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.state;
+}
+
+fn pipewireHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.event_loop;
+}
+
+fn pipewireHostAddConnection(ptr: *anyopaque) anyerror!*PipeWireConnection {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addPipeWireConnection();
+}
+
 fn dbusHostAddBus(ptr: *anyopaque, kind: lua_dbus.Kind) anyerror!*DbusBus {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addDbusBus(kind);
@@ -1092,6 +1142,7 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
 }
 
 const embedded_ui_source = @embedFile("ui.lua");
+const embedded_audio_source = @embedFile("audio.lua");
 const embedded_storybook_source = @embedFile("storybook.lua");
 const embedded_storybook_browser_source = @embedFile("storybook_browser.lua");
 const embedded_service_source = @embedFile("service.lua");
@@ -1127,6 +1178,13 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_pushcclosure(lua_state, dbusModuleLoader, 1);
     c.lua_setfield(lua_state, preload_table, "keywork.dbus");
 
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, pipewireModuleLoader, 1);
+    c.lua_setfield(lua_state, preload_table, "keywork.pipewire");
+
+    c.lua_pushcclosure(lua_state, audioModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.audio");
+
     c.lua_pushcclosure(lua_state, logModuleLoader, 0);
     c.lua_setfield(lua_state, preload_table, "keywork.log");
 
@@ -1159,6 +1217,13 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 fn storybookModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     if (c.luaL_loadbuffer(lua_state, embedded_storybook_source.ptr, embedded_storybook_source.len, "@keywork/storybook.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn audioModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_audio_source.ptr, embedded_audio_source.len, "@keywork/audio.lua") != 0) return c.lua_error(lua_state);
     if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     return 1;
 }
@@ -1378,6 +1443,14 @@ fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     app.dbus_host = app.dbusHost();
     lua_dbus.pushModule(lua_state, &app.dbus_host);
+    return 1;
+}
+
+fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    app.pipewire_host = app.pipewireHost();
+    lua_pipewire.pushModule(lua_state, &app.pipewire_host);
     return 1;
 }
 
@@ -1659,14 +1732,20 @@ test "keywork core excludes optional capability modules" {
         \\assert(kw.invalidate == nil)
         \\assert(kw.loop == nil)
         \\assert(kw.dbus == nil)
+        \\assert(kw.pipewire == nil)
+        \\assert(kw.audio == nil)
         \\assert(kw.log == nil)
         \\assert(package.loaded["keywork.loop"] == nil)
         \\assert(package.loaded["keywork.process"] == nil)
         \\assert(package.loaded["keywork.dbus"] == nil)
+        \\assert(package.loaded["keywork.pipewire"] == nil)
+        \\assert(package.loaded["keywork.audio"] == nil)
         \\assert(package.loaded["keywork.log"] == nil)
         \\assert(type(require("keywork.loop").timer) == "function")
         \\assert(type(require("keywork.process").spawn) == "function")
         \\assert(type(require("keywork.dbus").session) == "function")
+        \\assert(type(require("keywork.pipewire").connect) == "function")
+        \\assert(type(require("keywork.audio").monitor) == "function")
         \\assert(type(require("keywork.log").info) == "function")
         \\local options = { child = kw.text("x") }
         \\local root = kw.app(options)
