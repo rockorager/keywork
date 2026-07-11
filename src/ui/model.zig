@@ -1153,6 +1153,10 @@ pub const RenderNode = struct {
     /// Kept separate from layout dirtiness so a semantically identical
     /// rebuild does not manufacture damage merely by re-running layout.
     needs_paint: bool = true,
+    /// Conservative bounds of this subtree's paint. Layout stores this
+    /// separately from `rect` because descendants and glyphs may overhang
+    /// layout geometry. Viewports clip it to their rect.
+    paint_bounds: ?Rect = null,
     /// Union of this node's previous and current bounds accumulated since
     /// the damage was last collected; null when the node has not changed.
     damage: ?Rect = null,
@@ -1194,6 +1198,59 @@ pub const RenderNode = struct {
             return self == .scroll or self == .list;
         }
     };
+
+    /// Returns retained paint bounds, deriving them for manually constructed
+    /// nodes used by embedders and tests that have not passed through layout.
+    pub fn paintBounds(self: *const RenderNode) ?Rect {
+        return self.paint_bounds orelse self.derivePaintBounds();
+    }
+
+    pub fn derivePaintBounds(self: *const RenderNode) ?Rect {
+        return self.derivePaintBoundsForChildren(self.children);
+    }
+
+    pub fn derivePaintBoundsForChildren(self: *const RenderNode, children: []const *RenderNode) ?Rect {
+        var bounds = unionPaintBounds(null, self.deriveOwnPaintBounds());
+        for (children) |child| bounds = unionPaintBounds(bounds, child.paintBounds());
+        if (self.kind.isViewport()) {
+            if (bounds) |value| {
+                const clipped = value.intersect(self.rect);
+                bounds = if (clipped.isEmpty()) null else clipped;
+            }
+        }
+        return bounds;
+    }
+
+    pub fn deriveOwnPaintBounds(self: *const RenderNode) ?Rect {
+        return switch (self.kind) {
+            .text => if (self.text) |value| blk: {
+                if (value.len == 0) break :blk null;
+                const overhang = @max(0, self.text_style.font_size);
+                break :blk .{
+                    .x = self.rect.x - overhang,
+                    .y = self.rect.y - overhang,
+                    .width = self.rect.width + overhang * 2,
+                    .height = self.rect.height + overhang * 2,
+                };
+            } else null,
+            .box => if (self.background.a > 0 or self.box_border != null) self.rect else null,
+            .separator => if (self.background.a > 0) self.rect else null,
+            .text_input, .spinner, .scroll, .list, .render_object => self.rect,
+            else => null,
+        };
+    }
+
+    fn unionPaintBounds(a: ?Rect, b: ?Rect) ?Rect {
+        const left = if (a) |value| if (!value.isEmpty()) value else null else null;
+        const right = if (b) |value| if (!value.isEmpty()) value else null else null;
+        const left_bounds = left orelse return right;
+        const right_bounds = right orelse return left;
+        const x0 = @min(left_bounds.x, right_bounds.x);
+        const y0 = @min(left_bounds.y, right_bounds.y);
+        const x1 = @max(left_bounds.x + left_bounds.width, right_bounds.x + right_bounds.width);
+        const y1 = @max(left_bounds.y + left_bounds.height, right_bounds.y + right_bounds.height);
+        return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+    }
 };
 
 pub const AppContext = struct {
@@ -5367,7 +5424,7 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
 
     const stateful: ToggleStateful = .{};
     const children = [_]Widget{ .{ .text = .{ .value = "static" } }, stateful.widget() };
-    const column: Widget = .{ .column = .{ .children = &children } };
+    const column: Widget = .{ .column = .{ .children = &children, .gap = 32 } };
     const constraints: Constraints = .{ .max_width = 200, .max_height = 120 };
 
     var scope: BuildScope = .{ .allocator = built_arena.allocator() };

@@ -51,9 +51,14 @@ fn paintNode(
     scale: f32,
     cull_rect: ?Rect,
 ) !void {
-    const bounds = if (node.kind == .text) inflatedRect(node.rect, node.text_style.font_size) else node.rect;
-    const paints_node = if (cull_rect) |cull| !bounds.intersect(cull).isEmpty() else true;
-    if (node.kind.isViewport() and !paints_node) return;
+    if (cull_rect) |cull| {
+        const subtree_bounds = node.paintBounds() orelse return;
+        if (subtree_bounds.intersect(cull).isEmpty()) return;
+    }
+    const paints_node = if (cull_rect) |cull|
+        if (node.deriveOwnPaintBounds()) |bounds| !bounds.intersect(cull).isEmpty() else false
+    else
+        true;
 
     if (paints_node) switch (node.kind) {
         .render_object => {
@@ -133,15 +138,6 @@ fn paintNode(
         try paintScrollbars(allocator, node, display_list, raster_cache, scale);
         try display_list.popClip(allocator);
     }
-}
-
-fn inflatedRect(rect: Rect, amount: f32) Rect {
-    return .{
-        .x = rect.x - amount,
-        .y = rect.y - amount,
-        .width = rect.width + amount * 2,
-        .height = rect.height + amount * 2,
-    };
 }
 
 test "damage paint emits only intersecting node commands" {

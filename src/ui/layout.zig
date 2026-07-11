@@ -43,16 +43,19 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     // need to refresh retained payload pointers while producing identical
     // pixels; only changed bounds or an explicitly changed painted payload
     // contribute damage.
-    const rect_changed = !std.meta.eql(node.rect, value.rect);
+    const old_paint_bounds = node.paintBounds();
+    const new_paint_bounds = value.derivePaintBoundsForChildren(children);
+    const bounds_changed = !std.meta.eql(old_paint_bounds, new_paint_bounds);
     const paint_changed = node.needs_paint;
     var damage = node.damage;
-    if (rect_changed or paint_changed) {
-        damage = unionDamage(unionDamage(damage, node.rect), value.rect);
+    if (bounds_changed or paint_changed) {
+        damage = unionPaintBounds(unionPaintBounds(damage, old_paint_bounds), new_paint_bounds);
     }
     node.* = value;
     node.children = children;
     node.text_buffer = text_buffer;
     node.constraints = constraints;
+    node.paint_bounds = new_paint_bounds;
     node.damage = damage;
     node.needs_layout = false;
     node.needs_paint = false;
@@ -66,6 +69,10 @@ fn unionDamage(damage: ?Rect, rect: Rect) ?Rect {
     const x1 = @max(existing.x + existing.width, rect.x + rect.width);
     const y1 = @max(existing.y + existing.height, rect.y + rect.height);
     return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
+fn unionPaintBounds(damage: ?Rect, paint_bounds: ?Rect) ?Rect {
+    return if (paint_bounds) |bounds| unionDamage(damage, bounds) else damage;
 }
 
 const ellipsis = "…";
@@ -187,12 +194,20 @@ fn moveNode(node: *RenderNode, x: f32, y: f32) void {
     if (node.rect.x == x and node.rect.y == y) return;
     const dx = x - node.rect.x;
     const dy = y - node.rect.y;
-    node.damage = unionDamage(node.damage, node.rect);
-    node.rect.x = x;
-    node.rect.y = y;
+    translateNode(node, dx, dy);
+}
+
+fn translateNode(node: *RenderNode, dx: f32, dy: f32) void {
+    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    node.rect.x += dx;
+    node.rect.y += dy;
+    if (node.paint_bounds) |*bounds| {
+        bounds.x += dx;
+        bounds.y += dy;
+    }
     if (node.caret_x) |caret_x| node.caret_x = caret_x + dx;
-    node.damage = unionDamage(node.damage, node.rect);
-    translateChildren(node, dx, dy);
+    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    for (node.children) |child| translateNode(child, dx, dy);
 }
 
 /// Lays out an element subtree into its retained render node, mutating
@@ -593,10 +608,11 @@ fn crossExtent(comptime kind: RenderNode.Kind, child: *const RenderNode) f32 {
 /// covered region. Returns whether the size actually changed.
 fn resizeNode(node: *RenderNode, width: f32, height: f32) bool {
     if (node.rect.width == width and node.rect.height == height) return false;
-    node.damage = unionDamage(node.damage, node.rect);
+    node.damage = unionPaintBounds(node.damage, node.paintBounds());
     node.rect.width = width;
     node.rect.height = height;
-    node.damage = unionDamage(node.damage, node.rect);
+    node.paint_bounds = node.derivePaintBounds();
+    node.damage = unionPaintBounds(node.damage, node.paintBounds());
     return true;
 }
 
@@ -710,10 +726,13 @@ fn layoutLinearElements(
         // wrappers over them) still occupy their whole share; this is a
         // no-op for children that honored the tight constraint.
         if (flexible_widget.fit == .tight) {
-            setMainExtent(kind, children[index], share);
             if (children[index].children.len == 1 and mainExtent(kind, children[index].children[0]) < share) {
                 setMainExtent(kind, children[index].children[0], share);
             }
+            // Recompute the wrapper after its child so its aggregate paint
+            // bounds observe any parent-side child resize.
+            setMainExtent(kind, children[index], share);
+            children[index].paint_bounds = children[index].derivePaintBounds();
         }
         cross = @max(cross, crossExtent(kind, children[index]));
     }
@@ -890,15 +909,6 @@ fn alignedOffset(alignment: Widget.Alignment, outer: f32, inner: f32) f32 {
     };
 }
 
-fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
-    for (node.children) |child| {
-        child.rect.x += dx;
-        child.rect.y += dy;
-        if (child.caret_x) |caret_x| child.caret_x = caret_x + dx;
-        translateChildren(child, dx, dy);
-    }
-}
-
 test "moving a clean subtree translates text input carets" {
     var input: RenderNode = .{
         .kind = .text_input,
@@ -917,6 +927,53 @@ test "moving a clean subtree translates text input carets" {
     try std.testing.expectEqual(@as(f32, 25), input.rect.x);
     try std.testing.expectEqual(@as(f32, 25), input.rect.y);
     try std.testing.expectEqual(@as(?f32, 57), input.caret_x);
+}
+
+test "text paint overhang contributes to retained damage" {
+    var text: RenderNode = .{
+        .kind = .text,
+        .rect = .{ .x = 20, .y = 10, .width = 16, .height = 16 },
+        .text = "a",
+        .needs_paint = true,
+    };
+    text.paint_bounds = text.derivePaintBounds();
+
+    commitRenderNode(&text, .{
+        .kind = .text,
+        .rect = text.rect,
+        .text = "b",
+    });
+
+    const expected: Rect = .{ .x = 4, .y = -6, .width = 48, .height = 48 };
+    try std.testing.expectEqual(expected, text.paint_bounds.?);
+    try std.testing.expectEqual(expected, text.damage.?);
+}
+
+test "removing an overflowing child damages its retained paint bounds" {
+    var child: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 30, .y = 0, .width = 20, .height = 20 },
+        .background = colors.white,
+        .needs_paint = false,
+    };
+    child.paint_bounds = child.derivePaintBounds();
+    var children = [_]*RenderNode{&child};
+    var parent: RenderNode = .{
+        .kind = .center,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .children = &children,
+        .needs_paint = false,
+    };
+    parent.paint_bounds = parent.derivePaintBounds();
+
+    parent.children = &.{};
+    commitRenderNode(&parent, .{
+        .kind = .center,
+        .rect = parent.rect,
+    });
+
+    try std.testing.expectEqual(child.rect, parent.damage.?);
+    try std.testing.expectEqual(@as(?Rect, null), parent.paint_bounds);
 }
 
 test "fitting boundary chooses the last measured cluster that fits" {
