@@ -14,7 +14,7 @@ allocator: std.mem.Allocator,
 library: c.FT_Library,
 fonts: std.ArrayList(FontFace) = .empty,
 next_font_id: u32 = 0,
-fallback_cache: std.AutoHashMapUnmanaged(FallbackKey, usize) = .empty,
+fallback_cache: std.StringHashMapUnmanaged(usize) = .empty,
 shape_cache: ShapeCache = .empty,
 glyph_cache: GlyphCache = .empty,
 cache_clock: u64 = 0,
@@ -196,6 +196,8 @@ pub fn deinit(self: *Self) void {
     self.shape_cache.deinit(self.allocator);
     self.clearGlyphCache();
     self.glyph_cache.deinit(self.allocator);
+    var fallback_keys = self.fallback_cache.keyIterator();
+    while (fallback_keys.next()) |key| self.allocator.free(key.*);
     self.fallback_cache.deinit(self.allocator);
     for (self.fonts.items) |*font| font.deinit(self.allocator);
     self.fonts.deinit(self.allocator);
@@ -440,25 +442,110 @@ fn nextFontRun(self: *Self, value: []const u8, index: *usize) !?FontRun {
     return .{ .font_index = font_index, .value = value[run_start..run_end] };
 }
 
-/// Chooses one font for a whole grapheme cluster. The base codepoint
-/// drives the lookup; an emoji-presentation signal anywhere in the cluster
-/// (VS16, ZWJ participants, emoji ranges) prefers a color font even when
-/// the base is plain text, e.g. keycap sequences starting with a digit.
+/// Codepoints per cluster whose coverage a candidate font must prove.
+/// Longer clusters (pathological mark runs) verify their tail through
+/// shaping rather than cmap checks.
+const max_required_codepoints = 16;
+
+/// Fonts loaded per cluster while walking fontconfig's sort order before
+/// giving up, bounding FT_Face memory when candidates keep failing.
+const max_fallback_candidates = 8;
+
+/// Chooses one font for a whole grapheme cluster. Every non-ignorable
+/// codepoint must be covered, not just the base: keycaps, ZWJ sequences,
+/// and combining marks otherwise land in a font that renders part of the
+/// cluster as .notdef. An emoji-presentation signal anywhere in the
+/// cluster (VS16, emoji ranges) prefers a color font even when the base
+/// is plain text, e.g. keycap sequences starting with a digit.
 fn fontForCluster(self: *Self, cluster: []const u8) !usize {
-    var base: ?u21 = null;
+    var required_buf: [max_required_codepoints]u21 = undefined;
+    var required_count: usize = 0;
+    var codepoint_count: usize = 0;
     var prefer_color = false;
     var force_text = false;
 
     var index: usize = 0;
     while (index < cluster.len) {
         const decoded = try nextCodepoint(cluster, &index);
-        if (base == null) base = decoded.codepoint;
+        codepoint_count += 1;
         if (decoded.codepoint == 0xFE0F or wantsColorGlyph(decoded.codepoint)) prefer_color = true;
         if (decoded.codepoint == 0xFE0E) force_text = true;
+        if (ignorableForCoverage(decoded.codepoint)) continue;
+        if (required_count < required_buf.len) {
+            required_buf[required_count] = decoded.codepoint;
+            required_count += 1;
+        }
     }
 
-    const base_codepoint = base orelse return primary_font_index;
-    return self.fontForCodepoint(base_codepoint, prefer_color and !force_text);
+    if (codepoint_count == 0) return primary_font_index;
+    const required = required_buf[0..required_count];
+    const want_color = prefer_color and !force_text;
+
+    // Fast path: a lone codepoint the primary font covers cannot shape
+    // to .notdef, so skip the cache and shape verification entirely.
+    if (!want_color and codepoint_count == 1 and required_count == 1 and
+        self.fontSupports(primary_font_index, required[0]))
+    {
+        return primary_font_index;
+    }
+
+    if (self.fallback_cache.get(cluster)) |font_index| return font_index;
+
+    const font_index = try self.resolveClusterFont(cluster, required, want_color, codepoint_count > 1);
+
+    const owned_cluster = try self.allocator.dupe(u8, cluster);
+    errdefer self.allocator.free(owned_cluster);
+    try self.fallback_cache.put(self.allocator, owned_cluster, font_index);
+    return font_index;
+}
+
+/// Walks fontconfig's sorted candidates for the cluster's required
+/// codepoints. A candidate wins only after its fontconfig charset, its
+/// actual cmap, and (for multi-codepoint clusters) a trial shape all
+/// succeed; charset entries lie often enough that each cheaper check
+/// gates the next. Falls back to the primary font when nothing passes.
+fn resolveClusterFont(self: *Self, cluster: []const u8, required: []const u21, want_color: bool, multi_codepoint: bool) !usize {
+    if (!want_color and self.fontSupportsAll(primary_font_index, required)) {
+        if (!multi_codepoint or self.shapesWithoutNotdef(primary_font_index, cluster)) return primary_font_index;
+    }
+
+    var required_c: [max_required_codepoints]u32 = undefined;
+    for (required, required_c[0..required.len]) |cp, *out| out.* = cp;
+
+    const set = c.keywork_fontconfig_sort_codepoints(
+        &required_c,
+        @intCast(required.len),
+        @intFromBool(want_color),
+    ) orelse return primary_font_index;
+    defer c.keywork_fontconfig_sort_destroy(set);
+
+    var loaded: usize = 0;
+    var candidate: c_uint = 0;
+    const candidate_count = c.keywork_fontconfig_sort_count(set);
+    while (candidate < candidate_count and loaded < max_fallback_candidates) : (candidate += 1) {
+        if (c.keywork_fontconfig_sort_covers(set, candidate, &required_c, @intCast(required.len)) == 0) continue;
+
+        var font_path: [4096]u8 = undefined;
+        if (c.keywork_fontconfig_sort_path(set, candidate, font_path[0..].ptr, font_path.len) == 0) continue;
+        const path = std.mem.sliceTo(font_path[0..], 0);
+        const font_index = self.loadFont(path) catch continue;
+        loaded += 1;
+
+        if (!self.fontSupportsAll(font_index, required)) continue;
+        if (multi_codepoint and !self.shapesWithoutNotdef(font_index, cluster)) continue;
+        return font_index;
+    }
+
+    return primary_font_index;
+}
+
+/// Joiners and variation selectors shape to zero-width glyphs or vanish
+/// entirely, so fonts legitimately omit them from their cmap; requiring
+/// them would reject fonts that render the cluster fine.
+fn ignorableForCoverage(codepoint: u21) bool {
+    return codepoint == 0x200C or codepoint == 0x200D or
+        (codepoint >= 0xFE00 and codepoint <= 0xFE0F) or
+        (codepoint >= 0xE0100 and codepoint <= 0xE01EF);
 }
 
 fn nextCodepoint(value: []const u8, index: *usize) !CodepointSlice {
@@ -471,34 +558,39 @@ fn nextCodepoint(value: []const u8, index: *usize) !CodepointSlice {
     return .{ .value = slice, .codepoint = try std.unicode.utf8Decode(slice) };
 }
 
-const FallbackKey = struct {
-    codepoint: u21,
-    prefer_color: bool,
-};
-
-fn fontForCodepoint(self: *Self, codepoint: u21, prefer_color: bool) !usize {
-    // A color-presentation cluster must not short-circuit to the primary
-    // font just because it covers the base codepoint (keycap digits).
-    if (!prefer_color and self.fontSupports(primary_font_index, codepoint)) return primary_font_index;
-    const key: FallbackKey = .{ .codepoint = codepoint, .prefer_color = prefer_color };
-    if (self.fallback_cache.get(key)) |font_index| return font_index;
-
-    var font_path: [4096]u8 = undefined;
-    const font_index = fallback: {
-        const want_color: c_int = if (prefer_color) 1 else 0;
-        if (c.keywork_fontconfig_match_codepoint(codepoint, want_color, font_path[0..].ptr, font_path.len) == 0) break :fallback primary_font_index;
-        const path = std.mem.sliceTo(font_path[0..], 0);
-        const loaded_index = self.loadFont(path) catch break :fallback primary_font_index;
-        if (!self.fontSupports(loaded_index, codepoint)) break :fallback primary_font_index;
-        break :fallback loaded_index;
-    };
-
-    try self.fallback_cache.put(self.allocator, key, font_index);
-    return font_index;
-}
-
 fn fontSupports(self: *Self, font_index: usize, codepoint: u21) bool {
     return c.keywork_ft_get_char_index(self.fonts.items[font_index].face, codepoint) != 0;
+}
+
+fn fontSupportsAll(self: *Self, font_index: usize, codepoints: []const u21) bool {
+    for (codepoints) |codepoint| {
+        if (!self.fontSupports(font_index, codepoint)) return false;
+    }
+    return true;
+}
+
+/// Trial-shapes a cluster and rejects the font when any glyph comes back
+/// as .notdef. Cmap coverage alone cannot promise this: composed
+/// sequences (keycaps, ZWJ emoji, mark stacking) depend on the font's
+/// shaping rules, which only HarfBuzz can evaluate.
+fn shapesWithoutNotdef(self: *Self, font_index: usize, cluster: []const u8) bool {
+    std.debug.assert(cluster.len > 0);
+    if (cluster.len > std.math.maxInt(c_int)) return false;
+
+    var glyphs: [64]c.KeyworkGlyph = undefined;
+    const font = &self.fonts.items[font_index];
+    const count = c.keywork_hb_shape_text(
+        font.hb_font,
+        cluster.ptr,
+        @intCast(cluster.len),
+        &glyphs,
+        glyphs.len,
+    );
+    if (count == 0) return false;
+    for (glyphs[0..count]) |glyph| {
+        if (glyph.glyph_index == 0) return false;
+    }
+    return true;
 }
 
 fn shapeRun(self: *Self, font_index: usize, pixel_size: u31, value: []const u8) !*const ShapedRun {
@@ -870,6 +962,18 @@ fn snapToPixel(value: f32) f32 {
 
 fn fromFixed26Dot6(value: i32) f32 {
     return @as(f32, @floatFromInt(value)) / 64.0;
+}
+
+test "ignorableForCoverage skips joiners and selectors but not cluster content" {
+    try std.testing.expect(ignorableForCoverage(0x200D)); // ZWJ
+    try std.testing.expect(ignorableForCoverage(0x200C)); // ZWNJ
+    try std.testing.expect(ignorableForCoverage(0xFE0E)); // VS15
+    try std.testing.expect(ignorableForCoverage(0xFE0F)); // VS16
+    try std.testing.expect(ignorableForCoverage(0xE0100)); // IVS
+    try std.testing.expect(!ignorableForCoverage(0x20E3)); // combining keycap
+    try std.testing.expect(!ignorableForCoverage(0x1F3FB)); // skin tone
+    try std.testing.expect(!ignorableForCoverage(0x1F1E6)); // regional indicator
+    try std.testing.expect(!ignorableForCoverage('A'));
 }
 
 test "subpixelPosition quantizes to quarter-pixel bins" {

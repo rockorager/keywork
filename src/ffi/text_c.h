@@ -45,45 +45,73 @@ static inline int keywork_fontconfig_match_default(char *out, size_t out_len) {
     return ok;
 }
 
-static inline int keywork_fontconfig_match_codepoint(uint32_t codepoint, int prefer_color, char *out, size_t out_len) {
-    if (out_len == 0) return 0;
-    out[0] = '\0';
-
-    if (!FcInit()) return 0;
+/// Fontconfig's sorted candidate list for a set of required codepoints.
+/// Unlike FcFontMatch, the full FcFontSort order lets callers walk past
+/// candidates whose real cmap or shaping coverage falls short of what
+/// the fontconfig charset promised. Destroy with
+/// keywork_fontconfig_sort_destroy.
+static inline FcFontSet *keywork_fontconfig_sort_codepoints(const uint32_t *codepoints, unsigned int count, int prefer_color) {
+    if (!FcInit()) return NULL;
 
     FcPattern *pattern = FcNameParse((const FcChar8 *)"sans");
-    if (!pattern) return 0;
+    if (!pattern) return NULL;
     if (prefer_color) FcPatternAddBool(pattern, FC_COLOR, FcTrue);
 
-    FcCharSet *charset = FcCharSetCreate();
-    if (!charset) {
-        FcPatternDestroy(pattern);
-        return 0;
-    }
-    int ok = FcCharSetAddChar(charset, (FcChar32)codepoint) && FcPatternAddCharSet(pattern, FC_CHARSET, charset);
-    FcCharSetDestroy(charset);
-    if (!ok) {
-        FcPatternDestroy(pattern);
-        return 0;
+    if (count > 0) {
+        FcCharSet *charset = FcCharSetCreate();
+        if (!charset) {
+            FcPatternDestroy(pattern);
+            return NULL;
+        }
+        int ok = 1;
+        for (unsigned int i = 0; i < count; i += 1) {
+            ok = ok && FcCharSetAddChar(charset, (FcChar32)codepoints[i]);
+        }
+        ok = ok && FcPatternAddCharSet(pattern, FC_CHARSET, charset);
+        FcCharSetDestroy(charset);
+        if (!ok) {
+            FcPatternDestroy(pattern);
+            return NULL;
+        }
     }
 
     FcConfigSubstitute(NULL, pattern, FcMatchPattern);
     FcDefaultSubstitute(pattern);
 
     FcResult result = FcResultNoMatch;
-    FcPattern *match = FcFontMatch(NULL, pattern, &result);
+    FcFontSet *set = FcFontSort(NULL, pattern, FcTrue, NULL, &result);
     FcPatternDestroy(pattern);
-    if (!match) return 0;
+    return set;
+}
+
+static inline unsigned int keywork_fontconfig_sort_count(const FcFontSet *set) {
+    return set ? (unsigned int)set->nfont : 0;
+}
+
+/// 1 when the candidate's fontconfig charset claims every codepoint.
+/// Cheap pre-filter so callers only load fonts worth verifying.
+static inline int keywork_fontconfig_sort_covers(FcFontSet *set, unsigned int index, const uint32_t *codepoints, unsigned int count) {
+    if (!set || index >= (unsigned int)set->nfont) return 0;
+    FcCharSet *charset = NULL;
+    if (FcPatternGetCharSet(set->fonts[index], FC_CHARSET, 0, &charset) != FcResultMatch || !charset) return 0;
+    for (unsigned int i = 0; i < count; i += 1) {
+        if (!FcCharSetHasChar(charset, (FcChar32)codepoints[i])) return 0;
+    }
+    return 1;
+}
+
+static inline int keywork_fontconfig_sort_path(FcFontSet *set, unsigned int index, char *out, size_t out_len) {
+    if (!set || index >= (unsigned int)set->nfont || out_len == 0) return 0;
+    out[0] = '\0';
 
     FcChar8 *file = NULL;
-    ok = FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch && file != NULL;
-    if (ok) {
-        int written = snprintf(out, out_len, "%s", (const char *)file);
-        ok = written > 0 && (size_t)written < out_len;
-    }
+    if (FcPatternGetString(set->fonts[index], FC_FILE, 0, &file) != FcResultMatch || file == NULL) return 0;
+    int written = snprintf(out, out_len, "%s", (const char *)file);
+    return written > 0 && (size_t)written < out_len;
+}
 
-    FcPatternDestroy(match);
-    return ok;
+static inline void keywork_fontconfig_sort_destroy(FcFontSet *set) {
+    if (set) FcFontSetDestroy(set);
 }
 
 static inline unsigned int keywork_ft_get_char_index(FT_Face face, uint32_t codepoint) {
