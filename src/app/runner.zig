@@ -713,6 +713,7 @@ fn PopupManager(comptime Backend: type) type {
 
         fn popupBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
             const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
+            scope.state_invalidator = .{ .ptr = surface, .call_fn = invalidatePopupState };
             return surface.popup.builder.build(scope, .{
                 .constraints = .{ .max_width = context.window_width, .max_height = context.window_height },
                 .theme = scope.theme,
@@ -720,6 +721,11 @@ fn PopupManager(comptime Backend: type) type {
                 .interaction = scope.interaction,
                 .app_context = context,
             });
+        }
+
+        fn invalidatePopupState(ptr: *anyopaque) anyerror!void {
+            const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
+            try surface.runtime.invalidateState();
         }
     };
 }
@@ -1095,7 +1101,13 @@ fn WindowManager(comptime Backend: type) type {
 
         fn managedBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
             const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+            scope.state_invalidator = .{ .ptr = managed, .call_fn = invalidateManagedState };
             return managed.manager.windows_host.buildWindowWidget(managed.id, scope, context);
+        }
+
+        fn invalidateManagedState(ptr: *anyopaque) anyerror!void {
+            const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+            try managed.runtime.invalidateState();
         }
     };
 }

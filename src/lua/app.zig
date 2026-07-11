@@ -235,6 +235,16 @@ pub const App = struct {
     }
 
     pub fn buildWidget(self: *App, allocator: std.mem.Allocator, runtime_state: State, render_scale: f32) !keywork.Widget {
+        return self.buildWidgetWithInvalidator(allocator, runtime_state, render_scale, null);
+    }
+
+    fn buildWidgetWithInvalidator(
+        self: *App,
+        allocator: std.mem.Allocator,
+        runtime_state: State,
+        render_scale: f32,
+        state_invalidator: ?keywork.Widget.Callback,
+    ) !keywork.Widget {
         try self.ensureLoaded();
 
         const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
@@ -242,7 +252,7 @@ pub const App = struct {
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_getfield(self.state, -1, "child");
-        const widget = try lua_widget.parse(self.widgetHost(), self.state, allocator, allocator, runtime_state, .{
+        const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
             .png_dims = &self.png_dims,
@@ -427,7 +437,7 @@ pub const App = struct {
         c.lua_settop(self.state, 0);
         defer c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, ref);
-        const widget = try lua_widget.parse(self.widgetHost(), self.state, scope.allocator, scope.allocator, context, .{
+        const widget = try lua_widget.parse(self.widgetHost(scope.state_invalidator), self.state, scope.allocator, scope.allocator, context, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
             .png_dims = &self.png_dims,
@@ -558,13 +568,13 @@ pub const App = struct {
 
     fn buildWidgetHost(ptr: *anyopaque, scope: *BuildScope, runtime_state: State) !keywork.Widget {
         const self: *App = @ptrCast(@alignCast(ptr));
-        return self.buildWidget(scope.allocator, runtime_state, scope.render_scale);
+        return self.buildWidgetWithInvalidator(scope.allocator, runtime_state, scope.render_scale, scope.state_invalidator);
     }
 
-    fn widgetHost(self: *App) lua_widget.Host {
+    fn widgetHost(self: *App, state_invalidator: ?keywork.Widget.Callback) lua_widget.Host {
         return .{
             .ptr = self,
-            .invalidate_state_fn = invalidateWidgetState,
+            .state_invalidator = state_invalidator orelse .{ .ptr = self, .call_fn = invalidateWidgetState },
             .create_scope_fn = createWidgetScope,
             .dispose_scope_fn = disposeWidgetScope,
         };
@@ -2951,6 +2961,78 @@ test "lua stateful widget set_state rebuilds retained subtree" {
 
     try runtime.click(.{ .x = 2, .y = 2 });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"1\"") != null);
+}
+
+test "lua stateful widget prefers its build scope invalidator" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local Counter = kw.stateful({
+        \\  build = function(self, state)
+        \\    return kw.gesture({ id = "counter", child = kw.text("counter"), on_tap = function()
+        \\      self:set_state()
+        \\    end })
+        \\  end,
+        \\})
+        \\return kw.app({ child = Counter({ key = "counter" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scoped-stateful.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "scoped-stateful.lua" });
+    defer allocator.free(script_path);
+
+    const Counter = struct {
+        calls: usize = 0,
+
+        fn invalidate(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    const ScopedHost = struct {
+        app: *App,
+        invalidator: *Counter,
+
+        fn host(self: *@This()) keywork.AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, context: State) anyerror!keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            scope.state_invalidator = .{ .ptr = self.invalidator, .call_fn = Counter.invalidate };
+            return self.app.host().buildWidget(scope, context);
+        }
+    };
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    var global_invalidator: Counter = .{};
+    app.bindInvalidator(.{
+        .ptr = &global_invalidator,
+        .invalidate_fn = Counter.invalidate,
+        .invalidate_state_fn = Counter.invalidate,
+    });
+
+    var scoped_invalidator: Counter = .{};
+    var scoped_host: ScopedHost = .{ .app = &app, .invalidator = &scoped_invalidator };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 40 },
+        scoped_host.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try runtime.click(.{ .x = 2, .y = 2 });
+    try std.testing.expectEqual(@as(usize, 1), scoped_invalidator.calls);
+    try std.testing.expectEqual(@as(usize, 0), global_invalidator.calls);
 }
 
 test "lua stateful widget dispose runs when removed" {

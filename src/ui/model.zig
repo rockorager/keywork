@@ -764,6 +764,9 @@ pub const BuildScope = struct {
     interaction: InteractionState = .{},
     actions: ?*const ActionScope = null,
     app_context: AppContext = .{},
+    /// The runtime that owns this build. Stateful widgets retain this
+    /// callback so a local state change dirties only its own runtime.
+    state_invalidator: ?Widget.Callback = null,
     /// Render scale of the runtime driving this build, so scale-dependent
     /// asset choices (e.g. icon rasterization) match the target window.
     render_scale: f32 = 1,

@@ -28,12 +28,18 @@ const tableRefField = lua_value.tableRefField;
 
 pub const Host = struct {
     ptr: *anyopaque,
-    invalidate_state_fn: *const fn (*anyopaque) anyerror!void,
+    state_invalidator: keywork.Widget.Callback,
     create_scope_fn: *const fn (*anyopaque) anyerror!*lua_task.LuaScope,
     dispose_scope_fn: *const fn (*anyopaque, *lua_task.LuaScope) void,
 
     pub fn invalidateState(self: Host) !void {
-        try self.invalidate_state_fn(self.ptr);
+        try self.state_invalidator.call();
+    }
+
+    fn withStateInvalidator(self: Host, state_invalidator: ?keywork.Widget.Callback) Host {
+        var result = self;
+        result.state_invalidator = state_invalidator orelse return result;
+        return result;
     }
 
     pub fn createScope(self: Host) !*lua_task.LuaScope {
@@ -528,7 +534,7 @@ const LuaStatefulWidget = struct {
         pushRuntimeState(self.lua_state, context.app_context);
         if (c.lua_pcall(self.lua_state, 2, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful build failed");
         defer pop(self.lua_state, 1);
-        return try parse(self.host, self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
+        return try parse(self.host.withStateInvalidator(scope.state_invalidator), self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
     }
 
     fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -637,7 +643,7 @@ const LuaPopupBuilder = struct {
             if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "popup build failed");
         }
         defer pop(self.lua_state, 1);
-        return try parse(self.host, self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
+        return try parse(self.host.withStateInvalidator(scope.state_invalidator), self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
     }
 
     /// Transfers the registry ref like LuaCallback.clone: parse-tree
@@ -1229,7 +1235,7 @@ test "failed gesture parse destroys callbacks it already captured" {
     var host_ctx: u8 = 0;
     const host: Host = .{
         .ptr = &host_ctx,
-        .invalidate_state_fn = TestHost.invalidate,
+        .state_invalidator = .{ .ptr = &host_ctx, .call_fn = TestHost.invalidate },
         .create_scope_fn = TestHost.createScope,
         .dispose_scope_fn = TestHost.disposeScope,
     };
@@ -1557,7 +1563,7 @@ const LuaItemBuilder = struct {
             return error.LuaCallbackFailed;
         }
         defer pop(self.lua_state, 1);
-        return parse(self.host, self.lua_state, scope.allocator, scope.allocator, scope.app_context, self.parse_context, -1);
+        return parse(self.host.withStateInvalidator(scope.state_invalidator), self.lua_state, scope.allocator, scope.allocator, scope.app_context, self.parse_context, -1);
     }
 
     /// Transfers the registry ref like LuaCallback.clone: parse-tree
