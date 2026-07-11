@@ -1684,6 +1684,236 @@ test "wheel scroll reaches a selected list nested in a flexible column slot" {
     try std.testing.expectEqual(@as(f32, 100), keywork.listState(list_element).offset);
 }
 
+test "present damage covers every display-list change during fast wheel scroll" {
+    const TestApp = struct {
+        var dummy: u8 = 0;
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        // Mirrors the launcher: column { header, expanded(box(padding(list))), footer },
+        // rows are boxes filling their 44px slot.
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const allocator = scope.allocator;
+            const list_widget = keywork.widgets.list("results", 64, 44, .{ .ptr = &dummy, .build_fn = buildItem });
+            const padded = try keywork.widgets.padding(allocator, .{ .left = 6, .right = 6, .top = 6, .bottom = 6 }, list_widget);
+            const boxed: keywork.Widget = .{ .box = .{ .child = try keywork.Widget.alloc(allocator, padded) } };
+            const children = [_]keywork.Widget{
+                keywork.widgets.text("header"),
+                try keywork.widgets.expandedFlex(allocator, boxed, 1),
+                keywork.widgets.text("footer"),
+            };
+            return try keywork.widgets.column(allocator, &children, 0);
+        }
+
+        fn buildItem(_: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
+            const label = try std.fmt.allocPrint(scope.allocator, "row {d}", .{index});
+            const text: keywork.Widget = .{ .text = .{ .value = label } };
+            return .{ .box = .{ .child = try keywork.Widget.alloc(scope.allocator, text), .min_height = 44 } };
+        }
+    };
+
+    // Snapshot of one paint command with its active clip, so consecutive
+    // presents can be diffed: a command present in only one of two
+    // consecutive frames changed pixels, and those pixels must fall inside
+    // that present's damage rect. This is the invariant the SHM backend's
+    // partial repaint relies on.
+    const Entry = struct {
+        clip: ?keywork.Rect,
+        rect: keywork.Rect,
+        color: keywork.Color,
+        font_size: f32,
+        cache_key: u64,
+        kind: enum { fill, text, image },
+        text: []u8,
+
+        fn eql(self: @This(), other: @This()) bool {
+            return self.kind == other.kind and
+                std.meta.eql(self.clip, other.clip) and
+                std.meta.eql(self.rect, other.rect) and
+                std.meta.eql(self.color, other.color) and
+                self.font_size == other.font_size and
+                self.cache_key == other.cache_key and
+                std.mem.eql(u8, self.text, other.text);
+        }
+    };
+
+    const TestBackend = struct {
+        allocator: std.mem.Allocator,
+        prev: std.ArrayList(Entry) = .empty,
+        presents: usize = 0,
+        violations: usize = 0,
+
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn deinit(self: *@This()) void {
+            freeEntries(self.allocator, &self.prev);
+        }
+
+        fn freeEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
+            for (entries.items) |entry| allocator.free(entry.text);
+            entries.deinit(allocator);
+        }
+
+        fn snapshot(allocator: std.mem.Allocator, commands: []const keywork.PaintCommand) !std.ArrayList(Entry) {
+            var entries: std.ArrayList(Entry) = .empty;
+            errdefer freeEntries(allocator, &entries);
+            var clip: ?keywork.Rect = null;
+            for (commands) |command| {
+                const entry: Entry = switch (command) {
+                    .set_clip => |value| {
+                        clip = value;
+                        continue;
+                    },
+                    .fill_rect => |fill| .{
+                        .clip = clip,
+                        .rect = fill.rect,
+                        .color = fill.color,
+                        .font_size = 0,
+                        .cache_key = 0,
+                        .kind = .fill,
+                        .text = &.{},
+                    },
+                    .text => |run| blk: {
+                        const measurer: keywork.TextMeasurer = .fixed;
+                        const size = try measurer.measureText(run.value, run.style);
+                        break :blk .{
+                            .clip = clip,
+                            .rect = .{ .x = run.origin.x, .y = run.origin.y, .width = size.width, .height = size.height },
+                            .color = run.style.color,
+                            .font_size = run.style.font_size,
+                            .cache_key = 0,
+                            .kind = .text,
+                            .text = try allocator.dupe(u8, run.value),
+                        };
+                    },
+                    .alpha_image => |image| .{
+                        .clip = clip,
+                        .rect = image.rect,
+                        .color = image.color,
+                        .font_size = 0,
+                        .cache_key = image.cache_key,
+                        .kind = .image,
+                        .text = &.{},
+                    },
+                    .color_image => |image| .{
+                        .clip = clip,
+                        .rect = image.rect,
+                        .color = .{ .a = 0, .r = 0, .g = 0, .b = 0 },
+                        .font_size = 0,
+                        .cache_key = image.cache_key,
+                        .kind = .image,
+                        .text = &.{},
+                    },
+                };
+                errdefer allocator.free(entry.text);
+                try entries.append(allocator, entry);
+            }
+            return entries;
+        }
+
+        fn checkCovered(self: *@This(), entry: Entry, damage: keywork.Rect, side: []const u8) void {
+            const effective = if (entry.clip) |clip| entry.rect.intersect(clip) else entry.rect;
+            if (effective.isEmpty()) return;
+            const epsilon = 0.01;
+            const covered = damage.x <= effective.x + epsilon and
+                damage.y <= effective.y + epsilon and
+                damage.x + damage.width >= effective.x + effective.width - epsilon and
+                damage.y + damage.height >= effective.y + effective.height - epsilon;
+            if (covered) return;
+            self.violations += 1;
+            std.debug.print(
+                "present {d}: {s} {t} \"{s}\" at {any} (clip {any}) outside damage {any}\n",
+                .{ self.presents, side, entry.kind, entry.text, entry.rect, entry.clip, damage },
+            );
+        }
+
+        fn present(ptr: *anyopaque, frame: RenderBackend.Frame) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.presents += 1;
+            var current = try snapshot(self.allocator, frame.display_list);
+            errdefer freeEntries(self.allocator, &current);
+            try std.testing.expectEqual(@as(usize, 1), frame.damage.len);
+            const damage = frame.damage[0];
+
+            if (self.presents > 1) {
+                const matched = try self.allocator.alloc(bool, self.prev.items.len);
+                defer self.allocator.free(matched);
+                @memset(matched, false);
+                for (current.items) |entry| {
+                    const found = for (self.prev.items, 0..) |old, index| {
+                        if (!matched[index] and entry.eql(old)) break index;
+                    } else null;
+                    if (found) |index| {
+                        matched[index] = true;
+                    } else {
+                        self.checkCovered(entry, damage, "new");
+                    }
+                }
+                for (self.prev.items, 0..) |old, index| {
+                    if (!matched[index]) self.checkCovered(old, damage, "vacated");
+                }
+            }
+
+            freeEntries(self.allocator, &self.prev);
+            self.prev = current;
+            return true;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{ .allocator = std.testing.allocator };
+    defer backend.deinit();
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 640, .max_height = 470 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    try runtime.frameDone();
+
+    // Fast wheel input: within each burst the first event may present
+    // immediately, the rest coalesce behind the pending frame callback and
+    // render as one summed jump on frame done. Fractional deltas mirror
+    // touchpad scrolling.
+    const bursts = [_][]const f32{
+        &.{100}, // plain wheel step
+        &.{ 120, 120, 120 }, // fast: several events, one frame
+        &.{900}, // jump farther than the built window
+        &.{ 33.5, 41.25, 27.75, 38.5 }, // fractional touchpad deltas
+        &.{ -240, -240, -240, -240 }, // fast back up
+        &.{-100_000}, // clamped overshoot back to the top
+    };
+    for (bursts) |burst| {
+        for (burst) |dy| {
+            try runtime.scrollBy(.{ .position = .{ .x = 320, .y = 200 }, .dx = 0, .dy = dy });
+        }
+        try runtime.frameDone();
+        try runtime.frameDone();
+    }
+    // Drain the scrollbar fade so animation-driven presents are checked too.
+    var ticks: usize = 0;
+    while (ticks < 120) : (ticks += 1) {
+        try runtime.frameDone();
+    }
+    try std.testing.expect(backend.presents > bursts.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.violations);
+}
+
 test "typing edits element-owned input state without rebuilding" {
     const TestApp = struct {
         builds: usize = 0,
