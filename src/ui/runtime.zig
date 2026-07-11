@@ -1045,7 +1045,7 @@ test "wheel scroll moves viewport content without rebuilding" {
     );
     defer runtime.deinit();
     try std.testing.expectEqual(@as(usize, 1), app.builds);
-    // 20 rows at 16px in a 120px viewport: 200px of scroll range.
+    // 20 Radix body rows at 24px in a 120px viewport: 360px of scroll range.
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 30 });
@@ -1054,7 +1054,7 @@ test "wheel scroll moves viewport content without rebuilding" {
 
     // Scrolling past the edges clamps.
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 10_000 });
-    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, -360), runtime.root.?.children[0].rect.y);
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = -10_000 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
@@ -1112,10 +1112,11 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     );
     defer runtime.deinit();
 
-    // 20 rows at 16px in a 120px viewport: content 320, scroll range 200.
+    // 20 Radix body rows at 24px in a 120px viewport: content 480, scroll
+    // range 360.
     // Thumb: track 114 (120 minus a 3px margin each end), length
-    // max(12, 114*120/320) = 42.75, travel 71.25.
-    const drag_scale: f32 = 200.0 / 71.25;
+    // max(12, 114*120/480) = 28.5, travel 85.5.
+    const drag_scale: f32 = 360.0 / 85.5;
     // The viewport shrink-wraps its child's width; the thumb hugs its
     // right edge.
     const viewport = runtime.root.?.rect;
@@ -1136,7 +1137,7 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
 
     // The drag stays captured when the pointer leaves the viewport.
     try runtime.pointerMove(.{ .x = 500, .y = 1000 });
-    try std.testing.expectEqual(@as(f32, -200), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, -360), runtime.root.?.children[0].rect.y);
     try runtime.pointerMove(.{ .x = 500, .y = -1000 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 

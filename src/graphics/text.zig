@@ -218,7 +218,8 @@ pub fn render(
 
     const primary = &self.fonts.items[primary_font_index];
     const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
-    const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const natural_line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const line_height = try lineHeightPixels(scale, text.style.line_height, natural_line_height);
     const origin_x = snapToPixel(text.origin.x * scale);
     var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
 
@@ -256,8 +257,8 @@ pub fn measure(self: *Self, scale: f32, value: []const u8, style: keywork.Resolv
     try self.ensureFontPixelSize(primary_font_index, pixel_size);
 
     const primary = &self.fonts.items[primary_font_index];
-    const line_height_pixels: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
-    const line_height = line_height_pixels / scale;
+    const natural_line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const line_height = try lineHeightPixels(scale, style.line_height, natural_line_height) / scale;
     var max_width: f32 = 0;
     var line_count: usize = 0;
 
@@ -285,7 +286,8 @@ pub fn appendGlyphs(
 
     const primary = &self.fonts.items[primary_font_index];
     const ascender: f32 = @floatFromInt(c.keywork_ft_ascender(primary.face));
-    const line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const natural_line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
+    const line_height = try lineHeightPixels(scale, text.style.line_height, natural_line_height);
     const origin_x = snapToPixel(text.origin.x * scale);
     var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
 
@@ -956,6 +958,12 @@ fn scaledPixelSize(scale: f32, font_size: f32) !u31 {
     return @intFromFloat(rounded);
 }
 
+fn lineHeightPixels(scale: f32, line_height: ?f32, natural_line_height: f32) !f32 {
+    const explicit = line_height orelse return natural_line_height;
+    if (!std.math.isFinite(explicit) or explicit <= 0) return error.InvalidLineHeight;
+    return explicit * scale;
+}
+
 fn snapToPixel(value: f32) f32 {
     return @round(value);
 }
@@ -984,4 +992,26 @@ test "subpixelPosition quantizes to quarter-pixel bins" {
     // Fractions near one roll over to the next whole pixel.
     try std.testing.expectEqual(SubpixelPosition{ .origin = 11, .bin = 0 }, subpixelPosition(10.9));
     try std.testing.expectEqual(SubpixelPosition{ .origin = -3, .bin = 2 }, subpixelPosition(-2.5));
+}
+
+test "explicit line height controls logical measurement and rendered baseline advance" {
+    var renderer = try init(std.testing.allocator);
+    defer renderer.deinit();
+
+    const style: keywork.ResolvedTextStyle = .{
+        .color = keywork.colors.ink,
+        .font_size = 14,
+        .line_height = 20,
+    };
+    try std.testing.expectEqual(@as(f32, 40), (try renderer.measure(1, "A\nA", style)).height);
+
+    var glyphs: std.ArrayList(PositionedGlyph) = .empty;
+    defer glyphs.deinit(std.testing.allocator);
+    try renderer.appendGlyphs(std.testing.allocator, 1, .{
+        .origin = .{ .x = 0, .y = 0 },
+        .value = "A\nA",
+        .style = style,
+    }, &glyphs);
+    try std.testing.expectEqual(@as(usize, 2), glyphs.items.len);
+    try std.testing.expectEqual(@as(f32, 20), glyphs.items[1].y - glyphs.items[0].y);
 }

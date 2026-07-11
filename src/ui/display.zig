@@ -414,7 +414,7 @@ pub fn fixedMeasureText(value: []const u8, style: ResolvedTextStyle) Size {
     }
     return .{
         .width = @as(f32, @floatFromInt(max_line_len)) * style.font_size * text_width_ratio,
-        .height = @as(f32, @floatFromInt(line_count)) * style.font_size,
+        .height = @as(f32, @floatFromInt(line_count)) * (style.line_height orelse style.font_size),
     };
 }
 
@@ -422,4 +422,7 @@ test "fixed text measurement accounts for lines" {
     const style: ResolvedTextStyle = .{ .color = types.colors.ink, .font_size = 16 };
     try std.testing.expectEqual(Size{ .width = 16, .height = 32 }, fixedMeasureText("ab\nc", style));
     try std.testing.expectEqual(Size{ .width = 0, .height = 16 }, fixedMeasureText("", style));
+
+    const explicit: ResolvedTextStyle = .{ .color = types.colors.ink, .font_size = 14, .line_height = 20 };
+    try std.testing.expectEqual(Size{ .width = 14, .height = 40 }, fixedMeasureText("ab\nc", explicit));
 }

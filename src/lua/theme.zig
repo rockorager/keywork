@@ -13,6 +13,7 @@ pub const TextOptions = struct {
     color: ?keywork.Color = null,
     size: ?f32 = null,
     font_size: ?f32 = null,
+    line_height: ?f32 = null,
     role: ?keywork.TextRole = null,
     max_lines: ?u32 = null,
     overflow: ?keywork.Widget.TextOverflow = null,
@@ -84,6 +85,7 @@ fn parseTextStyleField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8
     return .{
         .color = options.color orelse base.color,
         .font_size = options.resolvedFontSize() orelse base.font_size,
+        .line_height = options.line_height orelse base.line_height,
     };
 }
 

@@ -5,6 +5,7 @@ local ui = {}
 -- space_scale[3] is Radix --space-3.
 local space_scale = { 4, 8, 12, 16, 24, 32, 40, 48, 64 }
 local font_size_scale = { 12, 14, 16, 18, 20, 24, 28, 35, 60 }
+local line_height_scale = { 16, 20, 24, 26, 28, 30, 36, 40, 60 }
 local radius_scale = { 3, 4, 6, 8, 12, 16 }
 
 local default_theme = {
@@ -202,13 +203,14 @@ local default_theme = {
   },
 
   text = {
-    body = { size = font_size_scale[3] },
-    label = { size = font_size_scale[2] },
-    title = { size = font_size_scale[5] },
+    body = { size = font_size_scale[3], line_height = line_height_scale[3] },
+    label = { size = font_size_scale[2], line_height = line_height_scale[2] },
+    title = { size = font_size_scale[5], line_height = line_height_scale[5] },
   },
 
   space = space_scale,
   font_size = font_size_scale,
+  line_height = line_height_scale,
   radius = radius_scale,
 
   components = {
@@ -289,7 +291,16 @@ local function merge_table(base, overrides)
 end
 
 function ui.theme_data(options)
-  return merge_table(default_theme, options or {})
+  options = options or {}
+  local result = merge_table(default_theme, options)
+  -- A custom font size without a matching line height keeps the historical
+  -- font-metrics fallback instead of inheriting an unrelated Radix pair.
+  for role, style in pairs(options.text or {}) do
+    if type(style) == "table" and (style.size ~= nil or style.font_size ~= nil) and style.line_height == nil then
+      result.text[role].line_height = nil
+    end
+  end
+  return result
 end
 
 local function resolve_ref(value, tokens)
@@ -417,6 +428,7 @@ function ui.resolve_theme(theme, state_or_scheme)
   local colors = resolve_colors(scheme.colors)
   local space = copy_table(theme.space or {})
   local font_size = copy_table(theme.font_size or {})
+  local line_height = copy_table(theme.line_height or {})
   local radius = copy_table(theme.radius or {})
   local components = {
     button = resolve_button(theme.components and theme.components.button, colors, space, radius),
@@ -430,6 +442,7 @@ function ui.resolve_theme(theme, state_or_scheme)
     text = copy_table(theme.text or {}),
     space = space,
     font_size = font_size,
+    line_height = line_height,
     radius = radius,
     components = components,
   }
@@ -447,6 +460,7 @@ function ui.text(value, style)
     color = style.color,
     size = style.size,
     font_size = style.font_size,
+    line_height = style.line_height,
     role = style.role,
     max_lines = style.max_lines,
     overflow = style.overflow,
@@ -455,7 +469,7 @@ end
 
 function ui.label(value, options)
   options = options or {}
-  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, role = options.role or "label", max_lines = options.max_lines, overflow = options.overflow })
+  return ui.text(value, { color = options.color, size = options.size, font_size = options.font_size, line_height = options.line_height, role = options.role or "label", max_lines = options.max_lines, overflow = options.overflow })
 end
 
 function ui.keyed(key, child)
@@ -508,6 +522,7 @@ function ui.default_text_style(options)
     color = options.color,
     size = options.size,
     font_size = options.font_size,
+    line_height = options.line_height,
     child = options.child,
   }
 end
@@ -854,7 +869,7 @@ function ui.icon_label(icon_name, text, options)
   -- icon_theme context or the bridge's base 16px default.
   local children = { ui.icon({ name = icon_name, size = options.size, color = options.color }) }
   if text and text ~= "" then
-    table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, role = options.role }))
+    table.insert(children, ui.label(text, { color = options.color, size = options.label_size, font_size = options.font_size, line_height = options.line_height, role = options.role }))
   end
   -- "baseline" centers the icon on the text's cap-height midline (like
   -- macOS symbol alignment) instead of the text box's geometric center.
@@ -893,11 +908,12 @@ function ui.chip(options)
         color = color,
         label_size = options.label_size,
         font_size = options.font_size,
+        line_height = options.line_height,
         role = options.role,
         spacing = options.spacing,
       })
     else
-      child = ui.label(options.label or "", { color = color, size = options.label_size, font_size = options.font_size, role = options.role })
+      child = ui.label(options.label or "", { color = color, size = options.label_size, font_size = options.font_size, line_height = options.line_height, role = options.role })
     end
   end
   return ui.gesture({

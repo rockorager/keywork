@@ -712,6 +712,7 @@ pub fn parse(
             .value = value,
             .color = options.color,
             .font_size = options.resolvedFontSize(),
+            .line_height = options.line_height,
             .role = options.role orelse .body,
             .max_lines = options.max_lines,
             .overflow = options.overflow orelse .ellipsis,
@@ -758,7 +759,11 @@ pub fn parse(
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
         child.* = try parse(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
-        return .{ .default_text_style = .{ .style = .{ .color = options.color, .font_size = options.resolvedFontSize() }, .child = child } };
+        return .{ .default_text_style = .{ .style = .{
+            .color = options.color,
+            .font_size = options.resolvedFontSize(),
+            .line_height = options.line_height,
+        }, .child = child } };
     }
     if (std.mem.eql(u8, kind, "icon_theme")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);

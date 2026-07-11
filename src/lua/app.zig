@@ -3842,6 +3842,44 @@ test "lua resolves theme families and component tokens" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=8 y=6 value=\"Name\" color=#ff445566") != null);
 }
 
+test "lua default theme exposes paired Radix size 2 typography" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local theme = kw.resolve_theme(kw.theme_data(), "light")
+        \\return kw.app({
+        \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),
+        \\})
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "radix-typography.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "radix-typography.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 100, .max_height = 100 },
+        app.host(),
+        .light,
+    );
+    defer runtime.deinit();
+
+    const root = runtime.root.?;
+    try std.testing.expectEqualStrings("14:20", root.text.?);
+    try std.testing.expectEqual(@as(f32, 14), root.text_style.font_size);
+    try std.testing.expectEqual(@as(?f32, 20), root.text_style.line_height);
+    try std.testing.expectEqual(@as(f32, 20), root.rect.height);
+}
+
 test "lua flexible and main_align lay out through the parser" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3880,7 +3918,7 @@ test "lua flexible and main_align lay out through the parser" {
     // space_between pushes R (8px wide) to the 100px right edge.
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=92 y=0 value=\"R\"") != null);
     // The expanded text starts right after A regardless of its own width.
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=8 y=16 value=\"B\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=8 y=24 value=\"B\"") != null);
 }
 
 test "lua loop fs_event observes file changes" {

@@ -46,6 +46,7 @@ pub const colors = struct {
 pub const scale = struct {
     pub const space_steps = [9]f32{ 4, 8, 12, 16, 24, 32, 40, 48, 64 };
     pub const font_size_steps = [9]f32{ 12, 14, 16, 18, 20, 24, 28, 35, 60 };
+    pub const line_height_steps = [9]f32{ 16, 20, 24, 26, 28, 30, 36, 40, 60 };
     pub const radius_steps = [6]f32{ 3, 4, 6, 8, 12, 16 };
 
     pub fn space(step: usize) f32 {
@@ -54,6 +55,10 @@ pub const scale = struct {
 
     pub fn fontSize(step: usize) f32 {
         return font_size_steps[step - 1];
+    }
+
+    pub fn lineHeight(step: usize) f32 {
+        return line_height_steps[step - 1];
     }
 
     pub fn radius(step: usize) f32 {
@@ -114,11 +119,14 @@ pub const ColorScheme = struct {
 pub const TextStyle = struct {
     color: ?Color = null,
     font_size: ?f32 = null,
+    line_height: ?f32 = null,
 };
 
 pub const ResolvedTextStyle = struct {
     color: Color,
     font_size: f32,
+    /// Null preserves the selected font face's natural line height.
+    line_height: ?f32 = null,
 };
 
 pub const TextRole = enum {
@@ -128,9 +136,9 @@ pub const TextRole = enum {
 };
 
 pub const TextTheme = struct {
-    body: TextStyle = .{ .font_size = scale.fontSize(3) },
-    label: TextStyle = .{ .font_size = scale.fontSize(2) },
-    title: TextStyle = .{ .font_size = scale.fontSize(5) },
+    body: TextStyle = .{ .font_size = scale.fontSize(3), .line_height = scale.lineHeight(3) },
+    label: TextStyle = .{ .font_size = scale.fontSize(2), .line_height = scale.lineHeight(2) },
+    title: TextStyle = .{ .font_size = scale.fontSize(5), .line_height = scale.lineHeight(5) },
 };
 
 pub const ButtonTheme = struct {

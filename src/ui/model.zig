@@ -94,6 +94,7 @@ pub const Widget = union(enum) {
         value: []const u8,
         color: ?Color = null,
         font_size: ?f32 = null,
+        line_height: ?f32 = null,
         role: TextRole = .body,
         max_lines: ?u32 = null,
         overflow: TextOverflow = .ellipsis,
@@ -1042,14 +1043,21 @@ fn mergeTextStyle(base: TextStyle, overlay: TextStyle) TextStyle {
     return .{
         .color = overlay.color orelse base.color,
         .font_size = overlay.font_size orelse base.font_size,
+        .line_height = overlay.line_height orelse if (overlay.font_size != null) null else base.line_height,
     };
 }
 
 fn resolveTextStyle(theme: Theme, inherited_style: TextStyle, text_widget: Widget.Text) ResolvedTextStyle {
     const role_style = roleTextStyle(theme, text_widget.role);
+    const line_height = text_widget.line_height orelse
+        if (text_widget.font_size != null)
+            null
+        else
+            inherited_style.line_height orelse if (inherited_style.font_size != null) null else role_style.line_height;
     return .{
         .color = text_widget.color orelse inherited_style.color orelse role_style.color orelse theme.color_scheme.foreground,
         .font_size = text_widget.font_size orelse inherited_style.font_size orelse role_style.font_size orelse scale.fontSize(3),
+        .line_height = line_height,
     };
 }
 
@@ -2680,6 +2688,7 @@ fn widgetLayoutEqual(a: Widget, b: Widget) bool {
             const b_text = b.text;
             break :blk std.mem.eql(u8, a_text.value, b_text.value) and
                 a_text.font_size == b_text.font_size and
+                a_text.line_height == b_text.line_height and
                 a_text.max_lines == b_text.max_lines and
                 a_text.overflow == b_text.overflow;
         },
@@ -2737,6 +2746,7 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
             break :blk std.mem.eql(u8, a_text.value, b_text.value) and
                 std.meta.eql(a_text.color, b_text.color) and
                 a_text.font_size == b_text.font_size and
+                a_text.line_height == b_text.line_height and
                 a_text.max_lines == b_text.max_lines and
                 a_text.overflow == b_text.overflow;
         },
@@ -2821,6 +2831,7 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             const style = resolveTextStyle(theme, inherited_style, text_widget.*);
             text_widget.color = style.color;
             text_widget.font_size = style.font_size;
+            text_widget.line_height = style.line_height;
         },
         .text_input => |*input_widget| {
             input_widget.foreground = input_widget.style.foreground orelse inputForeground(theme);
@@ -2931,6 +2942,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             .value = try allocator.dupe(u8, text_widget.value),
             .color = text_widget.color,
             .font_size = text_widget.font_size,
+            .line_height = text_widget.line_height,
             .role = text_widget.role,
             .max_lines = text_widget.max_lines,
             .overflow = text_widget.overflow,
@@ -3322,7 +3334,7 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     defer build_arena.deinit();
     const build_allocator = build_arena.allocator();
 
-    // Ten 16px rows: 160px of content in a 40px viewport.
+    // Ten Radix body rows at 24px: 240px of content in a 40px viewport.
     var rows: [10]Widget = undefined;
     for (&rows, 0..) |*row, index| {
         row.* = if (index == 9)
@@ -3352,8 +3364,8 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     scrollState(&element).offset_y = 1000;
     _ = dirtyScrollElement(&element, "list");
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 120), scrollState(&element).offset_y);
-    try std.testing.expectEqual(@as(f32, -120), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 200), scrollState(&element).offset_y);
+    try std.testing.expectEqual(@as(f32, -200), root.children[0].rect.y);
 
     // Scrolled to the bottom, the last row is inside the viewport and
     // clickable again.
@@ -3623,7 +3635,7 @@ test "flex spacers collapse under unbounded scroll constraints" {
     try std.testing.expect(std.math.isFinite(content.rect.height));
     // The spacer gets no share of an infinite axis.
     try std.testing.expectEqual(@as(f32, 0), content.children[1].rect.height);
-    try std.testing.expectEqual(@as(f32, 32), content.rect.height);
+    try std.testing.expectEqual(@as(f32, 48), content.rect.height);
 }
 
 test "display list clip stack resolves nested intersections" {
@@ -3707,7 +3719,7 @@ test "layout, paint, and hit test a padded column" {
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .padding), root.kind);
     try std.testing.expectEqual(@as(f32, 60), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 72), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 88), root.rect.height);
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
@@ -3718,7 +3730,7 @@ test "layout, paint, and hit test a padded column" {
     try paint(allocator, root, &display_list, &raster_cache);
 
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
-    try std.testing.expectEqualStrings("ok", hitTestButton(root, .{ .x = 25, .y = 35 }).?);
+    try std.testing.expectEqualStrings("ok", hitTestButton(root, .{ .x = 25, .y = 45 }).?);
     try std.testing.expect(hitTestButton(root, .{ .x = 2, .y = 2 }) == null);
 }
 
@@ -3812,14 +3824,12 @@ test "tight flexible box centers its child within the whole share" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // Text A is 16 tall; the box must fill the remaining 32px share at
-    // layout time so its 16px child centers in the slack instead of
-    // top-aligning against a shrink-wrapped box.
+    // The 24px Radix body line and box divide the 48px axis evenly.
     const flexible_node = root.children[1];
     const box_node = flexible_node.children[0];
-    try std.testing.expectEqual(@as(f32, 32), flexible_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 32), box_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 16), box_node.rect.y);
+    try std.testing.expectEqual(@as(f32, 24), flexible_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 24), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 24), box_node.rect.y);
     try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
 }
 
@@ -3840,11 +3850,11 @@ test "stretch lays out children with tight cross constraints" {
 
     // Stretch is a tight cross constraint, not a post-layout inflation:
     // children fill the row's whole 40px cross axis, and the box centers
-    // its 16px child in the slack it knew about at alignment time.
+    // its 24px child in the slack it knew about at alignment time.
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 40), root.children[0].rect.height);
     try std.testing.expectEqual(@as(f32, 40), root.children[1].rect.height);
-    try std.testing.expectEqual(@as(f32, 12), root.children[1].children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 8), root.children[1].children[0].rect.y);
 }
 
 test "sized passes parent min constraints through unspecified axes" {
@@ -3867,13 +3877,13 @@ test "sized passes parent min constraints through unspecified axes" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // The sized wrapper only pins its width; the expanded 32px height min
+    // The sized wrapper only pins its width; the expanded 24px height min
     // passes through it so the box still aligns against the whole share.
     const sized_node = root.children[1].children[0];
     const box_node = sized_node.children[0];
     try std.testing.expectEqual(@as(f32, 50), sized_node.rect.width);
-    try std.testing.expectEqual(@as(f32, 32), sized_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 32), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 24), sized_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 24), box_node.rect.height);
     try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
 }
 
@@ -3964,7 +3974,7 @@ test "row centers children on the cross axis" {
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 8), root.children[0].rect.y);
     try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
 }
 
@@ -3973,7 +3983,7 @@ test "text role resolves themed font size for layout and paint" {
 
     const label: Widget = .{ .text = .{ .value = "Hi", .role = .label } };
     const themed: Widget = .{ .theme = .{
-        .theme = .{ .color_scheme = .light, .text_theme = .{ .label = .{ .color = colors.accent, .font_size = 22 } } },
+        .theme = .{ .color_scheme = .light, .text_theme = .{ .label = .{ .color = colors.accent, .font_size = 22, .line_height = 30 } } },
         .child = &label,
     } };
 
@@ -3985,8 +3995,9 @@ test "text role resolves themed font size for layout and paint" {
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     const text_node = root.children[0];
-    try std.testing.expectEqual(@as(f32, 22), text_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 30), text_node.rect.height);
     try std.testing.expectEqual(@as(f32, 22), text_node.text_style.font_size);
+    try std.testing.expectEqual(@as(?f32, 30), text_node.text_style.line_height);
     try std.testing.expectEqual(colors.accent, text_node.text_style.color);
 
     var display_list: DisplayList = .{};
@@ -4000,7 +4011,55 @@ test "text role resolves themed font size for layout and paint" {
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
     try std.testing.expect(display_list.commands.items[0] == .text);
     try std.testing.expectEqual(@as(f32, 22), display_list.commands.items[0].text.style.font_size);
+    try std.testing.expectEqual(@as(?f32, 30), display_list.commands.items[0].text.style.line_height);
     try std.testing.expectEqual(colors.accent, display_list.commands.items[0].text.style.color);
+}
+
+test "default Radix label resolves size 2 font and line height" {
+    const allocator = std.testing.allocator;
+    const label: Widget = .{ .text = .{ .value = "Label", .role = .label } };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &label, .{ .max_width = 100, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    try std.testing.expectEqual(@as(f32, 14), root.text_style.font_size);
+    try std.testing.expectEqual(@as(?f32, 20), root.text_style.line_height);
+    try std.testing.expectEqual(@as(f32, 20), root.rect.height);
+}
+
+test "wrapped text measures and paints with the same explicit line height" {
+    const allocator = std.testing.allocator;
+    const text_widget: Widget = .{ .text = .{
+        .value = "abcd",
+        .font_size = 10,
+        .line_height = 20,
+    } };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &text_widget, .{ .max_width = 10, .max_height = 100 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 10, .max_height = 100 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    try std.testing.expectEqualStrings("ab\ncd", root.text.?);
+    try std.testing.expectEqual(@as(f32, 40), root.rect.height);
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(allocator);
+    try paint(allocator, root, &display_list, &raster_cache);
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    try std.testing.expectEqualStrings("ab\ncd", display_list.commands.items[0].text.value);
+    try std.testing.expectEqual(@as(?f32, 20), display_list.commands.items[0].text.style.line_height);
 }
 
 test "default text style overrides descendant text defaults" {
@@ -4020,6 +4079,8 @@ test "default text style overrides descendant text defaults" {
     try std.testing.expectEqual(@as(RenderNode.Kind, .default_text_style), root.kind);
     try std.testing.expectEqual(test_red, root.children[0].text_style.color);
     try std.testing.expectEqual(@as(f32, 18), root.children[0].text_style.font_size);
+    try std.testing.expectEqual(@as(?f32, null), root.children[0].text_style.line_height);
+    try std.testing.expectEqual(@as(f32, 18), root.children[0].rect.height);
 }
 
 test "linear element clone preserves cross-axis alignment" {
@@ -4088,7 +4149,7 @@ test "box aligns child inside its minimum size" {
     try std.testing.expectEqual(@as(f32, 40), root.rect.width);
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 16), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 12), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 8), root.children[0].rect.y);
 }
 
 test "separator fills its cross axis and reserves main-axis margins" {
@@ -4385,7 +4446,7 @@ test "center moves descendants" {
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 38), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 32), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 28), root.children[0].rect.y);
     try std.testing.expectEqualStrings("centered", hitTestButton(root, .{ .x = 40, .y = 35 }).?);
 }
 

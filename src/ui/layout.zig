@@ -375,7 +375,11 @@ fn layoutElementInto(
         .stateful => try layoutWrapper(allocator, element, node, .stateful, constraints, origin, measurer),
         .element => try layoutWrapper(allocator, element, node, .element, constraints, origin, measurer),
         .text => |text_widget| {
-            const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
+            const style: ResolvedTextStyle = .{
+                .color = text_widget.color orelse colors.ink,
+                .font_size = text_widget.font_size orelse 16,
+                .line_height = text_widget.line_height,
+            };
             node.text_buffer.clearRetainingCapacity();
             const should_wrap = text_widget.max_lines != null or std.math.isFinite(constraints.max_width);
             const visible_text = if (should_wrap) blk: {
