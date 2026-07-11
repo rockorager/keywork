@@ -3,8 +3,11 @@
 const std = @import("std");
 const keywork = @import("../ui.zig");
 const c = @import("image_c");
+const svg_use = @import("svg_use.zig");
 
 const log = std.log.scoped(.keywork_svg);
+
+const max_svg_bytes = 4 * 1024 * 1024;
 
 const icon_supersample = 4;
 // The supersampled raster buffer costs 64 bytes per output pixel, so the
@@ -85,12 +88,10 @@ const SvgIcon = struct {
             return;
         }
 
-        const path_z = try context.allocator.dupeZ(u8, self.path);
-        defer context.allocator.free(path_z);
         // Parse failure degrades to a cached transparent tombstone
         // instead of failing the frame: the file may be malformed or
         // gone, and later repaints must not reopen it or warn again.
-        const image = c.nsvgParseFromFile(path_z.ptr, "px", 96) orelse {
+        const image = parseSvgFile(context.allocator, self.path) orelse {
             log.warn("svg parse failed: {s}", .{self.path});
             return self.paintTombstone(context, width, height, cache_key);
         };
@@ -202,6 +203,39 @@ const SvgIcon = struct {
         allocator.destroy(self);
     }
 };
+
+/// Reads and parses an SVG file, expanding `<use>` elements first
+/// because nanosvg drops them silently (GNOME icons clone repeated
+/// shapes with them). Returns null on any failure; the caller treats
+/// that as a broken file.
+fn parseSvgFile(allocator: std.mem.Allocator, path: []const u8) ?*c.NSVGimage {
+    const contents = readSvgFile(allocator, path) orelse return null;
+    defer allocator.free(contents);
+    // Failed expansion (oversized or hostile input) falls back to
+    // parsing the document as-is, matching the old behavior.
+    const expanded = svg_use.expandUses(allocator, contents) catch null;
+    defer if (expanded) |value| allocator.free(value);
+    // nsvgParse mutates its input and needs a terminator.
+    const buffer = allocator.dupeZ(u8, expanded orelse contents) catch return null;
+    defer allocator.free(buffer);
+    return c.nsvgParse(buffer.ptr, "px", 96);
+}
+
+fn readSvgFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const fd = std.posix.openat(std.os.linux.AT.FDCWD, path, .{ .CLOEXEC = true }, 0) catch return null;
+    defer _ = std.os.linux.close(fd);
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const read_count = std.posix.read(fd, &buffer) catch return null;
+        if (read_count == 0) break;
+        if (result.items.len + read_count > max_svg_bytes) return null;
+        result.appendSlice(allocator, buffer[0..read_count]) catch return null;
+    }
+    return result.toOwnedSlice(allocator) catch null;
+}
 
 /// Box-filters straight-alpha RGBA with alpha-weighted color averaging,
 /// so transparent samples cannot darken edge colors.
