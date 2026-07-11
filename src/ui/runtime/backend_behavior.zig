@@ -70,6 +70,10 @@ pub fn presentFrame(self: anytype) !void {
     if (self.animations_active) self.repaint_pending = true;
 
     const root = self.root orelse return error.NotBuilt;
+    // Content-sized hosts observe the authoritative retained root here,
+    // after rebuild/layout but before damage collection or paint. A native
+    // resize request defers this frame so no stale clipped buffer is shown.
+    if (!try self.reconsiderRootSize()) return;
     const frame_size = self.frameSize();
     const render_scale = self.renderScale();
     const full_frame: keywork.Rect = .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height };
@@ -125,7 +129,19 @@ pub fn frameDone(self: anytype) !void {
 
 pub fn configure(self: anytype, size: keywork.Size) !void {
     if (size.width > 0 and size.height > 0) {
-        self.constraints = .{ .max_width = size.width, .max_height = size.height };
+        self.configured_size = size;
+        if (!self.content_axes.any()) {
+            self.constraints = .{ .max_width = size.width, .max_height = size.height };
+        } else {
+            if (!self.content_axes.width) {
+                self.constraints.min_width = size.width;
+                self.constraints.max_width = size.width;
+            }
+            if (!self.content_axes.height) {
+                self.constraints.min_height = size.height;
+                self.constraints.max_height = size.height;
+            }
+        }
     }
     try self.invalidate();
 }

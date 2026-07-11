@@ -644,7 +644,10 @@ end
 --- `windows(ctx)` function. Windows are diffed by `id`: a newly declared
 --- id creates a surface, a dropped id destroys it. Fields left nil
 --- inherit the app-level defaults; `output` names the output a
---- layer-shell window is placed on (see ctx.outputs).
+--- layer-shell window is placed on (see ctx.outputs). A layer-shell window's
+--- height may be `"content"`; its retained root child is then laid out under
+--- a loose, output-capped height. Prefer natural or loose Flexible children
+--- over Expanded in a shrink-wrapped direction.
 ---
 --- A callable table rather than a function: the runtime attaches
 --- window-level operations (start_move, start_resize,

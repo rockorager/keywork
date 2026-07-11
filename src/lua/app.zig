@@ -451,7 +451,16 @@ pub const App = struct {
         if (c.lua_isnumber(self.state, -1) != 0) decl.width = @floatCast(c.lua_tonumber(self.state, -1));
         pop(self.state, 1);
         c.lua_getfield(self.state, table, "height");
-        if (c.lua_isnumber(self.state, -1) != 0) decl.height = @floatCast(c.lua_tonumber(self.state, -1));
+        if (c.lua_isnumber(self.state, -1) != 0) {
+            decl.height = @floatCast(c.lua_tonumber(self.state, -1));
+        } else if (c.lua_type(self.state, -1) == c.LUA_TSTRING) {
+            const value = stringFromStack(self.state, -1) catch unreachable;
+            if (!std.mem.eql(u8, value, "content")) {
+                pop(self.state, 1);
+                return error.InvalidWindowHeight;
+            }
+            decl.content_height = true;
+        }
         pop(self.state, 1);
 
         c.lua_getfield(self.state, table, "output");
@@ -3878,6 +3887,47 @@ test "lua default theme exposes paired Radix size 2 typography" {
     try std.testing.expectEqual(@as(f32, 14), root.text_style.font_size);
     try std.testing.expectEqual(@as(?f32, 20), root.text_style.line_height);
     try std.testing.expectEqual(@as(f32, 20), root.rect.height);
+}
+
+test "lua window declarations preserve numeric sizes and accept content height" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\return kw.app({
+        \\  windows = function()
+        \\    return {
+        \\      kw.window({ id = "fixed", width = 320, height = 180, child = kw.text("fixed") }),
+        \\      kw.window({
+        \\        id = "content", width = 380, height = "content",
+        \\        layer_shell = { layer = "overlay", anchor = { "top", "right" } },
+        \\        child = kw.text("content"),
+        \\      }),
+        \\    }
+        \\  end,
+        \\})
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "content-window.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "content-window.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const declarations = try app.buildWindowDecls(arena.allocator(), .{});
+
+    try std.testing.expectEqual(@as(usize, 2), declarations.len);
+    try std.testing.expectEqual(@as(?f32, 320), declarations[0].width);
+    try std.testing.expectEqual(@as(?f32, 180), declarations[0].height);
+    try std.testing.expect(!declarations[0].content_height);
+    try std.testing.expectEqual(@as(?f32, 380), declarations[1].width);
+    try std.testing.expectEqual(@as(?f32, null), declarations[1].height);
+    try std.testing.expect(declarations[1].content_height);
+    try std.testing.expect(declarations[1].layer_shell != null);
 }
 
 test "lua flexible and main_align lay out through the parser" {

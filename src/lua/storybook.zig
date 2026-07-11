@@ -24,6 +24,7 @@ pub const Story = struct {
     index: usize,
     width: f32 = 640,
     height: f32 = 480,
+    content_height: bool = false,
     scale: f32 = 1,
     color_scheme: ColorScheme = .light,
 
@@ -122,7 +123,11 @@ fn parseStory(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_index
         c.LUA_TTABLE => {
             const viewport = c.lua_gettop(lua_state);
             if (try optionalNumberField(lua_state, viewport, "width")) |value| story.width = try positiveFinite(value);
-            if (try optionalNumberField(lua_state, viewport, "height")) |value| story.height = try positiveFinite(value);
+            switch (try viewportHeightField(lua_state, viewport)) {
+                .default => {},
+                .fixed => |height| story.height = height,
+                .content => story.content_height = true,
+            }
             if (try optionalNumberField(lua_state, viewport, "scale")) |value| story.scale = try positiveFinite(value);
         },
         else => return error.InvalidStoryViewport,
@@ -163,6 +168,27 @@ fn optionalNumberField(lua_state: *c.lua_State, table: c_int, name: [*:0]const u
     };
 }
 
+const ViewportHeight = union(enum) {
+    default,
+    fixed: f32,
+    content,
+};
+
+fn viewportHeightField(lua_state: *c.lua_State, table: c_int) !ViewportHeight {
+    c.lua_getfield(lua_state, table, "height");
+    defer pop(lua_state, 1);
+    return switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => .default,
+        c.LUA_TNUMBER => .{ .fixed = try positiveFinite(c.lua_tonumber(lua_state, -1)) },
+        c.LUA_TSTRING => blk: {
+            const height = try stringFromStack(lua_state, -1);
+            if (!std.mem.eql(u8, height, "content")) return error.InvalidStoryViewport;
+            break :blk .content;
+        },
+        else => error.InvalidStoryViewport,
+    };
+}
+
 fn positiveFinite(value: f64) !f32 {
     if (!std.math.isFinite(value) or value <= 0 or value > std.math.floatMax(f32)) return error.InvalidStoryViewport;
     return @floatCast(value);
@@ -186,4 +212,25 @@ test "story ids are safe relative paths" {
     try std.testing.expect(!validId("../escape"));
     try std.testing.expect(!validId("button//default"));
     try std.testing.expect(!validId("button/default state"));
+}
+
+test "storybook parses content height without changing numeric viewports" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    const script =
+        \\return { type = "storybook", stories = {
+        \\  { type = "story", id = "fixed", name = "Fixed", viewport = { width = 320, height = 180 }, render = function() end },
+        \\  { type = "story", id = "content", name = "Content", viewport = { width = 380, height = "content", scale = 2 }, render = function() end },
+        \\} }
+    ;
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, script));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
+
+    var catalog = try parseRoot(lua_state, std.testing.allocator, -1);
+    defer catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f32, 180), catalog.stories[0].height);
+    try std.testing.expect(!catalog.stories[0].content_height);
+    try std.testing.expectEqual(@as(f32, 380), catalog.stories[1].width);
+    try std.testing.expect(catalog.stories[1].content_height);
+    try std.testing.expectEqual(@as(f32, 2), catalog.stories[1].scale);
 }

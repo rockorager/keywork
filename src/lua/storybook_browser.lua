@@ -2,9 +2,11 @@ local kw = require("keywork")
 
 local function viewport_for(story)
   local viewport = story.viewport or {}
+  local content_height = viewport.height == "content"
   return {
     width = viewport.width or 640,
-    height = viewport.height or 480,
+    height = content_height and 480 or (viewport.height or 480),
+    content_height = content_height,
     scale = viewport.scale or 1,
   }
 end
@@ -126,19 +128,23 @@ local Browser = kw.stateful({
       }
       local preview_theme = kw.theme_for(story_context)
       local story_widget = selected.render(story_context)
-      local preview = kw.sized({
+      local preview_container = {
+        background = preview_theme.colors.background,
+        min_width = viewport.width,
+        child = kw.keyed("storybook-preview:" .. selected.id, story_widget),
+      }
+      local preview_options = {
         width = viewport.width,
-        height = viewport.height,
-        child = kw.theme({
-          data = preview_theme,
-          child = kw.container({
-            background = preview_theme.colors.background,
-            min_width = viewport.width,
-            min_height = viewport.height,
-            child = kw.keyed("storybook-preview:" .. selected.id, story_widget),
-          }),
-        }),
+      }
+      if not viewport.content_height then
+        preview_container.min_height = viewport.height
+        preview_options.height = viewport.height
+      end
+      preview_options.child = kw.theme({
+        data = preview_theme,
+        child = kw.container(preview_container),
       })
+      local preview = kw.sized(preview_options)
 
       content = kw.column({
         align = "stretch",
@@ -165,7 +171,7 @@ local Browser = kw.stateful({
                     }),
                   },
                 })),
-                kw.text(string.format("%g × %g  ·  %gx  ·  %s", viewport.width, viewport.height, viewport.scale, scheme), {
+                kw.text(string.format("%g × %s  ·  %gx  ·  %s", viewport.width, viewport.content_height and "content" or string.format("%g", viewport.height), viewport.scale, scheme), {
                   color = colors.muted,
                   font_size = 12,
                   max_lines = 1,

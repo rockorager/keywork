@@ -15,6 +15,9 @@ pub const WindowDeclaration = struct {
     title: ?[:0]const u8 = null,
     width: ?f32 = null,
     height: ?f32 = null,
+    /// Let a layer-shell surface use the retained root child's laid-out
+    /// height. Normal xdg-toplevel windows do not support this policy.
+    content_height: bool = false,
     layer_shell: ?wayland_options.LayerShellOptions = null,
     /// Output name (e.g. "DP-1") the window should appear on; null lets
     /// the compositor choose.

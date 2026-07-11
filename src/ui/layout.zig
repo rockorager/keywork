@@ -748,6 +748,20 @@ fn layoutLinearElements(
 ) LayoutError!void {
     std.debug.assert(kind == .row or kind == .column);
 
+    const max_main = switch (kind) {
+        .row => constraints.max_width,
+        .column => constraints.max_height,
+        else => unreachable,
+    };
+    const bounded = std.math.isFinite(max_main);
+    if (!bounded) {
+        for (elements) |child_element| switch (child_element.widget) {
+            .spacer => |spacer_widget| if (spacer_widget.flex > 0) return error.UnboundedTightFlex,
+            .flexible => |flexible_widget| if (flexible_widget.flex > 0 and flexible_widget.fit == .tight) return error.UnboundedTightFlex,
+            else => {},
+        };
+    }
+
     const children = try ensureChildSlice(allocator, node, elements.len);
 
     const total_gap = if (elements.len > 0) gap * @as(f32, @floatFromInt(elements.len - 1)) else 0;
@@ -804,12 +818,6 @@ fn layoutLinearElements(
         }
     }
 
-    const max_main = switch (kind) {
-        .row => constraints.max_width,
-        .column => constraints.max_height,
-        else => unreachable,
-    };
-    const bounded = std.math.isFinite(max_main);
     const spare = if (bounded) @max(0, max_main - fixed_main - total_gap) else 0;
 
     // Pass 2: flexible children split the spare space in proportion to

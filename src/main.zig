@@ -110,6 +110,7 @@ test {
     _ = @import("lua/dbus.zig");
     _ = @import("lua/json.zig");
     _ = @import("lua/process.zig");
+    _ = @import("lua/storybook.zig");
     _ = @import("lua/xdg.zig");
     _ = @import("app/platform.zig");
     _ = @import("linux/event_loop.zig");

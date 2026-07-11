@@ -77,7 +77,13 @@ pub const Invalidator = struct {
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     backend: RenderBackend,
+    /// Constraints used by the retained layout tree. Content-sized axes may
+    /// stay looser than the compositor-configured render buffer.
     constraints: Constraints,
+    configured_size: Size,
+    content_axes: ContentAxes = .{},
+    root_size_handler: ?RootSizeHandler = null,
+    root_size_context: ?*anyopaque = null,
     app: AppHost,
     build_arena: std.heap.ArenaAllocator,
     color_scheme: UiColorScheme,
@@ -122,6 +128,19 @@ pub const Runtime = struct {
 
     pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
 
+    pub const ContentAxes = packed struct {
+        width: bool = false,
+        height: bool = false,
+
+        pub fn any(self: ContentAxes) bool {
+            return self.width or self.height;
+        }
+    };
+
+    /// Called after authoritative retained layout and before paint. False
+    /// defers presentation while a native surface resize is pending.
+    pub const RootSizeHandler = *const fn (ctx: *anyopaque, desired_size: Size) anyerror!bool;
+
     pub const State = AppContext;
 
     pub fn init(
@@ -157,6 +176,7 @@ pub const Runtime = struct {
             .allocator = allocator,
             .backend = backend,
             .constraints = constraints,
+            .configured_size = .{ .width = constraints.max_width, .height = constraints.max_height },
             .app = app,
             .build_arena = .init(allocator),
             .color_scheme = color_scheme,
@@ -192,7 +212,42 @@ pub const Runtime = struct {
     }
 
     pub fn frameSize(self: *const Runtime) Size {
-        return .{ .width = self.constraints.max_width, .height = self.constraints.max_height };
+        return self.configured_size;
+    }
+
+    pub fn setContentSizing(self: *Runtime, axes: ContentAxes) void {
+        self.content_axes = axes;
+    }
+
+    pub fn setRootSizeHandler(self: *Runtime, context: *anyopaque, handler: RootSizeHandler) void {
+        std.debug.assert(self.content_axes.any());
+        self.root_size_context = context;
+        self.root_size_handler = handler;
+    }
+
+    pub fn desiredFrameSize(self: *const Runtime) !Size {
+        const root = self.root orelse return error.NotBuilt;
+        return .{
+            .width = @max(1, if (self.content_axes.width) root.rect.width else self.constraints.max_width),
+            .height = @max(1, if (self.content_axes.height) root.rect.height else self.constraints.max_height),
+        };
+    }
+
+    /// Reconsiders the native/frame size from the retained root. Hosts call
+    /// this once during initial negotiation; normal frames call it after
+    /// rebuild automatically.
+    pub fn reconsiderRootSize(self: *Runtime) !bool {
+        if (!self.content_axes.any()) return true;
+        const desired_size = try self.desiredFrameSize();
+        if (self.root_size_handler) |handler| {
+            if (!try handler(self.root_size_context.?, desired_size)) {
+                self.repaint_pending = true;
+                return false;
+            }
+        } else {
+            self.configured_size = desired_size;
+        }
+        return true;
     }
 
     pub fn renderScale(self: *const Runtime) f32 {
@@ -559,6 +614,74 @@ test "deferred invalidations coalesce until flush" {
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
     try runtime.flushPendingRepaint();
     try std.testing.expectEqual(@as(usize, 2), backend.presents);
+}
+
+test "content height follows retained root state and respects its cap" {
+    const TestApp = struct {
+        height: f32 = 36,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return keywork.widgets.sized(scope.allocator, keywork.widgets.spacer(0), null, self.height);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    const Observer = struct {
+        calls: usize = 0,
+        desired: Size = .{ .width = 0, .height = 0 },
+
+        fn observe(ptr: *anyopaque, desired: Size) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.desired = desired;
+            return true;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var observer: Observer = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .min_width = 380, .max_width = 380, .max_height = 80 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    runtime.setContentSizing(.{ .height = true });
+    runtime.setRootSizeHandler(&observer, Observer.observe);
+
+    try runtime.repaint();
+    try std.testing.expectEqual(Size{ .width = 380, .height = 36 }, observer.desired);
+
+    app.height = 120;
+    try runtime.invalidate();
+    try std.testing.expectEqual(Size{ .width = 380, .height = 80 }, observer.desired);
+    try std.testing.expectEqual(@as(usize, 2), observer.calls);
 }
 
 test "rebuild passes that never stabilize return an error" {

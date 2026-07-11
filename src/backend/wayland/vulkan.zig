@@ -172,6 +172,11 @@ pub const Backend = struct {
         _ = self.connection.display.flush();
     }
 
+    pub fn requestLayerSize(self: *Backend, win: *Window, width: u31, height: u31) !void {
+        try win.protocol.requestLayerSize(width, height);
+        _ = self.connection.display.flush();
+    }
+
     pub fn outputCount(self: *const Backend) usize {
         return self.connection.outputs.items.len;
     }
@@ -230,6 +235,15 @@ pub const Backend = struct {
         if (win.protocol.closed) return error.WindowClosed;
         // Configure marked a repaint pending, but the window's handlers
         // are not installed yet; the caller paints the initial frame.
+        _ = win.protocol.flushPending();
+        self.input.setTargetScale(&win.input_target, win.protocol.scale);
+    }
+
+    pub fn waitForConfigureAfter(self: *Backend, win: *Window, generation: u64) !void {
+        while (win.protocol.configureGeneration() == generation and !win.protocol.closed) {
+            if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        }
+        if (win.protocol.closed) return error.WindowClosed;
         _ = win.protocol.flushPending();
         self.input.setTargetScale(&win.input_target, win.protocol.scale);
     }
@@ -334,6 +348,10 @@ pub const Backend = struct {
 
         pub fn currentSize(self: *const Window) keywork.Size {
             return self.protocol.currentSize();
+        }
+
+        pub fn configureGeneration(self: *const Window) u64 {
+            return self.protocol.configureGeneration();
         }
 
         /// Whether the compositor reports this toplevel as suspended (not

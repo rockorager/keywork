@@ -1,6 +1,7 @@
 //! Interactive and headless Storybook commands.
 
 const std = @import("std");
+const keywork = @import("../ui.zig");
 const cli = @import("cli.zig");
 const platform_mod = @import("platform.zig");
 const runner = @import("runner.zig");
@@ -10,11 +11,23 @@ const lua_app = @import("../lua/app.zig");
 const lua_storybook = @import("../lua/storybook.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 
-const schema_version = 1;
+const schema_version = 2;
+
+const ViewportHeightOutput = union(enum) {
+    fixed: f32,
+    content,
+
+    pub fn jsonStringify(self: ViewportHeightOutput, stringify: anytype) !void {
+        switch (self) {
+            .fixed => |height| try stringify.write(height),
+            .content => try stringify.write("content"),
+        }
+    }
+};
 
 const ViewportOutput = struct {
     width: f32,
-    height: f32,
+    height: ViewportHeightOutput,
     scale: f32,
 };
 
@@ -124,14 +137,24 @@ fn list(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *st
     if (!options.json) {
         if (catalog.title) |title| try writer.print("{s}\n", .{title});
         for (catalog.stories) |story| {
-            try writer.print("{s}\t{s}\t{d}x{d}@{d}\t{s}\n", .{
-                story.id,
-                story.name,
-                story.width,
-                story.height,
-                story.scale,
-                story.color_scheme.name(),
-            });
+            if (story.content_height) {
+                try writer.print("{s}\t{s}\t{d}xcontent@{d}\t{s}\n", .{
+                    story.id,
+                    story.name,
+                    story.width,
+                    story.scale,
+                    story.color_scheme.name(),
+                });
+            } else {
+                try writer.print("{s}\t{s}\t{d}x{d}@{d}\t{s}\n", .{
+                    story.id,
+                    story.name,
+                    story.width,
+                    story.height,
+                    story.scale,
+                    story.color_scheme.name(),
+                });
+            }
         }
         return;
     }
@@ -200,7 +223,14 @@ fn renderStory(
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         backend.backend(),
-        .{ .max_width = story.width, .max_height = story.height },
+        if (story.content_height)
+            .{
+                .min_width = story.width,
+                .max_width = story.width,
+                .max_height = story.height,
+            }
+        else
+            .{ .max_width = story.width, .max_height = story.height },
         app.host(),
         runtimeColorScheme(story.color_scheme),
     );
@@ -209,6 +239,7 @@ fn renderStory(
     defer app.unbindRuntime();
     // The first frame is always time zero, regardless of host timing.
     runtime.clock = .{ .now_fn = zeroTime };
+    if (story.content_height) runtime.setContentSizing(.{ .height = true });
     try runtime.repaint();
     try backend.writePng(io, path);
 
@@ -236,7 +267,11 @@ fn storyOutput(story: lua_storybook.Story) StoryOutput {
 }
 
 fn viewportOutput(story: lua_storybook.Story) ViewportOutput {
-    return .{ .width = story.width, .height = story.height, .scale = story.scale };
+    return .{
+        .width = story.width,
+        .height = if (story.content_height) .content else .{ .fixed = story.height },
+        .scale = story.scale,
+    };
 }
 
 fn runtimeColorScheme(scheme: lua_storybook.ColorScheme) runtime_mod.UiColorScheme {
@@ -291,4 +326,91 @@ test "story output keeps declared rendering metadata" {
     try std.testing.expectEqualStrings("button/default", output.id);
     try std.testing.expectEqual(@as(f32, 2), output.viewport.scale);
     try std.testing.expectEqualStrings("dark", output.color_scheme);
+}
+
+test "storybook JSON schema represents content viewport height" {
+    const story: lua_storybook.Story = .{
+        .id = @constCast("notice/default"),
+        .name = @constCast("Default"),
+        .index = 1,
+        .width = 380,
+        .content_height = true,
+        .scale = 2,
+    };
+    const stories = [_]StoryOutput{storyOutput(story)};
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeJson(&output.writer, CatalogOutput{ .title = null, .stories = &stories });
+
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"version\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"height\": \"content\"") != null);
+}
+
+test "content-height Storybook snapshot uses exact measured pixel height" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local sb = require("keywork.storybook")
+        \\return sb.book({ stories = {
+        \\  sb.story({
+        \\    id = "notice/default",
+        \\    name = "Default",
+        \\    viewport = { width = 380, height = "content", scale = 2 },
+        \\    render = function()
+        \\      return kw.sized({ width = 380, height = 37, child = kw.spacer() })
+        \\    end,
+        \\  }),
+        \\} })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "content-storybook.lua", .data = script });
+    const root_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root_path);
+    const script_path = try std.fs.path.join(allocator, &.{ root_path, "content-storybook.lua" });
+    defer allocator.free(script_path);
+    const output_path = try std.fs.path.join(allocator, &.{ root_path, "snapshots" });
+    defer allocator.free(output_path);
+
+    var discovery = try lua_app.App.initStorybook(allocator, script_path);
+    defer discovery.deinit();
+    const parsed_story = (try discovery.storyCatalog()).stories[0];
+    try std.testing.expect(parsed_story.content_height);
+
+    const result = try renderStory(
+        allocator,
+        std.testing.io,
+        .{ .operation = .snapshot, .script_path = script_path, .output_path = output_path },
+        parsed_story,
+    );
+    defer allocator.free(result.path);
+    try std.testing.expectEqual(@as(u31, 760), result.pixel_width);
+    try std.testing.expectEqual(@as(u31, 74), result.pixel_height);
+
+    var browser = try lua_app.App.initStorybookBrowser(allocator, script_path);
+    defer browser.deinit();
+    var browser_backend = try memory_backend.init(allocator, 1);
+    defer browser_backend.deinit();
+    var browser_runtime = try runtime_mod.Runtime.init(
+        allocator,
+        browser_backend.backend(),
+        .{ .max_width = 1200, .max_height = 800 },
+        browser.host(),
+        .light,
+    );
+    defer browser_runtime.deinit();
+    browser.bindRuntime(&browser_runtime);
+    defer browser.unbindRuntime();
+    try std.testing.expect(renderTreeHasSize(browser_runtime.root.?, .{ .width = 380, .height = 37 }));
+    try std.testing.expect(!renderTreeHasSize(browser_runtime.root.?, .{ .width = 380, .height = 480 }));
+}
+
+fn renderTreeHasSize(node: *const keywork.RenderNode, size: keywork.Size) bool {
+    if (node.rect.width == size.width and node.rect.height == size.height) return true;
+    for (node.children) |child| {
+        if (renderTreeHasSize(child, size)) return true;
+    }
+    return false;
 }

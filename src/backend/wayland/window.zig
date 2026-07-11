@@ -75,6 +75,7 @@ pub const Surface = struct {
     decoration: ?*zxdg.ToplevelDecorationV1 = null,
     layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
     configured: bool = false,
+    configure_generation: u64 = 0,
     closed: bool = false,
     /// The compositor reports the toplevel as not visible (minimized, on a
     /// hidden workspace, or fully occluded); repainting would be wasted
@@ -281,6 +282,26 @@ pub const Surface = struct {
         self.surface.commit();
     }
 
+    /// Requests new logical dimensions for an existing layer surface. The
+    /// configured dimensions remain unchanged until the compositor replies.
+    pub fn requestLayerSize(self: *Surface, width: u31, height: u31) !void {
+        const layer_surface = switch (self.shell_role) {
+            .layer => |role| role.surface,
+            else => return error.NotLayerSurface,
+        };
+        std.debug.assert(width > 0 and height > 0);
+        layer_surface.setSize(width, height);
+        // A configure dimension of zero delegates that axis to the client;
+        // retain this request so currentSize then reflects the accepted size.
+        self.width = width;
+        self.height = height;
+        self.surface.commit();
+    }
+
+    pub fn configureGeneration(self: *const Surface) u64 {
+        return self.configure_generation;
+    }
+
     pub fn currentSize(self: *const Surface) keywork.Size {
         return .{ .width = @floatFromInt(self.width), .height = @floatFromInt(self.height) };
     }
@@ -404,6 +425,7 @@ pub const Surface = struct {
             .configure => |configure| {
                 xdg_surface.ackConfigure(configure.serial);
                 self.configured = true;
+                self.configure_generation +%= 1;
                 self.repaint_pending = true;
             },
         }
@@ -416,6 +438,7 @@ pub const Surface = struct {
                 if (configure.width > 0) self.width = @intCast(configure.width);
                 if (configure.height > 0) self.height = @intCast(configure.height);
                 self.configured = true;
+                self.configure_generation +%= 1;
                 self.repaint_pending = true;
             },
             .closed => self.closed = true,

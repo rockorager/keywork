@@ -8,9 +8,9 @@ return sb.book({
       id = "text/hello",
       group = "Text",
       name = "Hello",
-      viewport = { width = 320, height = 180 },
+      viewport = { width = 320, height = "content" },
       render = function()
-        return kw.center(kw.text("Hello from Storybook"))
+        return kw.padding({ all = 24, child = kw.text("Hello from Storybook") })
       end,
     }),
     sb.story({

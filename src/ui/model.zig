@@ -3615,7 +3615,7 @@ test "list follows controlled selection and leaves free scrolling alone" {
     try std.testing.expectEqual(@as(f32, 16), state.offset);
 }
 
-test "flex spacers collapse under unbounded scroll constraints" {
+test "tight flex reports an error under unbounded scroll constraints" {
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
@@ -3629,13 +3629,10 @@ test "flex spacers collapse under unbounded scroll constraints" {
     var scope: BuildScope = .{ .allocator = build_allocator };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &scroll_widget, constraints);
     defer destroyElementTree(retained_allocator, &element);
-    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-
-    const content = root.children[0];
-    try std.testing.expect(std.math.isFinite(content.rect.height));
-    // The spacer gets no share of an infinite axis.
-    try std.testing.expectEqual(@as(f32, 0), content.children[1].rect.height);
-    try std.testing.expectEqual(@as(f32, 48), content.rect.height);
+    try std.testing.expectError(
+        error.UnboundedTightFlex,
+        layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed),
+    );
 }
 
 test "display list clip stack resolves nested intersections" {

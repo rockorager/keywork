@@ -249,11 +249,17 @@ const QueuedPlatformEvents = struct {
     popup_manager: ?PopupHooks = null,
     popup_surface: bool = false,
     suspended_query: ?SuspendedQuery = null,
+    configure_hook: ?ConfigureHook = null,
     events: std.ArrayList(Event) = .empty,
 
     const SuspendedQuery = struct {
         ctx: *anyopaque,
         func: *const fn (ctx: *anyopaque) bool,
+    };
+
+    const ConfigureHook = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, size: keywork.Size) anyerror!void,
     };
 
     const Event = union(enum) {
@@ -357,7 +363,10 @@ const QueuedPlatformEvents = struct {
                 },
                 else => try self.runtime.keyInput(input),
             },
-            .configure => |size| runtime_mod.Runtime.waylandConfigure(self.runtime, size),
+            .configure => |size| if (self.configure_hook) |hook|
+                try hook.func(hook.ctx, size)
+            else
+                runtime_mod.Runtime.waylandConfigure(self.runtime, size),
             .frame_done => runtime_mod.Runtime.waylandFrameDone(self.runtime),
         };
     }
@@ -805,6 +814,63 @@ fn runWaylandWindowed(
     try loop.run();
 }
 
+const LayerProtocolSize = struct {
+    width: u31,
+    height: u31,
+
+    fn fromLayout(size: keywork.Size) !LayerProtocolSize {
+        return .{
+            .width = try positiveU31(size.width),
+            .height = try positiveU31(size.height),
+        };
+    }
+
+    fn eql(a: LayerProtocolSize, b: LayerProtocolSize) bool {
+        return a.width == b.width and a.height == b.height;
+    }
+};
+
+const LayerSizeDecision = union(enum) {
+    present,
+    wait,
+    request: LayerProtocolSize,
+};
+
+/// Dedupe at the integer Wayland protocol boundary, not in physical pixels.
+/// This prevents fractional layout and output-scale conversions from causing
+/// resize loops while a configure is in flight.
+const LayerSizeNegotiator = struct {
+    configured: LayerProtocolSize,
+    last_requested: ?LayerProtocolSize = null,
+    pending: bool = false,
+
+    fn init(configured: keywork.Size) !LayerSizeNegotiator {
+        return .{ .configured = try .fromLayout(configured) };
+    }
+
+    fn reconsider(self: *LayerSizeNegotiator, desired: keywork.Size) !LayerSizeDecision {
+        if (self.pending) return .wait;
+        const request = try LayerProtocolSize.fromLayout(desired);
+        if (request.eql(self.configured) or
+            (self.last_requested != null and request.eql(self.last_requested.?)))
+        {
+            self.last_requested = request;
+            return .present;
+        }
+        self.last_requested = request;
+        self.pending = true;
+        return .{ .request = request };
+    }
+
+    fn acceptConfigure(self: *LayerSizeNegotiator, configured: keywork.Size) !bool {
+        const accepted = try LayerProtocolSize.fromLayout(configured);
+        const constrained = self.last_requested != null and !accepted.eql(self.last_requested.?);
+        self.configured = accepted;
+        self.pending = false;
+        return constrained;
+    }
+};
+
 /// Reconciles the app's declared window set against live surfaces by id:
 /// each managed window owns its surface, runtime, input queue, and popup
 /// manager. Output hotplug, script invalidation, and compositor closes
@@ -832,6 +898,8 @@ fn WindowManager(comptime Backend: type) type {
             id: []u8,
             win: *Backend.Window,
             layer_shell: bool,
+            content_height: bool,
+            size_negotiator: ?LayerSizeNegotiator = null,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             popups: PopupManager(Backend),
@@ -1011,11 +1079,31 @@ fn WindowManager(comptime Backend: type) type {
             self.closed_ids.put(self.allocator, key, {}) catch self.allocator.free(key);
         }
 
+        fn contentHeightCap(self: *const Self, output_name: ?[]const u8, layer: wayland_options.LayerShellOptions) !f32 {
+            var cap: ?f32 = null;
+            for (0..self.backend.outputCount()) |index| {
+                const info = self.backend.outputInfoAt(index);
+                if (output_name) |name| {
+                    if (!std.mem.eql(u8, name, info.name)) continue;
+                }
+                if (info.height <= 0) continue;
+                cap = if (cap) |current| @min(current, info.height) else info.height;
+                if (output_name != null) break;
+            }
+            const output_height = cap orelse self.options.height;
+            const vertical_margin: f32 = @floatFromInt(@as(i64, layer.margin.top) + @as(i64, layer.margin.bottom));
+            return @max(1, output_height - vertical_margin);
+        }
+
         fn createManaged(self: *Self, decl: app_windows.WindowDeclaration) !void {
             // Null declaration fields inherit the app-level defaults.
             const layer_shell = decl.layer_shell orelse self.options.layer_shell;
             const width = decl.width orelse self.options.width;
-            const height = decl.height orelse self.options.height;
+            if (decl.content_height and layer_shell == null) return error.ContentSizeRequiresLayerShell;
+            const height_cap = if (decl.content_height)
+                try self.contentHeightCap(decl.output, layer_shell.?)
+            else
+                decl.height orelse self.options.height;
             const output = if (decl.output) |name|
                 self.backend.findOutputByName(name) orelse return error.UnknownOutput
             else
@@ -1025,7 +1113,7 @@ fn WindowManager(comptime Backend: type) type {
                 .title = decl.title orelse self.options.title,
                 .app_id = self.options.app_id,
                 .width = if (layer_shell != null and width <= 0) 0 else try positiveU31(width),
-                .height = try positiveU31(height),
+                .height = try positiveU31(height_cap),
                 .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
                 .output = output,
@@ -1041,11 +1129,14 @@ fn WindowManager(comptime Backend: type) type {
             errdefer self.allocator.free(id);
 
             const size = win.currentSize();
+            const layout_height_cap = @min(size.height, height_cap);
             managed.* = .{
                 .manager = self,
                 .id = id,
                 .win = win,
                 .layer_shell = layer_shell != null,
+                .content_height = decl.content_height,
+                .size_negotiator = if (decl.content_height) try .init(size) else null,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined },
                 .popups = .{
@@ -1058,17 +1149,34 @@ fn WindowManager(comptime Backend: type) type {
             managed.runtime = try runtime_mod.Runtime.initWithRasterCache(
                 self.allocator,
                 win.renderBackend(),
-                .{ .max_width = size.width, .max_height = size.height },
+                if (decl.content_height)
+                    .{
+                        .min_width = size.width,
+                        .max_width = size.width,
+                        .max_height = layout_height_cap,
+                    }
+                else
+                    .{ .max_width = size.width, .max_height = size.height },
                 .{ .ptr = managed, .vtable = &managed_host_vtable },
                 self.color_scheme,
                 self.raster_cache,
             );
             errdefer managed.runtime.deinit();
             managed.queue.runtime = &managed.runtime;
+            managed.queue.configure_hook = .{ .ctx = managed, .func = managedConfigure };
             managed.queue.popup_manager = managed.popups.hooks();
             managed.popups.runtime = &managed.runtime;
             if (managed.layer_shell) managed.runtime.setFrameBackground(keywork.colors.transparent);
             managed.runtime.setDeferredRepaint(true);
+            if (managed.content_height) {
+                managed.runtime.setContentSizing(.{ .height = true });
+                managed.runtime.setRootSizeHandler(managed, managedRootSize);
+                const generation = win.configureGeneration();
+                if (!try managed.runtime.reconsiderRootSize()) {
+                    try self.backend.waitForConfigureAfter(win, generation);
+                    try managedConfigure(managed, win.currentSize());
+                }
+            }
 
             win.setPointerButtonHandler(&managed.queue, QueuedPlatformEvents.pointerButton);
             win.setPointerMoveHandler(&managed.queue, QueuedPlatformEvents.pointerMove);
@@ -1105,6 +1213,29 @@ fn WindowManager(comptime Backend: type) type {
             return managed.manager.windows_host.buildWindowWidget(managed.id, scope, context);
         }
 
+        fn managedRootSize(ptr: *anyopaque, desired_size: keywork.Size) !bool {
+            const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+            const negotiator = &(managed.size_negotiator orelse return true);
+            return switch (try negotiator.reconsider(desired_size)) {
+                .present => true,
+                .wait => false,
+                .request => |request| blk: {
+                    try managed.manager.backend.requestLayerSize(managed.win, request.width, request.height);
+                    break :blk false;
+                },
+            };
+        }
+
+        fn managedConfigure(ptr: *anyopaque, size: keywork.Size) !void {
+            const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+            if (managed.size_negotiator) |*negotiator| {
+                if (try negotiator.acceptConfigure(size)) {
+                    managed.runtime.constraints.max_height = @min(managed.runtime.constraints.max_height, size.height);
+                }
+            }
+            try managed.runtime.configure(size);
+        }
+
         fn invalidateManagedState(ptr: *anyopaque) anyerror!void {
             const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
             try managed.runtime.invalidateState();
@@ -1117,6 +1248,29 @@ fn positiveU31(value: f32) !u31 {
     const rounded = @ceil(value);
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
     return @intFromFloat(rounded);
+}
+
+test "layer size negotiation emits one request per retained size" {
+    var negotiator = try LayerSizeNegotiator.init(.{ .width = 380, .height = 480 });
+
+    const initial = try negotiator.reconsider(.{ .width = 380, .height = 63.2 });
+    try std.testing.expectEqual(LayerProtocolSize{ .width = 380, .height = 64 }, initial.request);
+    try std.testing.expect(try negotiator.reconsider(.{ .width = 380, .height = 63.2 }) == .wait);
+
+    try std.testing.expect(!try negotiator.acceptConfigure(.{ .width = 380, .height = 64 }));
+    try std.testing.expect(try negotiator.reconsider(.{ .width = 380, .height = 63.2 }) == .present);
+
+    const changed = try negotiator.reconsider(.{ .width = 380, .height = 80 });
+    try std.testing.expectEqual(LayerProtocolSize{ .width = 380, .height = 80 }, changed.request);
+    try std.testing.expect(try negotiator.reconsider(.{ .width = 380, .height = 80 }) == .wait);
+}
+
+test "layer size negotiation dedupes fractional scale round trips" {
+    // 31 physical pixels at 1.5x round-trip to 20.666 logical pixels. Both
+    // it and the original 20.25 layout request map to protocol height 21.
+    var negotiator = try LayerSizeNegotiator.init(.{ .width = 380, .height = 21 });
+    try std.testing.expect(try negotiator.reconsider(.{ .width = 380, .height = 20.25 }) == .present);
+    try std.testing.expect(try negotiator.reconsider(.{ .width = 380, .height = 31.0 / 1.5 }) == .present);
 }
 
 test "queued key text is copied" {
