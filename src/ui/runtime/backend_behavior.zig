@@ -89,9 +89,12 @@ pub fn presentFrame(self: anytype) !void {
     }
     const damage = if (collected) |dirty| dirty.intersect(full_frame) else full_frame;
     self.display_list.clearRetainingCapacity(self.allocator);
+    const raster_cache = self.rasterCache();
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(self.allocator);
     const background = self.frameBackground();
     if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
-    try keywork.paintScaled(self.allocator, root, &self.display_list, render_scale);
+    try keywork.paintScaled(self.allocator, root, &self.display_list, raster_cache, render_scale);
     self.frame_pending = try self.backend.present(.{
         .size = frame_size,
         .scale = render_scale,

@@ -10,6 +10,7 @@ const AppHost = keywork.AppHost;
 const Constraints = keywork.Constraints;
 const BuildScope = keywork.BuildScope;
 const DisplayList = keywork.DisplayList;
+const RasterCache = keywork.RasterCache;
 const Element = keywork.Element;
 const CursorShape = keywork.CursorShape;
 const KeyInput = keywork.KeyInput;
@@ -92,6 +93,8 @@ pub const Runtime = struct {
     element_root: ?Element = null,
     root: ?*RenderNode = null,
     display_list: DisplayList = .{},
+    owned_raster_cache: RasterCache = .{},
+    external_raster_cache: ?*RasterCache = null,
     app_context: State = .{},
     frame_background: ?keywork.Color = null,
     repaint_pending: bool = false,
@@ -128,6 +131,28 @@ pub const Runtime = struct {
         app: AppHost,
         color_scheme: UiColorScheme,
     ) !Runtime {
+        return initWithOptionalRasterCache(allocator, backend, constraints, app, color_scheme, null);
+    }
+
+    pub fn initWithRasterCache(
+        allocator: std.mem.Allocator,
+        backend: RenderBackend,
+        constraints: Constraints,
+        app: AppHost,
+        color_scheme: UiColorScheme,
+        raster_cache: *RasterCache,
+    ) !Runtime {
+        return initWithOptionalRasterCache(allocator, backend, constraints, app, color_scheme, raster_cache);
+    }
+
+    fn initWithOptionalRasterCache(
+        allocator: std.mem.Allocator,
+        backend: RenderBackend,
+        constraints: Constraints,
+        app: AppHost,
+        color_scheme: UiColorScheme,
+        raster_cache: ?*RasterCache,
+    ) !Runtime {
         var self: Runtime = .{
             .allocator = allocator,
             .backend = backend,
@@ -135,6 +160,7 @@ pub const Runtime = struct {
             .app = app,
             .build_arena = .init(allocator),
             .color_scheme = color_scheme,
+            .external_raster_cache = raster_cache,
         };
         errdefer self.deinit();
         try self.rebuild();
@@ -147,6 +173,7 @@ pub const Runtime = struct {
             self.element_root = null;
         }
         self.display_list.deinit(self.allocator);
+        self.owned_raster_cache.deinit(self.allocator);
         if (self.focused_id) |id| self.allocator.free(id);
         for (self.pending_interaction_ids.items) |id| self.allocator.free(id);
         self.pending_interaction_ids.deinit(self.allocator);
@@ -154,6 +181,10 @@ pub const Runtime = struct {
         if (self.pressed_id) |id| self.allocator.free(id);
         if (self.scrollbar_drag) |drag| self.allocator.free(drag.id);
         self.build_arena.deinit();
+    }
+
+    pub fn rasterCache(self: *Runtime) *RasterCache {
+        return self.external_raster_cache orelse &self.owned_raster_cache;
     }
 
     fn currentState(self: *const Runtime) State {

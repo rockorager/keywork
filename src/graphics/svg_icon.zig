@@ -63,25 +63,25 @@ const SvgIcon = struct {
         const height = @max(1, @as(usize, @intFromFloat(req_height)));
         const cache_key = cacheKey(self.path, width, height, icon_supersample);
         if (self.color) |tint| {
-            if (context.display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |alpha| {
+            if (context.raster_cache.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |alpha| {
                 try context.display_list.alphaImage(
                     context.allocator,
                     context.rect,
                     @intCast(width),
                     @intCast(height),
-                    @constCast(alpha),
+                    alpha,
                     tint,
                     cache_key,
                 );
                 return;
             }
-        } else if (context.display_list.cachedColorImage(cache_key, @intCast(width), @intCast(height))) |cached| {
+        } else if (context.raster_cache.cachedColorImage(cache_key, @intCast(width), @intCast(height))) |cached| {
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                @constCast(cached),
+                cached,
                 cache_key,
             );
             return;
@@ -121,24 +121,26 @@ const SvgIcon = struct {
         if (self.color) |tint| {
             const alpha = try context.allocator.alloc(u8, width * height);
             downsampleAlpha(alpha, pixels, width, height, icon_supersample);
+            const cached = try context.raster_cache.insertAlpha(context.allocator, cache_key, @intCast(width), @intCast(height), alpha);
             try context.display_list.alphaImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                alpha,
+                cached,
                 tint,
                 cache_key,
             );
         } else {
             const colors = try context.allocator.alloc(keywork.Color, width * height);
             downsamplePremultipliedColor(colors, pixels, width, height, icon_supersample);
+            const cached = try context.raster_cache.insertColor(context.allocator, cache_key, @intCast(width), @intCast(height), colors);
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                colors,
+                cached,
                 cache_key,
             );
         }
@@ -157,24 +159,26 @@ const SvgIcon = struct {
         if (self.color) |tint| {
             const alpha = try context.allocator.alloc(u8, width * height);
             @memset(alpha, 0);
+            const cached = try context.raster_cache.insertAlpha(context.allocator, cache_key, @intCast(width), @intCast(height), alpha);
             try context.display_list.alphaImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                alpha,
+                cached,
                 tint,
                 cache_key,
             );
         } else {
             const colors = try context.allocator.alloc(keywork.Color, width * height);
             @memset(colors, keywork.colors.transparent);
+            const cached = try context.raster_cache.insertColor(context.allocator, cache_key, @intCast(width), @intCast(height), colors);
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 @intCast(width),
                 @intCast(height),
-                colors,
+                cached,
                 cache_key,
             );
         }

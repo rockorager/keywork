@@ -75,25 +75,26 @@ const Image = struct {
         hasher.update(std.mem.asBytes(&target_height));
         const cache_key = hasher.final();
 
-        if (context.display_list.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+        if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 target_width,
                 target_height,
-                @constCast(cached),
+                cached,
                 cache_key,
             );
             return;
         }
 
         const pixels = try resampledPixels(context.allocator, self.pixels, self.width, self.height, target_width, target_height);
+        const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
             context.rect,
             target_width,
             target_height,
-            pixels,
+            cached,
             cache_key,
         );
     }
@@ -200,13 +201,13 @@ const PngIcon = struct {
         hasher.update(std.mem.asBytes(&target_height));
         const cache_key = hasher.final();
 
-        if (context.display_list.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+        if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
             try context.display_list.colorImage(
                 context.allocator,
                 context.rect,
                 target_width,
                 target_height,
-                @constCast(cached),
+                cached,
                 cache_key,
             );
             return;
@@ -244,12 +245,13 @@ const PngIcon = struct {
             target_width,
             target_height,
         );
+        const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
             context.rect,
             target_width,
             target_height,
-            pixels,
+            cached,
             cache_key,
         );
     }
@@ -285,7 +287,8 @@ fn paintTombstone(
 ) !void {
     const pixels = try context.allocator.alloc(keywork.Color, @as(usize, width) * height);
     @memset(pixels, keywork.colors.transparent);
-    try context.display_list.colorImage(context.allocator, context.rect, width, height, pixels, cache_key);
+    const cached = try context.raster_cache.insertColor(context.allocator, cache_key, width, height, pixels);
+    try context.display_list.colorImage(context.allocator, context.rect, width, height, cached, cache_key);
 }
 
 /// Caches intrinsic image dimensions per path so widget parsing (every

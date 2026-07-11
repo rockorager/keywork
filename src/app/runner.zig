@@ -86,12 +86,15 @@ fn runHeadlessRuntime(
     backend: keywork.RenderBackend,
     options: Options,
 ) !void {
-    var runtime = try runtime_mod.Runtime.init(
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var runtime = try runtime_mod.Runtime.initWithRasterCache(
         allocator,
         backend,
         constraints,
         app,
         .no_preference,
+        &raster_cache,
     );
     defer runtime.deinit();
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
@@ -159,12 +162,15 @@ fn runWayland(
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
-    var runtime = try runtime_mod.Runtime.init(
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var runtime = try runtime_mod.Runtime.initWithRasterCache(
         allocator,
         win.renderBackend(),
         initial_constraints,
         app,
         initial_color_scheme,
+        &raster_cache,
     );
     defer runtime.deinit();
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
@@ -594,12 +600,13 @@ fn PopupManager(comptime Backend: type) type {
                 .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
             };
-            surface.runtime = try runtime_mod.Runtime.init(
+            surface.runtime = try runtime_mod.Runtime.initWithRasterCache(
                 self.allocator,
                 win.renderBackend(),
                 .{ .max_width = size.width, .max_height = size.height },
                 .{ .ptr = surface, .vtable = &popup_host_vtable },
                 self.runtime.color_scheme,
+                self.runtime.rasterCache(),
             );
             errdefer surface.runtime.deinit();
             surface.queue.runtime = &surface.runtime;
@@ -740,12 +747,15 @@ fn runWaylandWindowed(
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
     var manager: Manager = .{
         .allocator = allocator,
         .backend = backend,
         .windows_host = windows_host,
         .options = &options,
         .color_scheme = initial_color_scheme,
+        .raster_cache = &raster_cache,
     };
     defer manager.deinit();
     backend.setOutputsChangedHandler(&manager, Manager.outputsChanged);
@@ -800,6 +810,7 @@ fn WindowManager(comptime Backend: type) type {
         windows_host: app_windows.WindowsHost,
         options: *const Options,
         color_scheme: runtime_mod.UiColorScheme = .no_preference,
+        raster_cache: *keywork.RasterCache,
         windows: std.ArrayList(*ManagedWindow) = .empty,
         /// Ids the compositor closed while the app still declares them;
         /// skipped on reconcile so a close is not immediately undone. An id
@@ -1038,12 +1049,13 @@ fn WindowManager(comptime Backend: type) type {
                     .runtime = undefined,
                 },
             };
-            managed.runtime = try runtime_mod.Runtime.init(
+            managed.runtime = try runtime_mod.Runtime.initWithRasterCache(
                 self.allocator,
                 win.renderBackend(),
                 .{ .max_width = size.width, .max_height = size.height },
                 .{ .ptr = managed, .vtable = &managed_host_vtable },
                 self.color_scheme,
+                self.raster_cache,
             );
             errdefer managed.runtime.deinit();
             managed.queue.runtime = &managed.runtime;

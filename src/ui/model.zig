@@ -29,6 +29,7 @@ pub const PointerButtons = types.PointerButtons;
 pub const TapEvent = types.TapEvent;
 pub const ScrollEvent = types.ScrollEvent;
 pub const DisplayList = display.DisplayList;
+pub const RasterCache = display.RasterCache;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
 
@@ -717,6 +718,7 @@ pub const Widget = union(enum) {
             rect: Rect,
             scale: f32,
             display_list: *DisplayList,
+            raster_cache: *RasterCache,
         };
 
         pub const VTable = struct {
@@ -3023,22 +3025,33 @@ fn testCallbackCall(_: *anyopaque, _: TapEvent) !void {}
 
 const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
 
-test "display list reuses cached alpha image data" {
+test "raster cache reuses alpha image data across display lists" {
     const allocator = std.testing.allocator;
 
-    var display_list: DisplayList = .{};
-    defer display_list.deinit(allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var first_list: DisplayList = .{};
+    defer first_list.deinit(allocator);
+    var second_list: DisplayList = .{};
+    defer second_list.deinit(allocator);
 
-    const first_alpha = try allocator.dupe(u8, &.{ 1, 2, 3, 4 });
-    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, first_alpha, colors.white, 42);
-    const cached_ptr = display_list.commands.items[0].alpha_image.alpha.ptr;
+    {
+        raster_cache.beginFrame();
+        defer raster_cache.endFrame(allocator);
+        const alpha = try raster_cache.insertAlpha(allocator, 42, 2, 2, try allocator.dupe(u8, &.{ 1, 2, 3, 4 }));
+        try first_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, alpha, colors.white, 42);
+    }
+    const bytes_after_first = raster_cache.byte_usage;
 
-    display_list.clearRetainingCapacity(allocator);
-
-    const second_alpha = try allocator.dupe(u8, &.{ 5, 6, 7, 8 });
-    try display_list.alphaImage(allocator, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, 2, 2, second_alpha, colors.black, 42);
-    try std.testing.expectEqual(cached_ptr, display_list.commands.items[0].alpha_image.alpha.ptr);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, display_list.commands.items[0].alpha_image.alpha);
+    {
+        raster_cache.beginFrame();
+        defer raster_cache.endFrame(allocator);
+        const alpha = raster_cache.cachedAlphaImage(42, 2, 2).?;
+        try second_list.alphaImage(allocator, .{ .x = 2, .y = 2, .width = 2, .height = 2 }, 2, 2, alpha, colors.black, 42);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, second_list.commands.items[0].alpha_image.alpha);
+        try std.testing.expectEqual(bytes_after_first, raster_cache.byte_usage);
+        try std.testing.expectEqual(@as(u32, 1), raster_cache.alpha.count());
+    }
 }
 
 test "rounded rect alpha covers fill and hollow border band" {
@@ -3105,7 +3118,11 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     // Paint clips the content to the viewport rect.
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(retained_allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(retained_allocator);
+    try paintScaled(retained_allocator, root, &display_list, &raster_cache, 1);
     var saw_viewport_clip = false;
     for (display_list.commands.items) |command| {
         switch (command) {
@@ -3151,7 +3168,11 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
     // (an alpha mask tinted with the scrollbar color).
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(retained_allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(retained_allocator);
+    try paintScaled(retained_allocator, root, &display_list, &raster_cache, 1);
     var saw_thumb = false;
     for (display_list.commands.items) |command| {
         switch (command) {
@@ -3396,7 +3417,11 @@ test "text input paint clips its content" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paintScaled(retained_allocator, root, &display_list, 1);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(retained_allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(retained_allocator);
+    try paintScaled(retained_allocator, root, &display_list, &raster_cache, 1);
 
     var clip_active = false;
     var text_clipped = false;
@@ -3442,7 +3467,11 @@ test "layout, paint, and hit test a padded column" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paint(allocator, root, &display_list);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(allocator);
+    try paint(allocator, root, &display_list, &raster_cache);
 
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
     try std.testing.expectEqualStrings("ok", hitTestButton(root, .{ .x = 25, .y = 35 }).?);
@@ -3718,7 +3747,11 @@ test "text role resolves themed font size for layout and paint" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paint(allocator, root, &display_list);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(allocator);
+    try paint(allocator, root, &display_list, &raster_cache);
 
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
     try std.testing.expect(display_list.commands.items[0] == .text);
@@ -3777,7 +3810,11 @@ test "rounded box paints alpha images for fill and border" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
-    try paintScaled(allocator, root, &display_list, 1.5);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(allocator);
+    try paintScaled(allocator, root, &display_list, &raster_cache, 1.5);
 
     try std.testing.expectEqual(@as(usize, 3), display_list.commands.items.len);
     try std.testing.expect(display_list.commands.items[0] == .alpha_image);
@@ -4753,7 +4790,11 @@ test "element tree retains cloned render objects beyond build scope" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
-    try paint(retained_allocator, root, &display_list);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(retained_allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(retained_allocator);
+    try paint(retained_allocator, root, &display_list, &raster_cache);
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
 
     destroyElementTree(retained_allocator, &element);
@@ -5752,7 +5793,11 @@ test "render object widget owns custom layout paint and hit testing" {
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(std.testing.allocator);
-    try paint(std.testing.allocator, root, &display_list);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(std.testing.allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(std.testing.allocator);
+    try paint(std.testing.allocator, root, &display_list, &raster_cache);
 
     try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
     try std.testing.expectEqualStrings("badge", hitTestButton(root, .{ .x = 8, .y = 8 }).?);

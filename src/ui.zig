@@ -34,6 +34,7 @@ pub const Element = model.Element;
 pub const RenderNode = model.RenderNode;
 pub const PaintCommand = display.PaintCommand;
 pub const DisplayList = display.DisplayList;
+pub const RasterCache = display.RasterCache;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
 pub const TextMetrics = display.TextMetrics;

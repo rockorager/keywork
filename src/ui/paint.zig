@@ -16,21 +16,27 @@ const ShortcutKey = model.ShortcutKey;
 const Intent = model.Intent;
 const CursorShape = model.CursorShape;
 const DisplayList = model.DisplayList;
+const RasterCache = @import("display.zig").RasterCache;
 const ResolvedTextStyle = model.ResolvedTextStyle;
 
-pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList) !void {
-    return paintScaled(allocator, node, display_list, 1);
+pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache) !void {
+    return paintScaled(allocator, node, display_list, raster_cache, 1);
 }
 
-pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
+pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
+    std.debug.assert(raster_cache.in_frame);
+    return paintNode(allocator, node, display_list, raster_cache, scale);
+}
+
+fn paintNode(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
     switch (node.kind) {
         .render_object => {
             const render_object = node.render_object orelse return error.MissingRenderObject;
-            try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list });
+            try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list, .raster_cache = raster_cache });
         },
         .box => {
             if (node.box_radius > 0) {
-                try paintRoundedBox(allocator, display_list, node.rect, node.background, node.box_border, node.box_border_width, node.box_radius, scale);
+                try paintRoundedBox(allocator, display_list, raster_cache, node.rect, node.background, node.box_border, node.box_border_width, node.box_radius, scale);
             } else {
                 if (node.background.a > 0) try display_list.fillRect(allocator, node.rect, node.background);
                 if (node.box_border) |border| try paintBorder(allocator, display_list, node.rect, border, node.box_border_width);
@@ -56,7 +62,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text_input => {
             const border = if (node.focused) node.focused_border else node.border;
             if (node.box_radius > 0) {
-                try paintRoundedBox(allocator, display_list, node.rect, node.background, border, 1, node.box_radius, scale);
+                try paintRoundedBox(allocator, display_list, raster_cache, node.rect, node.background, border, 1, node.box_radius, scale);
             } else {
                 try display_list.fillRect(allocator, node.rect, node.background);
                 try paintBorder(allocator, display_list, node.rect, border, 1);
@@ -84,17 +90,17 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
-        .spinner => try paintSpinner(allocator, node, display_list, scale),
+        .spinner => try paintSpinner(allocator, node, display_list, raster_cache, scale),
         .scroll, .list => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
 
     for (node.children) |child| {
-        try paintScaled(allocator, child, display_list, scale);
+        try paintNode(allocator, child, display_list, raster_cache, scale);
     }
 
     if (node.kind.isViewport()) {
-        try paintScrollbars(allocator, node, display_list, scale);
+        try paintScrollbars(allocator, node, display_list, raster_cache, scale);
         try display_list.popClip(allocator);
     }
 }
@@ -106,7 +112,7 @@ const spinner_trail_floor: f32 = 0.15;
 /// A ring of dots at fixed positions; the sweep phase picks the brightest
 /// dot and brightness trails off behind it. Dot positions never move, so
 /// the spinner needs no path stroking or transforms.
-fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
+fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
     std.debug.assert(node.spinner_progress >= 0 and node.spinner_progress < 1);
     const size = @min(node.rect.width, node.rect.height);
     if (size <= 0) return;
@@ -131,7 +137,7 @@ fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_l
             .width = dot_radius * 2,
             .height = dot_radius * 2,
         };
-        try paintRoundedBox(allocator, display_list, dot, color, null, 0, dot_radius, scale);
+        try paintRoundedBox(allocator, display_list, raster_cache, dot, color, null, 0, dot_radius, scale);
     }
 }
 
@@ -201,12 +207,12 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
 /// Paints proportional scrollbar thumbs for axes whose content overflows
 /// the viewport, from the geometry recorded during layout. Thumbs are
 /// pill-shaped overlays painted over the content's edge.
-fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
+fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
     std.debug.assert(node.kind.isViewport());
     const color = fadedScrollbarColor(node.scrollbar_alpha) orelse return;
     inline for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
         if (scrollbarGeometry(node, axis)) |geometry| {
-            try paintRoundedBox(allocator, display_list, geometry.thumb, color, null, 0, scrollbar_thickness / 2, scale);
+            try paintRoundedBox(allocator, display_list, raster_cache, geometry.thumb, color, null, 0, scrollbar_thickness / 2, scale);
         }
     }
 }
@@ -270,6 +276,7 @@ fn paintBorder(allocator: std.mem.Allocator, display_list: *DisplayList, rect: R
 fn paintRoundedBox(
     allocator: std.mem.Allocator,
     display_list: *DisplayList,
+    raster_cache: *RasterCache,
     rect: Rect,
     background: Color,
     border: ?Color,
@@ -286,22 +293,22 @@ fn paintRoundedBox(
 
     if (background.a > 0) {
         const cache_key = roundedRectCacheKey(width, height, scaled_radius, null);
-        const alpha = if (display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
+        const alpha = if (raster_cache.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
             cached
         else
-            try roundedRectAlpha(allocator, width, height, scaled_radius, null);
-        try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), @constCast(alpha), background, cache_key);
+            try raster_cache.insertAlpha(allocator, cache_key, @intCast(width), @intCast(height), try roundedRectAlpha(allocator, width, height, scaled_radius, null));
+        try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, background, cache_key);
     }
 
     if (border) |border_color| {
         const stroke_width = @min(@max(0, border_width * render_scale), @min(@as(f32, @floatFromInt(width)), @as(f32, @floatFromInt(height))) / 2);
         if (stroke_width > 0) {
             const cache_key = roundedRectCacheKey(width, height, scaled_radius, stroke_width);
-            const alpha = if (display_list.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
+            const alpha = if (raster_cache.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
                 cached
             else
-                try roundedRectAlpha(allocator, width, height, scaled_radius, stroke_width);
-            try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), @constCast(alpha), border_color, cache_key);
+                try raster_cache.insertAlpha(allocator, cache_key, @intCast(width), @intCast(height), try roundedRectAlpha(allocator, width, height, scaled_radius, stroke_width));
+            try display_list.alphaImage(allocator, rect, @intCast(width), @intCast(height), alpha, border_color, cache_key);
         }
     }
 }
