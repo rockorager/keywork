@@ -25,11 +25,37 @@ pub fn paint(allocator: std.mem.Allocator, node: *const RenderNode, display_list
 
 pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
     std.debug.assert(raster_cache.in_frame);
-    return paintNode(allocator, node, display_list, raster_cache, scale);
+    return paintNode(allocator, node, display_list, raster_cache, scale, null);
 }
 
-fn paintNode(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
-    switch (node.kind) {
+/// Builds only the commands that can affect `damage`. The caller must use
+/// this only with a backend that preserves pixels outside that region.
+pub fn paintDamagedScaled(
+    allocator: std.mem.Allocator,
+    node: *const RenderNode,
+    display_list: *DisplayList,
+    raster_cache: *RasterCache,
+    scale: f32,
+    damage: Rect,
+) !void {
+    std.debug.assert(raster_cache.in_frame);
+    if (damage.isEmpty()) return;
+    return paintNode(allocator, node, display_list, raster_cache, scale, damage);
+}
+
+fn paintNode(
+    allocator: std.mem.Allocator,
+    node: *const RenderNode,
+    display_list: *DisplayList,
+    raster_cache: *RasterCache,
+    scale: f32,
+    cull_rect: ?Rect,
+) !void {
+    const bounds = if (node.kind == .text) inflatedRect(node.rect, node.text_style.font_size) else node.rect;
+    const paints_node = if (cull_rect) |cull| !bounds.intersect(cull).isEmpty() else true;
+    if (node.kind.isViewport() and !paints_node) return;
+
+    if (paints_node) switch (node.kind) {
         .render_object => {
             const render_object = node.render_object orelse return error.MissingRenderObject;
             try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list, .raster_cache = raster_cache });
@@ -93,16 +119,166 @@ fn paintNode(allocator: std.mem.Allocator, node: *const RenderNode, display_list
         .spinner => try paintSpinner(allocator, node, display_list, raster_cache, scale),
         .scroll, .list => try display_list.pushClip(allocator, node.rect),
         else => {},
-    }
+    };
 
+    const child_cull = if (node.kind.isViewport())
+        if (cull_rect) |cull| node.rect.intersect(cull) else null
+    else
+        cull_rect;
     for (node.children) |child| {
-        try paintNode(allocator, child, display_list, raster_cache, scale);
+        try paintNode(allocator, child, display_list, raster_cache, scale, child_cull);
     }
 
     if (node.kind.isViewport()) {
         try paintScrollbars(allocator, node, display_list, raster_cache, scale);
         try display_list.popClip(allocator);
     }
+}
+
+fn inflatedRect(rect: Rect, amount: f32) Rect {
+    return .{
+        .x = rect.x - amount,
+        .y = rect.y - amount,
+        .width = rect.width + amount * 2,
+        .height = rect.height + amount * 2,
+    };
+}
+
+test "damage paint emits only intersecting node commands" {
+    var first: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .background = colors.white,
+    };
+    var second: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 30, .y = 0, .width = 20, .height = 20 },
+        .background = colors.ink,
+    };
+    var children = [_]*RenderNode{ &first, &second };
+    const root: RenderNode = .{
+        .kind = .row,
+        .rect = .{ .x = 0, .y = 0, .width = 50, .height = 20 },
+        .children = &children,
+    };
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(std.testing.allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(std.testing.allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(std.testing.allocator);
+
+    try paintDamagedScaled(std.testing.allocator, &root, &display_list, &raster_cache, 1, second.rect);
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    try std.testing.expectEqual(second.rect, display_list.commands.items[0].fill_rect.rect);
+}
+
+test "damage paint retains text whose glyphs may overhang its layout rect" {
+    const text: RenderNode = .{
+        .kind = .text,
+        .rect = .{ .x = 20, .y = 0, .width = 20, .height = 20 },
+        .text = "text",
+    };
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(std.testing.allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(std.testing.allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(std.testing.allocator);
+
+    try paintDamagedScaled(
+        std.testing.allocator,
+        &text,
+        &display_list,
+        &raster_cache,
+        1,
+        .{ .x = 10, .y = 0, .width = 5, .height = 20 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    try std.testing.expect(display_list.commands.items[0] == .text);
+}
+
+test "damage paint keeps overflowing children and culls clipped viewports" {
+    var visible_overflow: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 30, .y = 0, .width = 20, .height = 20 },
+        .background = colors.ink,
+    };
+    var overflow_children = [_]*RenderNode{&visible_overflow};
+    var outside_parent: RenderNode = .{
+        .kind = .center,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .children = &overflow_children,
+    };
+    var clipped_child: RenderNode = .{
+        .kind = .box,
+        .rect = visible_overflow.rect,
+        .background = colors.white,
+    };
+    var clipped_children = [_]*RenderNode{&clipped_child};
+    var viewport: RenderNode = .{
+        .kind = .scroll,
+        .rect = .{ .x = 0, .y = 30, .width = 20, .height = 20 },
+        .children = &clipped_children,
+    };
+    var children = [_]*RenderNode{ &outside_parent, &viewport };
+    const root: RenderNode = .{
+        .kind = .column,
+        .rect = .{ .x = 0, .y = 0, .width = 50, .height = 50 },
+        .children = &children,
+    };
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(std.testing.allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(std.testing.allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(std.testing.allocator);
+
+    try paintDamagedScaled(std.testing.allocator, &root, &display_list, &raster_cache, 1, visible_overflow.rect);
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    try std.testing.expectEqual(visible_overflow.rect, display_list.commands.items[0].fill_rect.rect);
+    try std.testing.expectEqual(@as(usize, 0), display_list.clip_stack.items.len);
+}
+
+test "damage paint does not emit children outside an intersecting viewport" {
+    var clipped_child: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 25, .y = 0, .width = 10, .height = 20 },
+        .background = colors.white,
+    };
+    var viewport_children = [_]*RenderNode{&clipped_child};
+    const viewport: RenderNode = .{
+        .kind = .scroll,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .children = &viewport_children,
+    };
+
+    var display_list: DisplayList = .{};
+    defer display_list.deinit(std.testing.allocator);
+    var raster_cache: RasterCache = .{};
+    defer raster_cache.deinit(std.testing.allocator);
+    raster_cache.beginFrame();
+    defer raster_cache.endFrame(std.testing.allocator);
+
+    try paintDamagedScaled(
+        std.testing.allocator,
+        &viewport,
+        &display_list,
+        &raster_cache,
+        1,
+        .{ .x = 15, .y = 0, .width = 20, .height = 20 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), display_list.commands.items.len);
+    try std.testing.expect(display_list.commands.items[0] == .set_clip);
+    try std.testing.expect(display_list.commands.items[1] == .set_clip);
+    try std.testing.expectEqual(@as(usize, 0), display_list.clip_stack.items.len);
 }
 
 const spinner_dots = 8;

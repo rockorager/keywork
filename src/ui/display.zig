@@ -327,6 +327,9 @@ pub const RenderBackend = struct {
         /// Optional; backends without real font metrics fall back to the
         /// fixed approximation.
         text_metrics: ?*const fn (ptr: *anyopaque, font_size: f32) anyerror!TextMetrics = null,
+        /// Optional logical bounds within which a damage-only display list
+        /// is safe. Backends that redraw from scratch leave this null.
+        partial_paint_bounds: ?*const fn (ptr: *anyopaque, size: Size, scale: f32, damage: []const Rect) anyerror!?Rect = null,
     };
 
     pub const Frame = struct {
@@ -334,6 +337,9 @@ pub const RenderBackend = struct {
         scale: f32,
         damage: []const Rect,
         display_list: []const PaintCommand,
+        /// The display list omits commands outside damage. A backend that
+        /// advertised this capability must preserve those pixels or fail.
+        partial_display_list: bool = false,
     };
 
     pub fn present(self: RenderBackend, frame: Frame) !bool {
@@ -347,6 +353,11 @@ pub const RenderBackend = struct {
     pub fn textMetrics(self: RenderBackend, font_size: f32) !TextMetrics {
         const text_metrics = self.vtable.text_metrics orelse return fixedTextMetrics(font_size);
         return text_metrics(self.ptr, font_size);
+    }
+
+    pub fn partialPaintBounds(self: RenderBackend, size: Size, scale_value: f32, damage: []const Rect) !?Rect {
+        const partial_paint_bounds = self.vtable.partial_paint_bounds orelse return null;
+        return partial_paint_bounds(self.ptr, size, scale_value, damage);
     }
 
     pub fn scale(self: RenderBackend) f32 {

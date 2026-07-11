@@ -661,6 +661,100 @@ test "rebuilds that change nothing present nothing" {
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
 }
 
+test "backend capability gates damage-only display lists" {
+    const TestApp = struct {
+        const left_color = keywork.Color.argb(255, 1, 2, 3);
+        const right_color = keywork.Color.argb(255, 4, 5, 6);
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const empty = keywork.widgets.spacer(0);
+            const left: keywork.Widget = .{ .box = .{
+                .child = &empty,
+                .background = left_color,
+                .min_width = 20,
+                .min_height = 20,
+            } };
+            const right: keywork.Widget = .{ .box = .{
+                .child = &empty,
+                .background = right_color,
+                .min_width = 20,
+                .min_height = 20,
+            } };
+            return keywork.widgets.row(scope.allocator, &.{ left, right }, 0);
+        }
+    };
+
+    const TestBackend = struct {
+        allow_partial: bool = false,
+        last_partial: bool = false,
+        left_fills: usize = 0,
+        right_fills: usize = 0,
+
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{
+                .present = present,
+                .measure_text = measureText,
+                .scale = scale,
+                .partial_paint_bounds = partialPaintBounds,
+            } };
+        }
+
+        fn present(ptr: *anyopaque, frame: RenderBackend.Frame) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.last_partial = frame.partial_display_list;
+            self.left_fills = 0;
+            self.right_fills = 0;
+            for (frame.display_list) |command| switch (command) {
+                .fill_rect => |fill| {
+                    if (std.meta.eql(fill.color, TestApp.left_color)) self.left_fills += 1;
+                    if (std.meta.eql(fill.color, TestApp.right_color)) self.right_fills += 1;
+                },
+                else => {},
+            };
+            return false;
+        }
+
+        fn partialPaintBounds(ptr: *anyopaque, _: Size, _: f32, damage: []const keywork.Rect) !?keywork.Rect {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.allow_partial or damage.len != 1) return null;
+            return damage[0];
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    defer runtime.deinit();
+    try runtime.repaint();
+
+    const right = runtime.root.?.children[1];
+    right.damage = right.rect;
+    try runtime.repaint();
+    try std.testing.expect(!backend.last_partial);
+    try std.testing.expectEqual(@as(usize, 1), backend.left_fills);
+    try std.testing.expectEqual(@as(usize, 1), backend.right_fills);
+
+    backend.allow_partial = true;
+    right.damage = right.rect;
+    try runtime.repaint();
+    try std.testing.expect(backend.last_partial);
+    try std.testing.expectEqual(@as(usize, 0), backend.left_fills);
+    try std.testing.expectEqual(@as(usize, 1), backend.right_fills);
+}
+
 fn renderedInputText(node: *const RenderNode) ?[]const u8 {
     if (node.kind == .text_input) return node.text;
     for (node.children) |child| {

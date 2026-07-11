@@ -94,12 +94,18 @@ pub fn presentFrame(self: anytype) !void {
     defer raster_cache.endFrame(self.allocator);
     const background = self.frameBackground();
     if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
-    try keywork.paintScaled(self.allocator, root, &self.display_list, raster_cache, render_scale);
+    const partial_paint_bounds = try self.backend.partialPaintBounds(frame_size, render_scale, &.{damage});
+    if (partial_paint_bounds) |paint_bounds| {
+        try keywork.paintDamagedScaled(self.allocator, root, &self.display_list, raster_cache, render_scale, paint_bounds);
+    } else {
+        try keywork.paintScaled(self.allocator, root, &self.display_list, raster_cache, render_scale);
+    }
     self.frame_pending = try self.backend.present(.{
         .size = frame_size,
         .scale = render_scale,
         .damage = &.{damage},
         .display_list = self.display_list.commands.items,
+        .partial_display_list = partial_paint_bounds != null,
     });
     self.presented_size = frame_size;
     self.presented_scale = render_scale;

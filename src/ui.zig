@@ -63,6 +63,7 @@ pub const dirtyTextInputElement = model.dirtyTextInputElement;
 pub const dirtyScrollElement = model.dirtyScrollElement;
 pub const refreshInteractionElements = model.refreshInteractionElements;
 pub const paintScaled = model.paintScaled;
+pub const paintDamagedScaled = model.paintDamagedScaled;
 pub const ScrollbarAxis = model.ScrollbarAxis;
 pub const ScrollbarThumbHit = model.ScrollbarThumbHit;
 pub const hitTestScrollbarThumb = model.hitTestScrollbarThumb;

@@ -280,6 +280,7 @@ pub const Backend = struct {
         input_target: WaylandInput.Target,
         buffers: std.ArrayList(*Buffer) = .empty,
         last_rendered: ?*Buffer = null,
+        last_rendered_scale: f32 = 0,
         /// Monotonic per-window frame number; `Buffer.frame` refers to it.
         frame_counter: u64 = 0,
         history: DamageHistory = .{},
@@ -289,7 +290,13 @@ pub const Backend = struct {
         frame_context: ?*anyopaque = null,
 
         pub fn renderBackend(self: *Window) keywork.RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = renderScale, .text_metrics = textMetrics } };
+            return .{ .ptr = self, .vtable = &.{
+                .present = present,
+                .measure_text = measureText,
+                .scale = renderScale,
+                .text_metrics = textMetrics,
+                .partial_paint_bounds = partialPaintBounds,
+            } };
         }
 
         pub fn setPointerButtonHandler(self: *Window, context: *anyopaque, handler: PointerButtonHandler) void {
@@ -364,8 +371,10 @@ pub const Backend = struct {
             const height = try window.scaledFrameDimension(logical_height, protocol.scale);
             const buffer = try self.acquireBuffer(width, height);
             const damage_clip = self.partialDamageClip(frame, buffer, width, height);
+            if (frame.partial_display_list and damage_clip == null) return error.PartialPaintUnavailable;
             try rasterize(&self.backend.text_renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, damage_clip);
             self.last_rendered = buffer;
+            self.last_rendered_scale = protocol.scale;
 
             try protocol.armFrameCallback();
             protocol.surface.attach(buffer.wl_buffer, 0, 0);
@@ -409,6 +418,41 @@ pub const Backend = struct {
             return self.protocol.scale;
         }
 
+        fn partialPaintBounds(ptr: *anyopaque, size: keywork.Size, scale: f32, damage: []const keywork.Rect) !?keywork.Rect {
+            const self: *Window = @ptrCast(@alignCast(ptr));
+            if (!self.protocol.configured or scale != self.protocol.scale or damage.len != 1) return null;
+
+            const probe: keywork.RenderBackend.Frame = .{
+                .size = size,
+                .scale = scale,
+                .damage = damage,
+                .display_list = &.{},
+            };
+            const logical_width = try window.frameLogicalWidth(probe, self.protocol.width);
+            const logical_height = try window.frameLogicalHeight(probe, self.protocol.height);
+            const width = try window.scaledFrameDimension(logical_width, scale);
+            const height = try window.scaledFrameDimension(logical_height, scale);
+            const last = self.last_rendered orelse return null;
+            if (self.last_rendered_scale != scale or last.width != width or last.height != height) return null;
+
+            const clip = TextRenderer.PixelClip.fromRect(damage[0], scale);
+            if (clip.x0 >= clip.x1 or clip.y0 >= clip.y1) return null;
+            if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
+
+            // Cull against pixel-aligned logical bounds. A neighboring node
+            // whose edge shares a rounded damage pixel must still be emitted.
+            const x0: f32 = @floatFromInt(@max(0, clip.x0));
+            const y0: f32 = @floatFromInt(@max(0, clip.y0));
+            const x1: f32 = @floatFromInt(@min(@as(i32, width), clip.x1));
+            const y1: f32 = @floatFromInt(@min(@as(i32, height), clip.y1));
+            return .{
+                .x = x0 / scale,
+                .y = y0 / scale,
+                .width = (x1 - x0) / scale,
+                .height = (y1 - y0) / scale,
+            };
+        }
+
         /// Returns the pixel region that must be re-rasterized, or null
         /// when a full redraw is required. Partial redraw needs the
         /// previous frame's content: either the acquired buffer already
@@ -419,6 +463,7 @@ pub const Backend = struct {
             if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
 
             const last = self.last_rendered orelse return null;
+            if (self.last_rendered_scale != self.protocol.scale) return null;
             if (last == buffer) return clip;
             if (last.width != width or last.height != height) return null;
             if (self.history.canRepair(buffer.frame, width, height)) {

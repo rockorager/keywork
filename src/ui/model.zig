@@ -723,6 +723,8 @@ pub const Widget = union(enum) {
 
         pub const VTable = struct {
             layout: *const fn (ptr: *const anyopaque, context: LayoutContext) anyerror!Size,
+            /// Paint commands must stay within `context.rect`; partial frame
+            /// generation uses that rect as the render object's paint bound.
             paint: *const fn (ptr: *const anyopaque, context: PaintContext) anyerror!void,
             hit_test: ?*const fn (ptr: *const anyopaque, rect: Rect, point: Point) ?[]const u8 = null,
         };
@@ -3159,6 +3161,7 @@ const paint_model = @import("paint.zig");
 
 pub const paint = paint_model.paint;
 pub const paintScaled = paint_model.paintScaled;
+pub const paintDamagedScaled = paint_model.paintDamagedScaled;
 pub const ScrollbarAxis = paint_model.ScrollbarAxis;
 pub const ScrollbarThumbHit = paint_model.ScrollbarThumbHit;
 pub const hitTestScrollbarThumb = paint_model.hitTestScrollbarThumb;
