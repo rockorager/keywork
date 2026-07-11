@@ -1,9 +1,11 @@
 //! PipeWire registry integration for keywork.pipewire.
 //!
-//! Each connection exposes the server's initial registry snapshot and live
-//! global add/remove notifications as an asynchronous Lua event stream. The
-//! PipeWire loop is nested into Keywork's epoll loop, so idle connections do
-//! not consume a thread or wake the application.
+//! Each connection exposes the server's registry, default metadata, and audio
+//! node properties as an asynchronous Lua event stream. Route-aware volume
+//! and mute methods write hardware device routes when available, falling back
+//! to node properties for virtual devices. The PipeWire loop is nested into
+//! Keywork's epoll loop, so idle connections do not consume a thread or wake
+//! the application.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -64,6 +66,10 @@ pub const Connection = struct {
             .global = registryGlobal,
             .global_remove = registryGlobalRemove,
             .metadata = metadataProperty,
+            .node_props = nodeProps,
+            .node_route = nodeRoute,
+            .routes_reset = routesReset,
+            .route = routeInfo,
         };
         connection.native = pipewire_c.kw_pw_connection_create(&events, connection) orelse
             return error.PipeWireUnavailable;
@@ -217,6 +223,72 @@ fn metadataProperty(
     };
 }
 
+fn nodeProps(
+    data: ?*anyopaque,
+    id: u32,
+    volumes: [*c]const f32,
+    volume_count: u32,
+    has_mute: c_int,
+    muted: c_int,
+) callconv(.c) void {
+    const connection: *Connection = @ptrCast(@alignCast(data.?));
+    if (connection.closed) return;
+    const lua_state = connection.host.luaState();
+    pushNodePropsEvent(lua_state, id, volumes, volume_count, has_mute != 0, muted != 0);
+    connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
+        log.warn("PipeWire node properties delivery failed: {}", .{err});
+    };
+}
+
+fn nodeRoute(
+    data: ?*anyopaque,
+    id: u32,
+    device_id: u32,
+    route_device: u32,
+    route_managed: c_int,
+) callconv(.c) void {
+    const connection: *Connection = @ptrCast(@alignCast(data.?));
+    if (connection.closed) return;
+    const lua_state = connection.host.luaState();
+    c.lua_createtable(lua_state, 0, 5);
+    pushStringField(lua_state, "type", "node_route");
+    pushIntegerField(lua_state, "id", id);
+    pushIntegerField(lua_state, "device_id", device_id);
+    pushIntegerField(lua_state, "route_device", route_device);
+    c.lua_pushboolean(lua_state, if (route_managed != 0) 1 else 0);
+    c.lua_setfield(lua_state, -2, "route_managed");
+    connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
+        log.warn("PipeWire node route delivery failed: {}", .{err});
+    };
+}
+
+fn routeInfo(
+    data: ?*anyopaque,
+    id: u32,
+    device: u32,
+    availability: u32,
+) callconv(.c) void {
+    const connection: *Connection = @ptrCast(@alignCast(data.?));
+    if (connection.closed) return;
+    const lua_state = connection.host.luaState();
+    pushRouteEvent(lua_state, id, device, availability);
+    connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
+        log.warn("PipeWire route delivery failed: {}", .{err});
+    };
+}
+
+fn routesReset(data: ?*anyopaque, id: u32) callconv(.c) void {
+    const connection: *Connection = @ptrCast(@alignCast(data.?));
+    if (connection.closed) return;
+    const lua_state = connection.host.luaState();
+    c.lua_createtable(lua_state, 0, 2);
+    pushStringField(lua_state, "type", "routes_reset");
+    pushIntegerField(lua_state, "id", id);
+    connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
+        log.warn("PipeWire route reset delivery failed: {}", .{err});
+    };
+}
+
 fn pushGlobalEvent(
     lua_state: *c.lua_State,
     id: u32,
@@ -244,6 +316,44 @@ fn pushGlobalEvent(
         }
     }
     c.lua_setfield(lua_state, -2, "properties");
+}
+
+fn pushNodePropsEvent(
+    lua_state: *c.lua_State,
+    id: u32,
+    volumes: [*c]const f32,
+    volume_count: u32,
+    has_mute: bool,
+    muted: bool,
+) void {
+    c.lua_createtable(lua_state, 0, 4);
+    pushStringField(lua_state, "type", "node_props");
+    pushIntegerField(lua_state, "id", id);
+    c.lua_createtable(lua_state, @intCast(volume_count), 0);
+    if (volumes != null) {
+        for (volumes[0..volume_count], 1..) |volume, index| {
+            c.lua_pushnumber(lua_state, volume);
+            c.lua_rawseti(lua_state, -2, @intCast(index));
+        }
+    }
+    c.lua_setfield(lua_state, -2, "channel_volumes");
+    if (has_mute) {
+        c.lua_pushboolean(lua_state, if (muted) 1 else 0);
+        c.lua_setfield(lua_state, -2, "muted");
+    }
+}
+
+fn pushRouteEvent(lua_state: *c.lua_State, id: u32, device: u32, availability: u32) void {
+    const availability_name: []const u8 = switch (availability) {
+        1 => "no",
+        2 => "yes",
+        else => "unknown",
+    };
+    c.lua_createtable(lua_state, 0, 4);
+    pushStringField(lua_state, "type", "route");
+    pushIntegerField(lua_state, "id", id);
+    pushIntegerField(lua_state, "device", device);
+    pushStringField(lua_state, "availability", availability_name);
 }
 
 fn pushStringField(lua_state: *c.lua_State, name: [*:0]const u8, value: []const u8) void {
@@ -275,6 +385,9 @@ const connection_type: [*:0]const u8 = "keywork.pipewire_connection";
 const connection_methods = [_]lua_handle.Method{
     .{ .name = "next", .func = luaConnectionNext },
     .{ .name = "events", .func = luaConnectionEvents },
+    .{ .name = "set_volume", .func = luaConnectionSetVolume },
+    .{ .name = "set_mute", .func = luaConnectionSetMute },
+    .{ .name = "set_metadata", .func = luaConnectionSetMetadata },
     .{ .name = "close", .func = luaConnectionClose },
     .{ .name = "closed", .func = luaConnectionClosed },
 };
@@ -305,6 +418,68 @@ fn luaConnectionEvents(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     _ = c.luaL_checkudata(lua_state, 1, connection_type);
     return lua_coro.pushIterator(lua_state, luaConnectionNext);
+}
+
+fn checkedNodeId(lua_state: *c.lua_State) ?u32 {
+    const value = c.luaL_checkinteger(lua_state, 2);
+    if (value < 0 or value > std.math.maxInt(u32)) {
+        _ = c.luaL_argerror(lua_state, 2, "node id is out of range");
+        return null;
+    }
+    return @intCast(value);
+}
+
+fn pushOperationResult(lua_state: *c.lua_State, result: c_int) c_int {
+    if (result >= 0) {
+        c.lua_pushboolean(lua_state, 1);
+        return 1;
+    }
+    c.lua_pushnil(lua_state);
+    const message = zSpan(pipewire_c.kw_pw_error_string(result));
+    c.lua_pushlstring(lua_state, message.ptr, message.len);
+    return 2;
+}
+
+fn luaConnectionSetVolume(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const connection = lua_handle.resource(Connection, lua_state, 1, connection_type) orelse return 0;
+    const node_id = checkedNodeId(lua_state) orelse return 0;
+    const volume = c.luaL_checknumber(lua_state, 3);
+    if (!std.math.isFinite(volume) or volume < 0 or volume > 10) {
+        return c.luaL_argerror(lua_state, 3, "volume must be between 0 and 10");
+    }
+    const native = connection.native orelse return 0;
+    return pushOperationResult(
+        lua_state,
+        pipewire_c.kw_pw_connection_set_volume(native, node_id, @floatCast(volume)),
+    );
+}
+
+fn luaConnectionSetMute(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const connection = lua_handle.resource(Connection, lua_state, 1, connection_type) orelse return 0;
+    const node_id = checkedNodeId(lua_state) orelse return 0;
+    if (c.lua_type(lua_state, 3) != c.LUA_TBOOLEAN) {
+        return c.luaL_argerror(lua_state, 3, "mute must be a boolean");
+    }
+    const native = connection.native orelse return 0;
+    return pushOperationResult(
+        lua_state,
+        pipewire_c.kw_pw_connection_set_mute(native, node_id, c.lua_toboolean(lua_state, 3)),
+    );
+}
+
+fn luaConnectionSetMetadata(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const connection = lua_handle.resource(Connection, lua_state, 1, connection_type) orelse return 0;
+    const key = c.luaL_checklstring(lua_state, 2, null).?;
+    const value_type = c.luaL_checklstring(lua_state, 3, null).?;
+    const value = c.luaL_checklstring(lua_state, 4, null).?;
+    const native = connection.native orelse return 0;
+    return pushOperationResult(
+        lua_state,
+        pipewire_c.kw_pw_connection_set_metadata(native, key, value_type, value),
+    );
 }
 
 fn luaConnectionClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -339,4 +514,33 @@ test "PipeWire global events expose registry properties" {
     c.lua_getfield(lua_state, -1, "properties");
     c.lua_getfield(lua_state, -1, "media.class");
     try std.testing.expectEqualStrings("Audio/Sink", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+}
+
+test "PipeWire node property events expose channel volumes and mute" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    const volumes = [_]f32{ 0.125, 0.5 };
+
+    pushNodePropsEvent(lua_state, 42, &volumes, volumes.len, true, false);
+    c.lua_getfield(lua_state, -1, "type");
+    try std.testing.expectEqualStrings("node_props", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+    c.lua_settop(lua_state, -2);
+    c.lua_getfield(lua_state, -1, "channel_volumes");
+    c.lua_rawgeti(lua_state, -1, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.lua_tonumber(lua_state, -1), 0.0001);
+    c.lua_settop(lua_state, -3);
+    c.lua_getfield(lua_state, -1, "muted");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_toboolean(lua_state, -1));
+}
+
+test "PipeWire route events expose availability" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    pushRouteEvent(lua_state, 50, 1, 1);
+    c.lua_getfield(lua_state, -1, "type");
+    try std.testing.expectEqualStrings("route", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+    c.lua_settop(lua_state, -2);
+    c.lua_getfield(lua_state, -1, "availability");
+    try std.testing.expectEqualStrings("no", zSpan(c.lua_tolstring(lua_state, -1, null).?));
 }
