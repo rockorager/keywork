@@ -1,8 +1,11 @@
-//! Headless Storybook catalog and snapshot commands.
+//! Interactive and headless Storybook commands.
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const platform_mod = @import("platform.zig");
+const runner = @import("runner.zig");
 const memory_backend = @import("../backend/memory.zig");
+const event_loop = @import("../linux/event_loop.zig");
 const lua_app = @import("../lua/app.zig");
 const lua_storybook = @import("../lua/storybook.zig");
 const runtime_mod = @import("../ui/runtime.zig");
@@ -48,9 +51,69 @@ const SnapshotManifest = struct {
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {
     switch (options.operation) {
+        .run => try runInteractive(allocator, options, writer),
         .list => try list(allocator, options, writer),
         .snapshot => try snapshot(allocator, io, options, writer),
     }
+}
+
+fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    var app = try lua_app.App.initStorybookBrowser(allocator, options.script_path);
+    defer app.deinit();
+    const catalog = try app.storyCatalog();
+    const title = if (catalog.title) |book_title|
+        try std.fmt.allocPrintSentinel(allocator, "{s} — Keywork Storybook", .{book_title}, 0)
+    else
+        try allocator.dupeZ(u8, "Keywork Storybook");
+    defer allocator.free(title);
+
+    try runner.run(allocator, &loop, app.host(), .{
+        .title = title,
+        .app_id = "dev.keywork.Storybook",
+        .width = 1200,
+        .height = 800,
+        .backend = .wayland_shm,
+        .log_writer = writer,
+        .runtime_context = &app,
+        .bind_runtime = bindLuaRuntime,
+        .bind_platform = bindLuaPlatform,
+        .unbind_platform = unbindLuaPlatform,
+        .unbind_runtime = unbindLuaRuntime,
+        .bind_event_loop = bindLuaEventLoop,
+        .unbind_event_loop = unbindLuaEventLoop,
+    });
+}
+
+fn bindLuaRuntime(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    app.bindRuntime(runtime);
+}
+
+fn bindLuaPlatform(ctx: *anyopaque, platform: platform_mod.Platform) void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    app.bindPlatform(platform);
+}
+
+fn unbindLuaPlatform(ctx: *anyopaque) void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    app.unbindPlatform();
+}
+
+fn unbindLuaRuntime(ctx: *anyopaque) void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    app.unbindRuntime();
+}
+
+fn bindLuaEventLoop(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    try app.bindEventLoop(loop);
+}
+
+fn unbindLuaEventLoop(ctx: *anyopaque) void {
+    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
+    app.unbindEventLoop();
 }
 
 fn list(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {

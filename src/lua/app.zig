@@ -53,11 +53,13 @@ pub const App = struct {
     /// traces point at the script file.
     chunk_name: [:0]u8,
     root_kind: RootKind = .application,
+    storybook_browser: bool = false,
     window_config: WindowConfig = .{},
     storybook_catalog: ?lua_storybook.Catalog = null,
     selected_story_id: ?[]u8 = null,
     state: *c.lua_State,
     script_ref: c_int = -1,
+    browser_ref: c_int = -1,
     start_ref: c_int = -1,
     stop_ref: c_int = -1,
     script_dirty: bool = true,
@@ -127,6 +129,12 @@ pub const App = struct {
         return app;
     }
 
+    pub fn initStorybookBrowser(allocator: std.mem.Allocator, path: []const u8) !App {
+        var app = try initStorybook(allocator, path);
+        app.storybook_browser = true;
+        return app;
+    }
+
     pub fn deinit(self: *App) void {
         self.stopLifecycleLog();
         // Scopes and tasks go first: destroying a task cancels the
@@ -153,6 +161,7 @@ pub const App = struct {
         self.pending_scope_cancels.deinit(self.allocator);
         self.releaseWindowChildren(&self.window_children);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        if (self.browser_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
         c.lua_close(self.state);
@@ -277,6 +286,7 @@ pub const App = struct {
     ) !keywork.Widget {
         try self.ensureLoaded();
         if (self.root_kind == .storybook) {
+            if (self.storybook_browser) return self.buildStorybookBrowser(allocator, runtime_state, render_scale, state_invalidator);
             return self.buildSelectedStory(allocator, runtime_state, render_scale, state_invalidator);
         }
 
@@ -295,6 +305,28 @@ pub const App = struct {
         // paced across builds; a full collection here would stall every
         // rebuild for time proportional to the entire Lua heap. Full
         // collections still happen on script reload.
+        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
+        return widget;
+    }
+
+    fn buildStorybookBrowser(
+        self: *App,
+        allocator: std.mem.Allocator,
+        runtime_state: State,
+        render_scale: f32,
+        state_invalidator: ?keywork.Widget.Callback,
+    ) !keywork.Widget {
+        if (self.browser_ref < 0) return error.StorybookBrowserMissing;
+        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
+
+        c.lua_settop(self.state, 0);
+        defer c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
+        const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
+            .icon_cache = &self.icon_cache,
+            .icon_scale = icon_scale,
+            .png_dims = &self.png_dims,
+        }, -1);
         _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;
     }
@@ -534,12 +566,15 @@ pub const App = struct {
         errdefer if (!committed) if (catalog) |*value| value.deinit(self.allocator);
         const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         errdefer if (!committed) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, script_ref);
+        const browser_ref = if (self.storybook_browser) try self.createStorybookBrowserRef(script_ref) else -1;
+        errdefer if (!committed and browser_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, browser_ref);
         const start_ref = if (self.root_kind == .application) try tableFunctionRef(self.state, script_ref, "start") else -1;
         errdefer if (!committed and start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, start_ref);
         const stop_ref = if (self.root_kind == .application) try tableFunctionRef(self.state, script_ref, "stop") else -1;
         errdefer if (!committed and stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, stop_ref);
 
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        if (self.browser_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
         self.window_config.deinit(self.allocator);
@@ -547,12 +582,24 @@ pub const App = struct {
         self.window_config = config;
         self.storybook_catalog = catalog;
         self.script_ref = script_ref;
+        self.browser_ref = browser_ref;
         self.start_ref = start_ref;
         self.stop_ref = stop_ref;
         self.script_dirty = false;
         committed = true;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
         if (self.event_loop != null and self.invalidator != null) try self.startLifecycle();
+    }
+
+    fn createStorybookBrowserRef(self: *App, script_ref: c_int) !c_int {
+        if (c.luaL_loadbuffer(self.state, embedded_storybook_browser_source.ptr, embedded_storybook_browser_source.len, "@keywork/storybook_browser.lua") != 0) {
+            return self.failWithLuaError(error.StorybookBrowserLoadFailed);
+        }
+        if (c.lua_pcall(self.state, 0, 1, 0) != 0) return self.failWithLuaError(error.StorybookBrowserLoadFailed);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, script_ref);
+        if (c.lua_pcall(self.state, 1, 1, 0) != 0) return self.failWithLuaError(error.StorybookBrowserCreateFailed);
+        if (c.lua_type(self.state, -1) != c.LUA_TTABLE) return error.StorybookBrowserInvalid;
+        return c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
     }
 
     fn tableFunctionRef(lua_state: *c.lua_State, table_ref: c_int, key: [*:0]const u8) !c_int {
@@ -1037,6 +1084,7 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
 
 const embedded_ui_source = @embedFile("ui.lua");
 const embedded_storybook_source = @embedFile("storybook.lua");
+const embedded_storybook_browser_source = @embedFile("storybook_browser.lua");
 const embedded_service_source = @embedFile("service.lua");
 const embedded_process_source = @embedFile("process.lua");
 const embedded_stream_source = @embedFile("stream.lua");
@@ -1567,6 +1615,25 @@ test "storybook root catalogs and renders a selected story" {
         .window_height = 180,
         .color_scheme = "dark",
     }, 2);
+
+    var browser = try App.initStorybookBrowser(allocator, script_path);
+    defer browser.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try runtime_mod.Runtime.init(
+        allocator,
+        log_backend.backend(),
+        .{ .max_width = 1200, .max_height = 800 },
+        browser.host(),
+        .light,
+    );
+    defer runtime.deinit();
+    browser.bindRuntime(&runtime);
+    defer browser.unbindRuntime();
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"Components\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"Hello\"") != null);
 }
 
 test "keywork core excludes optional capability modules" {

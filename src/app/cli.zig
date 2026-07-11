@@ -16,6 +16,7 @@ pub const Options = struct {
 };
 
 pub const StorybookOperation = enum {
+    run,
     list,
     snapshot,
 };
@@ -35,6 +36,7 @@ pub const Command = union(enum) {
 
 pub const usage =
     \\usage: keywork [options] <script.lua> [args...]
+    \\       keywork storybook run <stories.lua>
     \\       keywork storybook list <stories.lua> [--json]
     \\       keywork storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
     \\
@@ -99,7 +101,9 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
 
 fn parseStorybook(args: anytype) !StorybookOptions {
     const operation_name = args.next() orelse return error.MissingStorybookOperation;
-    const operation: StorybookOperation = if (std.mem.eql(u8, operation_name, "list"))
+    const operation: StorybookOperation = if (std.mem.eql(u8, operation_name, "run"))
+        .run
+    else if (std.mem.eql(u8, operation_name, "list"))
         .list
     else if (std.mem.eql(u8, operation_name, "snapshot"))
         .snapshot
@@ -133,7 +137,7 @@ fn parseStorybook(args: anytype) !StorybookOptions {
     if (result.script_path.len == 0) return error.MissingScriptPath;
     if (result.story_id) |id| if (id.len == 0) return error.MissingOptionValue;
     if (result.output_path.len == 0) return error.MissingOptionValue;
-    if (operation == .list and (result.story_id != null or output_set)) return error.InvalidStorybookOption;
+    if (operation != .snapshot and (result.story_id != null or output_set)) return error.InvalidStorybookOption;
     return result;
 }
 
