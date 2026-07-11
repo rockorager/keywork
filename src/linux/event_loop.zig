@@ -336,6 +336,9 @@ pub const EventLoop = struct {
 
         const mask = linux.IN.MODIFY |
             linux.IN.CLOSE_WRITE |
+            linux.IN.CREATE |
+            linux.IN.DELETE |
+            linux.IN.MOVED_FROM |
             linux.IN.MOVED_TO |
             linux.IN.DELETE_SELF |
             linux.IN.MOVE_SELF |
@@ -740,6 +743,46 @@ test "file watch fires and can quit the loop" {
     try loop.run();
 
     try std.testing.expect(context.fired);
+}
+
+test "directory watch reports child create and delete" {
+    const DirWatchTest = struct {
+        created: bool = false,
+        deleted: bool = false,
+
+        fn callback(
+            ctx: *anyopaque,
+            loop: *EventLoop,
+            path: []const u8,
+            mask: u32,
+            name: ?[]const u8,
+        ) !void {
+            _ = path;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (name == null) return;
+            if (mask & linux.IN.CREATE != 0) self.created = true;
+            if (mask & linux.IN.DELETE != 0) self.deleted = true;
+            if (self.created and self.deleted) loop.quit();
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const watched_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(watched_path);
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var context: DirWatchTest = .{};
+    _ = try loop.addFileWatch(watched_path, &context, DirWatchTest.callback);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child.txt", .data = "x\n" });
+    try tmp.dir.deleteFile(std.testing.io, "child.txt");
+    try loop.run();
+
+    try std.testing.expect(context.created);
+    try std.testing.expect(context.deleted);
 }
 
 test "source removed during dispatch does not fire stale events" {
