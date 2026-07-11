@@ -19,6 +19,17 @@ const initial_staging_capacity = initial_atlas_size * initial_atlas_size;
 const max_prepare_attempts = 8;
 const frames_in_flight = 2;
 
+const AtlasCapacityAction = union(enum) {
+    grow: u32,
+    reset,
+};
+
+fn atlasCapacityAction(current_size: u32, max_size: u32) AtlasCapacityAction {
+    std.debug.assert(current_size <= max_size);
+    if (current_size == max_size) return .reset;
+    return .{ .grow = @min(current_size * 2, max_size) };
+}
+
 /// GPU resources cycled per in-flight frame so CPU recording of frame N
 /// overlaps GPU execution of frame N-1.
 const FrameResources = struct {
@@ -610,20 +621,31 @@ pub const Renderer = struct {
         self.atlas_row_height = 0;
     }
 
-    /// Doubles the atlas. Safe mid-frame because the previous submission's
-    /// fence was already waited on and the aborted command buffer that
-    /// referenced the old image is reset before re-recording.
-    fn growAtlas(self: *Self) !void {
-        if (self.atlas_size * 2 > self.max_atlas_size) return error.GlyphAtlasFull;
+    /// Grows the atlas when possible. At the device limit, forgets historical
+    /// slots so the retry repacks only assets used by the current frame. Safe
+    /// mid-frame because the aborted command buffer is reset before retrying.
+    fn recoverAtlasCapacity(self: *Self, atlas_layout_before: vk.ImageLayout) !void {
         // The other in-flight frame may still sample the old image.
         var fences: [frames_in_flight]vk.Fence = undefined;
         for (&self.frames, 0..) |*frame, index| fences[index] = frame.in_flight;
         _ = try self.vkd.waitForFences(self.device, &fences, .true, std.math.maxInt(u64));
-        self.atlas_size *= 2;
-        self.destroyImage(&self.atlas);
-        try self.createAtlasImage();
-        self.resetAtlasPacking();
-        log.info("glyph atlas grown to {d}x{d}", .{ self.atlas_size, self.atlas_size });
+        switch (atlasCapacityAction(self.atlas_size, self.max_atlas_size)) {
+            .grow => |new_size| {
+                self.atlas_size = new_size;
+                self.destroyImage(&self.atlas);
+                try self.createAtlasImage();
+                self.resetAtlasPacking();
+                log.info("glyph atlas grown to {d}x{d}", .{ new_size, new_size });
+            },
+            .reset => {
+                self.resetAtlasPacking();
+                // prepareQuads may have recorded an unsubmitted transition
+                // before discovering the overflow. Restore the layout the GPU
+                // actually has so the retry records the correct transition.
+                self.atlas.layout = atlas_layout_before;
+                log.info("glyph atlas full at {d}x{d}; repacking current frame", .{ self.atlas_size, self.atlas_size });
+            },
+        }
     }
 
     /// Doubles the staging buffer after an upload overflow. The atlas image
@@ -797,7 +819,7 @@ pub const Renderer = struct {
             self.prepareQuads(display_list, scale) catch |err| switch (err) {
                 error.GlyphAtlasFull => {
                     if (attempts >= max_prepare_attempts) return err;
-                    try self.growAtlas();
+                    try self.recoverAtlasCapacity(atlas_layout_before);
                     continue;
                 },
                 error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
@@ -1537,4 +1559,10 @@ test "clipQuad culls quads fully outside the clip" {
         .uv_bottom = 1,
     };
     try std.testing.expectEqual(@as(?QuadBounds, null), clipQuad(quad, .{ .x0 = 10, .y0 = 0, .x1 = 20, .y1 = 10 }));
+}
+
+test "atlas capacity grows to the device limit then resets" {
+    try std.testing.expectEqual(AtlasCapacityAction{ .grow = 2048 }, atlasCapacityAction(1024, 8192));
+    try std.testing.expectEqual(AtlasCapacityAction{ .grow = 5000 }, atlasCapacityAction(4096, 5000));
+    try std.testing.expectEqual(AtlasCapacityAction.reset, atlasCapacityAction(8192, 8192));
 }

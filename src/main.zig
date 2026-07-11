@@ -84,6 +84,7 @@ test {
     _ = @import("app/application.zig");
     _ = @import("app/runner.zig");
     _ = @import("backend/wayland/shm.zig");
+    _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");
     _ = @import("lua/app.zig");
     _ = @import("lua/coro.zig");
