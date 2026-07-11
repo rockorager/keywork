@@ -190,6 +190,7 @@ fn moveNode(node: *RenderNode, x: f32, y: f32) void {
     node.damage = unionDamage(node.damage, node.rect);
     node.rect.x = x;
     node.rect.y = y;
+    if (node.caret_x) |caret_x| node.caret_x = caret_x + dx;
     node.damage = unionDamage(node.damage, node.rect);
     translateChildren(node, dx, dy);
 }
@@ -893,8 +894,29 @@ fn translateChildren(node: *RenderNode, dx: f32, dy: f32) void {
     for (node.children) |child| {
         child.rect.x += dx;
         child.rect.y += dy;
+        if (child.caret_x) |caret_x| child.caret_x = caret_x + dx;
         translateChildren(child, dx, dy);
     }
+}
+
+test "moving a clean subtree translates text input carets" {
+    var input: RenderNode = .{
+        .kind = .text_input,
+        .rect = .{ .x = 10, .y = 5, .width = 100, .height = 20 },
+        .caret_x = 42,
+    };
+    var children = [_]*RenderNode{&input};
+    var root: RenderNode = .{
+        .kind = .center,
+        .rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 },
+        .children = &children,
+    };
+
+    moveNode(&root, 15, 20);
+
+    try std.testing.expectEqual(@as(f32, 25), input.rect.x);
+    try std.testing.expectEqual(@as(f32, 25), input.rect.y);
+    try std.testing.expectEqual(@as(?f32, 57), input.caret_x);
 }
 
 test "fitting boundary chooses the last measured cluster that fits" {

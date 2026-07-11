@@ -1943,9 +1943,6 @@ pub fn updateElementTreeScoped(
     widget: *const Widget,
     constraints: Constraints,
 ) anyerror!void {
-    // Every element this update visits gets its widget replaced, so its
-    // cached layout can no longer be trusted.
-    markElementLayoutDirty(element);
     if (!canUpdateElement(element, widget)) {
         var replacement = try buildElementTreeScoped(allocator, scope, widget, constraints);
         errdefer destroyElementTree(allocator, &replacement);
@@ -2001,6 +1998,7 @@ pub fn updateElementTreeScoped(
             state.first = range.first;
             state.built = range.count;
             state.range_stale = false;
+            markElementWidgetDirtyIfChanged(element, element_widget);
             destroyElementWidget(allocator, &element.widget);
             element.widget = element_widget;
         },
@@ -2075,6 +2073,14 @@ pub fn updateElementTreeScoped(
             destroyElementWidget(allocator, &element.widget);
             element.widget = element_widget;
         },
+    }
+
+    syncRenderNodeMetadata(element);
+    for (element.children) |*child| {
+        if (elementNeedsLayout(child)) {
+            markElementLayoutDirty(element);
+            break;
+        }
     }
 }
 
@@ -2410,7 +2416,7 @@ fn updateSingleChildElement(
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
     try updateElementTreeScoped(allocator, scope, &element.children[0], child_widget, child_constraints);
-    markElementPaintDirtyIfChanged(element, element_widget);
+    markElementWidgetDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
@@ -2432,10 +2438,15 @@ fn updateLinearElement(
         for (child_widgets, 0..) |*child_widget, index| {
             try updateElementTreeScoped(allocator, scope, &element.children[index], child_widget, constraints);
         }
+        markElementWidgetDirtyIfChanged(element, element_widget);
         destroyElementWidget(allocator, &element.widget);
         element.widget = element_widget;
         return;
     }
+
+    // A changed child list or order changes linear layout even when all
+    // reused children remain individually clean.
+    markElementLayoutDirty(element);
 
     const old_children = element.children;
     const used = try allocator.alloc(bool, old_children.len);
@@ -2572,7 +2583,7 @@ fn widgetKey(widget: Widget) ?Widget.Key {
 fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget: Widget) anyerror!void {
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
-    markElementPaintDirtyIfChanged(element, element_widget);
+    markElementWidgetDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
@@ -2580,17 +2591,82 @@ fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget:
 fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme, inherited_style: TextStyle) anyerror!void {
     var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme, inherited_style);
     errdefer destroyElementWidget(allocator, &element_widget);
-    markElementPaintDirtyIfChanged(element, element_widget);
+    markElementWidgetDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
 
-fn markElementPaintDirtyIfChanged(element: *Element, widget: Widget) void {
+fn markElementWidgetDirtyIfChanged(element: *Element, widget: Widget) void {
+    if (!widgetLayoutEqual(element.widget, widget)) markElementLayoutDirty(element);
     if (!widgetPaintEqual(element.widget, widget)) markElementPaintDirty(element);
 }
 
 fn markElementPaintDirty(element: *Element) void {
-    if (element.render_node) |node| node.needs_paint = true;
+    if (element.render_node) |node| {
+        node.needs_layout = true;
+        node.needs_paint = true;
+    }
+}
+
+fn elementNeedsLayout(element: *const Element) bool {
+    const node = element.render_node orelse return true;
+    return node.needs_layout;
+}
+
+fn widgetLayoutEqual(a: Widget, b: Widget) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .text => |a_text| blk: {
+            const b_text = b.text;
+            break :blk std.mem.eql(u8, a_text.value, b_text.value) and
+                a_text.font_size == b_text.font_size and
+                a_text.max_lines == b_text.max_lines and
+                a_text.overflow == b_text.overflow;
+        },
+        .box => |a_box| blk: {
+            const b_box = b.box;
+            break :blk a_box.min_width == b_box.min_width and
+                a_box.min_height == b_box.min_height and
+                a_box.horizontal_align == b_box.horizontal_align and
+                a_box.vertical_align == b_box.vertical_align;
+        },
+        .scroll => |scroll| scroll.axes == b.scroll.axes,
+        .list => |list| list.item_count == b.list.item_count and
+            list.item_extent == b.list.item_extent and
+            list.selected == b.list.selected,
+        .text_input => |a_input| blk: {
+            const b_input = b.text_input;
+            break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
+                a_input.padding_x == b_input.padding_x and
+                a_input.padding_y == b_input.padding_y and
+                a_input.font_size == b_input.font_size;
+        },
+        .separator => |separator| separator.thickness == b.separator.thickness and
+            separator.margin == b.separator.margin and
+            separator.axis == b.separator.axis,
+        .spinner => |spinner| spinner.size == b.spinner.size,
+        .row, .column => |children| children.gap == switch (b) {
+            inline .row, .column => |other| other.gap,
+            else => unreachable,
+        } and children.cross_align == switch (b) {
+            inline .row, .column => |other| other.cross_align,
+            else => unreachable,
+        } and children.main_align == switch (b) {
+            inline .row, .column => |other| other.main_align,
+            else => unreachable,
+        },
+        .spacer => |spacer| spacer.flex == b.spacer.flex,
+        .flexible => |flexible| flexible.flex == b.flexible.flex and flexible.fit == b.flexible.fit,
+        .sized => |sized| sized.width == b.sized.width and
+            sized.height == b.sized.height and
+            sized.min_width == b.sized.min_width and
+            sized.min_height == b.sized.min_height and
+            sized.max_width == b.sized.max_width and
+            sized.max_height == b.sized.max_height,
+        .padding => |padding| std.meta.eql(padding.insets, b.padding.insets),
+        .render_object => false,
+        else => true,
+    };
 }
 
 fn widgetPaintEqual(a: Widget, b: Widget) bool {
@@ -2631,6 +2707,51 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
         .render_object => false,
         else => true,
     };
+}
+
+/// Refreshes payload fields borrowed from the retained widget even when
+/// layout can stay cached. This prevents callback and id updates from forcing
+/// geometry work while ensuring no render node points at a destroyed widget.
+fn syncRenderNodeMetadata(element: *Element) void {
+    const node = element.render_node orelse return;
+    switch (element.widget) {
+        .text => |text| if (text.max_lines == null) {
+            node.text = text.value;
+        },
+        .clickable => |clickable| {
+            node.clickable_id = clickable.id;
+            node.click_callback = clickable.on_click;
+            node.tap_down_callback = clickable.on_tap_down;
+            node.tap_up_callback = clickable.on_tap_up;
+            node.tap_cancel_callback = clickable.on_tap_cancel;
+            node.scroll_event_callback = clickable.on_scroll;
+            node.hover_change_callback = clickable.on_hover_change;
+            node.click_buttons = clickable.buttons;
+            node.click_activation = clickable.activation;
+            node.click_cursor = clickable.cursor;
+        },
+        .focus => |focus| {
+            node.focus_id = focus.node.id;
+            node.focused = element.focused;
+            node.autofocus = focus.autofocus;
+            node.skip_traversal = focus.skip_traversal;
+            node.can_request_focus = focus.can_request_focus;
+            node.focus_change_callback = focus.on_focus_change;
+        },
+        .focus_scope => |focus_scope| {
+            node.focus_scope_id = focus_scope.id;
+            node.modal_focus_scope = focus_scope.modal;
+        },
+        .scroll => |scroll| node.scroll_id = scroll.id,
+        .list => |list| node.scroll_id = list.id,
+        .text_input => |input| {
+            node.text_input_id = input.id;
+            node.focus_id = input.focus_node.id;
+            node.autofocus = input.autofocus;
+            node.placeholder = input.placeholder;
+        },
+        else => {},
+    }
 }
 
 fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme, inherited_style: TextStyle) !Widget {
@@ -4218,6 +4339,7 @@ test "clickable carries opaque callback handles through hit testing" {
     };
 
     var counter: Counter = .{};
+    var updated_counter: Counter = .{};
     const label: Widget = .{ .text = .{ .value = "Count" } };
     const button: Widget = .{ .clickable = .{
         .id = "counter",
@@ -4236,6 +4358,23 @@ test "clickable carries opaque callback handles through hit testing" {
     try std.testing.expectEqualStrings("counter", hit.id);
     try hit.callback.?.call(.{ .source = .keyboard });
     try std.testing.expectEqual(@as(usize, 1), counter.value);
+
+    _ = collectDamage(root);
+    const updated: Widget = .{ .clickable = .{
+        .id = "updated-counter",
+        .child = &label,
+        .on_click = .{ .ptr = &updated_counter, .call_fn = Counter.increment },
+    } };
+    try updateElementTree(std.testing.allocator, &built_element, &updated, .{ .max_width = 100, .max_height = 80 });
+
+    // Callback-only updates refresh borrowed render metadata without
+    // invalidating otherwise cached layout.
+    try std.testing.expect(!root.needs_layout);
+    const updated_hit = hitTestClick(root, .{ .x = 2, .y = 2 }, .left).?;
+    try std.testing.expectEqualStrings("updated-counter", updated_hit.id);
+    try updated_hit.callback.?.call(.{ .source = .keyboard });
+    try std.testing.expectEqual(@as(usize, 1), counter.value);
+    try std.testing.expectEqual(@as(usize, 1), updated_counter.value);
 }
 
 test "clickable applies hover background style" {
@@ -5269,7 +5408,9 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     var full_scope: BuildScope = .{ .allocator = built_arena.allocator() };
     try updateElementTreeScoped(allocator, &full_scope, &element, &column, constraints);
     try std.testing.expectEqual(state.rebuild_generation, state.built_generation);
+    try std.testing.expect(!root.needs_layout);
     _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
+    try std.testing.expectEqual(initial_measures + 1, backend_state.measures);
     try std.testing.expectEqual(@as(?Rect, null), collectDamage(root));
     const builds_after_full_update = state.builds;
     _ = built_arena.reset(.retain_capacity);
