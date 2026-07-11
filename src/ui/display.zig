@@ -405,5 +405,21 @@ pub fn fixedTextMetrics(font_size: f32) TextMetrics {
 pub const text_width_ratio = 0.5;
 
 pub fn fixedMeasureText(value: []const u8, style: ResolvedTextStyle) Size {
-    return .{ .width = @as(f32, @floatFromInt(value.len)) * style.font_size * text_width_ratio, .height = style.font_size };
+    var max_line_len: usize = 0;
+    var line_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, value, '\n');
+    while (lines.next()) |line| {
+        max_line_len = @max(max_line_len, line.len);
+        line_count += 1;
+    }
+    return .{
+        .width = @as(f32, @floatFromInt(max_line_len)) * style.font_size * text_width_ratio,
+        .height = @as(f32, @floatFromInt(line_count)) * style.font_size,
+    };
+}
+
+test "fixed text measurement accounts for lines" {
+    const style: ResolvedTextStyle = .{ .color = types.colors.ink, .font_size = 16 };
+    try std.testing.expectEqual(Size{ .width = 16, .height = 32 }, fixedMeasureText("ab\nc", style));
+    try std.testing.expectEqual(Size{ .width = 0, .height = 16 }, fixedMeasureText("", style));
 }

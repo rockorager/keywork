@@ -3,6 +3,7 @@
 const std = @import("std");
 const model = @import("model.zig");
 const uucode = @import("uucode");
+const unicode_linebreak = @import("linebreak");
 
 const Widget = model.Widget;
 const Element = model.Element;
@@ -112,53 +113,156 @@ fn measuredFittingEnd(
     return fittingBoundary(boundaries.items, widths.items, available_width);
 }
 
-fn constrainText(
+const FittedTextLine = struct {
+    content_end: usize,
+    next_start: usize,
+    hard_break: bool,
+};
+
+fn previousScalarStart(value: []const u8, start: usize, end: usize) usize {
+    std.debug.assert(start < end);
+    var result = end - 1;
+    while (result > start and value[result] & 0xc0 == 0x80) result -= 1;
+    return result;
+}
+
+fn trimTrailingSpaces(value: []const u8, start: usize, end: usize) usize {
+    var result = end;
+    while (result > start and value[result - 1] == ' ') result -= 1;
+    return result;
+}
+
+fn breakContentEnd(value: []const u8, start: usize, end: usize, hard_break: bool) usize {
+    if (!hard_break) return trimTrailingSpaces(value, start, end);
+
+    var result = previousScalarStart(value, start, end);
+    // Treat CRLF as one hard break and normalize every hard break to the
+    // newline inserted by wrapText.
+    if (std.mem.eql(u8, value[result..end], "\n") and result > start) {
+        const previous = previousScalarStart(value, start, result);
+        if (std.mem.eql(u8, value[previous..result], "\r")) result = previous;
+    }
+    return trimTrailingSpaces(value, start, result);
+}
+
+fn fitTextLine(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    source_start: usize,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!FittedTextLine {
+    std.debug.assert(source_start < value.len);
+    var breaks = try unicode_linebreak.Iterator.init(value[source_start..]);
+    var last_fitting: ?FittedTextLine = null;
+
+    while (breaks.next()) |line_break| {
+        const next_start = source_start + line_break.end;
+        const terminal = next_start == value.len;
+        const content_end = breakContentEnd(value, source_start, next_start, line_break.hard);
+        const candidate: FittedTextLine = .{
+            .content_end = content_end,
+            .next_start = next_start,
+            .hard_break = line_break.hard,
+        };
+        if (!std.math.isFinite(available_width)) {
+            if (line_break.hard or terminal) return candidate;
+            continue;
+        }
+
+        const measured = try measurer.measureText(value[source_start..content_end], style);
+
+        if (measured.width <= available_width) {
+            if (line_break.hard or terminal) return candidate;
+            last_fitting = candidate;
+            continue;
+        }
+
+        if (last_fitting) |fitting| return fitting;
+        if (content_end == source_start) return candidate;
+
+        const source_line = value[source_start..content_end];
+        const fitting_end = try measuredFittingEnd(allocator, source_line, available_width, style, measurer);
+        if (fitting_end > 0) {
+            return .{
+                .content_end = source_start + fitting_end,
+                .next_start = source_start + fitting_end,
+                .hard_break = false,
+            };
+        }
+
+        // A grapheme wider than the constraint still has to make progress;
+        // preserving it is preferable to silently dropping text.
+        var graphemes = uucode.grapheme.utf8Iterator(source_line);
+        const first = graphemes.nextGrapheme() orelse unreachable;
+        return .{
+            .content_end = source_start + first.end,
+            .next_start = source_start + first.end,
+            .hard_break = false,
+        };
+    }
+    unreachable;
+}
+
+fn appendEllipsizedLine(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     value: []const u8,
-    max_lines: u32,
+    source_start: usize,
+    content_end: usize,
+    available_width: f32,
+    style: ResolvedTextStyle,
+    measurer: TextMeasurer,
+) LayoutError!void {
+    const ellipsis_width = (try measurer.measureText(ellipsis, style)).width;
+    if (ellipsis_width > available_width) return;
+    const fitting_end = try measuredFittingEnd(allocator, value[source_start..content_end], available_width - ellipsis_width, style, measurer);
+    const visible_end = trimTrailingSpaces(value, source_start, source_start + fitting_end);
+    try output.appendSlice(allocator, value[source_start..visible_end]);
+    try output.appendSlice(allocator, ellipsis);
+}
+
+fn wrapText(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    max_lines: ?u32,
     overflow: Widget.TextOverflow,
     available_width: f32,
     style: ResolvedTextStyle,
     measurer: TextMeasurer,
 ) LayoutError!void {
-    std.debug.assert(max_lines >= 1);
+    if (max_lines) |limit| std.debug.assert(limit >= 1);
+    if (value.len == 0) return;
+    const line_limit: usize = if (max_lines) |limit| limit else std.math.maxInt(usize);
     var source_start: usize = 0;
-    var line: u32 = 0;
-    while (line < max_lines and source_start < value.len) : (line += 1) {
-        const newline = std.mem.indexOfScalarPos(u8, value, source_start, '\n');
-        const source_end = newline orelse value.len;
-        const source_line = value[source_start..source_end];
-        const fitting_end = try measuredFittingEnd(allocator, source_line, available_width, style, measurer);
-        const line_fits = fitting_end == source_line.len;
-        const has_more = !line_fits or newline != null;
-        const final_line = line + 1 == max_lines;
+    var line_count: usize = 0;
 
-        var visible_end = fitting_end;
-        var add_ellipsis = false;
-        if (final_line and has_more and overflow == .ellipsis) {
-            const ellipsis_width = (try measurer.measureText(ellipsis, style)).width;
-            // An ellipsis wider than the line is omitted rather than painted
-            // outside the promised bounds.
-            if (ellipsis_width <= available_width) {
-                visible_end = try measuredFittingEnd(allocator, source_line, available_width - ellipsis_width, style, measurer);
-                add_ellipsis = true;
-            } else visible_end = 0;
+    while (source_start < value.len) {
+        const line = try fitTextLine(allocator, value, source_start, available_width, style, measurer);
+        // A leading SP run is a legal opportunity whose visible content is
+        // empty. Consume it without manufacturing a blank visual line.
+        if (!line.hard_break and line.content_end == source_start and line.next_start > source_start) {
+            source_start = line.next_start;
+            continue;
+        }
+        line_count += 1;
+        const has_more = line.next_start < value.len or line.hard_break;
+        if (line_count == line_limit and has_more) {
+            if (overflow == .ellipsis) {
+                try appendEllipsizedLine(allocator, output, value, source_start, line.content_end, available_width, style, measurer);
+            } else {
+                try output.appendSlice(allocator, value[source_start..line.content_end]);
+            }
+            return;
         }
 
-        try output.appendSlice(allocator, source_line[0..visible_end]);
-        if (add_ellipsis) try output.appendSlice(allocator, ellipsis);
-        if (final_line or !has_more) break;
+        try output.appendSlice(allocator, value[source_start..line.content_end]);
+        if (!has_more) return;
         try output.append(allocator, '\n');
-
-        if (line_fits) {
-            source_start = source_end + 1;
-        } else if (fitting_end > 0) {
-            source_start += fitting_end;
-        } else {
-            var it = uucode.grapheme.utf8Iterator(source_line);
-            source_start += (it.nextGrapheme() orelse break).end;
-        }
+        std.debug.assert(line.next_start > source_start);
+        source_start = line.next_start;
     }
 }
 
@@ -273,8 +377,9 @@ fn layoutElementInto(
         .text => |text_widget| {
             const style: ResolvedTextStyle = .{ .color = text_widget.color orelse colors.ink, .font_size = text_widget.font_size orelse 16 };
             node.text_buffer.clearRetainingCapacity();
-            const visible_text = if (text_widget.max_lines) |max_lines| blk: {
-                try constrainText(allocator, &node.text_buffer, text_widget.value, max_lines, text_widget.overflow, constraints.max_width, style, measurer);
+            const should_wrap = text_widget.max_lines != null or std.math.isFinite(constraints.max_width);
+            const visible_text = if (should_wrap) blk: {
+                try wrapText(allocator, &node.text_buffer, text_widget.value, text_widget.max_lines, text_widget.overflow, constraints.max_width, style, measurer);
                 break :blk node.text_buffer.items;
             } else text_widget.value;
             const measured = try measurer.measureText(visible_text, style);
@@ -284,6 +389,7 @@ fn layoutElementInto(
                 .kind = .text,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
                 .text = visible_text,
+                .text_buffered = should_wrap,
                 .text_style = style,
                 .foreground = style.color,
             });
@@ -983,36 +1089,72 @@ test "fitting boundary chooses the last measured cluster that fits" {
     try std.testing.expectEqual(@as(usize, 0), fittingBoundary(&boundaries, &widths, 2));
 }
 
-test "constrained text preserves fitting text and ellipsizes one line" {
+test "wrapped text preserves fitting text and ellipsizes one line" {
     const allocator = std.testing.allocator;
     const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try constrainText(allocator, &output, "abc", 1, .ellipsis, 40, style, .fixed);
+    try wrapText(allocator, &output, "abc", 1, .ellipsis, 40, style, .fixed);
     try std.testing.expectEqualStrings("abc", output.items);
 
     output.clearRetainingCapacity();
-    try constrainText(allocator, &output, "abcdef", 1, .ellipsis, 40, style, .fixed);
+    try wrapText(allocator, &output, "abcdef", 1, .ellipsis, 40, style, .fixed);
     try std.testing.expectEqualStrings("ab…", output.items);
 }
 
-test "constrained text omits an ellipsis that cannot fit" {
+test "wrapped text omits an ellipsis that cannot fit" {
     const allocator = std.testing.allocator;
     const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try constrainText(allocator, &output, "abc", 1, .ellipsis, 16, style, .fixed);
+    try wrapText(allocator, &output, "abc", 1, .ellipsis, 16, style, .fixed);
     try std.testing.expectEqualStrings("", output.items);
 }
 
-test "constrained text wraps and ellipsizes at two lines" {
+test "wrapped text uses Unicode opportunities and ellipsizes at two lines" {
     const allocator = std.testing.allocator;
     const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try constrainText(allocator, &output, "abcdefg", 2, .ellipsis, 24, style, .fixed);
-    try std.testing.expectEqualStrings("abc\n…", output.items);
+    try wrapText(allocator, &output, "hello world again", 2, .ellipsis, 48, style, .fixed);
+    try std.testing.expectEqualStrings("hello\nwor…", output.items);
+}
+
+test "wrapped text prefers word boundaries and emergency breaks long words" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try wrapText(allocator, &output, "hello world", null, .ellipsis, 48, style, .fixed);
+    try std.testing.expectEqualStrings("hello\nworld", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, 24, style, .fixed);
+    try std.testing.expectEqualStrings("abc\ndef\ng", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "hello   ", null, .ellipsis, 48, style, .fixed);
+    try std.testing.expectEqualStrings("hello", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "   abc", null, .ellipsis, 16, style, .fixed);
+    try std.testing.expectEqualStrings("ab\nc", output.items);
+}
+
+test "wrapped text normalizes hard breaks and preserves graphemes" {
+    const allocator = std.testing.allocator;
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, 100, style, .fixed);
+    try std.testing.expectEqualStrings("one\ntwo", output.items);
+
+    output.clearRetainingCapacity();
+    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, 8, style, .fixed);
+    try std.testing.expectEqualStrings("e\u{301}\nx", output.items);
 }

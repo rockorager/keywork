@@ -54,9 +54,16 @@ pub fn build(b: *std.Build) void {
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .fields = @as([]const []const u8, &.{"grapheme_break"}),
+        .build_config_path = b.path("lib/linebreak/uucode_config.zig"),
     });
     const uucode_module = uucode_dep.module("uucode");
+
+    const linebreak_module = b.addModule("linebreak", .{
+        .root_source_file = b.path("lib/linebreak/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linebreak_module.addImport("uucode", uucode_module);
 
     const z2d_dep = b.dependency("z2d", .{
         .target = target,
@@ -102,6 +109,7 @@ pub fn build(b: *std.Build) void {
     app_module.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
     app_module.addImport("vulkan", vulkan_mod);
     app_module.addImport("uucode", uucode_module);
+    app_module.addImport("linebreak", linebreak_module);
     app_module.addImport("z2d", z2d_module);
     app_module.addImport("xkb_c", xkb_c_module);
     app_module.addImport("dbus_c", dbus_c_module);
@@ -204,9 +212,11 @@ pub fn build(b: *std.Build) void {
     });
     app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    const linebreak_tests = b.addTest(.{ .root_module = linebreak_module });
+    test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "examples", "build", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "lib", "examples", "build", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
 }

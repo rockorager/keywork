@@ -14,6 +14,25 @@ return sb.book({
       end,
     }),
     sb.story({
+      id = "text/wrapping",
+      group = "Text",
+      name = "Wrapping",
+      viewport = { width = 360, height = 240 },
+      render = function(context)
+        local theme = kw.theme_for(context)
+        return kw.center(kw.sized({
+          width = 240,
+          child = kw.container({
+            background = theme.colors.surface,
+            border = theme.colors.border,
+            radius = 8,
+            padding = { all = 16 },
+            child = kw.text("Unicode line breaking keeps words together while allowing unusuallylongcontentwithoutbreaks to wrap safely."),
+          }),
+        }))
+      end,
+    }),
+    sb.story({
       id = "button/dark",
       group = "Button",
       name = "Dark",

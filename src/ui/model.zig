@@ -1101,6 +1101,7 @@ pub const RenderNode = struct {
     rect: Rect,
     text: ?[]const u8 = null,
     text_buffer: std.ArrayList(u8) = .empty,
+    text_buffered: bool = false,
     text_style: ResolvedTextStyle = defaultResolvedTextStyle(),
     clickable_id: ?[]const u8 = null,
     click_callback: ?Widget.TapCallback = null,
@@ -2774,7 +2775,7 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
 fn syncRenderNodeMetadata(element: *Element) void {
     const node = element.render_node orelse return;
     switch (element.widget) {
-        .text => |text| if (text.max_lines == null) {
+        .text => |text| if (!node.text_buffered) {
             node.text = text.value;
         },
         .clickable => |clickable| {
@@ -5433,7 +5434,9 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
 
     const root = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
     const initial_measures = backend_state.measures;
-    try std.testing.expectEqual(@as(usize, 2), initial_measures);
+    // Finite-width text is measured once while selecting a line break and
+    // once as the final multiline run.
+    try std.testing.expectEqual(@as(usize, 4), initial_measures);
     try std.testing.expect(collectDamage(root) != null);
 
     // A clean tree re-laid out with identical constraints skips entirely
@@ -5452,7 +5455,7 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     try std.testing.expect(try rebuildDirtyElementTreeScoped(allocator, &rebuild_scope, &element, constraints));
 
     _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
-    try std.testing.expectEqual(initial_measures + 1, backend_state.measures);
+    try std.testing.expectEqual(initial_measures + 2, backend_state.measures);
     try std.testing.expectEqualStrings("two", root.children[1].children[0].text.?);
 
     // Damage covers the relaid stateful subtree, not the clean sibling
@@ -5470,7 +5473,7 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     try std.testing.expectEqual(state.rebuild_generation, state.built_generation);
     try std.testing.expect(!root.needs_layout);
     _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
-    try std.testing.expectEqual(initial_measures + 1, backend_state.measures);
+    try std.testing.expectEqual(initial_measures + 2, backend_state.measures);
     try std.testing.expectEqual(@as(?Rect, null), collectDamage(root));
     const builds_after_full_update = state.builds;
     _ = built_arena.reset(.retain_capacity);
