@@ -1147,6 +1147,10 @@ pub const RenderNode = struct {
     /// subtrees can be skipped when re-laid out with identical inputs.
     constraints: Constraints = .{ .max_width = 0, .max_height = 0 },
     needs_layout: bool = true,
+    /// Whether this node's painted payload changed since its last layout.
+    /// Kept separate from layout dirtiness so a semantically identical
+    /// rebuild does not manufacture damage merely by re-running layout.
+    needs_paint: bool = true,
     /// Union of this node's previous and current bounds accumulated since
     /// the damage was last collected; null when the node has not changed.
     damage: ?Rect = null,
@@ -1960,8 +1964,10 @@ pub fn updateElementTreeScoped(
             try updateSingleChildElement(allocator, scope, element, widget.*, sized_widget.child, constrainSized(constraints, sized_widget));
         },
         .text_input => {
+            const focused = scope.interaction.isFocused(widget.text_input.focus_node);
+            if (element.focused != focused) markElementPaintDirty(element);
             try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style);
-            element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
+            element.focused = focused;
         },
         .separator => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
         .spinner => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
@@ -2164,6 +2170,7 @@ pub fn dirtyTextInputElement(element: *Element, focus_id: []const u8) ?*Element 
     if (element.kind == .text_input) {
         if (std.mem.eql(u8, element.widget.text_input.focus_node.id, focus_id)) {
             markElementLayoutDirty(element);
+            markElementPaintDirty(element);
             return element;
         }
         return null;
@@ -2240,6 +2247,7 @@ pub fn refreshInteractionElements(
             if (matched and (clickable_widget.hover_style != null or clickable_widget.pressed_style != null)) {
                 applyClickableStateStyle(&element.children[0], clickable_widget, scope.interaction);
                 markElementLayoutDirty(&element.children[0]);
+                markElementPaintDirty(&element.children[0]);
                 markElementLayoutDirty(element);
                 return true;
             }
@@ -2402,6 +2410,7 @@ fn updateSingleChildElement(
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
     try updateElementTreeScoped(allocator, scope, &element.children[0], child_widget, child_constraints);
+    markElementPaintDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
@@ -2563,6 +2572,7 @@ fn widgetKey(widget: Widget) ?Widget.Key {
 fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget: Widget) anyerror!void {
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
+    markElementPaintDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
 }
@@ -2570,8 +2580,57 @@ fn replaceElementWidget(allocator: std.mem.Allocator, element: *Element, widget:
 fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, widget: Widget, theme: Theme, inherited_style: TextStyle) anyerror!void {
     var element_widget = try cloneWidgetForElementThemed(allocator, widget, theme, inherited_style);
     errdefer destroyElementWidget(allocator, &element_widget);
+    markElementPaintDirtyIfChanged(element, element_widget);
     destroyElementWidget(allocator, &element.widget);
     element.widget = element_widget;
+}
+
+fn markElementPaintDirtyIfChanged(element: *Element, widget: Widget) void {
+    if (!widgetPaintEqual(element.widget, widget)) markElementPaintDirty(element);
+}
+
+fn markElementPaintDirty(element: *Element) void {
+    if (element.render_node) |node| node.needs_paint = true;
+}
+
+fn widgetPaintEqual(a: Widget, b: Widget) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .text => |a_text| blk: {
+            const b_text = b.text;
+            break :blk std.mem.eql(u8, a_text.value, b_text.value) and
+                std.meta.eql(a_text.color, b_text.color) and
+                a_text.font_size == b_text.font_size and
+                a_text.max_lines == b_text.max_lines and
+                a_text.overflow == b_text.overflow;
+        },
+        .box => |a_box| blk: {
+            const b_box = b.box;
+            break :blk std.meta.eql(a_box.background, b_box.background) and
+                std.meta.eql(a_box.border, b_box.border) and
+                a_box.border_width == b_box.border_width and
+                a_box.radius == b_box.radius;
+        },
+        .text_input => |a_input| blk: {
+            const b_input = b.text_input;
+            break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
+                std.meta.eql(a_input.foreground, b_input.foreground) and
+                std.meta.eql(a_input.background, b_input.background) and
+                std.meta.eql(a_input.border, b_input.border) and
+                std.meta.eql(a_input.focused_border, b_input.focused_border) and
+                std.meta.eql(a_input.placeholder_foreground, b_input.placeholder_foreground) and
+                a_input.padding_x == b_input.padding_x and
+                a_input.padding_y == b_input.padding_y and
+                a_input.radius == b_input.radius and
+                a_input.font_size == b_input.font_size;
+        },
+        .separator => |separator| std.meta.eql(separator, b.separator),
+        .spinner => |spinner| std.meta.eql(spinner, b.spinner),
+        // Render objects own arbitrary paint behavior; only their
+        // implementation can know whether two instances paint alike.
+        .render_object => false,
+        else => true,
+    };
 }
 
 fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, theme: Theme, inherited_style: TextStyle) !Widget {
@@ -5210,6 +5269,8 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     var full_scope: BuildScope = .{ .allocator = built_arena.allocator() };
     try updateElementTreeScoped(allocator, &full_scope, &element, &column, constraints);
     try std.testing.expectEqual(state.rebuild_generation, state.built_generation);
+    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, measurer);
+    try std.testing.expectEqual(@as(?Rect, null), collectDamage(root));
     const builds_after_full_update = state.builds;
     _ = built_arena.reset(.retain_capacity);
     var clean_scope: BuildScope = .{ .allocator = built_arena.allocator() };

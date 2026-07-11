@@ -511,12 +511,16 @@ test "invalidation raised during rebuild is not dropped" {
 
 test "deferred invalidations coalesce until flush" {
     const TestApp = struct {
+        builds: usize = 0,
+
         fn host(self: *@This()) AppHost {
             return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
         }
 
-        fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
-            return keywork.widgets.text("hello");
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            return keywork.widgets.text(try std.fmt.allocPrint(scope.allocator, "build {d}", .{self.builds}));
         }
     };
 
@@ -606,7 +610,7 @@ test "rebuild passes that never stabilize return an error" {
     try std.testing.expectError(error.RebuildDidNotStabilize, runtime.invalidate());
 }
 
-test "state invalidation that changes nothing presents nothing" {
+test "rebuilds that change nothing present nothing" {
     const TestApp = struct {
         fn host(self: *@This()) AppHost {
             return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
@@ -647,14 +651,14 @@ test "state invalidation that changes nothing presents nothing" {
     try runtime.repaint();
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
 
-    // App-wide state invalidations reach every window; one that dirties no
-    // scope here must relayout nothing and skip the present entirely.
+    // A state invalidation that dirties no scope relayouts nothing.
     try runtime.invalidateState();
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
 
-    // A full rebuild lays out a fresh tree and still presents.
+    // A full rebuild still refreshes the retained tree, but identical
+    // layout and paint output does not manufacture damage.
     try runtime.invalidate();
-    try std.testing.expectEqual(@as(usize, 2), backend.presents);
+    try std.testing.expectEqual(@as(usize, 1), backend.presents);
 }
 
 fn renderedInputText(node: *const RenderNode) ?[]const u8 {

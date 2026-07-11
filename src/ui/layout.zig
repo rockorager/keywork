@@ -39,17 +39,14 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     const children = node.children;
     const text_buffer = node.text_buffer;
     const constraints = node.constraints;
-    // Non-painting wrappers only damage when their bounds change (covering
-    // vacated regions); painted nodes always damage since their payload may
-    // have changed. Ancestors on a dirty path re-commit with identical
-    // geometry and must not inflate the damage to their full bounds.
+    // Layout and paint dirtiness are independent. A full widget rebuild may
+    // need to refresh retained payload pointers while producing identical
+    // pixels; only changed bounds or an explicitly changed painted payload
+    // contribute damage.
     const rect_changed = !std.meta.eql(node.rect, value.rect);
-    const paints = switch (value.kind) {
-        .box, .text, .text_input, .separator, .spinner, .render_object => true,
-        else => false,
-    };
+    const paint_changed = node.needs_paint;
     var damage = node.damage;
-    if (rect_changed or paints) {
+    if (rect_changed or paint_changed) {
         damage = unionDamage(unionDamage(damage, node.rect), value.rect);
     }
     node.* = value;
@@ -58,6 +55,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     node.constraints = constraints;
     node.damage = damage;
     node.needs_layout = false;
+    node.needs_paint = false;
 }
 
 fn unionDamage(damage: ?Rect, rect: Rect) ?Rect {
