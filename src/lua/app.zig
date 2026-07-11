@@ -92,6 +92,9 @@ pub const App = struct {
         const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
         errdefer c.lua_close(lua_state);
         c.luaL_openlibs(lua_state);
+        installScriptModuleRoots(lua_state, allocator, path) catch |err| {
+            std.log.scoped(.keywork_luajit).warn("script module roots not installed: {}", .{err});
+        };
 
         return .{
             .allocator = allocator,
@@ -915,6 +918,28 @@ test "scriptChunk handles a shebang-only file" {
     try std.testing.expectEqualStrings("\n", scriptChunk("#!/usr/bin/env keywork\n"));
 }
 
+/// Prepends the script's directory to `package.path` so applications can
+/// require sibling modules (`foo` → `<script-dir>/foo.lua` or
+/// `<script-dir>/foo/init.lua`) without a LUA_PATH bootstrap wrapper.
+fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocator, script_path: []const u8) !void {
+    const dir = std.fs.path.dirname(script_path) orelse ".";
+
+    c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
+        pop(lua_state, 1);
+        return error.NoPackageTable;
+    }
+    const package_table = c.lua_gettop(lua_state);
+    c.lua_getfield(lua_state, package_table, "path");
+    const existing = stringFromStack(lua_state, -1) catch "";
+
+    const merged = try std.fmt.allocPrint(allocator, "{s}/?.lua;{s}/?/init.lua;{s}", .{ dir, dir, existing });
+    defer allocator.free(merged);
+    c.lua_pushlstring(lua_state, merged.ptr, merged.len);
+    c.lua_setfield(lua_state, package_table, "path");
+    pop(lua_state, 2);
+}
+
 const embedded_ui_source = @embedFile("ui.lua");
 const embedded_service_source = @embedFile("service.lua");
 const embedded_process_source = @embedFile("process.lua");
@@ -1290,6 +1315,35 @@ test "application lifecycle hooks run exactly once per load" {
     app.stopLifecycleLog();
     c.lua_getglobal(app.state, "stops");
     try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+}
+
+test "script directory is a module root for require" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling.lua", .data = "return { value = 41 }\n" });
+    try tmp.dir.createDir(std.testing.io, "nested", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/init.lua", .data = "return { value = 1 }\n" });
+    const script =
+        \\local kw = require("keywork")
+        \\local sibling = require("sibling")
+        \\local nested = require("nested")
+        \\answer = sibling.value + nested.value
+        \\return kw.app({ child = kw.text("modules") })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "modules.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "modules.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.init(allocator, script_path);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    c.lua_getglobal(app.state, "answer");
+    try std.testing.expectEqual(@as(c.lua_Integer, 42), c.lua_tointeger(app.state, -1));
     pop(app.state, 1);
 }
 
