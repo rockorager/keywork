@@ -19,7 +19,9 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
-    scanner.generate("wl_compositor", 4);
+    // Generate current core surface events, then negotiate every global down
+    // to the version advertised by the compositor at runtime.
+    scanner.generate("wl_compositor", 7);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 8);
     scanner.generate("wl_output", 4);
@@ -211,6 +213,7 @@ pub fn build(b: *std.Build) void {
 
 fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("wayland-client", .{});
+    module.linkSystemLibrary("wayland-cursor", .{});
     module.linkSystemLibrary("vulkan", .{});
     module.linkSystemLibrary("xkbcommon", .{});
     module.linkSystemLibrary("dbus-1", .{});

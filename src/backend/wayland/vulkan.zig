@@ -44,8 +44,15 @@ pub const Backend = struct {
         errdefer connection.deinit();
 
         const seat = connection.takeSeat();
-        var input = WaylandInput.init(allocator, seat, connection.seatCapabilities(), connection.cursor_shape_manager) catch |err| {
-            if (seat) |wl_seat| wl_seat.release();
+        var input = WaylandInput.init(
+            allocator,
+            seat,
+            connection.seatCapabilities(),
+            connection.cursor_shape_manager,
+            connection.compositor,
+            connection.shm,
+        ) catch |err| {
+            if (seat) |wl_seat| WaylandInput.destroySeat(wl_seat);
             return err;
         };
         errdefer input.deinit();
@@ -103,9 +110,10 @@ pub const Backend = struct {
         try self.windows.append(self.allocator, win);
         errdefer _ = self.windows.pop();
         try self.input.registerTarget(&win.input_target);
+        errdefer self.input.unregisterTarget(&win.input_target);
 
         // Listener contexts must point at the window's final storage.
-        win.protocol.attachListeners();
+        try win.protocol.attachListeners();
         return win;
     }
 
@@ -132,8 +140,9 @@ pub const Backend = struct {
         try self.windows.append(self.allocator, win);
         errdefer _ = self.windows.pop();
         try self.input.registerTarget(&win.input_target);
+        errdefer self.input.unregisterTarget(&win.input_target);
 
-        win.protocol.attachListeners();
+        try win.protocol.attachListeners();
         if (self.input.seat) |seat| {
             if (self.input.last_button_press_serial) |serial| win.protocol.grabPopup(seat, serial);
         }
@@ -204,7 +213,10 @@ pub const Backend = struct {
         if (self.allClosed()) return error.WindowClosed;
         // Configure marks a repaint pending, but repaint handlers are not
         // installed yet; the caller paints the initial frame explicitly.
-        for (self.windows.items) |win| _ = win.protocol.flushPending();
+        for (self.windows.items) |win| {
+            _ = win.protocol.flushPending();
+            self.input.setTargetScale(&win.input_target, win.protocol.scale);
+        }
     }
 
     /// Dispatches until `win` receives its initial configure (or closes).
@@ -219,6 +231,7 @@ pub const Backend = struct {
         // Configure marked a repaint pending, but the window's handlers
         // are not installed yet; the caller paints the initial frame.
         _ = win.protocol.flushPending();
+        self.input.setTargetScale(&win.input_target, win.protocol.scale);
     }
 
     pub fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
@@ -338,6 +351,7 @@ pub const Backend = struct {
 
         fn flushPending(self: *Window) void {
             const pending = self.protocol.flushPending();
+            self.backend.input.setTargetScale(&self.input_target, self.protocol.scale);
             if (pending.repaint) {
                 if (self.repaint_handler) |handler| handler(self.repaint_context.?, self.currentSize());
             }
@@ -358,8 +372,7 @@ pub const Backend = struct {
             const logical_height = try window.frameLogicalHeight(frame, protocol.height);
             const width = try window.scaledFrameDimension(logical_width, protocol.scale);
             const height = try window.scaledFrameDimension(logical_height, protocol.scale);
-            protocol.surface.setBufferScale(1);
-            if (protocol.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
+            protocol.configureBuffer(logical_width, logical_height);
             const pending = try self.renderer.present(frame.display_list, protocol.scale, width, height);
             if (!pending) return false;
             try protocol.armFrameCallback();

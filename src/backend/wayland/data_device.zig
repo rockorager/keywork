@@ -98,7 +98,7 @@ pub const Clipboard = struct {
         seat: *wl.Seat,
     ) !*Clipboard {
         const device = try manager.getDataDevice(seat);
-        errdefer device.release();
+        errdefer destroyDataDevice(device);
         const self = try allocator.create(Clipboard);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -117,7 +117,7 @@ pub const Clipboard = struct {
         if (self.pending) |state| state.destroy();
         if (self.selection) |state| state.destroy();
         if (self.drag) |state| state.destroy();
-        self.device.release();
+        destroyDataDevice(self.device);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -177,6 +177,13 @@ pub const Clipboard = struct {
         return state;
     }
 };
+
+fn destroyDataDevice(device: *wl.DataDevice) void {
+    if (device.getVersion() >= wl.DataDevice.release_since_version)
+        device.release()
+    else
+        device.destroy();
+}
 
 fn deviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *Clipboard) void {
     switch (event) {

@@ -32,6 +32,11 @@ listeners_attached: bool = false,
 pointer: ?*wl.Pointer = null,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
 cursor_shape_device: ?*wp.CursorShapeDeviceV1 = null,
+compositor: ?*wl.Compositor = null,
+shm: ?*wl.Shm = null,
+cursor_theme: ?*wl.CursorTheme = null,
+cursor_theme_scale: u32 = 0,
+cursor_surface: ?*wl.Surface = null,
 keyboard: ?*wl.Keyboard = null,
 xkb_context: ?*xkb.struct_xkb_context = null,
 xkb_keymap: ?*xkb.struct_xkb_keymap = null,
@@ -79,6 +84,9 @@ repeat_interval_ms: u64 = 0,
 /// and selected by pointer/keyboard focus. Owned by the backend window.
 pub const Target = struct {
     surface: *wl.Surface,
+    /// Integer cursor-theme scale. Fractional window scales round up so the
+    /// compositor downsamples a crisp legacy cursor rather than magnifying it.
+    cursor_scale: u32 = 1,
     pointer_button_handler: ?PointerButtonHandler = null,
     pointer_button_context: ?*anyopaque = null,
     pointer_move_handler: ?PointerMoveHandler = null,
@@ -162,6 +170,8 @@ pub fn init(
     seat: ?*wl.Seat,
     capabilities: wl.Seat.Capability,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1,
+    compositor: ?*wl.Compositor,
+    shm: ?*wl.Shm,
 ) !Self {
     const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
 
@@ -169,6 +179,8 @@ pub fn init(
         .allocator = allocator,
         .seat = seat,
         .cursor_shape_manager = cursor_shape_manager,
+        .compositor = compositor,
+        .shm = shm,
         .xkb_context = xkb_context,
     };
     // Only bind devices the seat has advertised. Calling get_pointer on a
@@ -183,9 +195,11 @@ pub fn deinit(self: *Self) void {
     self.clearXkbKeymap();
     if (self.xkb_context) |context| xkb.xkb_context_unref(context);
     self.destroyCursorShapeDevice();
-    if (self.pointer) |pointer| pointer.release();
-    if (self.keyboard) |keyboard| keyboard.release();
-    if (self.seat) |seat| seat.release();
+    if (self.pointer) |pointer| destroyPointer(pointer);
+    if (self.keyboard) |keyboard| destroyKeyboard(keyboard);
+    if (self.seat) |seat| destroySeat(seat);
+    if (self.cursor_surface) |surface| surface.destroy();
+    if (self.cursor_theme) |theme| theme.destroy();
 }
 
 pub fn attachListeners(self: *Self) void {
@@ -237,6 +251,18 @@ pub fn unregisterTarget(self: *Self, target: *Target) void {
     if (self.fling_target == target) self.stopFling();
 }
 
+pub fn setTargetScale(self: *Self, target: *Target, scale: f32) void {
+    const cursor_scale: u32 = if (std.math.isFinite(scale) and scale > 1)
+        @intFromFloat(@ceil(scale))
+    else
+        1;
+    if (cursor_scale == target.cursor_scale) return;
+    target.cursor_scale = cursor_scale;
+    if (self.cursor_shape_device != null or self.pointer_target != target) return;
+    self.cursor_shape = null;
+    if (self.pointer_position) |point| self.updateCursorShape(point);
+}
+
 fn findTarget(self: *Self, surface: ?*wl.Surface) ?*Target {
     const wanted = surface orelse return null;
     for (self.targets.items) |target| {
@@ -278,7 +304,7 @@ fn applySeatCapabilities(self: *Self, capabilities: wl.Seat.Capability) void {
         }
     } else if (self.pointer != null) {
         self.destroyCursorShapeDevice();
-        self.pointer.?.release();
+        destroyPointer(self.pointer.?);
         self.pointer = null;
         self.pointer_target = null;
         self.pointer_position = null;
@@ -295,7 +321,7 @@ fn applySeatCapabilities(self: *Self, capabilities: wl.Seat.Capability) void {
             }
         }
     } else if (self.keyboard != null) {
-        self.keyboard.?.release();
+        destroyKeyboard(self.keyboard.?);
         self.keyboard = null;
         self.keyboard_target = null;
         self.shift_down = false;
@@ -527,11 +553,81 @@ fn updateCursorShape(self: *Self, point: keywork.Point) void {
     const target = self.pointer_target orelse return;
     const handler = target.cursor_shape_handler orelse return;
     const serial = self.pointer_enter_serial orelse return;
-    const device = self.cursor_shape_device orelse return;
     const shape = handler(target.cursor_shape_context.?, point);
     if (self.cursor_shape == shape) return;
-    device.setShape(serial, waylandCursorShape(shape));
+    if (self.cursor_shape_device) |device| {
+        device.setShape(serial, waylandCursorShape(shape));
+    } else if (!self.applyLegacyCursor(target, serial, shape)) {
+        return;
+    }
     self.cursor_shape = shape;
+}
+
+fn applyLegacyCursor(self: *Self, target: *const Target, serial: u32, shape: keywork.CursorShape) bool {
+    const pointer = self.pointer orelse return false;
+    const compositor = self.compositor orelse return false;
+    const surface = self.cursor_surface orelse surface: {
+        const created = compositor.createSurface() catch |err| {
+            log.warn("failed to create legacy cursor surface: {}", .{err});
+            return false;
+        };
+        self.cursor_surface = created;
+        break :surface created;
+    };
+    const scale = if (surface.getVersion() >= wl.Surface.set_buffer_scale_since_version)
+        target.cursor_scale
+    else
+        1;
+    const replacing_theme = self.cursor_theme_scale != scale;
+    const theme = if (replacing_theme) theme: {
+        const shm = self.shm orelse return false;
+        const size = std.math.mul(u32, 24, scale) catch return false;
+        break :theme wl.CursorTheme.load(null, @intCast(size), shm) catch |err| {
+            log.warn("failed to load legacy cursor theme: {}", .{err});
+            return false;
+        };
+    } else self.cursor_theme orelse return false;
+    var adopted_theme = !replacing_theme;
+    defer if (!adopted_theme) theme.destroy();
+    const cursor = legacyCursor(theme, shape) orelse return false;
+    if (cursor.image_count == 0) return false;
+    const image = cursor.images[0];
+    const buffer = image.getBuffer() catch |err| {
+        log.warn("failed to get legacy cursor buffer: {}", .{err});
+        return false;
+    };
+
+    if (surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
+        surface.setBufferScale(@intCast(scale));
+    }
+    pointer.setCursor(
+        serial,
+        surface,
+        @intCast(image.hotspot_x / scale),
+        @intCast(image.hotspot_y / scale),
+    );
+    surface.attach(buffer, 0, 0);
+    if (surface.getVersion() >= wl.Surface.damage_buffer_since_version)
+        surface.damageBuffer(0, 0, @intCast(image.width), @intCast(image.height))
+    else
+        surface.damage(0, 0, @intCast(image.width), @intCast(image.height));
+    surface.commit();
+    if (replacing_theme) {
+        const old_theme = self.cursor_theme;
+        self.cursor_theme = theme;
+        self.cursor_theme_scale = scale;
+        adopted_theme = true;
+        if (old_theme) |old| old.destroy();
+    }
+    return true;
+}
+
+fn legacyCursor(theme: *wl.CursorTheme, shape: keywork.CursorShape) ?*wl.Cursor {
+    return switch (shape) {
+        .default => theme.getCursor("default") orelse theme.getCursor("left_ptr"),
+        .pointer => theme.getCursor("pointer") orelse theme.getCursor("hand2"),
+        .text => theme.getCursor("text") orelse theme.getCursor("xterm"),
+    };
 }
 
 fn waylandCursorShape(shape: keywork.CursorShape) wp.CursorShapeDeviceV1.Shape {
@@ -540,6 +636,27 @@ fn waylandCursorShape(shape: keywork.CursorShape) wp.CursorShapeDeviceV1.Shape {
         .pointer => .pointer,
         .text => .text,
     };
+}
+
+pub fn destroySeat(seat: *wl.Seat) void {
+    if (seat.getVersion() >= wl.Seat.release_since_version)
+        seat.release()
+    else
+        seat.destroy();
+}
+
+fn destroyPointer(pointer: *wl.Pointer) void {
+    if (pointer.getVersion() >= wl.Pointer.release_since_version)
+        pointer.release()
+    else
+        pointer.destroy();
+}
+
+fn destroyKeyboard(keyboard: *wl.Keyboard) void {
+    if (keyboard.getVersion() >= wl.Keyboard.release_since_version)
+        keyboard.release()
+    else
+        keyboard.destroy();
 }
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void {

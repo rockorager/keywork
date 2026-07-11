@@ -61,9 +61,13 @@ pub const PopupOptions = struct {
 /// Renderer-owned buffers and swapchains deliberately remain outside this
 /// type so protocol callbacks cannot depend on a rendering implementation.
 pub const Surface = struct {
+    connection: *Connection,
     surface: *wl.Surface,
     viewport: ?*wp.Viewport,
     fractional_scale: ?*wp.FractionalScaleV1,
+    entered_outputs: std.ArrayList(*wl.Output) = .empty,
+    preferred_buffer_scale: ?u32 = null,
+    registered: bool = false,
     shell_role: ShellRole,
     /// xdg-decoration object for toplevels; must be destroyed before the
     /// toplevel it decorates. Null on layer/popup roles or when the
@@ -89,7 +93,7 @@ pub const Surface = struct {
         frame_done: bool = false,
     };
 
-    pub fn init(connection: *const Connection, output: ?*wl.Output, options: anytype) !Surface {
+    pub fn init(connection: *Connection, output: ?*wl.Output, options: anytype) !Surface {
         const compositor = connection.compositor orelse return error.NoWlCompositor;
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
@@ -97,15 +101,14 @@ pub const Surface = struct {
         errdefer shell_role.destroy();
         const decoration = try createDecoration(connection.decoration_manager, shell_role, options.decorations);
         errdefer if (decoration) |toplevel_decoration| toplevel_decoration.destroy();
-        const viewport = if (connection.viewporter) |manager| try manager.getViewport(surface) else null;
-        errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
-        const fractional_scale = if (connection.fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
-        errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+        const scale_objects = createScaleObjects(connection, surface);
+        errdefer scale_objects.deinit();
 
         return .{
+            .connection = connection,
             .surface = surface,
-            .viewport = viewport,
-            .fractional_scale = fractional_scale,
+            .viewport = scale_objects.viewport,
+            .fractional_scale = scale_objects.fractional_scale,
             .shell_role = shell_role,
             .decoration = decoration,
             .layer_keyboard_interactivity = if (options.layer_shell) |layer_options|
@@ -120,7 +123,7 @@ pub const Surface = struct {
     /// Creates a popup surface anchored to `parent`. The compositor may
     /// reposition or resize the popup; the final geometry arrives in the
     /// xdg_popup configure event.
-    pub fn initPopup(connection: *const Connection, parent: *const Surface, options: PopupOptions) !Surface {
+    pub fn initPopup(connection: *Connection, parent: *const Surface, options: PopupOptions) !Surface {
         const compositor = connection.compositor orelse return error.NoWlCompositor;
         const wm_base = connection.wm_base orelse return error.NoXdgWmBase;
         std.debug.assert(options.width > 0 and options.height > 0);
@@ -145,19 +148,18 @@ pub const Surface = struct {
         // instead of an xdg parent.
         if (parent.shell_role == .layer) parent.shell_role.layer.surface.getPopup(popup);
 
-        const viewport = if (connection.viewporter) |manager| try manager.getViewport(surface) else null;
-        errdefer if (viewport) |surface_viewport| surface_viewport.destroy();
-        const fractional_scale = if (connection.fractional_scale_manager) |manager| try manager.getFractionalScale(surface) else null;
-        errdefer if (fractional_scale) |surface_scale| surface_scale.destroy();
+        const scale_objects = createScaleObjects(connection, surface);
+        errdefer scale_objects.deinit();
 
         return .{
+            .connection = connection,
             .surface = surface,
-            .viewport = viewport,
-            .fractional_scale = fractional_scale,
+            .viewport = scale_objects.viewport,
+            .fractional_scale = scale_objects.fractional_scale,
             .shell_role = .{ .popup = .{ .surface = xdg_surface, .popup = popup } },
             .width = options.width,
             .height = options.height,
-            .scale = parent.scale,
+            .scale = if (scale_objects.fractional_scale != null or parent.fractional_scale == null) parent.scale else 1,
         };
     }
 
@@ -180,6 +182,8 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        if (self.registered) self.connection.unregisterSurface(self);
+        self.entered_outputs.deinit(self.connection.allocator);
         if (self.frame_callback) |callback| callback.destroy();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
@@ -207,7 +211,10 @@ pub const Surface = struct {
 
     /// Listener installation is separate from initialization because the
     /// callback context must point at the object's final storage location.
-    pub fn attachListeners(self: *Surface) void {
+    pub fn attachListeners(self: *Surface) !void {
+        try self.connection.registerSurface(self);
+        self.registered = true;
+        self.surface.setListener(*Surface, surfaceListener, self);
         switch (self.shell_role) {
             .xdg => |role| {
                 role.surface.setListener(*Surface, xdgSurfaceListener, self);
@@ -221,6 +228,33 @@ pub const Surface = struct {
         }
         if (self.fractional_scale) |fractional_scale| {
             fractional_scale.setListener(*Surface, fractionalScaleListener, self);
+        }
+    }
+
+    /// Configures the mapping from the physical render buffer to the
+    /// surface's logical coordinate space. Fractional scaling uses a
+    /// viewport; the core fallback uses an integer buffer scale.
+    pub fn configureBuffer(self: *Surface, logical_width: u31, logical_height: u31) void {
+        if (self.viewport) |viewport| {
+            if (self.surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
+                self.surface.setBufferScale(1);
+            }
+            viewport.setDestination(logical_width, logical_height);
+            return;
+        }
+        if (self.surface.getVersion() < wl.Surface.set_buffer_scale_since_version) return;
+        const scale: i32 = @intFromFloat(@max(1, self.scale));
+        self.surface.setBufferScale(scale);
+    }
+
+    /// Damage is expressed in buffer pixels when supported. Very old core
+    /// surfaces only accept logical damage, where full-surface damage avoids
+    /// lossy conversion for scaled buffers.
+    pub fn damagePixels(self: *Surface, x: i32, y: i32, width: i32, height: i32) void {
+        if (self.surface.getVersion() >= wl.Surface.damage_buffer_since_version) {
+            self.surface.damageBuffer(x, y, width, height);
+        } else {
+            self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
         }
     }
 
@@ -287,12 +321,82 @@ pub const Surface = struct {
             .preferred_scale => |preferred| {
                 if (preferred.scale == 0) return;
                 const scale = @as(f32, @floatFromInt(preferred.scale)) / 120.0;
-                if (scale == self.scale) return;
-                self.scale = scale;
-                self.scale_changed = true;
-                log.info("fractional scale {d}", .{scale});
+                self.setScale(scale);
             },
         }
+    }
+
+    fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Surface) void {
+        switch (event) {
+            .enter => |enter| {
+                const output = enter.output orelse return;
+                for (self.entered_outputs.items) |existing| {
+                    if (existing == output) return;
+                }
+                self.entered_outputs.append(self.connection.allocator, output) catch |err| {
+                    log.warn("failed to track entered output: {}", .{err});
+                    return;
+                };
+                self.updateIntegerScale();
+            },
+            .leave => |leave| {
+                const output = leave.output orelse return;
+                for (self.entered_outputs.items, 0..) |existing, index| {
+                    if (existing != output) continue;
+                    _ = self.entered_outputs.orderedRemove(index);
+                    self.updateIntegerScale();
+                    return;
+                }
+            },
+            .preferred_buffer_scale => |preferred| {
+                if (preferred.factor <= 0) return;
+                self.preferred_buffer_scale = @intCast(preferred.factor);
+                self.updateIntegerScale();
+            },
+            // Keywork renders in the compositor's normal surface
+            // orientation; this event is only an optimization hint.
+            .preferred_buffer_transform => {},
+        }
+    }
+
+    fn updateIntegerScale(self: *Surface) void {
+        if (self.fractional_scale != null) return;
+        if (self.surface.getVersion() < wl.Surface.set_buffer_scale_since_version) {
+            self.setScale(1);
+            return;
+        }
+
+        var scale: u32 = self.preferred_buffer_scale orelse 1;
+        if (self.preferred_buffer_scale == null) {
+            var entered_index: usize = 0;
+            while (entered_index < self.entered_outputs.items.len) {
+                const entered = self.entered_outputs.items[entered_index];
+                const output_scale = for (self.connection.outputs.items) |output_ref| {
+                    if (output_ref.output == entered) break @as(u32, @intCast(@max(1, output_ref.scale)));
+                } else {
+                    _ = self.entered_outputs.orderedRemove(entered_index);
+                    continue;
+                };
+                scale = @max(scale, output_scale);
+                entered_index += 1;
+            }
+        }
+        self.setScale(@floatFromInt(scale));
+    }
+
+    fn forgetOutput(self: *Surface, output: *wl.Output) void {
+        for (self.entered_outputs.items, 0..) |entered, index| {
+            if (entered != output) continue;
+            _ = self.entered_outputs.orderedRemove(index);
+            return;
+        }
+    }
+
+    fn setScale(self: *Surface, scale: f32) void {
+        if (scale == self.scale) return;
+        self.scale = scale;
+        self.scale_changed = true;
+        log.info("surface scale {d}", .{scale});
     }
 
     fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self: *Surface) void {
@@ -342,6 +446,33 @@ pub const Surface = struct {
         }
     }
 };
+
+const ScaleObjects = struct {
+    viewport: ?*wp.Viewport = null,
+    fractional_scale: ?*wp.FractionalScaleV1 = null,
+
+    fn deinit(self: ScaleObjects) void {
+        if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
+        if (self.viewport) |viewport| viewport.destroy();
+    }
+};
+
+/// Fractional scaling is only usable when both protocols are present. A
+/// compositor advertising just one of them falls back to core integer scale.
+fn createScaleObjects(connection: *const Connection, surface: *wl.Surface) ScaleObjects {
+    const viewporter = connection.viewporter orelse return .{};
+    const scale_manager = connection.fractional_scale_manager orelse return .{};
+    const viewport = viewporter.getViewport(surface) catch |err| {
+        log.warn("failed to create surface viewport: {}", .{err});
+        return .{};
+    };
+    const fractional_scale = scale_manager.getFractionalScale(surface) catch |err| {
+        log.warn("failed to create fractional scale object: {}", .{err});
+        viewport.destroy();
+        return .{};
+    };
+    return .{ .viewport = viewport, .fractional_scale = fractional_scale };
+}
 
 /// Requests the preferred decoration mode for xdg toplevels. Without the
 /// manager (or on layer/popup roles) the compositor's default applies,
@@ -461,6 +592,7 @@ pub const Connection = struct {
     seat_capabilities_ctx: ?*anyopaque = null,
     seat_capabilities_fn: ?*const fn (ctx: *anyopaque, capabilities: wl.Seat.Capability) void = null,
     outputs: std.ArrayList(OutputRef) = .empty,
+    surfaces: std.ArrayList(*Surface) = .empty,
     /// Fired when the output set or an output's properties change:
     /// hotplug adds (after the initial done), removals, and mode/scale
     /// updates. Consumers re-read the outputs list.
@@ -505,7 +637,9 @@ pub const Connection = struct {
     }
 
     fn deinitGlobals(self: *Connection) void {
-        if (self.seat) |seat| seat.release();
+        std.debug.assert(self.surfaces.items.len == 0);
+        self.surfaces.deinit(self.allocator);
+        if (self.seat) |seat| destroySeat(seat);
         releaseOutputs(self.allocator, &self.outputs);
         if (self.decoration_manager) |manager| manager.destroy();
         if (self.activation) |activation| activation.destroy();
@@ -516,7 +650,12 @@ pub const Connection = struct {
         if (self.layer_shell) |layer_shell| layer_shell.destroy();
         if (self.wm_base) |wm_base| wm_base.destroy();
         if (self.shm) |shm| shm.destroy();
-        if (self.compositor) |compositor| compositor.destroy();
+        if (self.compositor) |compositor| {
+            if (compositor.getVersion() >= wl.Compositor.release_since_version)
+                compositor.release()
+            else
+                compositor.destroy();
+        }
     }
 
     pub fn takeSeat(self: *Connection) ?*wl.Seat {
@@ -548,8 +687,22 @@ pub const Connection = struct {
     }
 
     fn notifyOutputsChanged(self: *Connection) void {
-        const handler = self.outputs_changed_fn orelse return;
-        handler(self.outputs_changed_ctx.?);
+        for (self.surfaces.items) |surface| surface.updateIntegerScale();
+        if (self.outputs_changed_fn) |handler| handler(self.outputs_changed_ctx.?);
+    }
+
+    fn registerSurface(self: *Connection, surface: *Surface) !void {
+        std.debug.assert(!surface.registered);
+        try self.surfaces.append(self.allocator, surface);
+    }
+
+    fn unregisterSurface(self: *Connection, surface: *Surface) void {
+        for (self.surfaces.items, 0..) |registered, index| {
+            if (registered != surface) continue;
+            _ = self.surfaces.orderedRemove(index);
+            return;
+        }
+        unreachable;
     }
 
     pub fn outputInfoAt(self: *const Connection, index: usize) OutputInfo {
@@ -626,25 +779,35 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
     switch (event) {
         .global => |global| {
             if (std.mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
-                self.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
-            } else if (self.needs.shm and std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
-                self.shm = registry.bind(global.name, wl.Shm, 1) catch return;
+                if (self.compositor == null)
+                    self.compositor = registry.bind(global.name, wl.Compositor, @min(global.version, wl.Compositor.generated_version)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
+                if (self.shm == null)
+                    self.shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
-                self.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
+                if (self.wm_base == null)
+                    self.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, xdg.WmBase.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
-                self.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, @min(global.version, 5)) catch return;
+                if (self.layer_shell == null)
+                    self.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, @min(global.version, zwlr.LayerShellV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
-                self.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
+                if (self.viewporter == null)
+                    self.viewporter = registry.bind(global.name, wp.Viewporter, @min(global.version, wp.Viewporter.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
-                self.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+                if (self.fractional_scale_manager == null)
+                    self.fractional_scale_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, @min(global.version, wp.FractionalScaleManagerV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
-                self.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
+                if (self.cursor_shape_manager == null)
+                    self.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, @min(global.version, wp.CursorShapeManagerV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.DataDeviceManager.interface.name) == .eq) {
-                self.data_device_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
+                if (self.data_device_manager == null)
+                    self.data_device_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, wl.DataDeviceManager.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.ActivationV1.interface.name) == .eq) {
-                self.activation = registry.bind(global.name, xdg.ActivationV1, 1) catch return;
+                if (self.activation == null)
+                    self.activation = registry.bind(global.name, xdg.ActivationV1, @min(global.version, xdg.ActivationV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
-                self.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
+                if (self.decoration_manager == null)
+                    self.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, @min(global.version, zxdg.DecorationManagerV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                 // Single-seat: bind only the first seat. seat_selected outlives
                 // takeSeat() (which nulls self.seat) so later seats stay unbound
@@ -652,14 +815,14 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
                 if (!shouldBindSeat(self.seat_selected)) return;
                 // Install the listener before the roundtrip continues so the
                 // compositor's initial capabilities event is not dropped.
-                const seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+                const seat = registry.bind(global.name, wl.Seat, @min(global.version, wl.Seat.generated_version)) catch return;
                 self.seat = seat;
                 self.seat_selected = true;
                 seat.setListener(*Connection, connectionSeatListener, self);
             } else if (self.needs.outputs and std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
-                const output = registry.bind(global.name, wl.Output, @min(global.version, 4)) catch return;
+                const output = registry.bind(global.name, wl.Output, @min(global.version, wl.Output.generated_version)) catch return;
                 self.outputs.append(self.allocator, .{ .global_name = global.name, .output = output }) catch {
-                    output.release();
+                    destroyOutput(output);
                     return;
                 };
                 output.setListener(*Connection, outputListener, self);
@@ -672,7 +835,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
             for (self.outputs.items, 0..) |output_ref, index| {
                 if (output_ref.global_name != remove.name) continue;
                 if (output_ref.name) |name| self.allocator.free(name);
-                output_ref.output.release();
+                for (self.surfaces.items) |surface| surface.forgetOutput(output_ref.output);
+                destroyOutput(output_ref.output);
                 _ = self.outputs.orderedRemove(index);
                 self.notifyOutputsChanged();
                 break;
@@ -684,9 +848,23 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
 fn releaseOutputs(allocator: std.mem.Allocator, outputs: *std.ArrayList(OutputRef)) void {
     for (outputs.items) |output_ref| {
         if (output_ref.name) |name| allocator.free(name);
-        output_ref.output.release();
+        destroyOutput(output_ref.output);
     }
     outputs.deinit(allocator);
+}
+
+fn destroySeat(seat: *wl.Seat) void {
+    if (seat.getVersion() >= wl.Seat.release_since_version)
+        seat.release()
+    else
+        seat.destroy();
+}
+
+fn destroyOutput(output: *wl.Output) void {
+    if (output.getVersion() >= wl.Output.release_since_version)
+        output.release()
+    else
+        output.destroy();
 }
 
 const TokenRequest = struct {

@@ -51,8 +51,15 @@ pub const Backend = struct {
         errdefer text_renderer_instance.deinit();
 
         const seat = connection.takeSeat();
-        var input = WaylandInput.init(allocator, seat, connection.seatCapabilities(), connection.cursor_shape_manager) catch |err| {
-            if (seat) |wl_seat| wl_seat.release();
+        var input = WaylandInput.init(
+            allocator,
+            seat,
+            connection.seatCapabilities(),
+            connection.cursor_shape_manager,
+            connection.compositor,
+            connection.shm,
+        ) catch |err| {
+            if (seat) |wl_seat| WaylandInput.destroySeat(wl_seat);
             return err;
         };
         errdefer input.deinit();
@@ -102,9 +109,10 @@ pub const Backend = struct {
         try self.windows.append(self.allocator, win);
         errdefer _ = self.windows.pop();
         try self.input.registerTarget(&win.input_target);
+        errdefer self.input.unregisterTarget(&win.input_target);
 
         // Listener contexts must point at the window's final storage.
-        win.protocol.attachListeners();
+        try win.protocol.attachListeners();
         // Commit and flush now so the compositor prepares the initial
         // configure while the caller finishes setup. Events queue until
         // the first dispatch.
@@ -130,8 +138,9 @@ pub const Backend = struct {
         try self.windows.append(self.allocator, win);
         errdefer _ = self.windows.pop();
         try self.input.registerTarget(&win.input_target);
+        errdefer self.input.unregisterTarget(&win.input_target);
 
-        win.protocol.attachListeners();
+        try win.protocol.attachListeners();
         if (self.input.seat) |seat| {
             if (self.input.last_button_press_serial) |serial| win.protocol.grabPopup(seat, serial);
         }
@@ -202,7 +211,10 @@ pub const Backend = struct {
         if (self.allClosed()) return error.WindowClosed;
         // Configure marks a repaint pending, but repaint handlers are not
         // installed yet; the caller paints the initial frame explicitly.
-        for (self.windows.items) |win| _ = win.protocol.flushPending();
+        for (self.windows.items) |win| {
+            _ = win.protocol.flushPending();
+            self.input.setTargetScale(&win.input_target, win.protocol.scale);
+        }
     }
 
     /// Dispatches until `win` receives its initial configure (or closes).
@@ -217,6 +229,7 @@ pub const Backend = struct {
         // Configure marked a repaint pending, but the window's handlers
         // are not installed yet; the caller paints the initial frame.
         _ = win.protocol.flushPending();
+        self.input.setTargetScale(&win.input_target, win.protocol.scale);
     }
 
     pub fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
@@ -349,6 +362,7 @@ pub const Backend = struct {
 
         fn flushPending(self: *Window) void {
             const pending = self.protocol.flushPending();
+            self.backend.input.setTargetScale(&self.input_target, self.protocol.scale);
             if (pending.repaint) {
                 if (self.repaint_handler) |handler| handler(self.repaint_context.?, self.currentSize());
             }
@@ -383,12 +397,11 @@ pub const Backend = struct {
                 const y0: i32 = @max(0, clip.y0);
                 const x1: i32 = @min(@as(i32, width), clip.x1);
                 const y1: i32 = @min(@as(i32, height), clip.y1);
-                protocol.surface.damageBuffer(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
+                protocol.damagePixels(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
             } else {
-                protocol.surface.damageBuffer(0, 0, width, height);
+                protocol.damagePixels(0, 0, width, height);
             }
-            protocol.surface.setBufferScale(1);
-            if (protocol.viewport) |viewport| viewport.setDestination(logical_width, logical_height);
+            protocol.configureBuffer(logical_width, logical_height);
             protocol.surface.commit();
             buffer.busy = true;
             self.frame_counter += 1;
