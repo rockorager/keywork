@@ -1944,8 +1944,6 @@ pub fn updateElementTreeScoped(
     switch (widget.*) {
         .keyed => |keyed_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, keyed_widget.child, constraints);
-            if (element.key) |old_key| destroyKey(allocator, old_key);
-            element.key = try cloneKey(allocator, keyed_widget.key);
         },
         .text => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
         .spacer => try replaceElementWidget(allocator, element, widget.*),
@@ -2335,9 +2333,17 @@ fn rebuildDirtyChildren(
 fn canUpdateElement(element: *const Element, widget: *const Widget) bool {
     if (element.kind != elementKindForWidget(widget.*)) return false;
     return switch (widget.*) {
-        .stateful => |stateful_widget| element.widget.stateful.type_token == stateful_widget.type_token,
+        .keyed => |keyed_widget| if (element.key) |key| keysEqual(key, keyed_widget.key) else false,
+        .stateful => |stateful_widget| statefulTypesEqual(element.widget.stateful, stateful_widget),
         else => true,
     };
+}
+
+fn statefulTypesEqual(a: Widget.Stateful, b: Widget.Stateful) bool {
+    if (a.type_token != null or b.type_token != null) {
+        return a.type_token != null and b.type_token != null and a.type_token.? == b.type_token.?;
+    }
+    return a.vtable == b.vtable;
 }
 
 fn elementKindForWidget(widget: Widget) Element.Kind {
@@ -5158,6 +5164,132 @@ test "stateful widgets with different type tokens never share state" {
     // state is disposed and fresh state created, never silently reused.
     const second_widget = second.widget();
     try updateElementTree(std.testing.allocator, &element, &second_widget, .{ .max_width = 200, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 2), created);
+    try std.testing.expectEqual(@as(usize, 1), destroyed);
+}
+
+test "tokenless stateful widgets use vtable identity" {
+    const Tokenless = struct {
+        created: *usize,
+        destroyed: *usize,
+
+        const State = struct {};
+        const first_vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = buildFirst,
+            .destroy_state = destroyState,
+        };
+        const second_vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = buildSecond,
+            .destroy_state = destroyState,
+        };
+
+        fn widget(self: *const @This(), vtable: *const Widget.Stateful.VTable) Widget {
+            return .{ .stateful = .{ .ptr = self, .vtable = vtable } };
+        }
+
+        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.created.* += 1;
+            const state = try allocator.create(State);
+            state.* = .{};
+            return state;
+        }
+
+        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
+
+        fn buildFirst(_: *const anyopaque, _: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            return .{ .text = .{ .value = "first" } };
+        }
+
+        fn buildSecond(_: *const anyopaque, _: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            return .{ .text = .{ .value = "second" } };
+        }
+
+        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroyed.* += 1;
+            allocator.destroy(@as(*State, @ptrCast(@alignCast(state_ptr))));
+        }
+    };
+
+    var created: usize = 0;
+    var destroyed: usize = 0;
+    const stateful: Tokenless = .{ .created = &created, .destroyed = &destroyed };
+    const first = stateful.widget(&Tokenless.first_vtable);
+    var element = try buildElementTree(std.testing.allocator, &first, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(std.testing.allocator, &element);
+    const first_state = element.state.?;
+
+    const matching = stateful.widget(&Tokenless.first_vtable);
+    try updateElementTree(std.testing.allocator, &element, &matching, .{ .max_width = 200, .max_height = 80 });
+    try std.testing.expectEqual(first_state, element.state.?);
+    try std.testing.expectEqual(@as(usize, 1), created);
+    try std.testing.expectEqual(@as(usize, 0), destroyed);
+
+    const different = stateful.widget(&Tokenless.second_vtable);
+    try updateElementTree(std.testing.allocator, &element, &different, .{ .max_width = 200, .max_height = 80 });
+    try std.testing.expectEqual(@as(usize, 2), created);
+    try std.testing.expectEqual(@as(usize, 1), destroyed);
+    try std.testing.expectEqualStrings("second", element.children[0].widget.text.value);
+}
+
+test "changing a nested key replaces state" {
+    const Counted = struct {
+        created: *usize,
+        destroyed: *usize,
+
+        const State = struct {};
+        const vtable: Widget.Stateful.VTable = .{
+            .create_state = createState,
+            .update = update,
+            .build = build,
+            .destroy_state = destroyState,
+        };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .stateful = .{ .ptr = self, .vtable = &vtable } };
+        }
+
+        fn createState(ptr: *const anyopaque, allocator: std.mem.Allocator) !*anyopaque {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.created.* += 1;
+            const state = try allocator.create(State);
+            state.* = .{};
+            return state;
+        }
+
+        fn update(_: *const anyopaque, _: *anyopaque, _: std.mem.Allocator, _: Widget.BuildContext) !void {}
+
+        fn build(_: *const anyopaque, _: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            return .{ .text = .{ .value = "stateful" } };
+        }
+
+        fn destroyState(ptr: *const anyopaque, state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            self.destroyed.* += 1;
+            allocator.destroy(@as(*State, @ptrCast(@alignCast(state_ptr))));
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const constraints: Constraints = .{ .max_width = 200, .max_height = 80 };
+    var created: usize = 0;
+    var destroyed: usize = 0;
+    const counted: Counted = .{ .created = &created, .destroyed = &destroyed };
+    const stateful = counted.widget();
+    const first_keyed: Widget = .{ .keyed = .{ .key = .{ .string = "first" }, .child = &stateful } };
+    const first: Widget = .{ .box = .{ .child = &first_keyed } };
+    var element = try buildElementTree(allocator, &first, constraints);
+    defer destroyElementTree(allocator, &element);
+
+    const second_keyed: Widget = .{ .keyed = .{ .key = .{ .string = "second" }, .child = &stateful } };
+    const second: Widget = .{ .box = .{ .child = &second_keyed } };
+    try updateElementTree(allocator, &element, &second, constraints);
+
     try std.testing.expectEqual(@as(usize, 2), created);
     try std.testing.expectEqual(@as(usize, 1), destroyed);
 }
