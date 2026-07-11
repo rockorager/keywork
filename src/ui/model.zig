@@ -2436,14 +2436,23 @@ fn updateKeyedLinearElement(
     @memset(used, false);
 
     const new_children = try allocator.alloc(Element, child_widgets.len);
-    var initialized: usize = 0;
+    for (new_children) |*child| {
+        child.* = .{ .kind = .spacer, .widget = .{ .spacer = .{ .flex = 0 } } };
+    }
     errdefer {
-        for (new_children[0..initialized]) |*child| destroyElementTree(allocator, child);
-        allocator.free(new_children);
         for (old_children, 0..) |*old_child, index| {
             if (!used[index]) destroyElementTree(allocator, old_child);
         }
         allocator.free(old_children);
+        // Reconciliation may already have updated moved children. Keep every
+        // new slot valid and attach the partial result so an error never
+        // leaves element.children pointing at the freed old slice.
+        element.children = new_children;
+        if (element.render_node) |node| {
+            allocator.free(node.children);
+            node.children = &.{};
+            node.needs_layout = true;
+        }
     }
 
     for (child_widgets, 0..) |*child_widget, index| {
@@ -2452,19 +2461,16 @@ fn updateKeyedLinearElement(
                 used[old_index] = true;
                 new_children[index] = old_children[old_index];
                 try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
-                initialized += 1;
                 continue;
             }
         } else if (index < old_children.len and !used[index] and old_children[index].key == null) {
             used[index] = true;
             new_children[index] = old_children[index];
             try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
-            initialized += 1;
             continue;
         }
 
         new_children[index] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
-        initialized += 1;
     }
 
     for (old_children, 0..) |*old_child, index| {
@@ -5371,6 +5377,86 @@ test "keyed linear update matches children by key" {
     try std.testing.expectEqualStrings("C", element.children[1].children[0].widget.text.value);
     try std.testing.expectEqualStrings("a", element.children[2].key.?.string);
     try std.testing.expectEqualStrings("A2", element.children[2].children[0].widget.text.value);
+}
+
+test "keyed linear update retains valid ownership after child update error" {
+    const FallibleComponent = struct {
+        value: []const u8,
+        fail: bool = false,
+
+        const vtable: Widget.Component.VTable = .{ .build = build };
+
+        fn widget(self: *const @This()) Widget {
+            return .{ .component = .{ .ptr = self, .vtable = &vtable } };
+        }
+
+        fn build(ptr: *const anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.ExpectedUpdateFailure;
+            return .{ .text = .{ .value = self.value } };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const constraints: Constraints = .{ .max_width = 200, .max_height = 80 };
+    const initial_component: FallibleComponent = .{ .value = "old" };
+    const old_text: Widget = .{ .text = .{ .value = "removed" } };
+    const initial_component_widget = initial_component.widget();
+    const initial_children = [_]Widget{
+        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &initial_component_widget } },
+        .{ .keyed = .{ .key = .{ .string = "b" }, .child = &old_text } },
+    };
+    const initial: Widget = .{ .column = .{ .children = &initial_children } };
+    var element = try buildElementTree(allocator, &initial, constraints);
+    defer destroyElementTree(allocator, &element);
+    _ = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    const failing_component: FallibleComponent = .{ .value = "new", .fail = true };
+    const failing_component_widget = failing_component.widget();
+    const new_text: Widget = .{ .text = .{ .value = "new child" } };
+    const failing_children = [_]Widget{
+        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &failing_component_widget } },
+        .{ .keyed = .{ .key = .{ .string = "c" }, .child = &new_text } },
+    };
+    const failing: Widget = .{ .column = .{ .children = &failing_children } };
+    try std.testing.expectError(error.ExpectedUpdateFailure, updateElementTree(allocator, &element, &failing, constraints));
+
+    try std.testing.expectEqual(@as(usize, 2), element.children.len);
+    try std.testing.expectEqualStrings("a", element.children[0].key.?.string);
+    try std.testing.expectEqual(@as(Element.Kind, .spacer), element.children[1].kind);
+    try std.testing.expectEqual(@as(usize, 0), element.render_node.?.children.len);
+
+    const recovered_component: FallibleComponent = .{ .value = "recovered" };
+    const recovered_component_widget = recovered_component.widget();
+    const recovered_children = [_]Widget{
+        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &recovered_component_widget } },
+        .{ .keyed = .{ .key = .{ .string = "c" }, .child = &new_text } },
+    };
+    const recovered: Widget = .{ .column = .{ .children = &recovered_children } };
+    try updateElementTree(allocator, &element, &recovered, constraints);
+    const root = try layoutElement(allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    try std.testing.expectEqual(@as(usize, 2), root.children.len);
+    try std.testing.expectEqualStrings("recovered", root.children[0].children[0].children[0].text.?);
+    try std.testing.expectEqualStrings("new child", root.children[1].children[0].text.?);
+
+    // A newly inserted keyed child can also fail while being built, after an
+    // earlier moved child was already updated. Its preinitialized slot stays
+    // valid and owns no resources.
+    const updated_component: FallibleComponent = .{ .value = "updated" };
+    const updated_component_widget = updated_component.widget();
+    const newly_failing_component: FallibleComponent = .{ .value = "never built", .fail = true };
+    const newly_failing_component_widget = newly_failing_component.widget();
+    const build_failing_children = [_]Widget{
+        .{ .keyed = .{ .key = .{ .string = "a" }, .child = &updated_component_widget } },
+        .{ .keyed = .{ .key = .{ .string = "d" }, .child = &newly_failing_component_widget } },
+    };
+    const build_failing: Widget = .{ .column = .{ .children = &build_failing_children } };
+    try std.testing.expectError(error.ExpectedUpdateFailure, updateElementTree(allocator, &element, &build_failing, constraints));
+
+    try std.testing.expectEqualStrings("updated", element.children[0].children[0].children[0].widget.text.value);
+    try std.testing.expectEqual(@as(Element.Kind, .spacer), element.children[1].kind);
+    try std.testing.expectEqual(@as(usize, 0), element.render_node.?.children.len);
 }
 
 test "render object widget owns custom layout paint and hit testing" {
