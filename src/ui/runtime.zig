@@ -2095,6 +2095,81 @@ test "shortcut invokes ambient action outside text input focus" {
     try std.testing.expectEqualStrings(" ", renderedInputText(runtime.root.?).?);
 }
 
+test "bound tab fires its shortcut instead of traversal; shift-tab still traverses" {
+    const TestApp = struct {
+        actions: usize = 0,
+
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var input = keywork.widgets.textInput("input", "", "placeholder");
+            input.text_input.autofocus = true;
+            const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = ignoreTap });
+            const children = [_]keywork.Widget{ input, button };
+            const column = try keywork.widgets.column(scope.allocator, &children, 4);
+            const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{
+                .{ .key = .tab, .intent = .action("activate") },
+            };
+            const action_bindings = [_]keywork.Widget.ActionBinding{.{ .id = "activate", .callback = .{ .ptr = self, .call_fn = activate } }};
+            const shortcuts = try keywork.widgets.shortcuts(scope.allocator, &shortcut_bindings, column);
+            return keywork.widgets.actions(scope.allocator, &action_bindings, shortcuts);
+        }
+
+        fn activate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.actions += 1;
+        }
+
+        fn ignoreTap(_: *anyopaque, _: keywork.TapEvent) !void {}
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+
+    // Bound plain tab fires the shortcut and leaves focus alone, even
+    // while the text input is focused.
+    try runtime.keyInput(.{ .tab = .{} });
+    try std.testing.expectEqual(@as(usize, 1), app.actions);
+    try std.testing.expectEqualStrings("input", runtime.focused_id.?);
+
+    // Shift-tab never matches a tab shortcut; it keeps reverse traversal.
+    try runtime.keyInput(.{ .tab = .{ .reverse = true } });
+    try std.testing.expectEqual(@as(usize, 1), app.actions);
+    try std.testing.expectEqualStrings("button", runtime.focused_id.?);
+}
+
 test "non-editing shortcuts fire while a text input is focused" {
     const TestApp = struct {
         actions: usize = 0,

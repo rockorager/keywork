@@ -259,6 +259,7 @@ pub const ShortcutKey = enum {
     enter,
     space,
     backspace,
+    tab,
     escape,
     up,
     down,

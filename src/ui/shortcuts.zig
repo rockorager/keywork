@@ -26,7 +26,10 @@ pub fn shortcutKeyForInput(input: KeyInput) ?ShortcutKey {
         .escape => .escape,
         .up => .up,
         .down => .down,
-        .text, .tab => null,
+        // Plain tab may be bound as a shortcut (unbound it falls through
+        // to focus traversal); shift-tab always keeps reverse traversal.
+        .tab => |tab| if (tab.reverse) null else .tab,
+        .text => null,
     };
 }
 
@@ -34,7 +37,7 @@ pub fn shortcutKeyForInput(input: KeyInput) ?ShortcutKey {
 /// input owns focus; editing keys must keep reaching the input.
 pub fn shortcutAllowedWhileEditing(key: ShortcutKey) bool {
     return switch (key) {
-        .enter, .escape, .up, .down => true,
+        .enter, .tab, .escape, .up, .down => true,
         .space, .backspace => false,
     };
 }

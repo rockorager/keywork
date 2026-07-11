@@ -1289,6 +1289,7 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
     if (std.mem.eql(u8, value, "enter")) return .enter;
     if (std.mem.eql(u8, value, "space")) return .space;
     if (std.mem.eql(u8, value, "backspace")) return .backspace;
+    if (std.mem.eql(u8, value, "tab")) return .tab;
     if (std.mem.eql(u8, value, "escape")) return .escape;
     if (std.mem.eql(u8, value, "up")) return .up;
     if (std.mem.eql(u8, value, "down")) return .down;
