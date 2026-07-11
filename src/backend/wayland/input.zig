@@ -119,7 +119,7 @@ pub const Target = struct {
 /// Multiplier for finger and continuous axis deltas. libinput's touchpad
 /// deltas track finger travel 1:1, which feels sluggish for scrolling
 /// content; toolkits conventionally boost them.
-const touchpad_scroll_speed = 2.0;
+const touchpad_scroll_speed = 3.0;
 
 /// Kinetic scroll tuning. Velocity decays exponentially per millisecond,
 /// matching the feel of common toolkits.
