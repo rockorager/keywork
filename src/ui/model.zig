@@ -1841,6 +1841,7 @@ fn buildLinearElementTree(
     constraints: Constraints,
 ) anyerror!Element {
     std.debug.assert(kind == .row or kind == .column);
+    std.debug.assert(widgetKeysAreUnique(child_widgets));
 
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
@@ -2408,43 +2409,44 @@ fn updateLinearElement(
     child_widgets: []const Widget,
     constraints: Constraints,
 ) anyerror!void {
-    if (hasKeyedChildren(element.children) or hasKeyedWidgets(child_widgets)) {
-        try updateKeyedLinearElement(allocator, scope, element, widget, child_widgets, constraints);
-        return;
-    }
-
-    if (element.children.len != child_widgets.len) {
-        var replacement = try buildElementTreeScoped(allocator, scope, &widget, constraints);
-        errdefer destroyElementTree(allocator, &replacement);
-        destroyElementTree(allocator, element);
-        element.* = replacement;
-        return;
-    }
+    std.debug.assert(widgetKeysAreUnique(child_widgets));
 
     var element_widget = try cloneWidgetForElement(allocator, widget);
     errdefer destroyElementWidget(allocator, &element_widget);
-    for (child_widgets, 0..) |*child_widget, index| {
-        try updateElementTreeScoped(allocator, scope, &element.children[index], child_widget, constraints);
-    }
-    destroyElementWidget(allocator, &element.widget);
-    element.widget = element_widget;
-}
 
-fn updateKeyedLinearElement(
-    allocator: std.mem.Allocator,
-    scope: *BuildScope,
-    element: *Element,
-    widget: Widget,
-    child_widgets: []const Widget,
-    constraints: Constraints,
-) !void {
-    var element_widget = try cloneWidgetForElement(allocator, widget);
-    errdefer destroyElementWidget(allocator, &element_widget);
+    if (childrenCanUpdateInPlace(element.children, child_widgets)) {
+        for (child_widgets, 0..) |*child_widget, index| {
+            try updateElementTreeScoped(allocator, scope, &element.children[index], child_widget, constraints);
+        }
+        destroyElementWidget(allocator, &element.widget);
+        element.widget = element_widget;
+        return;
+    }
 
     const old_children = element.children;
     const used = try allocator.alloc(bool, old_children.len);
     defer allocator.free(used);
     @memset(used, false);
+
+    var old_top: usize = 0;
+    var new_top: usize = 0;
+    while (old_top < old_children.len and new_top < child_widgets.len and canUpdateElement(&old_children[old_top], &child_widgets[new_top])) {
+        old_top += 1;
+        new_top += 1;
+    }
+
+    var old_bottom = old_children.len;
+    var new_bottom = child_widgets.len;
+    while (old_bottom > old_top and new_bottom > new_top and canUpdateElement(&old_children[old_bottom - 1], &child_widgets[new_bottom - 1])) {
+        old_bottom -= 1;
+        new_bottom -= 1;
+    }
+
+    var keyed_children: KeyedChildMap = .empty;
+    defer keyed_children.deinit(allocator);
+    for (old_children[old_top..old_bottom], old_top..) |old_child, index| {
+        if (old_child.key) |key| try keyed_children.put(allocator, key, index);
+    }
 
     const new_children = try allocator.alloc(Element, child_widgets.len);
     for (new_children) |*child| {
@@ -2466,22 +2468,36 @@ fn updateKeyedLinearElement(
         }
     }
 
-    for (child_widgets, 0..) |*child_widget, index| {
+    for (child_widgets[0..new_top], 0..) |*child_widget, index| {
+        used[index] = true;
+        new_children[index] = old_children[index];
+        try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
+    }
+
+    for (child_widgets[new_top..new_bottom], new_top..) |*child_widget, index| {
         if (widgetKey(child_widget.*)) |key| {
-            if (findElementByKey(old_children, used, key)) |old_index| {
+            if (keyed_children.get(key)) |old_index| {
+                if (used[old_index] or !canUpdateElement(&old_children[old_index], child_widget)) {
+                    new_children[index] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
+                    continue;
+                }
                 used[old_index] = true;
                 new_children[index] = old_children[old_index];
                 try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
                 continue;
             }
-        } else if (index < old_children.len and !used[index] and old_children[index].key == null) {
-            used[index] = true;
-            new_children[index] = old_children[index];
-            try updateElementTreeScoped(allocator, scope, &new_children[index], child_widget, constraints);
-            continue;
         }
 
         new_children[index] = try buildElementTreeScoped(allocator, scope, child_widget, constraints);
+    }
+
+    const suffix_len = child_widgets.len - new_bottom;
+    for (0..suffix_len) |offset| {
+        const old_index = old_bottom + offset;
+        const new_index = new_bottom + offset;
+        used[old_index] = true;
+        new_children[new_index] = old_children[old_index];
+        try updateElementTreeScoped(allocator, scope, &new_children[new_index], &child_widgets[new_index], constraints);
     }
 
     for (old_children, 0..) |*old_child, index| {
@@ -2493,23 +2509,43 @@ fn updateKeyedLinearElement(
     element.children = new_children;
 }
 
-fn hasKeyedChildren(children: []const Element) bool {
-    for (children) |child| if (child.key != null) return true;
-    return false;
-}
-
-fn hasKeyedWidgets(items: []const Widget) bool {
-    for (items) |widget| if (widgetKey(widget) != null) return true;
-    return false;
-}
-
-fn findElementByKey(children: []const Element, used: []const bool, key: Widget.Key) ?usize {
-    for (children, 0..) |child, index| {
-        if (used[index]) continue;
-        const child_key = child.key orelse continue;
-        if (keysEqual(child_key, key)) return index;
+fn childrenCanUpdateInPlace(children: []const Element, widgets_to_update: []const Widget) bool {
+    if (children.len != widgets_to_update.len) return false;
+    for (children, widgets_to_update) |*child, *widget| {
+        if (!canUpdateElement(child, widget)) return false;
     }
-    return null;
+    return true;
+}
+
+const KeyContext = struct {
+    pub fn hash(_: @This(), key: Widget.Key) u64 {
+        return switch (key) {
+            .string => |value| std.hash.Wyhash.hash(0, value),
+            .integer => |value| std.hash.Wyhash.hash(1, std.mem.asBytes(&value)),
+        };
+    }
+
+    pub fn eql(_: @This(), a: Widget.Key, b: Widget.Key) bool {
+        return keysEqual(a, b);
+    }
+};
+
+const KeyedChildMap = std.HashMapUnmanaged(
+    Widget.Key,
+    usize,
+    KeyContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn widgetKeysAreUnique(items: []const Widget) bool {
+    for (items, 0..) |item, index| {
+        const key = widgetKey(item) orelse continue;
+        for (items[index + 1 ..]) |other| {
+            const other_key = widgetKey(other) orelse continue;
+            if (keysEqual(key, other_key)) return false;
+        }
+    }
+    return true;
 }
 
 fn widgetKey(widget: Widget) ?Widget.Key {
@@ -5514,6 +5550,43 @@ test "element update reuses matching children and replaces shape changes" {
     try std.testing.expectEqual(@as(usize, 1), element.children.len);
     try std.testing.expectEqual(@as(f32, 1), element.widget.column.gap);
     try std.testing.expectEqualStrings("E", element.children[0].widget.text.value);
+}
+
+test "linear update preserves compatible unkeyed suffix across insertion and removal" {
+    const allocator = std.testing.allocator;
+    const constraints: Constraints = .{ .max_width = 300, .max_height = 120 };
+
+    const input: Widget = .{ .text_input = .{
+        .id = "query",
+        .focus_node = .named("query"),
+        .value = "initial",
+        .placeholder = "Search",
+    } };
+    const tail: Widget = .{ .text = .{ .value = "tail" } };
+    const initial_children = [_]Widget{ input, tail };
+    const initial: Widget = .{ .column = .{ .children = &initial_children } };
+    var element = try buildElementTree(allocator, &initial, constraints);
+    defer destroyElementTree(allocator, &element);
+
+    const input_state = textInputState(&element.children[0]);
+    input_state.text.clearRetainingCapacity();
+    try input_state.text.appendSlice(allocator, "edited");
+
+    const inserted_text: Widget = .{ .text = .{ .value = "inserted" } };
+    const inserted_box: Widget = .{ .box = .{ .child = &inserted_text } };
+    const inserted_children = [_]Widget{ inserted_box, input, tail };
+    const inserted: Widget = .{ .column = .{ .children = &inserted_children } };
+    try updateElementTree(allocator, &element, &inserted, constraints);
+
+    try std.testing.expectEqual(input_state, textInputState(&element.children[1]));
+    try std.testing.expectEqualStrings("edited", input_state.text.items);
+
+    const removed_children = [_]Widget{ input, tail };
+    const removed: Widget = .{ .column = .{ .children = &removed_children } };
+    try updateElementTree(allocator, &element, &removed, constraints);
+
+    try std.testing.expectEqual(input_state, textInputState(&element.children[0]));
+    try std.testing.expectEqualStrings("edited", input_state.text.items);
 }
 
 test "keyed linear update matches children by key" {
