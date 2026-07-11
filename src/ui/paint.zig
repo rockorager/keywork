@@ -84,6 +84,7 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
         .text => if (node.text) |value| {
             try display_list.text(allocator, .{ .x = node.rect.x, .y = node.rect.y }, value, node.text_style);
         },
+        .spinner => try paintSpinner(allocator, node, display_list, scale),
         .scroll, .list => try display_list.pushClip(allocator, node.rect),
         else => {},
     }
@@ -98,8 +99,44 @@ pub fn paintScaled(allocator: std.mem.Allocator, node: *const RenderNode, displa
     }
 }
 
+const spinner_dots = 8;
+/// Floor for trailing dot brightness so the whole ring stays visible.
+const spinner_trail_floor: f32 = 0.15;
+
+/// A ring of dots at fixed positions; the sweep phase picks the brightest
+/// dot and brightness trails off behind it. Dot positions never move, so
+/// the spinner needs no path stroking or transforms.
+fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
+    std.debug.assert(node.spinner_progress >= 0 and node.spinner_progress < 1);
+    const size = @min(node.rect.width, node.rect.height);
+    if (size <= 0) return;
+    const dot_radius = size * 0.1;
+    const ring_radius = size / 2 - dot_radius;
+    const center_x = node.rect.x + node.rect.width / 2;
+    const center_y = node.rect.y + node.rect.height / 2;
+
+    for (0..spinner_dots) |index| {
+        const fraction = @as(f32, @floatFromInt(index)) / spinner_dots;
+        // Dots start at 12 o'clock and the sweep runs clockwise; a dot is
+        // brightest as the sweep passes it and dims with age behind it.
+        const angle = fraction * std.math.tau - std.math.tau / 4.0;
+        const age = @mod(node.spinner_progress - fraction + 1, 1);
+        const intensity = spinner_trail_floor + (1 - spinner_trail_floor) * (1 - age);
+        var color = node.foreground;
+        color.a = @intFromFloat(@round(@as(f32, @floatFromInt(color.a)) * intensity));
+        if (color.a == 0) continue;
+        const dot: Rect = .{
+            .x = center_x + ring_radius * @cos(angle) - dot_radius,
+            .y = center_y + ring_radius * @sin(angle) - dot_radius,
+            .width = dot_radius * 2,
+            .height = dot_radius * 2,
+        };
+        try paintRoundedBox(allocator, display_list, dot, color, null, 0, dot_radius, scale);
+    }
+}
+
 pub const scrollbar_thickness: f32 = 6;
-const scrollbar_margin: f32 = 3;
+pub const scrollbar_margin: f32 = 3;
 const scrollbar_min_thumb: f32 = 12;
 pub const scrollbar_color: Color = Color.argb(0xb4, 0x80, 0x80, 0x88);
 /// Extra pointer slop around the painted thumb so the thin bar is
@@ -166,12 +203,28 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
 /// pill-shaped overlays painted over the content's edge.
 fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, scale: f32) !void {
     std.debug.assert(node.kind.isViewport());
+    const color = fadedScrollbarColor(node.scrollbar_alpha) orelse return;
     inline for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
         if (scrollbarGeometry(node, axis)) |geometry| {
-            try paintRoundedBox(allocator, display_list, geometry.thumb, scrollbar_color, null, 0, scrollbar_thickness / 2, scale);
+            try paintRoundedBox(allocator, display_list, geometry.thumb, color, null, 0, scrollbar_thickness / 2, scale);
         }
     }
 }
+
+/// Thumb color at the node's current fade alpha; null when it has faded
+/// out entirely and nothing should paint.
+fn fadedScrollbarColor(alpha: f32) ?Color {
+    std.debug.assert(alpha >= 0 and alpha <= 1);
+    const scaled: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(scrollbar_color.a)) * alpha));
+    if (scaled == 0) return null;
+    var color = scrollbar_color;
+    color.a = scaled;
+    return color;
+}
+
+/// Alpha below which a fading thumb stops accepting pointer grabs, so a
+/// nearly invisible thumb does not steal clicks from content beneath it.
+const scrollbar_hit_min_alpha: f32 = 0.1;
 
 pub const ScrollbarThumbHit = struct {
     id: []const u8,
@@ -190,6 +243,7 @@ pub fn hitTestScrollbarThumb(node: *const RenderNode, point: Point) ?ScrollbarTh
         if (hitTestScrollbarThumb(node.children[index], point)) |hit| return hit;
     }
     if (!node.kind.isViewport()) return null;
+    if (node.scrollbar_alpha < scrollbar_hit_min_alpha) return null;
     const id = node.scroll_id orelse return null;
     for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
         const geometry = scrollbarGeometry(node, axis) orelse continue;

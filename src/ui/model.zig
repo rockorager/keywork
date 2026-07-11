@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const display = @import("display.zig");
+const animation = @import("animation.zig");
 
 pub const Color = types.Color;
 pub const colors = types.colors;
@@ -50,6 +51,7 @@ pub const Widget = union(enum) {
     list: List,
     text_input: TextInput,
     separator: Separator,
+    spinner: Spinner,
     row: Children,
     column: Children,
     spacer: Spacer,
@@ -376,6 +378,15 @@ pub const Widget = union(enum) {
         axis: Axis = .horizontal,
 
         pub const Axis = enum { horizontal, vertical };
+    };
+
+    /// Indeterminate activity indicator: a ring of dots whose highlight
+    /// sweeps once per period. Its presence keeps per-frame demand
+    /// registered, so it only belongs in trees doing visible work.
+    pub const Spinner = struct {
+        size: f32 = 20,
+        color: ?Color = null,
+        period_ms: u32 = 900,
     };
 
     pub const Children = struct {
@@ -874,6 +885,10 @@ pub const widgets = struct {
         return .{ .spacer = .{ .flex = @max(0, flex) } };
     }
 
+    pub fn spinner(options: Widget.Spinner) Widget {
+        return .{ .spinner = options };
+    }
+
     pub fn sized(allocator: std.mem.Allocator, child: Widget, width: ?f32, height: ?f32) !Widget {
         return .{ .sized = .{ .child = try Widget.alloc(allocator, child), .width = width, .height = height } };
     }
@@ -912,6 +927,7 @@ pub const Element = struct {
         list,
         text_input,
         separator,
+        spinner,
         row,
         column,
         spacer,
@@ -1104,6 +1120,12 @@ pub const RenderNode = struct {
     box_radius: f32 = 0,
     separator_axis: Widget.Separator.Axis = .horizontal,
     separator_margin: f32 = 0,
+    /// Scrollbar thumb opacity for viewport nodes, copied from the scroll
+    /// state at layout and written directly by animation ticks between
+    /// layouts. Zero hides the thumb from painting and pointer hits.
+    scrollbar_alpha: f32 = 1,
+    /// Sweep phase of a spinner node in 0..1.
+    spinner_progress: f32 = 0,
     placeholder: ?[]const u8 = null,
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
@@ -1135,6 +1157,7 @@ pub const RenderNode = struct {
         list,
         text_input,
         separator,
+        spinner,
         row,
         column,
         spacer,
@@ -1176,10 +1199,13 @@ pub fn textInputState(element: *Element) *TextInputState {
 }
 
 /// Scroll position owned by a scroll element; clamped to the content
-/// extent during layout.
+/// extent during layout. The scrollbar thumb rests hidden and is revealed
+/// by scroll activity, fading back out on the shared fade timeline.
 pub const ScrollState = struct {
     offset_x: f32 = 0,
     offset_y: f32 = 0,
+    scrollbar_alpha: f32 = 0,
+    scrollbar_fade: animation.Timeline = .{},
 };
 
 pub fn scrollState(element: *Element) *ScrollState {
@@ -1201,11 +1227,121 @@ pub const ListState = struct {
     /// triggers the follow scroll, so free scrolling in between is left
     /// alone.
     last_selected: ?usize = null,
+    scrollbar_alpha: f32 = 0,
+    scrollbar_fade: animation.Timeline = .{},
 };
 
 pub fn listState(element: *Element) *ListState {
     std.debug.assert(element.kind == .list);
     return @ptrCast(@alignCast(element.state.?));
+}
+
+/// Free-running sweep owned by a spinner element. The phase baseline is
+/// captured on the first animation tick, so a spinner built in a tree
+/// that never ticks (popup measurement, headless snapshots) stays inert.
+pub const SpinnerState = struct {
+    start_ns: ?u64 = null,
+    progress: f32 = 0,
+};
+
+pub fn spinnerState(element: *Element) *SpinnerState {
+    std.debug.assert(element.kind == .spinner);
+    return @ptrCast(@alignCast(element.state.?));
+}
+
+/// Advances every animation in the tree to `now_ns`, writing new values
+/// into the retained render nodes and accumulating damage directly:
+/// animation ticks repaint without rebuilding or re-laying-out anything.
+/// Returns true while any animation still demands another frame.
+pub fn advanceAnimations(element: *Element, now_ns: u64) bool {
+    var active = switch (element.kind) {
+        .scroll => blk: {
+            const state = scrollState(element);
+            break :blk advanceScrollbarFade(&state.scrollbar_fade, &state.scrollbar_alpha, element.render_node, now_ns);
+        },
+        .list => blk: {
+            const state = listState(element);
+            break :blk advanceScrollbarFade(&state.scrollbar_fade, &state.scrollbar_alpha, element.render_node, now_ns);
+        },
+        .spinner => blk: {
+            const state = spinnerState(element);
+            const start = state.start_ns orelse now_ns;
+            state.start_ns = start;
+            const period_ns = @as(u64, element.widget.spinner.period_ms) * std.time.ns_per_ms;
+            state.progress = animation.repeatingPhase(start, now_ns, period_ns);
+            if (element.render_node) |node| {
+                node.spinner_progress = state.progress;
+                addRenderDamage(node, node.rect);
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+    for (element.children) |*child| {
+        if (advanceAnimations(child, now_ns)) active = true;
+    }
+    return active;
+}
+
+/// Whether any animation in the tree demands another frame. Queried after
+/// rebuilds so animations created by this frame's build register demand
+/// even though they were not advanced this frame.
+pub fn anyAnimationsActive(element: *Element) bool {
+    const active = switch (element.kind) {
+        .scroll => scrollState(element).scrollbar_fade.active,
+        .list => listState(element).scrollbar_fade.active,
+        .spinner => true,
+        else => false,
+    };
+    if (active) return true;
+    for (element.children) |*child| {
+        if (anyAnimationsActive(child)) return true;
+    }
+    return false;
+}
+
+/// Restarts the reveal-then-fade cycle in response to scroll activity.
+pub fn revealScrollbar(element: *Element, now_ns: u64) void {
+    switch (element.kind) {
+        .scroll => {
+            const state = scrollState(element);
+            state.scrollbar_alpha = 1;
+            state.scrollbar_fade.start(now_ns, animation.scrollbar_fade_total_ns);
+        },
+        .list => {
+            const state = listState(element);
+            state.scrollbar_alpha = 1;
+            state.scrollbar_fade.start(now_ns, animation.scrollbar_fade_total_ns);
+        },
+        else => unreachable,
+    }
+}
+
+fn advanceScrollbarFade(timeline: *animation.Timeline, alpha: *f32, render_node: ?*RenderNode, now_ns: u64) bool {
+    if (!timeline.active) return false;
+    alpha.* = animation.scrollbarFadeAlpha(timeline.advance(now_ns));
+    const node = render_node orelse return timeline.active;
+    node.scrollbar_alpha = alpha.*;
+    // Damage only the edge strips the thumbs occupy, and only for axes
+    // that overflow; the fade repaints without touching the content.
+    const strip = scrollbar_thickness + scrollbar_margin * 2;
+    if (node.scroll_content.height > node.rect.height) {
+        addRenderDamage(node, .{
+            .x = node.rect.x + node.rect.width - strip,
+            .y = node.rect.y,
+            .width = strip,
+            .height = node.rect.height,
+        });
+    }
+    if (node.scroll_content.width > node.rect.width) {
+        addRenderDamage(node, .{
+            .x = node.rect.x,
+            .y = node.rect.y + node.rect.height - strip,
+            .width = node.rect.width,
+            .height = strip,
+        });
+    }
+    return timeline.active;
 }
 
 const list_buffer_items = 2;
@@ -1420,6 +1556,12 @@ pub fn buildElementTreeScoped(
             };
         },
         .separator => return .{ .kind = .separator, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) },
+        .spinner => {
+            const element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
+            const state = try allocator.create(SpinnerState);
+            state.* = .{};
+            return .{ .kind = .spinner, .widget = element_widget, .state = state };
+        },
         .render_object => return .{ .kind = .render_object, .widget = try cloneWidgetForElement(allocator, widget.*) },
         .box => |box_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
@@ -1761,6 +1903,7 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
             },
             .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
             .list => allocator.destroy(@as(*ListState, @ptrCast(@alignCast(state)))),
+            .spinner => allocator.destroy(@as(*SpinnerState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
         element.state = null;
@@ -1811,6 +1954,7 @@ pub fn updateElementTreeScoped(
             element.focused = scope.interaction.isFocused(element.widget.text_input.focus_node);
         },
         .separator => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
+        .spinner => try replaceElementWidgetThemed(allocator, element, widget.*, scope.theme, scope.default_text_style),
         .render_object => try replaceElementWidget(allocator, element, widget.*),
         .box => |box_widget| {
             try updateSingleChildElement(allocator, scope, element, widget.*, box_widget.child, constraints);
@@ -1927,6 +2071,7 @@ pub fn rebuildDirtyElementTreeScoped(
         .spacer,
         .text_input,
         .separator,
+        .spinner,
         .render_object,
         .button,
         => return false,
@@ -2059,6 +2204,7 @@ pub fn refreshInteractionElements(
         .spacer,
         .text_input,
         .separator,
+        .spinner,
         .render_object,
         => return false,
 
@@ -2204,6 +2350,7 @@ fn elementKindForWidget(widget: Widget) Element.Kind {
         .list => .list,
         .text_input => .text_input,
         .separator => .separator,
+        .spinner => .spinner,
         .row => .row,
         .column => .column,
         .spacer => .spacer,
@@ -2386,6 +2533,7 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             input_widget.font_size = input_widget.style.font_size orelse theme.input_theme.font_size;
         },
         .separator => |*separator| separator.color = separator.color orelse theme.color_scheme.border,
+        .spinner => |*spinner_widget| spinner_widget.color = spinner_widget.color orelse theme.color_scheme.primary,
         else => {},
     }
     return result;
@@ -2488,6 +2636,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         } },
         .spacer => |spacer_widget| .{ .spacer = spacer_widget },
         .separator => |separator| .{ .separator = separator },
+        .spinner => |spinner_widget| .{ .spinner = spinner_widget },
         .sized => |sized_widget| .{ .sized = sized_widget },
         .button => |button_widget| blk: {
             const id = try allocator.dupe(u8, button_widget.id);
@@ -2634,6 +2783,7 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         .text => |text_widget| allocator.free(text_widget.value),
         .spacer => {},
         .separator => {},
+        .spinner => {},
         .sized => {},
         .button => |button_widget| {
             if (button_widget.on_pressed) |callback| callback.destroy(allocator);
@@ -2774,6 +2924,7 @@ pub const hitTestScrollbarThumb = paint_model.hitTestScrollbarThumb;
 const roundedRectAlpha = paint_model.roundedRectAlpha;
 const scrollbar_color = paint_model.scrollbar_color;
 const scrollbar_thickness = paint_model.scrollbar_thickness;
+const scrollbar_margin = paint_model.scrollbar_margin;
 const hit_testing_model = @import("hit_testing.zig");
 
 pub const hitTestButton = hit_testing_model.hitTestButton;
@@ -2802,6 +2953,7 @@ const layout_model = @import("layout.zig");
 
 const layoutElement = layout_model.layoutElement;
 const markElementLayoutDirty = layout_model.markElementLayoutDirty;
+const addRenderDamage = layout_model.addDamage;
 const constrainSized = layout_model.constrainSized;
 pub const collectDamage = layout_model.collectDamage;
 
@@ -2933,6 +3085,7 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
     try std.testing.expectEqual(@as(f32, 240), root.children[0].rect.width);
 
     scrollState(&element).offset_x = 1000;
+    revealScrollbar(&element, 0);
     _ = dirtyScrollElement(&element, "strip");
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_x);

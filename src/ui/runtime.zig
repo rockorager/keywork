@@ -18,6 +18,7 @@ const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
 
+const animation = @import("animation.zig");
 const backend_behavior = @import("runtime/backend_behavior.zig");
 const focus_scroll = @import("runtime/focus_scroll.zig");
 const input_behavior = @import("runtime/input.zig");
@@ -107,6 +108,14 @@ pub const Runtime = struct {
     presented_scale: f32 = 0,
     repaint_scheduler: ?RepaintScheduler = null,
     repaint_scheduler_context: ?*anyopaque = null,
+    /// Monotonic time source for animations; injectable so tests drive
+    /// frames deterministically.
+    clock: animation.Clock = .{},
+    /// Whether any animation demanded another frame at the end of the
+    /// last presented frame. While set, each presented frame re-requests
+    /// a repaint so the backend's frame pacing sustains the loop; when it
+    /// clears, the runtime returns to zero-cost idle.
+    animations_active: bool = false,
 
     pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
 
@@ -197,6 +206,11 @@ pub const Runtime = struct {
 
     pub fn invalidateState(self: *Runtime) !void {
         try backend_behavior.invalidateState(self);
+    }
+
+    /// Current animation time; the reference clock for starting timelines.
+    pub fn animationNow(self: *const Runtime) u64 {
+        return self.clock.now();
     }
 
     /// Popups declared by anchored elements in the current tree, with
@@ -977,6 +991,10 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     const viewport = runtime.root.?.rect;
     const thumb_x = viewport.x + viewport.width - 6;
 
+    // The thumb rests hidden; scroll activity reveals it without moving
+    // the content, so it can be grabbed.
+    try runtime.scrollBy(.{ .position = .{ .x = thumb_x, .y = 10 }, .dx = 0, .dy = 0 });
+
     // Press on the thumb; this starts a drag, not a click.
     try runtime.pointerButton(.{ .button = .left, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
     try std.testing.expect(runtime.scrollbar_drag != null);
@@ -1047,6 +1065,9 @@ test "non-left buttons do not start scrollbar drags" {
     const viewport = runtime.root.?.rect;
     const thumb_x = viewport.x + viewport.width - 6;
 
+    // Reveal the resting-hidden thumb so it can be grabbed at all.
+    try runtime.scrollBy(.{ .position = .{ .x = thumb_x, .y = 10 }, .dx = 0, .dy = 0 });
+
     // A right press on the thumb neither starts a drag nor scrolls.
     try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = .{ .x = thumb_x, .y = 10 } });
     try std.testing.expect(runtime.scrollbar_drag == null);
@@ -1062,6 +1083,164 @@ test "non-left buttons do not start scrollbar drags" {
     try std.testing.expect(runtime.scrollbar_drag != null);
     try runtime.pointerButton(.{ .button = .left, .state = .released, .position = .{ .x = thumb_x, .y = 10 } });
     try std.testing.expect(runtime.scrollbar_drag == null);
+}
+
+/// Fake monotonic clock for driving animation frames deterministically.
+const FakeClock = struct {
+    now_ns: u64 = 0,
+
+    fn clock(self: *FakeClock) @import("animation.zig").Clock {
+        return .{ .ptr = self, .now_fn = now };
+    }
+
+    fn now(ptr: ?*anyopaque) u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(ptr.?));
+        return self.now_ns;
+    }
+};
+
+test "scrollbar reveals on scroll and fades out on the animation clock" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            var rows: [20]keywork.Widget = undefined;
+            for (&rows) |*row| row.* = keywork.widgets.text("row");
+            const column = try keywork.widgets.column(scope.allocator, &rows, 0);
+            return keywork.widgets.scroll(scope.allocator, "list", column);
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    const animation_module = @import("animation.zig");
+    var fake_clock: FakeClock = .{};
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 200, .max_height = 120 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    runtime.clock = fake_clock.clock();
+
+    // The thumb rests hidden and the runtime idles with no frame demand.
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.scrollbar_alpha);
+    try std.testing.expect(!runtime.animations_active);
+    try std.testing.expect(!runtime.repaint_pending);
+
+    // Scroll activity shows the thumb at full alpha and starts the fade,
+    // which registers continuous frame demand.
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 30 });
+    try std.testing.expectEqual(@as(f32, 1), runtime.root.?.scrollbar_alpha);
+    try std.testing.expect(runtime.animations_active);
+    try std.testing.expect(runtime.repaint_pending);
+
+    // The thumb holds at full alpha, then eases out.
+    fake_clock.now_ns = animation_module.scrollbar_fade_hold_ms * std.time.ns_per_ms / 2;
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(f32, 1), runtime.root.?.scrollbar_alpha);
+
+    fake_clock.now_ns = (animation_module.scrollbar_fade_hold_ms + animation_module.scrollbar_fade_duration_ms / 2) * std.time.ns_per_ms;
+    try runtime.repaint();
+    try std.testing.expect(runtime.root.?.scrollbar_alpha > 0 and runtime.root.?.scrollbar_alpha < 1);
+    try std.testing.expect(runtime.animations_active);
+
+    // Completion lands at exactly invisible and drops the frame demand.
+    fake_clock.now_ns = animation_module.scrollbar_fade_total_ns;
+    try runtime.repaint();
+    try std.testing.expectApproxEqAbs(@as(f32, 0), runtime.root.?.scrollbar_alpha, 0.001);
+    try std.testing.expect(!runtime.animations_active);
+
+    // Renewed activity restarts the cycle from full alpha.
+    try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = -10 });
+    try std.testing.expectEqual(@as(f32, 1), runtime.root.?.scrollbar_alpha);
+    try std.testing.expect(runtime.animations_active);
+}
+
+test "spinner sweeps on the animation clock and demands frames while mounted" {
+    const TestApp = struct {
+        fn host(self: *@This()) AppHost {
+            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
+        }
+
+        fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            return keywork.widgets.spinner(.{ .period_ms = 1000 });
+        }
+    };
+
+    const TestBackend = struct {
+        fn backend(self: *@This()) RenderBackend {
+            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+        }
+
+        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+            return false;
+        }
+
+        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+            const measurer: keywork.TextMeasurer = .fixed;
+            return measurer.measureText(value, style);
+        }
+
+        fn scale(_: *anyopaque) f32 {
+            return 1;
+        }
+    };
+
+    var fake_clock: FakeClock = .{ .now_ns = 5000 * std.time.ns_per_ms };
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        backend.backend(),
+        .{ .max_width = 100, .max_height = 100 },
+        app.host(),
+        .no_preference,
+    );
+    defer runtime.deinit();
+    runtime.clock = fake_clock.clock();
+
+    // The first tick captures the phase baseline at the current time, so
+    // the sweep starts at zero regardless of the clock's absolute value.
+    try runtime.repaint();
+    try std.testing.expectEqual(@as(f32, 0), runtime.root.?.spinner_progress);
+    try std.testing.expect(runtime.animations_active);
+    try std.testing.expect(runtime.repaint_pending);
+
+    fake_clock.now_ns += 250 * std.time.ns_per_ms;
+    try runtime.repaint();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), runtime.root.?.spinner_progress, 0.001);
+
+    // The sweep wraps instead of terminating; demand never drops while
+    // the spinner stays mounted.
+    fake_clock.now_ns += 1000 * std.time.ns_per_ms;
+    try runtime.repaint();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), runtime.root.?.spinner_progress, 0.001);
+    try std.testing.expect(runtime.animations_active);
 }
 
 test "non-left buttons do not move text-input focus" {

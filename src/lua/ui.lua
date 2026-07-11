@@ -793,6 +793,16 @@ function ui.spacer(flex)
   }
 end
 
+function ui.spinner(options)
+  options = options or {}
+  return {
+    type = "spinner",
+    size = options.size,
+    color = options.color,
+    period_ms = options.period_ms,
+  }
+end
+
 function ui.svg_icon(options)
   options = options or {}
   return {

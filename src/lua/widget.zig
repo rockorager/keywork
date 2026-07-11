@@ -250,6 +250,12 @@ const SpacerOptions = struct {
     flex: f32 = 1,
 };
 
+const SpinnerOptions = struct {
+    size: f32 = 20,
+    color: ?keywork.Color = null,
+    period_ms: u32 = 900,
+};
+
 const LuaCallback = struct {
     allocator: std.mem.Allocator,
     lua_state: *c.lua_State,
@@ -938,6 +944,14 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "spacer")) {
         const options = try lua_codec.decode(SpacerOptions, lua_state, table, allocator);
         return keywork.widgets.spacer(options.flex);
+    }
+    if (std.mem.eql(u8, kind, "spinner")) {
+        const options = try lua_codec.decode(SpinnerOptions, lua_state, table, allocator);
+        return keywork.widgets.spinner(.{
+            .size = @max(0, options.size),
+            .color = options.color,
+            .period_ms = @max(1, options.period_ms),
+        });
     }
     if (std.mem.eql(u8, kind, "separator")) {
         const options = try lua_codec.decode(SeparatorOptions, lua_state, table, allocator);

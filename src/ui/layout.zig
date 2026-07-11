@@ -45,7 +45,7 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     // geometry and must not inflate the damage to their full bounds.
     const rect_changed = !std.meta.eql(node.rect, value.rect);
     const paints = switch (value.kind) {
-        .box, .text, .text_input, .separator, .render_object => true,
+        .box, .text, .text_input, .separator, .spinner, .render_object => true,
         else => false,
     };
     var damage = node.damage;
@@ -155,6 +155,12 @@ fn constrainText(
             source_start += (it.nextGrapheme() orelse break).end;
         }
     }
+}
+
+/// Accumulates damage on a retained node outside of layout, for changes
+/// (animation ticks) that repaint without re-laying-out anything.
+pub fn addDamage(node: *RenderNode, rect: Rect) void {
+    node.damage = unionDamage(node.damage, rect);
 }
 
 /// Collects and clears the damage accumulated across the tree since the
@@ -391,6 +397,7 @@ fn layoutElementInto(
                 .scroll_id = scroll_widget.id,
                 .scroll_content = child.rect.size(),
                 .scroll_offset = .{ .x = state.offset_x, .y = state.offset_y },
+                .scrollbar_alpha = state.scrollbar_alpha,
             });
         },
         .list => |list_widget| {
@@ -441,6 +448,7 @@ fn layoutElementInto(
                 .scroll_id = list_widget.id,
                 .scroll_content = .{ .width = content_width, .height = content_height },
                 .scroll_offset = .{ .x = 0, .y = state.offset },
+                .scrollbar_alpha = state.scrollbar_alpha,
             });
         },
         .text_input => |input_widget| {
@@ -491,6 +499,17 @@ fn layoutElementInto(
                 .background = separator.color.?,
                 .separator_axis = separator.axis,
                 .separator_margin = separator.margin,
+            });
+        },
+        .spinner => |spinner_widget| {
+            const state = model.spinnerState(element);
+            const size_value = constraints.clamp(.{ .width = spinner_widget.size, .height = spinner_widget.size });
+            _ = try ensureChildSlice(allocator, node, 0);
+            commitRenderNode(node, .{
+                .kind = .spinner,
+                .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
+                .foreground = spinner_widget.color.?,
+                .spinner_progress = state.progress,
             });
         },
         .padding => |padding_widget| {

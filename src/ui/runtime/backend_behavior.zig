@@ -26,6 +26,18 @@ pub fn presentFrame(self: anytype) !void {
 
     self.rendering = true;
     defer self.rendering = false;
+    // Consume the request that triggered this frame; requests raised
+    // during rebuild or paint survive to trigger the next one.
+    self.repaint_pending = false;
+    errdefer self.repaint_pending = true;
+
+    // Advance animations to this frame's time before building, writing
+    // values and damage straight into the retained render nodes: ticks
+    // repaint without rebuilding or re-laying-out anything.
+    if (self.element_root) |*element_root| {
+        _ = keywork.advanceAnimations(element_root, self.clock.now());
+    }
+
     try lifecycle_reconciliation.flushInteractionRefresh(self);
     // Consume pending flags before rebuilding so invalidations raised by
     // callbacks during the rebuild are observed on the next pass instead
@@ -48,7 +60,14 @@ pub fn presentFrame(self: anytype) !void {
             if (keywork.anyListRangeStale(element_root)) self.state_rebuild_pending = true;
         }
     }
-    self.repaint_pending = false;
+
+    // Query demand after the rebuild loop so animations created by this
+    // frame's build register even though they were not advanced yet.
+    self.animations_active = if (self.element_root) |*element_root|
+        keywork.anyAnimationsActive(element_root)
+    else
+        false;
+    if (self.animations_active) self.repaint_pending = true;
 
     const root = self.root orelse return error.NotBuilt;
     const frame_size = self.frameSize();
@@ -61,7 +80,9 @@ pub fn presentFrame(self: anytype) !void {
     // clean windows. A size or scale change (or first frame) still
     // repaints the full frame conservatively.
     const collected = keywork.collectDamage(root);
-    if (collected == null) {
+    if (collected == null and !self.animations_active) {
+        // Never skip while animating: the present's frame callback is
+        // what sustains the animation loop, so skipping would stall it.
         if (self.presented_size) |presented| {
             if (std.meta.eql(presented, frame_size) and self.presented_scale == render_scale) return;
         }

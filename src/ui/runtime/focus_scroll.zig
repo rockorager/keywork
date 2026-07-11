@@ -144,6 +144,10 @@ pub fn scrollElementById(self: anytype, id: []const u8, dx: f32, dy: f32) !void 
         },
         else => unreachable,
     }
+    // Any scroll activity — wheel, thumb drag, focus reveal — shows the
+    // scrollbar and restarts its fade, even when clamping left the offset
+    // unchanged, matching the feedback of scrolling against an edge.
+    keywork.revealScrollbar(scroll_element, self.clock.now());
     try self.invalidateState();
 }
 
