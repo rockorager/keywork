@@ -12,6 +12,7 @@ const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_socket = @import("socket.zig");
+const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const lua_image = @import("image.zig");
@@ -40,13 +41,21 @@ const stringFromStack = lua_value.stringFromStack;
 
 pub const WindowConfig = lua_config.Config;
 
+pub const RootKind = enum {
+    application,
+    storybook,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
     /// Chunk name passed to the Lua loader ("@" ++ path) so stack
     /// traces point at the script file.
     chunk_name: [:0]u8,
+    root_kind: RootKind = .application,
     window_config: WindowConfig = .{},
+    storybook_catalog: ?lua_storybook.Catalog = null,
+    selected_story_id: ?[]u8 = null,
     state: *c.lua_State,
     script_ref: c_int = -1,
     start_ref: c_int = -1,
@@ -112,6 +121,12 @@ pub const App = struct {
         };
     }
 
+    pub fn initStorybook(allocator: std.mem.Allocator, path: []const u8) !App {
+        var app = try init(allocator, path);
+        app.root_kind = .storybook;
+        return app;
+    }
+
     pub fn deinit(self: *App) void {
         self.stopLifecycleLog();
         // Scopes and tasks go first: destroying a task cancels the
@@ -143,6 +158,8 @@ pub const App = struct {
         c.lua_close(self.state);
         self.icon_cache.deinit();
         self.png_dims.deinit();
+        if (self.storybook_catalog) |*catalog| catalog.deinit(self.allocator);
+        if (self.selected_story_id) |id| self.allocator.free(id);
         self.window_config.deinit(self.allocator);
         self.allocator.free(self.path);
         self.allocator.free(self.chunk_name);
@@ -238,6 +255,19 @@ pub const App = struct {
         return self.buildWidgetWithInvalidator(allocator, runtime_state, render_scale, null);
     }
 
+    pub fn storyCatalog(self: *App) !*const lua_storybook.Catalog {
+        try self.ensureLoaded();
+        return if (self.storybook_catalog) |*catalog| catalog else error.NotStorybook;
+    }
+
+    pub fn selectStory(self: *App, id: []const u8) !void {
+        const catalog = try self.storyCatalog();
+        _ = catalog.find(id) orelse return error.UnknownStory;
+        const selected = try self.allocator.dupe(u8, id);
+        if (self.selected_story_id) |previous| self.allocator.free(previous);
+        self.selected_story_id = selected;
+    }
+
     fn buildWidgetWithInvalidator(
         self: *App,
         allocator: std.mem.Allocator,
@@ -246,6 +276,9 @@ pub const App = struct {
         state_invalidator: ?keywork.Widget.Callback,
     ) !keywork.Widget {
         try self.ensureLoaded();
+        if (self.root_kind == .storybook) {
+            return self.buildSelectedStory(allocator, runtime_state, render_scale, state_invalidator);
+        }
 
         const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
 
@@ -262,6 +295,36 @@ pub const App = struct {
         // paced across builds; a full collection here would stall every
         // rebuild for time proportional to the entire Lua heap. Full
         // collections still happen on script reload.
+        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
+        return widget;
+    }
+
+    fn buildSelectedStory(
+        self: *App,
+        allocator: std.mem.Allocator,
+        runtime_state: State,
+        render_scale: f32,
+        state_invalidator: ?keywork.Widget.Callback,
+    ) !keywork.Widget {
+        const selected_id = self.selected_story_id orelse return error.StoryNotSelected;
+        const catalog = if (self.storybook_catalog) |*value| value else return error.NotStorybook;
+        const story = catalog.find(selected_id) orelse return error.UnknownStory;
+        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
+
+        c.lua_settop(self.state, 0);
+        defer c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+        c.lua_getfield(self.state, -1, "stories");
+        c.lua_rawgeti(self.state, -1, @intCast(story.index));
+        c.lua_getfield(self.state, -1, "render");
+        if (c.lua_type(self.state, -1) != c.LUA_TFUNCTION) return error.StoryRenderMissing;
+        lua_widget.pushRuntimeState(self.state, runtime_state);
+        if (c.lua_pcall(self.state, 1, 1, 0) != 0) return self.failWithLuaError(error.StoryRenderFailed);
+        const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
+            .icon_cache = &self.icon_cache,
+            .icon_scale = icon_scale,
+            .png_dims = &self.png_dims,
+        }, -1);
         _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;
     }
@@ -459,22 +522,30 @@ pub const App = struct {
         errdefer c.lua_settop(self.state, 0);
 
         if (c.lua_type(self.state, -1) != c.LUA_TTABLE) return error.ScriptReturnedInvalidValue;
-        const app_root = c.lua_gettop(self.state);
-        var config = try lua_config.parseRoot(self.state, self.allocator, app_root);
+        const root = c.lua_gettop(self.state);
+        var config: WindowConfig = .{};
+        var catalog: ?lua_storybook.Catalog = null;
+        switch (self.root_kind) {
+            .application => config = try lua_config.parseRoot(self.state, self.allocator, root),
+            .storybook => catalog = try lua_storybook.parseRoot(self.state, self.allocator, root),
+        }
         var committed = false;
         errdefer if (!committed) config.deinit(self.allocator);
+        errdefer if (!committed) if (catalog) |*value| value.deinit(self.allocator);
         const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         errdefer if (!committed) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, script_ref);
-        const start_ref = try tableFunctionRef(self.state, script_ref, "start");
+        const start_ref = if (self.root_kind == .application) try tableFunctionRef(self.state, script_ref, "start") else -1;
         errdefer if (!committed and start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, start_ref);
-        const stop_ref = try tableFunctionRef(self.state, script_ref, "stop");
+        const stop_ref = if (self.root_kind == .application) try tableFunctionRef(self.state, script_ref, "stop") else -1;
         errdefer if (!committed and stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, stop_ref);
 
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
         self.window_config.deinit(self.allocator);
+        if (self.storybook_catalog) |*previous| previous.deinit(self.allocator);
         self.window_config = config;
+        self.storybook_catalog = catalog;
         self.script_ref = script_ref;
         self.start_ref = start_ref;
         self.stop_ref = stop_ref;
@@ -965,6 +1036,7 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
 }
 
 const embedded_ui_source = @embedFile("ui.lua");
+const embedded_storybook_source = @embedFile("storybook.lua");
 const embedded_service_source = @embedFile("service.lua");
 const embedded_process_source = @embedFile("process.lua");
 const embedded_stream_source = @embedFile("stream.lua");
@@ -982,6 +1054,9 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, keyworkModuleLoader, 1);
     c.lua_setfield(lua_state, preload_table, "keywork");
+
+    c.lua_pushcclosure(lua_state, storybookModuleLoader, 0);
+    c.lua_setfield(lua_state, preload_table, "keywork.storybook");
 
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, loopModuleLoader, 1);
@@ -1022,6 +1097,13 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_setfield(lua_state, preload_table, "keywork.portal");
 
     pop(lua_state, 2);
+}
+
+fn storybookModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    if (c.luaL_loadbuffer(lua_state, embedded_storybook_source.ptr, embedded_storybook_source.len, "@keywork/storybook.lua") != 0) return c.lua_error(lua_state);
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
+    return 1;
 }
 
 fn serviceModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -1435,6 +1517,56 @@ test "script must return a valid keywork.app root" {
         defer app.deinit();
         try std.testing.expectError(error.InvalidAppRoot, app.ensureLoaded());
     }
+}
+
+test "storybook root catalogs and renders a selected story" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local sb = require("keywork.storybook")
+        \\return sb.book({
+        \\  title = "Components",
+        \\  stories = {
+        \\    sb.story({
+        \\      id = "text/hello",
+        \\      group = "Text",
+        \\      name = "Hello",
+        \\      viewport = { width = 320, height = 180, scale = 2 },
+        \\      color_scheme = "dark",
+        \\      render = function(context)
+        \\        assert(context.window_width == 320)
+        \\        assert(context.color_scheme == "dark")
+        \\        return kw.text("hello")
+        \\      end,
+        \\    }),
+        \\  },
+        \\})
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stories.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stories.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.initStorybook(allocator, script_path);
+    defer app.deinit();
+    const catalog = try app.storyCatalog();
+    try std.testing.expectEqualStrings("Components", catalog.title.?);
+    try std.testing.expectEqual(@as(usize, 1), catalog.stories.len);
+    try std.testing.expectEqual(@as(f32, 2), catalog.stories[0].scale);
+    try std.testing.expectEqual(lua_storybook.ColorScheme.dark, catalog.stories[0].color_scheme);
+    try std.testing.expectError(error.UnknownStory, app.selectStory("missing"));
+    try app.selectStory("text/hello");
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    _ = try app.buildWidget(arena.allocator(), .{
+        .window_width = 320,
+        .window_height = 180,
+        .color_scheme = "dark",
+    }, 2);
 }
 
 test "keywork core excludes optional capability modules" {

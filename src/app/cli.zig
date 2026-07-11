@@ -15,7 +15,38 @@ pub const Options = struct {
     app_args: []const [:0]const u8 = &.{},
 };
 
-pub const usage = "usage: keywork [options] <script.lua> [args...]\n";
+pub const StorybookOperation = enum {
+    list,
+    snapshot,
+};
+
+pub const StorybookOptions = struct {
+    operation: StorybookOperation,
+    script_path: []const u8,
+    story_id: ?[]const u8 = null,
+    output_path: []const u8 = "storybook-snapshots",
+    json: bool = false,
+};
+
+pub const Command = union(enum) {
+    run: Options,
+    storybook: StorybookOptions,
+};
+
+pub const usage =
+    \\usage: keywork [options] <script.lua> [args...]
+    \\       keywork storybook list <stories.lua> [--json]
+    \\       keywork storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
+    \\
+;
+
+pub fn parseCommand(init: std.process.Init, allocator: std.mem.Allocator) !Command {
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    const first = args.next() orelse return error.MissingScriptPath;
+    if (!std.mem.eql(u8, first, "storybook")) return .{ .run = try parse(init, allocator) };
+    return .{ .storybook = try parseStorybook(&args) };
+}
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
     var result: Options = .{};
@@ -63,6 +94,46 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
     }
     if (result.script_path.len == 0) return error.MissingScriptPath;
     result.app_args = try app_args.toOwnedSlice(allocator);
+    return result;
+}
+
+fn parseStorybook(args: anytype) !StorybookOptions {
+    const operation_name = args.next() orelse return error.MissingStorybookOperation;
+    const operation: StorybookOperation = if (std.mem.eql(u8, operation_name, "list"))
+        .list
+    else if (std.mem.eql(u8, operation_name, "snapshot"))
+        .snapshot
+    else
+        return error.UnknownStorybookOperation;
+
+    var result: StorybookOptions = .{ .operation = operation, .script_path = "" };
+    var output_set = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            result.json = true;
+        } else if (std.mem.eql(u8, arg, "--story")) {
+            result.story_id = args.next() orelse return error.MissingOptionValue;
+        } else if (std.mem.startsWith(u8, arg, "--story=")) {
+            result.story_id = arg["--story=".len..];
+        } else if (std.mem.eql(u8, arg, "--output")) {
+            result.output_path = args.next() orelse return error.MissingOptionValue;
+            output_set = true;
+        } else if (std.mem.startsWith(u8, arg, "--output=")) {
+            result.output_path = arg["--output=".len..];
+            output_set = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownOption;
+        } else if (result.script_path.len == 0) {
+            result.script_path = arg;
+        } else {
+            return error.UnexpectedArgument;
+        }
+    }
+
+    if (result.script_path.len == 0) return error.MissingScriptPath;
+    if (result.story_id) |id| if (id.len == 0) return error.MissingOptionValue;
+    if (result.output_path.len == 0) return error.MissingOptionValue;
+    if (operation == .list and (result.story_id != null or output_set)) return error.InvalidStorybookOption;
     return result;
 }
 
