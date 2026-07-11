@@ -58,7 +58,7 @@ fn luaSetState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
             return c.luaL_error(lua_state, "set_state callback failed");
         }
     }
-    state.dirty = true;
+    state.rebuild_generation +%= 1;
     state.host.invalidateState() catch |err| {
         std.log.scoped(.keywork_luajit).warn("set_state invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "set_state invalidate failed");
@@ -437,8 +437,8 @@ const LuaStatefulWidget = struct {
         .update = update,
         .build = build,
         .destroy_state = destroyState,
-        .needs_rebuild = needsRebuild,
-        .clear_rebuild = clearRebuild,
+        .rebuild_token = rebuildToken,
+        .finish_rebuild = finishRebuild,
     };
 
     fn widget(self: *LuaStatefulWidget) keywork.Widget {
@@ -554,14 +554,15 @@ const LuaStatefulWidget = struct {
         allocator.destroy(state);
     }
 
-    fn needsRebuild(_: *const anyopaque, state_ptr: *anyopaque) bool {
+    fn rebuildToken(state_ptr: *anyopaque, force: bool) ?u64 {
         const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
-        return state.dirty;
+        if (!force and state.rebuild_generation == state.built_generation) return null;
+        return state.rebuild_generation;
     }
 
-    fn clearRebuild(_: *const anyopaque, state_ptr: *anyopaque) void {
+    fn finishRebuild(state_ptr: *anyopaque, token: u64) void {
         const state: *LuaStatefulState = @ptrCast(@alignCast(state_ptr));
-        state.dirty = false;
+        state.built_generation = token;
     }
 
     fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
@@ -602,7 +603,8 @@ const LuaStatefulState = struct {
     lua_state: *c.lua_State,
     state_ref: c_int,
     slot_ref: c_int = -1,
-    dirty: bool = false,
+    rebuild_generation: u64 = 0,
+    built_generation: u64 = 0,
     /// Lazily created on first self.scope access; canceled on dispose.
     scope: ?*lua_task.LuaScope = null,
 };

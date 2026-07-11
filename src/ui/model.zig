@@ -623,8 +623,8 @@ pub const Widget = union(enum) {
             update: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator, context: BuildContext) anyerror!void,
             build: *const fn (ptr: *const anyopaque, state: *anyopaque, scope: *BuildScope, context: BuildContext) anyerror!Widget,
             destroy_state: *const fn (ptr: *const anyopaque, state: *anyopaque, allocator: std.mem.Allocator) void,
-            needs_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) bool = null,
-            clear_rebuild: ?*const fn (ptr: *const anyopaque, state: *anyopaque) void = null,
+            rebuild_token: ?*const fn (state: *anyopaque, force: bool) ?u64 = null,
+            finish_rebuild: ?*const fn (state: *anyopaque, token: u64) void = null,
         };
 
         pub fn createState(self: Stateful, allocator: std.mem.Allocator) !*anyopaque {
@@ -643,14 +643,15 @@ pub const Widget = union(enum) {
             self.vtable.destroy_state(self.ptr, state, allocator);
         }
 
-        pub fn needsRebuild(self: Stateful, state: *anyopaque) bool {
-            const needs_rebuild = self.vtable.needs_rebuild orelse return false;
-            return needs_rebuild(self.ptr, state);
+        pub fn rebuildToken(self: Stateful, state: *anyopaque, force: bool) ?u64 {
+            const rebuild_token = self.vtable.rebuild_token orelse return null;
+            return rebuild_token(state, force);
         }
 
-        pub fn clearRebuild(self: Stateful, state: *anyopaque) void {
-            const clear_rebuild = self.vtable.clear_rebuild orelse return;
-            clear_rebuild(self.ptr, state);
+        pub fn finishRebuild(self: Stateful, state: *anyopaque, token: ?u64) void {
+            const value = token orelse return;
+            const finish_rebuild = self.vtable.finish_rebuild orelse return;
+            finish_rebuild(state, value);
         }
 
         pub fn clone(self: Stateful, allocator: std.mem.Allocator) !Stateful {
@@ -1792,6 +1793,7 @@ pub fn buildElementTreeScoped(
             const retained_stateful = element_widget.stateful;
             const state = try retained_stateful.createState(allocator);
             errdefer retained_stateful.destroyState(state, allocator);
+            const rebuild_token = retained_stateful.rebuildToken(state, true);
             const built = try retained_stateful.build(state, scope, buildContext(scope, constraints));
             const children = try allocator.alloc(Element, 1);
             var initialized = false;
@@ -1801,6 +1803,7 @@ pub fn buildElementTreeScoped(
             }
             children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
             initialized = true;
+            retained_stateful.finishRebuild(state, rebuild_token);
             return .{ .kind = .stateful, .widget = element_widget, .state = state, .children = children };
         },
         .element => |custom_element| {
@@ -2045,8 +2048,10 @@ pub fn updateElementTreeScoped(
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
             try stateful_widget.update(state, allocator, buildContext(scope, constraints));
+            const rebuild_token = stateful_widget.rebuildToken(state, true);
             const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
             try updateSingleChildElement(allocator, scope, element, widget.*, &built, constraints);
+            stateful_widget.finishRebuild(state, rebuild_token);
         },
         .element => |custom_element| {
             var replacement_child = try custom_element.build(allocator, scope, buildContext(scope, constraints));
@@ -2135,10 +2140,10 @@ pub fn rebuildDirtyElementTreeScoped(
         },
         .stateful => |stateful_widget| {
             const state = element.state orelse return error.MissingState;
-            if (stateful_widget.needsRebuild(state)) {
+            if (stateful_widget.rebuildToken(state, false)) |rebuild_token| {
                 const built = try stateful_widget.build(state, scope, buildContext(scope, constraints));
                 try updateElementTreeScoped(allocator, scope, &element.children[0], &built, constraints);
-                stateful_widget.clearRebuild(state);
+                stateful_widget.finishRebuild(state, rebuild_token);
                 markElementLayoutDirty(element);
                 return true;
             }
@@ -5019,7 +5024,10 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
 
     const ToggleStateful = struct {
         const State = struct {
-            dirty: bool = false,
+            rebuild_generation: u64 = 0,
+            built_generation: u64 = 0,
+            builds: usize = 0,
+            invalidate_during_build: bool = false,
             label: []const u8 = "one",
         };
 
@@ -5028,8 +5036,8 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
             .update = update,
             .build = build,
             .destroy_state = destroyState,
-            .needs_rebuild = needsRebuild,
-            .clear_rebuild = clearRebuild,
+            .rebuild_token = rebuildToken,
+            .finish_rebuild = finishRebuild,
         };
 
         fn widget(self: *const @This()) Widget {
@@ -5046,6 +5054,11 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
 
         fn build(_: *const anyopaque, state_ptr: *anyopaque, _: *BuildScope, _: Widget.BuildContext) !Widget {
             const state: *State = @ptrCast(@alignCast(state_ptr));
+            state.builds += 1;
+            if (state.invalidate_during_build) {
+                state.invalidate_during_build = false;
+                state.rebuild_generation +%= 1;
+            }
             return .{ .text = .{ .value = state.label } };
         }
 
@@ -5053,12 +5066,14 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
             allocator.destroy(@as(*State, @ptrCast(@alignCast(state_ptr))));
         }
 
-        fn needsRebuild(_: *const anyopaque, state_ptr: *anyopaque) bool {
-            return @as(*State, @ptrCast(@alignCast(state_ptr))).dirty;
+        fn rebuildToken(state_ptr: *anyopaque, force: bool) ?u64 {
+            const state: *State = @ptrCast(@alignCast(state_ptr));
+            if (!force and state.rebuild_generation == state.built_generation) return null;
+            return state.rebuild_generation;
         }
 
-        fn clearRebuild(_: *const anyopaque, state_ptr: *anyopaque) void {
-            @as(*State, @ptrCast(@alignCast(state_ptr))).dirty = false;
+        fn finishRebuild(state_ptr: *anyopaque, token: u64) void {
+            @as(*State, @ptrCast(@alignCast(state_ptr))).built_generation = token;
         }
     };
 
@@ -5092,7 +5107,7 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     // Dirtying the stateful subtree relayouts it, but the clean sibling
     // text is never re-measured.
     const state: *ToggleStateful.State = @ptrCast(@alignCast(element.children[1].state.?));
-    state.dirty = true;
+    state.rebuild_generation += 1;
     state.label = "two";
     _ = built_arena.reset(.retain_capacity);
     var rebuild_scope: BuildScope = .{ .allocator = built_arena.allocator() };
@@ -5107,6 +5122,32 @@ test "clean subtrees skip layout and dirty stateful subtrees relayout" {
     const damage = collectDamage(root).?;
     const sibling = root.children[0];
     try std.testing.expect(damage.y >= sibling.rect.y + sibling.rect.height);
+
+    // A full update consumes an already-pending state generation, so a later
+    // dirty pass does not rebuild the same state again.
+    state.rebuild_generation += 1;
+    _ = built_arena.reset(.retain_capacity);
+    var full_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    try updateElementTreeScoped(allocator, &full_scope, &element, &column, constraints);
+    try std.testing.expectEqual(state.rebuild_generation, state.built_generation);
+    const builds_after_full_update = state.builds;
+    _ = built_arena.reset(.retain_capacity);
+    var clean_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    try std.testing.expect(!try rebuildDirtyElementTreeScoped(allocator, &clean_scope, &element, constraints));
+    try std.testing.expectEqual(builds_after_full_update, state.builds);
+
+    // A generation raised from inside build is newer than the token being
+    // acknowledged and therefore survives for the next pass.
+    state.rebuild_generation += 1;
+    state.invalidate_during_build = true;
+    _ = built_arena.reset(.retain_capacity);
+    var invalidating_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(allocator, &invalidating_scope, &element, constraints));
+    try std.testing.expect(state.rebuild_generation != state.built_generation);
+    _ = built_arena.reset(.retain_capacity);
+    var followup_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    try std.testing.expect(try rebuildDirtyElementTreeScoped(allocator, &followup_scope, &element, constraints));
+    try std.testing.expectEqual(state.rebuild_generation, state.built_generation);
 }
 
 test "stateful widgets with different type tokens never share state" {
