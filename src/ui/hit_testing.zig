@@ -29,7 +29,7 @@ pub const ClickHit = struct {
     tap_cancel: ?Widget.TapCallback = null,
     hover_change: ?Widget.FocusChangeCallback = null,
     rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-    activation: Widget.ClickActivation = .release,
+    activation: Widget.ClickActivation = .press,
     cursor: CursorShape = .default,
 };
 

@@ -135,7 +135,10 @@ pub const Widget = union(enum) {
         /// scrolling beneath a stationary pointer does not re-fire it.
         on_hover_change: ?FocusChangeCallback = null,
         buttons: PointerButtons = .{},
-        activation: ClickActivation = .release,
+        /// Press fires on_click at pointer-down (the desktop feels
+        /// snappier); release waits for pointer-up over the same target
+        /// so a press can be aborted by dragging off.
+        activation: ClickActivation = .press,
         hover_style: ?ClickableStyle = null,
         pressed_style: ?ClickableStyle = null,
         focused_border: ?Color = null,
@@ -1099,7 +1102,7 @@ pub const RenderNode = struct {
     scroll_event_callback: ?Widget.ScrollEventCallback = null,
     hover_change_callback: ?Widget.FocusChangeCallback = null,
     click_buttons: PointerButtons = .{},
-    click_activation: Widget.ClickActivation = .release,
+    click_activation: Widget.ClickActivation = .press,
     click_cursor: CursorShape = .default,
     text_input_id: ?[]const u8 = null,
     focus_id: ?[]const u8 = null,

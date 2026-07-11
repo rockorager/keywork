@@ -567,6 +567,7 @@ function ui.gesture(options)
     child = options.child,
     hover_background = options.hover_background,
     cursor = options.cursor,
+    activation = options.activation,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
@@ -586,6 +587,11 @@ end
 --- the app. `on_hover(hovered)` fires on pointer enter/leave, driven only
 --- by real pointer motion (content scrolling beneath a stationary
 --- pointer does not re-fire it).
+---
+--- `on_tap` fires on pointer-down by default (the desktop feels
+--- snappier). Pass `activation = "release"` to wait for pointer-up over
+--- the same target, letting a press be aborted by dragging off before
+--- letting go.
 function ui.pressable(options)
   return {
     type = "gesture",
@@ -595,6 +601,7 @@ function ui.pressable(options)
     pressed_background = options.pressed_background,
     focused_border = options.focused_border,
     cursor = options.cursor,
+    activation = options.activation,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,
@@ -909,6 +916,7 @@ function ui.chip(options)
     }, child),
     hover_background = hover_background,
     cursor = options.cursor,
+    activation = options.activation,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,

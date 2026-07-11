@@ -816,6 +816,7 @@ test "in-flight press ignores other buttons until the initiating button releases
                 .{ .ptr = self, .call_fn = record },
             );
             widget.clickable.buttons = .any;
+            widget.clickable.activation = .release;
             return widget;
         }
 
@@ -1401,6 +1402,7 @@ test "releasing a non-left press outside the target fires tap_cancel" {
                 .{ .ptr = self, .call_fn = recordClick },
             );
             widget.clickable.buttons = .any;
+            widget.clickable.activation = .release;
             widget.clickable.on_tap_up = .{ .ptr = self, .call_fn = recordUp };
             widget.clickable.on_tap_cancel = .{ .ptr = self, .call_fn = recordCancel };
             return widget;

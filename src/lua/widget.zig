@@ -91,6 +91,7 @@ const GestureOptions = struct {
     pressed_background: ?keywork.Color = null,
     focused_border: ?keywork.Color = null,
     cursor: keywork.CursorShape = .default,
+    activation: keywork.Widget.ClickActivation = .press,
 
     fn hoverStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
         if (self.hover_background == null) return null;
@@ -815,6 +816,7 @@ pub fn parse(
             .pressed_style = options.pressedStyle(),
             .focused_border = options.focused_border,
             .cursor = options.cursor,
+            .activation = options.activation,
         } };
     }
     if (std.mem.eql(u8, kind, "anchored")) {
@@ -1173,6 +1175,34 @@ test "gesture buttons parse names and reject invalid values" {
     try std.testing.expectError(
         error.ExpectedLuaFunction,
         getOptionalTapCallbackField(lua_state, std.testing.allocator, table, "on_tap"),
+    );
+
+    // Every path above must leave the stack balanced.
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+}
+
+test "gesture activation parses release and defaults to press" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+
+    // Absent activation keeps the press default.
+    const defaults = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
+    try std.testing.expectEqual(keywork.Widget.ClickActivation.press, defaults.activation);
+
+    c.lua_pushstring(lua_state, "release");
+    c.lua_setfield(lua_state, table, "activation");
+    const options = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
+    try std.testing.expectEqual(keywork.Widget.ClickActivation.release, options.activation);
+
+    // Unknown values are rejected rather than silently defaulted.
+    c.lua_pushstring(lua_state, "click");
+    c.lua_setfield(lua_state, table, "activation");
+    try std.testing.expectError(
+        error.UnknownLuaEnumValue,
+        lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator),
     );
 
     // Every path above must leave the stack balanced.
