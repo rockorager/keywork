@@ -41,6 +41,17 @@ const FrameResources = struct {
     vertex_buffer: GpuBuffer = .{},
 };
 
+const SwapchainResources = struct {
+    swapchain: vk.SwapchainKHR,
+    images: []vk.Image,
+    image_views: []vk.ImageView,
+    render_pass: vk.RenderPass,
+    framebuffers: []vk.Framebuffer,
+    render_finished_semaphores: []vk.Semaphore,
+    present_fences: []vk.Fence,
+    present_fence_pending: []bool,
+};
+
 const GpuBuffer = struct {
     buffer: vk.Buffer = .null_handle,
     memory: vk.DeviceMemory = .null_handle,
@@ -166,6 +177,7 @@ pub const Renderer = struct {
     device: vk.Device,
     queue_family_index: u32,
     queue: vk.Queue,
+    swapchain_maintenance: bool,
     swapchain: vk.SwapchainKHR,
     swapchain_extent: vk.Extent2D,
     swapchain_format: vk.Format,
@@ -200,26 +212,42 @@ pub const Renderer = struct {
     /// One per swapchain image: a per-frame present semaphore could still
     /// be pending when its frame slot is reused.
     render_finished_semaphores: []vk.Semaphore,
+    present_fences: []vk.Fence,
+    present_fence_pending: []bool,
+    retired_swapchains: std.ArrayList(SwapchainResources),
 
     pub fn init(allocator: std.mem.Allocator, display: *wl.Display, surface: *wl.Surface) !Self {
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
 
         const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
+        const loader_api_version = if (vkb.dispatch.vkEnumerateInstanceVersion != null)
+            try vkb.enumerateInstanceVersion()
+        else
+            vk.API_VERSION_1_0.toU32();
+        const instance_api_version = @min(loader_api_version, vk.API_VERSION_1_1.toU32());
+        const instance_extension_properties = try vkb.enumerateInstanceExtensionPropertiesAlloc(null, allocator);
+        defer allocator.free(instance_extension_properties);
+        const surface_maintenance =
+            hasExtension(instance_extension_properties, vk.extensions.khr_get_surface_capabilities_2.name) and
+            hasExtension(instance_extension_properties, vk.extensions.ext_surface_maintenance_1.name);
         const instance_extensions = [_][*:0]const u8{
             vk.extensions.khr_surface.name,
             vk.extensions.khr_wayland_surface.name,
+            vk.extensions.khr_get_surface_capabilities_2.name,
+            vk.extensions.ext_surface_maintenance_1.name,
         };
+        const instance_extension_count: u32 = if (surface_maintenance) instance_extensions.len else 2;
         const app_info: vk.ApplicationInfo = .{
             .p_application_name = "Keywork",
             .application_version = vk.makeApiVersion(0, 0, 0, 0).toU32(),
             .p_engine_name = "Keywork",
             .engine_version = vk.makeApiVersion(0, 0, 0, 0).toU32(),
-            .api_version = vk.API_VERSION_1_0.toU32(),
+            .api_version = instance_api_version,
         };
         const instance = try vkb.createInstance(&.{
             .p_application_info = &app_info,
-            .enabled_extension_count = instance_extensions.len,
+            .enabled_extension_count = instance_extension_count,
             .pp_enabled_extension_names = &instance_extensions,
         }, null);
 
@@ -233,8 +261,29 @@ pub const Renderer = struct {
 
         const selection = try selectPhysicalDevice(allocator, vki, instance, surface_khr);
         const memory_properties = vki.getPhysicalDeviceMemoryProperties(selection.physical_device);
-        const device_limits = vki.getPhysicalDeviceProperties(selection.physical_device).limits;
-        const device_extension_names = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
+        const physical_device_properties = vki.getPhysicalDeviceProperties(selection.physical_device);
+        const device_limits = physical_device_properties.limits;
+        const extension_properties = try vki.enumerateDeviceExtensionPropertiesAlloc(selection.physical_device, null, allocator);
+        defer allocator.free(extension_properties);
+        var maintenance_features: vk.PhysicalDeviceSwapchainMaintenance1FeaturesEXT = .{};
+        const can_query_extended_features = instance_api_version >= vk.API_VERSION_1_1.toU32() and
+            physical_device_properties.api_version >= vk.API_VERSION_1_1.toU32();
+        const has_maintenance_extension = surface_maintenance and can_query_extended_features and
+            hasExtension(extension_properties, vk.extensions.ext_swapchain_maintenance_1.name);
+        if (has_maintenance_extension) {
+            var features: vk.PhysicalDeviceFeatures2 = .{ .features = .{} };
+            features.p_next = @ptrCast(&maintenance_features);
+            vki.getPhysicalDeviceFeatures2(selection.physical_device, &features);
+        }
+        const swapchain_maintenance = has_maintenance_extension and maintenance_features.swapchain_maintenance_1 == .true;
+        var requested_maintenance_features: vk.PhysicalDeviceSwapchainMaintenance1FeaturesEXT = .{
+            .swapchain_maintenance_1 = .true,
+        };
+        const device_extension_names = [_][*:0]const u8{
+            vk.extensions.khr_swapchain.name,
+            vk.extensions.ext_swapchain_maintenance_1.name,
+        };
+        const device_extension_count: u32 = if (swapchain_maintenance) device_extension_names.len else 1;
         const queue_priority: f32 = 1.0;
         const queue_create_info: vk.DeviceQueueCreateInfo = .{
             .queue_family_index = selection.queue_family_index,
@@ -242,9 +291,10 @@ pub const Renderer = struct {
             .p_queue_priorities = @ptrCast(&queue_priority),
         };
         const device = try vki.createDevice(selection.physical_device, &.{
+            .p_next = if (swapchain_maintenance) @ptrCast(&requested_maintenance_features) else null,
             .queue_create_info_count = 1,
             .p_queue_create_infos = @ptrCast(&queue_create_info),
-            .enabled_extension_count = device_extension_names.len,
+            .enabled_extension_count = device_extension_count,
             .pp_enabled_extension_names = &device_extension_names,
         }, null);
 
@@ -285,6 +335,7 @@ pub const Renderer = struct {
             .device = device,
             .queue_family_index = selection.queue_family_index,
             .queue = queue,
+            .swapchain_maintenance = swapchain_maintenance,
             .swapchain = .null_handle,
             .swapchain_extent = .{ .width = 0, .height = 0 },
             .swapchain_format = .undefined,
@@ -317,13 +368,19 @@ pub const Renderer = struct {
             .frames = frames,
             .frame_index = 0,
             .render_finished_semaphores = &.{},
+            .present_fences = &.{},
+            .present_fence_pending = &.{},
+            .retired_swapchains = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.vkd.deviceWaitIdle(self.device) catch {};
+        self.waitForPendingPresents() catch {};
         self.destroyTextResources();
         self.destroySwapchain();
+        for (self.retired_swapchains.items) |*resources| self.destroySwapchainResources(resources);
+        self.retired_swapchains.deinit(self.allocator);
         self.text_vertices.deinit(self.allocator);
         self.atlas_slots.deinit(self.allocator);
         for (&self.frames) |*frame| {
@@ -335,6 +392,20 @@ pub const Renderer = struct {
         self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
         self.text_renderer.deinit();
+    }
+
+    fn waitForPendingPresents(self: *Self) !void {
+        try self.waitForPendingPresentFences(self.present_fences, self.present_fence_pending);
+        for (self.retired_swapchains.items) |resources| {
+            try self.waitForPendingPresentFences(resources.present_fences, resources.present_fence_pending);
+        }
+    }
+
+    fn waitForPendingPresentFences(self: *Self, fences: []const vk.Fence, pending: []const bool) !void {
+        for (fences, pending) |fence, is_pending| {
+            if (!is_pending) continue;
+            _ = try self.vkd.waitForFences(self.device, &.{fence}, .true, std.math.maxInt(u64));
+        }
     }
 
     pub fn present(self: *Self, display_list: []const keywork.PaintCommand, scale: f32, width: u31, height: u31) !bool {
@@ -358,9 +429,7 @@ pub const Renderer = struct {
 
     fn ensureSwapchain(self: *Self, width: u31, height: u31) !bool {
         if (!self.swapchain_dirty and self.swapchain != .null_handle and self.swapchain_extent.width == width and self.swapchain_extent.height == height) return true;
-        try self.vkd.deviceWaitIdle(self.device);
-        self.destroySwapchain();
-        self.swapchain_dirty = false;
+        try self.reapRetiredSwapchains();
 
         const caps = try self.vki.getPhysicalDeviceSurfaceCapabilitiesKHR(self.physical_device, self.surface_khr);
         const formats = try self.vki.getPhysicalDeviceSurfaceFormatsAllocKHR(self.physical_device, self.surface_khr, self.allocator);
@@ -376,6 +445,15 @@ pub const Renderer = struct {
         if (!caps.supported_usage_flags.contains(usage)) return error.UnsupportedSwapchainUsage;
 
         if (extent.width == 0 or extent.height == 0) return false;
+        // Present fences let old WSI resources retire asynchronously. Fall
+        // back to the present queue only on drivers without maintenance1, or
+        // for the rare format change that also replaces the graphics pipeline.
+        if (self.swapchain != .null_handle and
+            (!self.swapchain_maintenance or self.swapchain_format != surface_format.format))
+        {
+            try self.vkd.queueWaitIdle(self.queue);
+        }
+        const old_swapchain = try self.retireSwapchain();
         self.swapchain = try self.vkd.createSwapchainKHR(self.device, &.{
             .surface = self.surface_khr,
             .min_image_count = image_count,
@@ -389,6 +467,7 @@ pub const Renderer = struct {
             .composite_alpha = composite_alpha,
             .present_mode = .fifo_khr,
             .clipped = .true,
+            .old_swapchain = old_swapchain,
         }, null);
         errdefer self.destroySwapchain();
 
@@ -398,37 +477,110 @@ pub const Renderer = struct {
         self.render_finished_semaphores = try self.allocator.alloc(vk.Semaphore, self.swapchain_images.len);
         @memset(self.render_finished_semaphores, .null_handle);
         for (self.render_finished_semaphores) |*semaphore| semaphore.* = try self.vkd.createSemaphore(self.device, &.{}, null);
+        if (self.swapchain_maintenance) {
+            self.present_fences = try self.allocator.alloc(vk.Fence, self.swapchain_images.len);
+            @memset(self.present_fences, .null_handle);
+            self.present_fence_pending = try self.allocator.alloc(bool, self.swapchain_images.len);
+            @memset(self.present_fence_pending, false);
+            for (self.present_fences) |*fence| fence.* = try self.vkd.createFence(self.device, &.{}, null);
+        }
         try self.createRenderTargets();
         try self.ensureTextResources();
         try self.ensureTextPipeline();
+        self.swapchain_dirty = false;
+        try self.reapRetiredSwapchains();
         log.info("Vulkan swapchain {d}x{d} images={d}", .{ extent.width, extent.height, self.swapchain_images.len });
         return true;
     }
 
     fn destroySwapchain(self: *Self) void {
-        for (self.framebuffers) |framebuffer| {
-            if (framebuffer != .null_handle) self.vkd.destroyFramebuffer(self.device, framebuffer, null);
+        var resources = self.takeSwapchain();
+        self.destroySwapchainResources(&resources);
+    }
+
+    fn retireSwapchain(self: *Self) !vk.SwapchainKHR {
+        if (self.swapchain == .null_handle) return .null_handle;
+        const resources = self.currentSwapchainResources();
+        try self.retired_swapchains.append(self.allocator, resources);
+        self.resetCurrentSwapchain();
+        return resources.swapchain;
+    }
+
+    fn reapRetiredSwapchains(self: *Self) !void {
+        var index: usize = 0;
+        while (index < self.retired_swapchains.items.len) {
+            const resources = &self.retired_swapchains.items[index];
+            var complete = true;
+            for (resources.present_fences, resources.present_fence_pending) |fence, pending| {
+                if (!pending) continue;
+                if (try self.vkd.getFenceStatus(self.device, fence) == .not_ready) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete) {
+                index += 1;
+                continue;
+            }
+            var retired = self.retired_swapchains.swapRemove(index);
+            self.destroySwapchainResources(&retired);
         }
-        if (self.framebuffers.len > 0) self.allocator.free(self.framebuffers);
-        if (self.render_pass != .null_handle) self.vkd.destroyRenderPass(self.device, self.render_pass, null);
-        for (self.render_finished_semaphores) |semaphore| {
-            if (semaphore != .null_handle) self.vkd.destroySemaphore(self.device, semaphore, null);
-        }
-        if (self.render_finished_semaphores.len > 0) self.allocator.free(self.render_finished_semaphores);
-        self.render_finished_semaphores = &.{};
-        for (self.swapchain_image_views) |view| {
-            if (view != .null_handle) self.vkd.destroyImageView(self.device, view, null);
-        }
-        if (self.swapchain_image_views.len > 0) self.allocator.free(self.swapchain_image_views);
-        if (self.swapchain_images.len > 0) self.allocator.free(self.swapchain_images);
-        self.framebuffers = &.{};
-        self.render_pass = .null_handle;
-        self.swapchain_image_views = &.{};
-        self.swapchain_images = &.{};
-        if (self.swapchain != .null_handle) self.vkd.destroySwapchainKHR(self.device, self.swapchain, null);
+    }
+
+    fn currentSwapchainResources(self: *Self) SwapchainResources {
+        return .{
+            .swapchain = self.swapchain,
+            .images = self.swapchain_images,
+            .image_views = self.swapchain_image_views,
+            .render_pass = self.render_pass,
+            .framebuffers = self.framebuffers,
+            .render_finished_semaphores = self.render_finished_semaphores,
+            .present_fences = self.present_fences,
+            .present_fence_pending = self.present_fence_pending,
+        };
+    }
+
+    fn takeSwapchain(self: *Self) SwapchainResources {
+        const resources = self.currentSwapchainResources();
+        self.resetCurrentSwapchain();
+        return resources;
+    }
+
+    fn resetCurrentSwapchain(self: *Self) void {
         self.swapchain = .null_handle;
         self.swapchain_extent = .{ .width = 0, .height = 0 };
         self.swapchain_format = .undefined;
+        self.swapchain_images = &.{};
+        self.swapchain_image_views = &.{};
+        self.render_pass = .null_handle;
+        self.framebuffers = &.{};
+        self.render_finished_semaphores = &.{};
+        self.present_fences = &.{};
+        self.present_fence_pending = &.{};
+    }
+
+    fn destroySwapchainResources(self: *Self, resources: *SwapchainResources) void {
+        for (resources.framebuffers) |framebuffer| {
+            if (framebuffer != .null_handle) self.vkd.destroyFramebuffer(self.device, framebuffer, null);
+        }
+        if (resources.framebuffers.len > 0) self.allocator.free(resources.framebuffers);
+        if (resources.render_pass != .null_handle) self.vkd.destroyRenderPass(self.device, resources.render_pass, null);
+        for (resources.render_finished_semaphores) |semaphore| {
+            if (semaphore != .null_handle) self.vkd.destroySemaphore(self.device, semaphore, null);
+        }
+        if (resources.render_finished_semaphores.len > 0) self.allocator.free(resources.render_finished_semaphores);
+        for (resources.present_fences) |fence| {
+            if (fence != .null_handle) self.vkd.destroyFence(self.device, fence, null);
+        }
+        if (resources.present_fences.len > 0) self.allocator.free(resources.present_fences);
+        if (resources.present_fence_pending.len > 0) self.allocator.free(resources.present_fence_pending);
+        for (resources.image_views) |view| {
+            if (view != .null_handle) self.vkd.destroyImageView(self.device, view, null);
+        }
+        if (resources.image_views.len > 0) self.allocator.free(resources.image_views);
+        if (resources.images.len > 0) self.allocator.free(resources.images);
+        if (resources.swapchain != .null_handle) self.vkd.destroySwapchainKHR(self.device, resources.swapchain, null);
+        resources.* = undefined;
     }
 
     fn createRenderTargets(self: *Self) !void {
@@ -861,13 +1013,30 @@ pub const Renderer = struct {
             .p_signal_semaphores = @ptrCast(&self.render_finished_semaphores[image_index]),
         }}, self.in_flight);
 
-        const present_result = self.vkd.queuePresentKHR(self.queue, &.{
+        var present_fence_info: vk.SwapchainPresentFenceInfoEXT = undefined;
+        var present_info: vk.PresentInfoKHR = .{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast(&self.render_finished_semaphores[image_index]),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&self.swapchain),
             .p_image_indices = @ptrCast(&image_index),
-        }) catch |err| switch (err) {
+        };
+        if (self.swapchain_maintenance) {
+            const fence = self.present_fences[image_index];
+            if (self.present_fence_pending[image_index]) {
+                // Reacquiring the image means its previous presentation is
+                // complete; normally this wait only observes a signaled fence.
+                _ = try self.vkd.waitForFences(self.device, &.{fence}, .true, std.math.maxInt(u64));
+            }
+            try self.vkd.resetFences(self.device, &.{fence});
+            present_fence_info = .{
+                .swapchain_count = 1,
+                .p_fences = @ptrCast(&fence),
+            };
+            present_info.p_next = @ptrCast(&present_fence_info);
+            self.present_fence_pending[image_index] = true;
+        }
+        const present_result = self.vkd.queuePresentKHR(self.queue, &present_info) catch |err| switch (err) {
             error.OutOfDateKHR => return .stale,
             else => return err,
         };
@@ -1420,6 +1589,14 @@ fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, i
         }
     }
     return error.NoSuitableVulkanDevice;
+}
+
+fn hasExtension(properties: []const vk.ExtensionProperties, name: [:0]const u8) bool {
+    for (properties) |property| {
+        const property_name = std.mem.sliceTo(&property.extension_name, 0);
+        if (std.mem.eql(u8, property_name, name)) return true;
+    }
+    return false;
 }
 
 fn chooseSurfaceFormat(formats: []const vk.SurfaceFormatKHR) vk.SurfaceFormatKHR {

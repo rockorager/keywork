@@ -391,10 +391,11 @@ pub const Backend = struct {
             const width = try window.scaledFrameDimension(logical_width, protocol.scale);
             const height = try window.scaledFrameDimension(logical_height, protocol.scale);
             protocol.configureBuffer(logical_width, logical_height);
+            // Mesa's Wayland WSI commits the wl_surface inside
+            // vkQueuePresentKHR, so queue the callback before that commit.
+            try protocol.armFrameCallback();
             const pending = try self.renderer.present(frame.display_list, protocol.scale, width, height);
             if (!pending) return false;
-            try protocol.armFrameCallback();
-            protocol.surface.commit();
             _ = self.backend.connection.display.flush();
             return true;
         }

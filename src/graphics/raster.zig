@@ -13,13 +13,16 @@ pub fn rasterize(
     commands: []const keywork.PaintCommand,
     base_clip: ?TextRenderer.PixelClip,
 ) !void {
+    const background = if (commands.len > 0) fullFrameFill(commands[0], width, height, scale) else null;
+    const clear_color = background orelse keywork.colors.transparent;
     if (base_clip) |clip| {
-        clearRegion(pixels, width, height, clip);
+        clearRegion(pixels, width, height, clip, clear_color);
     } else {
-        @memset(pixels, @as(u32, @bitCast(keywork.colors.transparent)));
+        @memset(pixels, @as(u32, @bitCast(clear_color)));
     }
     var clip: ?TextRenderer.PixelClip = base_clip;
-    for (commands) |command| {
+    const first_command: usize = if (background != null) 1 else 0;
+    for (commands[first_command..]) |command| {
         switch (command) {
             .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color, clip),
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
@@ -28,6 +31,22 @@ pub fn rasterize(
             .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
     }
+}
+
+/// A leading opaque fill that reaches every target pixel is the clear. This
+/// avoids writing the whole buffer twice for the normal window background.
+fn fullFrameFill(command: keywork.PaintCommand, width: u31, height: u31, scale: f32) ?keywork.Color {
+    const fill = switch (command) {
+        .fill_rect => |value| value,
+        else => return null,
+    };
+    if (fill.color.a != 255) return null;
+    const x0 = clampPixel(@floor(fill.rect.x * scale), width);
+    const y0 = clampPixel(@floor(fill.rect.y * scale), height);
+    const x1 = clampPixel(@ceil((fill.rect.x + fill.rect.width) * scale), width);
+    const y1 = clampPixel(@ceil((fill.rect.y + fill.rect.height) * scale), height);
+    if (x0 != 0 or y0 != 0 or x1 != width or y1 != height) return null;
+    return fill.color;
 }
 
 fn combineClips(base: ?TextRenderer.PixelClip, rect: ?keywork.Rect, scale: f32) ?TextRenderer.PixelClip {
@@ -42,8 +61,8 @@ fn combineClips(base: ?TextRenderer.PixelClip, rect: ?keywork.Rect, scale: f32) 
     };
 }
 
-fn clearRegion(pixels: []u32, width: u31, height: u31, clip: TextRenderer.PixelClip) void {
-    const value: u32 = @bitCast(keywork.colors.transparent);
+fn clearRegion(pixels: []u32, width: u31, height: u31, clip: TextRenderer.PixelClip, color: keywork.Color) void {
+    const value: u32 = @bitCast(color);
     const x0 = clampClip(clip.x0, width);
     const x1 = clampClip(clip.x1, width);
     const y0 = clampClip(clip.y0, height);
@@ -208,4 +227,19 @@ test "translucent rectangle blends without lowering destination alpha" {
 
     const expected: u32 = @bitCast(keywork.Color.argb(255, 128, 128, 128));
     try std.testing.expectEqualSlices(u32, &@as([width * height]u32, @splat(expected)), &pixels);
+}
+
+test "opaque leading full-frame fill can replace clear" {
+    const color = keywork.Color.argb(255, 12, 34, 56);
+    const command: keywork.PaintCommand = .{ .fill_rect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 320, .height = 240 },
+        .color = color,
+    } };
+    try std.testing.expectEqual(color, fullFrameFill(command, 400, 300, 1.25).?);
+
+    const translucent: keywork.PaintCommand = .{ .fill_rect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 400, .height = 300 },
+        .color = keywork.Color.argb(254, 12, 34, 56),
+    } };
+    try std.testing.expectEqual(null, fullFrameFill(translucent, 400, 300, 1));
 }
