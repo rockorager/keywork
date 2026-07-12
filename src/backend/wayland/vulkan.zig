@@ -30,8 +30,8 @@ const RendererAdapter = struct {
 
     pub fn present(win: anytype, frame: keywork.RenderBackend.Frame) !bool {
         const protocol = &win.protocol;
-        const logical_width = try window.frameLogicalWidth(frame, protocol.width);
-        const logical_height = try window.frameLogicalHeight(frame, protocol.height);
+        const logical_width = try window.frameLogicalDimension(frame.size.width, protocol.width);
+        const logical_height = try window.frameLogicalDimension(frame.size.height, protocol.height);
         const width = try window.scaledFrameDimension(logical_width, protocol.scale);
         const height = try window.scaledFrameDimension(logical_height, protocol.scale);
         protocol.configureBuffer(logical_width, logical_height);

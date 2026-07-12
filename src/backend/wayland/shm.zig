@@ -50,8 +50,8 @@ const RendererAdapter = struct {
 
     pub fn present(win: anytype, frame: keywork.RenderBackend.Frame) !bool {
         const protocol = &win.protocol;
-        const logical_width = try window.frameLogicalWidth(frame, protocol.width);
-        const logical_height = try window.frameLogicalHeight(frame, protocol.height);
+        const logical_width = try window.frameLogicalDimension(frame.size.width, protocol.width);
+        const logical_height = try window.frameLogicalDimension(frame.size.height, protocol.height);
         const width = try window.scaledFrameDimension(logical_width, protocol.scale);
         const height = try window.scaledFrameDimension(logical_height, protocol.scale);
         const buffer = try acquireBuffer(win, width, height);
@@ -98,14 +98,8 @@ const RendererAdapter = struct {
     pub fn partialPaintBounds(win: anytype, size: keywork.Size, scale: f32, damage: []const keywork.Rect) !?keywork.Rect {
         if (!win.protocol.configured or scale != win.protocol.scale or damage.len != 1) return null;
 
-        const probe: keywork.RenderBackend.Frame = .{
-            .size = size,
-            .scale = scale,
-            .damage = damage,
-            .display_list = &.{},
-        };
-        const logical_width = try window.frameLogicalWidth(probe, win.protocol.width);
-        const logical_height = try window.frameLogicalHeight(probe, win.protocol.height);
+        const logical_width = try window.frameLogicalDimension(size.width, win.protocol.width);
+        const logical_height = try window.frameLogicalDimension(size.height, win.protocol.height);
         const width = try window.scaledFrameDimension(logical_width, scale);
         const height = try window.scaledFrameDimension(logical_height, scale);
         const last = win.renderer.last_rendered orelse return null;

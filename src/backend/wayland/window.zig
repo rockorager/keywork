@@ -1129,14 +1129,8 @@ pub fn eventLoopFinish(
     return !is_closed(ctx);
 }
 
-pub fn frameLogicalWidth(frame: keywork.RenderBackend.Frame, fallback: u31) !u31 {
-    const value = if (frame.size.width > 0) frame.size.width else @as(f32, @floatFromInt(fallback));
-    return positiveU31(value);
-}
-
-pub fn frameLogicalHeight(frame: keywork.RenderBackend.Frame, fallback: u31) !u31 {
-    const value = if (frame.size.height > 0) frame.size.height else @as(f32, @floatFromInt(fallback));
-    return positiveU31(value);
+pub fn frameLogicalDimension(dimension: f32, fallback: u31) !u31 {
+    return positiveU31(if (dimension > 0) dimension else @as(f32, @floatFromInt(fallback)));
 }
 
 pub fn scaledFrameDimension(logical_dimension: u31, scale: f32) !u31 {
