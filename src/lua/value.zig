@@ -8,6 +8,11 @@ pub fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
     return c.lua_gettop(lua_state) + index + 1;
 }
 
+pub fn upvaluePointer(comptime Pointer: type, lua_state: *c.lua_State, slot: c_int) Pointer {
+    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(slot)).?;
+    return @ptrCast(@alignCast(ptr));
+}
+
 pub fn expectType(lua_state: *c.lua_State, index: c_int, expected: c_int) !void {
     if (c.lua_type(lua_state, index) != expected) return error.UnexpectedLuaType;
 }

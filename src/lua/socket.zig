@@ -207,8 +207,7 @@ pub fn installApi(lua_state: *c.lua_State, loop_table: c_int, host: *Host) void 
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*Host, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*Host, lua_state, 1).*;
 }
 
 const socket_type: [*:0]const u8 = "keywork.socket";

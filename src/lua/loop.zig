@@ -302,8 +302,7 @@ pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Ho
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*Host, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*Host, lua_state, 1).*;
 }
 
 fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {

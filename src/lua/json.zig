@@ -46,8 +46,7 @@ pub fn pushModule(lua_state: *c.lua_State, allocator: *const std.mem.Allocator) 
 }
 
 fn allocatorFromUpvalue(lua_state: *c.lua_State) std.mem.Allocator {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*const std.mem.Allocator, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*const std.mem.Allocator, lua_state, 1).*;
 }
 
 fn isNullSentinel(lua_state: *c.lua_State, index: c_int) bool {

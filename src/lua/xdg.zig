@@ -242,8 +242,7 @@ pub fn installApi(lua_state: *c.lua_State, table: c_int, allocator: *const std.m
 }
 
 fn upvalueAllocator(lua_state: *c.lua_State) std.mem.Allocator {
-    const ptr: *const std.mem.Allocator = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    return ptr.*;
+    return lua_value.upvaluePointer(*const std.mem.Allocator, lua_state, 1).*;
 }
 
 fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

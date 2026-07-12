@@ -1195,7 +1195,7 @@ fn loadEmbeddedModule(lua_state: *c.lua_State, source: []const u8, chunk_name: [
 
 fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     if (c.luaL_loadbuffer(lua_state, embedded_ui_source.ptr, embedded_ui_source.len, "@keywork/ui.lua") != 0) return c.lua_error(lua_state);
     if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     const keywork_table = c.lua_gettop(lua_state);
@@ -1242,7 +1242,7 @@ fn pushClipboardNamespace(lua_state: *c.lua_State, app: *App) void {
 /// the clipboard is empty or holds no text.
 fn luaClipboardRead(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
     const text = platform.clipboardRead(app.allocator) catch |err| return lua_value.pushNilError(lua_state, err);
     const value = text orelse {
@@ -1259,7 +1259,7 @@ fn luaClipboardRead(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 /// serial.
 fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const text = lua_value.checkString(lua_state, 1);
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
     platform.clipboardWrite(text) catch |err| return lua_value.pushNilError(lua_state, err);
@@ -1272,7 +1272,7 @@ fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 /// in; call from a press handler.
 fn luaWindowStartMove(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
     platform.startMove() catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
@@ -1283,7 +1283,7 @@ fn luaWindowStartMove(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 /// xdg_toplevel ("top", "bottom_left" / "bottom-left", ...).
 fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const edge = platform_mod.resizeEdgeFromName(lua_value.checkString(lua_state, 1)) orelse
         return c.luaL_error(lua_state, "invalid resize edge (expected top, bottom, left, right, or a corner)");
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
@@ -1298,7 +1298,7 @@ fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 /// without an error means the compositor lacks xdg-activation.
 fn luaWindowRequestActivationToken(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
 
     var app_id: ?[:0]u8 = null;
@@ -1322,7 +1322,7 @@ fn luaWindowRequestActivationToken(lua_state_optional: ?*c.lua_State) callconv(.
 
 fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     c.lua_createtable(lua_state, 0, 4);
     const loop_table = c.lua_gettop(lua_state);
     app.loop_host = app.loopHost();
@@ -1334,7 +1334,7 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, app);
     c.lua_pushcclosure(lua_state, luaSpawn, 1);
@@ -1356,7 +1356,7 @@ fn xdgApplicationsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c
 
 fn xdgModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     c.lua_createtable(lua_state, 0, 12);
     lua_xdg.installApi(lua_state, -1, &app.allocator);
     // The embedded Lua layer adds the base-directory functions in place.
@@ -1376,7 +1376,7 @@ fn portalModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     app.dbus_host = app.dbusHost();
     lua_dbus.pushModule(lua_state, &app.dbus_host);
     return 1;
@@ -1384,7 +1384,7 @@ fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     app.pipewire_host = app.pipewireHost();
     lua_pipewire.pushModule(lua_state, &app.pipewire_host);
     return 1;
@@ -1392,7 +1392,7 @@ fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn jsonModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     lua_json.pushModule(lua_state, &app.allocator);
     return 1;
 }
@@ -1441,7 +1441,7 @@ fn luaAppCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaQuit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     if (app.event_loop) |loop| {
         loop.quit();
     } else {
@@ -1452,7 +1452,7 @@ fn luaQuit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaReload(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     app.script_dirty = true;
     if (app.invalidator) |invalidator| invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("reload invalidate failed: {}", .{err});
@@ -1514,7 +1514,7 @@ fn tryLuaToString(lua_state: *c.lua_State, index: c_int, writer: *std.Io.Writer)
 
 fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     lua_task.raiseIfCanceled(lua_state);
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
 
@@ -1549,7 +1549,7 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
     const invalidator = app.invalidator orelse return 0;
     invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});

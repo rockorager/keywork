@@ -158,8 +158,7 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*Host, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*Host, lua_state, 1).*;
 }
 
 fn pipewireCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {

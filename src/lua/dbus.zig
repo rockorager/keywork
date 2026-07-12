@@ -53,8 +53,7 @@ pub const Kind = enum {
 };
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*Host, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*Host, lua_state, 1).*;
 }
 
 pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {

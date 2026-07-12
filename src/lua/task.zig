@@ -19,6 +19,7 @@ const std = @import("std");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_loop = @import("loop.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 const log = std.log.scoped(.keywork_luajit);
@@ -301,8 +302,7 @@ pub fn pushScopeHandle(lua_state: *c.lua_State, scope: *LuaScope) void {
 }
 
 fn hostFromLua(lua_state: *c.lua_State) lua_loop.Host {
-    const ptr = c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?;
-    return @as(*lua_loop.Host, @ptrCast(@alignCast(ptr))).*;
+    return lua_value.upvaluePointer(*lua_loop.Host, lua_state, 1).*;
 }
 
 /// Implements loop.spawn(fn, ...): runs `fn` on a fresh coroutine until it
