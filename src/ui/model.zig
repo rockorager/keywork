@@ -1604,13 +1604,8 @@ pub fn buildElementTreeScoped(
             const element_key = try cloneKey(allocator, keyed_widget.key);
             errdefer destroyKey(allocator, element_key);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, keyed_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .keyed, .widget = element_widget, .key = element_key, .children = children };
         },
         .text => return .{ .kind = .text, .widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style) },
@@ -1619,13 +1614,8 @@ pub fn buildElementTreeScoped(
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, sized_widget.child, constrainSized(constraints, sized_widget));
-            initialized = true;
             return .{ .kind = .sized, .widget = element_widget, .children = children };
         },
         .text_input => {
@@ -1654,52 +1644,32 @@ pub fn buildElementTreeScoped(
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, box_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .box, .widget = element_widget, .children = children };
         },
         .clickable => |clickable_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildClickableChildElement(allocator, scope, clickable_widget, constraints);
-            initialized = true;
             return .{ .kind = .clickable, .widget = element_widget, .children = children };
         },
         .anchored => |anchored_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, anchored_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .anchored, .widget = element_widget, .children = children };
         },
         .focus => |focus_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, focus_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children };
         },
         .scroll => |scroll_widget| {
@@ -1729,52 +1699,32 @@ pub fn buildElementTreeScoped(
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, focus_scope_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .focus_scope, .widget = element_widget, .children = children };
         },
         .padding => |padding_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, padding_widget.child, constraints.inset(padding_widget.insets));
-            initialized = true;
             return .{ .kind = .padding, .widget = element_widget, .children = children };
         },
         .flexible => |flexible_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, flexible_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .flexible, .widget = element_widget, .children = children };
         },
         .center => |center_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, center_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .center, .widget = element_widget, .children = children };
         },
         .button => {
@@ -1782,13 +1732,8 @@ pub fn buildElementTreeScoped(
             errdefer destroyElementWidget(allocator, &element_widget);
             const built = try buildButtonWidget(scope.allocator, scope.theme, scope.interaction, scope.actions, element_widget.button);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
-            initialized = true;
             return .{ .kind = .button, .widget = element_widget, .children = children };
         },
         .actions => |actions_widget| {
@@ -1799,26 +1744,16 @@ pub fn buildElementTreeScoped(
             scope.actions = &nested_actions;
             defer scope.actions = previous_actions;
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, actions_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .actions, .widget = element_widget, .children = children };
         },
         .shortcuts => |shortcuts_widget| {
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, shortcuts_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .shortcuts, .widget = element_widget, .children = children };
         },
         .theme => |theme_widget| {
@@ -1828,13 +1763,8 @@ pub fn buildElementTreeScoped(
             scope.theme = theme_widget.theme;
             defer scope.theme = previous_theme;
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, theme_widget.child, constraints);
-            initialized = true;
             return .{ .kind = .theme, .widget = element_widget, .children = children };
         },
         .default_text_style => |default_text_style| {
@@ -1844,13 +1774,8 @@ pub fn buildElementTreeScoped(
             scope.default_text_style = mergeTextStyle(previous_style, default_text_style.style);
             defer scope.default_text_style = previous_style;
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, default_text_style.child, constraints);
-            initialized = true;
             return .{ .kind = .default_text_style, .widget = element_widget, .children = children };
         },
         .row => |row_widget| return buildLinearElementTree(allocator, scope, .row, widget.*, row_widget.children, constraints),
@@ -1860,13 +1785,8 @@ pub fn buildElementTreeScoped(
             errdefer destroyElementWidget(allocator, &element_widget);
             const built = try component_widget.build(scope, buildContext(scope, constraints));
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try buildElementTreeScoped(allocator, scope, &built, constraints);
-            initialized = true;
             return .{ .kind = .component, .widget = element_widget, .children = children };
         },
         .stateful => |stateful_widget| {
@@ -1893,13 +1813,8 @@ pub fn buildElementTreeScoped(
             var element_widget = try cloneWidgetForElement(allocator, widget.*);
             errdefer destroyElementWidget(allocator, &element_widget);
             const children = try allocator.alloc(Element, 1);
-            var initialized = false;
-            errdefer {
-                if (initialized) destroyElementTree(allocator, &children[0]);
-                allocator.free(children);
-            }
+            errdefer allocator.free(children);
             children[0] = try custom_element.build(allocator, scope, buildContext(scope, constraints));
-            initialized = true;
             return .{ .kind = .element, .widget = element_widget, .children = children };
         },
     }
