@@ -207,10 +207,6 @@ pub const Runtime = struct {
         return self.external_raster_cache orelse &self.owned_raster_cache;
     }
 
-    fn currentState(self: *const Runtime) State {
-        return lifecycle_reconciliation.currentState(self);
-    }
-
     pub fn frameSize(self: *const Runtime) Size {
         return self.configured_size;
     }
@@ -312,10 +308,6 @@ pub const Runtime = struct {
         try backend_behavior.presentFrame(self);
     }
 
-    fn frameDone(self: *Runtime) !void {
-        try backend_behavior.frameDone(self);
-    }
-
     pub fn click(self: *Runtime, point: Point) !void {
         try input_behavior.click(self, point);
     }
@@ -326,22 +318,6 @@ pub const Runtime = struct {
 
     pub const ScrollbarDrag = focus_scroll.ScrollbarDrag;
 
-    fn pointerDown(self: *Runtime, point: Point) !void {
-        try input_behavior.pointerDown(self, point);
-    }
-
-    fn beginScrollbarDrag(self: *Runtime, hit: keywork.ScrollbarThumbHit, point: Point) !void {
-        try focus_scroll.beginScrollbarDrag(self, hit, point);
-    }
-
-    fn clearScrollbarDrag(self: *Runtime) void {
-        focus_scroll.clearScrollbarDrag(self);
-    }
-
-    fn pointerUp(self: *Runtime, point: Point) !void {
-        try input_behavior.pointerUp(self, point);
-    }
-
     pub fn requestFocus(self: *Runtime, id: []const u8) !void {
         try focus_scroll.requestFocus(self, id);
     }
@@ -350,44 +326,8 @@ pub const Runtime = struct {
         try focus_scroll.clearFocus(self);
     }
 
-    fn setFocused(self: *Runtime, id: ?[]const u8) !bool {
-        return focus_scroll.setFocused(self, id);
-    }
-
     pub fn keyInput(self: *Runtime, input: KeyInput) !void {
         try input_behavior.keyInput(self, input);
-    }
-
-    fn activateShortcut(self: *Runtime, input: KeyInput) !bool {
-        return input_behavior.activateShortcut(self, input);
-    }
-
-    fn focusedTarget(self: *Runtime) ?keywork.FocusTarget {
-        return focus_scroll.focusedTarget(self);
-    }
-
-    fn focusedTargetIs(self: *Runtime, kind: keywork.FocusTarget.Kind) bool {
-        return focus_scroll.focusedTargetIs(self, kind);
-    }
-
-    fn focusNext(self: *Runtime, reverse: bool) !void {
-        try focus_scroll.focusNext(self, reverse);
-    }
-
-    fn revealFocused(self: *Runtime) !void {
-        try focus_scroll.revealFocused(self);
-    }
-
-    fn activeModalScopeId(targets: []const keywork.FocusTarget) ?[]const u8 {
-        return focus_scroll.activeModalScopeId(targets);
-    }
-
-    fn sameOptionalString(a: ?[]const u8, b: ?[]const u8) bool {
-        return focus_scroll.sameOptionalString(a, b);
-    }
-
-    fn activateClick(self: *Runtime, hit: keywork.ClickHit, event: keywork.TapEvent) !bool {
-        return input_behavior.activateClick(self, hit, event);
     }
 
     pub fn cursorShape(self: *Runtime, point: Point) CursorShape {
@@ -396,22 +336,6 @@ pub const Runtime = struct {
 
     pub fn pointerMove(self: *Runtime, point: ?Point) !void {
         try input_behavior.pointerMove(self, point);
-    }
-
-    fn setHoveredId(self: *Runtime, id: ?[]const u8) !bool {
-        return input_behavior.setHoveredId(self, id);
-    }
-
-    fn setPressedId(self: *Runtime, id: ?[]const u8) !bool {
-        return input_behavior.setPressedId(self, id);
-    }
-
-    fn queueInteractionRefresh(self: *Runtime, id: []const u8) !void {
-        try input_behavior.queueInteractionRefresh(self, id);
-    }
-
-    fn flushInteractionRefresh(self: *Runtime) !void {
-        try lifecycle_reconciliation.flushInteractionRefresh(self);
     }
 
     pub fn waylandPointerButton(ctx: *anyopaque, event: keywork.PointerButtonEvent) void {
@@ -424,10 +348,6 @@ pub const Runtime = struct {
 
     pub fn scrollBy(self: *Runtime, event: keywork.ScrollEvent) !void {
         try focus_scroll.scrollBy(self, event);
-    }
-
-    fn scrollElementById(self: *Runtime, id: []const u8, dx: f32, dy: f32) !void {
-        try focus_scroll.scrollElementById(self, id, dx, dy);
     }
 
     pub fn waylandScroll(ctx: *anyopaque, event: keywork.ScrollEvent) void {
@@ -461,48 +381,62 @@ pub const Runtime = struct {
     fn rebuild(self: *Runtime) !void {
         try lifecycle_reconciliation.rebuild(self);
     }
+};
 
-    fn rebuildDirtyState(self: *Runtime) !void {
-        try lifecycle_reconciliation.rebuildDirtyState(self);
+const BasicTestBackend = struct {
+    fn backend(self: *@This()) RenderBackend {
+        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
     }
 
-    fn buildScope(self: *Runtime, state: State) BuildScope {
-        return lifecycle_reconciliation.buildScope(self, state);
+    fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
+        return false;
     }
 
-    fn rebuildRetainedTrees(self: *Runtime) !void {
-        try lifecycle_reconciliation.rebuildRetainedTrees(self);
+    fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+        const measurer: keywork.TextMeasurer = .fixed;
+        return measurer.measureText(value, style);
     }
 
-    fn reconcileInteractionAfterRebuild(self: *Runtime) void {
-        lifecycle_reconciliation.reconcileInteractionAfterRebuild(self);
-    }
-
-    fn reconcileFocusAfterRebuild(self: *Runtime) !bool {
-        return lifecycle_reconciliation.reconcileFocusAfterRebuild(self);
-    }
-
-    fn autofocusTarget(targets: []const keywork.FocusTarget, modal_scope_id: ?[]const u8) ?keywork.FocusTarget {
-        return lifecycle_reconciliation.autofocusTarget(targets, modal_scope_id);
+    fn scale(_: *anyopaque) f32 {
+        return 1;
     }
 };
 
-fn popLastGrapheme(bytes: *std.ArrayList(u8)) void {
-    input_behavior.popLastGrapheme(bytes);
-}
+const CountingTestBackend = struct {
+    presents: usize = 0,
+
+    fn backend(self: *@This()) RenderBackend {
+        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+    }
+
+    fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.presents += 1;
+        return false;
+    }
+
+    fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
+        const measurer: keywork.TextMeasurer = .fixed;
+        return measurer.measureText(value, style);
+    }
+
+    fn scale(_: *anyopaque) f32 {
+        return 1;
+    }
+};
 
 test "popLastGrapheme removes one extended grapheme cluster" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(std.testing.allocator);
 
     try bytes.appendSlice(std.testing.allocator, "aé🇺🇸👩🏽‍🚀");
-    popLastGrapheme(&bytes);
+    input_behavior.popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("aé🇺🇸", bytes.items);
-    popLastGrapheme(&bytes);
+    input_behavior.popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("aé", bytes.items);
-    popLastGrapheme(&bytes);
+    input_behavior.popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("a", bytes.items);
-    popLastGrapheme(&bytes);
+    input_behavior.popLastGrapheme(&bytes);
     try std.testing.expectEqualStrings("", bytes.items);
 }
 
@@ -526,27 +460,8 @@ test "invalidation raised during rebuild is not dropped" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: BasicTestBackend = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
         backend.backend(),
@@ -579,31 +494,8 @@ test "deferred invalidations coalesce until flush" {
         }
     };
 
-    const TestBackend = struct {
-        presents: usize = 0,
-
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.presents += 1;
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: CountingTestBackend = .{};
     var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
     defer runtime.deinit();
     try runtime.repaint();
@@ -630,25 +522,6 @@ test "content height follows retained root state and respects its cap" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     const Observer = struct {
         calls: usize = 0,
         desired: Size = .{ .width = 0, .height = 0 },
@@ -662,7 +535,7 @@ test "content height follows retained root state and respects its cap" {
     };
 
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: BasicTestBackend = .{};
     var observer: Observer = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
@@ -699,27 +572,8 @@ test "rebuild passes that never stabilize return an error" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: BasicTestBackend = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
         backend.backend(),
@@ -744,31 +598,8 @@ test "rebuilds that change nothing present nothing" {
         }
     };
 
-    const TestBackend = struct {
-        presents: usize = 0,
-
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.presents += 1;
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: CountingTestBackend = .{};
     var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
     defer runtime.deinit();
     try runtime.repaint();
@@ -2139,7 +1970,7 @@ test "present damage covers every display-list change during fast wheel scroll" 
         .no_preference,
     );
     defer runtime.deinit();
-    try runtime.frameDone();
+    try backend_behavior.frameDone(&runtime);
 
     // Fast wheel input: within each burst the first event may present
     // immediately, the rest coalesce behind the pending frame callback and
@@ -2157,13 +1988,13 @@ test "present damage covers every display-list change during fast wheel scroll" 
         for (burst) |dy| {
             try runtime.scrollBy(.{ .position = .{ .x = 320, .y = 200 }, .dx = 0, .dy = dy });
         }
-        try runtime.frameDone();
-        try runtime.frameDone();
+        try backend_behavior.frameDone(&runtime);
+        try backend_behavior.frameDone(&runtime);
     }
     // Drain the scrollbar fade so animation-driven presents are checked too.
     var ticks: usize = 0;
     while (ticks < 120) : (ticks += 1) {
-        try runtime.frameDone();
+        try backend_behavior.frameDone(&runtime);
     }
     try std.testing.expect(backend.presents > bursts.len);
     try std.testing.expectEqual(@as(usize, 0), backend.violations);
@@ -2909,7 +2740,7 @@ test "autofocus replaces focused node removed during rebuild" {
     );
     defer runtime.deinit();
 
-    _ = try runtime.setFocused("old");
+    _ = try focus_scroll.setFocused(&runtime, "old");
     try runtime.rebuild();
     try std.testing.expectEqualStrings("old", runtime.focused_id.?);
 
