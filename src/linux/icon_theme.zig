@@ -203,13 +203,9 @@ fn lookupInHomeTheme(
     formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
 ) !?IconFile {
-    const config_home = env("XDG_DATA_HOME") orelse blk: {
-        const home = env("HOME") orelse return null;
-        break :blk try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
-    };
-    const allocated = env("XDG_DATA_HOME") == null;
-    defer if (allocated) allocator.free(config_home);
-    return lookupInDataRootTheme(allocator, config_home, name, size, theme_name, formats, inherited);
+    const data_home = try allocDataHome(allocator) orelse return null;
+    defer allocator.free(data_home);
+    return lookupInDataRootTheme(allocator, data_home, name, size, theme_name, formats, inherited);
 }
 
 fn lookupInDataDirThemes(
@@ -375,13 +371,15 @@ fn lookupInPixmaps(allocator: std.mem.Allocator, name: []const u8, formats: []co
 }
 
 fn lookupInHomePixmaps(allocator: std.mem.Allocator, name: []const u8, formats: []const IconFormat) !?IconFile {
-    const data_home = env("XDG_DATA_HOME") orelse blk: {
-        const home = env("HOME") orelse return null;
-        break :blk try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
-    };
-    const allocated = env("XDG_DATA_HOME") == null;
-    defer if (allocated) allocator.free(data_home);
+    const data_home = try allocDataHome(allocator) orelse return null;
+    defer allocator.free(data_home);
     return lookupInDataRootPixmaps(allocator, data_home, name, formats);
+}
+
+fn allocDataHome(allocator: std.mem.Allocator) !?[]u8 {
+    if (env("XDG_DATA_HOME")) |data_home| return try allocator.dupe(u8, data_home);
+    const home = env("HOME") orelse return null;
+    return try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
 }
 
 fn lookupInDataRootPixmaps(allocator: std.mem.Allocator, data_root: []const u8, name: []const u8, formats: []const IconFormat) !?IconFile {
