@@ -963,20 +963,21 @@ fn digitFromKey(key: u32, shift: bool) []const u8 {
     };
 }
 
-test "Wayland key translation does not turn shortcut chords into text edits" {
+fn initTestInput(layout: [*:0]const u8) !Self {
     const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
-    defer xkb.xkb_context_unref(context);
-    const names: xkb.struct_xkb_rule_names = .{ .layout = "us" };
+    errdefer xkb.xkb_context_unref(context);
+    const names: xkb.struct_xkb_rule_names = .{ .layout = layout };
     const keymap = xkb.xkb_keymap_new_from_names(context, &names, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapFailed;
-    defer xkb.xkb_keymap_unref(keymap);
+    errdefer xkb.xkb_keymap_unref(keymap);
     const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
-    defer xkb.xkb_state_unref(state);
+    return .{ .allocator = std.testing.allocator, .xkb_context = context, .xkb_keymap = keymap, .xkb_state = state };
+}
 
-    var input: Self = .{
-        .allocator = std.testing.allocator,
-        .xkb_keymap = keymap,
-        .xkb_state = state,
-    };
+test "Wayland key translation does not turn shortcut chords into text edits" {
+    var input = try initTestInput("us");
+    defer input.deinit();
+    const keymap = input.xkb_keymap.?;
+    const state = input.xkb_state.?;
 
     try std.testing.expectEqualStrings("a", input.keyInputFromWaylandKey(30).?.text);
 
@@ -1005,19 +1006,9 @@ test "Wayland key translation does not turn shortcut chords into text edits" {
 }
 
 test "Wayland key translation preserves consumed AltGr input" {
-    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
-    defer xkb.xkb_context_unref(context);
-    const names: xkb.struct_xkb_rule_names = .{ .layout = "de" };
-    const keymap = xkb.xkb_keymap_new_from_names(context, &names, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapFailed;
-    defer xkb.xkb_keymap_unref(keymap);
-    const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
-    defer xkb.xkb_state_unref(state);
-
-    var input: Self = .{
-        .allocator = std.testing.allocator,
-        .xkb_keymap = keymap,
-        .xkb_state = state,
-    };
+    var input = try initTestInput("de");
+    defer input.deinit();
+    const state = input.xkb_state.?;
 
     // KEY_RIGHTALT selects level three; AltGr+Q is @ on the German layout.
     _ = xkb.xkb_state_update_key(state, 100 + 8, xkb.XKB_KEY_DOWN);
