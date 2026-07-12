@@ -7,6 +7,7 @@ pub const LayerShellOptions = struct {
     exclusive_zone: i32 = 0,
     margin: Margin = .{},
     keyboard_interactivity: KeyboardInteractivity = .none,
+    pointer_interactivity: PointerInteractivity = .auto,
 
     pub const Layer = enum {
         background,
@@ -33,6 +34,11 @@ pub const LayerShellOptions = struct {
         none,
         exclusive,
         on_demand,
+    };
+
+    pub const PointerInteractivity = enum {
+        auto,
+        none,
     };
 };
 

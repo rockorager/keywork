@@ -53,7 +53,8 @@ pub const Options = struct {
 
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
     const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
-    const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = options.height };
+    const initial_height = if (options.layer_shell != null and options.height <= 0) 480 else options.height;
+    const constraints: keywork.Constraints = .{ .max_width = initial_width, .max_height = initial_height };
     return switch (options.backend) {
         .log => runLog(allocator, loop, app, constraints, options),
         .wayland_shm => if (options.windows_host) |windows_host|
@@ -142,7 +143,6 @@ fn runWayland(
     defer if (settings_client) |*settings| settings.deinit();
 
     var initial_constraints = constraints;
-    const backend_width = if (options.layer_shell != null and options.width <= 0) 0 else try positiveU31(constraints.max_width);
     var backend = try Backend.create(allocator);
     defer backend.destroy();
     if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
@@ -150,8 +150,8 @@ fn runWayland(
     const win = try backend.createWindow(.{
         .title = options.title,
         .app_id = options.app_id,
-        .width = backend_width,
-        .height = try positiveU31(constraints.max_height),
+        .width = try layerSurfaceDimension(options.layer_shell, options.width),
+        .height = try layerSurfaceDimension(options.layer_shell, options.height),
         .decorations = options.decorations,
         .layer_shell = options.layer_shell,
     });
@@ -1112,8 +1112,8 @@ fn WindowManager(comptime Backend: type) type {
             const win = try self.backend.createWindow(.{
                 .title = decl.title orelse self.options.title,
                 .app_id = self.options.app_id,
-                .width = if (layer_shell != null and width <= 0) 0 else try positiveU31(width),
-                .height = try positiveU31(height_cap),
+                .width = try layerSurfaceDimension(layer_shell, width),
+                .height = try layerSurfaceDimension(layer_shell, height_cap),
                 .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
                 .output = output,
@@ -1243,11 +1243,24 @@ fn WindowManager(comptime Backend: type) type {
     };
 }
 
+fn layerSurfaceDimension(layer_shell: ?wayland_options.LayerShellOptions, value: f32) !u31 {
+    if (layer_shell != null and value <= 0) return 0;
+    return positiveU31(value);
+}
+
 fn positiveU31(value: f32) !u31 {
     if (!std.math.isFinite(value) or value <= 0) return error.InvalidFrameSize;
     const rounded = @ceil(value);
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
     return @intFromFloat(rounded);
+}
+
+test "layer surfaces may delegate both dimensions to anchors" {
+    const layer: wayland_options.LayerShellOptions = .{};
+    try std.testing.expectEqual(@as(u31, 0), try layerSurfaceDimension(layer, 0));
+    try std.testing.expectEqual(@as(u31, 0), try layerSurfaceDimension(layer, -1));
+    try std.testing.expectEqual(@as(u31, 48), try layerSurfaceDimension(layer, 48));
+    try std.testing.expectError(error.InvalidFrameSize, layerSurfaceDimension(null, 0));
 }
 
 test "layer size negotiation emits one request per retained size" {

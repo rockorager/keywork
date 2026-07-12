@@ -4001,7 +4001,7 @@ test "lua window declarations preserve numeric sizes and accept content height" 
         \\      kw.window({ id = "fixed", width = 320, height = 180, child = kw.text("fixed") }),
         \\      kw.window({
         \\        id = "content", width = 380, height = "content",
-        \\        layer_shell = { layer = "overlay", anchor = { "top", "right" } },
+        \\        layer_shell = { layer = "overlay", anchor = { "top", "right" }, pointer = "none" },
         \\        child = kw.text("content"),
         \\      }),
         \\    }
@@ -4027,6 +4027,7 @@ test "lua window declarations preserve numeric sizes and accept content height" 
     try std.testing.expectEqual(@as(?f32, null), declarations[1].height);
     try std.testing.expect(declarations[1].content_height);
     try std.testing.expect(declarations[1].layer_shell != null);
+    try std.testing.expect(declarations[1].layer_shell.?.pointer_interactivity == .none);
 }
 
 test "lua flexible and main_align lay out through the parser" {

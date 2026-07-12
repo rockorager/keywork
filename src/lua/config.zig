@@ -150,6 +150,15 @@ pub fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !waylan
             return invalidAppRoot("unknown keyboard interactivity '{s}' (expected none, exclusive, or on-demand)", .{name});
     }
 
+    if (try checkStringField(lua_state, table_index, "pointer")) |name| {
+        options.pointer_interactivity = if (std.mem.eql(u8, name, "auto"))
+            .auto
+        else if (std.mem.eql(u8, name, "none"))
+            .none
+        else
+            return invalidAppRoot("unknown pointer interactivity '{s}' (expected auto or none)", .{name});
+    }
+
     return options;
 }
 

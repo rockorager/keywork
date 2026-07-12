@@ -102,6 +102,13 @@ pub const Surface = struct {
         errdefer shell_role.destroy();
         const decoration = try createDecoration(connection.decoration_manager, shell_role, options.decorations);
         errdefer if (decoration) |toplevel_decoration| toplevel_decoration.destroy();
+        if (options.layer_shell) |layer_options| {
+            if (layer_options.pointer_interactivity == .none) {
+                const empty_region = try compositor.createRegion();
+                defer empty_region.destroy();
+                surface.setInputRegion(empty_region);
+            }
+        }
         const scale_objects = createScaleObjects(connection, surface);
         errdefer scale_objects.deinit();
 
