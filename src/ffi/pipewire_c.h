@@ -69,7 +69,8 @@ struct kw_pw_events {
 
 struct kw_pw_connection *kw_pw_connection_create(
     const struct kw_pw_events *events,
-    void *data
+    void *data,
+    int realtime
 );
 
 int kw_pw_connection_get_fd(struct kw_pw_connection *connection);

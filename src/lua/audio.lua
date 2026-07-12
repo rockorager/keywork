@@ -1,8 +1,10 @@
 --- High-level audio-device monitoring and control over PipeWire.
 ---
---- `audio.monitor()` returns a monitor whose event stream contains normalized
---- sink/source device records. It hides PipeWire interface names and property
---- keys while retaining the raw properties for applications that need them.
+--- `audio.monitor(options)` returns a monitor whose event stream contains
+--- normalized sink/source device records. Pass `{ realtime = true }` only if
+--- the application needs PipeWire realtime scheduling; it is off by default.
+--- The monitor hides PipeWire interface names and property keys while
+--- retaining the raw properties for applications that need them.
 --- Device `volume` is on PipeWire's cubic user scale (1.0 is 100%), while
 --- route-aware writes use the native linear channel volumes internally.
 
@@ -363,8 +365,8 @@ function Monitor:closed()
   return self.is_closed or self.connection:closed()
 end
 
-function audio.monitor()
-  local connection, err = pipewire.connect()
+function audio.monitor(options)
+  local connection, err = pipewire.connect(options)
   if not connection then return nil, err end
 
   local monitor = setmetatable({

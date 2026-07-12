@@ -4,8 +4,8 @@
 //! node properties as an asynchronous Lua event stream. Route-aware volume
 //! and mute methods write hardware device routes when available, falling back
 //! to node properties for virtual devices. The PipeWire loop is nested into
-//! Keywork's epoll loop, so idle connections do not consume a thread or wake
-//! the application.
+//! Keywork's epoll loop. Realtime scheduling, and its PipeWire helper thread,
+//! are disabled unless explicitly requested by the application.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -26,7 +26,7 @@ pub const Host = struct {
         allocator: *const fn (*anyopaque) std.mem.Allocator,
         luaState: *const fn (*anyopaque) *c.lua_State,
         eventLoop: *const fn (*anyopaque) ?*event_loop.EventLoop,
-        addConnection: *const fn (*anyopaque) anyerror!*Connection,
+        addConnection: *const fn (*anyopaque, bool) anyerror!*Connection,
     };
 
     fn allocator(self: Host) std.mem.Allocator {
@@ -41,8 +41,8 @@ pub const Host = struct {
         return self.vtable.eventLoop(self.ptr);
     }
 
-    fn addConnection(self: Host) !*Connection {
-        return self.vtable.addConnection(self.ptr);
+    fn addConnection(self: Host, realtime: bool) !*Connection {
+        return self.vtable.addConnection(self.ptr, realtime);
     }
 };
 
@@ -57,7 +57,7 @@ pub const Connection = struct {
     dispatching: bool = false,
     pending_destroy: bool = false,
 
-    pub fn create(host: Host) !*Connection {
+    pub fn create(host: Host, realtime: bool) !*Connection {
         const allocator = host.allocator();
         const connection = try allocator.create(Connection);
         errdefer allocator.destroy(connection);
@@ -71,7 +71,7 @@ pub const Connection = struct {
             .routes_reset = routesReset,
             .route = routeInfo,
         };
-        connection.native = pipewire_c.kw_pw_connection_create(&events, connection) orelse
+        connection.native = pipewire_c.kw_pw_connection_create(&events, connection, @intFromBool(realtime)) orelse
             return error.PipeWireUnavailable;
         return connection;
     }
@@ -392,11 +392,28 @@ const connection_methods = [_]lua_handle.Method{
     .{ .name = "closed", .func = luaConnectionClosed },
 };
 
+fn checkRealtimeOption(lua_state: *c.lua_State) bool {
+    if (c.lua_isnoneornil(lua_state, 1)) return false;
+    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
+    c.lua_getfield(lua_state, 1, "realtime");
+    if (c.lua_isnil(lua_state, -1)) {
+        c.lua_settop(lua_state, -2);
+        return false;
+    }
+    if (c.lua_type(lua_state, -1) != c.LUA_TBOOLEAN) {
+        _ = c.luaL_argerror(lua_state, 1, "realtime must be a boolean");
+        unreachable;
+    }
+    const realtime = c.lua_toboolean(lua_state, -1) != 0;
+    c.lua_settop(lua_state, -2);
+    return realtime;
+}
+
 fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
     lua_task.raiseIfCanceled(lua_state);
-    const connection = host.addConnection() catch |err| {
+    const connection = host.addConnection(checkRealtimeOption(lua_state)) catch |err| {
         log.warn("PipeWire connect failed: {}", .{err});
         c.lua_pushnil(lua_state);
         const name = @errorName(err);
@@ -543,4 +560,17 @@ test "PipeWire route events expose availability" {
     c.lua_settop(lua_state, -2);
     c.lua_getfield(lua_state, -1, "availability");
     try std.testing.expectEqualStrings("no", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+}
+
+test "PipeWire realtime scheduling is opt-in" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    try std.testing.expect(!checkRealtimeOption(lua_state));
+
+    c.lua_createtable(lua_state, 0, 1);
+    try std.testing.expect(!checkRealtimeOption(lua_state));
+    c.lua_pushboolean(lua_state, 1);
+    c.lua_setfield(lua_state, -2, "realtime");
+    try std.testing.expect(checkRealtimeOption(lua_state));
 }

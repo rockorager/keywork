@@ -547,7 +547,8 @@ static const struct pw_registry_events registry_events = {
 
 struct kw_pw_connection *kw_pw_connection_create(
     const struct kw_pw_events *events,
-    void *data
+    void *data,
+    int realtime
 ) {
     struct kw_pw_connection *connection = NULL;
     struct pw_properties *properties = NULL;
@@ -573,6 +574,7 @@ struct kw_pw_connection *kw_pw_connection_create(
     properties = pw_properties_new(
         PW_KEY_APP_NAME, "Keywork",
         PW_KEY_APP_ID, "dev.keywork.Keywork",
+        "module.rt", realtime ? "true" : "false",
         NULL
     );
     if (properties == NULL)

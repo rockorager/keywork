@@ -846,8 +846,8 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &dbus_host_vtable };
     }
 
-    fn addPipeWireConnection(self: *App) !*PipeWireConnection {
-        const connection = try PipeWireConnection.create(self.pipewireHost());
+    fn addPipeWireConnection(self: *App, realtime: bool) !*PipeWireConnection {
+        const connection = try PipeWireConnection.create(self.pipewireHost(), realtime);
         errdefer connection.destroy(self.allocator, self.state);
         try self.pipewire_connections.append(self.allocator, connection);
         errdefer _ = self.pipewire_connections.pop();
@@ -1067,9 +1067,9 @@ fn pipewireHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
     return app.event_loop;
 }
 
-fn pipewireHostAddConnection(ptr: *anyopaque) anyerror!*PipeWireConnection {
+fn pipewireHostAddConnection(ptr: *anyopaque, realtime: bool) anyerror!*PipeWireConnection {
     const app: *App = @ptrCast(@alignCast(ptr));
-    return app.addPipeWireConnection();
+    return app.addPipeWireConnection(realtime);
 }
 
 fn dbusHostAddBus(ptr: *anyopaque, kind: lua_dbus.Kind) anyerror!*DbusBus {
