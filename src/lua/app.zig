@@ -1558,6 +1558,13 @@ fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn initTestApp(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, script: []const u8) !App {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], name });
+    defer allocator.free(script_path);
+    return App.init(allocator, script_path);
+}
+
 test "script must return a valid keywork.app root" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1572,11 +1579,7 @@ test "script must return a valid keywork.app root" {
     };
 
     for (cases) |case| {
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case.name, .data = case.script });
-        const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], case.name });
-        defer allocator.free(script_path);
-
-        var app = try App.init(allocator, script_path);
+        var app = try initTestApp(allocator, &tmp, case.name, case.script);
         defer app.deinit();
         try std.testing.expectError(error.InvalidAppRoot, app.ensureLoaded());
     }
@@ -1687,11 +1690,7 @@ test "keywork core excludes optional capability modules" {
         \\return root
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app-callable.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "app-callable.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "app-callable.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -1711,11 +1710,7 @@ test "application lifecycle hooks run exactly once per load" {
         \\})
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lifecycle.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "lifecycle.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "lifecycle.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -1748,11 +1743,7 @@ test "script directory is a module root for require" {
         \\return kw.app({ child = kw.text("modules") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "modules.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "modules.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "modules.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -1773,11 +1764,7 @@ test "reload cancels resources from the previous script load" {
         \\return kw.app({ child = kw.text("reload") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reload.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "reload.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "reload.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     const previous_timer = app.timers.items[0];
@@ -1814,11 +1801,7 @@ test "stale handles from a previous script load are inert" {
         \\return kw.app({ child = kw.text("stale") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stale.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stale.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "stale.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -1852,11 +1835,7 @@ test "application quit is idempotent before the loop starts" {
         \\return kw.app({ child = kw.text("quit") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "quit.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "quit.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "quit.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expect(app.quit_requested);
@@ -1890,11 +1869,7 @@ test "lua timer streams ticks to a coroutine reader" {
         \\return kw.app({ child = kw.text("timer") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-ticks.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-ticks.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "timer-ticks.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -1949,11 +1924,7 @@ test "lua one-shot timer ends iteration after its tick" {
         \\return kw.app({ child = kw.text("timer") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-oneshot.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-oneshot.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "timer-oneshot.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2012,11 +1983,7 @@ test "lua timer cancel resumes a parked reader and ends iteration" {
         \\return kw.app({ child = kw.text("timer") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "timer-cancel.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "timer-cancel.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "timer-cancel.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2044,11 +2011,7 @@ test "lua loop.spawn awaits loop.sleep" {
         \\return kw.app({ child = kw.text("sleep") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "sleep.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2102,11 +2065,7 @@ test "loop.sleep on the main state raises" {
         \\return kw.app({ child = kw.text("main") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep-main.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep-main.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "sleep-main.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 0), app.timers.items.len);
@@ -2124,11 +2083,7 @@ test "a sleeping coroutine tears down cleanly with the app" {
         \\return kw.app({ child = kw.text("sleep") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sleep-teardown.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "sleep-teardown.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "sleep-teardown.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
@@ -2188,11 +2143,7 @@ test "loop.spawn returns a task handle with status, join, and cancel" {
         \\return kw.app({ child = kw.text("task") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "task.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "task.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "task.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     // The parked tasks are torn down silently with the app.
@@ -2228,11 +2179,7 @@ test "scope cancel unwinds member tasks and inherited children" {
         \\return kw.app({ child = kw.text("scope") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scope.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "scope.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "scope.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.scopes.items.len);
@@ -2266,11 +2213,7 @@ test "task cancel cancels resources the task created" {
         \\return kw.app({ child = kw.text("owned") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "owned.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "owned.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "owned.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
@@ -2299,11 +2242,7 @@ test "reload cancels tasks and scopes from the previous load" {
         \\return kw.app({ child = kw.text("reload-tasks") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reload-tasks.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "reload-tasks.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "reload-tasks.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 2), app.tasks.items.len);
@@ -2365,11 +2304,7 @@ test "shared service starts once, fans out, and stops with its last subscriber" 
         \\return kw.app({ child = kw.text("service") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "service.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -2408,11 +2343,7 @@ test "restarting a settled service body tears down its old scope" {
         \\return kw.app({ child = kw.text("service-restart") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service-restart.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service-restart.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "service-restart.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -2440,11 +2371,7 @@ test "reload resets stale service entries" {
         \\return kw.app({ child = kw.text("service-reload") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "service-reload.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "service-reload.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "service-reload.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2507,11 +2434,7 @@ test "lua bus:call awaits replies and reports peer errors as nil, err" {
         \\return kw.app({ child = kw.text("dbus") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-call.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-call.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-call.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2580,11 +2503,7 @@ test "lua bus:subscribe streams signals to a coroutine reader" {
         \\return kw.app({ child = kw.text("dbus-sub") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-subscribe.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-subscribe.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-subscribe.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2666,11 +2585,7 @@ test "lua loop.channel delivers pushed values to a coroutine reader" {
         \\return kw.app({ child = kw.text("channel") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "channel.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "channel.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "channel.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -2756,11 +2671,7 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
         \\return kw.app({ child = kw.text("observe") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-observe.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-observe.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-observe.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2868,11 +2779,7 @@ test "lua exported methods can yield before replying" {
         \\return kw.app({ child = kw.text("async methods") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-async-methods.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-async-methods.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-async-methods.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -2956,11 +2863,7 @@ test "lua dbus session buses are pooled and refcounted" {
         \\return kw.app({ child = kw.text("pool") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-pool.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-pool.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-pool.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -3085,11 +2988,7 @@ test "lua dbus property sugar and proxies drive exported objects" {
         \\return kw.app({ child = kw.text("dbus-props") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dbus-properties.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dbus-properties.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dbus-properties.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -3156,11 +3055,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stateful.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stateful.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "stateful.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3289,11 +3184,7 @@ test "lua stateful widget dispose runs when removed" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dispose.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "dispose.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "dispose.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3360,11 +3251,7 @@ test "lua stateful set_state is inert after dispose" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stale-set-state.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stale-set-state.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "stale-set-state.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3434,11 +3321,7 @@ test "widget scope is canceled on the loop turn after dispose" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "widget-scope.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "widget-scope.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "widget-scope.lua", script);
     defer app.deinit();
 
     var loop = try event_loop.EventLoop.init(allocator);
@@ -3542,11 +3425,7 @@ test "widget dispose releases its service subscription" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "widget-service.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "widget-service.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "widget-service.lua", script);
     defer app.deinit();
 
     var loop = try event_loop.EventLoop.init(allocator);
@@ -3613,11 +3492,7 @@ test "event loop bind survives a vanished fs_event path" {
         \\return kw.app({ child = kw.text("bind") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bind-vanished.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "bind-vanished.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "bind-vanished.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.fs_events.items.len);
@@ -3661,11 +3536,7 @@ test "lua fs_event cancel resumes a parked reader and ends iteration" {
         \\return kw.app({ child = kw.text("cancel") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event-cancel.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event-cancel.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "fs-event-cancel.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -3693,11 +3564,7 @@ test "lua fd watch cancel resumes a parked reader and ends iteration" {
         \\return kw.app({ child = kw.text("fd-cancel") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fd-cancel.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fd-cancel.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "fd-cancel.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -3731,11 +3598,7 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
         \\
     , .{fds[0]});
     defer allocator.free(script);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fd-pending.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fd-pending.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "fd-pending.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -3787,11 +3650,7 @@ test "lua stateful build context keeps ambient component theme" {
         \\return kw.app({ child = kw.theme({ data = theme, child = App({ key = "app" }) }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "theme-context.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "theme-context.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "theme-context.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3856,11 +3715,7 @@ test "lua resolves theme families and component tokens" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "theme-family.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "theme-family.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "theme-family.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -3896,11 +3751,7 @@ test "lua default theme exposes paired Radix size 2 typography" {
         \\})
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "radix-typography.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "radix-typography.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "radix-typography.lua", script);
     defer app.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -3942,11 +3793,7 @@ test "lua window declarations preserve numeric sizes and accept content height" 
         \\})
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "content-window.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "content-window.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "content-window.lua", script);
     defer app.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -3978,11 +3825,7 @@ test "lua flexible and main_align lay out through the parser" {
         \\}) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "flex.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "flex.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "flex.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -4043,11 +3886,7 @@ test "lua loop fs_event observes file changes" {
         \\
     , .{watched_path});
     defer allocator.free(script);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "fs-event.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -4142,11 +3981,7 @@ test "lua process spawn captures stdout and exit" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spawn.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "spawn.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "spawn.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -4248,11 +4083,7 @@ test "lua stream.lines splits chunks and yields the unterminated tail" {
         \\return kw.app({ child = kw.text("lines") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lines.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "lines.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "lines.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -4358,11 +4189,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     const script = try std.mem.concat(allocator, u8, &.{ "local data_dir = \"", data_dir, "\"\n", script_body });
     defer allocator.free(script);
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "xdg.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "xdg.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "xdg.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 }
@@ -4411,11 +4238,7 @@ test "lua process.capture collects output and exit status" {
         \\return kw.app({ child = App({ key = "app" }) })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "capture.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "capture.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "capture.lua", script);
     defer app.deinit();
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -4478,11 +4301,7 @@ test "lua process spawn reports a missing executable as nil, err" {
         \\return kw.app({ child = kw.text("spawn") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spawn-missing.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "spawn-missing.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "spawn-missing.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -4507,11 +4326,7 @@ test "lua fs_event reports a missing path as nil, err" {
         \\return kw.app({ child = kw.text("fs_event") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fs-event-missing.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs-event-missing.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "fs-event-missing.lua", script);
     defer app.deinit();
 
     // Registration is deferred until an event loop is bound, so bind first
@@ -4561,11 +4376,7 @@ test "lua process output produced before bind is queued for readers" {
         \\return kw.app({ child = kw.text("spawn") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spawn-rebind.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "spawn-rebind.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "spawn-rebind.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.processes.items.len);
@@ -4652,11 +4463,7 @@ test "lua loop.connect reports a missing socket path as nil, err" {
         \\return kw.app({ child = kw.text("connect") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "connect-missing.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "connect-missing.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "connect-missing.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -4700,11 +4507,7 @@ test "lua socket streams chunks and finishes on peer EOF" {
         \\
     , .{socket_path});
     defer allocator.free(script);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-stream.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-stream.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "socket-stream.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.sockets.items.len);
@@ -4794,11 +4597,7 @@ test "lua socket close resumes a parked reader and ends iteration" {
         \\
     , .{socket_path});
     defer allocator.free(script);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-close.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-close.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "socket-close.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.sockets.items.len);
@@ -4837,11 +4636,7 @@ test "lua socket write parks under backpressure and resumes when flushed" {
         \\
     , .{ socket_path, socket_path });
     defer allocator.free(script);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "socket-write.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "socket-write.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "socket-write.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
@@ -4931,11 +4726,7 @@ test "lua process stdin roundtrips through cat under backpressure" {
         \\return kw.app({ child = kw.text("stdin") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stdin-roundtrip.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stdin-roundtrip.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "stdin-roundtrip.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expectEqual(@as(usize, 1), app.processes.items.len);
@@ -5010,11 +4801,7 @@ test "lua process stdin write semantics without an event loop" {
         \\return kw.app({ child = kw.text("stdin-sync") })
         \\
     ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stdin-sync.lua", .data = script });
-    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "stdin-sync.lua" });
-    defer allocator.free(script_path);
-
-    var app = try App.init(allocator, script_path);
+    var app = try initTestApp(allocator, &tmp, "stdin-sync.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
 
