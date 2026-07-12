@@ -121,40 +121,13 @@ const Image = struct {
         const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.width * render_scale))));
         const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.height * render_scale))));
 
-        var hasher = std.hash.Wyhash.init(self.cache_key);
-        hasher.update(std.mem.asBytes(&target_width));
-        hasher.update(std.mem.asBytes(&target_height));
-        hasher.update(std.mem.asBytes(&geometry.source.x));
-        hasher.update(std.mem.asBytes(&geometry.source.y));
-        hasher.update(std.mem.asBytes(&geometry.source.width));
-        hasher.update(std.mem.asBytes(&geometry.source.height));
-        const cache_key = hasher.final();
-
-        if (self.cache == .auto) {
-            if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
-                try context.display_list.colorImage(
-                    context.allocator,
-                    geometry.rect,
-                    target_width,
-                    target_height,
-                    cached,
-                    cache_key,
-                );
-                return;
-            }
-        }
+        const cache_key = geometryCacheKey(self.cache_key, target_width, target_height, geometry.source);
+        if (self.cache == .auto and try paintCached(context, geometry.rect, target_width, target_height, cache_key)) return;
 
         const pixel_allocator = imagePixelAllocator(self.cache, context.allocator);
         const pixels = try resampledPixels(pixel_allocator, self.pixels, self.width, self.height, target_width, target_height, geometry.source);
         const rendered = try retainPixels(context, self.cache, pixel_allocator, cache_key, target_width, target_height, pixels);
-        try context.display_list.colorImage(
-            context.allocator,
-            geometry.rect,
-            target_width,
-            target_height,
-            rendered,
-            cache_key,
-        );
+        try paintColorImage(context, geometry.rect, target_width, target_height, rendered, cache_key);
     }
 
     fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*anyopaque {
@@ -277,28 +250,8 @@ const FileImage = struct {
         const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.width * render_scale))));
         const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.height * render_scale))));
 
-        var hasher = std.hash.Wyhash.init(self.source_key);
-        hasher.update(std.mem.asBytes(&target_width));
-        hasher.update(std.mem.asBytes(&target_height));
-        hasher.update(std.mem.asBytes(&geometry.source.x));
-        hasher.update(std.mem.asBytes(&geometry.source.y));
-        hasher.update(std.mem.asBytes(&geometry.source.width));
-        hasher.update(std.mem.asBytes(&geometry.source.height));
-        const cache_key = hasher.final();
-
-        if (self.cache == .auto) {
-            if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
-                try context.display_list.colorImage(
-                    context.allocator,
-                    geometry.rect,
-                    target_width,
-                    target_height,
-                    cached,
-                    cache_key,
-                );
-                return;
-            }
-        }
+        const cache_key = geometryCacheKey(self.source_key, target_width, target_height, geometry.source);
+        if (self.cache == .auto and try paintCached(context, geometry.rect, target_width, target_height, cache_key)) return;
 
         const path_z = try context.allocator.dupeZ(u8, self.path);
         defer context.allocator.free(path_z);
@@ -333,14 +286,7 @@ const FileImage = struct {
             geometry.source,
         );
         const rendered = try retainPixels(context, self.cache, pixel_allocator, cache_key, target_width, target_height, pixels);
-        try context.display_list.colorImage(
-            context.allocator,
-            geometry.rect,
-            target_width,
-            target_height,
-            rendered,
-            cache_key,
-        );
+        try paintColorImage(context, geometry.rect, target_width, target_height, rendered, cache_key);
     }
 
     fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*anyopaque {
@@ -379,6 +325,27 @@ const FittedGeometry = struct {
     rect: keywork.Rect,
     source: SourceRect = .{},
 };
+
+fn geometryCacheKey(seed: u64, width: u32, height: u32, source: SourceRect) u64 {
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(std.mem.asBytes(&width));
+    hasher.update(std.mem.asBytes(&height));
+    hasher.update(std.mem.asBytes(&source.x));
+    hasher.update(std.mem.asBytes(&source.y));
+    hasher.update(std.mem.asBytes(&source.width));
+    hasher.update(std.mem.asBytes(&source.height));
+    return hasher.final();
+}
+
+fn paintCached(context: keywork.Widget.RenderObject.PaintContext, rect: keywork.Rect, width: u32, height: u32, cache_key: u64) !bool {
+    const cached = context.raster_cache.cachedColorImage(cache_key, width, height) orelse return false;
+    try paintColorImage(context, rect, width, height, cached, cache_key);
+    return true;
+}
+
+fn paintColorImage(context: keywork.Widget.RenderObject.PaintContext, rect: keywork.Rect, width: u32, height: u32, pixels: []const keywork.Color, cache_key: u64) !void {
+    try context.display_list.colorImage(context.allocator, rect, width, height, pixels, cache_key);
+}
 
 fn imagePixelAllocator(cache: Cache, retained_allocator: std.mem.Allocator) std.mem.Allocator {
     return switch (cache) {
@@ -470,7 +437,7 @@ fn paintTombstone(
     const pixels = try context.allocator.alloc(keywork.Color, @as(usize, width) * height);
     @memset(pixels, keywork.colors.transparent);
     const cached = try context.raster_cache.insertColor(context.allocator, cache_key, width, height, pixels);
-    try context.display_list.colorImage(context.allocator, rect, width, height, cached, cache_key);
+    try paintColorImage(context, rect, width, height, cached, cache_key);
 }
 
 /// Caches intrinsic image dimensions per path and file fingerprint so widget
