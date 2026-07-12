@@ -77,7 +77,7 @@ fn parseTextStyleField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8
     if (c.lua_isnil(lua_state, -1)) return base;
     if (c.lua_isnumber(lua_state, -1) != 0) {
         var result = base;
-        result.color = colorFromStack(lua_state, -1) catch result.color;
+        result.color = lua_codec.decodeColor(lua_state, -1) catch result.color;
         return result;
     }
     if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
@@ -170,18 +170,11 @@ fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, def
 fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
-    return colorFromStack(lua_state, -1) catch default;
+    return lua_codec.decodeColor(lua_state, -1) catch default;
 }
 
 fn getOptionalColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?keywork.Color {
     c.lua_getfield(lua_state, table, key);
     defer pop(lua_state, 1);
-    return colorFromStack(lua_state, -1) catch null;
-}
-
-fn colorFromStack(lua_state: *c.lua_State, index: c_int) !keywork.Color {
-    if (c.lua_isnumber(lua_state, index) == 0) return error.ExpectedLuaNumber;
-    const value = c.lua_tonumber(lua_state, index);
-    if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidLuaColor;
-    return @bitCast(@as(u32, @intFromFloat(value)));
+    return lua_codec.decodeColor(lua_state, -1) catch null;
 }

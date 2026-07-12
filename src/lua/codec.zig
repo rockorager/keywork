@@ -95,7 +95,7 @@ fn decodeValue(comptime T: type, lua_state: *c.lua_State, index: c_int, allocato
     }
 }
 
-fn decodeColor(lua_state: *c.lua_State, index: c_int) !keywork.Color {
+pub fn decodeColor(lua_state: *c.lua_State, index: c_int) !keywork.Color {
     if (c.lua_isnumber(lua_state, index) == 0) return error.ExpectedLuaNumber;
     const value = c.lua_tonumber(lua_state, index);
     if (value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidLuaColor;
