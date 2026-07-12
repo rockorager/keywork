@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const linux_syscall = @import("../linux/syscall.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_sink = @import("sink.zig");
@@ -133,7 +134,7 @@ pub const LuaProcess = struct {
         var result: LuaProcess = .{
             .host = host,
             .pid = pid,
-            .pidfd = try linuxFd(linux.pidfd_open(pid, 0)),
+            .pidfd = try linux_syscall.fd(linux.pidfd_open(pid, 0)),
         };
         errdefer {
             if (result.pidfd != invalid_fd) _ = linux.close(result.pidfd);
@@ -146,7 +147,7 @@ pub const LuaProcess = struct {
             errdefer {
                 if (result.stdin_fd != invalid_fd) _ = linux.close(result.stdin_fd);
             }
-            try setNonblocking(result.stdin_fd);
+            try linux_syscall.setNonblocking(result.stdin_fd);
         }
         if (stdout_pipe) |pipe| {
             _ = linux.close(pipe[1]);
@@ -154,7 +155,7 @@ pub const LuaProcess = struct {
             errdefer {
                 if (result.stdout_pipe.fd != invalid_fd) _ = linux.close(result.stdout_pipe.fd);
             }
-            try setNonblocking(result.stdout_pipe.fd);
+            try linux_syscall.setNonblocking(result.stdout_pipe.fd);
         }
         if (stderr_pipe) |pipe| {
             _ = linux.close(pipe[1]);
@@ -162,7 +163,7 @@ pub const LuaProcess = struct {
             errdefer {
                 if (result.stderr_pipe.fd != invalid_fd) _ = linux.close(result.stderr_pipe.fd);
             }
-            try setNonblocking(result.stderr_pipe.fd);
+            try linux_syscall.setNonblocking(result.stderr_pipe.fd);
         }
         return result;
     }
@@ -724,7 +725,7 @@ fn isExecutable(path: [:0]const u8) bool {
 
 fn createPipe() ![2]i32 {
     var fds: [2]i32 = undefined;
-    try linuxVoid(linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    try linux_syscall.check(linux.pipe2(&fds, .{ .CLOEXEC = true }));
     return fds;
 }
 
@@ -734,26 +735,7 @@ fn closePipe(pipe: [2]i32) void {
 }
 
 fn dupTo(old: i32, new: i32) !void {
-    _ = try linuxFd(linux.dup2(old, new));
-}
-
-fn setNonblocking(fd: i32) !void {
-    const flags = try linuxFd(linux.fcntl(fd, linux.F.GETFL, 0));
-    try linuxVoid(linux.fcntl(fd, linux.F.SETFL, @as(usize, @intCast(flags)) | linux.SOCK.NONBLOCK));
-}
-
-fn linuxFd(result: usize) !i32 {
-    return switch (linux.errno(result)) {
-        .SUCCESS => @intCast(result),
-        else => error.LinuxSyscallFailed,
-    };
-}
-
-fn linuxVoid(result: usize) !void {
-    return switch (linux.errno(result)) {
-        .SUCCESS => {},
-        else => error.LinuxSyscallFailed,
-    };
+    _ = try linux_syscall.fd(linux.dup2(old, new));
 }
 
 const absoluteIndex = lua_value.absoluteIndex;

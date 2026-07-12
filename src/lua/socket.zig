@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
+const linux_syscall = @import("../linux/syscall.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_task = @import("task.zig");
@@ -59,7 +60,7 @@ pub const LuaSocket = struct {
         @memset(&address.path, 0);
         @memcpy(address.path[0..path.len], path);
 
-        const fd = try linuxFd(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
+        const fd = try linux_syscall.fd(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
         errdefer _ = linux.close(fd);
         // A blocking connect: unix sockets connect locally and immediately,
         // so async connect plumbing would buy nothing.
@@ -75,7 +76,7 @@ pub const LuaSocket = struct {
                 else => return error.ConnectFailed,
             }
         }
-        try setNonblocking(fd);
+        try linux_syscall.setNonblocking(fd);
         return fd;
     }
 
@@ -322,23 +323,4 @@ fn luaSocketClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     };
     c.lua_pushboolean(lua_state, if (socket.canceled or socket.fd == invalid_fd) 1 else 0);
     return 1;
-}
-
-fn setNonblocking(fd: i32) !void {
-    const flags = try linuxFd(linux.fcntl(fd, linux.F.GETFL, 0));
-    try linuxVoid(linux.fcntl(fd, linux.F.SETFL, @as(usize, @intCast(flags)) | linux.SOCK.NONBLOCK));
-}
-
-fn linuxFd(result: usize) !i32 {
-    return switch (linux.errno(result)) {
-        .SUCCESS => @intCast(result),
-        else => error.LinuxSyscallFailed,
-    };
-}
-
-fn linuxVoid(result: usize) !void {
-    return switch (linux.errno(result)) {
-        .SUCCESS => {},
-        else => error.LinuxSyscallFailed,
-    };
 }
