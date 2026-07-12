@@ -170,12 +170,7 @@ pub const LuaScope = struct {
 /// Calls the function on top of the stack, logging instead of propagating
 /// failures: one broken cleanup callback must not stop the rest.
 fn callCancelCallback(lua_state: *c.lua_State) void {
-    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {
-        var len: usize = 0;
-        const message = c.lua_tolstring(lua_state, -1, &len);
-        if (message) |text| log.warn("scope on_cancel callback failed: {s}", .{text[0..len]});
-        c.lua_settop(lua_state, -2);
-    }
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) lua_value.failLuaCall(lua_state, "scope on_cancel callback failed") catch {};
 }
 
 /// Registry table mapping live task coroutines to their LuaTask pointer

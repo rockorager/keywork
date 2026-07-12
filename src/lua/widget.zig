@@ -1561,13 +1561,7 @@ const LuaItemBuilder = struct {
         if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         c.lua_pushinteger(self.lua_state, @intCast(index + 1));
-        if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) {
-            var len: usize = 0;
-            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
-            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("list item builder failed: {s}", .{message[0..len]});
-            pop(self.lua_state, 1);
-            return error.LuaCallbackFailed;
-        }
+        if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "list item builder failed");
         defer pop(self.lua_state, 1);
         return parse(self.host.withStateInvalidator(scope.state_invalidator), self.lua_state, scope.allocator, scope.allocator, scope.app_context, self.parse_context, -1);
     }
