@@ -1136,10 +1136,7 @@ pub const Renderer = struct {
         errdefer _ = self.atlas_slots.remove(key);
         try self.atlas_slots.put(self.allocator, key, slot);
 
-        if (self.atlas.layout != .transfer_dst_optimal) {
-            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
-            self.atlas.layout = .transfer_dst_optimal;
-        }
+        self.prepareAtlasUpload();
 
         const coverage_size: vk.DeviceSize = if (glyph.channels == 4)
             @intCast(glyph.coverage.len)
@@ -1153,21 +1150,7 @@ pub const Renderer = struct {
             try self.stageMaskTexels(glyph.coverage);
         }
 
-        const copy: vk.BufferImageCopy = .{
-            .buffer_offset = self.staging_used,
-            .buffer_row_length = 0,
-            .buffer_image_height = 0,
-            .image_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .mip_level = 0,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
-            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
-        };
-        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
-        self.staging_used += coverage_size;
+        self.copyStagingToAtlas(slot, coverage_size);
         return slot;
     }
 
@@ -1197,10 +1180,7 @@ pub const Renderer = struct {
         errdefer _ = self.atlas_slots.remove(key);
         try self.atlas_slots.put(self.allocator, key, slot);
 
-        if (self.atlas.layout != .transfer_dst_optimal) {
-            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
-            self.atlas.layout = .transfer_dst_optimal;
-        }
+        self.prepareAtlasUpload();
 
         const image_size: vk.DeviceSize = @intCast(image.pixels.len * 4);
         if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
@@ -1215,21 +1195,7 @@ pub const Renderer = struct {
         }
         try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
 
-        const copy: vk.BufferImageCopy = .{
-            .buffer_offset = self.staging_used,
-            .buffer_row_length = 0,
-            .buffer_image_height = 0,
-            .image_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .mip_level = 0,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
-            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
-        };
-        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
-        self.staging_used += image_size;
+        self.copyStagingToAtlas(slot, image_size);
         return slot;
     }
 
@@ -1244,30 +1210,13 @@ pub const Renderer = struct {
         errdefer _ = self.atlas_slots.remove(key);
         try self.atlas_slots.put(self.allocator, key, slot);
 
-        if (self.atlas.layout != .transfer_dst_optimal) {
-            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
-            self.atlas.layout = .transfer_dst_optimal;
-        }
+        self.prepareAtlasUpload();
 
         const image_size: vk.DeviceSize = @intCast(image.alpha.len * 4);
         if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
         try self.stageMaskTexels(image.alpha);
 
-        const copy: vk.BufferImageCopy = .{
-            .buffer_offset = self.staging_used,
-            .buffer_row_length = 0,
-            .buffer_image_height = 0,
-            .image_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .mip_level = 0,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .image_offset = .{ .x = @intCast(slot.x), .y = @intCast(slot.y), .z = 0 },
-            .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
-        };
-        self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
-        self.staging_used += image_size;
+        self.copyStagingToAtlas(slot, image_size);
         return slot;
     }
 
@@ -1279,15 +1228,23 @@ pub const Renderer = struct {
         errdefer _ = self.atlas_slots.remove(key);
         try self.atlas_slots.put(self.allocator, key, slot);
 
-        if (self.atlas.layout != .transfer_dst_optimal) {
-            self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
-            self.atlas.layout = .transfer_dst_optimal;
-        }
+        self.prepareAtlasUpload();
 
         const coverage = [_]u8{0xff} ** (solid_block_size * solid_block_size);
         if (self.staging_used + coverage.len * 4 > self.staging_buffer.size) return error.ImageUploadTooLarge;
         try self.stageMaskTexels(&coverage);
 
+        self.copyStagingToAtlas(slot, coverage.len * 4);
+        return slot;
+    }
+
+    fn prepareAtlasUpload(self: *Self) void {
+        if (self.atlas.layout == .transfer_dst_optimal) return;
+        self.transitionAtlas(self.atlas.layout, .transfer_dst_optimal);
+        self.atlas.layout = .transfer_dst_optimal;
+    }
+
+    fn copyStagingToAtlas(self: *Self, slot: AtlasSlot, size: vk.DeviceSize) void {
         const copy: vk.BufferImageCopy = .{
             .buffer_offset = self.staging_used,
             .buffer_row_length = 0,
@@ -1302,8 +1259,7 @@ pub const Renderer = struct {
             .image_extent = .{ .width = slot.width, .height = slot.height, .depth = 1 },
         };
         self.vkd.cmdCopyBufferToImage(self.command_buffer, self.staging_buffer.buffer, self.atlas.image, .transfer_dst_optimal, &.{copy});
-        self.staging_used += coverage.len * 4;
-        return slot;
+        self.staging_used += size;
     }
 
     fn allocateAtlasSlot(self: *Self, width: u32, height: u32) !AtlasSlot {
