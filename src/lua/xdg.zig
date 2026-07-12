@@ -250,11 +250,9 @@ fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const list = c.lua_gettop(lua_state);
     for (entries, 1..) |entry, index| {
         c.lua_createtable(lua_state, 0, 2);
-        c.lua_pushlstring(lua_state, entry.name.ptr, entry.name.len);
-        c.lua_setfield(lua_state, -2, "name");
+        lua_value.setStringField(lua_state, -1, "name", entry.name);
         const kind = entry.kind.name();
-        c.lua_pushlstring(lua_state, kind.ptr, kind.len);
-        c.lua_setfield(lua_state, -2, "type");
+        lua_value.setStringField(lua_state, -1, "type", kind);
         c.lua_rawseti(lua_state, list, @intCast(index));
     }
     return 1;

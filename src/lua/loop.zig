@@ -725,8 +725,7 @@ fn pushFdEvents(lua_state: *c.lua_State, events: u32) void {
 fn pushFsEvent(lua_state: *c.lua_State, path: []const u8, mask: u32, name: ?[]const u8) void {
     c.lua_createtable(lua_state, 0, 7);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushlstring(lua_state, path.ptr, path.len);
-    c.lua_setfield(lua_state, table, "path");
+    lua_value.setStringField(lua_state, table, "path", path);
     if (name) |event_name| {
         c.lua_pushlstring(lua_state, event_name.ptr, event_name.len);
     } else {

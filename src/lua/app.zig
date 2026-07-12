@@ -547,8 +547,7 @@ pub const App = struct {
         const outputs = c.lua_gettop(lua_state);
         for (context.outputs, 1..) |output, index| {
             c.lua_createtable(lua_state, 0, 4);
-            c.lua_pushlstring(lua_state, output.name.ptr, output.name.len);
-            c.lua_setfield(lua_state, -2, "name");
+            lua_value.setStringField(lua_state, -1, "name", output.name);
             c.lua_pushnumber(lua_state, output.width);
             c.lua_setfield(lua_state, -2, "width");
             c.lua_pushnumber(lua_state, output.height);
@@ -558,8 +557,7 @@ pub const App = struct {
             c.lua_rawseti(lua_state, outputs, @intCast(index));
         }
         c.lua_setfield(lua_state, table, "outputs");
-        c.lua_pushlstring(lua_state, context.color_scheme.ptr, context.color_scheme.len);
-        c.lua_setfield(lua_state, table, "color_scheme");
+        lua_value.setStringField(lua_state, table, "color_scheme", context.color_scheme);
     }
 
     fn releaseWindowChildren(self: *App, map: *std.StringHashMapUnmanaged(c_int)) void {
@@ -1086,8 +1084,7 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
 
     const merged = try std.fmt.allocPrint(allocator, "{s}/?.lua;{s}/?/init.lua;{s}", .{ dir, dir, existing });
     defer allocator.free(merged);
-    c.lua_pushlstring(lua_state, merged.ptr, merged.len);
-    c.lua_setfield(lua_state, package_table, "path");
+    lua_value.setStringField(lua_state, package_table, "path", merged);
     pop(lua_state, 2);
 }
 

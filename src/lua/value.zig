@@ -67,6 +67,12 @@ pub fn checkString(lua_state: *c.lua_State, index: c_int) []const u8 {
     return ptr[0..len];
 }
 
+pub fn setStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, value: []const u8) void {
+    const absolute_table = absoluteIndex(lua_state, table);
+    c.lua_pushlstring(lua_state, value.ptr, value.len);
+    c.lua_setfield(lua_state, absolute_table, key);
+}
+
 pub fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
     return allocator.dupe(u8, try stringFromStack(lua_state, index));
 }

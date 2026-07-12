@@ -932,8 +932,7 @@ test "file image parses and decodes lazily into fitted paint" {
     defer c.lua_close(lua_state);
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushlstring(lua_state, path.ptr, path.len);
-    c.lua_setfield(lua_state, table, "path");
+    lua_value.setStringField(lua_state, table, "path", path);
     c.lua_pushstring(lua_state, "cover");
     c.lua_setfield(lua_state, table, "fit");
 

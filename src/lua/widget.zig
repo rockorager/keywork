@@ -342,8 +342,7 @@ const LuaCallback = struct {
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         c.lua_createtable(self.lua_state, 0, 8);
         const source = @tagName(event.source);
-        c.lua_pushlstring(self.lua_state, source.ptr, source.len);
-        c.lua_setfield(self.lua_state, -2, "source");
+        lua_value.setStringField(self.lua_state, -1, "source", source);
         if (event.button) |value| {
             const button = @tagName(value);
             c.lua_pushlstring(self.lua_state, button.ptr, button.len);
@@ -675,8 +674,7 @@ pub fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_setfield(lua_state, table, "window_width");
     c.lua_pushnumber(lua_state, state.window_height);
     c.lua_setfield(lua_state, table, "window_height");
-    c.lua_pushlstring(lua_state, state.color_scheme.ptr, state.color_scheme.len);
-    c.lua_setfield(lua_state, table, "color_scheme");
+    lua_value.setStringField(lua_state, table, "color_scheme", state.color_scheme);
 }
 
 fn pushRuntimeStateWithTheme(lua_state: *c.lua_State, state: State, parse_context: ParseContext) void {

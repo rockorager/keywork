@@ -193,7 +193,7 @@ fn registryGlobalRemove(data: ?*anyopaque, id: u32) callconv(.c) void {
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 2);
-    pushStringField(lua_state, "type", "global_remove");
+    lua_value.setStringField(lua_state, -1, "type", "global_remove");
     pushIntegerField(lua_state, "id", id);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire registry delivery failed: {}", .{err});
@@ -212,7 +212,7 @@ fn metadataProperty(
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 6);
-    pushStringField(lua_state, "type", "metadata");
+    lua_value.setStringField(lua_state, -1, "type", "metadata");
     pushIntegerField(lua_state, "id", id);
     pushIntegerField(lua_state, "subject", subject);
     pushOptionalStringField(lua_state, "key", key);
@@ -251,7 +251,7 @@ fn nodeRoute(
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 5);
-    pushStringField(lua_state, "type", "node_route");
+    lua_value.setStringField(lua_state, -1, "type", "node_route");
     pushIntegerField(lua_state, "id", id);
     pushIntegerField(lua_state, "device_id", device_id);
     pushIntegerField(lua_state, "route_device", route_device);
@@ -284,7 +284,7 @@ fn routesReset(data: ?*anyopaque, id: u32) callconv(.c) void {
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 2);
-    pushStringField(lua_state, "type", "routes_reset");
+    lua_value.setStringField(lua_state, -1, "type", "routes_reset");
     pushIntegerField(lua_state, "id", id);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire route reset delivery failed: {}", .{err});
@@ -301,10 +301,10 @@ fn pushGlobalEvent(
     property_count: u32,
 ) void {
     c.lua_createtable(lua_state, 0, 6);
-    pushStringField(lua_state, "type", "global");
+    lua_value.setStringField(lua_state, -1, "type", "global");
     pushIntegerField(lua_state, "id", id);
     pushIntegerField(lua_state, "permissions", permissions);
-    pushStringField(lua_state, "interface", interface);
+    lua_value.setStringField(lua_state, -1, "interface", interface);
     pushIntegerField(lua_state, "version", version);
 
     c.lua_createtable(lua_state, 0, @intCast(property_count));
@@ -329,7 +329,7 @@ fn pushNodePropsEvent(
     muted: bool,
 ) void {
     c.lua_createtable(lua_state, 0, 4);
-    pushStringField(lua_state, "type", "node_props");
+    lua_value.setStringField(lua_state, -1, "type", "node_props");
     pushIntegerField(lua_state, "id", id);
     c.lua_createtable(lua_state, @intCast(volume_count), 0);
     if (volumes != null) {
@@ -359,17 +359,12 @@ fn pushRouteEvent(
         else => "unknown",
     };
     c.lua_createtable(lua_state, 0, 6);
-    pushStringField(lua_state, "type", "route");
+    lua_value.setStringField(lua_state, -1, "type", "route");
     pushIntegerField(lua_state, "id", id);
     pushIntegerField(lua_state, "device", device);
-    pushStringField(lua_state, "availability", availability_name);
+    lua_value.setStringField(lua_state, -1, "availability", availability_name);
     pushOptionalStringField(lua_state, "port_type", port_type);
     pushOptionalStringField(lua_state, "bus", bus);
-}
-
-fn pushStringField(lua_state: *c.lua_State, name: [*:0]const u8, value: []const u8) void {
-    c.lua_pushlstring(lua_state, value.ptr, value.len);
-    c.lua_setfield(lua_state, -2, name);
 }
 
 fn pushOptionalStringField(lua_state: *c.lua_State, name: [*:0]const u8, value: [*c]const u8) void {
