@@ -247,6 +247,46 @@ pub const App = struct {
         self.event_loop = null;
     }
 
+    pub fn bindRuntimeOpaque(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.bindRuntime(runtime);
+    }
+
+    pub fn bindInvalidatorOpaque(ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.bindInvalidator(invalidator);
+    }
+
+    pub fn bindPlatformOpaque(ctx: *anyopaque, platform: platform_mod.Platform) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.bindPlatform(platform);
+    }
+
+    pub fn unbindPlatformOpaque(ctx: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.unbindPlatform();
+    }
+
+    pub fn unbindRuntimeOpaque(ctx: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.unbindRuntime();
+    }
+
+    pub fn bindEventLoopOpaque(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        try self.bindEventLoop(loop);
+    }
+
+    pub fn unbindEventLoopOpaque(ctx: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.unbindEventLoop();
+    }
+
+    pub fn shouldRunHeadlessOpaque(ctx: *anyopaque) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.hasLiveAsyncResources();
+    }
+
     pub fn host(self: *App) keywork.AppHost {
         return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidgetHost } };
     }

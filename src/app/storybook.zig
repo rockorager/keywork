@@ -3,7 +3,6 @@
 const std = @import("std");
 const keywork = @import("../ui.zig");
 const cli = @import("cli.zig");
-const platform_mod = @import("platform.zig");
 const runner = @import("runner.zig");
 const memory_backend = @import("../backend/memory.zig");
 const event_loop = @import("../linux/event_loop.zig");
@@ -90,43 +89,13 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
         .backend = .wayland_shm,
         .log_writer = writer,
         .runtime_context = &app,
-        .bind_runtime = bindLuaRuntime,
-        .bind_platform = bindLuaPlatform,
-        .unbind_platform = unbindLuaPlatform,
-        .unbind_runtime = unbindLuaRuntime,
-        .bind_event_loop = bindLuaEventLoop,
-        .unbind_event_loop = unbindLuaEventLoop,
+        .bind_runtime = lua_app.App.bindRuntimeOpaque,
+        .bind_platform = lua_app.App.bindPlatformOpaque,
+        .unbind_platform = lua_app.App.unbindPlatformOpaque,
+        .unbind_runtime = lua_app.App.unbindRuntimeOpaque,
+        .bind_event_loop = lua_app.App.bindEventLoopOpaque,
+        .unbind_event_loop = lua_app.App.unbindEventLoopOpaque,
     });
-}
-
-fn bindLuaRuntime(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    app.bindRuntime(runtime);
-}
-
-fn bindLuaPlatform(ctx: *anyopaque, platform: platform_mod.Platform) void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    app.bindPlatform(platform);
-}
-
-fn unbindLuaPlatform(ctx: *anyopaque) void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    app.unbindPlatform();
-}
-
-fn unbindLuaRuntime(ctx: *anyopaque) void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    app.unbindRuntime();
-}
-
-fn bindLuaEventLoop(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    try app.bindEventLoop(loop);
-}
-
-fn unbindLuaEventLoop(ctx: *anyopaque) void {
-    const app: *lua_app.App = @ptrCast(@alignCast(ctx));
-    app.unbindEventLoop();
 }
 
 fn list(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {

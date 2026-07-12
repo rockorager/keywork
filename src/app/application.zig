@@ -3,11 +3,9 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const app_options = @import("options.zig");
-const platform_mod = @import("platform.zig");
 const runner = @import("runner.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_module = @import("../lua/app.zig");
-const runtime_mod = @import("../ui/runtime.zig");
 
 const Application = @This();
 
@@ -57,53 +55,13 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .log_writer = &stdout_writer.interface,
         .runtime_context = &self.lua,
         .windows_host = self.lua.windowsHost(),
-        .bind_runtime = bindLuaRuntime,
-        .bind_invalidator = bindLuaInvalidator,
-        .bind_platform = bindLuaPlatform,
-        .unbind_platform = unbindLuaPlatform,
-        .unbind_runtime = unbindLuaRuntime,
-        .bind_event_loop = bindLuaEventLoop,
-        .unbind_event_loop = unbindLuaEventLoop,
-        .should_run_headless = luaShouldRunHeadless,
+        .bind_runtime = lua_module.App.bindRuntimeOpaque,
+        .bind_invalidator = lua_module.App.bindInvalidatorOpaque,
+        .bind_platform = lua_module.App.bindPlatformOpaque,
+        .unbind_platform = lua_module.App.unbindPlatformOpaque,
+        .unbind_runtime = lua_module.App.unbindRuntimeOpaque,
+        .bind_event_loop = lua_module.App.bindEventLoopOpaque,
+        .unbind_event_loop = lua_module.App.unbindEventLoopOpaque,
+        .should_run_headless = lua_module.App.shouldRunHeadlessOpaque,
     });
-}
-
-fn bindLuaRuntime(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.bindRuntime(runtime);
-}
-
-fn bindLuaInvalidator(ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.bindInvalidator(invalidator);
-}
-
-fn bindLuaPlatform(ctx: *anyopaque, platform: platform_mod.Platform) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.bindPlatform(platform);
-}
-
-fn unbindLuaPlatform(ctx: *anyopaque) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.unbindPlatform();
-}
-
-fn unbindLuaRuntime(ctx: *anyopaque) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.unbindRuntime();
-}
-
-fn bindLuaEventLoop(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    try lua.bindEventLoop(loop);
-}
-
-fn unbindLuaEventLoop(ctx: *anyopaque) void {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    lua.unbindEventLoop();
-}
-
-fn luaShouldRunHeadless(ctx: *anyopaque) bool {
-    const lua: *lua_module.App = @ptrCast(@alignCast(ctx));
-    return lua.hasLiveAsyncResources();
 }
