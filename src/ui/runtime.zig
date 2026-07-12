@@ -632,8 +632,8 @@ test "backend capability gates damage-only display lists" {
         fn backend(self: *@This()) RenderBackend {
             return .{ .ptr = self, .vtable = &.{
                 .present = present,
-                .measure_text = measureText,
-                .scale = scale,
+                .measure_text = TestBackend.measureText,
+                .scale = TestBackend.scale,
                 .partial_paint_bounds = partialPaintBounds,
             } };
         }
@@ -657,15 +657,6 @@ test "backend capability gates damage-only display lists" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.allow_partial or damage.len != 1) return null;
             return damage[0];
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1547,7 +1538,11 @@ test "present damage covers every display-list change during fast wheel scroll" 
         violations: usize = 0,
 
         fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
+            return .{ .ptr = self, .vtable = &.{
+                .present = present,
+                .measure_text = TestBackend.measureText,
+                .scale = TestBackend.scale,
+            } };
         }
 
         fn deinit(self: *@This()) void {
@@ -1662,15 +1657,6 @@ test "present damage covers every display-list change during fast wheel scroll" 
             freeEntries(self.allocator, &self.prev);
             self.prev = current;
             return true;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
