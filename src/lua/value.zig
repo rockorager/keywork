@@ -75,11 +75,14 @@ pub fn pop(lua_state: *c.lua_State, count: c_int) void {
     c.lua_settop(lua_state, -count - 1);
 }
 
-pub fn pushNilError(lua_state: *c.lua_State, err: anyerror) c_int {
+pub fn pushNilMessage(lua_state: *c.lua_State, message: []const u8) c_int {
     c.lua_pushnil(lua_state);
-    const name = @errorName(err);
-    c.lua_pushlstring(lua_state, name.ptr, name.len);
+    c.lua_pushlstring(lua_state, message.ptr, message.len);
     return 2;
+}
+
+pub fn pushNilError(lua_state: *c.lua_State, err: anyerror) c_int {
+    return pushNilMessage(lua_state, @errorName(err));
 }
 
 /// Logs and pops the Lua error at the top of the stack, then returns

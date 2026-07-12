@@ -263,16 +263,8 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // distinguishable result, so this is not a silent no-op.
     const socket_or_dead = lua_handle.resource(LuaSocket, lua_state, 1, socket_type);
     const data = lua_value.checkString(lua_state, 2);
-    const socket = socket_or_dead orelse {
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "closed");
-        return 2;
-    };
-    if (socket.canceled or socket.fd == invalid_fd) {
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "closed");
-        return 2;
-    }
+    const socket = socket_or_dead orelse return lua_value.pushNilMessage(lua_state, "closed");
+    if (socket.canceled or socket.fd == invalid_fd) return lua_value.pushNilMessage(lua_state, "closed");
     if (socket.sink.hasWaiter()) return c.luaL_error(lua_state, "socket already has a waiting writer");
 
     // Fast path: write what the kernel accepts right now. A write that
@@ -280,10 +272,7 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // main state.
     const written = lua_sink.writeNow(socket.fd, data) catch |err| {
         socket.shutdownFd(lua_state, .resume_reader);
-        c.lua_pushnil(lua_state);
-        const name = lua_sink.errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilMessage(lua_state, lua_sink.errorName(err));
     };
     if (written == data.len) {
         c.lua_pushboolean(lua_state, 1);

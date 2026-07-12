@@ -1107,13 +1107,9 @@ fn luaDbusSubscribe(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const bus = leasedBus(lua_state, 1) orelse {
-        // An awaited call needs a distinguishable result, so a dead bus
-        // handle reports nil, err instead of the usual silent no-op.
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "BusClosed");
-        return 2;
-    };
+    // An awaited call needs a distinguishable result, so a dead bus handle
+    // reports nil, err instead of the usual silent no-op.
+    const bus = leasedBus(lua_state, 1) orelse return lua_value.pushNilMessage(lua_state, "BusClosed");
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     if (lua_coro.onMainThread(lua_state)) return c.luaL_error(lua_state, "bus:call must be called from a coroutine (wrap the caller in loop.spawn)");
     // Sending on a disconnected bus is an expected runtime condition and

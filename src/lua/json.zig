@@ -222,9 +222,7 @@ fn luaDecode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     defer parsed.deinit();
 
     pushJsonValue(lua_state, parsed.value) catch {
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "DocumentTooDeep");
-        return 2;
+        return lua_value.pushNilMessage(lua_state, "DocumentTooDeep");
     };
     return 1;
 }

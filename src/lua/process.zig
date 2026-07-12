@@ -543,19 +543,11 @@ fn luaWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // distinguishable result, so this is not a silent no-op.
     const process_or_dead = lua_handle.resource(LuaProcess, lua_state, 1, process_type);
     const data = lua_value.checkString(lua_state, 2);
-    const process = process_or_dead orelse {
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "closed");
-        return 2;
-    };
+    const process = process_or_dead orelse return lua_value.pushNilMessage(lua_state, "closed");
     // Writing to a process spawned without a stdin pipe can never succeed,
     // so it is misuse rather than a runtime failure.
     if (!process.stdin_piped) return c.luaL_error(lua_state, "process stdin is not a pipe (spawn with stdin = \"pipe\")");
-    if (process.canceled or process.stdin_fd == invalid_fd) {
-        c.lua_pushnil(lua_state);
-        c.lua_pushliteral(lua_state, "closed");
-        return 2;
-    }
+    if (process.canceled or process.stdin_fd == invalid_fd) return lua_value.pushNilMessage(lua_state, "closed");
     if (process.stdin_sink.hasWaiter()) return c.luaL_error(lua_state, "process stdin already has a waiting writer");
 
     // Fast path: write what the pipe accepts right now. A write that
@@ -563,10 +555,7 @@ fn luaWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // main state.
     const written = lua_sink.writeNow(process.stdin_fd, data) catch |err| {
         process.closeStdin(lua_state, .resume_reader);
-        c.lua_pushnil(lua_state);
-        const name = lua_sink.errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilMessage(lua_state, lua_sink.errorName(err));
     };
     if (written == data.len) {
         c.lua_pushboolean(lua_state, 1);
