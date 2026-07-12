@@ -300,6 +300,41 @@ static void device_info(void *data, const struct pw_device_info *info) {
     }
 }
 
+static const char *route_info_value(
+    const struct spa_pod *info,
+    const char *wanted_key
+) {
+    if (info == NULL)
+        return NULL;
+    struct spa_pod_parser parser;
+    struct spa_pod_frame frame;
+    int32_t item_count;
+    spa_pod_parser_pod(&parser, info);
+    if (spa_pod_parser_push_struct(&parser, &frame) < 0 ||
+        spa_pod_parser_get_int(&parser, &item_count) < 0 ||
+        item_count < 0)
+        return NULL;
+
+    const char *result = NULL;
+    for (int32_t i = 0; i < item_count; i++) {
+        const char *key;
+        const char *value;
+        if (spa_pod_parser_get(
+                &parser,
+                SPA_POD_String(&key),
+                SPA_POD_String(&value),
+                NULL
+            ) < 0)
+            break;
+        if (key != NULL && value != NULL && strcmp(key, wanted_key) == 0) {
+            result = value;
+            break;
+        }
+    }
+    spa_pod_parser_pop(&parser, &frame);
+    return result;
+}
+
 static void device_param(
     void *data,
     int seq,
@@ -317,13 +352,15 @@ static void device_param(
     int32_t route_index = -1;
     int32_t route_device = -1;
     uint32_t availability = SPA_PARAM_AVAILABILITY_unknown;
+    const struct spa_pod *route_info = NULL;
     if (spa_pod_parse_object(
             param,
             SPA_TYPE_OBJECT_ParamRoute,
             NULL,
             SPA_PARAM_ROUTE_index, SPA_POD_Int(&route_index),
             SPA_PARAM_ROUTE_device, SPA_POD_Int(&route_device),
-            SPA_PARAM_ROUTE_available, SPA_POD_OPT_Id(&availability)
+            SPA_PARAM_ROUTE_available, SPA_POD_OPT_Id(&availability),
+            SPA_PARAM_ROUTE_info, SPA_POD_OPT_PodStruct(&route_info)
         ) < 0 || route_index < 0 || route_device < 0)
         return;
     update_route(
@@ -336,7 +373,8 @@ static void device_param(
         device->connection->data,
         device->id,
         (uint32_t)route_device,
-        availability
+        availability,
+        route_info_value(route_info, "port.type")
     );
 }
 

@@ -47,19 +47,26 @@ local function device_route(device)
   return device.device_id, device.route_device
 end
 
-local function device_availability(monitor, device)
+local function device_route_record(monitor, device)
   local device_id, route_device = device_route(device)
   local routes = device_id and monitor.routes[device_id] or nil
-  if not routes then return "unknown" end
+  if not routes then return nil, false end
+  return routes[route_device], true
+end
+
+local function device_availability(monitor, device)
+  local route, routes_known = device_route_record(monitor, device)
+  if not routes_known then return "unknown" end
   -- Route-managed nodes can remain registered when their hardware port is
   -- unavailable. Some devices report those routes as `no`; others omit them
   -- from the current route enumeration entirely.
-  return routes[route_device] or "no"
+  return route and route.availability or "no"
 end
 
 local function device_record(monitor, device, event_type)
   local properties = device.properties
   local name = properties["node.name"]
+  local route = device_route_record(monitor, device)
   local availability = device_availability(monitor, device)
   return {
     type = event_type,
@@ -74,6 +81,7 @@ local function device_record(monitor, device, event_type)
     muted = current_muted(device),
     availability = availability,
     available = availability ~= "no",
+    port_type = route and route.port_type,
     properties = properties,
   }
 end
@@ -203,8 +211,16 @@ local function apply_route(monitor, event)
     routes = {}
     monitor.routes[event.id] = routes
   end
-  if routes[event.device] == event.availability then return end
-  routes[event.device] = event.availability
+  local previous = routes[event.device]
+  if previous
+      and previous.availability == event.availability
+      and previous.port_type == event.port_type then
+    return
+  end
+  routes[event.device] = {
+    availability = event.availability,
+    port_type = event.port_type,
+  }
   for _, device in pairs(monitor.by_id) do
     local device_id, route_device = device_route(device)
     if device_id == event.id and route_device == event.device then
