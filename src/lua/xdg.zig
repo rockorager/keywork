@@ -62,14 +62,7 @@ pub fn mkdirAll(path: []const u8) !void {
 pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const open_result = linux.openat(linux.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    switch (linux.errno(open_result)) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        .ACCES => return error.AccessDenied,
-        else => return error.OpenFailed,
-    }
-    const fd: i32 = @intCast(open_result);
+    const fd = try openFd(linux.openat(linux.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
     defer _ = linux.close(fd);
 
     var list: std.ArrayList(u8) = .empty;
@@ -105,14 +98,7 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []c
     const tmp_path = try std.fmt.allocPrintSentinel(allocator, "{s}.tmp-{x}", .{ path, @as(u64, @bitCast(random_bytes)) }, 0);
     defer allocator.free(tmp_path);
 
-    const open_result = linux.openat(linux.AT.FDCWD, tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o666);
-    switch (linux.errno(open_result)) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        .ACCES => return error.AccessDenied,
-        else => return error.OpenFailed,
-    }
-    const fd: i32 = @intCast(open_result);
+    const fd = try openFd(linux.openat(linux.AT.FDCWD, tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o666));
     var fd_open = true;
     defer if (fd_open) {
         _ = linux.close(fd);
@@ -134,16 +120,18 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []c
 pub fn writeFileTruncate(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const open_result = linux.openat(linux.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o666);
-    switch (linux.errno(open_result)) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        .ACCES => return error.AccessDenied,
-        else => return error.OpenFailed,
-    }
-    const fd: i32 = @intCast(open_result);
+    const fd = try openFd(linux.openat(linux.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o666));
     defer _ = linux.close(fd);
     try writeAll(fd, data);
+}
+
+fn openFd(result: usize) !i32 {
+    return switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .NOENT => error.FileNotFound,
+        .ACCES => error.AccessDenied,
+        else => error.OpenFailed,
+    };
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
