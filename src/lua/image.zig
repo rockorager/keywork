@@ -293,17 +293,8 @@ const FileImage = struct {
         const self: *const FileImage = @ptrCast(@alignCast(ptr));
         const result = try allocator.create(FileImage);
         errdefer allocator.destroy(result);
-        result.* = .{
-            .path = try allocator.dupe(u8, self.path),
-            .width = self.width,
-            .height = self.height,
-            .source_width = self.source_width,
-            .source_height = self.source_height,
-            .fit = self.fit,
-            .alignment = self.alignment,
-            .cache = self.cache,
-            .source_key = self.source_key,
-        };
+        result.* = self.*;
+        result.path = try allocator.dupe(u8, self.path);
         return result;
     }
 
