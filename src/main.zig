@@ -101,6 +101,7 @@ test {
     _ = @import("app/runner.zig");
     _ = @import("app/storybook.zig");
     _ = @import("backend/memory.zig");
+    _ = @import("backend/wayland/input.zig");
     _ = @import("backend/wayland/shm.zig");
     _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");

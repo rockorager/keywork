@@ -766,6 +766,7 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     const state = self.xkb_state orelse return keyInputFromEvdev(key, self.shift_down);
     const keycode: xkb.xkb_keycode_t = key + 8;
     const keysym = xkb.xkb_state_key_get_one_sym(state, keycode);
+    if (hasUnconsumedShortcutModifier(state, keycode)) return null;
     switch (keysym) {
         xkb.XKB_KEY_BackSpace => return .backspace,
         xkb.XKB_KEY_Return, xkb.XKB_KEY_KP_Enter => return .enter,
@@ -788,6 +789,24 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     const len: usize = @intCast(written);
     if (len >= self.key_text_buffer.len) return null;
     return .{ .text = self.key_text_buffer[0..len] };
+}
+
+fn hasUnconsumedShortcutModifier(state: *xkb.struct_xkb_state, keycode: xkb.xkb_keycode_t) bool {
+    const keymap = xkb.xkb_state_get_keymap(state) orelse return false;
+    const shortcut_modifiers = [_][*c]const u8{
+        xkb.XKB_MOD_NAME_CTRL,
+        xkb.XKB_VMOD_NAME_ALT,
+        xkb.XKB_MOD_NAME_MOD1,
+        xkb.XKB_VMOD_NAME_SUPER,
+        xkb.XKB_MOD_NAME_MOD4,
+    };
+    for (shortcut_modifiers) |name| {
+        if (xkb.xkb_state_mod_name_is_active(state, name, xkb.XKB_STATE_MODS_EFFECTIVE) <= 0) continue;
+        const index = xkb.xkb_keymap_mod_get_index(keymap, name);
+        if (index == xkb.XKB_MOD_INVALID) continue;
+        if (xkb.xkb_state_mod_index_is_consumed2(state, keycode, index, xkb.XKB_CONSUMED_MODE_GTK) == 0) return true;
+    }
+    return false;
 }
 
 fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
@@ -942,4 +961,65 @@ fn digitFromKey(key: u32, shift: bool) []const u8 {
         11 => "0",
         else => unreachable,
     };
+}
+
+test "Wayland key translation does not turn shortcut chords into text edits" {
+    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(context);
+    const names: xkb.struct_xkb_rule_names = .{ .layout = "us" };
+    const keymap = xkb.xkb_keymap_new_from_names(context, &names, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(keymap);
+    const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_state_unref(state);
+
+    var input: Self = .{
+        .allocator = std.testing.allocator,
+        .xkb_keymap = keymap,
+        .xkb_state = state,
+    };
+
+    try std.testing.expectEqualStrings("a", input.keyInputFromWaylandKey(30).?.text);
+
+    const ctrl_index = xkb.xkb_keymap_mod_get_index(keymap, xkb.XKB_MOD_NAME_CTRL);
+    try std.testing.expect(ctrl_index != xkb.XKB_MOD_INVALID);
+    const ctrl_mask: xkb.xkb_mod_mask_t = @as(xkb.xkb_mod_mask_t, 1) << @intCast(ctrl_index);
+    _ = xkb.xkb_state_update_mask(state, ctrl_mask, 0, 0, 0, 0, 0);
+    try std.testing.expect(input.keyInputFromWaylandKey(30) == null);
+    try std.testing.expect(input.keyInputFromWaylandKey(57) == null);
+    try std.testing.expect(input.keyInputFromWaylandKey(14) == null);
+
+    const alt_index = xkb.xkb_keymap_mod_get_index(keymap, "Mod1");
+    try std.testing.expect(alt_index != xkb.XKB_MOD_INVALID);
+    const alt_mask: xkb.xkb_mod_mask_t = @as(xkb.xkb_mod_mask_t, 1) << @intCast(alt_index);
+    _ = xkb.xkb_state_update_mask(state, alt_mask, 0, 0, 0, 0, 0);
+    try std.testing.expect(input.keyInputFromWaylandKey(30) == null);
+
+    const super_index = xkb.xkb_keymap_mod_get_index(keymap, xkb.XKB_MOD_NAME_MOD4);
+    try std.testing.expect(super_index != xkb.XKB_MOD_INVALID);
+    const super_mask: xkb.xkb_mod_mask_t = @as(xkb.xkb_mod_mask_t, 1) << @intCast(super_index);
+    _ = xkb.xkb_state_update_mask(state, super_mask, 0, 0, 0, 0, 0);
+    try std.testing.expect(input.keyInputFromWaylandKey(30) == null);
+
+    _ = xkb.xkb_state_update_mask(state, 0, 0, 0, 0, 0, 0);
+    try std.testing.expectEqualStrings("a", input.keyInputFromWaylandKey(30).?.text);
+}
+
+test "Wayland key translation preserves consumed AltGr input" {
+    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(context);
+    const names: xkb.struct_xkb_rule_names = .{ .layout = "de" };
+    const keymap = xkb.xkb_keymap_new_from_names(context, &names, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(keymap);
+    const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_state_unref(state);
+
+    var input: Self = .{
+        .allocator = std.testing.allocator,
+        .xkb_keymap = keymap,
+        .xkb_state = state,
+    };
+
+    // KEY_RIGHTALT selects level three; AltGr+Q is @ on the German layout.
+    _ = xkb.xkb_state_update_key(state, 100 + 8, xkb.XKB_KEY_DOWN);
+    try std.testing.expectEqualStrings("@", input.keyInputFromWaylandKey(16).?.text);
 }

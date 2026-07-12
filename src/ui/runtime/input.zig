@@ -166,11 +166,24 @@ pub fn editFocusedTextInput(self: anytype, edit: TextEdit) !void {
     const input = keywork.dirtyTextInputElement(element_root, focused_id) orelse return;
     const state = keywork.textInputState(input);
     switch (edit) {
-        .append => |bytes| try state.text.appendSlice(self.allocator, bytes),
+        .append => |bytes| {
+            if (!isEditableText(bytes)) return;
+            try state.text.appendSlice(self.allocator, bytes);
+        },
         .pop_grapheme => popLastGrapheme(&state.text),
     }
     if (input.widget.text_input.on_change) |callback| try callback.call(state.text.items);
     try self.invalidateState();
+}
+
+fn isEditableText(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    const view = std.unicode.Utf8View.init(bytes) catch return false;
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) return false;
+    }
+    return true;
 }
 
 pub fn activateShortcut(self: anytype, input: keywork.KeyInput) !bool {

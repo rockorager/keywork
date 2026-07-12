@@ -2248,6 +2248,14 @@ test "typing edits element-owned input state without rebuilding" {
     try std.testing.expectEqual(builds_after_focus, app.builds);
     try std.testing.expectEqualStrings("hi", app.lastChange());
 
+    // Synthetic or backend text events cannot put control or malformed UTF-8
+    // into the element-owned editing state.
+    try runtime.keyInput(.{ .text = "\x01" });
+    try runtime.keyInput(.{ .text = "\xc2\x80" });
+    try runtime.keyInput(.{ .text = "\xff" });
+    try std.testing.expectEqualStrings("hi", app.lastChange());
+    try std.testing.expectEqualStrings("hi", renderedInputText(runtime.root.?).?);
+
     // The second input keeps independent state.
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("second", runtime.focused_id.?);
