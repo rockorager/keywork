@@ -125,13 +125,7 @@ pub const Stream = struct {
         // A parked reader implies an empty queue: deliver would have resumed
         // it instead of queueing.
         std.debug.assert(self.queue.items.len == 0);
-        switch (mode) {
-            .resume_reader => resumeReaderWith(main_state, &self.reader_ref, 0),
-            .silent => {
-                c.luaL_unref(main_state, c.LUA_REGISTRYINDEX, self.reader_ref);
-                self.reader_ref = -1;
-            },
-        }
+        self.releaseReader(main_state, mode);
     }
 
     /// Ends the stream: drops queued values and finishes a parked reader
@@ -141,6 +135,11 @@ pub const Stream = struct {
         self.queue.deinit(allocator);
         self.queue = .empty;
         if (self.reader_ref < 0) return;
+        self.releaseReader(main_state, mode);
+    }
+
+    fn releaseReader(self: *Stream, main_state: *c.lua_State, mode: CancelMode) void {
+        std.debug.assert(self.reader_ref >= 0);
         switch (mode) {
             .resume_reader => resumeReaderWith(main_state, &self.reader_ref, 0),
             .silent => {
