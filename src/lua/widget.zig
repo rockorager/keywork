@@ -185,6 +185,9 @@ const ParseContext = struct {
     /// Intrinsic image dimensions per path, so raster icons skip the
     /// stbi_info header read on every rebuild.
     png_dims: ?*lua_image.DimsCache = null,
+    /// Lexically enclosing Lua theme. Borrowed during recursive parsing;
+    /// deferred builders and stateful widgets clone it for their lifetime.
+    theme_ref: c_int = -1,
 
     fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
         return .{
@@ -203,7 +206,19 @@ const ParseContext = struct {
             .icon_cache = self.icon_cache,
             .icon_scale = self.icon_scale,
             .png_dims = self.png_dims,
+            .theme_ref = self.theme_ref,
         };
+    }
+
+    fn cloneOwned(self: ParseContext, lua_state: *c.lua_State) !ParseContext {
+        var result = self;
+        if (self.theme_ref >= 0) result.theme_ref = try cloneRegistryRef(lua_state, self.theme_ref);
+        return result;
+    }
+
+    fn deinitOwned(self: *ParseContext, lua_state: *c.lua_State) void {
+        if (self.theme_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.theme_ref);
+        self.theme_ref = -2;
     }
 };
 
@@ -531,7 +546,7 @@ const LuaStatefulWidget = struct {
             return error.StatefulBuildMissing;
         }
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.state_ref);
-        pushRuntimeState(self.lua_state, context.app_context);
+        pushRuntimeStateWithTheme(self.lua_state, context.app_context, self.parse_context);
         if (c.lua_pcall(self.lua_state, 2, 1, 0) != 0) return failLuaCall(self.lua_state, "stateful build failed");
         defer pop(self.lua_state, 1);
         return try parse(self.host.withStateInvalidator(scope.state_invalidator), self.lua_state, scope.allocator, scope.allocator, context.app_context, self.parse_context, -1);
@@ -578,8 +593,11 @@ const LuaStatefulWidget = struct {
         errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, spec_ref);
         const props_ref = try cloneRegistryRef(self.lua_state, self.props_ref);
         errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, props_ref);
+        var parse_context = try self.parse_context.cloneOwned(self.lua_state);
+        errdefer parse_context.deinitOwned(self.lua_state);
         c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+        self.parse_context.deinitOwned(self.lua_state);
         self.spec_ref = -2;
         self.props_ref = -2;
 
@@ -591,7 +609,7 @@ const LuaStatefulWidget = struct {
             .spec_ref = spec_ref,
             .props_ref = props_ref,
             .spec_token = self.spec_token,
-            .parse_context = self.parse_context,
+            .parse_context = parse_context,
         };
         return result;
     }
@@ -600,6 +618,7 @@ const LuaStatefulWidget = struct {
         const self: *LuaStatefulWidget = @ptrCast(@alignCast(@constCast(ptr)));
         if (self.spec_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         if (self.props_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+        self.parse_context.deinitOwned(self.lua_state);
         self.allocator.destroy(self);
     }
 };
@@ -639,7 +658,7 @@ const LuaPopupBuilder = struct {
         if (self.content_ref < 0) return error.LuaPopupBuilderAlreadyMoved;
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
         if (c.lua_isfunction(self.lua_state, -1)) {
-            pushRuntimeState(self.lua_state, context.app_context);
+            pushRuntimeStateWithTheme(self.lua_state, context.app_context, self.parse_context);
             if (c.lua_pcall(self.lua_state, 1, 1, 0) != 0) return failLuaCall(self.lua_state, "popup build failed");
         }
         defer pop(self.lua_state, 1);
@@ -653,7 +672,10 @@ const LuaPopupBuilder = struct {
         if (self.content_ref < 0) return error.LuaPopupBuilderAlreadyMoved;
         const content_ref = try cloneRegistryRef(self.lua_state, self.content_ref);
         errdefer c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, content_ref);
+        var parse_context = try self.parse_context.cloneOwned(self.lua_state);
+        errdefer parse_context.deinitOwned(self.lua_state);
         c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
+        self.parse_context.deinitOwned(self.lua_state);
         self.content_ref = -2;
         const result = try allocator.create(LuaPopupBuilder);
         result.* = .{
@@ -661,7 +683,7 @@ const LuaPopupBuilder = struct {
             .host = self.host,
             .lua_state = self.lua_state,
             .content_ref = content_ref,
-            .parse_context = self.parse_context,
+            .parse_context = parse_context,
         };
         return result;
     }
@@ -669,6 +691,7 @@ const LuaPopupBuilder = struct {
     fn destroy(_: std.mem.Allocator, ptr: *const anyopaque) void {
         const self: *LuaPopupBuilder = @ptrCast(@alignCast(@constCast(ptr)));
         if (self.content_ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.content_ref);
+        self.parse_context.deinitOwned(self.lua_state);
         self.allocator.destroy(self);
     }
 };
@@ -682,6 +705,14 @@ pub fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_setfield(lua_state, table, "window_height");
     c.lua_pushlstring(lua_state, state.color_scheme.ptr, state.color_scheme.len);
     c.lua_setfield(lua_state, table, "color_scheme");
+}
+
+fn pushRuntimeStateWithTheme(lua_state: *c.lua_State, state: State, parse_context: ParseContext) void {
+    pushRuntimeState(lua_state, state);
+    if (parse_context.theme_ref < 0) return;
+    const table = c.lua_gettop(lua_state);
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, parse_context.theme_ref);
+    c.lua_setfield(lua_state, table, "theme");
 }
 
 /// Both allocators are the runtime's per-build arena, so parse never frees
@@ -733,6 +764,8 @@ pub fn parse(
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
         const props_ref = try tableRefField(lua_state, table, "props");
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, props_ref);
+        var owned_parse_context = try parse_context.cloneOwned(lua_state);
+        errdefer owned_parse_context.deinitOwned(lua_state);
         c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
         const spec_token = c.lua_topointer(lua_state, -1);
         pop(lua_state, 1);
@@ -743,16 +776,27 @@ pub fn parse(
             .spec_ref = spec_ref,
             .props_ref = props_ref,
             .spec_token = spec_token,
-            .parse_context = parse_context,
+            .parse_context = owned_parse_context,
         };
         return stateful.widget();
     }
     if (std.mem.eql(u8, kind, "theme")) {
+        const native_theme = lua_theme.parseField(lua_state, table, "theme");
+        c.lua_getfield(lua_state, table, "theme");
+        const theme_ref = if (c.lua_type(lua_state, -1) == c.LUA_TTABLE)
+            c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX)
+        else blk: {
+            pop(lua_state, 1);
+            break :blk -1;
+        };
+        defer if (theme_ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, theme_ref);
+        var theme_context = parse_context;
+        theme_context.theme_ref = theme_ref;
         const child = try allocator.create(keywork.Widget);
         c.lua_getfield(lua_state, table, "child");
         defer pop(lua_state, 1);
-        child.* = try parse(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, -1);
-        return .{ .theme = .{ .theme = lua_theme.parseField(lua_state, table, "theme"), .child = child } };
+        child.* = try parse(host, lua_state, allocator, callback_allocator, runtime_state, theme_context, -1);
+        return .{ .theme = .{ .theme = native_theme, .child = child } };
     }
     if (std.mem.eql(u8, kind, "default_text_style")) {
         const options = try lua_codec.decode(TextOptions, lua_state, table, allocator);
@@ -858,13 +902,15 @@ pub fn parse(
         }
         const content_ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, content_ref);
+        var owned_parse_context = try parse_context.cloneOwned(lua_state);
+        errdefer owned_parse_context.deinitOwned(lua_state);
         const builder = try callback_allocator.create(LuaPopupBuilder);
         builder.* = .{
             .allocator = callback_allocator,
             .host = host,
             .lua_state = lua_state,
             .content_ref = content_ref,
-            .parse_context = parse_context,
+            .parse_context = owned_parse_context,
         };
         const on_close = try getOptionalCallbackField(lua_state, callback_allocator, popup_table, "on_close");
 
@@ -952,8 +998,10 @@ pub fn parse(
         c.lua_pushvalue(lua_state, -1);
         const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
         errdefer c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        var owned_parse_context = try parse_context.cloneOwned(lua_state);
+        errdefer owned_parse_context.deinitOwned(lua_state);
         const builder = try callback_allocator.create(LuaItemBuilder);
-        builder.* = .{ .allocator = callback_allocator, .host = host, .lua_state = lua_state, .ref = ref, .parse_context = parse_context };
+        builder.* = .{ .allocator = callback_allocator, .host = host, .lua_state = lua_state, .ref = ref, .parse_context = owned_parse_context };
         var list_widget = keywork.widgets.list(id, options.count, options.item_height, builder.itemBuilder());
         // Lua indices are 1-based; 0 or nil means no selection.
         if (options.selected) |selected| {
@@ -1602,8 +1650,11 @@ const LuaItemBuilder = struct {
     fn cloneBuilder(allocator: std.mem.Allocator, ptr: *const anyopaque) !*const anyopaque {
         const self: *LuaItemBuilder = @ptrCast(@alignCast(@constCast(ptr)));
         if (self.ref < 0) return error.LuaCallbackAlreadyMoved;
+        var parse_context = try self.parse_context.cloneOwned(self.lua_state);
+        errdefer parse_context.deinitOwned(self.lua_state);
         const copy = try allocator.create(LuaItemBuilder);
-        copy.* = .{ .allocator = allocator, .host = self.host, .lua_state = self.lua_state, .ref = self.ref, .parse_context = self.parse_context };
+        copy.* = .{ .allocator = allocator, .host = self.host, .lua_state = self.lua_state, .ref = self.ref, .parse_context = parse_context };
+        self.parse_context.deinitOwned(self.lua_state);
         self.ref = -2;
         return copy;
     }
@@ -1611,6 +1662,7 @@ const LuaItemBuilder = struct {
     fn destroyBuilder(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
         const self: *LuaItemBuilder = @ptrCast(@alignCast(@constCast(ptr)));
         if (self.ref >= 0) c.luaL_unref(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        self.parse_context.deinitOwned(self.lua_state);
         allocator.destroy(self);
     }
 };

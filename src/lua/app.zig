@@ -3823,19 +3823,35 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     try std.testing.expect(app.fd_watches.items[0].canceled);
 }
 
-test "lua stateful build context includes theme" {
+test "lua stateful build context keeps ambient component theme" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script =
         \\local kw = require("keywork")
+        \\local theme = kw.resolve_theme(kw.theme_data({
+        \\  components = { chip = {
+        \\    min_height = 28,
+        \\    hover_background = 0xff00ff00,
+        \\    selected_background = 0xffff0000,
+        \\  } },
+        \\}), "dark")
         \\local App = kw.stateful({
         \\  build = function(self, context)
-        \\    return kw.theme({ data = context.theme, child = kw.label(context.theme.color_scheme) })
+        \\    local chip = context.theme.components.chip
+        \\    local status = context.theme.color_scheme == "dark"
+        \\      and chip.min_height == 28
+        \\      and chip.hover_background == 0xff00ff00
+        \\      and chip.selected_background == 0xffff0000
+        \\    return kw.column({ children = {
+        \\      kw.chip({ id = "hover", label = "Hover", on_tap = function() end }),
+        \\      kw.chip({ id = "selected", label = "Selected", selected = true }),
+        \\      kw.label(status and "ambient" or "missing"),
+        \\    } })
         \\  end,
         \\})
-        \\return kw.app({ child = App({ key = "app" }) })
+        \\return kw.app({ child = kw.theme({ data = theme, child = App({ key = "app" }) }) })
         \\
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "theme-context.lua", .data = script });
@@ -3851,14 +3867,18 @@ test "lua stateful build context includes theme" {
     var runtime = try runtime_mod.Runtime.init(
         allocator,
         log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
+        .{ .max_width = 100, .max_height = 100 },
         app.host(),
         .dark,
     );
     defer runtime.deinit();
 
     try runtime.repaint();
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"ambient\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ffff0000") != null);
+
+    try runtime.pointerMove(.{ .x = 5, .y = 5 });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff00ff00") != null);
 }
 
 test "lua resolves theme families and component tokens" {
