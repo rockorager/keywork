@@ -263,6 +263,32 @@ local default_theme = {
       padding_y = space_scale[1],
       radius = radius_scale[2],
     },
+
+    menu = {
+      background = "surface",
+      border = "border",
+      border_width = 1,
+      radius = radius_scale[4],
+      padding = space_scale[1],
+      item = {
+        padding_x = space_scale[3],
+        padding_y = space_scale[2],
+        radius = radius_scale[4],
+        hover_background = "fill_secondary",
+        selected_background = "fill",
+        selected_hover_background = "fill",
+      },
+      label = {
+        padding_x = space_scale[3],
+        padding_y = space_scale[2],
+        foreground = "text_secondary",
+      },
+      separator = {
+        color = "border",
+        thickness = 1,
+        margin = space_scale[1],
+      },
+    },
   },
 }
 
@@ -412,6 +438,38 @@ local function resolve_chip(chip, colors, space, radius)
   }
 end
 
+local function resolve_menu(menu, colors, space, radius)
+  menu = menu or {}
+  local item = menu.item or {}
+  local label = menu.label or {}
+  local separator = menu.separator or {}
+  return {
+    background = resolve_color(menu.background, colors),
+    border = resolve_color(menu.border, colors),
+    border_width = menu.border_width,
+    radius = resolve_radius(menu.radius, radius),
+    padding = resolve_space(menu.padding, space),
+    item = {
+      padding_x = resolve_space(item.padding_x, space),
+      padding_y = resolve_space(item.padding_y, space),
+      radius = resolve_radius(item.radius, radius),
+      hover_background = resolve_color(item.hover_background, colors),
+      selected_background = resolve_color(item.selected_background, colors),
+      selected_hover_background = resolve_color(item.selected_hover_background, colors),
+    },
+    label = {
+      padding_x = resolve_space(label.padding_x, space),
+      padding_y = resolve_space(label.padding_y, space),
+      foreground = resolve_color(label.foreground, colors),
+    },
+    separator = {
+      color = resolve_color(separator.color, colors),
+      thickness = separator.thickness,
+      margin = resolve_space(separator.margin, space),
+    },
+  }
+end
+
 function ui.resolve_theme(theme, state_or_scheme)
   theme = theme or default_theme
   local color_scheme = "light"
@@ -434,6 +492,7 @@ function ui.resolve_theme(theme, state_or_scheme)
     button = resolve_button(theme.components and theme.components.button, colors, space, radius),
     input = resolve_input(theme.components and theme.components.input, colors, space, radius),
     chip = resolve_chip(theme.components and theme.components.chip, colors, space, radius),
+    menu = resolve_menu(theme.components and theme.components.menu, colors, space, radius),
   }
 
   return {
@@ -880,11 +939,8 @@ function ui.icon_label(icon_name, text, options)
   return ui.row({ spacing = options.spacing or 6, align = options.align or "baseline", children = children })
 end
 
---- Pass a resolved theme (see ui.resolve_theme) as `theme` to default the
---- chip's metrics and colors from `theme.components.chip`; explicit options
---- always win.
-function ui.chip(options)
-  local chip_theme = options.theme and options.theme.components and options.theme.components.chip or {}
+local function build_chip(options, theme)
+  local chip_theme = theme and theme.components and theme.components.chip or {}
   local selected = options.selected or false
   local background = options.background or chip_theme.background
   if selected then
@@ -942,6 +998,139 @@ function ui.chip(options)
     on_tap_up = options.on_tap_up,
     on_tap_cancel = options.on_tap_cancel,
   })
+end
+
+local Chip = ui.stateful({
+  build = function(self, context)
+    return build_chip(self.props, self.props.theme or context.theme)
+  end,
+})
+
+--- Chip metrics and colors come from the ambient theme. Pass `theme` only
+--- to intentionally override `theme.components.chip`; explicit style options
+--- always win.
+function ui.chip(options)
+  return Chip(options)
+end
+
+local function build_menu(options, theme)
+  local menu_theme = theme and theme.components and theme.components.menu or {}
+  return ui.container({
+    background = options.background or menu_theme.background,
+    border = options.border or menu_theme.border,
+    border_width = options.border_width or menu_theme.border_width,
+    radius = options.radius or menu_theme.radius,
+    padding = options.padding or menu_theme.padding,
+    child = options.child,
+  })
+end
+
+local Menu = ui.stateful({
+  build = function(self, context)
+    return build_menu(self.props, self.props.theme or context.theme)
+  end,
+})
+
+--- Menu surface using the ambient `theme.components.menu` colors and metrics.
+--- Placement remains the responsibility of ui.popup/ui.anchored.
+function ui.menu(options)
+  return Menu(options)
+end
+
+local function build_menu_item(options, theme)
+  local menu_theme = theme and theme.components and theme.components.menu or {}
+  local item_theme = menu_theme.item or {}
+  local selected = options.selected or false
+  local background = options.background
+  local hover_background
+  if options.hover_background ~= false then
+    hover_background = options.hover_background or item_theme.hover_background
+  end
+  if selected then
+    background = options.selected_background or item_theme.selected_background or background
+    if options.hover_background ~= false then
+      if options.selected_hover_background == false then
+        hover_background = nil
+      else
+        hover_background = options.selected_hover_background or item_theme.selected_hover_background or hover_background
+      end
+    end
+  end
+  local padding = options.padding
+  if not padding then
+    padding = { x = item_theme.padding_x or 12, y = item_theme.padding_y or 8 }
+  end
+  return ui.pressable({
+    id = options.id,
+    hover_background = hover_background,
+    cursor = options.cursor,
+    activation = options.activation,
+    on_tap = options.on_tap,
+    on_hover = options.on_hover,
+    child = ui.container({
+      background = background,
+      radius = options.radius or item_theme.radius,
+      padding = padding,
+    }, options.child),
+  })
+end
+
+local MenuItem = ui.stateful({
+  build = function(self, context)
+    return build_menu_item(self.props, self.props.theme or context.theme)
+  end,
+})
+
+--- Interactive row using the ambient `theme.components.menu.item` colors and
+--- metrics. `selected` lets keyboard and pointer selection share one highlight.
+function ui.menu_item(options)
+  return MenuItem(options)
+end
+
+local function build_menu_label(options, theme)
+  local menu_theme = theme and theme.components and theme.components.menu or {}
+  local label_theme = menu_theme.label or {}
+  local child = options.child or ui.label(options.text or "", {
+    color = options.color or label_theme.foreground,
+  })
+  local padding = options.padding
+  if not padding then
+    padding = { x = label_theme.padding_x or 12, y = label_theme.padding_y or 8 }
+  end
+  return ui.padding({ insets = padding, child = child })
+end
+
+local MenuLabel = ui.stateful({
+  build = function(self, context)
+    return build_menu_label(self.props, self.props.theme or context.theme)
+  end,
+})
+
+--- Non-interactive menu row for a group or section name.
+function ui.menu_label(options)
+  return MenuLabel(options)
+end
+
+local function build_menu_separator(options, theme)
+  local menu_theme = theme and theme.components and theme.components.menu or {}
+  local separator_theme = menu_theme.separator or {}
+  return ui.separator({
+    color = options.color or separator_theme.color,
+    thickness = options.thickness or separator_theme.thickness or 1,
+    margin = options.margin or separator_theme.margin or 4,
+    axis = options.axis,
+  })
+end
+
+local MenuSeparator = ui.stateful({
+  build = function(self, context)
+    return build_menu_separator(self.props, self.props.theme or context.theme)
+  end,
+})
+
+--- Themed divider between menu items or groups.
+function ui.menu_separator(options)
+  return MenuSeparator(options)
 end
 
 function ui.icon_button(options)
