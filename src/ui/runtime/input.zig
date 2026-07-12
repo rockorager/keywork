@@ -167,7 +167,7 @@ pub fn editFocusedTextInput(self: anytype, edit: TextEdit) !void {
     const state = keywork.textInputState(input);
     switch (edit) {
         .append => |bytes| {
-            if (!isEditableText(bytes)) return;
+            if (!isSingleLineText(bytes)) return;
             try state.text.appendSlice(self.allocator, bytes);
         },
         .pop_grapheme => popLastGrapheme(&state.text),
@@ -176,12 +176,13 @@ pub fn editFocusedTextInput(self: anytype, edit: TextEdit) !void {
     try self.invalidateState();
 }
 
-fn isEditableText(bytes: []const u8) bool {
+fn isSingleLineText(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     const view = std.unicode.Utf8View.init(bytes) catch return false;
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) return false;
+        if (codepoint == 0x2028 or codepoint == 0x2029) return false;
     }
     return true;
 }

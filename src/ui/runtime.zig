@@ -1564,6 +1564,8 @@ test "typing edits element-owned input state without rebuilding" {
     try runtime.keyInput(.{ .text = "\x01" });
     try runtime.keyInput(.{ .text = "\xc2\x80" });
     try runtime.keyInput(.{ .text = "\xff" });
+    try runtime.keyInput(.{ .text = "\xe2\x80\xa8" });
+    try runtime.keyInput(.{ .text = "\xe2\x80\xa9" });
     try std.testing.expectEqualStrings("hi", app.lastChange());
     try std.testing.expectEqualStrings("hi", renderedInputText(runtime.root.?).?);
 
