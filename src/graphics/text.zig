@@ -900,13 +900,8 @@ fn blitGlyphBitmap(
 }
 
 fn blendPremultiplied(pixels: []u32, width: u31, height: u31, x: i32, y: i32, b: u8, g: u8, r: u8, a: u8) void {
-    if (x < 0 or y < 0) return;
-    const ux: usize = @intCast(x);
-    const uy: usize = @intCast(y);
-    if (ux >= width or uy >= height) return;
-
-    const index = uy * width + ux;
-    const dst: keywork.Color = @bitCast(pixels[index]);
+    const pixel = pixelAt(pixels, width, height, x, y) orelse return;
+    const dst: keywork.Color = @bitCast(pixel.*);
     const inv = 255 - @as(u32, a);
     const out: keywork.Color = .{
         .a = @intCast(@min(255, @as(u32, a) + (@as(u32, dst.a) * inv + 127) / 255)),
@@ -914,7 +909,7 @@ fn blendPremultiplied(pixels: []u32, width: u31, height: u31, x: i32, y: i32, b:
         .g = @intCast(@min(255, @as(u32, g) + (@as(u32, dst.g) * inv + 127) / 255)),
         .b = @intCast(@min(255, @as(u32, b) + (@as(u32, dst.b) * inv + 127) / 255)),
     };
-    pixels[index] = @bitCast(out);
+    pixel.* = @bitCast(out);
 }
 
 fn scaleFixed(value: i32, factor: f32) i32 {
@@ -934,14 +929,17 @@ fn clampSpan(value: i32, limit: usize) usize {
 }
 
 fn blendPixel(pixels: []u32, width: u31, height: u31, x: i32, y: i32, color: keywork.Color, coverage: u8) void {
-    if (x < 0 or y < 0) return;
+    const pixel = pixelAt(pixels, width, height, x, y) orelse return;
+    const dst: keywork.Color = @bitCast(pixel.*);
+    pixel.* = @bitCast(color.blendOver(dst, coverage));
+}
+
+fn pixelAt(pixels: []u32, width: u31, height: u31, x: i32, y: i32) ?*u32 {
+    if (x < 0 or y < 0) return null;
     const ux: usize = @intCast(x);
     const uy: usize = @intCast(y);
-    if (ux >= width or uy >= height) return;
-
-    const index = uy * width + ux;
-    const dst: keywork.Color = @bitCast(pixels[index]);
-    pixels[index] = @bitCast(color.blendOver(dst, coverage));
+    if (ux >= width or uy >= height) return null;
+    return &pixels[uy * width + ux];
 }
 
 fn scaledPixelSize(scale: f32, font_size: f32) !u31 {
