@@ -542,8 +542,7 @@ fn luaWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // A dead or closed handle reports nil, err: writes need a
     // distinguishable result, so this is not a silent no-op.
     const process_or_dead = lua_handle.resource(LuaProcess, lua_state, 1, process_type);
-    var data_len: usize = 0;
-    const data_ptr = c.luaL_checklstring(lua_state, 2, &data_len).?;
+    const data = lua_value.checkString(lua_state, 2);
     const process = process_or_dead orelse {
         c.lua_pushnil(lua_state);
         c.lua_pushliteral(lua_state, "closed");
@@ -562,7 +561,6 @@ fn luaWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // Fast path: write what the pipe accepts right now. A write that
     // completes synchronously never yields, so it also works from the
     // main state.
-    const data = data_ptr[0..data_len];
     const written = lua_sink.writeNow(process.stdin_fd, data) catch |err| {
         process.closeStdin(lua_state, .resume_reader);
         c.lua_pushnil(lua_state);

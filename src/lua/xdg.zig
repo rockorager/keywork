@@ -246,15 +246,9 @@ fn upvalueAllocator(lua_state: *c.lua_State) std.mem.Allocator {
     return ptr.*;
 }
 
-fn checkString(lua_state: *c.lua_State, index: c_int) []const u8 {
-    var len: usize = 0;
-    const ptr = c.luaL_checklstring(lua_state, index, &len);
-    return ptr[0..len];
-}
-
 fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const path = checkString(lua_state, 1);
+    const path = lua_value.checkString(lua_state, 1);
     mkdirAll(path) catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
@@ -263,7 +257,7 @@ fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const allocator = upvalueAllocator(lua_state);
-    const path = checkString(lua_state, 1);
+    const path = lua_value.checkString(lua_state, 1);
     const entries = readDirAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer freeDirEntries(allocator, entries);
 
@@ -284,7 +278,7 @@ fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaReadFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const allocator = upvalueAllocator(lua_state);
-    const path = checkString(lua_state, 1);
+    const path = lua_value.checkString(lua_state, 1);
     const data = readFileAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer allocator.free(data);
     c.lua_pushlstring(lua_state, data.ptr, data.len);
@@ -294,8 +288,8 @@ fn luaReadFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaWriteFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const allocator = upvalueAllocator(lua_state);
-    const path = checkString(lua_state, 1);
-    const data = checkString(lua_state, 2);
+    const path = lua_value.checkString(lua_state, 1);
+    const data = lua_value.checkString(lua_state, 2);
     var atomic = true;
     if (c.lua_type(lua_state, 3) == c.LUA_TTABLE) {
         c.lua_getfield(lua_state, 3, "atomic");

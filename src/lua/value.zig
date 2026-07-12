@@ -56,6 +56,12 @@ pub fn stringFromStack(lua_state: *c.lua_State, index: c_int) ![]const u8 {
     return ptr[0..len];
 }
 
+pub fn checkString(lua_state: *c.lua_State, index: c_int) []const u8 {
+    var len: usize = 0;
+    const ptr = c.luaL_checklstring(lua_state, index, &len);
+    return ptr[0..len];
+}
+
 pub fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
     return allocator.dupe(u8, try stringFromStack(lua_state, index));
 }

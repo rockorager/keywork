@@ -1260,10 +1260,9 @@ fn luaClipboardRead(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    var len: usize = 0;
-    const ptr = c.luaL_checklstring(lua_state, 1, &len);
+    const text = lua_value.checkString(lua_state, 1);
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
-    platform.clipboardWrite(ptr[0..len]) catch |err| return lua_value.pushNilError(lua_state, err);
+    platform.clipboardWrite(text) catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }
@@ -1285,9 +1284,7 @@ fn luaWindowStartMove(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    var len: usize = 0;
-    const ptr = c.luaL_checklstring(lua_state, 1, &len);
-    const edge = platform_mod.resizeEdgeFromName(ptr[0..len]) orelse
+    const edge = platform_mod.resizeEdgeFromName(lua_value.checkString(lua_state, 1)) orelse
         return c.luaL_error(lua_state, "invalid resize edge (expected top, bottom, left, right, or a corner)");
     const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
     platform.startResize(edge) catch |err| return lua_value.pushNilError(lua_state, err);

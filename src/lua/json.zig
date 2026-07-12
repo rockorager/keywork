@@ -213,12 +213,11 @@ fn integerKey(lua_state: *c.lua_State, index: c_int) ?usize {
 
 fn luaDecode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    var len: usize = 0;
-    const ptr = c.luaL_checklstring(lua_state, 1, &len).?;
+    const input = lua_value.checkString(lua_state, 1);
     const allocator = allocatorFromUpvalue(lua_state);
 
     // Malformed input is expected runtime data, so decode reports nil, err.
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, ptr[0..len], .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch |err| {
         return lua_value.pushNilError(lua_state, err);
     };
     defer parsed.deinit();

@@ -225,9 +225,7 @@ fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const host = hostFromLua(lua_state);
     lua_task.raiseIfCanceled(lua_state);
-    var path_len: usize = 0;
-    const path_ptr = c.luaL_checklstring(lua_state, 1, &path_len).?;
-    const path = path_ptr[0..path_len];
+    const path = lua_value.checkString(lua_state, 1);
 
     // A missing or refusing socket is an expected runtime failure, so
     // connect reports nil, err instead of raising.
@@ -265,8 +263,7 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // A dead or closed handle reports nil, err: writes need a
     // distinguishable result, so this is not a silent no-op.
     const socket_or_dead = lua_handle.resource(LuaSocket, lua_state, 1, socket_type);
-    var data_len: usize = 0;
-    const data_ptr = c.luaL_checklstring(lua_state, 2, &data_len).?;
+    const data = lua_value.checkString(lua_state, 2);
     const socket = socket_or_dead orelse {
         c.lua_pushnil(lua_state);
         c.lua_pushliteral(lua_state, "closed");
@@ -282,7 +279,6 @@ fn luaSocketWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // Fast path: write what the kernel accepts right now. A write that
     // completes synchronously never yields, so it also works from the
     // main state.
-    const data = data_ptr[0..data_len];
     const written = lua_sink.writeNow(socket.fd, data) catch |err| {
         socket.shutdownFd(lua_state, .resume_reader);
         c.lua_pushnil(lua_state);
