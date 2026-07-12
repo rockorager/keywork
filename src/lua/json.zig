@@ -140,7 +140,7 @@ fn encodeNumber(jw: *std.json.Stringify, number: f64) EncodeError!void {
 fn encodeTable(lua_state: *c.lua_State, index: c_int, jw: *std.json.Stringify, depth: usize) EncodeError!void {
     if (depth >= max_encode_depth) return error.TooDeep;
     if (c.lua_checkstack(lua_state, 8) == 0) return error.StackOverflow;
-    const table = absoluteIndex(lua_state, index);
+    const table = lua_value.absoluteIndex(lua_state, index);
 
     if (hasArrayMark(lua_state, table)) return encodeArray(lua_state, table, jw, depth);
 
@@ -271,11 +271,6 @@ fn luaArray(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     pushArrayMetatable(lua_state);
     _ = c.lua_setmetatable(lua_state, -2);
     return 1;
-}
-
-fn absoluteIndex(lua_state: *c.lua_State, index: c_int) c_int {
-    if (index > 0 or index <= c.LUA_REGISTRYINDEX) return index;
-    return c.lua_gettop(lua_state) + index + 1;
 }
 
 // --- tests ------------------------------------------------------------------
