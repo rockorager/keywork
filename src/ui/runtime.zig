@@ -384,25 +384,6 @@ pub const Runtime = struct {
 };
 
 const TestBackend = struct {
-    fn backend(self: *@This()) RenderBackend {
-        return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-    }
-
-    fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-        return false;
-    }
-
-    fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-        const measurer: keywork.TextMeasurer = .fixed;
-        return measurer.measureText(value, style);
-    }
-
-    fn scale(_: *anyopaque) f32 {
-        return 1;
-    }
-};
-
-const CountingTestBackend = struct {
     presents: usize = 0,
 
     fn backend(self: *@This()) RenderBackend {
@@ -495,7 +476,7 @@ test "deferred invalidations coalesce until flush" {
     };
 
     var app: TestApp = .{};
-    var backend: CountingTestBackend = .{};
+    var backend: TestBackend = .{};
     var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
     defer runtime.deinit();
     try runtime.repaint();
@@ -599,7 +580,7 @@ test "rebuilds that change nothing present nothing" {
     };
 
     var app: TestApp = .{};
-    var backend: CountingTestBackend = .{};
+    var backend: TestBackend = .{};
     var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
     defer runtime.deinit();
     try runtime.repaint();
