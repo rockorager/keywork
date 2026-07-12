@@ -2006,15 +2006,6 @@ fn pushDbusIterSequence(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) 
     }
 }
 
-fn tableRefField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) !c_int {
-    c.lua_getfield(lua_state, table, key);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) {
-        pop(lua_state, 1);
-        return error.ExpectedLuaTable;
-    }
-    return c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
-}
-
 fn tryZTemp(value: []const u8) [:0]const u8 {
     std.debug.assert(value.len < dbus_temp_z_buffers[0].len);
     const slot = dbus_temp_z_slot % dbus_temp_z_buffers.len;
