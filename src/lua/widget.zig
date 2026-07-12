@@ -140,6 +140,7 @@ const SizedOptions = struct {
 const IconOptions = struct {
     size: ?f32 = null,
     color: ?keywork.Color = null,
+    symbolic: ?bool = null,
 };
 
 const SeparatorOptions = struct {
@@ -191,11 +192,15 @@ const ParseContext = struct {
     /// deferred builders and stateful widgets clone it for their lifetime.
     theme_ref: c_int = -1,
 
-    fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color } {
+    fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color, symbolic: bool } {
+        const color = options.color orelse self.icon.color;
         return .{
             .size = options.size orelse self.icon.size orelse 16,
             // No explicit or ambient color renders the icon's own palette.
-            .color = options.color orelse self.icon.color,
+            .color = color,
+            // A tint naturally belongs on a monochrome symbolic asset;
+            // callers can explicitly keep the regular icon when needed.
+            .symbolic = options.symbolic orelse self.icon.symbolic orelse (color != null),
         };
     }
 
@@ -204,6 +209,7 @@ const ParseContext = struct {
             .icon = .{
                 .size = options.size orelse self.icon.size,
                 .color = options.color orelse self.icon.color,
+                .symbolic = options.symbolic orelse self.icon.symbolic,
             },
             .icon_cache = self.icon_cache,
             .icon_scale = self.icon_scale,
@@ -1024,13 +1030,13 @@ pub fn parse(
         if (parse_context.icon_cache) |cache| {
             // The cache owns the path and tombstones misses, so absent
             // icons neither re-walk the theme tree nor warn again.
-            const icon_file = try cache.lookup(name, lookup_size) orelse return missingIconWidget(allocator, fallback_color);
+            const icon_file = try cache.lookupPreferred(name, lookup_size, icon.symbolic) orelse return missingIconWidget(allocator, fallback_color);
             return switch (icon_file.format) {
                 .svg => svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
                 .png => pngIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
             };
         }
-        const icon_file = try icon_theme.lookupIconSized(allocator, name, lookup_size) orelse {
+        const icon_file = try icon_theme.lookupIconSizedPreferred(allocator, name, lookup_size, icon.symbolic) orelse {
             std.log.scoped(.keywork_luajit).warn("missing icon {s}", .{name});
             return missingIconWidget(allocator, fallback_color);
         };
@@ -1107,6 +1113,16 @@ test "absolute icon paths bypass icon theme lookup" {
     try std.testing.expect(isAbsolutePath("/tmp/icon.png"));
     try std.testing.expect(!isAbsolutePath("document-open"));
     try std.testing.expect(!isAbsolutePath(""));
+}
+
+test "icon tint prefers symbolic assets unless explicitly disabled" {
+    const context: ParseContext = .{};
+    try std.testing.expect(!context.resolveIcon(.{}).symbolic);
+    try std.testing.expect(context.resolveIcon(.{ .color = keywork.colors.ink }).symbolic);
+    try std.testing.expect(!context.resolveIcon(.{ .color = keywork.colors.ink, .symbolic = false }).symbolic);
+
+    const themed = context.mergeIcon(.{ .color = keywork.colors.ink });
+    try std.testing.expect(themed.resolveIcon(.{}).symbolic);
 }
 
 test "plain text input defaults are chromeless and explicit values win" {

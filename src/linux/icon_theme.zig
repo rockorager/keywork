@@ -111,20 +111,26 @@ pub const Cache = struct {
     /// The returned icon path is owned by the cache and stays valid
     /// until deinit; null means the icon is known to be missing.
     pub fn lookup(self: *Cache, name: []const u8, logical_size: f32) !?IconFile {
+        return self.lookupPreferred(name, logical_size, false);
+    }
+
+    /// Prefers the name's -symbolic variant when requested, then falls
+    /// back to the regular icon. The preference is part of the cache key.
+    pub fn lookupPreferred(self: *Cache, name: []const u8, logical_size: f32, prefer_symbolic: bool) !?IconFile {
         const size = positiveIconSize(logical_size);
         // Hits are the hot path (every icon widget on every rebuild):
         // probe with a stack-formatted key so they stay allocation-free.
         var buf: [256]u8 = undefined;
-        if (std.fmt.bufPrint(&buf, "{d}\x00{s}", .{ size, name })) |probe| {
+        if (std.fmt.bufPrint(&buf, "{d}\x00{d}\x00{s}", .{ size, @intFromBool(prefer_symbolic), name })) |probe| {
             if (self.entries.get(probe)) |cached| return cached;
         } else |_| {}
-        const key = try std.fmt.allocPrint(self.allocator, "{d}\x00{s}", .{ size, name });
+        const key = try std.fmt.allocPrint(self.allocator, "{d}\x00{d}\x00{s}", .{ size, @intFromBool(prefer_symbolic), name });
         errdefer self.allocator.free(key);
         if (self.entries.get(key)) |cached| {
             self.allocator.free(key);
             return cached;
         }
-        const icon = try lookupIconSized(self.allocator, name, logical_size);
+        const icon = try lookupIconSizedPreferred(self.allocator, name, logical_size, prefer_symbolic);
         errdefer if (icon) |value| self.allocator.free(value.path);
         if (icon == null) log.warn("missing icon {s}", .{name});
         try self.entries.put(self.allocator, key, icon);
@@ -134,6 +140,17 @@ pub const Cache = struct {
 
 pub fn lookupIconSized(allocator: std.mem.Allocator, name: []const u8, logical_size: f32) !?IconFile {
     return lookupIconSizedWithFormats(allocator, name, logical_size, &.{ .svg, .png });
+}
+
+/// Prefers a themed -symbolic icon while preserving ordinary lookup as
+/// a fallback. Explicit symbolic names and paths keep their normal meaning.
+pub fn lookupIconSizedPreferred(allocator: std.mem.Allocator, name: []const u8, logical_size: f32, prefer_symbolic: bool) !?IconFile {
+    if (!prefer_symbolic or std.mem.endsWith(u8, name, "-symbolic") or std.mem.indexOfScalar(u8, name, '/') != null) return lookupIconSized(allocator, name, logical_size);
+
+    const symbolic_name = try std.fmt.allocPrint(allocator, "{s}-symbolic", .{name});
+    defer allocator.free(symbolic_name);
+    if (try lookupIconSizedWithFormats(allocator, symbolic_name, logical_size, &.{ .svg, .png })) |icon| return icon;
+    return lookupIconSized(allocator, name, logical_size);
 }
 
 fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, logical_size: f32, formats: []const IconFormat) !?IconFile {
@@ -545,6 +562,11 @@ test "cache tombstones missing icons and serves repeat lookups" {
     // A different size is a distinct lookup.
     try std.testing.expect(try cache.lookup("keywork-definitely-missing-icon", 32) == null);
     try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+
+    // Symbolic preference can resolve to a different file, so it gets
+    // an independent cache entry at the same name and size.
+    try std.testing.expect(try cache.lookupPreferred("keywork-definitely-missing-icon", 16, true) == null);
+    try std.testing.expectEqual(@as(usize, 3), cache.entries.count());
 }
 
 test "cache returns the same owned path for repeated hits" {
