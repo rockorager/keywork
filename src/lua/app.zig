@@ -1388,8 +1388,7 @@ fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
 fn luaAppCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     if (c.lua_isnoneornil(lua_state, 2)) c.lua_createtable(lua_state, 0, 1) else c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.lua_pushliteral(lua_state, "app");
-    c.lua_setfield(lua_state, -2, "type");
+    lua_value.setStringField(lua_state, -1, "type", "app");
     return 1;
 }
 

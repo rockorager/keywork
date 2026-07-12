@@ -1126,11 +1126,9 @@ test "gesture buttons parse names and reject invalid values" {
     try std.testing.expectEqual(default_buttons, try getPointerButtons(lua_state, table));
 
     // "any" enables every button; other strings are rejected.
-    c.lua_pushstring(lua_state, "any");
-    c.lua_setfield(lua_state, table, "buttons");
+    lua_value.setStringField(lua_state, table, "buttons", "any");
     try std.testing.expectEqual(keywork.PointerButtons.any, try getPointerButtons(lua_state, table));
-    c.lua_pushstring(lua_state, "primary");
-    c.lua_setfield(lua_state, table, "buttons");
+    lua_value.setStringField(lua_state, table, "buttons", "primary");
     try std.testing.expectError(error.InvalidPointerButtons, getPointerButtons(lua_state, table));
 
     // Arrays of names enable exactly the listed buttons.
@@ -1181,14 +1179,12 @@ test "gesture activation parses release and defaults to press" {
     const defaults = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(keywork.Widget.ClickActivation.press, defaults.activation);
 
-    c.lua_pushstring(lua_state, "release");
-    c.lua_setfield(lua_state, table, "activation");
+    lua_value.setStringField(lua_state, table, "activation", "release");
     const options = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(keywork.Widget.ClickActivation.release, options.activation);
 
     // Unknown values are rejected rather than silently defaulted.
-    c.lua_pushstring(lua_state, "click");
-    c.lua_setfield(lua_state, table, "activation");
+    lua_value.setStringField(lua_state, table, "activation", "click");
     try std.testing.expectError(
         error.UnknownLuaEnumValue,
         lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator),
@@ -1208,13 +1204,11 @@ test "text line breaking parses Knuth-Plass and defaults to greedy" {
     const defaults = try lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(keywork.Widget.LineBreakStrategy.greedy, defaults.line_break);
 
-    c.lua_pushstring(lua_state, "knuth_plass");
-    c.lua_setfield(lua_state, table, "line_break");
+    lua_value.setStringField(lua_state, table, "line_break", "knuth_plass");
     const options = try lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(keywork.Widget.LineBreakStrategy.knuth_plass, options.line_break);
 
-    c.lua_pushstring(lua_state, "optimal");
-    c.lua_setfield(lua_state, table, "line_break");
+    lua_value.setStringField(lua_state, table, "line_break", "optimal");
     try std.testing.expectError(
         error.UnknownLuaEnumValue,
         lua_codec.decode(TextOptions, lua_state, table, std.testing.allocator),
@@ -1247,10 +1241,8 @@ test "failed gesture parse destroys callbacks it already captured" {
 
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushstring(lua_state, "gesture");
-    c.lua_setfield(lua_state, table, "type");
-    c.lua_pushstring(lua_state, "g");
-    c.lua_setfield(lua_state, table, "id");
+    lua_value.setStringField(lua_state, table, "type", "gesture");
+    lua_value.setStringField(lua_state, table, "id", "g");
     try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return 1"));
     c.lua_setfield(lua_state, table, "on_tap");
 

@@ -876,14 +876,10 @@ test "image options decode fit alignment cache and revision" {
 
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushstring(lua_state, "/tmp/wallpaper.png");
-    c.lua_setfield(lua_state, table, "path");
-    c.lua_pushstring(lua_state, "cover");
-    c.lua_setfield(lua_state, table, "fit");
-    c.lua_pushstring(lua_state, "bottom_right");
-    c.lua_setfield(lua_state, table, "align");
-    c.lua_pushstring(lua_state, "frame");
-    c.lua_setfield(lua_state, table, "cache");
+    lua_value.setStringField(lua_state, table, "path", "/tmp/wallpaper.png");
+    lua_value.setStringField(lua_state, table, "fit", "cover");
+    lua_value.setStringField(lua_state, table, "align", "bottom_right");
+    lua_value.setStringField(lua_state, table, "cache", "frame");
     lua_value.setIntegerField(lua_state, table, "revision", 7);
 
     const options = try lua_codec.decode(Options, lua_state, table, std.testing.allocator);
@@ -905,10 +901,8 @@ test "image requires exactly one source" {
     const table = c.lua_gettop(lua_state);
     try std.testing.expectError(error.InvalidImageSource, parse(lua_state, std.testing.allocator, null, table));
 
-    c.lua_pushstring(lua_state, "/tmp/wallpaper.png");
-    c.lua_setfield(lua_state, table, "path");
-    c.lua_pushstring(lua_state, "argb");
-    c.lua_setfield(lua_state, table, "pixels");
+    lua_value.setStringField(lua_state, table, "path", "/tmp/wallpaper.png");
+    lua_value.setStringField(lua_state, table, "pixels", "argb");
     try std.testing.expectError(error.InvalidImageSource, parse(lua_state, std.testing.allocator, null, table));
     try std.testing.expectEqual(table, c.lua_gettop(lua_state));
 }
@@ -932,8 +926,7 @@ test "file image parses and decodes lazily into fitted paint" {
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
     lua_value.setStringField(lua_state, table, "path", path);
-    c.lua_pushstring(lua_state, "cover");
-    c.lua_setfield(lua_state, table, "fit");
+    lua_value.setStringField(lua_state, table, "fit", "cover");
 
     var dims_cache: DimsCache = .init(allocator);
     defer dims_cache.deinit();

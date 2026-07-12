@@ -964,8 +964,7 @@ fn luaDbusArray(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
     c.lua_createtable(lua_state, 0, 3);
-    c.lua_pushliteral(lua_state, "array");
-    c.lua_setfield(lua_state, -2, "__dbus_type");
+    lua_value.setStringField(lua_state, -1, "__dbus_type", "array");
     c.lua_pushvalue(lua_state, 1);
     c.lua_setfield(lua_state, -2, "signature");
     c.lua_pushvalue(lua_state, 2);
@@ -977,8 +976,7 @@ fn luaDbusVariant(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
     c.lua_createtable(lua_state, 0, 3);
-    c.lua_pushliteral(lua_state, "variant");
-    c.lua_setfield(lua_state, -2, "__dbus_type");
+    lua_value.setStringField(lua_state, -1, "__dbus_type", "variant");
     c.lua_pushvalue(lua_state, 1);
     c.lua_setfield(lua_state, -2, "signature");
     c.lua_pushvalue(lua_state, 2);
@@ -988,8 +986,7 @@ fn luaDbusVariant(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn pushDbusTypedValue(lua_state: *c.lua_State, comptime type_name: [:0]const u8, value_index: c_int) c_int {
     c.lua_createtable(lua_state, 0, 2);
-    c.lua_pushstring(lua_state, type_name.ptr);
-    c.lua_setfield(lua_state, -2, "__dbus_type");
+    lua_value.setStringField(lua_state, -1, "__dbus_type", type_name);
     c.lua_pushvalue(lua_state, value_index);
     c.lua_setfield(lua_state, -2, "value");
     return 1;
