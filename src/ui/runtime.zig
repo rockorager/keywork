@@ -407,7 +407,9 @@ const TestBackend = struct {
 };
 
 fn initTestRuntime(app: anytype, backend: anytype, constraints: Constraints) !Runtime {
-    return Runtime.init(std.testing.allocator, backend.backend(), constraints, app.host(), .no_preference);
+    const TestApp = @TypeOf(app.*);
+    const host: AppHost = .{ .ptr = app, .vtable = &.{ .build_widget = TestApp.buildWidget } };
+    return Runtime.init(std.testing.allocator, backend.backend(), constraints, host, .no_preference);
 }
 
 test "popLastGrapheme removes one extended grapheme cluster" {
@@ -429,10 +431,6 @@ test "invalidation raised during rebuild is not dropped" {
     const TestApp = struct {
         builds: usize = 0,
         runtime: ?*Runtime = null,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -462,10 +460,6 @@ test "deferred invalidations coalesce until flush" {
     const TestApp = struct {
         builds: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.builds += 1;
@@ -490,10 +484,6 @@ test "deferred invalidations coalesce until flush" {
 test "content height follows retained root state and respects its cap" {
     const TestApp = struct {
         height: f32 = 36,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -534,10 +524,6 @@ test "rebuild passes that never stabilize return an error" {
     const TestApp = struct {
         runtime: ?*Runtime = null,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.runtime) |runtime| try runtime.invalidate();
@@ -556,10 +542,6 @@ test "rebuild passes that never stabilize return an error" {
 
 test "rebuilds that change nothing present nothing" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
             return keywork.widgets.text("hello");
         }
@@ -586,10 +568,6 @@ test "backend capability gates damage-only display lists" {
     const TestApp = struct {
         const left_color = keywork.Color.argb(255, 1, 2, 3);
         const right_color = keywork.Color.argb(255, 4, 5, 6);
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const empty = keywork.widgets.spacer(0);
@@ -679,10 +657,6 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
     const TestApp = struct {
         clicks: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const input = keywork.widgets.textInput("input", "", "placeholder");
@@ -729,10 +703,6 @@ test "accepted non-left buttons tap with event details, filtered buttons do noth
         last_source: ?keywork.TapSource = null,
         had_local: bool = false,
         accept_any: bool,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -788,10 +758,6 @@ test "in-flight press ignores other buttons until the initiating button releases
         clicks: usize = 0,
         last_button: ?keywork.PointerButton = null,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var widget = try keywork.widgets.clickable(
@@ -832,10 +798,6 @@ test "wheel scroll moves viewport content without rebuilding" {
     const TestApp = struct {
         builds: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.builds += 1;
@@ -873,10 +835,6 @@ test "wheel scroll moves viewport content without rebuilding" {
 test "dragging the scrollbar thumb scrolls and captures the pointer" {
     const TestApp = struct {
         builds: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -932,10 +890,6 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
 
 test "non-left buttons do not start scrollbar drags" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             var rows: [20]keywork.Widget = undefined;
             for (&rows) |*row| row.* = keywork.widgets.text("row");
@@ -988,10 +942,6 @@ const FakeClock = struct {
 
 test "scrollbar reveals on scroll and fades out on the animation clock" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             var rows: [20]keywork.Widget = undefined;
             for (&rows) |*row| row.* = keywork.widgets.text("row");
@@ -1045,10 +995,6 @@ test "scrollbar reveals on scroll and fades out on the animation clock" {
 
 test "spinner sweeps on the animation clock and demands frames while mounted" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
             return keywork.widgets.spinner(.{ .period_ms = 1000 });
         }
@@ -1082,10 +1028,6 @@ test "spinner sweeps on the animation clock and demands frames while mounted" {
 
 test "non-left buttons do not move text-input focus" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const input = keywork.widgets.textInput("input", "", "placeholder");
             const label = keywork.widgets.text("label");
@@ -1123,10 +1065,6 @@ test "right click on a text input bubbles to a button-accepting ancestor" {
     const TestApp = struct {
         clicks: usize = 0,
         last_button: ?keywork.PointerButton = null,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1175,10 +1113,6 @@ test "releasing a non-left press outside the target fires tap_cancel" {
         cancels: usize = 0,
         cancel_button: ?keywork.PointerButton = null,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var widget = try keywork.widgets.clickable(
@@ -1226,10 +1160,6 @@ test "releasing a non-left press outside the target fires tap_cancel" {
 
 test "keyboard focus scrolls its viewport to reveal the target" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             var rows: [12]keywork.Widget = undefined;
             var names: [12][]const u8 = undefined;
@@ -1283,10 +1213,6 @@ test "scrolling a virtualized list converges its window in one frame" {
 
         var dummy: u8 = 0;
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.builds += 1;
@@ -1327,10 +1253,6 @@ test "scrolling a virtualized list converges its window in one frame" {
 test "wheel scroll reaches a selected list nested in a flexible column slot" {
     const TestApp = struct {
         var dummy: u8 = 0;
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         // Mirrors the launcher: column { header, expanded(box(padding(list))), footer }.
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
@@ -1375,10 +1297,6 @@ test "wheel scroll reaches a selected list nested in a flexible column slot" {
 test "present damage covers every display-list change during fast wheel scroll" {
     const TestApp = struct {
         var dummy: u8 = 0;
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         // Mirrors the launcher: column { header, expanded(box(padding(list))), footer },
         // rows are boxes filling their 44px slot.
@@ -1597,10 +1515,6 @@ test "typing edits element-owned input state without rebuilding" {
         last_change: [32]u8 = undefined,
         last_change_len: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.builds += 1;
@@ -1673,10 +1587,6 @@ test "pointer hover restyles buttons without a full rebuild" {
     const TestApp = struct {
         builds: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.builds += 1;
@@ -1741,10 +1651,6 @@ test "pointer motion fires clickable hover callbacks on enter and leave" {
         enters: usize = 0,
         leaves: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const label: keywork.Widget = .{ .text = .{ .value = "row" } };
@@ -1787,10 +1693,6 @@ test "intent button callbacks survive dirty-state restyles" {
     const TestApp = struct {
         first_actions: usize = 0,
         second_actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1848,10 +1750,6 @@ test "shortcut invokes ambient action outside text input focus" {
     const TestApp = struct {
         actions: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const input = keywork.widgets.textInput("input", "", "placeholder");
@@ -1888,10 +1786,6 @@ test "shortcut invokes ambient action outside text input focus" {
 test "bound tab fires its shortcut instead of traversal; shift-tab still traverses" {
     const TestApp = struct {
         actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1938,10 +1832,6 @@ test "bound tab fires its shortcut instead of traversal; shift-tab still travers
 test "non-editing shortcuts fire while a text input is focused" {
     const TestApp = struct {
         actions: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1991,10 +1881,6 @@ test "focus widget participates in traversal and shortcut context" {
     const TestApp = struct {
         actions: usize = 0,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const label = keywork.widgets.text("Focusable shortcut target");
@@ -2024,10 +1910,6 @@ test "focus widget participates in traversal and shortcut context" {
 
 test "autofocus focus node is selected during initial build" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             return keywork.widgets.focusWithOptions(
                 scope.allocator,
@@ -2054,10 +1936,6 @@ test "autofocus focus node is selected during initial build" {
 test "autofocus replaces focused node removed during rebuild" {
     const TestApp = struct {
         show_old_focus: bool = true,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2097,10 +1975,6 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
         a_blurred: usize = 0,
         b_focused: usize = 0,
         b_blurred: usize = 0,
-
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
 
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2165,10 +2039,6 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
 
 test "focus traversal respects request and traversal policy" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const a = try keywork.widgets.focus(scope.allocator, .named("a"), keywork.widgets.text("A"));
             const skipped = try keywork.widgets.focusWithOptions(
@@ -2211,10 +2081,6 @@ test "focused node becoming non-requestable falls back to autofocus" {
     const TestApp = struct {
         allow_a_focus: bool = true,
 
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const a = try keywork.widgets.focusWithOptions(
@@ -2250,10 +2116,6 @@ test "focused node becoming non-requestable falls back to autofocus" {
 
 test "focus scope contains tab traversal once focus is inside it" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const a1 = try keywork.widgets.focus(scope.allocator, .named("a1"), keywork.widgets.text("A1"));
             const a2 = try keywork.widgets.focus(scope.allocator, .named("a2"), keywork.widgets.text("A2"));
@@ -2289,10 +2151,6 @@ test "focus scope contains tab traversal once focus is inside it" {
 
 test "modal focus scope traps autofocus traversal and focus requests" {
     const TestApp = struct {
-        fn host(self: *@This()) AppHost {
-            return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidget } };
-        }
-
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const background = try keywork.widgets.focusWithOptions(
                 scope.allocator,
