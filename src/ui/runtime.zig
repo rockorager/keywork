@@ -406,6 +406,10 @@ const TestBackend = struct {
     }
 };
 
+fn initTestRuntime(app: anytype, backend: anytype, constraints: Constraints) !Runtime {
+    return Runtime.init(std.testing.allocator, backend.backend(), constraints, app.host(), .no_preference);
+}
+
 test "popLastGrapheme removes one extended grapheme cluster" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(std.testing.allocator);
@@ -443,13 +447,7 @@ test "invalidation raised during rebuild is not dropped" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     app.runtime = &runtime;
 
@@ -477,7 +475,7 @@ test "deferred invalidations coalesce until flush" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
     defer runtime.deinit();
     try runtime.repaint();
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
@@ -518,13 +516,7 @@ test "content height follows retained root state and respects its cap" {
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var observer: Observer = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .min_width = 380, .max_width = 380, .max_height = 80 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .min_width = 380, .max_width = 380, .max_height = 80 });
     defer runtime.deinit();
     runtime.setContentSizing(.{ .height = true });
     runtime.setRootSizeHandler(&observer, Observer.observe);
@@ -555,13 +547,7 @@ test "rebuild passes that never stabilize return an error" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     app.runtime = &runtime;
 
@@ -581,7 +567,7 @@ test "rebuilds that change nothing present nothing" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
     defer runtime.deinit();
     try runtime.repaint();
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
@@ -662,7 +648,7 @@ test "backend capability gates damage-only display lists" {
 
     var app: TestApp = .{};
     var backend: DamageTestBackend = .{};
-    var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
     defer runtime.deinit();
     try runtime.repaint();
 
@@ -715,13 +701,7 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.keyInput(.{ .tab = .{} });
@@ -779,13 +759,7 @@ test "accepted non-left buttons tap with event details, filtered buttons do noth
     const point: keywork.Point = .{ .x = 5, .y = 5 };
 
     var any_app: TestApp = .{ .accept_any = true };
-    var any_runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        any_app.host(),
-        .no_preference,
-    );
+    var any_runtime = try initTestRuntime(&any_app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer any_runtime.deinit();
 
     try any_runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = point });
@@ -796,13 +770,7 @@ test "accepted non-left buttons tap with event details, filtered buttons do noth
     try std.testing.expect(any_app.had_local);
 
     var plain_app: TestApp = .{ .accept_any = false };
-    var plain_runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        plain_app.host(),
-        .no_preference,
-    );
+    var plain_runtime = try initTestRuntime(&plain_app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer plain_runtime.deinit();
 
     try plain_runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = point });
@@ -846,13 +814,7 @@ test "in-flight press ignores other buttons until the initiating button releases
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     const point: keywork.Point = .{ .x = 5, .y = 5 };
@@ -886,13 +848,7 @@ test "wheel scroll moves viewport content without rebuilding" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     try std.testing.expectEqual(@as(usize, 1), app.builds);
     // 20 Radix body rows at 24px in a 120px viewport: 360px of scroll range.
@@ -934,13 +890,7 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     // 20 Radix body rows at 24px in a 120px viewport: content 480, scroll
@@ -996,13 +946,7 @@ test "non-left buttons do not start scrollbar drags" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     const viewport = runtime.root.?.rect;
@@ -1060,13 +1004,7 @@ test "scrollbar reveals on scroll and fades out on the animation clock" {
     var fake_clock: FakeClock = .{};
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     runtime.clock = fake_clock.clock();
 
@@ -1119,13 +1057,7 @@ test "spinner sweeps on the animation clock and demands frames while mounted" {
     var fake_clock: FakeClock = .{ .now_ns = 5000 * std.time.ns_per_ms };
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 100, .max_height = 100 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 100 });
     defer runtime.deinit();
     runtime.clock = fake_clock.clock();
 
@@ -1164,13 +1096,7 @@ test "non-left buttons do not move text-input focus" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     const input_point: keywork.Point = .{ .x = 5, .y = 5 };
@@ -1223,13 +1149,7 @@ test "right click on a text input bubbles to a button-accepting ancestor" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     const input_point: keywork.Point = .{ .x = 5, .y = 5 };
@@ -1293,13 +1213,7 @@ test "releasing a non-left press outside the target fires tap_cancel" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.pointerButton(.{ .button = .right, .state = .pressed, .position = .{ .x = 5, .y = 5 } });
@@ -1340,13 +1254,7 @@ test "keyboard focus scrolls its viewport to reveal the target" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 300, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 300, .max_height = 120 });
     defer runtime.deinit();
 
     const viewport = runtime.root.?.rect;
@@ -1401,13 +1309,7 @@ test "scrolling a virtualized list converges its window in one frame" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     try std.testing.expectEqualStrings("row 0", TestApp.firstRowText(runtime.root.?).?);
 
@@ -1453,13 +1355,7 @@ test "wheel scroll reaches a selected list nested in a flexible column slot" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 640, .max_height = 470 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 640, .max_height = 470 });
     defer runtime.deinit();
 
     const list_element = keywork.dirtyScrollElement(&runtime.element_root.?, "results").?;
@@ -1663,13 +1559,7 @@ test "present damage covers every display-list change during fast wheel scroll" 
     var app: TestApp = .{};
     var backend: TrackingTestBackend = .{ .allocator = std.testing.allocator };
     defer backend.deinit();
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 640, .max_height = 470 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 640, .max_height = 470 });
     defer runtime.deinit();
     try backend_behavior.frameDone(&runtime);
 
@@ -1742,13 +1632,7 @@ test "typing edits element-owned input state without rebuilding" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.keyInput(.{ .tab = .{} });
@@ -1824,13 +1708,7 @@ test "pointer hover restyles buttons without a full rebuild" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     try std.testing.expectEqual(@as(usize, 1), app.builds);
 
@@ -1889,13 +1767,7 @@ test "pointer motion fires clickable hover callbacks on enter and leave" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.pointerMove(.{ .x = 5, .y = 5 });
@@ -1957,13 +1829,7 @@ test "intent button callbacks survive dirty-state restyles" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     // Hovering restyles the first button through the dirty-state arena;
@@ -2006,13 +1872,7 @@ test "shortcut invokes ambient action outside text input focus" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.keyInput(.space);
@@ -2058,13 +1918,7 @@ test "bound tab fires its shortcut instead of traversal; shift-tab still travers
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("input", runtime.focused_id.?);
@@ -2112,13 +1966,7 @@ test "non-editing shortcuts fire while a text input is focused" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 200, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
     // The autofocus text input owns focus from the initial build.
@@ -2165,13 +2013,7 @@ test "focus widget participates in traversal and shortcut context" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 80 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 80 });
     defer runtime.deinit();
 
     try runtime.keyInput(.{ .tab = .{} });
@@ -2198,13 +2040,7 @@ test "autofocus focus node is selected during initial build" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 80 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 80 });
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("initial", runtime.focused_id.?);
@@ -2242,13 +2078,7 @@ test "autofocus replaces focused node removed during rebuild" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 120 });
     defer runtime.deinit();
 
     _ = try focus_scroll.setFocused(&runtime, "old");
@@ -2311,13 +2141,7 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 120 });
     defer runtime.deinit();
 
     try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
@@ -2367,13 +2191,7 @@ test "focus traversal respects request and traversal policy" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 160 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 160 });
     defer runtime.deinit();
 
     try std.testing.expectEqual(@as(?[]u8, null), runtime.focused_id);
@@ -2418,13 +2236,7 @@ test "focused node becoming non-requestable falls back to autofocus" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 120 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 120 });
     defer runtime.deinit();
 
     try runtime.requestFocus("a");
@@ -2462,13 +2274,7 @@ test "focus scope contains tab traversal once focus is inside it" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 160 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 160 });
     defer runtime.deinit();
 
     try runtime.keyInput(.{ .tab = .{} });
@@ -2514,13 +2320,7 @@ test "modal focus scope traps autofocus traversal and focus requests" {
 
     var app: TestApp = .{};
     var backend: TestBackend = .{};
-    var runtime = try Runtime.init(
-        std.testing.allocator,
-        backend.backend(),
-        .{ .max_width = 240, .max_height = 180 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 240, .max_height = 180 });
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
