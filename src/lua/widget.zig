@@ -198,9 +198,7 @@ const ParseContext = struct {
             .size = options.size orelse self.icon.size orelse 16,
             // No explicit or ambient color renders the icon's own palette.
             .color = color,
-            // A tint naturally belongs on a monochrome symbolic asset;
-            // callers can explicitly keep the regular icon when needed.
-            .symbolic = options.symbolic orelse self.icon.symbolic orelse (color != null),
+            .symbolic = options.symbolic orelse self.icon.symbolic orelse false,
         };
     }
 
@@ -1115,14 +1113,15 @@ test "absolute icon paths bypass icon theme lookup" {
     try std.testing.expect(!isAbsolutePath(""));
 }
 
-test "icon tint prefers symbolic assets unless explicitly disabled" {
+test "symbolic icon preference is explicit and inherited" {
     const context: ParseContext = .{};
     try std.testing.expect(!context.resolveIcon(.{}).symbolic);
-    try std.testing.expect(context.resolveIcon(.{ .color = keywork.colors.ink }).symbolic);
-    try std.testing.expect(!context.resolveIcon(.{ .color = keywork.colors.ink, .symbolic = false }).symbolic);
+    try std.testing.expect(!context.resolveIcon(.{ .color = keywork.colors.ink }).symbolic);
+    try std.testing.expect(context.resolveIcon(.{ .symbolic = true }).symbolic);
 
-    const themed = context.mergeIcon(.{ .color = keywork.colors.ink });
+    const themed = context.mergeIcon(.{ .symbolic = true });
     try std.testing.expect(themed.resolveIcon(.{}).symbolic);
+    try std.testing.expect(!themed.resolveIcon(.{ .symbolic = false }).symbolic);
 }
 
 test "plain text input defaults are chromeless and explicit values win" {
