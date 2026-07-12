@@ -1103,42 +1103,31 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     c.lua_getfield(lua_state, package_table, "preload");
     const preload_table = c.lua_gettop(lua_state);
 
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork", keyworkModuleLoader, 1);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.storybook", storybookModuleLoader, 0);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.loop", loopModuleLoader, 1);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.process", processModuleLoader, 1);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.dbus", dbusModuleLoader, 1);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.pipewire", pipewireModuleLoader, 1);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.audio", audioModuleLoader, 0);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.log", logModuleLoader, 0);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.json", jsonModuleLoader, 1);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.service", serviceModuleLoader, 0);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.stream", streamModuleLoader, 0);
-
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, preload_table, "keywork.xdg", xdgModuleLoader, 1);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.xdg.applications", xdgApplicationsModuleLoader, 0);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.notify", notifyModuleLoader, 0);
-
-    lua_value.setClosureField(lua_state, preload_table, "keywork.portal", portalModuleLoader, 0);
+    const modules = [_]struct {
+        name: [*:0]const u8,
+        loader: c.lua_CFunction,
+        uses_app: bool = false,
+    }{
+        .{ .name = "keywork", .loader = keyworkModuleLoader, .uses_app = true },
+        .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
+        .{ .name = "keywork.loop", .loader = loopModuleLoader, .uses_app = true },
+        .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
+        .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
+        .{ .name = "keywork.pipewire", .loader = pipewireModuleLoader, .uses_app = true },
+        .{ .name = "keywork.audio", .loader = audioModuleLoader },
+        .{ .name = "keywork.log", .loader = logModuleLoader },
+        .{ .name = "keywork.json", .loader = jsonModuleLoader, .uses_app = true },
+        .{ .name = "keywork.service", .loader = serviceModuleLoader },
+        .{ .name = "keywork.stream", .loader = streamModuleLoader },
+        .{ .name = "keywork.xdg", .loader = xdgModuleLoader, .uses_app = true },
+        .{ .name = "keywork.xdg.applications", .loader = xdgApplicationsModuleLoader },
+        .{ .name = "keywork.notify", .loader = notifyModuleLoader },
+        .{ .name = "keywork.portal", .loader = portalModuleLoader },
+    };
+    for (modules) |module| {
+        if (module.uses_app) c.lua_pushlightuserdata(lua_state, app);
+        lua_value.setClosureField(lua_state, preload_table, module.name, module.loader, @intFromBool(module.uses_app));
+    }
 
     pop(lua_state, 2);
 }
