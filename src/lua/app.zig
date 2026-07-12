@@ -1591,6 +1591,16 @@ fn expectLuaBooleans(app: *App, globals: []const [:0]const u8) !void {
     for (globals) |global| try expectLuaBoolean(app, global, true);
 }
 
+fn initTestRuntime(
+    allocator: std.mem.Allocator,
+    backend: *log_backend_mod.LogBackend,
+    app: *App,
+    constraints: keywork.Constraints,
+    color_scheme: runtime_mod.UiColorScheme,
+) !runtime_mod.Runtime {
+    return runtime_mod.Runtime.init(allocator, backend.backend(), constraints, app.host(), color_scheme);
+}
+
 test "script must return a valid keywork.app root" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2943,13 +2953,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
     app.bindRuntime(&runtime);
 
@@ -3072,13 +3076,7 @@ test "lua stateful widget dispose runs when removed" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
     app.bindRuntime(&runtime);
 
@@ -3137,13 +3135,7 @@ test "lua stateful set_state is inert after dispose" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
     app.bindRuntime(&runtime);
 
@@ -3210,13 +3202,7 @@ test "widget scope is canceled on the loop turn after dispose" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
     app.bindRuntime(&runtime);
 
@@ -3312,13 +3298,7 @@ test "widget dispose releases its service subscription" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
     app.bindRuntime(&runtime);
 
@@ -3528,13 +3508,7 @@ test "lua stateful build context keeps ambient component theme" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 100 },
-        app.host(),
-        .dark,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 100 }, .dark);
     defer runtime.deinit();
 
     try runtime.repaint();
@@ -3593,13 +3567,7 @@ test "lua resolves theme families and component tokens" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 240, .max_height = 40 },
-        app.host(),
-        .dark,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 240, .max_height = 40 }, .dark);
     defer runtime.deinit();
 
     try runtime.repaint();
@@ -3628,13 +3596,7 @@ test "lua default theme exposes paired Radix size 2 typography" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 100 },
-        app.host(),
-        .light,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 100 }, .light);
     defer runtime.deinit();
 
     const root = runtime.root.?;
@@ -3703,13 +3665,7 @@ test "lua flexible and main_align lay out through the parser" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 60 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 60 }, .no_preference);
     defer runtime.deinit();
 
     try runtime.repaint();
@@ -3768,13 +3724,7 @@ test "lua loop fs_event observes file changes" {
     // widgets whose Lua dispose callbacks cancel sources on the loop.
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), app.fs_events.items.len);
@@ -3846,13 +3796,7 @@ test "lua process spawn captures stdout and exit" {
     // widgets whose Lua dispose callbacks cancel sources on the loop.
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
 
     try runtime.repaint();
@@ -4083,13 +4027,7 @@ test "lua process.capture collects output and exit status" {
     var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var runtime = try runtime_mod.Runtime.init(
-        allocator,
-        log_backend.backend(),
-        .{ .max_width = 100, .max_height = 40 },
-        app.host(),
-        .no_preference,
-    );
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
     defer runtime.deinit();
 
     try runtime.repaint();
