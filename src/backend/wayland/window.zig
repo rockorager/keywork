@@ -1130,16 +1130,16 @@ pub fn eventLoopFinish(
 }
 
 pub fn frameLogicalDimension(dimension: f32, fallback: u31) !u31 {
-    return positiveU31(if (dimension > 0) dimension else @as(f32, @floatFromInt(fallback)));
+    return frameDimension(if (dimension > 0) dimension else @as(f32, @floatFromInt(fallback)));
 }
 
 pub fn scaledFrameDimension(logical_dimension: u31, scale: f32) !u31 {
     if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidScale;
     const value = @as(f32, @floatFromInt(logical_dimension)) * scale;
-    return positiveU31(value);
+    return frameDimension(value);
 }
 
-fn positiveU31(value: f32) !u31 {
+pub fn frameDimension(value: f32) !u31 {
     if (!std.math.isFinite(value) or value <= 0) return error.InvalidFrameSize;
     const rounded = @ceil(value);
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;

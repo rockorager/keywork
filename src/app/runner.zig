@@ -13,6 +13,7 @@ const runtime_mod = @import("../ui/runtime.zig");
 const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
 const wayland_vulkan = @import("../backend/wayland/vulkan.zig");
+const wayland_window = @import("../backend/wayland/window.zig");
 
 const log = std.log.scoped(.keywork_runner);
 
@@ -573,8 +574,8 @@ fn PopupManager(comptime Backend: type) type {
 
         fn createPopup(self: *Self, request: keywork.PopupRequest) !void {
             const size = try self.measureContent(request.popup);
-            const width = try positiveU31(size.width);
-            const height = try positiveU31(size.height);
+            const width = try wayland_window.frameDimension(size.width);
+            const height = try wayland_window.frameDimension(size.height);
             const rect = request.anchor_rect;
 
             const surface = try self.allocator.create(PopupSurface);
@@ -643,8 +644,8 @@ fn PopupManager(comptime Backend: type) type {
         /// constraints used for subsequent frames.
         fn resizePopup(self: *Self, popup: *PopupSurface, request: keywork.PopupRequest) !void {
             const size = try self.measureContent(request.popup);
-            const width = try positiveU31(size.width);
-            const height = try positiveU31(size.height);
+            const width = try wayland_window.frameDimension(size.width);
+            const height = try wayland_window.frameDimension(size.height);
             if (width == popup.requested_width and height == popup.requested_height) return;
 
             const rect = request.anchor_rect;
@@ -820,8 +821,8 @@ const LayerProtocolSize = struct {
 
     fn fromLayout(size: keywork.Size) !LayerProtocolSize {
         return .{
-            .width = try positiveU31(size.width),
-            .height = try positiveU31(size.height),
+            .width = try wayland_window.frameDimension(size.width),
+            .height = try wayland_window.frameDimension(size.height),
         };
     }
 
@@ -1245,14 +1246,7 @@ fn WindowManager(comptime Backend: type) type {
 
 fn layerSurfaceDimension(layer_shell: ?wayland_options.LayerShellOptions, value: f32) !u31 {
     if (layer_shell != null and value <= 0) return 0;
-    return positiveU31(value);
-}
-
-fn positiveU31(value: f32) !u31 {
-    if (!std.math.isFinite(value) or value <= 0) return error.InvalidFrameSize;
-    const rounded = @ceil(value);
-    if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
-    return @intFromFloat(rounded);
+    return wayland_window.frameDimension(value);
 }
 
 test "layer surfaces may delegate both dimensions to anchors" {
