@@ -1215,22 +1215,19 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 }
 
 fn storybookModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_storybook_source.ptr, embedded_storybook_source.len, "@keywork/storybook.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_storybook_source, "@keywork/storybook.lua");
 }
 
 fn audioModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_audio_source.ptr, embedded_audio_source.len, "@keywork/audio.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_audio_source, "@keywork/audio.lua");
 }
 
 fn serviceModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_service_source.ptr, embedded_service_source.len, "@keywork/service.lua") != 0) return c.lua_error(lua_state);
+    return loadEmbeddedModule(lua_state_optional.?, embedded_service_source, "@keywork/service.lua");
+}
+
+fn loadEmbeddedModule(lua_state: *c.lua_State, source: []const u8, chunk_name: [*:0]const u8) c_int {
+    if (c.luaL_loadbuffer(lua_state, source.ptr, source.len, chunk_name) != 0) return c.lua_error(lua_state);
     if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
     return 1;
 }
@@ -1399,17 +1396,11 @@ fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn streamModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_stream_source.ptr, embedded_stream_source.len, "@keywork/stream.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_stream_source, "@keywork/stream.lua");
 }
 
 fn xdgApplicationsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_xdg_applications_source.ptr, embedded_xdg_applications_source.len, "@keywork/xdg_applications.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_xdg_applications_source, "@keywork/xdg_applications.lua");
 }
 
 fn xdgModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -1425,17 +1416,11 @@ fn xdgModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn notifyModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_notify_source.ptr, embedded_notify_source.len, "@keywork/notify.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_notify_source, "@keywork/notify.lua");
 }
 
 fn portalModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    if (c.luaL_loadbuffer(lua_state, embedded_portal_source.ptr, embedded_portal_source.len, "@keywork/portal.lua") != 0) return c.lua_error(lua_state);
-    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_portal_source, "@keywork/portal.lua");
 }
 
 fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
