@@ -936,57 +936,49 @@ fn dbusFilter(_: ?*dbus_c.DBusConnection, message: ?*dbus_c.DBusMessage, user_da
 }
 
 fn luaDbusString(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "string", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "string", 1, null);
 }
 
 fn luaDbusObjectPath(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "object_path", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "object_path", 1, null);
 }
 
 fn luaDbusBoolean(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "boolean", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "boolean", 1, null);
 }
 
 fn luaDbusInt32(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "int32", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "int32", 1, null);
 }
 
 fn luaDbusUint32(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "uint32", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "uint32", 1, null);
 }
 
 fn luaDbusDouble(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    return pushDbusTypedValue(lua_state_optional.?, "double", 1);
+    return pushDbusTypedValue(lua_state_optional.?, "double", 1, null);
 }
 
 fn luaDbusArray(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
     c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
-    c.lua_createtable(lua_state, 0, 3);
-    lua_value.setStringField(lua_state, -1, "__dbus_type", "array");
-    c.lua_pushvalue(lua_state, 1);
-    c.lua_setfield(lua_state, -2, "signature");
-    c.lua_pushvalue(lua_state, 2);
-    c.lua_setfield(lua_state, -2, "value");
-    return 1;
+    return pushDbusTypedValue(lua_state, "array", 2, 1);
 }
 
 fn luaDbusVariant(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
-    c.lua_createtable(lua_state, 0, 3);
-    lua_value.setStringField(lua_state, -1, "__dbus_type", "variant");
-    c.lua_pushvalue(lua_state, 1);
-    c.lua_setfield(lua_state, -2, "signature");
-    c.lua_pushvalue(lua_state, 2);
-    c.lua_setfield(lua_state, -2, "value");
-    return 1;
+    return pushDbusTypedValue(lua_state, "variant", 2, 1);
 }
 
-fn pushDbusTypedValue(lua_state: *c.lua_State, comptime type_name: [:0]const u8, value_index: c_int) c_int {
-    c.lua_createtable(lua_state, 0, 2);
+fn pushDbusTypedValue(lua_state: *c.lua_State, comptime type_name: [:0]const u8, value_index: c_int, signature_index: ?c_int) c_int {
+    c.lua_createtable(lua_state, 0, if (signature_index == null) 2 else 3);
     lua_value.setStringField(lua_state, -1, "__dbus_type", type_name);
+    if (signature_index) |index| {
+        c.lua_pushvalue(lua_state, index);
+        c.lua_setfield(lua_state, -2, "signature");
+    }
     c.lua_pushvalue(lua_state, value_index);
     c.lua_setfield(lua_state, -2, "value");
     return 1;
