@@ -408,18 +408,17 @@ fn fitTextParagraph(
     }
     if (!std.math.isFinite(paths[final_candidate][final_fitness].demerits)) return error.NoLineBreakPath;
 
-    var reversed: std.ArrayList(FittedTextLine) = .empty;
-    defer reversed.deinit(allocator);
+    const first_new_line = lines.items.len;
+    errdefer lines.shrinkRetainingCapacity(first_new_line);
     var point: BreakPoint = .{
         .candidate = final_candidate,
         .fitness = @enumFromInt(final_fitness),
     };
     while (true) {
-        try reversed.append(allocator, candidates[point.candidate].line);
+        try lines.append(allocator, candidates[point.candidate].line);
         point = paths[point.candidate][@intFromEnum(point.fitness)].previous orelse break;
     }
-    std.mem.reverse(FittedTextLine, reversed.items);
-    try lines.appendSlice(allocator, reversed.items);
+    std.mem.reverse(FittedTextLine, lines.items[first_new_line..]);
 }
 
 fn appendEllipsizedLine(
