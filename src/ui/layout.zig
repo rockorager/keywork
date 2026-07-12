@@ -1403,109 +1403,48 @@ test "removing an overflowing child damages its retained paint bounds" {
     try std.testing.expectEqual(@as(?Rect, null), parent.paint_bounds);
 }
 
-test "wrapped text preserves fitting text and ellipsizes one line" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+fn expectWrapped(value: []const u8, max_lines: ?u32, line_break: Widget.LineBreakStrategy, available_width: f32, expected: []const u8) !void {
     var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    defer output.deinit(std.testing.allocator);
+    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
+    try wrapText(std.testing.allocator, &output, value, max_lines, .ellipsis, line_break, available_width, style, .fixed);
+    try std.testing.expectEqualStrings(expected, output.items);
+}
 
-    try wrapText(allocator, &output, "abc", 1, .ellipsis, .greedy, 40, style, .fixed);
-    try std.testing.expectEqualStrings("abc", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "abcdef", 1, .ellipsis, .greedy, 40, style, .fixed);
-    try std.testing.expectEqualStrings("ab…", output.items);
+test "wrapped text preserves fitting text and ellipsizes one line" {
+    try expectWrapped("abc", 1, .greedy, 40, "abc");
+    try expectWrapped("abcdef", 1, .greedy, 40, "ab…");
 }
 
 test "wrapped text omits an ellipsis that cannot fit" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    try wrapText(allocator, &output, "abc", 1, .ellipsis, .greedy, 16, style, .fixed);
-    try std.testing.expectEqualStrings("", output.items);
+    try expectWrapped("abc", 1, .greedy, 16, "");
 }
 
 test "wrapped text uses Unicode opportunities and ellipsizes at two lines" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    try wrapText(allocator, &output, "hello world again", 2, .ellipsis, .greedy, 48, style, .fixed);
-    try std.testing.expectEqualStrings("hello\nwor…", output.items);
+    try expectWrapped("hello world again", 2, .greedy, 48, "hello\nwor…");
 }
 
 test "wrapped text prefers word boundaries and emergency breaks long words" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    try wrapText(allocator, &output, "hello world", null, .ellipsis, .greedy, 48, style, .fixed);
-    try std.testing.expectEqualStrings("hello\nworld", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, .greedy, 24, style, .fixed);
-    try std.testing.expectEqualStrings("abc\ndef\ng", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "hello   ", null, .ellipsis, .greedy, 48, style, .fixed);
-    try std.testing.expectEqualStrings("hello", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "   abc", null, .ellipsis, .greedy, 16, style, .fixed);
-    try std.testing.expectEqualStrings("ab\nc", output.items);
+    try expectWrapped("hello world", null, .greedy, 48, "hello\nworld");
+    try expectWrapped("abcdefg", null, .greedy, 24, "abc\ndef\ng");
+    try expectWrapped("hello   ", null, .greedy, 48, "hello");
+    try expectWrapped("   abc", null, .greedy, 16, "ab\nc");
 }
 
 test "wrapped text normalizes hard breaks and preserves graphemes" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, .greedy, 100, style, .fixed);
-    try std.testing.expectEqualStrings("one\ntwo", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, .greedy, 8, style, .fixed);
-    try std.testing.expectEqualStrings("e\u{301}\nx", output.items);
+    try expectWrapped("one\r\ntwo", null, .greedy, 100, "one\ntwo");
+    try expectWrapped("e\u{301}x", null, .greedy, 8, "e\u{301}\nx");
 }
 
 test "Knuth-Plass chooses lower paragraph demerits than greedy wrapping" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
     const value = "aaaaaa bbb ccccc ddddd";
-    try wrapText(allocator, &output, value, null, .ellipsis, .greedy, 80, style, .fixed);
-    try std.testing.expectEqualStrings("aaaaaa bbb\nccccc\nddddd", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, value, null, .ellipsis, .knuth_plass, 80, style, .fixed);
-    try std.testing.expectEqualStrings("aaaaaa\nbbb ccccc\nddddd", output.items);
+    try expectWrapped(value, null, .greedy, 80, "aaaaaa bbb\nccccc\nddddd");
+    try expectWrapped(value, null, .knuth_plass, 80, "aaaaaa\nbbb ccccc\nddddd");
 }
 
 test "Knuth-Plass preserves hard breaks and emergency grapheme wrapping" {
-    const allocator = std.testing.allocator;
-    const style: ResolvedTextStyle = .{ .color = colors.ink, .font_size = 16 };
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    try wrapText(allocator, &output, "abcdefg", null, .ellipsis, .knuth_plass, 24, style, .fixed);
-    try std.testing.expectEqualStrings("abc\ndef\ng", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "one\r\ntwo", null, .ellipsis, .knuth_plass, 100, style, .fixed);
-    try std.testing.expectEqualStrings("one\ntwo", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "   abc", null, .ellipsis, .knuth_plass, 16, style, .fixed);
-    try std.testing.expectEqualStrings("ab\nc", output.items);
-
-    output.clearRetainingCapacity();
-    try wrapText(allocator, &output, "e\u{301}x", null, .ellipsis, .knuth_plass, 8, style, .fixed);
-    try std.testing.expectEqualStrings("e\u{301}\nx", output.items);
+    try expectWrapped("abcdefg", null, .knuth_plass, 24, "abc\ndef\ng");
+    try expectWrapped("one\r\ntwo", null, .knuth_plass, 100, "one\ntwo");
+    try expectWrapped("   abc", null, .knuth_plass, 16, "ab\nc");
+    try expectWrapped("e\u{301}x", null, .knuth_plass, 8, "e\u{301}\nx");
 }
