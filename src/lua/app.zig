@@ -1578,6 +1578,19 @@ fn runUntilLuaBoolean(loop: *event_loop.EventLoop, app: *App, global: [:0]const 
     try loop.run();
 }
 
+fn expectLuaBoolean(app: *App, global: [:0]const u8, expected: bool) !void {
+    c.lua_getglobal(app.state, global.ptr);
+    defer pop(app.state, 1);
+    std.testing.expectEqual(expected, c.lua_toboolean(app.state, -1) != 0) catch |err| {
+        std.debug.print("unexpected Lua boolean global '{s}'\n", .{global});
+        return err;
+    };
+}
+
+fn expectLuaBooleans(app: *App, globals: []const [:0]const u8) !void {
+    for (globals) |global| try expectLuaBoolean(app, global, true);
+}
+
 test "script must return a valid keywork.app root" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1818,19 +1831,13 @@ test "stale handles from a previous script load are inert" {
     defer app.deinit();
     try app.ensureLoaded();
 
-    c.lua_getglobal(app.state, "fresh_canceled");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) == 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "fresh_canceled", false);
 
     app.script_dirty = true;
     try app.ensureLoaded();
 
-    c.lua_getglobal(app.state, "stale_canceled");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
-    c.lua_getglobal(app.state, "stale_still_canceled");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "stale_canceled", true);
+    try expectLuaBoolean(&app, "stale_still_canceled", true);
     // The stale cancel calls must not have created new resources.
     try std.testing.expectEqual(@as(usize, 1), app.timers.items.len);
     try std.testing.expect(app.timers.items[0].canceled);
@@ -1908,9 +1915,7 @@ test "lua timer streams ticks to a coroutine reader" {
     try loop.addRepeatingTimer(1, &context, TickTest.callback);
     try loop.run();
 
-    c.lua_getglobal(app.state, "done");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "done", true);
     c.lua_getglobal(app.state, "ticks");
     defer pop(app.state, 1);
     try std.testing.expect(c.lua_tointeger(app.state, -1) >= 3);
@@ -1963,9 +1968,7 @@ test "lua one-shot timer ends iteration after its tick" {
     try loop.addRepeatingTimer(1, &context, TickTest.callback);
     try loop.run();
 
-    c.lua_getglobal(app.state, "done");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "done", true);
     c.lua_getglobal(app.state, "ticks");
     defer pop(app.state, 1);
     try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
@@ -2000,9 +2003,7 @@ test "lua timer cancel resumes a parked reader and ends iteration" {
     defer app.deinit();
     try app.ensureLoaded();
 
-    c.lua_getglobal(app.state, "ended");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "ended", true);
     try std.testing.expect(app.timers.items[0].canceled);
 }
 
@@ -2271,9 +2272,7 @@ test "reload cancels tasks and scopes from the previous load" {
     c.lua_getglobal(app.state, "stale_task_status");
     try std.testing.expectEqualStrings("canceled", try stringFromStack(app.state, -1));
     pop(app.state, 1);
-    c.lua_getglobal(app.state, "stale_scope_canceled");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "stale_scope_canceled", true);
 }
 
 test "shared service starts once, fans out, and stops with its last subscriber" {
@@ -2458,12 +2457,8 @@ test "lua bus:call awaits replies and reports peer errors as nil, err" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 3000);
 
-    c.lua_getglobal(app.state, "got_id");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
-    c.lua_getglobal(app.state, "got_error");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "got_id", true);
+    try expectLuaBoolean(&app, "got_error", true);
 }
 
 test "lua bus:subscribe streams signals to a coroutine reader" {
@@ -2512,12 +2507,8 @@ test "lua bus:subscribe streams signals to a coroutine reader" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 3000);
 
-    c.lua_getglobal(app.state, "got_signal");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
-    c.lua_getglobal(app.state, "sub_ended");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "got_signal", true);
+    try expectLuaBoolean(&app, "sub_ended", true);
 }
 
 test "lua loop.channel delivers pushed values to a coroutine reader" {
@@ -2665,15 +2656,7 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
-    const expected_true = [_][:0]const u8{ "initial_ok", "refresh_ok", "resync_ok", "vanish_ok", "recover_ok", "done" };
-    for (expected_true) |global| {
-        c.lua_getglobal(app.state, global.ptr);
-        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
-            std.debug.print("expected global '{s}' to be true\n", .{global});
-            return err;
-        };
-        pop(app.state, 1);
-    }
+    try expectLuaBooleans(&app, &.{ "initial_ok", "refresh_ok", "resync_ok", "vanish_ok", "recover_ok", "done" });
 }
 
 test "lua exported methods can yield before replying" {
@@ -2758,15 +2741,7 @@ test "lua exported methods can yield before replying" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
-    const expected_true = [_][:0]const u8{ "slow_ok", "boom_ok", "done" };
-    for (expected_true) |global| {
-        c.lua_getglobal(app.state, global.ptr);
-        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
-            std.debug.print("expected global '{s}' to be true\n", .{global});
-            return err;
-        };
-        pop(app.state, 1);
-    }
+    try expectLuaBooleans(&app, &.{ "slow_ok", "boom_ok", "done" });
 }
 
 test "lua dbus session buses are pooled and refcounted" {
@@ -2827,15 +2802,7 @@ test "lua dbus session buses are pooled and refcounted" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
-    const expected_true = [_][:0]const u8{ "closed_ok", "shared_ok", "fully_closed_ok", "reacquire_ok", "done" };
-    for (expected_true) |global| {
-        c.lua_getglobal(app.state, global.ptr);
-        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
-            std.debug.print("expected global '{s}' to be true\n", .{global});
-            return err;
-        };
-        pop(app.state, 1);
-    }
+    try expectLuaBooleans(&app, &.{ "closed_ok", "shared_ok", "fully_closed_ok", "reacquire_ok", "done" });
 }
 
 test "lua dbus property sugar and proxies drive exported objects" {
@@ -2937,18 +2904,10 @@ test "lua dbus property sugar and proxies drive exported objects" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
-    const expected_true = [_][:0]const u8{
+    try expectLuaBooleans(&app, &.{
         "got_initial", "set_ok",    "got_updated", "typed_set",
         "typed_get",   "read_only", "proxy_echo",  "proxy_error",
-    };
-    for (expected_true) |global| {
-        c.lua_getglobal(app.state, global.ptr);
-        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
-            std.debug.print("expected global '{s}' to be true\n", .{global});
-            return err;
-        };
-        pop(app.state, 1);
-    }
+    });
 }
 
 test "lua stateful widget set_state rebuilds retained subtree" {
@@ -3127,9 +3086,7 @@ test "lua stateful widget dispose runs when removed" {
     try runtime.click(.{ .x = 2, .y = 2 });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"gone\"") != null);
 
-    c.lua_getglobal(app.state, "disposed");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "disposed", true);
 }
 
 test "lua stateful set_state is inert after dispose" {
@@ -3193,9 +3150,7 @@ test "lua stateful set_state is inert after dispose" {
     try runtime.repaint();
     try runtime.click(.{ .x = 2, .y = 2 });
 
-    c.lua_getglobal(app.state, "disposed");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "disposed", true);
 
     c.lua_getglobal(app.state, "stale_set_state");
     try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
@@ -3294,9 +3249,7 @@ test "widget scope is canceled on the loop turn after dispose" {
 
     try std.testing.expect(app.scopes.items[0].canceled);
     try std.testing.expectEqual(@as(usize, 0), app.pending_scope_cancels.items.len);
-    c.lua_getglobal(app.state, "scope_task_woke");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "scope_task_woke", true);
     try std.testing.expectEqual(lua_task.Status.canceled, app.tasks.items[0].status);
 }
 
@@ -3391,9 +3344,7 @@ test "widget dispose releases its service subscription" {
     try loop.addRepeatingTimer(1, &context, ServiceTest.callback);
     try loop.run();
 
-    c.lua_getglobal(app.state, "service_unwound");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "service_unwound", true);
     // Both the widget scope and the service scope are canceled, and the
     // service task settled as canceled.
     for (app.scopes.items) |scope| try std.testing.expect(scope.canceled);
@@ -3536,9 +3487,7 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     c.lua_getglobal(app.state, "start_reader");
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
 
-    c.lua_getglobal(app.state, "got_read");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "got_read", true);
     try std.testing.expect(app.fd_watches.items[0].canceled);
 }
 
@@ -3839,9 +3788,7 @@ test "lua loop fs_event observes file changes" {
 
     try runUntilLuaBoolean(&loop, &app, "fs_event_seen", 1000);
 
-    c.lua_getglobal(app.state, "fs_event_seen");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "fs_event_seen", true);
     c.lua_getglobal(app.state, "fs_event_path");
     defer pop(app.state, 1);
     const path = try stringFromStack(app.state, -1);
@@ -3916,9 +3863,7 @@ test "lua process spawn captures stdout and exit" {
     defer app.unbindEventLoop();
     try runUntilLuaBoolean(&loop, &app, "spawn_done", 1000);
 
-    c.lua_getglobal(app.state, "spawn_done");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "spawn_done", true);
     c.lua_getglobal(app.state, "spawn_output");
     defer pop(app.state, 1);
     const value = try stringFromStack(app.state, -1);
@@ -4155,12 +4100,8 @@ test "lua process.capture collects output and exit status" {
     defer app.unbindEventLoop();
     try runUntilLuaBoolean(&loop, &app, "capture_done", 1000);
 
-    c.lua_getglobal(app.state, "capture_done");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    c.lua_getglobal(app.state, "capture_ok");
-    defer pop(app.state, 1);
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
+    try expectLuaBoolean(&app, "capture_done", true);
+    try expectLuaBoolean(&app, "capture_ok", true);
 }
 
 test "lua process spawn reports a missing executable as nil, err" {
@@ -4282,9 +4223,7 @@ test "lua process output produced before bind is queued for readers" {
 
     try runUntilLuaBoolean(&loop, &app, "spawn_done", 1000);
 
-    c.lua_getglobal(app.state, "spawn_done");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "spawn_done", true);
     c.lua_getglobal(app.state, "spawn_output");
     defer pop(app.state, 1);
     const value = try stringFromStack(app.state, -1);
@@ -4388,15 +4327,11 @@ test "lua socket streams chunks and finishes on peer EOF" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 1000);
 
-    c.lua_getglobal(app.state, "done");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "done", true);
     c.lua_getglobal(app.state, "received");
     try std.testing.expectEqualStrings("pong", try stringFromStack(app.state, -1));
     pop(app.state, 1);
-    c.lua_getglobal(app.state, "closed_after");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "closed_after", true);
     // EOF closed the socket without canceling it; it no longer counts as
     // live async work.
     try std.testing.expect(!app.sockets.items[0].canceled);
@@ -4487,12 +4422,8 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     try app.ensureLoaded();
 
     // The writer parked with unflushed bytes buffered.
-    c.lua_getglobal(app.state, "wrote");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) == 0);
-    pop(app.state, 1);
-    c.lua_getglobal(app.state, "main_write_raised");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "wrote", false);
+    try expectLuaBoolean(&app, "main_write_raised", true);
     try std.testing.expectEqual(@as(usize, 2), app.sockets.items.len);
     try std.testing.expect(app.sockets.items[0].sink.buffer.items.len > 0);
 
@@ -4531,9 +4462,7 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     try loop.addRepeatingTimer(1, &context, WriteTest.callback);
     try loop.run();
 
-    c.lua_getglobal(app.state, "write_ok");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "write_ok", true);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), context.drained);
     try std.testing.expectEqual(@as(usize, 0), app.sockets.items[0].sink.buffer.items.len);
 }
@@ -4586,12 +4515,8 @@ test "lua process stdin roundtrips through cat under backpressure" {
 
     try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
-    c.lua_getglobal(app.state, "done");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
-    c.lua_getglobal(app.state, "write_ok");
-    try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
-    pop(app.state, 1);
+    try expectLuaBoolean(&app, "done", true);
+    try expectLuaBoolean(&app, "write_ok", true);
     try std.testing.expectEqual(invalid_fd, app.processes.items[0].stdin_fd);
     try std.testing.expectEqual(@as(usize, 0), app.processes.items[0].stdin_sink.buffer.items.len);
 }
@@ -4636,12 +4561,5 @@ test "lua process stdin write semantics without an event loop" {
     defer app.deinit();
     try app.ensureLoaded();
 
-    for ([_][:0]const u8{ "main_write_raised", "closed_write", "nopipe_raised", "dead_write" }) |global| {
-        c.lua_getglobal(app.state, global.ptr);
-        std.testing.expect(c.lua_toboolean(app.state, -1) != 0) catch |err| {
-            std.debug.print("failed global: {s}\n", .{global});
-            return err;
-        };
-        pop(app.state, 1);
-    }
+    try expectLuaBooleans(&app, &.{ "main_write_raised", "closed_write", "nopipe_raised", "dead_write" });
 }
