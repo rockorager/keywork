@@ -78,39 +78,20 @@ fn unionPaintBounds(damage: ?Rect, paint_bounds: ?Rect) ?Rect {
 
 const ellipsis = "…";
 
-/// Returns the last cluster boundary whose cumulative shaped width fits.
-/// Keeping this independent of shaping makes the truncation decision easy to
-/// test; callers obtain widths by measuring whole prefixes so kerning and
-/// shaping clusters are respected.
-fn fittingBoundary(boundaries: []const usize, widths: []const f32, available_width: f32) usize {
-    std.debug.assert(boundaries.len == widths.len);
-    var result: usize = 0;
-    for (boundaries, widths) |boundary, width| {
-        if (width > available_width) break;
-        result = boundary;
-    }
-    return result;
-}
-
 fn measuredFittingEnd(
-    allocator: std.mem.Allocator,
     value: []const u8,
     available_width: f32,
     style: ResolvedTextStyle,
     measurer: TextMeasurer,
 ) LayoutError!usize {
-    var boundaries: std.ArrayList(usize) = .empty;
-    defer boundaries.deinit(allocator);
-    var widths: std.ArrayList(f32) = .empty;
-    defer widths.deinit(allocator);
-
+    var result: usize = 0;
     var it = uucode.grapheme.utf8Iterator(value);
     while (it.nextGrapheme()) |cluster| {
-        try boundaries.append(allocator, cluster.end);
         const measured = try measurer.measureText(value[0..cluster.end], style);
-        try widths.append(allocator, measured.width);
+        if (measured.width > available_width) break;
+        result = cluster.end;
     }
-    return fittingBoundary(boundaries.items, widths.items, available_width);
+    return result;
 }
 
 const FittedTextLine = struct {
@@ -170,7 +151,6 @@ fn breakContentEnd(value: []const u8, start: usize, end: usize, hard_break: bool
 }
 
 fn fitTextLine(
-    allocator: std.mem.Allocator,
     value: []const u8,
     source_start: usize,
     available_width: f32,
@@ -207,7 +187,7 @@ fn fitTextLine(
         if (content_end == source_start) return candidate;
 
         const source_line = value[source_start..content_end];
-        const fitting_end = try measuredFittingEnd(allocator, source_line, available_width, style, measurer);
+        const fitting_end = try measuredFittingEnd(source_line, available_width, style, measurer);
         if (fitting_end > 0) {
             return .{
                 .content_end = source_start + fitting_end,
@@ -454,7 +434,7 @@ fn appendEllipsizedLine(
 ) LayoutError!void {
     const ellipsis_width = (try measurer.measureText(ellipsis, style)).width;
     if (ellipsis_width > available_width) return;
-    const fitting_end = try measuredFittingEnd(allocator, value[source_start..content_end], available_width - ellipsis_width, style, measurer);
+    const fitting_end = try measuredFittingEnd(value[source_start..content_end], available_width - ellipsis_width, style, measurer);
     const visible_end = trimTrailingSpaces(value, source_start, source_start + fitting_end);
     try output.appendSlice(allocator, value[source_start..visible_end]);
     try output.appendSlice(allocator, ellipsis);
@@ -477,7 +457,7 @@ fn wrapTextGreedy(
     var line_count: usize = 0;
 
     while (source_start < value.len) {
-        const line = try fitTextLine(allocator, value, source_start, available_width, style, measurer);
+        const line = try fitTextLine(value, source_start, available_width, style, measurer);
         // A leading SP run is a legal opportunity whose visible content is
         // empty. Consume it without manufacturing a blank visual line.
         if (!line.hard_break and line.content_end == source_start and line.next_start > source_start) {
@@ -1421,13 +1401,6 @@ test "removing an overflowing child damages its retained paint bounds" {
 
     try std.testing.expectEqual(child.rect, parent.damage.?);
     try std.testing.expectEqual(@as(?Rect, null), parent.paint_bounds);
-}
-
-test "fitting boundary chooses the last measured cluster that fits" {
-    const boundaries = [_]usize{ 1, 3, 4 };
-    const widths = [_]f32{ 5, 12, 20 };
-    try std.testing.expectEqual(@as(usize, 3), fittingBoundary(&boundaries, &widths, 12));
-    try std.testing.expectEqual(@as(usize, 0), fittingBoundary(&boundaries, &widths, 2));
 }
 
 test "wrapped text preserves fitting text and ellipsizes one line" {
