@@ -339,22 +339,11 @@ pub const App = struct {
             return self.buildSelectedStory(allocator, runtime_state, render_scale, state_invalidator);
         }
 
-        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
-
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         c.lua_getfield(self.state, -1, "child");
-        const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
-            .icon_cache = &self.icon_cache,
-            .icon_scale = icon_scale,
-            .png_dims = &self.png_dims,
-        }, -1);
+        const widget = try self.parseWidgetAtTop(allocator, runtime_state, render_scale, state_invalidator);
         c.lua_settop(self.state, 0);
-        // A bounded incremental step keeps garbage from widget-table churn
-        // paced across builds; a full collection here would stall every
-        // rebuild for time proportional to the entire Lua heap. Full
-        // collections still happen on script reload.
-        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;
     }
 
@@ -366,18 +355,11 @@ pub const App = struct {
         state_invalidator: ?keywork.Widget.Callback,
     ) !keywork.Widget {
         if (self.browser_ref < 0) return error.StorybookBrowserMissing;
-        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
 
         c.lua_settop(self.state, 0);
         defer c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
-        const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
-            .icon_cache = &self.icon_cache,
-            .icon_scale = icon_scale,
-            .png_dims = &self.png_dims,
-        }, -1);
-        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
-        return widget;
+        return self.parseWidgetAtTop(allocator, runtime_state, render_scale, state_invalidator);
     }
 
     fn buildSelectedStory(
@@ -390,7 +372,6 @@ pub const App = struct {
         const selected_id = self.selected_story_id orelse return error.StoryNotSelected;
         const catalog = if (self.storybook_catalog) |*value| value else return error.NotStorybook;
         const story = catalog.find(selected_id) orelse return error.UnknownStory;
-        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
 
         c.lua_settop(self.state, 0);
         defer c.lua_settop(self.state, 0);
@@ -401,11 +382,18 @@ pub const App = struct {
         if (c.lua_type(self.state, -1) != c.LUA_TFUNCTION) return error.StoryRenderMissing;
         lua_widget.pushRuntimeState(self.state, runtime_state);
         if (c.lua_pcall(self.state, 1, 1, 0) != 0) return self.failWithLuaError(error.StoryRenderFailed);
+        return self.parseWidgetAtTop(allocator, runtime_state, render_scale, state_invalidator);
+    }
+
+    fn parseWidgetAtTop(self: *App, allocator: std.mem.Allocator, runtime_state: State, render_scale: f32, state_invalidator: ?keywork.Widget.Callback) !keywork.Widget {
+        const icon_scale: f32 = if (std.math.isFinite(render_scale) and render_scale > 0) render_scale else 1;
         const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
             .png_dims = &self.png_dims,
         }, -1);
+        // Keep garbage from widget-table churn paced across builds; full
+        // collections here would stall in proportion to the whole Lua heap.
         _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
         return widget;
     }
@@ -585,18 +573,11 @@ pub const App = struct {
 
     pub fn buildWindowWidget(self: *App, id: []const u8, scope: *BuildScope, context: keywork.AppContext) !keywork.Widget {
         const ref = self.window_children.get(id) orelse return error.UnknownWindow;
-        const icon_scale: f32 = if (std.math.isFinite(scope.render_scale) and scope.render_scale > 0) scope.render_scale else 1;
 
         c.lua_settop(self.state, 0);
         defer c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, ref);
-        const widget = try lua_widget.parse(self.widgetHost(scope.state_invalidator), self.state, scope.allocator, scope.allocator, context, .{
-            .icon_cache = &self.icon_cache,
-            .icon_scale = icon_scale,
-            .png_dims = &self.png_dims,
-        }, -1);
-        _ = c.lua_gc(self.state, c.LUA_GCSTEP, 200);
-        return widget;
+        return self.parseWidgetAtTop(scope.allocator, context, scope.render_scale, scope.state_invalidator);
     }
 
     fn reloadScript(self: *App) !void {
