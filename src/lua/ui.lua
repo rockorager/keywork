@@ -916,6 +916,7 @@ function ui.image(options)
     pixels = options.pixels,
     fit = options.fit,
     align = options.align,
+    cache = options.cache,
     revision = options.revision,
   }
 end

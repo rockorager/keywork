@@ -26,6 +26,11 @@ const Fit = enum {
     none,
 };
 
+const Cache = enum {
+    auto,
+    frame,
+};
+
 const Alignment = enum {
     top_left,
     top_center,
@@ -62,6 +67,7 @@ const Options = struct {
     format: []const u8 = "argb32",
     fit: Fit = .fill,
     @"align": Alignment = .center,
+    cache: Cache = .auto,
     revision: f64 = 0,
 };
 
@@ -73,6 +79,7 @@ const Image = struct {
     pixels: []keywork.Color,
     fit: Fit,
     alignment: Alignment,
+    cache: Cache,
     cache_key: u64,
 
     const vtable: keywork.Widget.RenderObject.VTable = .{
@@ -123,26 +130,29 @@ const Image = struct {
         hasher.update(std.mem.asBytes(&geometry.source.height));
         const cache_key = hasher.final();
 
-        if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
-            try context.display_list.colorImage(
-                context.allocator,
-                geometry.rect,
-                target_width,
-                target_height,
-                cached,
-                cache_key,
-            );
-            return;
+        if (self.cache == .auto) {
+            if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+                try context.display_list.colorImage(
+                    context.allocator,
+                    geometry.rect,
+                    target_width,
+                    target_height,
+                    cached,
+                    cache_key,
+                );
+                return;
+            }
         }
 
-        const pixels = try resampledPixels(context.allocator, self.pixels, self.width, self.height, target_width, target_height, geometry.source);
-        const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
+        const pixel_allocator = imagePixelAllocator(self.cache, context.allocator);
+        const pixels = try resampledPixels(pixel_allocator, self.pixels, self.width, self.height, target_width, target_height, geometry.source);
+        const rendered = try retainPixels(context, self.cache, pixel_allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
             geometry.rect,
             target_width,
             target_height,
-            cached,
+            rendered,
             cache_key,
         );
     }
@@ -159,6 +169,7 @@ const Image = struct {
             .pixels = try allocator.dupe(keywork.Color, self.pixels),
             .fit = self.fit,
             .alignment = self.alignment,
+            .cache = self.cache,
             .cache_key = self.cache_key,
         };
         return result;
@@ -207,6 +218,7 @@ pub fn parse(
         .pixels = pixels,
         .fit = options.fit,
         .alignment = options.@"align",
+        .cache = options.cache,
         .cache_key = hasher.final(),
     };
     return image.widget();
@@ -223,6 +235,7 @@ const FileImage = struct {
     source_height: u32,
     fit: Fit,
     alignment: Alignment,
+    cache: Cache,
     source_key: u64,
 
     const vtable: keywork.Widget.RenderObject.VTable = .{
@@ -273,16 +286,18 @@ const FileImage = struct {
         hasher.update(std.mem.asBytes(&geometry.source.height));
         const cache_key = hasher.final();
 
-        if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
-            try context.display_list.colorImage(
-                context.allocator,
-                geometry.rect,
-                target_width,
-                target_height,
-                cached,
-                cache_key,
-            );
-            return;
+        if (self.cache == .auto) {
+            if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
+                try context.display_list.colorImage(
+                    context.allocator,
+                    geometry.rect,
+                    target_width,
+                    target_height,
+                    cached,
+                    cache_key,
+                );
+                return;
+            }
         }
 
         const path_z = try context.allocator.dupeZ(u8, self.path);
@@ -296,35 +311,34 @@ const FileImage = struct {
         // reopen it or warn again.
         const source_bytes = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse {
             log.warn("image decode failed: {s}", .{self.path});
+            if (self.cache == .frame) return;
             return paintTombstone(context, geometry.rect, target_width, target_height, cache_key);
         };
         defer image_c.stbi_image_free(source_bytes);
         const dims = checkedDims(source_width, source_height) catch {
             log.warn("image rejected ({d}x{d}): {s}", .{ source_width, source_height, self.path });
+            if (self.cache == .frame) return;
             return paintTombstone(context, geometry.rect, target_width, target_height, cache_key);
         };
 
         const pixel_count = @as(usize, dims.width) * dims.height;
-        const source_pixels = try context.allocator.alloc(keywork.Color, pixel_count);
-        defer context.allocator.free(source_pixels);
-        fillRgbaPixels(source_pixels, source_bytes[0 .. pixel_count * 4]);
-
-        const pixels = try resampledPixels(
-            context.allocator,
-            source_pixels,
+        const pixel_allocator = imagePixelAllocator(self.cache, context.allocator);
+        const pixels = try resampledRgbaPixels(
+            pixel_allocator,
+            source_bytes[0 .. pixel_count * 4],
             dims.width,
             dims.height,
             target_width,
             target_height,
             geometry.source,
         );
-        const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
+        const rendered = try retainPixels(context, self.cache, pixel_allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
             geometry.rect,
             target_width,
             target_height,
-            cached,
+            rendered,
             cache_key,
         );
     }
@@ -341,6 +355,7 @@ const FileImage = struct {
             .source_height = self.source_height,
             .fit = self.fit,
             .alignment = self.alignment,
+            .cache = self.cache,
             .source_key = self.source_key,
         };
         return result;
@@ -364,6 +379,30 @@ const FittedGeometry = struct {
     rect: keywork.Rect,
     source: SourceRect = .{},
 };
+
+fn imagePixelAllocator(cache: Cache, retained_allocator: std.mem.Allocator) std.mem.Allocator {
+    return switch (cache) {
+        .auto => retained_allocator,
+        // Large one-frame rasters should return their pages after present
+        // instead of permanently raising the app-session allocator's RSS.
+        .frame => std.heap.page_allocator,
+    };
+}
+
+fn retainPixels(
+    context: keywork.Widget.RenderObject.PaintContext,
+    cache: Cache,
+    pixel_allocator: std.mem.Allocator,
+    cache_key: u64,
+    width: u32,
+    height: u32,
+    pixels: []keywork.Color,
+) ![]const keywork.Color {
+    return switch (cache) {
+        .auto => try context.raster_cache.insertColor(context.allocator, cache_key, width, height, pixels),
+        .frame => try context.raster_cache.insertFrameColor(context.allocator, pixel_allocator, pixels),
+    };
+}
 
 fn fittedGeometry(rect: keywork.Rect, source_width: u32, source_height: u32, fit: Fit, alignment: Alignment) FittedGeometry {
     const width: f32 = @floatFromInt(source_width);
@@ -525,6 +564,7 @@ fn fileImage(allocator: std.mem.Allocator, dims_cache: ?*DimsCache, path: []cons
         preferred,
         options.fit,
         options.@"align",
+        options.cache,
         fingerprint,
         revision,
     );
@@ -544,7 +584,7 @@ pub fn pngIcon(allocator: std.mem.Allocator, dims_cache: ?*DimsCache, path: []co
         .width = logical_size * @as(f32, @floatFromInt(dims.width)) / longest,
         .height = logical_size * @as(f32, @floatFromInt(dims.height)) / longest,
     };
-    return createFileImage(allocator, path, dims, preferred, .contain, .center, 0, 0);
+    return createFileImage(allocator, path, dims, preferred, .contain, .center, .auto, 0, 0);
 }
 
 fn createFileImage(
@@ -554,6 +594,7 @@ fn createFileImage(
     preferred: keywork.Size,
     fit: Fit,
     alignment: Alignment,
+    cache: Cache,
     fingerprint: u64,
     revision: u64,
 ) !keywork.Widget {
@@ -578,6 +619,7 @@ fn createFileImage(
         .source_height = dims.height,
         .fit = fit,
         .alignment = alignment,
+        .cache = cache,
         .source_key = hasher.final(),
     };
     return image.widget();
@@ -696,18 +738,67 @@ fn resampledPixels(
     const full_source = source_rect.x == 0 and source_rect.y == 0 and source_rect.width == 1 and source_rect.height == 1;
     if (full_source and source_width == target_width and source_height == target_height) return allocator.dupe(keywork.Color, source);
 
-    const source_bytes = try allocator.alloc(u8, source.len * 4);
-    defer allocator.free(source_bytes);
-    for (source, 0..) |pixel, index| {
-        const base = index * 4;
-        source_bytes[base] = pixel.r;
-        source_bytes[base + 1] = pixel.g;
-        source_bytes[base + 2] = pixel.b;
-        source_bytes[base + 3] = pixel.a;
+    const pixels = try allocator.alloc(keywork.Color, @as(usize, target_width) * target_height);
+    errdefer allocator.free(pixels);
+    const source_bytes = std.mem.sliceAsBytes(source);
+    const target_bytes = std.mem.sliceAsBytes(pixels);
+    if (full_source) {
+        if (image_c.stbir_resize_uint8_linear(
+            source_bytes.ptr,
+            @intCast(source_width),
+            @intCast(source_height),
+            0,
+            target_bytes.ptr,
+            @intCast(target_width),
+            @intCast(target_height),
+            0,
+            image_c.STBIR_BGRA_NO_AW,
+        ) == null) return error.ImageResizeFailed;
+    } else {
+        var resize: image_c.STBIR_RESIZE = undefined;
+        image_c.stbir_resize_init(
+            &resize,
+            source_bytes.ptr,
+            @intCast(source_width),
+            @intCast(source_height),
+            0,
+            target_bytes.ptr,
+            @intCast(target_width),
+            @intCast(target_height),
+            0,
+            image_c.STBIR_BGRA_NO_AW,
+            image_c.STBIR_TYPE_UINT8,
+        );
+        if (image_c.stbir_set_input_subrect(
+            &resize,
+            source_rect.x,
+            source_rect.y,
+            source_rect.x + source_rect.width,
+            source_rect.y + source_rect.height,
+        ) == 0) return error.ImageResizeFailed;
+        if (image_c.stbir_resize_extended(&resize) == 0) return error.ImageResizeFailed;
+    }
+    return pixels;
+}
+
+fn resampledRgbaPixels(
+    allocator: std.mem.Allocator,
+    source_bytes: []const u8,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    source_rect: SourceRect,
+) ![]keywork.Color {
+    const pixels = try allocator.alloc(keywork.Color, @as(usize, target_width) * target_height);
+    errdefer allocator.free(pixels);
+    const full_source = source_rect.x == 0 and source_rect.y == 0 and source_rect.width == 1 and source_rect.height == 1;
+    if (full_source and source_width == target_width and source_height == target_height) {
+        fillRgbaPixels(pixels, source_bytes);
+        return pixels;
     }
 
-    const target_bytes = try allocator.alloc(u8, @as(usize, target_width) * target_height * 4);
-    defer allocator.free(target_bytes);
+    const target_bytes = std.mem.sliceAsBytes(pixels);
     if (full_source) {
         if (image_c.stbir_resize_uint8_linear(
             source_bytes.ptr,
@@ -745,8 +836,13 @@ fn resampledPixels(
         if (image_c.stbir_resize_extended(&resize) == 0) return error.ImageResizeFailed;
     }
 
-    const pixels = try allocator.alloc(keywork.Color, @as(usize, target_width) * target_height);
-    fillRgbaPixels(pixels, target_bytes);
+    // stb wrote RGBA bytes into the framework's little-endian BGRA Color
+    // storage. Swap red and blue in place instead of allocating another
+    // full-size conversion buffer.
+    for (0..pixels.len) |index| {
+        const base = index * 4;
+        std.mem.swap(u8, &target_bytes[base], &target_bytes[base + 2]);
+    }
     return pixels;
 }
 
@@ -816,7 +912,7 @@ test "cropped image resampling selects the fitted source region" {
     for (pixels) |pixel| try std.testing.expectEqual(blue, pixel);
 }
 
-test "image options decode fit alignment and revision" {
+test "image options decode fit alignment cache and revision" {
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);
 
@@ -828,12 +924,15 @@ test "image options decode fit alignment and revision" {
     c.lua_setfield(lua_state, table, "fit");
     c.lua_pushstring(lua_state, "bottom_right");
     c.lua_setfield(lua_state, table, "align");
+    c.lua_pushstring(lua_state, "frame");
+    c.lua_setfield(lua_state, table, "cache");
     c.lua_pushinteger(lua_state, 7);
     c.lua_setfield(lua_state, table, "revision");
 
     const options = try lua_codec.decode(Options, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(Fit.cover, options.fit);
     try std.testing.expectEqual(Alignment.bottom_right, options.@"align");
+    try std.testing.expectEqual(Cache.frame, options.cache);
     try std.testing.expectEqual(@as(u64, 7), try imageRevision(options.revision));
     try std.testing.expectError(error.InvalidImageRevision, imageRevision(-1));
     try std.testing.expectError(error.InvalidImageRevision, imageRevision(1.5));

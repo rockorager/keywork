@@ -59,6 +59,7 @@ pub const RasterCache = struct {
 
     alpha: std.AutoHashMapUnmanaged(u64, AlphaEntry) = .empty,
     color: std.AutoHashMapUnmanaged(u64, ColorEntry) = .empty,
+    frame_color: std.ArrayList(FrameColorEntry) = .empty,
     byte_limit: usize = default_byte_limit,
     byte_usage: usize = 0,
     clock: u64 = 0,
@@ -78,6 +79,11 @@ pub const RasterCache = struct {
         used: u64,
     };
 
+    const FrameColorEntry = struct {
+        allocator: std.mem.Allocator,
+        pixels: []Color,
+    };
+
     pub fn init(byte_limit: usize) RasterCache {
         return .{ .byte_limit = byte_limit };
     }
@@ -90,16 +96,21 @@ pub const RasterCache = struct {
         var values = self.color.valueIterator();
         while (values.next()) |entry| allocator.free(entry.pixels);
         self.color.deinit(allocator);
+        std.debug.assert(self.frame_color.items.len == 0);
+        self.frame_color.deinit(allocator);
         self.* = undefined;
     }
 
     pub fn beginFrame(self: *RasterCache) void {
         std.debug.assert(!self.in_frame);
+        std.debug.assert(self.frame_color.items.len == 0);
         self.in_frame = true;
     }
 
     pub fn endFrame(self: *RasterCache, allocator: std.mem.Allocator) void {
         std.debug.assert(self.in_frame);
+        for (self.frame_color.items) |entry| entry.allocator.free(entry.pixels);
+        self.frame_color.clearRetainingCapacity();
         self.trim(allocator);
         self.in_frame = false;
     }
@@ -143,6 +154,25 @@ pub const RasterCache = struct {
         };
         if (retained_new) self.byte_usage += pixels.len * @sizeOf(Color);
         return cached_pixels;
+    }
+
+    /// Keeps pixels alive only until the current synchronous present
+    /// completes. The pixel allocator is retained with the allocation so
+    /// large frame-scoped images can use an allocator that returns their
+    /// pages immediately instead of inflating the app-session heap.
+    pub fn insertFrameColor(
+        self: *RasterCache,
+        metadata_allocator: std.mem.Allocator,
+        pixel_allocator: std.mem.Allocator,
+        pixels: []Color,
+    ) ![]const Color {
+        std.debug.assert(self.in_frame);
+        errdefer pixel_allocator.free(pixels);
+        try self.frame_color.append(metadata_allocator, .{
+            .allocator = pixel_allocator,
+            .pixels = pixels,
+        });
+        return pixels;
     }
 
     pub fn cachedAlphaImage(self: *RasterCache, cache_key: u64, width: u32, height: u32) ?[]const u8 {
@@ -314,6 +344,26 @@ test "raster cache retains current frame working set until end frame" {
     defer cache.endFrame(allocator);
     try std.testing.expect(cache.cachedAlphaImage(1, 1, 4) == null);
     try std.testing.expect(cache.byte_usage <= cache.byte_limit);
+}
+
+test "frame color pixels are released after present without entering cache" {
+    const allocator = std.testing.allocator;
+    var cache: RasterCache = .{};
+    defer cache.deinit(allocator);
+
+    cache.beginFrame();
+    const pixels = try allocator.alloc(Color, 4);
+    @memset(pixels, Color.argb(255, 1, 2, 3));
+    const retained = try cache.insertFrameColor(allocator, allocator, pixels);
+    try std.testing.expectEqual(@as(usize, 4), retained.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.byte_usage);
+    try std.testing.expectEqual(@as(usize, 1), cache.frame_color.items.len);
+    cache.endFrame(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), cache.frame_color.items.len);
+    cache.beginFrame();
+    defer cache.endFrame(allocator);
+    try std.testing.expect(cache.cachedColorImage(1, 2, 2) == null);
 }
 
 pub const RenderBackend = struct {
