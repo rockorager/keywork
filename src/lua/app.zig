@@ -1104,56 +1104,41 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
     const preload_table = c.lua_gettop(lua_state);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, keyworkModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork");
+    lua_value.setClosureField(lua_state, preload_table, "keywork", keyworkModuleLoader, 1);
 
-    c.lua_pushcclosure(lua_state, storybookModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.storybook");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.storybook", storybookModuleLoader, 0);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, loopModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.loop");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.loop", loopModuleLoader, 1);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, processModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.process");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.process", processModuleLoader, 1);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, dbusModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.dbus");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.dbus", dbusModuleLoader, 1);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, pipewireModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.pipewire");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.pipewire", pipewireModuleLoader, 1);
 
-    c.lua_pushcclosure(lua_state, audioModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.audio");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.audio", audioModuleLoader, 0);
 
-    c.lua_pushcclosure(lua_state, logModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.log");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.log", logModuleLoader, 0);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, jsonModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.json");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.json", jsonModuleLoader, 1);
 
-    c.lua_pushcclosure(lua_state, serviceModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.service");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.service", serviceModuleLoader, 0);
 
-    c.lua_pushcclosure(lua_state, streamModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.stream");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.stream", streamModuleLoader, 0);
 
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, xdgModuleLoader, 1);
-    c.lua_setfield(lua_state, preload_table, "keywork.xdg");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.xdg", xdgModuleLoader, 1);
 
-    c.lua_pushcclosure(lua_state, xdgApplicationsModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.xdg.applications");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.xdg.applications", xdgApplicationsModuleLoader, 0);
 
-    c.lua_pushcclosure(lua_state, notifyModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.notify");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.notify", notifyModuleLoader, 0);
 
-    c.lua_pushcclosure(lua_state, portalModuleLoader, 0);
-    c.lua_setfield(lua_state, preload_table, "keywork.portal");
+    lua_value.setClosureField(lua_state, preload_table, "keywork.portal", portalModuleLoader, 0);
 
     pop(lua_state, 2);
 }
@@ -1199,14 +1184,11 @@ fn installWindowOperations(lua_state: *c.lua_State, keywork_table: c_int, app: *
     std.debug.assert(c.lua_type(lua_state, -1) == c.LUA_TTABLE);
     const window_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaWindowStartMove, 1);
-    c.lua_setfield(lua_state, window_table, "start_move");
+    lua_value.setClosureField(lua_state, window_table, "start_move", luaWindowStartMove, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaWindowStartResize, 1);
-    c.lua_setfield(lua_state, window_table, "start_resize");
+    lua_value.setClosureField(lua_state, window_table, "start_resize", luaWindowStartResize, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaWindowRequestActivationToken, 1);
-    c.lua_setfield(lua_state, window_table, "request_activation_token");
+    lua_value.setClosureField(lua_state, window_table, "request_activation_token", luaWindowRequestActivationToken, 1);
     pop(lua_state, 1);
 }
 
@@ -1214,11 +1196,9 @@ fn pushClipboardNamespace(lua_state: *c.lua_State, app: *App) void {
     c.lua_createtable(lua_state, 0, 2);
     const clipboard_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaClipboardRead, 1);
-    c.lua_setfield(lua_state, clipboard_table, "read");
+    lua_value.setClosureField(lua_state, clipboard_table, "read", luaClipboardRead, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaClipboardWrite, 1);
-    c.lua_setfield(lua_state, clipboard_table, "write");
+    lua_value.setClosureField(lua_state, clipboard_table, "write", luaClipboardWrite, 1);
 }
 
 /// kw.clipboard.read() -> text | nil [, err]. Nil without an error means
@@ -1320,8 +1300,7 @@ fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
     c.lua_createtable(lua_state, 0, 2);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaSpawn, 1);
-    c.lua_setfield(lua_state, -2, "spawn");
+    lua_value.setClosureField(lua_state, -2, "spawn", luaSpawn, 1);
     // The embedded Lua layer augments the native table in place (capture, ...).
     if (c.luaL_loadbuffer(lua_state, embedded_process_source.ptr, embedded_process_source.len, "@keywork/process.lua") != 0) return c.lua_error(lua_state);
     c.lua_pushvalue(lua_state, -2);
@@ -1384,14 +1363,10 @@ fn logModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.lua_createtable(lua_state, 0, 4);
     const log_table = c.lua_gettop(lua_state);
-    c.lua_pushcclosure(lua_state, luaLogDebug, 0);
-    c.lua_setfield(lua_state, log_table, "debug");
-    c.lua_pushcclosure(lua_state, luaLogInfo, 0);
-    c.lua_setfield(lua_state, log_table, "info");
-    c.lua_pushcclosure(lua_state, luaLogWarn, 0);
-    c.lua_setfield(lua_state, log_table, "warn");
-    c.lua_pushcclosure(lua_state, luaLogErr, 0);
-    c.lua_setfield(lua_state, log_table, "err");
+    lua_value.setClosureField(lua_state, log_table, "debug", luaLogDebug, 0);
+    lua_value.setClosureField(lua_state, log_table, "info", luaLogInfo, 0);
+    lua_value.setClosureField(lua_state, log_table, "warn", luaLogWarn, 0);
+    lua_value.setClosureField(lua_state, log_table, "err", luaLogErr, 0);
     return 1;
 }
 
@@ -1399,18 +1374,14 @@ fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
     c.lua_createtable(lua_state, 0, 3);
     const app_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaQuit, 1);
-    c.lua_setfield(lua_state, app_table, "quit");
+    lua_value.setClosureField(lua_state, app_table, "quit", luaQuit, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaReload, 1);
-    c.lua_setfield(lua_state, app_table, "reload");
+    lua_value.setClosureField(lua_state, app_table, "reload", luaReload, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    c.lua_pushcclosure(lua_state, luaInvalidate, 1);
-    c.lua_setfield(lua_state, app_table, "invalidate");
+    lua_value.setClosureField(lua_state, app_table, "invalidate", luaInvalidate, 1);
 
     c.lua_createtable(lua_state, 0, 1);
-    c.lua_pushcclosure(lua_state, luaAppCall, 0);
-    c.lua_setfield(lua_state, -2, "__call");
+    lua_value.setClosureField(lua_state, -1, "__call", luaAppCall, 0);
     _ = c.lua_setmetatable(lua_state, app_table);
 }
 

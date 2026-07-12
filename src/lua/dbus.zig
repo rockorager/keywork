@@ -60,27 +60,17 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_createtable(lua_state, 0, 16);
     const dbus_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaDbusSession, 1);
-    c.lua_setfield(lua_state, dbus_table, "session");
+    lua_value.setClosureField(lua_state, dbus_table, "session", luaDbusSession, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaDbusSystem, 1);
-    c.lua_setfield(lua_state, dbus_table, "system");
-    c.lua_pushcclosure(lua_state, luaDbusString, 0);
-    c.lua_setfield(lua_state, dbus_table, "string");
-    c.lua_pushcclosure(lua_state, luaDbusObjectPath, 0);
-    c.lua_setfield(lua_state, dbus_table, "object_path");
-    c.lua_pushcclosure(lua_state, luaDbusBoolean, 0);
-    c.lua_setfield(lua_state, dbus_table, "boolean");
-    c.lua_pushcclosure(lua_state, luaDbusInt32, 0);
-    c.lua_setfield(lua_state, dbus_table, "int32");
-    c.lua_pushcclosure(lua_state, luaDbusUint32, 0);
-    c.lua_setfield(lua_state, dbus_table, "uint32");
-    c.lua_pushcclosure(lua_state, luaDbusDouble, 0);
-    c.lua_setfield(lua_state, dbus_table, "double");
-    c.lua_pushcclosure(lua_state, luaDbusArray, 0);
-    c.lua_setfield(lua_state, dbus_table, "array");
-    c.lua_pushcclosure(lua_state, luaDbusVariant, 0);
-    c.lua_setfield(lua_state, dbus_table, "variant");
+    lua_value.setClosureField(lua_state, dbus_table, "system", luaDbusSystem, 1);
+    lua_value.setClosureField(lua_state, dbus_table, "string", luaDbusString, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "object_path", luaDbusObjectPath, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "boolean", luaDbusBoolean, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "int32", luaDbusInt32, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "uint32", luaDbusUint32, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "double", luaDbusDouble, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "array", luaDbusArray, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "variant", luaDbusVariant, 0);
 
     // The property/proxy/observe sugar must suspend through bus:call, so it
     // is implemented as Lua closures layered on the bus methods table rather

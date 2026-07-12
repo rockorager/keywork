@@ -153,8 +153,7 @@ pub const Connection = struct {
 pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     c.lua_createtable(lua_state, 0, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaConnect, 1);
-    c.lua_setfield(lua_state, -2, "connect");
+    lua_value.setClosureField(lua_state, -2, "connect", luaConnect, 1);
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {

@@ -461,8 +461,7 @@ const LuaStatefulWidget = struct {
         c.lua_createtable(self.lua_state, 0, 1);
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.slot_ref);
         c.lua_pushvalue(self.lua_state, spec);
-        c.lua_pushcclosure(self.lua_state, luaStateIndex, 2);
-        c.lua_setfield(self.lua_state, -2, "__index");
+        lua_value.setClosureField(self.lua_state, -3, "__index", luaStateIndex, 2);
         _ = c.lua_setmetatable(self.lua_state, state_table);
         c.lua_getfield(self.lua_state, spec, "init");
         if (c.lua_isnil(self.lua_state, -1)) {
@@ -1398,8 +1397,7 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
 
 fn installStateMethods(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int) void {
     state.slot_ref = lua_handle.createSlot(lua_state, state);
-    c.lua_pushcclosure(lua_state, luaSetState, 1);
-    c.lua_setfield(lua_state, state_table, "set_state");
+    lua_value.setClosureField(lua_state, state_table, "set_state", luaSetState, 1);
 }
 
 /// __index for stateful widget state tables. Resolves "scope" to the

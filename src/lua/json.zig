@@ -31,15 +31,12 @@ pub fn pushModule(lua_state: *c.lua_State, allocator: *const std.mem.Allocator) 
     const module = c.lua_gettop(lua_state);
 
     c.lua_pushlightuserdata(lua_state, @constCast(allocator));
-    c.lua_pushcclosure(lua_state, luaEncode, 1);
-    c.lua_setfield(lua_state, module, "encode");
+    lua_value.setClosureField(lua_state, module, "encode", luaEncode, 1);
 
     c.lua_pushlightuserdata(lua_state, @constCast(allocator));
-    c.lua_pushcclosure(lua_state, luaDecode, 1);
-    c.lua_setfield(lua_state, module, "decode");
+    lua_value.setClosureField(lua_state, module, "decode", luaDecode, 1);
 
-    c.lua_pushcclosure(lua_state, luaArray, 0);
-    c.lua_setfield(lua_state, module, "array");
+    lua_value.setClosureField(lua_state, module, "array", luaArray, 0);
 
     c.lua_pushlightuserdata(lua_state, &null_sentinel);
     c.lua_setfield(lua_state, module, "null");

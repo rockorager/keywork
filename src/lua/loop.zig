@@ -279,26 +279,19 @@ pub const LuaTimer = struct {
 
 pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Host) void {
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaLoopTimer, 1);
-    c.lua_setfield(lua_state, loop_table, "timer");
+    lua_value.setClosureField(lua_state, loop_table, "timer", luaLoopTimer, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaWatchFd, 1);
-    c.lua_setfield(lua_state, loop_table, "fd");
+    lua_value.setClosureField(lua_state, loop_table, "fd", luaWatchFd, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaFsEvent, 1);
-    c.lua_setfield(lua_state, loop_table, "fs_event");
+    lua_value.setClosureField(lua_state, loop_table, "fs_event", luaFsEvent, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, lua_task.luaSpawn, 1);
-    c.lua_setfield(lua_state, loop_table, "spawn");
+    lua_value.setClosureField(lua_state, loop_table, "spawn", lua_task.luaSpawn, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, lua_task.luaScope, 1);
-    c.lua_setfield(lua_state, loop_table, "scope");
+    lua_value.setClosureField(lua_state, loop_table, "scope", lua_task.luaScope, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaSleep, 1);
-    c.lua_setfield(lua_state, loop_table, "sleep");
+    lua_value.setClosureField(lua_state, loop_table, "sleep", luaSleep, 1);
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaChannel, 1);
-    c.lua_setfield(lua_state, loop_table, "channel");
+    lua_value.setClosureField(lua_state, loop_table, "channel", luaChannel, 1);
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {

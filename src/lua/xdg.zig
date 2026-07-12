@@ -222,8 +222,7 @@ pub fn installApi(lua_state: *c.lua_State, table: c_int, allocator: *const std.m
     };
     for (functions) |function| {
         c.lua_pushlightuserdata(lua_state, @constCast(allocator));
-        c.lua_pushcclosure(lua_state, function.func, 1);
-        c.lua_setfield(lua_state, target, function.name);
+        lua_value.setClosureField(lua_state, target, function.name, function.func, 1);
     }
 }
 

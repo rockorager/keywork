@@ -9,6 +9,7 @@
 //! cancel anything.
 
 const std = @import("std");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 pub const Method = struct {
@@ -34,8 +35,7 @@ fn ensureMetatable(lua_state: *c.lua_State, type_name: [*:0]const u8, methods: [
     if (c.luaL_newmetatable(lua_state, type_name) != 0) {
         c.lua_createtable(lua_state, 0, @intCast(methods.len));
         for (methods) |method| {
-            c.lua_pushcclosure(lua_state, method.func, 0);
-            c.lua_setfield(lua_state, -2, method.name);
+            lua_value.setClosureField(lua_state, -1, method.name, method.func, 0);
         }
         c.lua_setfield(lua_state, -2, "__index");
     }

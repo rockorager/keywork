@@ -202,8 +202,7 @@ fn socketCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void 
 
 pub fn installApi(lua_state: *c.lua_State, loop_table: c_int, host: *Host) void {
     c.lua_pushlightuserdata(lua_state, host);
-    c.lua_pushcclosure(lua_state, luaConnect, 1);
-    c.lua_setfield(lua_state, loop_table, "connect");
+    lua_value.setClosureField(lua_state, loop_table, "connect", luaConnect, 1);
 }
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
