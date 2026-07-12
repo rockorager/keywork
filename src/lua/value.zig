@@ -13,6 +13,10 @@ pub fn upvaluePointer(comptime Pointer: type, lua_state: *c.lua_State, slot: c_i
     return @ptrCast(@alignCast(ptr));
 }
 
+pub fn upvalueAllocator(lua_state: *c.lua_State, slot: c_int) std.mem.Allocator {
+    return upvaluePointer(*const std.mem.Allocator, lua_state, slot).*;
+}
+
 pub fn expectType(lua_state: *c.lua_State, index: c_int, expected: c_int) !void {
     if (c.lua_type(lua_state, index) != expected) return error.UnexpectedLuaType;
 }

@@ -226,10 +226,6 @@ pub fn installApi(lua_state: *c.lua_State, table: c_int, allocator: *const std.m
     }
 }
 
-fn upvalueAllocator(lua_state: *c.lua_State) std.mem.Allocator {
-    return lua_value.upvaluePointer(*const std.mem.Allocator, lua_state, 1).*;
-}
-
 fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const path = lua_value.checkString(lua_state, 1);
@@ -240,7 +236,7 @@ fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const allocator = upvalueAllocator(lua_state);
+    const allocator = lua_value.upvalueAllocator(lua_state, 1);
     const path = lua_value.checkString(lua_state, 1);
     const entries = readDirAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer freeDirEntries(allocator, entries);
@@ -259,7 +255,7 @@ fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaReadFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const allocator = upvalueAllocator(lua_state);
+    const allocator = lua_value.upvalueAllocator(lua_state, 1);
     const path = lua_value.checkString(lua_state, 1);
     const data = readFileAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer allocator.free(data);
@@ -269,7 +265,7 @@ fn luaReadFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaWriteFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const allocator = upvalueAllocator(lua_state);
+    const allocator = lua_value.upvalueAllocator(lua_state, 1);
     const path = lua_value.checkString(lua_state, 1);
     const data = lua_value.checkString(lua_state, 2);
     var atomic = true;

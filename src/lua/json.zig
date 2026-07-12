@@ -42,10 +42,6 @@ pub fn pushModule(lua_state: *c.lua_State, allocator: *const std.mem.Allocator) 
     c.lua_setfield(lua_state, module, "null");
 }
 
-fn allocatorFromUpvalue(lua_state: *c.lua_State) std.mem.Allocator {
-    return lua_value.upvaluePointer(*const std.mem.Allocator, lua_state, 1).*;
-}
-
 fn isNullSentinel(lua_state: *c.lua_State, index: c_int) bool {
     if (c.lua_type(lua_state, index) != c.LUA_TLIGHTUSERDATA) return false;
     return c.lua_touserdata(lua_state, index) == @as(*anyopaque, &null_sentinel);
@@ -90,7 +86,7 @@ fn encodeErrorMessage(err: EncodeError) [*:0]const u8 {
 fn luaEncode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.luaL_checkany(lua_state, 1);
-    const allocator = allocatorFromUpvalue(lua_state);
+    const allocator = lua_value.upvalueAllocator(lua_state, 1);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
@@ -210,7 +206,7 @@ fn integerKey(lua_state: *c.lua_State, index: c_int) ?usize {
 fn luaDecode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const input = lua_value.checkString(lua_state, 1);
-    const allocator = allocatorFromUpvalue(lua_state);
+    const allocator = lua_value.upvalueAllocator(lua_state, 1);
 
     // Malformed input is expected runtime data, so decode reports nil, err.
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch |err| {
