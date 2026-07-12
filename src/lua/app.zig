@@ -6,6 +6,7 @@ const keywork = @import("../ui.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const icon_theme = @import("../linux/icon_theme.zig");
+const linux_syscall = @import("../linux/syscall.zig");
 const lua_config = @import("config.zig");
 const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
@@ -692,22 +693,10 @@ pub const App = struct {
         if (linux.errno(open_result) != .SUCCESS) return error.ScriptReadFailed;
         const fd: i32 = @intCast(open_result);
         defer _ = linux.close(fd);
-
-        var list: std.ArrayList(u8) = .empty;
-        errdefer list.deinit(self.allocator);
-        while (true) {
-            try list.ensureUnusedCapacity(self.allocator, 4096);
-            const dest = list.unusedCapacitySlice();
-            const read_result = linux.read(fd, dest.ptr, dest.len);
-            switch (linux.errno(read_result)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                else => return error.ScriptReadFailed,
-            }
-            if (read_result == 0) break;
-            list.items.len += read_result;
-        }
-        return list.toOwnedSlice(self.allocator);
+        return linux_syscall.readAllAlloc(self.allocator, fd) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ReadFailed => error.ScriptReadFailed,
+        };
     }
 
     /// Expose the standard Lua `arg` table: arg[0] is the script path,

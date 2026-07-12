@@ -3,6 +3,7 @@
 //! applications can persist state without shelling out.
 
 const std = @import("std");
+const linux_syscall = @import("../linux/syscall.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
@@ -64,22 +65,7 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     defer allocator.free(path_z);
     const fd = try openFd(linux.openat(linux.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
     defer _ = linux.close(fd);
-
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    while (true) {
-        try list.ensureUnusedCapacity(allocator, 4096);
-        const dest = list.unusedCapacitySlice();
-        const read_result = linux.read(fd, dest.ptr, dest.len);
-        switch (linux.errno(read_result)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return error.ReadFailed,
-        }
-        if (read_result == 0) break;
-        list.items.len += read_result;
-    }
-    return list.toOwnedSlice(allocator);
+    return linux_syscall.readAllAlloc(allocator, fd);
 }
 
 /// Replaces `path` atomically: the data lands in a same-directory
