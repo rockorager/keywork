@@ -359,7 +359,7 @@ const LuaCallback = struct {
         }
         pushModifiers(self.lua_state, event.modifiers);
         c.lua_setfield(self.lua_state, -2, "modifiers");
-        try self.pcallEvent("tap");
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) return failLuaCall(self.lua_state, "tap callback failed");
     }
 
     fn callScrollEvent(ptr: *anyopaque, event: keywork.ScrollEvent) !void {
@@ -373,55 +373,27 @@ const LuaCallback = struct {
         c.lua_setfield(self.lua_state, -2, "dy");
         pushModifiers(self.lua_state, event.modifiers);
         c.lua_setfield(self.lua_state, -2, "modifiers");
-        try self.pcallEvent("scroll");
-    }
-
-    fn pcallEvent(self: *LuaCallback, kind: []const u8) !void {
-        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
-            var len: usize = 0;
-            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
-            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("{s} callback failed: {s}", .{ kind, message[0..len] });
-            pop(self.lua_state, 1);
-            return error.LuaCallbackFailed;
-        }
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) return failLuaCall(self.lua_state, "scroll callback failed");
     }
 
     fn callTextChange(ptr: *anyopaque, text: []const u8) !void {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         c.lua_pushlstring(self.lua_state, text.ptr, text.len);
-        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
-            var len: usize = 0;
-            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
-            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("text change callback failed: {s}", .{message[0..len]});
-            pop(self.lua_state, 1);
-            return error.LuaCallbackFailed;
-        }
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) return failLuaCall(self.lua_state, "text change callback failed");
     }
 
     fn call(ptr: *anyopaque) !void {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
-        if (c.lua_pcall(self.lua_state, 0, 0, 0) != 0) {
-            var len: usize = 0;
-            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
-            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("callback failed: {s}", .{message[0..len]});
-            pop(self.lua_state, 1);
-            return error.LuaCallbackFailed;
-        }
+        if (c.lua_pcall(self.lua_state, 0, 0, 0) != 0) return failLuaCall(self.lua_state, "callback failed");
     }
 
     fn callFocusChange(ptr: *anyopaque, focused: bool) !void {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         c.lua_pushboolean(self.lua_state, if (focused) 1 else 0);
-        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) {
-            var len: usize = 0;
-            const message_ptr = c.lua_tolstring(self.lua_state, -1, &len);
-            if (message_ptr) |message| std.log.scoped(.keywork_luajit).warn("focus callback failed: {s}", .{message[0..len]});
-            pop(self.lua_state, 1);
-            return error.LuaCallbackFailed;
-        }
+        if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) return failLuaCall(self.lua_state, "focus callback failed");
     }
 
     fn clone(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
