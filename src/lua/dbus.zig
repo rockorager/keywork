@@ -11,6 +11,7 @@ const dbus_c = @import("dbus_c");
 
 const linux = std.os.linux;
 const invalid_fd: i32 = -1;
+const unix_fd_type: [*:0]const u8 = "keywork.dbus.unix_fd";
 
 var dbus_temp_z_slot: usize = 0;
 var dbus_temp_z_buffers: [8][4096]u8 = undefined;
@@ -1841,6 +1842,45 @@ fn pushOptionalDbusString(lua_state: *c.lua_State, value: ?[*:0]const u8) void {
     }
 }
 
+fn unixFd(lua_state: *c.lua_State, index: c_int) *i32 {
+    return @ptrCast(@alignCast(c.luaL_checkudata(lua_state, index, unix_fd_type).?));
+}
+
+fn closeUnixFd(fd: *i32) void {
+    if (fd.* == invalid_fd) return;
+    _ = linux.close(fd.*);
+    fd.* = invalid_fd;
+}
+
+fn luaUnixFdClose(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    closeUnixFd(unixFd(lua_state_optional.?, 1));
+    return 0;
+}
+
+fn luaUnixFdClosed(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.lua_pushboolean(lua_state, if (unixFd(lua_state, 1).* == invalid_fd) 1 else 0);
+    return 1;
+}
+
+fn ensureUnixFdMetatable(lua_state: *c.lua_State) void {
+    if (c.luaL_newmetatable(lua_state, unix_fd_type) != 0) {
+        c.lua_pushcclosure(lua_state, luaUnixFdClose, 0);
+        c.lua_setfield(lua_state, -2, "__gc");
+        c.lua_createtable(lua_state, 0, 2);
+        lua_value.setClosureField(lua_state, -1, "close", luaUnixFdClose, 0);
+        lua_value.setClosureField(lua_state, -1, "closed", luaUnixFdClosed, 0);
+        c.lua_setfield(lua_state, -2, "__index");
+    }
+}
+
+fn pushUnixFd(lua_state: *c.lua_State, value: i32) void {
+    const fd: *i32 = @ptrCast(@alignCast(c.lua_newuserdata(lua_state, @sizeOf(i32)).?));
+    fd.* = value;
+    ensureUnixFdMetatable(lua_state);
+    _ = c.lua_setmetatable(lua_state, -2);
+}
+
 fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
     switch (dbus_c.dbus_message_iter_get_arg_type(iter)) {
         dbus_c.DBUS_TYPE_STRING, dbus_c.DBUS_TYPE_OBJECT_PATH, dbus_c.DBUS_TYPE_SIGNATURE => {
@@ -1892,6 +1932,17 @@ fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) voi
             var value: f64 = 0;
             dbus_c.dbus_message_iter_get_basic(iter, &value);
             c.lua_pushnumber(lua_state, value);
+        },
+        dbus_c.DBUS_TYPE_UNIX_FD => {
+            // libdbus duplicates the descriptor here, sets FD_CLOEXEC, and
+            // transfers ownership of that duplicate to the caller.
+            var value: c_int = invalid_fd;
+            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (value < 0) {
+                c.lua_pushnil(lua_state);
+            } else {
+                pushUnixFd(lua_state, @intCast(value));
+            }
         },
         dbus_c.DBUS_TYPE_VARIANT => {
             var child: dbus_c.DBusMessageIter = undefined;
@@ -2015,6 +2066,54 @@ test "dbus introspection writes one argument per complete type" {
         \\      <arg type="i" direction="in"/>
         \\
     , output.written());
+}
+
+test "dbus UNIX_FD replies decode to owning Lua userdata" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    c.luaL_openlibs(lua_state);
+
+    const opened = linux.open("/dev/null", .{}, 0);
+    if (opened >= 4096) return error.OpenFailed;
+    var source_fd: c_int = @intCast(opened);
+    defer _ = linux.close(source_fd);
+
+    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
+    defer dbus_c.dbus_message_unref(message);
+    var append_iter: dbus_c.DBusMessageIter = undefined;
+    dbus_c.dbus_message_iter_init_append(message, &append_iter);
+    // Appending duplicates source_fd for the message; message unref and
+    // linux.close above release those two owners independently.
+    try appendDbusBasic(&append_iter, dbus_c.DBUS_TYPE_UNIX_FD, &source_fd);
+
+    // Decoding creates a third owner. Exercise both methods, including an
+    // idempotent close, without exposing the descriptor to Lua.
+    pushDbusArgsTable(lua_state, message);
+    c.lua_setglobal(lua_state, "args");
+    const check_script =
+        \\local fd = args[1]
+        \\assert(type(fd) == "userdata")
+        \\assert(not fd:closed())
+        \\fd:close()
+        \\assert(fd:closed())
+        \\fd:close()
+        \\assert(fd:closed())
+    ;
+    if (c.luaL_loadstring(lua_state, check_script) != 0) return error.LoadFailed;
+    if (c.lua_pcall(lua_state, 0, 0, 0) != 0) return error.ScriptFailed;
+
+    // A fresh read is another libdbus-owned duplicate. Drop its only Lua
+    // reference and verify __gc closes it.
+    var read_iter: dbus_c.DBusMessageIter = undefined;
+    try std.testing.expect(dbus_c.dbus_message_iter_init(message, &read_iter) != 0);
+    pushDbusIterValue(lua_state, &read_iter);
+    const collected_fd = unixFd(lua_state, -1).*;
+    try std.testing.expect(collected_fd >= 0);
+    try std.testing.expect(linux.fcntl(collected_fd, linux.F.GETFD, 0) < 4096);
+    pop(lua_state, 1);
+    _ = c.lua_gc(lua_state, c.LUA_GCCOLLECT, 0);
+    _ = c.lua_gc(lua_state, c.LUA_GCCOLLECT, 0);
+    try std.testing.expect(linux.fcntl(collected_fd, linux.F.GETFD, 0) >= 4096);
 }
 
 test "dbus dict and struct arguments encode from Lua tables" {
