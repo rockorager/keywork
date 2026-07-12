@@ -31,6 +31,7 @@ struct kw_pw_device {
     struct pw_device *proxy;
     struct spa_hook listener;
     struct kw_pw_route *routes;
+    char *bus;
     uint32_t id;
 };
 
@@ -284,6 +285,15 @@ static void destroy_routes(struct kw_pw_device *device) {
 
 static void device_info(void *data, const struct pw_device_info *info) {
     struct kw_pw_device *device = data;
+    const char *bus = info->props == NULL
+        ? NULL
+        : spa_dict_lookup(info->props, PW_KEY_DEVICE_BUS);
+    if (device->bus == NULL && bus != NULL) {
+        size_t length = strlen(bus) + 1;
+        device->bus = malloc(length);
+        if (device->bus != NULL)
+            memcpy(device->bus, bus, length);
+    }
     if ((info->change_mask & PW_DEVICE_CHANGE_MASK_PARAMS) == 0)
         return;
     for (uint32_t i = 0; i < info->n_params; i++) {
@@ -374,7 +384,8 @@ static void device_param(
         device->id,
         (uint32_t)route_device,
         availability,
-        route_info_value(route_info, "port.type")
+        route_info_value(route_info, "port.type"),
+        device->bus
     );
 }
 
@@ -444,6 +455,7 @@ static void destroy_devices(
         destroy_routes(device);
         spa_hook_remove(&device->listener);
         pw_proxy_destroy((struct pw_proxy *)device->proxy);
+        free(device->bus);
         free(device);
         if (match_id)
             return;

@@ -268,11 +268,12 @@ fn routeInfo(
     device: u32,
     availability: u32,
     port_type: [*c]const u8,
+    bus: [*c]const u8,
 ) callconv(.c) void {
     const connection: *Connection = @ptrCast(@alignCast(data.?));
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
-    pushRouteEvent(lua_state, id, device, availability, port_type);
+    pushRouteEvent(lua_state, id, device, availability, port_type, bus);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire route delivery failed: {}", .{err});
     };
@@ -350,18 +351,20 @@ fn pushRouteEvent(
     device: u32,
     availability: u32,
     port_type: [*c]const u8,
+    bus: [*c]const u8,
 ) void {
     const availability_name: []const u8 = switch (availability) {
         1 => "no",
         2 => "yes",
         else => "unknown",
     };
-    c.lua_createtable(lua_state, 0, 5);
+    c.lua_createtable(lua_state, 0, 6);
     pushStringField(lua_state, "type", "route");
     pushIntegerField(lua_state, "id", id);
     pushIntegerField(lua_state, "device", device);
     pushStringField(lua_state, "availability", availability_name);
     pushOptionalStringField(lua_state, "port_type", port_type);
+    pushOptionalStringField(lua_state, "bus", bus);
 }
 
 fn pushStringField(lua_state: *c.lua_State, name: [*:0]const u8, value: []const u8) void {
@@ -562,7 +565,7 @@ test "PipeWire route events expose availability and port type" {
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);
 
-    pushRouteEvent(lua_state, 50, 1, 1, "speaker");
+    pushRouteEvent(lua_state, 50, 1, 1, "speaker", "pci");
     c.lua_getfield(lua_state, -1, "type");
     try std.testing.expectEqualStrings("route", zSpan(c.lua_tolstring(lua_state, -1, null).?));
     c.lua_settop(lua_state, -2);
@@ -571,6 +574,9 @@ test "PipeWire route events expose availability and port type" {
     c.lua_settop(lua_state, -2);
     c.lua_getfield(lua_state, -1, "port_type");
     try std.testing.expectEqualStrings("speaker", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+    c.lua_settop(lua_state, -2);
+    c.lua_getfield(lua_state, -1, "bus");
+    try std.testing.expectEqualStrings("pci", zSpan(c.lua_tolstring(lua_state, -1, null).?));
 }
 
 test "PipeWire realtime scheduling is opt-in" {

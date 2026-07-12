@@ -82,6 +82,7 @@ local function device_record(monitor, device, event_type)
     availability = availability,
     available = availability ~= "no",
     port_type = route and route.port_type,
+    bus = properties["device.bus"] or (route and route.bus),
     properties = properties,
   }
 end
@@ -214,12 +215,14 @@ local function apply_route(monitor, event)
   local previous = routes[event.device]
   if previous
       and previous.availability == event.availability
-      and previous.port_type == event.port_type then
+      and previous.port_type == event.port_type
+      and previous.bus == event.bus then
     return
   end
   routes[event.device] = {
     availability = event.availability,
     port_type = event.port_type,
+    bus = event.bus,
   }
   for _, device in pairs(monitor.by_id) do
     local device_id, route_device = device_route(device)

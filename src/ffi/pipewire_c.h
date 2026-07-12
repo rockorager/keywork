@@ -55,7 +55,8 @@ typedef void (*kw_pw_route_fn)(
     uint32_t id,
     uint32_t device,
     uint32_t availability,
-    const char *port_type
+    const char *port_type,
+    const char *bus
 );
 
 struct kw_pw_events {
