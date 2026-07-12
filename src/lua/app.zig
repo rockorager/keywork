@@ -952,30 +952,30 @@ pub const App = struct {
 };
 
 const process_host_vtable: lua_process.Host.VTable = .{
-    .allocator = processHostAllocator,
-    .luaState = processHostLuaState,
-    .eventLoop = processHostEventLoop,
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
 };
 
-fn processHostAllocator(ptr: *anyopaque) std.mem.Allocator {
+fn hostAllocator(ptr: *anyopaque) std.mem.Allocator {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.allocator;
 }
 
-fn processHostLuaState(ptr: *anyopaque) *c.lua_State {
+fn hostLuaState(ptr: *anyopaque) *c.lua_State {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.state;
 }
 
-fn processHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
+fn hostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.event_loop;
 }
 
 const loop_host_vtable: lua_loop.Host.VTable = .{
-    .allocator = loopHostAllocator,
-    .luaState = loopHostLuaState,
-    .eventLoop = loopHostEventLoop,
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
     .invalidate = loopHostInvalidate,
     .addFdWatch = loopHostAddFdWatch,
     .addFsEvent = loopHostAddFsEvent,
@@ -984,21 +984,6 @@ const loop_host_vtable: lua_loop.Host.VTable = .{
     .addScope = loopHostAddScope,
     .addChannel = loopHostAddChannel,
 };
-
-fn loopHostAllocator(ptr: *anyopaque) std.mem.Allocator {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.allocator;
-}
-
-fn loopHostLuaState(ptr: *anyopaque) *c.lua_State {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.state;
-}
-
-fn loopHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.event_loop;
-}
 
 fn loopHostInvalidate(ptr: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ptr));
@@ -1037,26 +1022,11 @@ fn loopHostAddScope(ptr: *anyopaque) anyerror!*LuaScope {
 }
 
 const socket_host_vtable: lua_socket.Host.VTable = .{
-    .allocator = socketHostAllocator,
-    .luaState = socketHostLuaState,
-    .eventLoop = socketHostEventLoop,
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
     .addSocket = socketHostAddSocket,
 };
-
-fn socketHostAllocator(ptr: *anyopaque) std.mem.Allocator {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.allocator;
-}
-
-fn socketHostLuaState(ptr: *anyopaque) *c.lua_State {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.state;
-}
-
-fn socketHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.event_loop;
-}
 
 fn socketHostAddSocket(ptr: *anyopaque, fd: i32) anyerror!*LuaSocket {
     const app: *App = @ptrCast(@alignCast(ptr));
@@ -1064,48 +1034,18 @@ fn socketHostAddSocket(ptr: *anyopaque, fd: i32) anyerror!*LuaSocket {
 }
 
 const dbus_host_vtable: lua_dbus.Host.VTable = .{
-    .allocator = dbusHostAllocator,
-    .luaState = dbusHostLuaState,
-    .eventLoop = dbusHostEventLoop,
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
     .addBus = dbusHostAddBus,
 };
 
-fn dbusHostAllocator(ptr: *anyopaque) std.mem.Allocator {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.allocator;
-}
-
-fn dbusHostLuaState(ptr: *anyopaque) *c.lua_State {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.state;
-}
-
-fn dbusHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.event_loop;
-}
-
 const pipewire_host_vtable: lua_pipewire.Host.VTable = .{
-    .allocator = pipewireHostAllocator,
-    .luaState = pipewireHostLuaState,
-    .eventLoop = pipewireHostEventLoop,
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
     .addConnection = pipewireHostAddConnection,
 };
-
-fn pipewireHostAllocator(ptr: *anyopaque) std.mem.Allocator {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.allocator;
-}
-
-fn pipewireHostLuaState(ptr: *anyopaque) *c.lua_State {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.state;
-}
-
-fn pipewireHostEventLoop(ptr: *anyopaque) ?*event_loop.EventLoop {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return app.event_loop;
-}
 
 fn pipewireHostAddConnection(ptr: *anyopaque, realtime: bool) anyerror!*PipeWireConnection {
     const app: *App = @ptrCast(@alignCast(ptr));
