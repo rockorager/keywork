@@ -252,17 +252,10 @@ fn checkString(lua_state: *c.lua_State, index: c_int) []const u8 {
     return ptr[0..len];
 }
 
-fn pushNilError(lua_state: *c.lua_State, err: anyerror) c_int {
-    c.lua_pushnil(lua_state);
-    const name = @errorName(err);
-    c.lua_pushlstring(lua_state, name.ptr, name.len);
-    return 2;
-}
-
 fn luaMkdirAll(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const path = checkString(lua_state, 1);
-    mkdirAll(path) catch |err| return pushNilError(lua_state, err);
+    mkdirAll(path) catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }
@@ -271,7 +264,7 @@ fn luaReadDir(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const allocator = upvalueAllocator(lua_state);
     const path = checkString(lua_state, 1);
-    const entries = readDirAlloc(allocator, path) catch |err| return pushNilError(lua_state, err);
+    const entries = readDirAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer freeDirEntries(allocator, entries);
 
     c.lua_createtable(lua_state, @intCast(entries.len), 0);
@@ -292,7 +285,7 @@ fn luaReadFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const allocator = upvalueAllocator(lua_state);
     const path = checkString(lua_state, 1);
-    const data = readFileAlloc(allocator, path) catch |err| return pushNilError(lua_state, err);
+    const data = readFileAlloc(allocator, path) catch |err| return lua_value.pushNilError(lua_state, err);
     defer allocator.free(data);
     c.lua_pushlstring(lua_state, data.ptr, data.len);
     return 1;
@@ -313,7 +306,7 @@ fn luaWriteFile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         writeFileAtomic(allocator, path, data)
     else
         writeFileTruncate(allocator, path, data);
-    result catch |err| return pushNilError(lua_state, err);
+    result catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }

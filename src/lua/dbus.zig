@@ -1056,10 +1056,7 @@ fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
     const bus = sharedBus(lua_state, kind) orelse blk: {
         const created = host.addBus(kind) catch |err| {
             std.log.scoped(.keywork_luajit).warn("dbus bus failed: {}", .{err});
-            c.lua_pushnil(lua_state);
-            const name = @errorName(err);
-            c.lua_pushlstring(lua_state, name.ptr, name.len);
-            return 2;
+            return lua_value.pushNilError(lua_state, err);
         };
         setSharedBus(lua_state, kind, created);
         break :blk created;
@@ -1067,18 +1064,12 @@ fn luaBus(lua_state_optional: ?*c.lua_State, kind: Kind) c_int {
 
     const allocator = host.allocator();
     const lease = allocator.create(BusLease) catch |err| {
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     lease.* = .{ .bus = bus };
     bus.leases.append(allocator, lease) catch |err| {
         allocator.destroy(lease);
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     bus.refs += 1;
     lua_task.adopt(lua_state, .{ .ptr = lease, .cancel_fn = cancelBusLease });
@@ -1133,10 +1124,7 @@ fn luaCall(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     bus.call(lua_state, 2, ref) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus call failed: {}", .{err});
         if (err != error.DBusCallFailed) return c.luaL_error(lua_state, "dbus call failed");
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     return c.lua_yield(lua_state, 0);
 }
@@ -1150,10 +1138,7 @@ fn luaDbusRequestName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const owned = bus.requestName(lua_state, 2) catch |err| {
         std.log.scoped(.keywork_luajit).warn("dbus request_name failed: {}", .{err});
         if (err != error.DBusNameUnavailable) return c.luaL_error(lua_state, "dbus request_name failed");
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     owned.handle_ref = lua_handle.create(lua_state, owned_name_type, &owned_name_methods, owned);
     return 1;

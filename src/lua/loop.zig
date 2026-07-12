@@ -445,10 +445,7 @@ fn luaFsEvent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // reports nil, err instead of raising.
     const fs_event = host.addFsEvent(path) catch |err| {
         std.log.scoped(.keywork_luajit).warn("loop.fs_event failed: {}", .{err});
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     lua_task.adoptResource(FsEvent, lua_state, fs_event);
     pushFsEventHandle(lua_state, fs_event);

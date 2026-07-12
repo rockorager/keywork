@@ -14,6 +14,7 @@
 //!   encode raises for unencodable values (programmer misuse).
 
 const std = @import("std");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 /// Encoding this many nested tables means a cycle in practice.
@@ -218,10 +219,7 @@ fn luaDecode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     // Malformed input is expected runtime data, so decode reports nil, err.
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, ptr[0..len], .{}) catch |err| {
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     defer parsed.deinit();
 

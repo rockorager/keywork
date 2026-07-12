@@ -7,6 +7,7 @@ const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_task = @import("task.zig");
 const lua_sink = @import("sink.zig");
+const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;
@@ -232,18 +233,12 @@ fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // connect reports nil, err instead of raising.
     const fd = LuaSocket.connect(path) catch |err| {
         log.warn("loop.connect {s} failed: {}", .{ path, err });
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     const socket = host.addSocket(fd) catch |err| {
         _ = linux.close(fd);
         log.warn("loop.connect failed: {}", .{err});
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     lua_task.adoptResource(LuaSocket, lua_state, socket);
     socket.handle_ref = lua_handle.create(lua_state, socket_type, &socket_methods, socket);

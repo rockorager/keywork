@@ -1238,20 +1238,13 @@ fn pushClipboardNamespace(lua_state: *c.lua_State, app: *App) void {
     c.lua_setfield(lua_state, clipboard_table, "write");
 }
 
-fn pushPlatformError(lua_state: *c.lua_State, err: anyerror) c_int {
-    c.lua_pushnil(lua_state);
-    const name = @errorName(err);
-    c.lua_pushlstring(lua_state, name.ptr, name.len);
-    return 2;
-}
-
 /// kw.clipboard.read() -> text | nil [, err]. Nil without an error means
 /// the clipboard is empty or holds no text.
 fn luaClipboardRead(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
-    const text = platform.clipboardRead(app.allocator) catch |err| return pushPlatformError(lua_state, err);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    const text = platform.clipboardRead(app.allocator) catch |err| return lua_value.pushNilError(lua_state, err);
     const value = text orelse {
         c.lua_pushnil(lua_state);
         return 1;
@@ -1269,8 +1262,8 @@ fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
     var len: usize = 0;
     const ptr = c.luaL_checklstring(lua_state, 1, &len);
-    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
-    platform.clipboardWrite(ptr[0..len]) catch |err| return pushPlatformError(lua_state, err);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    platform.clipboardWrite(ptr[0..len]) catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }
@@ -1281,8 +1274,8 @@ fn luaClipboardWrite(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaWindowStartMove(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
-    platform.startMove() catch |err| return pushPlatformError(lua_state, err);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    platform.startMove() catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }
@@ -1296,8 +1289,8 @@ fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const ptr = c.luaL_checklstring(lua_state, 1, &len);
     const edge = platform_mod.resizeEdgeFromName(ptr[0..len]) orelse
         return c.luaL_error(lua_state, "invalid resize edge (expected top, bottom, left, right, or a corner)");
-    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
-    platform.startResize(edge) catch |err| return pushPlatformError(lua_state, err);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    platform.startResize(edge) catch |err| return lua_value.pushNilError(lua_state, err);
     c.lua_pushboolean(lua_state, 1);
     return 1;
 }
@@ -1309,7 +1302,7 @@ fn luaWindowStartResize(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaWindowRequestActivationToken(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app: *App = @ptrCast(@alignCast(c.lua_touserdata(lua_state, c.lua_upvalueindex(1)).?));
-    const platform = app.platform orelse return pushPlatformError(lua_state, error.PlatformUnavailable);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
 
     var app_id: ?[:0]u8 = null;
     defer if (app_id) |value| app.allocator.free(value);
@@ -1320,7 +1313,7 @@ fn luaWindowRequestActivationToken(lua_state_optional: ?*c.lua_State) callconv(.
     }
 
     const token = platform.activationToken(app.allocator, if (app_id) |value| value.ptr else null) catch |err|
-        return pushPlatformError(lua_state, err);
+        return lua_value.pushNilError(lua_state, err);
     const value = token orelse {
         c.lua_pushnil(lua_state);
         return 1;
@@ -1550,10 +1543,7 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     // runtime failures, so spawn reports nil, err instead of raising.
     const process = app.addProcess(spec) catch |err| {
         std.log.scoped(.keywork_luajit).warn("process.spawn failed: {}", .{err});
-        c.lua_pushnil(lua_state);
-        const name = @errorName(err);
-        c.lua_pushlstring(lua_state, name.ptr, name.len);
-        return 2;
+        return lua_value.pushNilError(lua_state, err);
     };
     lua_task.adoptResource(LuaProcess, lua_state, process);
     lua_process.pushHandle(lua_state, process);
