@@ -183,7 +183,7 @@ fn colorImage(
     }
 }
 
-fn clampClip(value: i32, max_value: u31) usize {
+pub fn clampClip(value: i32, max_value: u31) usize {
     if (value <= 0) return 0;
     return @min(@as(usize, @intCast(value)), max_value);
 }

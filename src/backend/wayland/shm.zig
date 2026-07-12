@@ -369,10 +369,10 @@ fn clipContains(outer: TextRenderer.PixelClip, inner: TextRenderer.PixelClip) bo
 /// collapse into a single contiguous copy so large repairs can use the
 /// non-temporal path.
 fn copyRegion(noalias dst: []u32, noalias src: []const u32, width: u31, height: u31, clip: TextRenderer.PixelClip) void {
-    const x0 = clampClip(clip.x0, width);
-    const x1 = clampClip(clip.x1, width);
-    const y0 = clampClip(clip.y0, height);
-    const y1 = clampClip(clip.y1, height);
+    const x0 = raster.clampClip(clip.x0, width);
+    const x1 = raster.clampClip(clip.x1, width);
+    const y0 = raster.clampClip(clip.y0, height);
+    const y1 = raster.clampClip(clip.y1, height);
     if (x0 >= x1 or y0 >= y1) return;
     if (x0 == 0 and x1 == width) {
         copyPixels(dst[y0 * width .. y1 * width], src[y0 * width .. y1 * width]);
@@ -382,11 +382,6 @@ fn copyRegion(noalias dst: []u32, noalias src: []const u32, width: u31, height: 
     while (y < y1) : (y += 1) {
         @memcpy(dst[y * width ..][x0..x1], src[y * width ..][x0..x1]);
     }
-}
-
-fn clampClip(value: i32, max_value: u31) usize {
-    if (value <= 0) return 0;
-    return @min(@as(usize, @intCast(value)), max_value);
 }
 
 /// Copy pixels into a buffer the CPU will not read back (a wl_shm
