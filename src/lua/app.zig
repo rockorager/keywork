@@ -1554,6 +1554,30 @@ fn initTestApp(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []c
     return App.init(allocator, script_path);
 }
 
+const LuaBooleanPoll = struct {
+    app: *App,
+    global: [:0]const u8,
+    max_ticks: u32,
+    ticks: u32 = 0,
+
+    fn callback(ctx: *anyopaque, loop: *event_loop.EventLoop, _: u64) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.ticks += 1;
+        c.lua_getglobal(self.app.state, self.global.ptr);
+        const done = c.lua_toboolean(self.app.state, -1) != 0;
+        pop(self.app.state, 1);
+        if (done or self.ticks > self.max_ticks) loop.quit();
+    }
+};
+
+fn runUntilLuaBoolean(loop: *event_loop.EventLoop, app: *App, global: [:0]const u8, max_ticks: u32) !void {
+    var poll: LuaBooleanPoll = .{ .app = app, .global = global, .max_ticks = max_ticks };
+    const timer = try loop.addTimer(&poll, LuaBooleanPoll.callback);
+    defer loop.removeTimer(timer);
+    try timer.arm(1, 1);
+    try loop.run();
+}
+
 test "script must return a valid keywork.app root" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2432,22 +2456,7 @@ test "lua bus:call awaits replies and reports peer errors as nil, err" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusCallTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 3000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusCallTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusCallTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 3000);
 
     c.lua_getglobal(app.state, "got_id");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
@@ -2501,22 +2510,7 @@ test "lua bus:subscribe streams signals to a coroutine reader" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusSubscribeTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 3000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusSubscribeTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusSubscribeTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 3000);
 
     c.lua_getglobal(app.state, "got_signal");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
@@ -2669,22 +2663,7 @@ test "lua bus:observe snapshots, resyncs, and tracks owner changes" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusObserveTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 5000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusObserveTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusObserveTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
     const expected_true = [_][:0]const u8{ "initial_ok", "refresh_ok", "resync_ok", "vanish_ok", "recover_ok", "done" };
     for (expected_true) |global| {
@@ -2777,22 +2756,7 @@ test "lua exported methods can yield before replying" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusAsyncMethodTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 5000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusAsyncMethodTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusAsyncMethodTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
     const expected_true = [_][:0]const u8{ "slow_ok", "boom_ok", "done" };
     for (expected_true) |global| {
@@ -2861,22 +2825,7 @@ test "lua dbus session buses are pooled and refcounted" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusPoolTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 5000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusPoolTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusPoolTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
     const expected_true = [_][:0]const u8{ "closed_ok", "shared_ok", "fully_closed_ok", "reacquire_ok", "done" };
     for (expected_true) |global| {
@@ -2986,22 +2935,7 @@ test "lua dbus property sugar and proxies drive exported objects" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const DbusPropertiesTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 5000) event_loop_instance.quit();
-        }
-    };
-    var context: DbusPropertiesTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, DbusPropertiesTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
     const expected_true = [_][:0]const u8{
         "got_initial", "set_ok",    "got_updated", "typed_set",
@@ -3903,22 +3837,7 @@ test "lua loop fs_event observes file changes" {
     try std.testing.expect(app.fs_events.items[0].registered);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "watched.txt", .data = "after\n" });
 
-    const FsEventTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "fs_event_seen");
-            const seen = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (seen or self.ticks > 1000) event_loop_instance.quit();
-        }
-    };
-    var context: FsEventTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, FsEventTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "fs_event_seen", 1000);
 
     c.lua_getglobal(app.state, "fs_event_seen");
     defer pop(app.state, 1);
@@ -3991,27 +3910,11 @@ test "lua process spawn captures stdout and exit" {
 
     try runtime.repaint();
 
-    const SpawnTest = struct {
-        app: *App,
-        ticks: usize = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "spawn_done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 1000) event_loop_instance.quit();
-        }
-    };
-
     app.bindRuntime(&runtime);
     defer app.unbindRuntime();
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
-    var context: SpawnTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, SpawnTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "spawn_done", 1000);
 
     c.lua_getglobal(app.state, "spawn_done");
     defer pop(app.state, 1);
@@ -4246,27 +4149,11 @@ test "lua process.capture collects output and exit status" {
 
     try runtime.repaint();
 
-    const CaptureTest = struct {
-        app: *App,
-        ticks: usize = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "capture_done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 1000) event_loop_instance.quit();
-        }
-    };
-
     app.bindRuntime(&runtime);
     defer app.unbindRuntime();
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
-    var context: CaptureTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, CaptureTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "capture_done", 1000);
 
     c.lua_getglobal(app.state, "capture_done");
     defer pop(app.state, 1);
@@ -4393,22 +4280,7 @@ test "lua process output produced before bind is queued for readers" {
     c.lua_getglobal(app.state, "start_reader");
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
 
-    const SpawnTest = struct {
-        app: *App,
-        ticks: usize = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "spawn_done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 1000) event_loop_instance.quit();
-        }
-    };
-    var context: SpawnTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, SpawnTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "spawn_done", 1000);
 
     c.lua_getglobal(app.state, "spawn_done");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
@@ -4514,22 +4386,7 @@ test "lua socket streams chunks and finishes on peer EOF" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const SocketTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 1000) event_loop_instance.quit();
-        }
-    };
-    var context: SocketTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, SocketTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 1000);
 
     c.lua_getglobal(app.state, "done");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
@@ -4727,22 +4584,7 @@ test "lua process stdin roundtrips through cat under backpressure" {
     try app.bindEventLoop(&loop);
     defer app.unbindEventLoop();
 
-    const StdinTest = struct {
-        app: *App,
-        ticks: u32 = 0,
-
-        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.ticks += 1;
-            c.lua_getglobal(self.app.state, "done");
-            const done = c.lua_toboolean(self.app.state, -1) != 0;
-            pop(self.app.state, 1);
-            if (done or self.ticks > 5000) event_loop_instance.quit();
-        }
-    };
-    var context: StdinTest = .{ .app = &app };
-    try loop.addRepeatingTimer(1, &context, StdinTest.callback);
-    try loop.run();
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
 
     c.lua_getglobal(app.state, "done");
     try std.testing.expect(c.lua_toboolean(app.state, -1) != 0);
