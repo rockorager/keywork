@@ -383,7 +383,7 @@ pub const Runtime = struct {
     }
 };
 
-const BasicTestBackend = struct {
+const TestBackend = struct {
     fn backend(self: *@This()) RenderBackend {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
     }
@@ -461,7 +461,7 @@ test "invalidation raised during rebuild is not dropped" {
     };
 
     var app: TestApp = .{};
-    var backend: BasicTestBackend = .{};
+    var backend: TestBackend = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
         backend.backend(),
@@ -535,7 +535,7 @@ test "content height follows retained root state and respects its cap" {
     };
 
     var app: TestApp = .{};
-    var backend: BasicTestBackend = .{};
+    var backend: TestBackend = .{};
     var observer: Observer = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
@@ -573,7 +573,7 @@ test "rebuild passes that never stabilize return an error" {
     };
 
     var app: TestApp = .{};
-    var backend: BasicTestBackend = .{};
+    var backend: TestBackend = .{};
     var runtime = try Runtime.init(
         std.testing.allocator,
         backend.backend(),
@@ -642,7 +642,7 @@ test "backend capability gates damage-only display lists" {
         }
     };
 
-    const TestBackend = struct {
+    const DamageTestBackend = struct {
         allow_partial: bool = false,
         last_partial: bool = false,
         left_fills: usize = 0,
@@ -689,7 +689,7 @@ test "backend capability gates damage-only display lists" {
     };
 
     var app: TestApp = .{};
-    var backend: TestBackend = .{};
+    var backend: DamageTestBackend = .{};
     var runtime = try Runtime.init(std.testing.allocator, backend.backend(), .{ .max_width = 100, .max_height = 40 }, app.host(), .no_preference);
     defer runtime.deinit();
     try runtime.repaint();
@@ -738,25 +738,6 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
             try std.testing.expectEqual(keywork.TapSource.keyboard, event.source);
             try std.testing.expectEqual(@as(?keywork.PointerButton, null), event.button);
             self.clicks += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -819,25 +800,6 @@ test "accepted non-left buttons tap with event details, filtered buttons do noth
             self.last_button = event.button;
             self.last_source = event.source;
             self.had_local = event.local != null;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -910,25 +872,6 @@ test "in-flight press ignores other buttons until the initiating button releases
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -966,25 +909,6 @@ test "wheel scroll moves viewport content without rebuilding" {
             for (&rows) |*row| row.* = keywork.widgets.text("row");
             const column = try keywork.widgets.column(scope.allocator, &rows, 0);
             return keywork.widgets.scroll(scope.allocator, "list", column);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1033,25 +957,6 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
             for (&rows) |*row| row.* = keywork.widgets.text("row");
             const column = try keywork.widgets.column(scope.allocator, &rows, 0);
             return keywork.widgets.scroll(scope.allocator, "list", column);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1117,25 +1022,6 @@ test "non-left buttons do not start scrollbar drags" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -1195,25 +1081,6 @@ test "scrollbar reveals on scroll and fades out on the animation clock" {
             for (&rows) |*row| row.* = keywork.widgets.text("row");
             const column = try keywork.widgets.column(scope.allocator, &rows, 0);
             return keywork.widgets.scroll(scope.allocator, "list", column);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1277,25 +1144,6 @@ test "spinner sweeps on the animation clock and demands frames while mounted" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var fake_clock: FakeClock = .{ .now_ns = 5000 * std.time.ns_per_ms };
     var app: TestApp = .{};
     var backend: TestBackend = .{};
@@ -1339,25 +1187,6 @@ test "non-left buttons do not move text-input focus" {
             const label = keywork.widgets.text("label");
             const children = [_]keywork.Widget{ input, label };
             return try keywork.widgets.column(scope.allocator, &children, 4);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1417,25 +1246,6 @@ test "right click on a text input bubbles to a button-accepting ancestor" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.clicks += 1;
             self.last_button = event.button;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1509,25 +1319,6 @@ test "releasing a non-left press outside the target fires tap_cancel" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -1572,25 +1363,6 @@ test "keyboard focus scrolls its viewport to reveal the target" {
                 if (findFocusRect(child, id)) |rect| return rect;
             }
             return null;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1655,25 +1427,6 @@ test "scrolling a virtualized list converges its window in one frame" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -1723,25 +1476,6 @@ test "wheel scroll reaches a selected list nested in a flexible column slot" {
         fn buildItem(_: *const anyopaque, scope: *BuildScope, index: usize) !keywork.Widget {
             const label = try std.fmt.allocPrint(scope.allocator, "row {d}", .{index});
             return .{ .text = .{ .value = label } };
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -1825,7 +1559,7 @@ test "present damage covers every display-list change during fast wheel scroll" 
         }
     };
 
-    const TestBackend = struct {
+    const TrackingTestBackend = struct {
         allocator: std.mem.Allocator,
         prev: std.ArrayList(Entry) = .empty,
         presents: usize = 0,
@@ -1960,7 +1694,7 @@ test "present damage covers every display-list change during fast wheel scroll" 
     };
 
     var app: TestApp = .{};
-    var backend: TestBackend = .{ .allocator = std.testing.allocator };
+    var backend: TrackingTestBackend = .{ .allocator = std.testing.allocator };
     defer backend.deinit();
     var runtime = try Runtime.init(
         std.testing.allocator,
@@ -2036,25 +1770,6 @@ test "typing edits element-owned input state without rebuilding" {
                 count.* += 1;
             }
             for (node.children) |child| collectInputTexts(child, out, count);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -2140,25 +1855,6 @@ test "pointer hover restyles buttons without a full rebuild" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2221,25 +1917,6 @@ test "pointer motion fires clickable hover callbacks on enter and leave" {
         fn hoverChanged(ptr: *anyopaque, hovered: bool) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (hovered) self.enters += 1 else self.leaves += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -2311,25 +1988,6 @@ test "intent button callbacks survive dirty-state restyles" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2376,25 +2034,6 @@ test "shortcut invokes ambient action outside text input focus" {
         fn activate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.actions += 1;
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -2448,25 +2087,6 @@ test "bound tab fires its shortcut instead of traversal; shift-tab still travers
         }
 
         fn ignoreTap(_: *anyopaque, _: keywork.TapEvent) !void {}
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
     };
 
     var app: TestApp = .{};
@@ -2523,25 +2143,6 @@ test "non-editing shortcuts fire while a text input is focused" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2595,25 +2196,6 @@ test "focus widget participates in traversal and shortcut context" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2644,25 +2226,6 @@ test "autofocus focus node is selected during initial build" {
                 keywork.widgets.text("Initial focus"),
                 .{ .autofocus = true },
             );
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -2707,25 +2270,6 @@ test "autofocus replaces focused node removed during rebuild" {
             );
             const children = [_]keywork.Widget{ first, replacement };
             return keywork.widgets.column(scope.allocator, &children, 4);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -2798,25 +2342,6 @@ test "runtime requestFocus and clearFocus notify focus widgets" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2873,25 +2398,6 @@ test "focus traversal respects request and traversal policy" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -2943,25 +2449,6 @@ test "focused node becoming non-requestable falls back to autofocus" {
         }
     };
 
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
-        }
-    };
-
     var app: TestApp = .{};
     var backend: TestBackend = .{};
     var runtime = try Runtime.init(
@@ -3003,25 +2490,6 @@ test "focus scope contains tab traversal once focus is inside it" {
 
             const children = [_]keywork.Widget{ scope_a, scope_b };
             return keywork.widgets.column(scope.allocator, &children, 8);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
@@ -3074,25 +2542,6 @@ test "modal focus scope traps autofocus traversal and focus requests" {
             const after_modal = try keywork.widgets.focus(scope.allocator, .named("after-modal"), keywork.widgets.text("After modal"));
             const children = [_]keywork.Widget{ background, modal, after_modal };
             return keywork.widgets.column(scope.allocator, &children, 8);
-        }
-    };
-
-    const TestBackend = struct {
-        fn backend(self: *@This()) RenderBackend {
-            return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
-        }
-
-        fn present(_: *anyopaque, _: RenderBackend.Frame) !bool {
-            return false;
-        }
-
-        fn measureText(_: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !Size {
-            const measurer: keywork.TextMeasurer = .fixed;
-            return measurer.measureText(value, style);
-        }
-
-        fn scale(_: *anyopaque) f32 {
-            return 1;
         }
     };
 
