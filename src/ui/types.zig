@@ -11,6 +11,17 @@ pub const Color = packed struct(u32) {
     pub fn argb(a: u8, r: u8, g: u8, b: u8) Color {
         return .{ .a = a, .r = r, .g = g, .b = b };
     }
+
+    pub fn blendOver(self: Color, destination: Color, coverage: u8) Color {
+        const source_alpha = (@as(u32, self.a) * coverage + 127) / 255;
+        const inverse_alpha = 255 - source_alpha;
+        return .{
+            .a = @intCast(source_alpha + (@as(u32, destination.a) * inverse_alpha + 127) / 255),
+            .r = @intCast((@as(u32, self.r) * source_alpha + @as(u32, destination.r) * inverse_alpha + 127) / 255),
+            .g = @intCast((@as(u32, self.g) * source_alpha + @as(u32, destination.g) * inverse_alpha + 127) / 255),
+            .b = @intCast((@as(u32, self.b) * source_alpha + @as(u32, destination.b) * inverse_alpha + 127) / 255),
+        };
+    }
 };
 
 pub const colors = struct {

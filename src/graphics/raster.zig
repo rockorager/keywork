@@ -191,16 +191,7 @@ fn clampClip(value: i32, max_value: u31) usize {
 fn blendPixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Color, coverage: u8) void {
     const index = y * width + x;
     const dst: keywork.Color = @bitCast(pixels[index]);
-    const src_a = (@as(u32, color.a) * coverage + 127) / 255;
-    const inv_a = 255 - src_a;
-
-    const out: keywork.Color = .{
-        .a = @intCast(src_a + (@as(u32, dst.a) * inv_a + 127) / 255),
-        .r = @intCast((@as(u32, color.r) * src_a + @as(u32, dst.r) * inv_a + 127) / 255),
-        .g = @intCast((@as(u32, color.g) * src_a + @as(u32, dst.g) * inv_a + 127) / 255),
-        .b = @intCast((@as(u32, color.b) * src_a + @as(u32, dst.b) * inv_a + 127) / 255),
-    };
-    pixels[index] = @bitCast(out);
+    pixels[index] = @bitCast(color.blendOver(dst, coverage));
 }
 
 fn clampPixel(value: f32, max_value: u31) usize {
