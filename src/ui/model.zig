@@ -357,6 +357,9 @@ pub const Widget = union(enum) {
         value: []const u8,
         placeholder: []const u8,
         on_change: ?TextChangeCallback = null,
+        on_submit: ?TextChangeCallback = null,
+        obscured: bool = false,
+        clear_on_submit: bool = false,
         foreground: Color = colors.ink,
         background: Color = colors.white,
         border: Color = colors.ink,
@@ -1903,6 +1906,7 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
             .stateful => element.widget.stateful.destroyState(state, allocator),
             .text_input => {
                 const input_state: *TextInputState = @ptrCast(@alignCast(state));
+                std.crypto.secureZero(u8, input_state.text.items);
                 input_state.text.deinit(allocator);
                 allocator.destroy(input_state);
             },
@@ -2628,6 +2632,7 @@ fn widgetLayoutEqual(a: Widget, b: Widget) bool {
         .text_input => |a_input| blk: {
             const b_input = b.text_input;
             break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
+                a_input.obscured == b_input.obscured and
                 a_input.padding_x == b_input.padding_x and
                 a_input.padding_y == b_input.padding_y and
                 a_input.font_size == b_input.font_size;
@@ -2683,6 +2688,7 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
         .text_input => |a_input| blk: {
             const b_input = b.text_input;
             break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
+                a_input.obscured == b_input.obscured and
                 std.meta.eql(a_input.foreground, b_input.foreground) and
                 std.meta.eql(a_input.background, b_input.background) and
                 std.meta.eql(a_input.border, b_input.border) and
@@ -2973,12 +2979,16 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
             const placeholder = try allocator.dupe(u8, input_widget.placeholder);
             errdefer allocator.free(placeholder);
             const on_change = if (input_widget.on_change) |callback| try callback.clone(allocator) else null;
+            const on_submit = if (input_widget.on_submit) |callback| try callback.clone(allocator) else null;
             break :blk .{ .text_input = .{
                 .id = id,
                 .focus_node = .named(focus_node_id),
                 .value = value,
                 .placeholder = placeholder,
                 .on_change = on_change,
+                .on_submit = on_submit,
+                .obscured = input_widget.obscured,
+                .clear_on_submit = input_widget.clear_on_submit,
                 .foreground = input_widget.foreground,
                 .background = input_widget.background,
                 .border = input_widget.border,
@@ -3053,8 +3063,10 @@ fn destroyElementWidget(allocator: std.mem.Allocator, widget: *Widget) void {
         },
         .text_input => |input_widget| {
             if (input_widget.on_change) |callback| callback.destroy(allocator);
+            if (input_widget.on_submit) |callback| callback.destroy(allocator);
             allocator.free(input_widget.id);
             allocator.free(input_widget.focus_node.id);
+            if (input_widget.obscured) std.crypto.secureZero(u8, @constCast(input_widget.value));
             allocator.free(input_widget.value);
             allocator.free(input_widget.placeholder);
         },

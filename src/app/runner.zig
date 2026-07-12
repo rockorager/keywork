@@ -37,6 +37,7 @@ pub const Options = struct {
     backend: app_options.BackendKind = .log,
     decorations: wayland_options.Decorations = .server,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    session_lock: bool = false,
     log_writer: *std.Io.Writer,
     runtime_context: ?*anyopaque = null,
     /// Declarative window-set host; when present the Wayland backends run
@@ -757,6 +758,7 @@ fn runWaylandWindowed(
 
     var backend = try Backend.create(allocator);
     defer backend.destroy();
+    if (options.session_lock) try backend.beginSessionLock();
     if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
     defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
 
@@ -787,6 +789,8 @@ fn runWaylandWindowed(
     }
 
     try manager.reconcile();
+    if (backend.sessionLockDenied()) return error.SessionLockDenied;
+    if (backend.sessionLockFinished()) return;
     if (manager.shouldQuit()) return;
 
     // Loop lifetime is the manager's decision, not the backend's: zero
@@ -961,6 +965,11 @@ fn WindowManager(comptime Backend: type) type {
             // sources, so they can enqueue semantic events after the platform
             // phase. Drain those before presenting the turn's coalesced frame.
             try self.drainAll();
+            if (self.backend.sessionLockDenied()) return error.SessionLockDenied;
+            if (self.backend.sessionLockFinished()) {
+                loop.quit();
+                return;
+            }
             for (self.windows.items) |managed| {
                 if (managed.win.protocol.closed) self.reconcile_pending = true;
             }
@@ -1109,6 +1118,8 @@ fn WindowManager(comptime Backend: type) type {
                 self.backend.findOutputByName(name) orelse return error.UnknownOutput
             else
                 null;
+            if (self.options.session_lock and output == null) return error.SessionLockRequiresOutput;
+            if (self.options.session_lock and layer_shell != null) return error.ConflictingShellRoles;
 
             const win = try self.backend.createWindow(.{
                 .title = decl.title orelse self.options.title,
@@ -1118,6 +1129,7 @@ fn WindowManager(comptime Backend: type) type {
                 .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
                 .output = output,
+                .session_lock = if (self.options.session_lock) self.backend.sessionLockHandle() else null,
             });
             errdefer self.backend.destroyWindow(win);
             // Per-window wait: a global wait would clear other windows'

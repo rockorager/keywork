@@ -1162,6 +1162,8 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     pushClipboardNamespace(lua_state, app);
     c.lua_setfield(lua_state, keywork_table, "clipboard");
+    pushSessionLockNamespace(lua_state, app);
+    c.lua_setfield(lua_state, keywork_table, "session_lock");
     installWindowOperations(lua_state, keywork_table, app);
     return 1;
 }
@@ -1188,6 +1190,31 @@ fn pushClipboardNamespace(lua_state: *c.lua_State, app: *App) void {
     lua_value.setClosureField(lua_state, clipboard_table, "read", luaClipboardRead, 1);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, clipboard_table, "write", luaClipboardWrite, 1);
+}
+
+fn pushSessionLockNamespace(lua_state: *c.lua_State, app: *App) void {
+    c.lua_createtable(lua_state, 0, 2);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, -2, "unlock", luaSessionLockUnlock, 1);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, -2, "locked", luaSessionLockLocked, 1);
+}
+
+fn luaSessionLockUnlock(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    platform.unlockSession() catch |err| return lua_value.pushNilError(lua_state, err);
+    c.lua_pushboolean(lua_state, 1);
+    return 1;
+}
+
+fn luaSessionLockLocked(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const platform = app.platform orelse return lua_value.pushNilError(lua_state, error.PlatformUnavailable);
+    c.lua_pushboolean(lua_state, if (platform.sessionLocked()) 1 else 0);
+    return 1;
 }
 
 /// kw.clipboard.read() -> text | nil [, err]. Nil without an error means
@@ -1654,6 +1681,8 @@ test "keywork core excludes optional capability modules" {
         \\assert(type(kw.app.quit) == "function")
         \\assert(type(kw.app.reload) == "function")
         \\assert(type(kw.app.invalidate) == "function")
+        \\assert(type(kw.session_lock.unlock) == "function")
+        \\assert(type(kw.session_lock.locked) == "function")
         \\assert(kw.invalidate == nil)
         \\assert(kw.loop == nil)
         \\assert(kw.dbus == nil)

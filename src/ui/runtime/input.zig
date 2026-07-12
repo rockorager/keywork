@@ -144,6 +144,19 @@ pub fn keyInput(self: anytype, input: keywork.KeyInput) !void {
             const target = focus_scroll.focusedTarget(self) orelse return;
             switch (target.kind) {
                 .text_input => {
+                    const focused_id = self.focused_id orelse return;
+                    const element_root = if (self.element_root) |*root| root else return;
+                    const submitted_input = keywork.dirtyTextInputElement(element_root, focused_id) orelse return;
+                    if (submitted_input.widget.text_input.on_submit) |callback| {
+                        const state = keywork.textInputState(submitted_input);
+                        callback.call(state.text.items) catch |err| {
+                            clearSubmittedInput(submitted_input, state);
+                            return err;
+                        };
+                        clearSubmittedInput(submitted_input, state);
+                        try self.invalidateState();
+                        return;
+                    }
                     self.autofocus_suppressed = true;
                     _ = try focus_scroll.setFocused(self, null);
                     try self.invalidate();
@@ -174,6 +187,13 @@ pub fn editFocusedTextInput(self: anytype, edit: TextEdit) !void {
     }
     if (input.widget.text_input.on_change) |callback| try callback.call(state.text.items);
     try self.invalidateState();
+}
+
+fn clearSubmittedInput(input: *keywork.Element, state: anytype) void {
+    if (!input.widget.text_input.clear_on_submit) return;
+    std.crypto.secureZero(u8, state.text.items);
+    state.text.clearRetainingCapacity();
+    if (input.widget.text_input.on_change) |callback| callback.call("") catch {};
 }
 
 fn isSingleLineText(bytes: []const u8) bool {

@@ -27,6 +27,8 @@ pub const Platform = struct {
         /// recent pointer press; call from a pointer-press handler.
         start_move: *const fn (ptr: *anyopaque) anyerror!void,
         start_resize: *const fn (ptr: *anyopaque, edge: ResizeEdge) anyerror!void,
+        unlock_session: *const fn (ptr: *anyopaque) anyerror!void,
+        session_locked: *const fn (ptr: *anyopaque) bool,
     };
 
     pub fn clipboardRead(self: Platform, allocator: std.mem.Allocator) !?[]u8 {
@@ -48,6 +50,14 @@ pub const Platform = struct {
     pub fn startResize(self: Platform, edge: ResizeEdge) !void {
         return self.vtable.start_resize(self.ptr, edge);
     }
+
+    pub fn unlockSession(self: Platform) !void {
+        return self.vtable.unlock_session(self.ptr);
+    }
+
+    pub fn sessionLocked(self: Platform) bool {
+        return self.vtable.session_locked(self.ptr);
+    }
 };
 
 /// Platform implementation shared by the Wayland backends: `Backend` is
@@ -62,6 +72,8 @@ pub fn WaylandPlatform(comptime Backend: type) type {
             .activation_token = activationToken,
             .start_move = startMove,
             .start_resize = startResize,
+            .unlock_session = unlockSession,
+            .session_locked = sessionLocked,
         };
 
         pub fn platform(backend: *Backend) Platform {
@@ -108,6 +120,16 @@ pub fn WaylandPlatform(comptime Backend: type) type {
             const win = try lastPressedWindow(backend);
             try win.protocol.startResize(backend.input.seat.?, backend.input.last_button_press_serial.?, edge);
             _ = backend.connection.display.flush();
+        }
+
+        fn unlockSession(ptr: *anyopaque) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.unlockSession();
+        }
+
+        fn sessionLocked(ptr: *anyopaque) bool {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.sessionLocked();
         }
 
         /// Interactive move/resize acts on the window the most recent

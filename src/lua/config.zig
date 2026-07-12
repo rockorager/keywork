@@ -18,6 +18,9 @@ pub const Config = struct {
     /// default (server-side).
     decorations: ?wayland_options.Decorations = null,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    /// Request ext-session-lock and make every declared window a lock
+    /// surface. Each window must name an output.
+    session_lock: bool = false,
     /// The script declares its window set via a `windows` function, so
     /// it needs a windowing backend even without app-level layer_shell.
     has_windows: bool = false,
@@ -41,6 +44,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     }
     if (try checkNumberField(lua_state, table_index, "width")) |value| config.width = @floatCast(value);
     if (try checkNumberField(lua_state, table_index, "height")) |value| config.height = @floatCast(value);
+    config.session_lock = try checkBoolField(lua_state, table_index, "session_lock");
     if (try checkStringField(lua_state, table_index, "decorations")) |name| {
         config.decorations = if (std.mem.eql(u8, name, "server"))
             .server
@@ -191,6 +195,16 @@ fn checkI32Field(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8
     const max: f64 = @floatFromInt(std.math.maxInt(i32));
     if (!std.math.isFinite(value) or value < min or value > max) return invalidAppRoot("app option '{s}' is out of range", .{name});
     return @intFromFloat(value);
+}
+
+fn checkBoolField(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u8) !bool {
+    c.lua_getfield(lua_state, table_index, name.ptr);
+    defer pop(lua_state, 1);
+    return switch (c.lua_type(lua_state, -1)) {
+        c.LUA_TNIL => false,
+        c.LUA_TBOOLEAN => c.lua_toboolean(lua_state, -1) != 0,
+        else => invalidAppRoot("app option '{s}' must be a boolean", .{name}),
+    };
 }
 
 fn backendFromName(name: []const u8) ?app_options.BackendKind {

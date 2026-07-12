@@ -863,10 +863,16 @@ fn layoutElementInto(
         },
         .text_input => |input_widget| {
             const value = textInputState(element).text.items;
-            const text_value = if (value.len > 0) value else input_widget.placeholder;
+            node.text_buffer.clearRetainingCapacity();
+            const visible_value = if (input_widget.obscured and value.len > 0) blk: {
+                var graphemes = uucode.grapheme.utf8Iterator(value);
+                while (graphemes.nextGrapheme() != null) try node.text_buffer.appendSlice(allocator, "•");
+                break :blk node.text_buffer.items;
+            } else value;
+            const text_value = if (visible_value.len > 0) visible_value else input_widget.placeholder;
             const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = input_widget.font_size };
             const measured = try measurer.measureText(text_value, style);
-            const value_size = try measurer.measureText(value, style);
+            const value_size = try measurer.measureText(visible_value, style);
             const fill_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else 0;
             const requested = Size{
                 .width = @max(input_min_width, @max(measured.width + input_widget.padding_x * 2, fill_width)),
@@ -877,7 +883,8 @@ fn layoutElementInto(
             commitRenderNode(node, .{
                 .kind = .text_input,
                 .rect = .{ .x = origin.x, .y = origin.y, .width = size_value.width, .height = size_value.height },
-                .text = textInputState(element).text.items,
+                .text = visible_value,
+                .text_buffered = input_widget.obscured,
                 .text_input_id = input_widget.id,
                 .focus_id = input_widget.focus_node.id,
                 .autofocus = input_widget.autofocus,

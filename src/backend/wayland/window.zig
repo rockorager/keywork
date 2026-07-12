@@ -7,6 +7,7 @@ const wayland_options = @import("options.zig");
 const wayland = @import("wayland");
 
 const linux = std.os.linux;
+const ext = wayland.client.ext;
 const wp = wayland.client.wp;
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
@@ -23,6 +24,9 @@ const ShellRole = union(enum) {
     layer: struct {
         surface: *zwlr.LayerSurfaceV1,
     },
+    session_lock: struct {
+        surface: *ext.SessionLockSurfaceV1,
+    },
     popup: struct {
         surface: *xdg.Surface,
         popup: *xdg.Popup,
@@ -35,6 +39,7 @@ const ShellRole = union(enum) {
                 role.surface.destroy();
             },
             .layer => |role| role.surface.destroy(),
+            .session_lock => |role| role.surface.destroy(),
             .popup => |role| {
                 role.popup.destroy();
                 role.surface.destroy();
@@ -98,7 +103,7 @@ pub const Surface = struct {
         const compositor = connection.compositor orelse return error.NoWlCompositor;
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
-        const shell_role = try createShellRole(surface, output, connection.wm_base, connection.layer_shell, options);
+        const shell_role = try createShellRole(surface, output, connection.wm_base, connection.layer_shell, options.session_lock, options);
         errdefer shell_role.destroy();
         const decoration = try createDecoration(connection.decoration_manager, shell_role, options.decorations);
         errdefer if (decoration) |toplevel_decoration| toplevel_decoration.destroy();
@@ -149,6 +154,7 @@ pub const Surface = struct {
             .xdg => |role| role.surface,
             .popup => |role| role.surface,
             .layer => null,
+            .session_lock => return error.PopupUnsupported,
         };
         const popup = try xdg_surface.getPopup(parent_xdg_surface, positioner);
         errdefer popup.destroy();
@@ -229,6 +235,7 @@ pub const Surface = struct {
                 role.toplevel.setListener(*Surface, toplevelListener, self);
             },
             .layer => |role| role.surface.setListener(*Surface, layerSurfaceListener, self),
+            .session_lock => |role| role.surface.setListener(*Surface, sessionLockSurfaceListener, self),
             .popup => |role| {
                 role.surface.setListener(*Surface, xdgSurfaceListener, self);
                 role.popup.setListener(*Surface, popupListener, self);
@@ -303,6 +310,10 @@ pub const Surface = struct {
         self.width = width;
         self.height = height;
         self.surface.commit();
+    }
+
+    pub fn isSessionLock(self: *const Surface) bool {
+        return self.shell_role == .session_lock;
     }
 
     pub fn configureGeneration(self: *const Surface) u64 {
@@ -449,6 +460,19 @@ pub const Surface = struct {
                 self.repaint_pending = true;
             },
             .closed => self.closed = true,
+        }
+    }
+
+    fn sessionLockSurfaceListener(lock_surface: *ext.SessionLockSurfaceV1, event: ext.SessionLockSurfaceV1.Event, self: *Surface) void {
+        switch (event) {
+            .configure => |configure| {
+                lock_surface.ackConfigure(configure.serial);
+                self.width = @intCast(configure.width);
+                self.height = @intCast(configure.height);
+                self.configured = true;
+                self.configure_generation +%= 1;
+                self.repaint_pending = true;
+            },
         }
     }
 
@@ -607,6 +631,7 @@ pub const Connection = struct {
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     data_device_manager: ?*wl.DataDeviceManager = null,
     activation: ?*xdg.ActivationV1 = null,
+    session_lock_manager: ?*ext.SessionLockManagerV1 = null,
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
     seat: ?*wl.Seat = null,
     /// True once the first seat global has been bound. Survives takeSeat()
@@ -672,6 +697,7 @@ pub const Connection = struct {
         if (self.seat) |seat| destroySeat(seat);
         releaseOutputs(self.allocator, &self.outputs);
         if (self.decoration_manager) |manager| manager.destroy();
+        if (self.session_lock_manager) |manager| manager.destroy();
         if (self.activation) |activation| activation.destroy();
         if (self.data_device_manager) |manager| manager.destroy();
         if (self.cursor_shape_manager) |manager| manager.destroy();
@@ -835,6 +861,9 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
             } else if (std.mem.orderZ(u8, global.interface, xdg.ActivationV1.interface.name) == .eq) {
                 if (self.activation == null)
                     self.activation = registry.bind(global.name, xdg.ActivationV1, @min(global.version, xdg.ActivationV1.generated_version)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, ext.SessionLockManagerV1.interface.name) == .eq) {
+                if (self.session_lock_manager == null)
+                    self.session_lock_manager = registry.bind(global.name, ext.SessionLockManagerV1, @min(global.version, ext.SessionLockManagerV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
                 if (self.decoration_manager == null)
                     self.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, @min(global.version, zxdg.DecorationManagerV1.generated_version)) catch return;
@@ -961,8 +990,14 @@ fn createShellRole(
     output: ?*wl.Output,
     wm_base: ?*xdg.WmBase,
     layer_shell: ?*zwlr.LayerShellV1,
+    session_lock: ?*SessionLock,
     options: anytype,
 ) !ShellRole {
+    if (session_lock) |lock| {
+        const lock_output = output orelse return error.SessionLockRequiresOutput;
+        const lock_surface = try lock.getSurface(surface, lock_output);
+        return .{ .session_lock = .{ .surface = lock_surface } };
+    }
     if (options.layer_shell) |layer_options| {
         const shell = layer_shell orelse return error.NoLayerShell;
         const layer_surface = try shell.getLayerSurface(surface, output, layer(layer_options.layer), layer_options.namespace);
@@ -989,6 +1024,108 @@ fn createShellRole(
     toplevel.setTitle(options.title);
     return .{ .xdg = .{ .surface = xdg_surface, .toplevel = toplevel } };
 }
+
+/// One session-lock request shared by every output surface in a lock client.
+/// If the client exits after `locked`, the proxy is intentionally abandoned:
+/// disconnecting must fail closed rather than sending an invalid destroy.
+pub const SessionLock = struct {
+    display: *wl.Display,
+    object: ?*ext.SessionLockV1,
+    sync_callback: ?*wl.Callback = null,
+    state: State = .pending,
+
+    pub const State = enum {
+        pending,
+        locked,
+        denied,
+        unlocking,
+        unlocked,
+    };
+
+    pub fn init(connection: *Connection) !SessionLock {
+        const manager = connection.session_lock_manager orelse return error.NoSessionLock;
+        const object = try manager.lock();
+        return .{ .display = connection.display, .object = object };
+    }
+
+    /// Rebind the listener after moving the value into its stable backend
+    /// storage. Protocol callbacks must never retain the temporary init stack.
+    pub fn attachListener(self: *SessionLock) void {
+        self.object.?.setListener(*SessionLock, listener, self);
+    }
+
+    pub fn deinit(self: *SessionLock) void {
+        if (self.sync_callback) |callback| callback.destroy();
+        self.sync_callback = null;
+        const object = self.object orelse return;
+        if (self.state != .locked) object.destroy();
+        self.object = null;
+    }
+
+    pub fn getSurface(self: *SessionLock, surface: *wl.Surface, output: *wl.Output) !*ext.SessionLockSurfaceV1 {
+        const object = self.object orelse return error.SessionLockFinished;
+        if (self.state != .pending and self.state != .locked) return error.SessionLockFinished;
+        return object.getLockSurface(surface, output);
+    }
+
+    pub fn unlock(self: *SessionLock, display: *wl.Display) !void {
+        if (self.state != .locked) return error.SessionNotLocked;
+        const object = self.object orelse return error.SessionLockFinished;
+        object.unlockAndDestroy();
+        self.object = null;
+        self.state = .unlocked;
+        // The protocol requires a sync before a lock client exits so the
+        // compositor has definitely processed unlock_and_destroy.
+        if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    }
+
+    pub fn finished(self: *const SessionLock) bool {
+        return self.state == .denied or self.state == .unlocked;
+    }
+
+    pub fn denied(self: *const SessionLock) bool {
+        return self.state == .denied;
+    }
+
+    pub fn locked(self: *const SessionLock) bool {
+        return self.state == .locked;
+    }
+
+    fn listener(_: *ext.SessionLockV1, event: ext.SessionLockV1.Event, self: *SessionLock) void {
+        switch (event) {
+            .locked => self.state = .locked,
+            .finished => {
+                const object = self.object orelse return;
+                if (self.state == .locked) {
+                    object.unlockAndDestroy();
+                    self.object = null;
+                    self.state = .unlocking;
+                    const callback = self.display.sync() catch {
+                        _ = self.display.flush();
+                        self.state = .unlocked;
+                        return;
+                    };
+                    self.sync_callback = callback;
+                    callback.setListener(*SessionLock, syncListener, self);
+                } else {
+                    object.destroy();
+                    self.object = null;
+                    self.state = .denied;
+                }
+            },
+        }
+    }
+
+    fn syncListener(callback: *wl.Callback, event: wl.Callback.Event, self: *SessionLock) void {
+        switch (event) {
+            .done => {
+                if (self.sync_callback == callback) self.sync_callback = null;
+                callback.destroy();
+                self.state = .unlocked;
+            },
+        }
+    }
+};
 
 /// The positioner anchor is the point on the anchor rect the popup
 /// attaches to: the requested edge, adjusted along it by the alignment.

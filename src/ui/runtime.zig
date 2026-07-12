@@ -1585,6 +1585,46 @@ test "typing edits element-owned input state without rebuilding" {
     try std.testing.expectEqualStrings("hi", app.lastChange());
 }
 
+test "obscured input masks graphemes and clears after submit" {
+    const TestApp = struct {
+        submitted: [32]u8 = undefined,
+        submitted_len: usize = 0,
+
+        fn buildWidget(ptr: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var input = keywork.widgets.textInput("password", "", "Password");
+            input.text_input.autofocus = true;
+            input.text_input.obscured = true;
+            input.text_input.clear_on_submit = true;
+            input.text_input.on_submit = .{ .ptr = self, .call_fn = submit };
+            return input;
+        }
+
+        fn submit(ptr: *anyopaque, text: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.submitted_len = @min(text.len, self.submitted.len);
+            @memcpy(self.submitted[0..self.submitted_len], text[0..self.submitted_len]);
+        }
+
+        fn submittedText(self: *const @This()) []const u8 {
+            return self.submitted[0..self.submitted_len];
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
+    defer runtime.deinit();
+
+    try runtime.keyInput(.{ .text = "a" });
+    try runtime.keyInput(.{ .text = "e\xcc\x81" });
+    try std.testing.expectEqualStrings("••", renderedInputText(runtime.root.?).?);
+    try runtime.keyInput(.enter);
+    try std.testing.expectEqualStrings("ae\xcc\x81", app.submittedText());
+    try std.testing.expectEqualStrings("", renderedInputText(runtime.root.?).?);
+    try std.testing.expectEqualStrings("password", runtime.focused_id.?);
+}
+
 test "pointer hover restyles buttons without a full rebuild" {
     const TestApp = struct {
         builds: usize = 0,

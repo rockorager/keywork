@@ -21,6 +21,7 @@ pub fn Backend(comptime RendererAdapter: type) type {
         renderer: RendererAdapter.BackendResources,
         windows: std.ArrayList(*Window),
         clipboard: ?*data_device.Clipboard = null,
+        session_lock: ?window.SessionLock = null,
 
         pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
         pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -38,6 +39,7 @@ pub fn Backend(comptime RendererAdapter: type) type {
             decorations: wayland_options.Decorations = .server,
             layer_shell: ?wayland_options.LayerShellOptions = null,
             output: ?*wl.Output = null,
+            session_lock: ?*window.SessionLock = null,
         };
 
         pub fn create(allocator: std.mem.Allocator) !*Self {
@@ -65,6 +67,7 @@ pub fn Backend(comptime RendererAdapter: type) type {
             while (self.windows.items.len > 0) self.destroyWindow(self.windows.items[self.windows.items.len - 1]);
             self.windows.deinit(self.allocator);
             if (self.clipboard) |clipboard| clipboard.destroy();
+            if (self.session_lock) |*lock| lock.deinit();
             RendererAdapter.deinitBackend(&self.renderer);
             self.input.deinit();
             self.connection.deinit();
@@ -82,6 +85,33 @@ pub fn Backend(comptime RendererAdapter: type) type {
             try win.protocol.attachListeners();
             if (@hasDecl(RendererAdapter, "afterWindowListeners")) RendererAdapter.afterWindowListeners(self, win);
             return win;
+        }
+
+        pub fn beginSessionLock(self: *Self) !void {
+            if (self.session_lock != null) return error.SessionLockAlreadyStarted;
+            self.session_lock = try window.SessionLock.init(self.connection);
+            self.session_lock.?.attachListener();
+        }
+
+        pub fn sessionLockHandle(self: *Self) ?*window.SessionLock {
+            return if (self.session_lock) |*lock| lock else null;
+        }
+
+        pub fn sessionLockFinished(self: *const Self) bool {
+            return if (self.session_lock) |*lock| lock.finished() else false;
+        }
+
+        pub fn sessionLockDenied(self: *const Self) bool {
+            return if (self.session_lock) |*lock| lock.denied() else false;
+        }
+
+        pub fn sessionLocked(self: *const Self) bool {
+            return if (self.session_lock) |*lock| lock.locked() else false;
+        }
+
+        pub fn unlockSession(self: *Self) !void {
+            const lock = self.sessionLockHandle() orelse return error.NoSessionLock;
+            try lock.unlock(self.connection.display);
         }
 
         pub fn createPopup(self: *Self, parent: *Window, options: window.PopupOptions) !*Window {
@@ -163,7 +193,8 @@ pub fn Backend(comptime RendererAdapter: type) type {
         }
 
         pub fn waitForAllConfigured(self: *Self) !void {
-            while (!self.allConfigured() and !self.allClosed()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            while (!self.allConfigured() and !self.allClosed() and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (self.allClosed()) return error.WindowClosed;
             for (self.windows.items) |win| {
                 _ = win.protocol.flushPending();
@@ -171,13 +202,15 @@ pub fn Backend(comptime RendererAdapter: type) type {
             }
         }
         pub fn waitForConfigured(self: *Self, win: *Window) !void {
-            while (!win.protocol.configured and !win.protocol.closed) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            while (!win.protocol.configured and !win.protocol.closed and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (win.protocol.closed) return error.WindowClosed;
             _ = win.protocol.flushPending();
             self.input.setTargetScale(&win.input_target, win.protocol.scale);
         }
         pub fn waitForConfigureAfter(self: *Self, win: *Window, generation: u64) !void {
-            while (win.protocol.configureGeneration() == generation and !win.protocol.closed) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            while (win.protocol.configureGeneration() == generation and !win.protocol.closed and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+            if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (win.protocol.closed) return error.WindowClosed;
             _ = win.protocol.flushPending();
             self.input.setTargetScale(&win.input_target, win.protocol.scale);

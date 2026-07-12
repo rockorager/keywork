@@ -39,6 +39,7 @@ const RendererAdapter = struct {
     }
 
     pub fn afterWindowListeners(backend: anytype, win: anytype) void {
+        if (win.protocol.isSessionLock()) return;
         win.protocol.surface.commit();
         _ = backend.connection.display.flush();
     }

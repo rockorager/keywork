@@ -16,6 +16,7 @@ const RendererAdapter = struct {
     pub fn deinitBackend(_: *BackendResources) void {}
 
     pub fn beforeWindowRendererInit(backend: anytype, protocol: *window.Surface) void {
+        if (protocol.isSessionLock()) return;
         protocol.surface.commit();
         _ = backend.connection.display.flush();
     }

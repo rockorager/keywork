@@ -36,7 +36,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;
     // Apps declaring a window set need a windowing backend by default.
     const backend = run_options.backend orelse window.backend orelse
-        if (layer_shell != null or window.has_windows) app_options.BackendKind.wayland_shm else .log;
+        if (layer_shell != null or window.has_windows or window.session_lock) app_options.BackendKind.wayland_shm else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
 
@@ -52,6 +52,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .backend = backend,
         .decorations = window.decorations orelse .server,
         .layer_shell = layer_shell,
+        .session_lock = window.session_lock,
         .log_writer = &stdout_writer.interface,
         .runtime_context = &self.lua,
         .windows_host = self.lua.windowsHost(),

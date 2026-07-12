@@ -151,6 +151,8 @@ const SeparatorOptions = struct {
 
 const TextInputOptions = struct {
     variant: ?[]const u8 = null,
+    obscured: bool = false,
+    clear_on_submit: bool = false,
     background: ?keywork.Color = null,
     foreground: ?keywork.Color = null,
     placeholder_color: ?keywork.Color = null,
@@ -898,10 +900,14 @@ pub fn parse(
         const placeholder = try dupeStringField(lua_state, allocator, table, "placeholder");
         const value = dupeStringField(lua_state, allocator, table, "value") catch try allocator.dupe(u8, "");
         const on_change = try getOptionalTextChangeCallbackField(lua_state, callback_allocator, table, "on_change");
+        const on_submit = try getOptionalTextChangeCallbackField(lua_state, callback_allocator, table, "on_submit");
         var widget = keywork.widgets.textInput(id, value, placeholder);
         const options = try lua_codec.decode(TextInputOptions, lua_state, table, allocator);
         widget.text_input.style = options.style();
         widget.text_input.on_change = on_change;
+        widget.text_input.on_submit = on_submit;
+        widget.text_input.obscured = options.obscured;
+        widget.text_input.clear_on_submit = options.clear_on_submit;
         widget.text_input.autofocus = boolField(lua_state, table, "autofocus");
         return widget;
     }
