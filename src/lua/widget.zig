@@ -1058,7 +1058,7 @@ pub fn parse(
         );
     }
     if (std.mem.eql(u8, kind, "image")) {
-        return try lua_image.parse(lua_state, allocator, table);
+        return try lua_image.parse(lua_state, allocator, parse_context.png_dims, table);
     }
     if (std.mem.eql(u8, kind, "icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);

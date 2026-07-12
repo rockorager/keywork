@@ -19,11 +19,50 @@ const log = std.log.scoped(.keywork_image);
 const max_image_dim = 16384;
 const max_image_pixels = 16 << 20;
 
+const Fit = enum {
+    fill,
+    cover,
+    contain,
+    none,
+};
+
+const Alignment = enum {
+    top_left,
+    top_center,
+    top_right,
+    center_left,
+    center,
+    center_right,
+    bottom_left,
+    bottom_center,
+    bottom_right,
+
+    fn horizontal(self: Alignment) f32 {
+        return switch (self) {
+            .top_left, .center_left, .bottom_left => 0,
+            .top_center, .center, .bottom_center => 0.5,
+            .top_right, .center_right, .bottom_right => 1,
+        };
+    }
+
+    fn vertical(self: Alignment) f32 {
+        return switch (self) {
+            .top_left, .top_center, .top_right => 0,
+            .center_left, .center, .center_right => 0.5,
+            .bottom_left, .bottom_center, .bottom_right => 1,
+        };
+    }
+};
+
 const Options = struct {
+    path: ?[]const u8 = null,
     width: u32 = 0,
     height: u32 = 0,
     size: ?f32 = null,
     format: []const u8 = "argb32",
+    fit: Fit = .fill,
+    @"align": Alignment = .center,
+    revision: f64 = 0,
 };
 
 const Image = struct {
@@ -32,6 +71,8 @@ const Image = struct {
     size: f32,
     preserve_aspect: bool = false,
     pixels: []keywork.Color,
+    fit: Fit,
+    alignment: Alignment,
     cache_key: u64,
 
     const vtable: keywork.Widget.RenderObject.VTable = .{
@@ -64,21 +105,28 @@ const Image = struct {
         if (context.rect.width <= 0 or context.rect.height <= 0) return;
         if (self.width == 0 or self.height == 0) return;
 
+        const geometry = fittedGeometry(context.rect, self.width, self.height, self.fit, self.alignment);
+        if (geometry.rect.width <= 0 or geometry.rect.height <= 0) return;
+
         // The renderer blits image pixels 1:1 at physical resolution, so
         // the source must be resampled to rect * scale (like svg_icon).
         const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
-        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.width * render_scale))));
-        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.height * render_scale))));
+        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.width * render_scale))));
+        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.height * render_scale))));
 
         var hasher = std.hash.Wyhash.init(self.cache_key);
         hasher.update(std.mem.asBytes(&target_width));
         hasher.update(std.mem.asBytes(&target_height));
+        hasher.update(std.mem.asBytes(&geometry.source.x));
+        hasher.update(std.mem.asBytes(&geometry.source.y));
+        hasher.update(std.mem.asBytes(&geometry.source.width));
+        hasher.update(std.mem.asBytes(&geometry.source.height));
         const cache_key = hasher.final();
 
         if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
             try context.display_list.colorImage(
                 context.allocator,
-                context.rect,
+                geometry.rect,
                 target_width,
                 target_height,
                 cached,
@@ -87,11 +135,11 @@ const Image = struct {
             return;
         }
 
-        const pixels = try resampledPixels(context.allocator, self.pixels, self.width, self.height, target_width, target_height);
+        const pixels = try resampledPixels(context.allocator, self.pixels, self.width, self.height, target_width, target_height, geometry.source);
         const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
-            context.rect,
+            geometry.rect,
             target_width,
             target_height,
             cached,
@@ -109,6 +157,8 @@ const Image = struct {
             .size = self.size,
             .preserve_aspect = self.preserve_aspect,
             .pixels = try allocator.dupe(keywork.Color, self.pixels),
+            .fit = self.fit,
+            .alignment = self.alignment,
             .cache_key = self.cache_key,
         };
         return result;
@@ -121,15 +171,25 @@ const Image = struct {
     }
 };
 
-pub fn parse(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) !keywork.Widget {
+pub fn parse(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    dims_cache: ?*DimsCache,
+    table: c_int,
+) !keywork.Widget {
     const options = try lua_codec.decode(Options, lua_state, table, allocator);
+
+    c.lua_getfield(lua_state, table, "pixels");
+    defer pop(lua_state, 1);
+    const has_pixels = !c.lua_isnil(lua_state, -1);
+    if ((options.path != null) == has_pixels) return error.InvalidImageSource;
+    if (options.path) |path| return fileImage(allocator, dims_cache, path, options);
+
     if (options.width == 0 or options.height == 0) return error.InvalidImageSize;
     if (options.width > max_image_dim or options.height > max_image_dim) return error.InvalidImageSize;
     if (@as(u64, options.width) * options.height > max_image_pixels) return error.InvalidImageSize;
     if (!std.mem.eql(u8, options.format, "argb32")) return error.UnsupportedImageFormat;
 
-    c.lua_getfield(lua_state, table, "pixels");
-    defer pop(lua_state, 1);
     const pixels = try parseArgb32Pixels(lua_state, allocator, -1, options.width, options.height);
     errdefer allocator.free(pixels);
 
@@ -145,28 +205,32 @@ pub fn parse(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int
         .height = options.height,
         .size = options.size orelse @floatFromInt(@max(options.width, options.height)),
         .pixels = pixels,
+        .fit = options.fit,
+        .alignment = options.@"align",
         .cache_key = hasher.final(),
     };
     return image.widget();
 }
 
-/// PNG-backed icon that defers pixel decoding to paint time. Widget parsing
-/// happens on every rebuild (every scroll frame for visible list rows), so
-/// it must stay free of decode work: only the header is read here for the
-/// intrinsic aspect ratio. Paint decodes once per path+target size and the
-/// pixels then live in the display list's color cache.
-const PngIcon = struct {
+/// File-backed image that defers pixel decoding to paint time. Widget parsing
+/// happens on every rebuild, so only the header is read here for intrinsic
+/// dimensions. Paint decodes once per file revision and target geometry.
+const FileImage = struct {
     path: []const u8,
-    size: f32,
+    width: f32,
+    height: f32,
     source_width: u32,
     source_height: u32,
+    fit: Fit,
+    alignment: Alignment,
+    source_key: u64,
 
     const vtable: keywork.Widget.RenderObject.VTable = .{
         .layout = layout,
         .paint = paint,
     };
 
-    fn widget(self: *PngIcon) keywork.Widget {
+    fn widget(self: *FileImage) keywork.Widget {
         return .{ .render_object = .{
             .ptr = self,
             .vtable = &vtable,
@@ -176,35 +240,43 @@ const PngIcon = struct {
     }
 
     fn layout(ptr: *const anyopaque, context: keywork.Widget.RenderObject.LayoutContext) !keywork.Size {
-        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
-        const longest: f32 = @floatFromInt(@max(self.source_width, self.source_height));
-        const width = self.size * @as(f32, @floatFromInt(self.source_width)) / longest;
-        const height = self.size * @as(f32, @floatFromInt(self.source_height)) / longest;
+        const self: *const FileImage = @ptrCast(@alignCast(ptr));
         return .{
-            .width = @min(width, context.constraints.max_width),
-            .height = @min(height, context.constraints.max_height),
+            .width = @min(self.width, context.constraints.max_width),
+            .height = @min(self.height, context.constraints.max_height),
         };
     }
 
     fn paint(ptr: *const anyopaque, context: keywork.Widget.RenderObject.PaintContext) !void {
-        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
+        const self: *const FileImage = @ptrCast(@alignCast(ptr));
         if (context.rect.width <= 0 or context.rect.height <= 0) return;
 
-        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
-        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.width * render_scale))));
-        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(context.rect.height * render_scale))));
+        const geometry = fittedGeometry(
+            context.rect,
+            self.source_width,
+            self.source_height,
+            self.fit,
+            self.alignment,
+        );
+        if (geometry.rect.width <= 0 or geometry.rect.height <= 0) return;
 
-        var path_hasher = std.hash.Wyhash.init(0);
-        path_hasher.update(self.path);
-        var hasher = std.hash.Wyhash.init(path_hasher.final());
+        const render_scale = if (std.math.isFinite(context.scale) and context.scale > 0) context.scale else 1;
+        const target_width: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.width * render_scale))));
+        const target_height: u32 = @max(1, @as(u32, @intFromFloat(@ceil(geometry.rect.height * render_scale))));
+
+        var hasher = std.hash.Wyhash.init(self.source_key);
         hasher.update(std.mem.asBytes(&target_width));
         hasher.update(std.mem.asBytes(&target_height));
+        hasher.update(std.mem.asBytes(&geometry.source.x));
+        hasher.update(std.mem.asBytes(&geometry.source.y));
+        hasher.update(std.mem.asBytes(&geometry.source.width));
+        hasher.update(std.mem.asBytes(&geometry.source.height));
         const cache_key = hasher.final();
 
         if (context.raster_cache.cachedColorImage(cache_key, target_width, target_height)) |cached| {
             try context.display_list.colorImage(
                 context.allocator,
-                context.rect,
+                geometry.rect,
                 target_width,
                 target_height,
                 cached,
@@ -224,12 +296,12 @@ const PngIcon = struct {
         // reopen it or warn again.
         const source_bytes = image_c.stbi_load(path_z.ptr, &source_width, &source_height, &source_channels, 4) orelse {
             log.warn("image decode failed: {s}", .{self.path});
-            return paintTombstone(context, target_width, target_height, cache_key);
+            return paintTombstone(context, geometry.rect, target_width, target_height, cache_key);
         };
         defer image_c.stbi_image_free(source_bytes);
         const dims = checkedDims(source_width, source_height) catch {
             log.warn("image rejected ({d}x{d}): {s}", .{ source_width, source_height, self.path });
-            return paintTombstone(context, target_width, target_height, cache_key);
+            return paintTombstone(context, geometry.rect, target_width, target_height, cache_key);
         };
 
         const pixel_count = @as(usize, dims.width) * dims.height;
@@ -244,11 +316,12 @@ const PngIcon = struct {
             dims.height,
             target_width,
             target_height,
+            geometry.source,
         );
         const cached = try context.raster_cache.insertColor(context.allocator, cache_key, target_width, target_height, pixels);
         try context.display_list.colorImage(
             context.allocator,
-            context.rect,
+            geometry.rect,
             target_width,
             target_height,
             cached,
@@ -257,30 +330,100 @@ const PngIcon = struct {
     }
 
     fn clone(allocator: std.mem.Allocator, ptr: *const anyopaque) !*anyopaque {
-        const self: *const PngIcon = @ptrCast(@alignCast(ptr));
-        const result = try allocator.create(PngIcon);
+        const self: *const FileImage = @ptrCast(@alignCast(ptr));
+        const result = try allocator.create(FileImage);
         errdefer allocator.destroy(result);
         result.* = .{
             .path = try allocator.dupe(u8, self.path),
-            .size = self.size,
+            .width = self.width,
+            .height = self.height,
             .source_width = self.source_width,
             .source_height = self.source_height,
+            .fit = self.fit,
+            .alignment = self.alignment,
+            .source_key = self.source_key,
         };
         return result;
     }
 
     fn destroy(allocator: std.mem.Allocator, ptr: *const anyopaque) void {
-        const self: *PngIcon = @ptrCast(@alignCast(@constCast(ptr)));
+        const self: *FileImage = @ptrCast(@alignCast(@constCast(ptr)));
         allocator.free(self.path);
         allocator.destroy(self);
     }
 };
+
+const SourceRect = struct {
+    x: f64 = 0,
+    y: f64 = 0,
+    width: f64 = 1,
+    height: f64 = 1,
+};
+
+const FittedGeometry = struct {
+    rect: keywork.Rect,
+    source: SourceRect = .{},
+};
+
+fn fittedGeometry(rect: keywork.Rect, source_width: u32, source_height: u32, fit: Fit, alignment: Alignment) FittedGeometry {
+    const width: f32 = @floatFromInt(source_width);
+    const height: f32 = @floatFromInt(source_height);
+    const horizontal = alignment.horizontal();
+    const vertical = alignment.vertical();
+
+    return switch (fit) {
+        .fill => .{ .rect = rect },
+        .contain => blk: {
+            const scale = @min(rect.width / width, rect.height / height);
+            const fitted_width = width * scale;
+            const fitted_height = height * scale;
+            break :blk .{ .rect = .{
+                .x = rect.x + (rect.width - fitted_width) * horizontal,
+                .y = rect.y + (rect.height - fitted_height) * vertical,
+                .width = fitted_width,
+                .height = fitted_height,
+            } };
+        },
+        .cover => blk: {
+            const source_aspect = width / height;
+            const target_aspect = rect.width / rect.height;
+            var source: SourceRect = .{};
+            if (source_aspect > target_aspect) {
+                source.width = target_aspect / source_aspect;
+                source.x = (1 - source.width) * horizontal;
+            } else if (source_aspect < target_aspect) {
+                source.height = source_aspect / target_aspect;
+                source.y = (1 - source.height) * vertical;
+            }
+            break :blk .{ .rect = rect, .source = source };
+        },
+        .none => blk: {
+            const fitted_width = @min(width, rect.width);
+            const fitted_height = @min(height, rect.height);
+            break :blk .{
+                .rect = .{
+                    .x = rect.x + (rect.width - fitted_width) * horizontal,
+                    .y = rect.y + (rect.height - fitted_height) * vertical,
+                    .width = fitted_width,
+                    .height = fitted_height,
+                },
+                .source = .{
+                    .x = @as(f64, @floatCast((width - fitted_width) * horizontal / width)),
+                    .y = @as(f64, @floatCast((height - fitted_height) * vertical / height)),
+                    .width = @as(f64, @floatCast(fitted_width / width)),
+                    .height = @as(f64, @floatCast(fitted_height / height)),
+                },
+            };
+        },
+    };
+}
 
 /// Caches a fully transparent image under the icon's key so later paints
 /// hit the cache instead of reopening the broken file; the backends skip
 /// zero-alpha pixels, so it draws nothing.
 fn paintTombstone(
     context: keywork.Widget.RenderObject.PaintContext,
+    rect: keywork.Rect,
     width: u32,
     height: u32,
     cache_key: u64,
@@ -288,18 +431,20 @@ fn paintTombstone(
     const pixels = try context.allocator.alloc(keywork.Color, @as(usize, width) * height);
     @memset(pixels, keywork.colors.transparent);
     const cached = try context.raster_cache.insertColor(context.allocator, cache_key, width, height, pixels);
-    try context.display_list.colorImage(context.allocator, context.rect, width, height, cached, cache_key);
+    try context.display_list.colorImage(context.allocator, rect, width, height, cached, cache_key);
 }
 
-/// Caches intrinsic image dimensions per path so widget parsing (every
-/// rebuild of a visible list row) skips the stbi_info header read.
-/// Probe failures tombstone like the icon-theme cache: a broken file
-/// stays broken until the process restarts, and warns only once.
+/// Caches intrinsic image dimensions per path and file fingerprint so widget
+/// rebuilds avoid repeated header reads without hiding same-path replacements.
 pub const DimsCache = struct {
     allocator: std.mem.Allocator,
-    entries: std.StringHashMapUnmanaged(?Dims) = .empty,
+    entries: std.StringHashMapUnmanaged(Entry) = .empty,
 
     pub const Dims = struct { width: u32, height: u32 };
+    const Entry = struct {
+        fingerprint: u64,
+        dims: ?Dims,
+    };
 
     pub fn init(allocator: std.mem.Allocator) DimsCache {
         return .{ .allocator = allocator };
@@ -311,16 +456,30 @@ pub const DimsCache = struct {
         self.entries.deinit(self.allocator);
     }
 
-    fn lookup(self: *DimsCache, path: []const u8) !?Dims {
-        if (self.entries.get(path)) |cached| return cached;
-        const dims: ?Dims = probeDims(self.allocator, path) catch |err| switch (err) {
+    fn lookup(self: *DimsCache, path: []const u8, fingerprint: ?u64) !?Dims {
+        if (self.entries.getPtr(path)) |entry| {
+            const changed_fingerprint = fingerprint orelse return entry.dims;
+            if (entry.fingerprint == changed_fingerprint) return entry.dims;
+            entry.* = .{
+                .fingerprint = changed_fingerprint,
+                .dims = try cachedProbe(self.allocator, path),
+            };
+            return entry.dims;
+        }
+
+        const dims = try cachedProbe(self.allocator, path);
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        try self.entries.put(self.allocator, key, .{ .fingerprint = fingerprint orelse 0, .dims = dims });
+        return dims;
+    }
+
+    fn cachedProbe(allocator: std.mem.Allocator, path: []const u8) !?Dims {
+        const dims: ?Dims = probeDims(allocator, path) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
         if (dims == null) log.warn("unreadable image: {s}", .{path});
-        const key = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(key);
-        try self.entries.put(self.allocator, key, dims);
         return dims;
     }
 };
@@ -344,23 +503,144 @@ fn checkedDims(width: c_int, height: c_int) !DimsCache.Dims {
     return .{ .width = w, .height = h };
 }
 
+fn fileImage(allocator: std.mem.Allocator, dims_cache: ?*DimsCache, path: []const u8, options: Options) !keywork.Widget {
+    if (path.len == 0) return error.InvalidImage;
+    if (options.size) |size| {
+        if (!std.math.isFinite(size) or size <= 0) return error.InvalidImageSize;
+    }
+
+    const revision = try imageRevision(options.revision);
+    const fingerprint = try fileFingerprint(allocator, path);
+    var revision_hasher = std.hash.Wyhash.init(fingerprint);
+    revision_hasher.update(std.mem.asBytes(&revision));
+    const dims = if (dims_cache) |cache|
+        (try cache.lookup(path, revision_hasher.final())) orelse return error.InvalidImage
+    else
+        try probeDims(allocator, path);
+    const preferred = preferredImageSize(dims, options);
+    return createFileImage(
+        allocator,
+        path,
+        dims,
+        preferred,
+        options.fit,
+        options.@"align",
+        fingerprint,
+        revision,
+    );
+}
+
 pub fn pngIcon(allocator: std.mem.Allocator, dims_cache: ?*DimsCache, path: []const u8, size: f32) !keywork.Widget {
     // Only the header is read for the intrinsic dimensions; the pixels
     // are decoded lazily at paint.
     const dims = if (dims_cache) |cache|
-        (try cache.lookup(path)) orelse return error.InvalidImage
+        (try cache.lookup(path, null)) orelse return error.InvalidImage
     else
         try probeDims(allocator, path);
 
-    const icon = try allocator.create(PngIcon);
-    errdefer allocator.destroy(icon);
-    icon.* = .{
+    const longest: f32 = @floatFromInt(@max(dims.width, dims.height));
+    const logical_size: f32 = @floatFromInt(positiveImageSize(size));
+    const preferred: keywork.Size = .{
+        .width = logical_size * @as(f32, @floatFromInt(dims.width)) / longest,
+        .height = logical_size * @as(f32, @floatFromInt(dims.height)) / longest,
+    };
+    return createFileImage(allocator, path, dims, preferred, .contain, .center, 0, 0);
+}
+
+fn createFileImage(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    dims: DimsCache.Dims,
+    preferred: keywork.Size,
+    fit: Fit,
+    alignment: Alignment,
+    fingerprint: u64,
+    revision: u64,
+) !keywork.Widget {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(path);
+    hasher.update(std.mem.asBytes(&fingerprint));
+    hasher.update(std.mem.asBytes(&revision));
+    hasher.update(std.mem.asBytes(&dims.width));
+    hasher.update(std.mem.asBytes(&dims.height));
+    const fit_value: u8 = @intFromEnum(fit);
+    const alignment_value: u8 = @intFromEnum(alignment);
+    hasher.update(std.mem.asBytes(&fit_value));
+    hasher.update(std.mem.asBytes(&alignment_value));
+
+    const image = try allocator.create(FileImage);
+    errdefer allocator.destroy(image);
+    image.* = .{
         .path = try allocator.dupe(u8, path),
-        .size = @floatFromInt(positiveImageSize(size)),
+        .width = preferred.width,
+        .height = preferred.height,
         .source_width = dims.width,
         .source_height = dims.height,
+        .fit = fit,
+        .alignment = alignment,
+        .source_key = hasher.final(),
     };
-    return icon.widget();
+    return image.widget();
+}
+
+fn preferredImageSize(dims: DimsCache.Dims, options: Options) keywork.Size {
+    const source_width: f32 = @floatFromInt(dims.width);
+    const source_height: f32 = @floatFromInt(dims.height);
+    if (options.width > 0 and options.height > 0) return .{
+        .width = @floatFromInt(options.width),
+        .height = @floatFromInt(options.height),
+    };
+    if (options.width > 0) {
+        const width: f32 = @floatFromInt(options.width);
+        return .{ .width = width, .height = width * source_height / source_width };
+    }
+    if (options.height > 0) {
+        const height: f32 = @floatFromInt(options.height);
+        return .{ .width = height * source_width / source_height, .height = height };
+    }
+    if (options.size) |size| {
+        const longest = @max(source_width, source_height);
+        return .{ .width = size * source_width / longest, .height = size * source_height / longest };
+    }
+    return .{ .width = source_width, .height = source_height };
+}
+
+fn imageRevision(value: f64) !u64 {
+    const max_exact_integer: f64 = 9007199254740991;
+    if (!std.math.isFinite(value) or value < 0 or value > max_exact_integer or value != @floor(value)) return error.InvalidImageRevision;
+    return @intFromFloat(value);
+}
+
+fn fileFingerprint(allocator: std.mem.Allocator, path: []const u8) !u64 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const linux = std.os.linux;
+    var stat = std.mem.zeroes(linux.Statx);
+    while (true) {
+        switch (linux.errno(linux.statx(
+            linux.AT.FDCWD,
+            path_z.ptr,
+            linux.AT.NO_AUTOMOUNT,
+            .{ .INO = true, .SIZE = true, .MTIME = true, .CTIME = true },
+            &stat,
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.ImageStatFailed,
+        }
+    }
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&stat.dev_major));
+    hasher.update(std.mem.asBytes(&stat.dev_minor));
+    hasher.update(std.mem.asBytes(&stat.ino));
+    hasher.update(std.mem.asBytes(&stat.size));
+    hasher.update(std.mem.asBytes(&stat.mtime.sec));
+    hasher.update(std.mem.asBytes(&stat.mtime.nsec));
+    hasher.update(std.mem.asBytes(&stat.ctime.sec));
+    hasher.update(std.mem.asBytes(&stat.ctime.nsec));
+    return hasher.final();
 }
 
 fn parseArgb32Pixels(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int, width: u32, height: u32) ![]keywork.Color {
@@ -411,8 +691,10 @@ fn resampledPixels(
     source_height: u32,
     target_width: u32,
     target_height: u32,
+    source_rect: SourceRect,
 ) ![]keywork.Color {
-    if (source_width == target_width and source_height == target_height) return allocator.dupe(keywork.Color, source);
+    const full_source = source_rect.x == 0 and source_rect.y == 0 and source_rect.width == 1 and source_rect.height == 1;
+    if (full_source and source_width == target_width and source_height == target_height) return allocator.dupe(keywork.Color, source);
 
     const source_bytes = try allocator.alloc(u8, source.len * 4);
     defer allocator.free(source_bytes);
@@ -426,17 +708,42 @@ fn resampledPixels(
 
     const target_bytes = try allocator.alloc(u8, @as(usize, target_width) * target_height * 4);
     defer allocator.free(target_bytes);
-    if (image_c.stbir_resize_uint8_linear(
-        source_bytes.ptr,
-        @intCast(source_width),
-        @intCast(source_height),
-        0,
-        target_bytes.ptr,
-        @intCast(target_width),
-        @intCast(target_height),
-        0,
-        image_c.STBIR_RGBA_NO_AW,
-    ) == null) return error.ImageResizeFailed;
+    if (full_source) {
+        if (image_c.stbir_resize_uint8_linear(
+            source_bytes.ptr,
+            @intCast(source_width),
+            @intCast(source_height),
+            0,
+            target_bytes.ptr,
+            @intCast(target_width),
+            @intCast(target_height),
+            0,
+            image_c.STBIR_RGBA_NO_AW,
+        ) == null) return error.ImageResizeFailed;
+    } else {
+        var resize: image_c.STBIR_RESIZE = undefined;
+        image_c.stbir_resize_init(
+            &resize,
+            source_bytes.ptr,
+            @intCast(source_width),
+            @intCast(source_height),
+            0,
+            target_bytes.ptr,
+            @intCast(target_width),
+            @intCast(target_height),
+            0,
+            image_c.STBIR_RGBA_NO_AW,
+            image_c.STBIR_TYPE_UINT8,
+        );
+        if (image_c.stbir_set_input_subrect(
+            &resize,
+            source_rect.x,
+            source_rect.y,
+            source_rect.x + source_rect.width,
+            source_rect.y + source_rect.height,
+        ) == 0) return error.ImageResizeFailed;
+        if (image_c.stbir_resize_extended(&resize) == 0) return error.ImageResizeFailed;
+    }
 
     const pixels = try allocator.alloc(keywork.Color, @as(usize, target_width) * target_height);
     fillRgbaPixels(pixels, target_bytes);
@@ -469,15 +776,182 @@ test "checkedDims rejects invalid and oversized sources" {
     try std.testing.expectEqual(@as(u32, 4096), dims.height);
 }
 
+test "fitted geometry implements fill cover contain and none" {
+    const rect: keywork.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 100 };
+
+    const fill = fittedGeometry(rect, 200, 100, .fill, .center);
+    try std.testing.expectEqual(rect, fill.rect);
+    try std.testing.expectEqual(SourceRect{}, fill.source);
+
+    const contain = fittedGeometry(rect, 200, 100, .contain, .center);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), contain.rect.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 45), contain.rect.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), contain.rect.width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), contain.rect.height, 0.001);
+
+    const cover = fittedGeometry(rect, 200, 100, .cover, .center);
+    try std.testing.expectEqual(rect, cover.rect);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), cover.source.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), cover.source.width, 0.0001);
+    const left_cover = fittedGeometry(rect, 200, 100, .cover, .top_left);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), left_cover.source.x, 0.0001);
+
+    const none = fittedGeometry(rect, 50, 25, .none, .bottom_right);
+    try std.testing.expectApproxEqAbs(@as(f32, 60), none.rect.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 95), none.rect.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), none.rect.width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 25), none.rect.height, 0.001);
+}
+
+test "cropped image resampling selects the fitted source region" {
+    const red = keywork.Color.argb(255, 255, 0, 0);
+    const blue = keywork.Color.argb(255, 0, 0, 255);
+    const source = [_]keywork.Color{
+        red, red, blue, blue,
+        red, red, blue, blue,
+    };
+    const pixels = try resampledPixels(std.testing.allocator, &source, 4, 2, 2, 2, .{ .x = 0.5, .width = 0.5 });
+    defer std.testing.allocator.free(pixels);
+    try std.testing.expectEqual(@as(usize, 4), pixels.len);
+    for (pixels) |pixel| try std.testing.expectEqual(blue, pixel);
+}
+
+test "image options decode fit alignment and revision" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+    c.lua_pushstring(lua_state, "/tmp/wallpaper.png");
+    c.lua_setfield(lua_state, table, "path");
+    c.lua_pushstring(lua_state, "cover");
+    c.lua_setfield(lua_state, table, "fit");
+    c.lua_pushstring(lua_state, "bottom_right");
+    c.lua_setfield(lua_state, table, "align");
+    c.lua_pushinteger(lua_state, 7);
+    c.lua_setfield(lua_state, table, "revision");
+
+    const options = try lua_codec.decode(Options, lua_state, table, std.testing.allocator);
+    try std.testing.expectEqual(Fit.cover, options.fit);
+    try std.testing.expectEqual(Alignment.bottom_right, options.@"align");
+    try std.testing.expectEqual(@as(u64, 7), try imageRevision(options.revision));
+    try std.testing.expectError(error.InvalidImageRevision, imageRevision(-1));
+    try std.testing.expectError(error.InvalidImageRevision, imageRevision(1.5));
+    try std.testing.expectError(error.InvalidImageRevision, imageRevision(std.math.inf(f64)));
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+}
+
+test "image requires exactly one source" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+    try std.testing.expectError(error.InvalidImageSource, parse(lua_state, std.testing.allocator, null, table));
+
+    c.lua_pushstring(lua_state, "/tmp/wallpaper.png");
+    c.lua_setfield(lua_state, table, "path");
+    c.lua_pushstring(lua_state, "argb");
+    c.lua_setfield(lua_state, table, "pixels");
+    try std.testing.expectError(error.InvalidImageSource, parse(lua_state, std.testing.allocator, null, table));
+    try std.testing.expectEqual(table, c.lua_gettop(lua_state));
+}
+
+test "file image parses and decodes lazily into fitted paint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "wallpaper.png" });
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const red = [_]u8{ 255, 0, 0, 255 };
+    const blue = [_]u8{ 0, 0, 255, 255 };
+    const rgba = red ++ red ++ blue ++ blue ++ red ++ red ++ blue ++ blue;
+    try std.testing.expect(image_c.stbi_write_png(path_z.ptr, 4, 2, 4, &rgba, 16) != 0);
+
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    c.lua_newtable(lua_state);
+    const table = c.lua_gettop(lua_state);
+    c.lua_pushlstring(lua_state, path.ptr, path.len);
+    c.lua_setfield(lua_state, table, "path");
+    c.lua_pushstring(lua_state, "cover");
+    c.lua_setfield(lua_state, table, "fit");
+
+    var dims_cache: DimsCache = .init(allocator);
+    defer dims_cache.deinit();
+    const widget = try parse(lua_state, allocator, &dims_cache, table);
+    const render_object = switch (widget) {
+        .render_object => |value| value,
+        else => return error.ExpectedRenderObject,
+    };
+    defer render_object.destroy(allocator);
+
+    var display_list: keywork.DisplayList = .{};
+    defer display_list.deinit(allocator);
+    var raster_cache = keywork.RasterCache.init(1024);
+    raster_cache.beginFrame();
+    defer {
+        raster_cache.endFrame(allocator);
+        raster_cache.deinit(allocator);
+    }
+    try render_object.paint(.{
+        .allocator = allocator,
+        .rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .scale = 1,
+        .display_list = &display_list,
+        .raster_cache = &raster_cache,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), display_list.commands.items.len);
+    const painted = switch (display_list.commands.items[0]) {
+        .color_image => |value| value,
+        else => return error.ExpectedColorImage,
+    };
+    try std.testing.expectEqual(@as(u32, 2), painted.width);
+    try std.testing.expectEqual(@as(u32, 2), painted.height);
+    try std.testing.expectEqual(@as(usize, 4), painted.pixels.len);
+
+    // Replacing the file at the same path must invalidate both dimensions
+    // and raster identity on the next widget rebuild.
+    const replacement_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "replacement.png" });
+    defer allocator.free(replacement_path);
+    const replacement_path_z = try allocator.dupeZ(u8, replacement_path);
+    defer allocator.free(replacement_path_z);
+    const green = [_]u8{ 0, 255, 0, 255 };
+    const replacement_rgba = green ** 8;
+    try std.testing.expect(image_c.stbi_write_png(replacement_path_z.ptr, 2, 4, 4, &replacement_rgba, 8) != 0);
+    try std.Io.Dir.rename(.cwd(), replacement_path, .cwd(), path, std.testing.io);
+
+    const replacement_widget = try parse(lua_state, allocator, &dims_cache, table);
+    const replacement_render_object = switch (replacement_widget) {
+        .render_object => |value| value,
+        else => return error.ExpectedRenderObject,
+    };
+    defer replacement_render_object.destroy(allocator);
+    const replacement_size = try replacement_render_object.layout(.{
+        .constraints = .{ .max_width = std.math.inf(f32), .max_height = std.math.inf(f32) },
+        .measurer = .fixed,
+    });
+    try std.testing.expectEqual(@as(f32, 2), replacement_size.width);
+    try std.testing.expectEqual(@as(f32, 4), replacement_size.height);
+}
+
 test "dims cache tombstones unreadable files" {
     // The first probe failure per path logs a warning by design.
     std.testing.log_level = .err;
     var cache: DimsCache = .init(std.testing.allocator);
     defer cache.deinit();
 
-    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png") == null);
+    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png", 1) == null);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
     // The tombstone answers without a second probe or a new entry.
-    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png") == null);
+    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png", 1) == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    // A changed fingerprint retries the probe without leaking another key.
+    try std.testing.expect(try cache.lookup("/nonexistent/keywork-test.png", 2) == null);
+    try std.testing.expectEqual(@as(u64, 2), cache.entries.get("/nonexistent/keywork-test.png").?.fingerprint);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
 }
