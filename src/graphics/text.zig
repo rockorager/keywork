@@ -221,7 +221,8 @@ pub fn render(
     const natural_line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
     const line_height = try lineHeightPixels(scale, text.style.line_height, natural_line_height);
     const origin_x = snapToPixel(text.origin.x * scale);
-    var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
+    const half_leading = snapToPixel((line_height - natural_line_height) / 2);
+    var baseline_y = snapToPixel(text.origin.y * scale) + half_leading + ascender;
 
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
@@ -289,7 +290,8 @@ pub fn appendGlyphs(
     const natural_line_height: f32 = @floatFromInt(@max(1, c.keywork_ft_line_height(primary.face)));
     const line_height = try lineHeightPixels(scale, text.style.line_height, natural_line_height);
     const origin_x = snapToPixel(text.origin.x * scale);
-    var baseline_y = snapToPixel(text.origin.y * scale) + ascender;
+    const half_leading = snapToPixel((line_height - natural_line_height) / 2);
+    var baseline_y = snapToPixel(text.origin.y * scale) + half_leading + ascender;
 
     var line_start: usize = 0;
     while (line_start <= text.value.len) {
@@ -994,7 +996,7 @@ test "subpixelPosition quantizes to quarter-pixel bins" {
     try std.testing.expectEqual(SubpixelPosition{ .origin = -3, .bin = 2 }, subpixelPosition(-2.5));
 }
 
-test "explicit line height controls logical measurement and rendered baseline advance" {
+test "explicit line height controls measurement, leading, and baseline advance" {
     var renderer = try init(std.testing.allocator);
     defer renderer.deinit();
 
@@ -1014,4 +1016,35 @@ test "explicit line height controls logical measurement and rendered baseline ad
     }, &glyphs);
     try std.testing.expectEqual(@as(usize, 2), glyphs.items.len);
     try std.testing.expectEqual(@as(f32, 20), glyphs.items[1].y - glyphs.items[0].y);
+
+    const natural_line_height = (try renderer.metrics(1, style.font_size)).line_height;
+    var natural_glyphs: std.ArrayList(PositionedGlyph) = .empty;
+    defer natural_glyphs.deinit(std.testing.allocator);
+    try renderer.appendGlyphs(std.testing.allocator, 1, .{
+        .origin = .{ .x = 0, .y = 0 },
+        .value = "A",
+        .style = .{ .color = keywork.colors.ink, .font_size = style.font_size },
+    }, &natural_glyphs);
+    try std.testing.expectEqual(
+        natural_glyphs.items[0].y + @round((style.line_height.? - natural_line_height) / 2),
+        glyphs.items[0].y,
+    );
+
+    var natural_height_glyphs: std.ArrayList(PositionedGlyph) = .empty;
+    defer natural_height_glyphs.deinit(std.testing.allocator);
+    try renderer.appendGlyphs(std.testing.allocator, 1, .{
+        .origin = .{ .x = 0, .y = 0 },
+        .value = "A",
+        .style = .{ .color = keywork.colors.ink, .font_size = style.font_size, .line_height = natural_line_height },
+    }, &natural_height_glyphs);
+    try std.testing.expectEqual(natural_glyphs.items[0].y, natural_height_glyphs.items[0].y);
+
+    var tight_glyphs: std.ArrayList(PositionedGlyph) = .empty;
+    defer tight_glyphs.deinit(std.testing.allocator);
+    try renderer.appendGlyphs(std.testing.allocator, 1, .{
+        .origin = .{ .x = 0, .y = 0 },
+        .value = "A",
+        .style = .{ .color = keywork.colors.ink, .font_size = style.font_size, .line_height = natural_line_height - 4 },
+    }, &tight_glyphs);
+    try std.testing.expectEqual(natural_glyphs.items[0].y - 2, tight_glyphs.items[0].y);
 }

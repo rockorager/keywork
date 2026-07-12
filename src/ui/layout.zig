@@ -1314,14 +1314,16 @@ fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignmen
 }
 
 /// Cross-axis position of the first text child's cap-height midline,
-/// mirroring paint: the text box centers in the row and glyphs sit at
-/// box top + ascender. Null when the row has no text child.
+/// including the half-leading used when painting an explicit line height.
+/// Null when the row has no text child.
 fn rowCapHeightCenter(children: []const *RenderNode, cross: f32, measurer: TextMeasurer) LayoutError!?f32 {
     for (children) |child| {
         if (child.kind != .text) continue;
         const text_metrics = try measurer.textMetrics(child.text_style.font_size);
+        const line_height = child.text_style.line_height orelse text_metrics.line_height;
+        const half_leading = (line_height - text_metrics.line_height) / 2;
         const top = @max(0, cross - child.rect.height) / 2;
-        return top + text_metrics.ascender - text_metrics.cap_height / 2;
+        return top + half_leading + text_metrics.ascender - text_metrics.cap_height / 2;
     }
     return null;
 }
@@ -1332,6 +1334,26 @@ fn alignedOffset(alignment: Widget.Alignment, outer: f32, inner: f32) f32 {
         .center => @max(0, outer - inner) / 2,
         .end => @max(0, outer - inner),
     };
+}
+
+test "explicit line height preserves a centered row cap-height" {
+    var natural: RenderNode = .{
+        .kind = .text,
+        .rect = .{ .x = 0, .y = 0, .width = 7, .height = 14 },
+        .text_style = .{ .color = colors.ink, .font_size = 14 },
+    };
+    var explicit: RenderNode = .{
+        .kind = .text,
+        .rect = .{ .x = 0, .y = 0, .width = 7, .height = 20 },
+        .text_style = .{ .color = colors.ink, .font_size = 14, .line_height = 20 },
+    };
+    const natural_children = [_]*RenderNode{&natural};
+    const explicit_children = [_]*RenderNode{&explicit};
+
+    try std.testing.expectEqual(
+        try rowCapHeightCenter(&natural_children, 28, .fixed),
+        try rowCapHeightCenter(&explicit_children, 28, .fixed),
+    );
 }
 
 test "moving a clean subtree translates text input carets" {

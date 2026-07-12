@@ -384,8 +384,8 @@ pub const TextMeasurer = union(enum) {
     }
 };
 
-/// Vertical font metrics in logical units, mirroring how text paints:
-/// glyphs sit at box top + ascender, all leading below the baseline.
+/// Natural vertical font metrics in logical units. Text with an explicit
+/// line height paints at box top + half-leading + ascender.
 pub const TextMetrics = struct {
     ascender: f32,
     cap_height: f32,
