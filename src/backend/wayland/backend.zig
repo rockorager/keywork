@@ -276,6 +276,10 @@ pub fn Backend(comptime RendererAdapter: type) type {
             }
             fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
                 const self: *Window = @ptrCast(@alignCast(ptr));
+                while (!self.protocol.configured and !self.protocol.closed) {
+                    if (self.backend.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+                }
+                if (self.protocol.closed) return error.WindowClosed;
                 return RendererAdapter.present(self, frame);
             }
             fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
