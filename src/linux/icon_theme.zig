@@ -24,7 +24,7 @@ pub const IconFormat = enum {
 };
 
 pub const IconFile = struct {
-    path: []u8,
+    path: [:0]u8,
     format: IconFormat,
 };
 
@@ -144,7 +144,9 @@ fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, lo
         // valid icon names nor paths we want to resolve from the cwd.
         if (name[0] != '/') return null;
         if (formatFromPath(name, formats)) |format| {
-            if (try exists(allocator, name)) return .{ .path = try allocator.dupe(u8, name), .format = format };
+            const path = try allocator.dupeZ(u8, name);
+            if (exists(path)) return .{ .path = path, .format = format };
+            allocator.free(path);
         }
         return null;
     }
@@ -392,16 +394,16 @@ fn lookupCandidate(allocator: std.mem.Allocator, data_root: []const u8, theme: [
 
 fn lookupFileCandidates(allocator: std.mem.Allocator, comptime exact_fmt: []const u8, comptime symbolic_fmt: []const u8, args: anytype, formats: []const IconFormat) !?IconFile {
     for (formats) |format| {
-        const path = try std.fmt.allocPrint(allocator, exact_fmt, args ++ .{format.extension()});
-        defer allocator.free(path);
-        if (try exists(allocator, path)) return .{ .path = try allocator.dupe(u8, path), .format = format };
+        const path = try std.fmt.allocPrintSentinel(allocator, exact_fmt, args ++ .{format.extension()}, 0);
+        if (exists(path)) return .{ .path = path, .format = format };
+        allocator.free(path);
     }
 
     if (std.mem.endsWith(u8, args[args.len - 1], "-symbolic")) return null;
     for (formats) |format| {
-        const path = try std.fmt.allocPrint(allocator, symbolic_fmt, args ++ .{format.extension()});
-        defer allocator.free(path);
-        if (try exists(allocator, path)) return .{ .path = try allocator.dupe(u8, path), .format = format };
+        const path = try std.fmt.allocPrintSentinel(allocator, symbolic_fmt, args ++ .{format.extension()}, 0);
+        if (exists(path)) return .{ .path = path, .format = format };
+        allocator.free(path);
     }
     return null;
 }
@@ -433,10 +435,8 @@ fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     return try result.toOwnedSlice(allocator);
 }
 
-fn exists(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    return linux.errno(linux.access(path_z.ptr, 0)) == .SUCCESS;
+fn exists(path: [:0]const u8) bool {
+    return linux.errno(linux.access(path.ptr, 0)) == .SUCCESS;
 }
 
 fn preferredTheme() []const u8 {
