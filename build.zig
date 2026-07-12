@@ -44,7 +44,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     image_c.addSystemIncludePath(stb_lib.include_dir);
-    addPkgConfigIncludePaths(b, image_c, &.{"resvg >= 0.47.0"});
+    requirePkgConfigVersion(b, "resvg", "0.47.0");
+    image_c.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
     const image_c_module = image_c.createModule();
 
     const vulkan_mod = b.dependency("vulkan_zig", .{
@@ -76,7 +77,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addPkgConfigIncludePaths(b, xkb_c, &.{"xkbcommon"});
+    xkb_c.linkSystemLibrary("xkbcommon", .{ .use_pkg_config = .force });
     const xkb_c_module = xkb_c.createModule();
 
     const dbus_c = b.addTranslateC(.{
@@ -84,7 +85,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addPkgConfigIncludePaths(b, dbus_c, &.{"dbus-1"});
+    dbus_c.linkSystemLibrary("dbus-1", .{ .use_pkg_config = .force });
     const dbus_c_module = dbus_c.createModule();
 
     const pipewire_c = b.addTranslateC(.{
@@ -99,7 +100,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addPkgConfigIncludePaths(b, text_c, &.{ "fontconfig", "freetype2", "harfbuzz" });
+    text_c.linkSystemLibrary("fontconfig", .{ .use_pkg_config = .force });
+    text_c.linkSystemLibrary("freetype2", .{ .use_pkg_config = .force });
+    text_c.linkSystemLibrary("harfbuzz", .{ .use_pkg_config = .force });
     const text_c_module = text_c.createModule();
 
     const lua = luajit.add(b, target, optimize);
@@ -157,62 +160,23 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // Window options come from the script's keywork.window declaration.
-    const run_lua_layershell_example_cmd = b.addRunArtifact(exe);
-    run_lua_layershell_example_cmd.addArgs(&.{
+    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", &.{
         "--script=examples/lua/layershell.lua",
     });
-    if (b.args) |args| {
-        run_lua_layershell_example_cmd.addArgs(args);
-    }
-
-    const run_lua_layershell_example_step = b.step("run-lua-layershell-example", "Run the Lua layer-shell example");
-    run_lua_layershell_example_step.dependOn(&run_lua_layershell_example_cmd.step);
-
-    const run_lua_vulkan_layershell_example_cmd = b.addRunArtifact(exe);
-    run_lua_vulkan_layershell_example_cmd.addArgs(&.{
+    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", &.{
         "--script=examples/lua/layershell.lua",
         "--backend=vulkan",
     });
-    if (b.args) |args| {
-        run_lua_vulkan_layershell_example_cmd.addArgs(args);
-    }
-
-    const run_lua_vulkan_layershell_example_step = b.step("run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example");
-    run_lua_vulkan_layershell_example_step.dependOn(&run_lua_vulkan_layershell_example_cmd.step);
-
-    const run_lua_bar_example_cmd = b.addRunArtifact(exe);
-    run_lua_bar_example_cmd.addArgs(&.{
+    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", &.{
         "--script=examples/lua/bar.lua",
     });
-    if (b.args) |args| {
-        run_lua_bar_example_cmd.addArgs(args);
-    }
-
-    const run_lua_bar_example_step = b.step("run-lua-bar-example", "Run the Lua desktop bar example");
-    run_lua_bar_example_step.dependOn(&run_lua_bar_example_cmd.step);
-
-    const run_lua_vulkan_bar_example_cmd = b.addRunArtifact(exe);
-    run_lua_vulkan_bar_example_cmd.addArgs(&.{
+    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", &.{
         "--script=examples/lua/bar.lua",
         "--backend=vulkan",
     });
-    if (b.args) |args| {
-        run_lua_vulkan_bar_example_cmd.addArgs(args);
-    }
-
-    const run_lua_vulkan_bar_example_step = b.step("run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example");
-    run_lua_vulkan_bar_example_step.dependOn(&run_lua_vulkan_bar_example_cmd.step);
-
-    const run_lua_shell_example_cmd = b.addRunArtifact(exe);
-    run_lua_shell_example_cmd.addArgs(&.{
+    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", &.{
         "--script=examples/lua/shell.lua",
     });
-    if (b.args) |args| {
-        run_lua_shell_example_cmd.addArgs(args);
-    }
-
-    const run_lua_shell_example_step = b.step("run-lua-shell-example", "Run the Lua desktop shell example");
-    run_lua_shell_example_step.dependOn(&run_lua_shell_example_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
     const app_tests = b.addTest(.{
@@ -242,21 +206,16 @@ fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("harfbuzz", .{});
 }
 
-fn addPkgConfigIncludePaths(b: *std.Build, translate_c: *std.Build.Step.TranslateC, packages: []const []const u8) void {
+fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) void {
     const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(b.allocator);
+    _ = b.run(&.{ pkg_config, b.fmt("--atleast-version={s}", .{minimum_version}), package });
+}
 
-    argv.append(b.allocator, pkg_config) catch @panic("OOM");
-    argv.append(b.allocator, "--cflags-only-I") catch @panic("OOM");
-    for (packages) |package| argv.append(b.allocator, package) catch @panic("OOM");
+fn addExampleRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, description: []const u8, fixed_args: []const []const u8) void {
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.addArgs(fixed_args);
+    if (b.args) |args| run_cmd.addArgs(args);
 
-    const cflags = b.run(argv.items);
-    var it = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
-    while (it.next()) |flag| {
-        if (!std.mem.startsWith(u8, flag, "-I")) continue;
-        if (flag.len == 2) continue;
-        const include_path = b.allocator.dupe(u8, flag[2..]) catch @panic("OOM");
-        translate_c.addSystemIncludePath(.{ .cwd_relative = include_path });
-    }
+    const run_step = b.step(name, description);
+    run_step.dependOn(&run_cmd.step);
 }
