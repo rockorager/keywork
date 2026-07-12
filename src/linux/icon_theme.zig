@@ -202,8 +202,12 @@ fn lookupInTheme(
         inherited.deinit(allocator);
     }
 
-    if (try lookupInHomeTheme(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
-    if (try lookupInDataDirThemes(allocator, name, size, theme_name, formats, &inherited)) |path| return path;
+    var fallback_theme = try loadThemeFromSearchPath(allocator, theme_name);
+    defer if (fallback_theme) |*theme| theme.deinit(allocator);
+    const fallback: ?*const Theme = if (fallback_theme) |*theme| theme else null;
+
+    if (try lookupInHomeTheme(allocator, name, size, theme_name, formats, &inherited, fallback)) |path| return path;
+    if (try lookupInDataDirThemes(allocator, name, size, theme_name, formats, &inherited, fallback)) |path| return path;
 
     for (inherited.items) |parent| {
         if (try lookupInTheme(allocator, name, size, parent, formats, visited, depth + 1)) |path| return path;
@@ -221,10 +225,11 @@ fn lookupInHomeTheme(
     theme_name: []const u8,
     formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
+    fallback_theme: ?*const Theme,
 ) !?IconFile {
     const data_home = try allocDataHome(allocator) orelse return null;
     defer allocator.free(data_home);
-    return lookupInDataRootTheme(allocator, data_home, name, size, theme_name, formats, inherited);
+    return lookupInDataRootTheme(allocator, data_home, name, size, theme_name, formats, inherited, fallback_theme);
 }
 
 fn lookupInDataDirThemes(
@@ -234,12 +239,13 @@ fn lookupInDataDirThemes(
     theme_name: []const u8,
     formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
+    fallback_theme: ?*const Theme,
 ) !?IconFile {
     const data_dirs = env("XDG_DATA_DIRS") orelse default_data_dirs;
     var it = std.mem.splitScalar(u8, data_dirs, ':');
     while (it.next()) |root| {
         if (root.len == 0) continue;
-        if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited)) |path| return path;
+        if (try lookupInDataRootTheme(allocator, root, name, size, theme_name, formats, inherited, fallback_theme)) |path| return path;
     }
     return null;
 }
@@ -252,9 +258,11 @@ fn lookupInDataRootTheme(
     theme_name: []const u8,
     formats: []const IconFormat,
     inherited: *std.ArrayList([]u8),
+    fallback_theme: ?*const Theme,
 ) !?IconFile {
-    var theme = try loadTheme(allocator, data_root, theme_name) orelse return null;
-    defer theme.deinit(allocator);
+    var loaded_theme = try loadTheme(allocator, data_root, theme_name);
+    defer if (loaded_theme) |*theme| theme.deinit(allocator);
+    const theme: *const Theme = if (loaded_theme) |*value| value else fallback_theme orelse return null;
 
     for (theme.inherits.items) |parent| {
         if (!visitedContains(inherited.items, parent)) try inherited.append(allocator, try allocator.dupe(u8, parent));
@@ -262,6 +270,21 @@ fn lookupInDataRootTheme(
 
     if (try lookupExactSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items)) |path| return path;
     return lookupClosestSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items);
+}
+
+fn loadThemeFromSearchPath(allocator: std.mem.Allocator, theme_name: []const u8) !?Theme {
+    if (try allocDataHome(allocator)) |data_home| {
+        defer allocator.free(data_home);
+        if (try loadTheme(allocator, data_home, theme_name)) |theme| return theme;
+    }
+
+    const data_dirs = env("XDG_DATA_DIRS") orelse default_data_dirs;
+    var it = std.mem.splitScalar(u8, data_dirs, ':');
+    while (it.next()) |root| {
+        if (root.len == 0) continue;
+        if (try loadTheme(allocator, root, theme_name)) |theme| return theme;
+    }
+    return null;
 }
 
 fn lookupExactSizeInTheme(
@@ -610,6 +633,47 @@ test "parse index theme directories and inherited themes" {
     try std.testing.expect(theme.directories.items[0].matchesSize(16));
     try std.testing.expect(theme.directories.items[1].matchesSize(128));
     try std.testing.expectEqual(@as(usize, 2), theme.inherits.items.len);
+}
+
+test "data root without index uses theme metadata from search path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "icons/hicolor/scalable/apps");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "icons/hicolor/scalable/apps/keywork-overlay-test.svg",
+        .data = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\"/>",
+    });
+    const data_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(data_root);
+
+    var fallback_theme = try parseIndexTheme(std.testing.allocator,
+        \\[Icon Theme]
+        \\Directories=scalable/apps
+        \\
+        \\[scalable/apps]
+        \\Size=128
+        \\MinSize=1
+        \\MaxSize=512
+        \\Type=Scalable
+    );
+    defer fallback_theme.deinit(std.testing.allocator);
+
+    var inherited: std.ArrayList([]u8) = .empty;
+    defer inherited.deinit(std.testing.allocator);
+    const icon = (try lookupInDataRootTheme(
+        std.testing.allocator,
+        data_root,
+        "keywork-overlay-test",
+        32,
+        "hicolor",
+        &.{ .svg, .png },
+        &inherited,
+        &fallback_theme,
+    )).?;
+    defer std.testing.allocator.free(icon.path);
+
+    try std.testing.expectEqual(IconFormat.svg, icon.format);
+    try std.testing.expect(std.mem.endsWith(u8, icon.path, "/icons/hicolor/scalable/apps/keywork-overlay-test.svg"));
 }
 
 test "scalable directory size range survives any key order" {
