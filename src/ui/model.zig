@@ -3203,6 +3203,21 @@ fn testTapCallback() Widget.TapCallback {
 
 fn testCallbackCall(_: *anyopaque, _: TapEvent) !void {}
 
+const TestListItems = struct {
+    builds: ?*usize = null,
+
+    fn builder(self: *const @This()) Widget.ItemBuilder {
+        return .{ .ptr = self, .build_fn = build };
+    }
+
+    fn build(ptr: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        if (self.builds) |builds| builds.* += 1;
+        const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
+        return .{ .text = .{ .value = label } };
+    }
+};
+
 const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
 
 test "raster cache reuses alpha image data across display lists" {
@@ -3366,25 +3381,13 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
 }
 
 test "virtualized list builds only the visible window and follows scroll" {
-    const Items = struct {
-        var dummy: u8 = 0;
-
-        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
-            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
-            return .{ .text = .{ .value = label } };
-        }
-
-        fn builder() Widget.ItemBuilder {
-            return .{ .ptr = &dummy, .build_fn = build };
-        }
-    };
-
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
 
     // 1000 items at 16px in a 48px viewport.
-    const list_widget = widgets.list("big-list", 1000, 16, Items.builder());
+    const items: TestListItems = .{};
+    const list_widget = widgets.list("big-list", 1000, 16, items.builder());
     const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
 
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
@@ -3421,27 +3424,14 @@ test "virtualized list builds only the visible window and follows scroll" {
 }
 
 test "list window reconciles rows across scroll and update" {
-    const Items = struct {
-        var builds: usize = 0;
-
-        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
-            builds += 1;
-            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
-            return .{ .text = .{ .value = label } };
-        }
-
-        fn builder() Widget.ItemBuilder {
-            return .{ .ptr = &builds, .build_fn = build };
-        }
-    };
-    Items.builds = 0;
-
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
 
     // 1000 items at 16px in a 48px viewport.
-    const list_widget = widgets.list("reconcile-list", 1000, 16, Items.builder());
+    var builds: usize = 0;
+    const items: TestListItems = .{ .builds = &builds };
+    const list_widget = widgets.list("reconcile-list", 1000, 16, items.builder());
     const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
 
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
@@ -3450,7 +3440,7 @@ test "list window reconciles rows across scroll and update" {
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
 
     const window = element.children.len;
-    try std.testing.expectEqual(window, Items.builds);
+    try std.testing.expectEqual(window, builds);
     // Item 1's render node, tracked across the scroll below.
     const item_one_node = element.children[1].render_node.?;
 
@@ -3465,42 +3455,30 @@ test "list window reconciles rows across scroll and update" {
 
     // Only the entering row was built; retained rows kept their elements.
     try std.testing.expectEqual(@as(usize, 1), listState(&element).first);
-    try std.testing.expectEqual(window + 1, Items.builds);
+    try std.testing.expectEqual(window + 1, builds);
     try std.testing.expectEqual(item_one_node, element.children[0].render_node.?);
     try std.testing.expectEqualStrings("item 1", element.children[0].widget.text.value);
 
     // A widget update re-runs the builder for every visible row but
     // reconciles into the retained elements instead of rebuilding them.
-    const builds_before_update = Items.builds;
-    var updated_widget = widgets.list("reconcile-list", 1000, 16, Items.builder());
+    const builds_before_update = builds;
+    var updated_widget = widgets.list("reconcile-list", 1000, 16, items.builder());
     updated_widget.list.selected = 2;
     var update_scope: BuildScope = .{ .allocator = build_arena.allocator() };
     try updateElementTreeScoped(retained_allocator, &update_scope, &element, &updated_widget, constraints);
 
-    try std.testing.expectEqual(builds_before_update + window, Items.builds);
+    try std.testing.expectEqual(builds_before_update + window, builds);
     try std.testing.expectEqual(item_one_node, element.children[0].render_node.?);
 }
 
 test "list follows controlled selection and leaves free scrolling alone" {
-    const Items = struct {
-        var dummy: u8 = 0;
-
-        fn build(_: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
-            const label = try std.fmt.allocPrint(scope.allocator, "item {d}", .{index});
-            return .{ .text = .{ .value = label } };
-        }
-
-        fn builder() Widget.ItemBuilder {
-            return .{ .ptr = &dummy, .build_fn = build };
-        }
-    };
-
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
 
     // 100 items at 16px in a 48px viewport (3 fully visible).
-    var list_widget = widgets.list("select-list", 100, 16, Items.builder());
+    const items: TestListItems = .{};
+    var list_widget = widgets.list("select-list", 100, 16, items.builder());
     list_widget.list.selected = 10;
     const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
 
