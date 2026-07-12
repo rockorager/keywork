@@ -194,7 +194,7 @@ fn registryGlobalRemove(data: ?*anyopaque, id: u32) callconv(.c) void {
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 2);
     lua_value.setStringField(lua_state, -1, "type", "global_remove");
-    pushIntegerField(lua_state, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire registry delivery failed: {}", .{err});
     };
@@ -213,8 +213,8 @@ fn metadataProperty(
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 6);
     lua_value.setStringField(lua_state, -1, "type", "metadata");
-    pushIntegerField(lua_state, "id", id);
-    pushIntegerField(lua_state, "subject", subject);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "subject", subject);
     pushOptionalStringField(lua_state, "key", key);
     pushOptionalStringField(lua_state, "value_type", value_type);
     pushOptionalStringField(lua_state, "value", value);
@@ -252,11 +252,10 @@ fn nodeRoute(
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 5);
     lua_value.setStringField(lua_state, -1, "type", "node_route");
-    pushIntegerField(lua_state, "id", id);
-    pushIntegerField(lua_state, "device_id", device_id);
-    pushIntegerField(lua_state, "route_device", route_device);
-    c.lua_pushboolean(lua_state, if (route_managed != 0) 1 else 0);
-    c.lua_setfield(lua_state, -2, "route_managed");
+    lua_value.setIntegerField(lua_state, -1, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "device_id", device_id);
+    lua_value.setIntegerField(lua_state, -1, "route_device", route_device);
+    lua_value.setBooleanField(lua_state, -1, "route_managed", route_managed != 0);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire node route delivery failed: {}", .{err});
     };
@@ -285,7 +284,7 @@ fn routesReset(data: ?*anyopaque, id: u32) callconv(.c) void {
     const lua_state = connection.host.luaState();
     c.lua_createtable(lua_state, 0, 2);
     lua_value.setStringField(lua_state, -1, "type", "routes_reset");
-    pushIntegerField(lua_state, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire route reset delivery failed: {}", .{err});
     };
@@ -302,10 +301,10 @@ fn pushGlobalEvent(
 ) void {
     c.lua_createtable(lua_state, 0, 6);
     lua_value.setStringField(lua_state, -1, "type", "global");
-    pushIntegerField(lua_state, "id", id);
-    pushIntegerField(lua_state, "permissions", permissions);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "permissions", permissions);
     lua_value.setStringField(lua_state, -1, "interface", interface);
-    pushIntegerField(lua_state, "version", version);
+    lua_value.setIntegerField(lua_state, -1, "version", version);
 
     c.lua_createtable(lua_state, 0, @intCast(property_count));
     if (properties != null) {
@@ -330,7 +329,7 @@ fn pushNodePropsEvent(
 ) void {
     c.lua_createtable(lua_state, 0, 4);
     lua_value.setStringField(lua_state, -1, "type", "node_props");
-    pushIntegerField(lua_state, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
     c.lua_createtable(lua_state, @intCast(volume_count), 0);
     if (volumes != null) {
         for (volumes[0..volume_count], 1..) |volume, index| {
@@ -340,8 +339,7 @@ fn pushNodePropsEvent(
     }
     c.lua_setfield(lua_state, -2, "channel_volumes");
     if (has_mute) {
-        c.lua_pushboolean(lua_state, if (muted) 1 else 0);
-        c.lua_setfield(lua_state, -2, "muted");
+        lua_value.setBooleanField(lua_state, -1, "muted", muted);
     }
 }
 
@@ -360,8 +358,8 @@ fn pushRouteEvent(
     };
     c.lua_createtable(lua_state, 0, 6);
     lua_value.setStringField(lua_state, -1, "type", "route");
-    pushIntegerField(lua_state, "id", id);
-    pushIntegerField(lua_state, "device", device);
+    lua_value.setIntegerField(lua_state, -1, "id", id);
+    lua_value.setIntegerField(lua_state, -1, "device", device);
     lua_value.setStringField(lua_state, -1, "availability", availability_name);
     pushOptionalStringField(lua_state, "port_type", port_type);
     pushOptionalStringField(lua_state, "bus", bus);
@@ -374,11 +372,6 @@ fn pushOptionalStringField(lua_state: *c.lua_State, name: [*:0]const u8, value: 
         const text = zSpan(value);
         c.lua_pushlstring(lua_state, text.ptr, text.len);
     }
-    c.lua_setfield(lua_state, -2, name);
-}
-
-fn pushIntegerField(lua_state: *c.lua_State, name: [*:0]const u8, value: u32) void {
-    c.lua_pushinteger(lua_state, @intCast(value));
     c.lua_setfield(lua_state, -2, name);
 }
 
@@ -579,7 +572,6 @@ test "PipeWire realtime scheduling is opt-in" {
 
     c.lua_createtable(lua_state, 0, 1);
     try std.testing.expect(!checkRealtimeOption(lua_state));
-    c.lua_pushboolean(lua_state, 1);
-    c.lua_setfield(lua_state, -2, "realtime");
+    lua_value.setBooleanField(lua_state, -1, "realtime", true);
     try std.testing.expect(checkRealtimeOption(lua_state));
 }

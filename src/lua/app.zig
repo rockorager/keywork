@@ -548,12 +548,9 @@ pub const App = struct {
         for (context.outputs, 1..) |output, index| {
             c.lua_createtable(lua_state, 0, 4);
             lua_value.setStringField(lua_state, -1, "name", output.name);
-            c.lua_pushnumber(lua_state, output.width);
-            c.lua_setfield(lua_state, -2, "width");
-            c.lua_pushnumber(lua_state, output.height);
-            c.lua_setfield(lua_state, -2, "height");
-            c.lua_pushnumber(lua_state, output.scale);
-            c.lua_setfield(lua_state, -2, "scale");
+            lua_value.setNumberField(lua_state, -1, "width", output.width);
+            lua_value.setNumberField(lua_state, -1, "height", output.height);
+            lua_value.setNumberField(lua_state, -1, "scale", output.scale);
             c.lua_rawseti(lua_state, outputs, @intCast(index));
         }
         c.lua_setfield(lua_state, table, "outputs");

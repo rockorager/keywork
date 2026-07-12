@@ -325,15 +325,13 @@ const LuaCallback = struct {
     fn pushModifiers(lua_state: *c.lua_State, modifiers: keywork.Modifiers) void {
         c.lua_createtable(lua_state, 0, 4);
         inline for (.{ .{ "shift", modifiers.shift }, .{ "ctrl", modifiers.ctrl }, .{ "alt", modifiers.alt }, .{ "super", modifiers.super } }) |field| {
-            c.lua_pushboolean(lua_state, if (field[1]) 1 else 0);
-            c.lua_setfield(lua_state, -2, field[0]);
+            lua_value.setBooleanField(lua_state, -1, field[0], field[1]);
         }
     }
 
     fn pushPosition(lua_state: *c.lua_State, position: keywork.Point, window_position: keywork.Point) void {
         inline for (.{ .{ "x", position.x }, .{ "y", position.y }, .{ "window_x", window_position.x }, .{ "window_y", window_position.y } }) |field| {
-            c.lua_pushnumber(lua_state, field[1]);
-            c.lua_setfield(lua_state, -2, field[0]);
+            lua_value.setNumberField(lua_state, -1, field[0], field[1]);
         }
     }
 
@@ -366,10 +364,8 @@ const LuaCallback = struct {
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         c.lua_createtable(self.lua_state, 0, 7);
         pushPosition(self.lua_state, event.position, event.window_position orelse event.position);
-        c.lua_pushnumber(self.lua_state, event.dx);
-        c.lua_setfield(self.lua_state, -2, "dx");
-        c.lua_pushnumber(self.lua_state, event.dy);
-        c.lua_setfield(self.lua_state, -2, "dy");
+        lua_value.setNumberField(self.lua_state, -1, "dx", event.dx);
+        lua_value.setNumberField(self.lua_state, -1, "dy", event.dy);
         pushModifiers(self.lua_state, event.modifiers);
         c.lua_setfield(self.lua_state, -2, "modifiers");
         if (c.lua_pcall(self.lua_state, 1, 0, 0) != 0) return failLuaCall(self.lua_state, "scroll callback failed");
@@ -670,10 +666,8 @@ const LuaPopupBuilder = struct {
 pub fn pushRuntimeState(lua_state: *c.lua_State, state: State) void {
     c.lua_createtable(lua_state, 0, 3);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushnumber(lua_state, state.window_width);
-    c.lua_setfield(lua_state, table, "window_width");
-    c.lua_pushnumber(lua_state, state.window_height);
-    c.lua_setfield(lua_state, table, "window_height");
+    lua_value.setNumberField(lua_state, table, "window_width", state.window_width);
+    lua_value.setNumberField(lua_state, table, "window_height", state.window_height);
     lua_value.setStringField(lua_state, table, "color_scheme", state.color_scheme);
 }
 
@@ -1163,13 +1157,11 @@ test "gesture buttons parse names and reject invalid values" {
     try std.testing.expectError(error.InvalidPointerButton, getPointerButtons(lua_state, table));
 
     // Non-table, non-string values are rejected.
-    c.lua_pushboolean(lua_state, 1);
-    c.lua_setfield(lua_state, table, "buttons");
+    lua_value.setBooleanField(lua_state, table, "buttons", true);
     try std.testing.expectError(error.InvalidPointerButtons, getPointerButtons(lua_state, table));
 
     // Tap callback fields must hold functions.
-    c.lua_pushinteger(lua_state, 7);
-    c.lua_setfield(lua_state, table, "on_tap");
+    lua_value.setIntegerField(lua_state, table, "on_tap", 7);
     try std.testing.expectError(
         error.ExpectedLuaFunction,
         getOptionalTapCallbackField(lua_state, std.testing.allocator, table, "on_tap"),
@@ -1266,8 +1258,7 @@ test "failed gesture parse destroys callbacks it already captured" {
     // A non-function later callback fails the parse after on_tap was
     // captured; the errdefer chain must release on_tap's registry ref and
     // its wrapper. The testing callback allocator reports a missed destroy.
-    c.lua_pushinteger(lua_state, 42);
-    c.lua_setfield(lua_state, table, "on_tap_down");
+    lua_value.setIntegerField(lua_state, table, "on_tap_down", 42);
     try std.testing.expectError(
         error.ExpectedLuaFunction,
         parse(host, lua_state, arena.allocator(), std.testing.allocator, .{}, .{}, table),

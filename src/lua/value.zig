@@ -73,6 +73,24 @@ pub fn setStringField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8,
     c.lua_setfield(lua_state, absolute_table, key);
 }
 
+pub fn setIntegerField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, value: c.lua_Integer) void {
+    const absolute_table = absoluteIndex(lua_state, table);
+    c.lua_pushinteger(lua_state, value);
+    c.lua_setfield(lua_state, absolute_table, key);
+}
+
+pub fn setNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, value: c.lua_Number) void {
+    const absolute_table = absoluteIndex(lua_state, table);
+    c.lua_pushnumber(lua_state, value);
+    c.lua_setfield(lua_state, absolute_table, key);
+}
+
+pub fn setBooleanField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, value: bool) void {
+    const absolute_table = absoluteIndex(lua_state, table);
+    c.lua_pushboolean(lua_state, @intFromBool(value));
+    c.lua_setfield(lua_state, absolute_table, key);
+}
+
 pub fn dupeStringFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) ![]const u8 {
     return allocator.dupe(u8, try stringFromStack(lua_state, index));
 }

@@ -1624,8 +1624,7 @@ fn pushCallTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
     pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_member(message));
     c.lua_setfield(lua_state, table, "member");
     const serial = dbus_c.dbus_message_get_serial(message);
-    c.lua_pushnumber(lua_state, @floatFromInt(serial));
-    c.lua_setfield(lua_state, table, "serial");
+    lua_value.setNumberField(lua_state, table, "serial", @floatFromInt(serial));
 }
 
 fn pushDbusMessageArgs(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) usize {

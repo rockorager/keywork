@@ -488,14 +488,11 @@ fn pushResult(lua_state: *c.lua_State, status: u32) void {
     c.lua_createtable(lua_state, 0, 3);
     const table = c.lua_gettop(lua_state);
     if (linux.W.IFEXITED(status)) {
-        c.lua_pushinteger(lua_state, linux.W.EXITSTATUS(status));
-        c.lua_setfield(lua_state, table, "code");
+        lua_value.setIntegerField(lua_state, table, "code", linux.W.EXITSTATUS(status));
     } else if (linux.W.IFSIGNALED(status)) {
-        c.lua_pushinteger(lua_state, @intFromEnum(linux.W.TERMSIG(status)));
-        c.lua_setfield(lua_state, table, "signal");
+        lua_value.setIntegerField(lua_state, table, "signal", @intFromEnum(linux.W.TERMSIG(status)));
     }
-    c.lua_pushboolean(lua_state, if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "ok");
+    lua_value.setBooleanField(lua_state, table, "ok", linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0);
 }
 
 fn luaCancel(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

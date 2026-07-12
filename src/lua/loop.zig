@@ -712,14 +712,10 @@ fn secondsToMilliseconds(seconds: f64) !u64 {
 fn pushFdEvents(lua_state: *c.lua_State, events: u32) void {
     c.lua_createtable(lua_state, 0, 4);
     const table = c.lua_gettop(lua_state);
-    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.IN != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "read");
-    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.OUT != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "write");
-    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.ERR != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "err");
-    c.lua_pushboolean(lua_state, if (events & linux.EPOLL.HUP != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "hup");
+    lua_value.setBooleanField(lua_state, table, "read", events & linux.EPOLL.IN != 0);
+    lua_value.setBooleanField(lua_state, table, "write", events & linux.EPOLL.OUT != 0);
+    lua_value.setBooleanField(lua_state, table, "err", events & linux.EPOLL.ERR != 0);
+    lua_value.setBooleanField(lua_state, table, "hup", events & linux.EPOLL.HUP != 0);
 }
 
 fn pushFsEvent(lua_state: *c.lua_State, path: []const u8, mask: u32, name: ?[]const u8) void {
@@ -732,14 +728,9 @@ fn pushFsEvent(lua_state: *c.lua_State, path: []const u8, mask: u32, name: ?[]co
         c.lua_pushnil(lua_state);
     }
     c.lua_setfield(lua_state, table, "name");
-    c.lua_pushinteger(lua_state, @intCast(mask));
-    c.lua_setfield(lua_state, table, "mask");
-    c.lua_pushboolean(lua_state, if (mask & (linux.IN.MODIFY | linux.IN.CLOSE_WRITE | linux.IN.ATTRIB) != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "change");
-    c.lua_pushboolean(lua_state, if (mask & (linux.IN.MOVED_TO | linux.IN.MOVE_SELF | linux.IN.DELETE_SELF) != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "rename");
-    c.lua_pushboolean(lua_state, if (mask & linux.IN.DELETE_SELF != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "delete_self");
-    c.lua_pushboolean(lua_state, if (mask & linux.IN.MOVE_SELF != 0) 1 else 0);
-    c.lua_setfield(lua_state, table, "move_self");
+    lua_value.setIntegerField(lua_state, table, "mask", mask);
+    lua_value.setBooleanField(lua_state, table, "change", mask & (linux.IN.MODIFY | linux.IN.CLOSE_WRITE | linux.IN.ATTRIB) != 0);
+    lua_value.setBooleanField(lua_state, table, "rename", mask & (linux.IN.MOVED_TO | linux.IN.MOVE_SELF | linux.IN.DELETE_SELF) != 0);
+    lua_value.setBooleanField(lua_state, table, "delete_self", mask & linux.IN.DELETE_SELF != 0);
+    lua_value.setBooleanField(lua_state, table, "move_self", mask & linux.IN.MOVE_SELF != 0);
 }

@@ -884,8 +884,7 @@ test "image options decode fit alignment cache and revision" {
     c.lua_setfield(lua_state, table, "align");
     c.lua_pushstring(lua_state, "frame");
     c.lua_setfield(lua_state, table, "cache");
-    c.lua_pushinteger(lua_state, 7);
-    c.lua_setfield(lua_state, table, "revision");
+    lua_value.setIntegerField(lua_state, table, "revision", 7);
 
     const options = try lua_codec.decode(Options, lua_state, table, std.testing.allocator);
     try std.testing.expectEqual(Fit.cover, options.fit);
