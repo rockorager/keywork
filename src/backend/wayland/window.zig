@@ -582,7 +582,7 @@ const OutputRef = struct {
 
 pub const OutputInfo = wayland_options.OutputInfo;
 
-const GlobalNeeds = struct {
+pub const GlobalNeeds = struct {
     shm: bool = false,
     outputs: bool = false,
 };
