@@ -42,6 +42,8 @@ pub const WindowsHost = struct {
         build_windows: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, context: WindowsContext) anyerror![]WindowDeclaration,
         /// Builds the widget tree for the window declared with `id`.
         build_window_widget: *const fn (ptr: *anyopaque, id: []const u8, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget,
+        /// Notifies the host after the compositor closes a managed window.
+        window_closed: *const fn (ptr: *anyopaque, id: []const u8) anyerror!void,
     };
 
     pub fn buildWindows(self: WindowsHost, allocator: std.mem.Allocator, context: WindowsContext) ![]WindowDeclaration {
@@ -50,5 +52,9 @@ pub const WindowsHost = struct {
 
     pub fn buildWindowWidget(self: WindowsHost, id: []const u8, scope: *keywork.BuildScope, context: keywork.AppContext) !keywork.Widget {
         return self.vtable.build_window_widget(self.ptr, id, scope, context);
+    }
+
+    pub fn windowClosed(self: WindowsHost, id: []const u8) !void {
+        try self.vtable.window_closed(self.ptr, id);
     }
 };

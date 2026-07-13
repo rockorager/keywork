@@ -959,7 +959,8 @@ end
 --- layer-shell window is placed on (see ctx.outputs). A layer-shell window's
 --- height may be `"content"`; its retained root child is then laid out under
 --- a loose, output-capped height. Prefer natural or loose Flexible children
---- over Expanded in a shrink-wrapped direction.
+--- over Expanded in a shrink-wrapped direction. `on_close` fires when the
+--- compositor closes the window so app state can stop declaring it.
 ---
 --- A callable table rather than a function: the runtime attaches
 --- window-level operations (start_move, start_resize,
@@ -973,6 +974,7 @@ ui.window = setmetatable({}, {
       height = options.height,
       output = options.output,
       layer_shell = options.layer_shell,
+      on_close = options.on_close,
       child = options.child,
     }
   end,

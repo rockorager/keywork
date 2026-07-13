@@ -95,6 +95,9 @@ pub const App = struct {
     /// Registry refs of the child widget tables from the last window-set
     /// build, keyed by window id (keys owned by `allocator`).
     window_children: std.StringHashMapUnmanaged(c_int) = .empty,
+    /// Registry refs of `kw.window` close callbacks from the last window-set
+    /// build, keyed by window id (keys owned by `allocator`).
+    window_close_callbacks: std.StringHashMapUnmanaged(c_int) = .empty,
     script_watch: ?*event_loop.EventLoop.FileWatch = null,
     icon_cache: icon_theme.Cache,
     png_dims: lua_image.DimsCache,
@@ -167,6 +170,7 @@ pub const App = struct {
         self.pipewire_connections.deinit(self.allocator);
         self.pending_scope_cancels.deinit(self.allocator);
         self.releaseWindowChildren(&self.window_children);
+        self.releaseWindowCallbacks(&self.window_close_callbacks);
         if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
         if (self.browser_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
@@ -406,6 +410,7 @@ pub const App = struct {
     const windows_host_vtable: app_windows.WindowsHost.VTable = .{
         .build_windows = hostBuildWindows,
         .build_window_widget = hostBuildWindowWidget,
+        .window_closed = hostWindowClosed,
     };
 
     fn hostBuildWindows(ptr: *anyopaque, allocator: std.mem.Allocator, context: app_windows.WindowsContext) anyerror![]app_windows.WindowDeclaration {
@@ -418,6 +423,11 @@ pub const App = struct {
         return self.buildWindowWidget(id, scope, context);
     }
 
+    fn hostWindowClosed(ptr: *anyopaque, id: []const u8) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        try self.windowClosed(id);
+    }
+
     /// Runs the script's windows function (or synthesizes a single main
     /// window from the app child) and captures each window's child table
     /// so per-window runtimes can build it later. Captures are staged and
@@ -425,8 +435,10 @@ pub const App = struct {
     /// window set's widget refs intact for live windows.
     pub fn buildWindowDecls(self: *App, allocator: std.mem.Allocator, context: app_windows.WindowsContext) ![]app_windows.WindowDeclaration {
         try self.ensureLoaded();
-        var staged: std.StringHashMapUnmanaged(c_int) = .empty;
-        errdefer self.releaseWindowChildren(&staged);
+        var staged_children: std.StringHashMapUnmanaged(c_int) = .empty;
+        errdefer self.releaseWindowChildren(&staged_children);
+        var staged_close_callbacks: std.StringHashMapUnmanaged(c_int) = .empty;
+        errdefer self.releaseWindowCallbacks(&staged_close_callbacks);
 
         c.lua_settop(self.state, 0);
         defer c.lua_settop(self.state, 0);
@@ -440,10 +452,10 @@ pub const App = struct {
             pop(self.state, 1);
             c.lua_getfield(self.state, script, "child");
             if (c.lua_isnil(self.state, -1)) return error.AppChildMissing;
-            try self.captureWindowChild(&staged, "main");
+            try self.captureWindowChild(&staged_children, "main");
             const decls = try allocator.alloc(app_windows.WindowDeclaration, 1);
             decls[0] = .{ .id = "main" };
-            self.commitWindowChildren(&staged);
+            self.commitWindowState(&staged_children, &staged_close_callbacks);
             return decls;
         }
 
@@ -459,14 +471,25 @@ pub const App = struct {
         while (index <= count) : (index += 1) {
             c.lua_rawgeti(self.state, list, @intCast(index));
             defer pop(self.state, 1);
-            const decl = try self.parseWindowDecl(allocator, &staged, c.lua_gettop(self.state));
+            const decl = try self.parseWindowDecl(
+                allocator,
+                &staged_children,
+                &staged_close_callbacks,
+                c.lua_gettop(self.state),
+            );
             try decls.append(allocator, decl);
         }
-        self.commitWindowChildren(&staged);
+        self.commitWindowState(&staged_children, &staged_close_callbacks);
         return decls.toOwnedSlice(allocator);
     }
 
-    fn parseWindowDecl(self: *App, allocator: std.mem.Allocator, staged: *std.StringHashMapUnmanaged(c_int), table: c_int) !app_windows.WindowDeclaration {
+    fn parseWindowDecl(
+        self: *App,
+        allocator: std.mem.Allocator,
+        staged_children: *std.StringHashMapUnmanaged(c_int),
+        staged_close_callbacks: *std.StringHashMapUnmanaged(c_int),
+        table: c_int,
+    ) !app_windows.WindowDeclaration {
         if (c.lua_type(self.state, table) != c.LUA_TTABLE) return error.WindowDeclInvalid;
 
         c.lua_getfield(self.state, table, "id");
@@ -478,6 +501,16 @@ pub const App = struct {
         pop(self.state, 1);
 
         var decl: app_windows.WindowDeclaration = .{ .id = id };
+
+        c.lua_getfield(self.state, table, "on_close");
+        if (c.lua_isnil(self.state, -1)) {
+            pop(self.state, 1);
+        } else if (c.lua_type(self.state, -1) == c.LUA_TFUNCTION) {
+            try self.captureWindowCloseCallback(staged_close_callbacks, id);
+        } else {
+            pop(self.state, 1);
+            return error.WindowCloseCallbackInvalid;
+        }
 
         c.lua_getfield(self.state, table, "title");
         if (c.lua_type(self.state, -1) == c.LUA_TSTRING) {
@@ -515,7 +548,7 @@ pub const App = struct {
 
         c.lua_getfield(self.state, table, "child");
         if (c.lua_isnil(self.state, -1)) return error.WindowChildMissing;
-        try self.captureWindowChild(staged, id);
+        try self.captureWindowChild(staged_children, id);
         return decl;
     }
 
@@ -533,11 +566,32 @@ pub const App = struct {
         try staged.putNoClobber(self.allocator, key, ref);
     }
 
-    /// Replaces the live window-child refs with the staged set.
-    fn commitWindowChildren(self: *App, staged: *std.StringHashMapUnmanaged(c_int)) void {
+    /// Takes the function on top of the stack as `id`'s close callback.
+    /// Stores a registry ref in `staged` and pops the function.
+    fn captureWindowCloseCallback(self: *App, staged: *std.StringHashMapUnmanaged(c_int), id: []const u8) !void {
+        if (staged.contains(id)) {
+            pop(self.state, 1);
+            return error.DuplicateWindowId;
+        }
+        const ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+        errdefer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, ref);
+        const key = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(key);
+        try staged.putNoClobber(self.allocator, key, ref);
+    }
+
+    /// Replaces the live refs with one successfully staged window-set build.
+    fn commitWindowState(
+        self: *App,
+        staged_children: *std.StringHashMapUnmanaged(c_int),
+        staged_close_callbacks: *std.StringHashMapUnmanaged(c_int),
+    ) void {
         self.releaseWindowChildren(&self.window_children);
-        self.window_children = staged.*;
-        staged.* = .empty;
+        self.window_children = staged_children.*;
+        staged_children.* = .empty;
+        self.releaseWindowCallbacks(&self.window_close_callbacks);
+        self.window_close_callbacks = staged_close_callbacks.*;
+        staged_close_callbacks.* = .empty;
     }
 
     fn pushWindowsContext(lua_state: *c.lua_State, context: app_windows.WindowsContext) void {
@@ -567,6 +621,16 @@ pub const App = struct {
         map.* = .empty;
     }
 
+    fn releaseWindowCallbacks(self: *App, map: *std.StringHashMapUnmanaged(c_int)) void {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        map.deinit(self.allocator);
+        map.* = .empty;
+    }
+
     pub fn buildWindowWidget(self: *App, id: []const u8, scope: *BuildScope, context: keywork.AppContext) !keywork.Widget {
         const ref = self.window_children.get(id) orelse return error.UnknownWindow;
 
@@ -574,6 +638,14 @@ pub const App = struct {
         defer c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, ref);
         return self.parseWidgetAtTop(scope.allocator, context, scope.render_scale, scope.state_invalidator);
+    }
+
+    pub fn windowClosed(self: *App, id: []const u8) !void {
+        const ref = self.window_close_callbacks.get(id) orelse return;
+        c.lua_settop(self.state, 0);
+        defer c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, ref);
+        if (c.lua_pcall(self.state, 0, 0, 0) != 0) return self.failWithLuaError(error.LuaCallbackFailed);
     }
 
     fn reloadScript(self: *App) !void {
@@ -3647,6 +3719,38 @@ test "lua window declarations preserve numeric sizes and accept content height" 
     try std.testing.expect(declarations[1].content_height);
     try std.testing.expect(declarations[1].layer_shell != null);
     try std.testing.expect(declarations[1].layer_shell.?.pointer_interactivity == .none);
+}
+
+test "lua managed window on_close callback is retained by id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\window_closed = false
+        \\return kw.app({
+        \\  windows = function()
+        \\    return {
+        \\      kw.window({
+        \\        id = "settings",
+        \\        on_close = function() window_closed = true end,
+        \\        child = kw.text("settings"),
+        \\      }),
+        \\    }
+        \\  end,
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "window-close.lua", script);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try app.buildWindowDecls(arena.allocator(), .{});
+
+    try app.windowClosed("settings");
+    try app.windowClosed("unknown");
+    try expectLuaBoolean(&app, "window_closed", true);
 }
 
 test "lua flexible and main_align lay out through the parser" {

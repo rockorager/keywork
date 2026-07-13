@@ -1038,6 +1038,9 @@ fn WindowManager(comptime Backend: type) type {
                 if (managed.win.protocol.closed) {
                     // Remember compositor closes so the still-present
                     // declaration does not resurrect the window.
+                    self.windows_host.windowClosed(managed.id) catch |err| {
+                        log.warn("window {s}: on_close failed: {}", .{ managed.id, err });
+                    };
                     self.rememberClosed(managed.id);
                     self.destroyManaged(index);
                     continue;
