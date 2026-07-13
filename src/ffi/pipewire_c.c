@@ -23,6 +23,10 @@ struct kw_pw_route {
     uint32_t index;
     uint32_t device;
     uint32_t availability;
+    float volumes[SPA_AUDIO_MAX_CHANNELS];
+    uint32_t volume_count;
+    int has_mute;
+    int muted;
 };
 
 struct kw_pw_device {
@@ -89,6 +93,43 @@ static uint32_t property_id(const struct spa_dict *properties, const char *key) 
     return (uint32_t)result;
 }
 
+static bool parse_audio_props(
+    const struct spa_pod *props,
+    float *volumes,
+    uint32_t *volume_count,
+    int *has_mute,
+    int *muted
+) {
+    if (props == NULL ||
+        !spa_pod_is_object_type(props, SPA_TYPE_OBJECT_Props))
+        return false;
+
+    bool changed = false;
+    struct spa_pod_prop *property;
+    SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)props, property) {
+        if (property->key == SPA_PROP_channelVolumes) {
+            uint32_t count = spa_pod_copy_array(
+                &property->value,
+                SPA_TYPE_Float,
+                volumes,
+                SPA_AUDIO_MAX_CHANNELS
+            );
+            if (count > 0) {
+                *volume_count = count;
+                changed = true;
+            }
+        } else if (property->key == SPA_PROP_mute) {
+            bool value;
+            if (spa_pod_get_bool(&property->value, &value) == 0) {
+                *has_mute = 1;
+                *muted = value;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 static void node_info(void *data, const struct pw_node_info *info) {
     struct kw_pw_node *node = data;
     if (info->props != NULL) {
@@ -140,30 +181,13 @@ static void node_param(
         !spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
         return;
 
-    bool changed = false;
-    struct spa_pod_prop *property;
-    SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)param, property) {
-        if (property->key == SPA_PROP_channelVolumes) {
-            uint32_t count = spa_pod_copy_array(
-                &property->value,
-                SPA_TYPE_Float,
-                node->volumes,
-                SPA_AUDIO_MAX_CHANNELS
-            );
-            if (count > 0) {
-                node->volume_count = count;
-                changed = true;
-            }
-        } else if (property->key == SPA_PROP_mute) {
-            bool muted;
-            if (spa_pod_get_bool(&property->value, &muted) == 0) {
-                node->has_mute = 1;
-                node->muted = muted;
-                changed = true;
-            }
-        }
-    }
-    if (changed) {
+    if (parse_audio_props(
+            param,
+            node->volumes,
+            &node->volume_count,
+            &node->has_mute,
+            &node->muted
+        )) {
         node->connection->events.node_props(
             node->connection->data,
             node->id,
@@ -252,7 +276,7 @@ static void destroy_nodes(
     }
 }
 
-static void update_route(
+static struct kw_pw_route *update_route(
     struct kw_pw_device *device,
     uint32_t route_index,
     uint32_t route_device,
@@ -262,17 +286,18 @@ static void update_route(
         if (route->device == route_device) {
             route->index = route_index;
             route->availability = availability;
-            return;
+            return route;
         }
     }
     struct kw_pw_route *route = calloc(1, sizeof(*route));
     if (route == NULL)
-        return;
+        return NULL;
     route->index = route_index;
     route->device = route_device;
     route->availability = availability;
     route->next = device->routes;
     device->routes = route;
+    return route;
 }
 
 static void destroy_routes(struct kw_pw_device *device) {
@@ -363,6 +388,7 @@ static void device_param(
     int32_t route_device = -1;
     uint32_t availability = SPA_PARAM_AVAILABILITY_unknown;
     const struct spa_pod *route_info = NULL;
+    const struct spa_pod *route_props = NULL;
     if (spa_pod_parse_object(
             param,
             SPA_TYPE_OBJECT_ParamRoute,
@@ -370,20 +396,36 @@ static void device_param(
             SPA_PARAM_ROUTE_index, SPA_POD_Int(&route_index),
             SPA_PARAM_ROUTE_device, SPA_POD_Int(&route_device),
             SPA_PARAM_ROUTE_available, SPA_POD_OPT_Id(&availability),
-            SPA_PARAM_ROUTE_info, SPA_POD_OPT_PodStruct(&route_info)
+            SPA_PARAM_ROUTE_info, SPA_POD_OPT_PodStruct(&route_info),
+            SPA_PARAM_ROUTE_props, SPA_POD_OPT_PodObject(&route_props)
         ) < 0 || route_index < 0 || route_device < 0)
         return;
-    update_route(
+    struct kw_pw_route *route = update_route(
         device,
         (uint32_t)route_index,
         (uint32_t)route_device,
         availability
+    );
+    if (route == NULL)
+        return;
+    route->volume_count = 0;
+    route->has_mute = 0;
+    parse_audio_props(
+        route_props,
+        route->volumes,
+        &route->volume_count,
+        &route->has_mute,
+        &route->muted
     );
     device->connection->events.route(
         device->connection->data,
         device->id,
         (uint32_t)route_device,
         availability,
+        route->volumes,
+        route->volume_count,
+        route->has_mute,
+        route->muted,
         route_info_value(route_info, "port.type"),
         device->bus
     );
@@ -760,7 +802,6 @@ static int set_node_props(
 static int set_route_props(
     struct kw_pw_device *device,
     struct kw_pw_route *route,
-    struct kw_pw_node *node,
     int set_volume,
     float volume,
     int set_mute,
@@ -788,17 +829,17 @@ static int set_route_props(
         SPA_PARAM_Route
     );
     if (set_volume) {
-        if (node->volume_count == 0)
+        if (route->volume_count == 0)
             return -EAGAIN;
         float volumes[SPA_AUDIO_MAX_CHANNELS];
-        for (uint32_t i = 0; i < node->volume_count; i++)
+        for (uint32_t i = 0; i < route->volume_count; i++)
             volumes[i] = volume;
         spa_pod_builder_prop(&builder, SPA_PROP_channelVolumes, 0);
         spa_pod_builder_array(
             &builder,
             sizeof(float),
             SPA_TYPE_Float,
-            node->volume_count,
+            route->volume_count,
             volumes
         );
     }
@@ -826,23 +867,24 @@ static int set_audio_props(
     struct kw_pw_node *node = find_node(connection, node_id);
     if (node == NULL)
         return -ENOENT;
-    if (node->route_managed) {
-        struct kw_pw_device *device = find_device(connection, node->device_id);
-        struct kw_pw_route *route = device == NULL
-            ? NULL
-            : find_route(device, node->profile_device);
-        if (route == NULL)
-            return -EAGAIN;
+    struct kw_pw_device *device = find_device(connection, node->device_id);
+    struct kw_pw_route *route = device == NULL
+        ? NULL
+        : find_route(device, node->profile_device);
+    /* A matching route with volume and mute properties is authoritative,
+     * even if a hotplug transition left the node's device.routes hint stale. */
+    if (route != NULL && route->volume_count > 0 && route->has_mute) {
         return set_route_props(
             device,
             route,
-            node,
             set_volume,
             volume,
             set_mute,
             muted
         );
     }
+    if (route == NULL && node->route_managed)
+        return -EAGAIN;
     return set_node_props(node, set_volume, volume, set_mute, muted);
 }
 

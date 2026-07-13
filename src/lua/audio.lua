@@ -33,18 +33,14 @@ local function observed_volume(device)
   return maximum and maximum ^ (1 / 3) or nil
 end
 
-local function current_volume(device)
-  return device.target_volume or observed_volume(device)
-end
-
-local function current_muted(device)
-  if device.target_muted ~= nil then return device.target_muted end
-  return device.muted
-end
-
 local function device_route(device)
-  if not device.route_managed then return nil end
-  return device.device_id, device.route_device
+  local device_id = device.device_id
+  local route_device = device.route_device
+  if type(device_id) ~= "number" or device_id == 0xffffffff
+      or type(route_device) ~= "number" or route_device == 0xffffffff then
+    return nil
+  end
+  return device_id, route_device
 end
 
 local function device_route_record(monitor, device)
@@ -54,7 +50,49 @@ local function device_route_record(monitor, device)
   return routes[route_device], true
 end
 
+local function control_record(monitor, device)
+  local route = device_route_record(monitor, device)
+  if route and route.muted ~= nil and observed_volume(route) ~= nil then
+    return route
+  end
+  return device
+end
+
+local function current_volume(monitor, device)
+  return device.target_volume or observed_volume(control_record(monitor, device))
+end
+
+local function current_muted(monitor, device)
+  if device.target_muted ~= nil then return device.target_muted end
+  return control_record(monitor, device).muted
+end
+
+local function acknowledge_control(device, record)
+  local volume = observed_volume(record)
+  if device.target_volume and volume
+      and math.abs(device.target_volume - volume) < 0.0001 then
+    device.target_volume = nil
+  end
+  if device.target_muted == record.muted then
+    device.target_muted = nil
+  end
+  if device.pending_props and device.pending_props > 0 then
+    device.pending_props = device.pending_props - 1
+    -- Hardware may quantize a requested volume. Once every queued write has
+    -- produced a property update, the server value wins even if it does not
+    -- exactly match the optimistic target.
+    if device.pending_props == 0 then
+      device.target_volume = nil
+      device.target_muted = nil
+    end
+  end
+  if device.target_volume == nil and device.target_muted == nil then
+    device.pending_props = 0
+  end
+end
+
 local function device_availability(monitor, device)
+  if not device.route_managed then return "unknown" end
   local route, routes_known = device_route_record(monitor, device)
   if not routes_known then return "unknown" end
   -- Route-managed nodes can remain registered when their hardware port is
@@ -77,8 +115,8 @@ local function device_record(monitor, device, event_type)
     nick = properties["node.nick"],
     icon_name = properties["device.icon-name"] or properties["device.icon_name"],
     default = name ~= nil and monitor.defaults[device.kind] == name,
-    volume = current_volume(device),
-    muted = current_muted(device),
+    volume = current_volume(monitor, device),
+    muted = current_muted(monitor, device),
     availability = availability,
     available = availability ~= "no",
     port_type = route and route.port_type,
@@ -161,30 +199,12 @@ local function apply_node_props(monitor, event)
   if not device then return end
   if event.channel_volumes and #event.channel_volumes > 0 then
     device.channel_volumes = event.channel_volumes
-    local volume = observed_volume(device)
-    if device.target_volume and volume
-        and math.abs(device.target_volume - volume) < 0.0001 then
-      device.target_volume = nil
-    end
   end
   if event.muted ~= nil then
     device.muted = event.muted
-    if device.target_muted == event.muted then
-      device.target_muted = nil
-    end
   end
-  if device.pending_props and device.pending_props > 0 then
-    device.pending_props = device.pending_props - 1
-    -- Hardware may quantize a requested volume. Once every queued write has
-    -- produced a property update, the server value wins even if it does not
-    -- exactly match the optimistic target.
-    if device.pending_props == 0 then
-      device.target_volume = nil
-      device.target_muted = nil
-    end
-  end
-  if device.target_volume == nil and device.target_muted == nil then
-    device.pending_props = 0
+  if control_record(monitor, device) == device then
+    acknowledge_control(device, device)
   end
   publish_device(monitor, device, "changed")
 end
@@ -212,21 +232,20 @@ local function apply_route(monitor, event)
     routes = {}
     monitor.routes[event.id] = routes
   end
-  local previous = routes[event.device]
-  if previous
-      and previous.availability == event.availability
-      and previous.port_type == event.port_type
-      and previous.bus == event.bus then
-    return
-  end
   routes[event.device] = {
     availability = event.availability,
+    channel_volumes = event.channel_volumes,
+    muted = event.muted,
     port_type = event.port_type,
     bus = event.bus,
   }
   for _, device in pairs(monitor.by_id) do
     local device_id, route_device = device_route(device)
     if device_id == event.id and route_device == event.device then
+      local route = routes[event.device]
+      if control_record(monitor, device) == route then
+        acknowledge_control(device, route)
+      end
       publish_device(monitor, device, "changed")
     end
   end
@@ -322,7 +341,7 @@ function Monitor:adjust_volume(target, delta, maximum)
   end
   local device = resolve_device(self, target)
   if not device then return nil, "audio device unavailable" end
-  local volume = current_volume(device)
+  local volume = current_volume(self, device)
   if volume == nil then return nil, "audio volume unavailable" end
   local limit = maximum or MAX_VOLUME
   return self:set_volume(device.id, math.max(0, math.min(limit, volume + delta)))
@@ -345,7 +364,7 @@ end
 function Monitor:toggle_muted(target)
   local device = resolve_device(self, target)
   if not device then return nil, "audio device unavailable" end
-  return self:set_muted(device.id, not (current_muted(device) == true))
+  return self:set_muted(device.id, not (current_muted(self, device) == true))
 end
 
 --- Asks the session manager to make the named node the configured default.

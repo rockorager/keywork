@@ -55,6 +55,10 @@ typedef void (*kw_pw_route_fn)(
     uint32_t id,
     uint32_t device,
     uint32_t availability,
+    const float *volumes,
+    uint32_t volume_count,
+    int has_mute,
+    int muted,
     const char *port_type,
     const char *bus
 );

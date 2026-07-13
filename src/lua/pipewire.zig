@@ -265,13 +265,28 @@ fn routeInfo(
     id: u32,
     device: u32,
     availability: u32,
+    volumes: [*c]const f32,
+    volume_count: u32,
+    has_mute: c_int,
+    muted: c_int,
     port_type: [*c]const u8,
     bus: [*c]const u8,
 ) callconv(.c) void {
     const connection: *Connection = @ptrCast(@alignCast(data.?));
     if (connection.closed) return;
     const lua_state = connection.host.luaState();
-    pushRouteEvent(lua_state, id, device, availability, port_type, bus);
+    pushRouteEvent(
+        lua_state,
+        id,
+        device,
+        availability,
+        volumes,
+        volume_count,
+        has_mute != 0,
+        muted != 0,
+        port_type,
+        bus,
+    );
     connection.stream.deliver(connection.host.allocator(), lua_state) catch |err| {
         log.warn("PipeWire route delivery failed: {}", .{err});
     };
@@ -347,6 +362,10 @@ fn pushRouteEvent(
     id: u32,
     device: u32,
     availability: u32,
+    volumes: [*c]const f32,
+    volume_count: u32,
+    has_mute: bool,
+    muted: bool,
     port_type: [*c]const u8,
     bus: [*c]const u8,
 ) void {
@@ -355,11 +374,22 @@ fn pushRouteEvent(
         2 => "yes",
         else => "unknown",
     };
-    c.lua_createtable(lua_state, 0, 6);
+    c.lua_createtable(lua_state, 0, 8);
     lua_value.setStringField(lua_state, -1, "type", "route");
     lua_value.setIntegerField(lua_state, -1, "id", id);
     lua_value.setIntegerField(lua_state, -1, "device", device);
     lua_value.setStringField(lua_state, -1, "availability", availability_name);
+    c.lua_createtable(lua_state, @intCast(volume_count), 0);
+    if (volumes != null) {
+        for (volumes[0..volume_count], 1..) |volume, index| {
+            c.lua_pushnumber(lua_state, volume);
+            c.lua_rawseti(lua_state, -2, @intCast(index));
+        }
+    }
+    c.lua_setfield(lua_state, -2, "channel_volumes");
+    if (has_mute) {
+        lua_value.setBooleanField(lua_state, -1, "muted", muted);
+    }
     pushOptionalStringField(lua_state, "port_type", port_type);
     pushOptionalStringField(lua_state, "bus", bus);
 }
@@ -545,16 +575,24 @@ test "PipeWire node property events expose channel volumes and mute" {
     try std.testing.expectEqual(@as(c_int, 0), c.lua_toboolean(lua_state, -1));
 }
 
-test "PipeWire route events expose availability and port type" {
+test "PipeWire route events expose controls, availability, and port type" {
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);
+    const volumes = [_]f32{ 0.125, 0.5 };
 
-    pushRouteEvent(lua_state, 50, 1, 1, "speaker", "pci");
+    pushRouteEvent(lua_state, 50, 1, 1, &volumes, volumes.len, true, false, "speaker", "pci");
     c.lua_getfield(lua_state, -1, "type");
     try std.testing.expectEqualStrings("route", zSpan(c.lua_tolstring(lua_state, -1, null).?));
     c.lua_settop(lua_state, -2);
     c.lua_getfield(lua_state, -1, "availability");
     try std.testing.expectEqualStrings("no", zSpan(c.lua_tolstring(lua_state, -1, null).?));
+    c.lua_settop(lua_state, -2);
+    c.lua_getfield(lua_state, -1, "channel_volumes");
+    c.lua_rawgeti(lua_state, -1, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.lua_tonumber(lua_state, -1), 0.0001);
+    c.lua_settop(lua_state, -3);
+    c.lua_getfield(lua_state, -1, "muted");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_toboolean(lua_state, -1));
     c.lua_settop(lua_state, -2);
     c.lua_getfield(lua_state, -1, "port_type");
     try std.testing.expectEqualStrings("speaker", zSpan(c.lua_tolstring(lua_state, -1, null).?));
