@@ -28,6 +28,8 @@ pub const colors = struct {
     pub const transparent: Color = Color.argb(0x00, 0x00, 0x00, 0x00);
     pub const white: Color = Color.argb(0xff, 0xff, 0xff, 0xff);
     pub const black: Color = Color.argb(0xff, 0x00, 0x00, 0x00);
+    pub const surface_light: Color = Color.argb(0xd9, 0xff, 0xff, 0xff);
+    pub const surface_dark: Color = Color.argb(0x40, 0x00, 0x00, 0x00);
 
     pub const slate1: Color = Color.argb(0xff, 0xfc, 0xfc, 0xfd);
     pub const slate2: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
@@ -35,6 +37,12 @@ pub const colors = struct {
     pub const slate7: Color = Color.argb(0xff, 0xcd, 0xce, 0xd6);
     pub const slate11: Color = Color.argb(0xff, 0x60, 0x64, 0x6c);
     pub const slate12: Color = Color.argb(0xff, 0x1c, 0x20, 0x24);
+    pub const slate_a3: Color = Color.argb(0x0f, 0x00, 0x00, 0x33);
+    pub const slate_a6: Color = Color.argb(0x26, 0x00, 0x00, 0x2f);
+    pub const slate_a7: Color = Color.argb(0x32, 0x00, 0x06, 0x2e);
+    pub const slate_a8: Color = Color.argb(0x46, 0x00, 0x08, 0x30);
+    pub const slate_a10: Color = Color.argb(0x7f, 0x00, 0x07, 0x1b);
+    pub const slate_a11: Color = Color.argb(0x9f, 0x00, 0x07, 0x14);
 
     pub const slate_dark1: Color = Color.argb(0xff, 0x11, 0x11, 0x13);
     pub const slate_dark2: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
@@ -42,8 +50,26 @@ pub const colors = struct {
     pub const slate_dark7: Color = Color.argb(0xff, 0x43, 0x48, 0x4e);
     pub const slate_dark11: Color = Color.argb(0xff, 0xb0, 0xb4, 0xba);
     pub const slate_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
+    pub const slate_dark_a3: Color = Color.argb(0x14, 0xdd, 0xea, 0xf8);
+    pub const slate_dark_a6: Color = Color.argb(0x30, 0xd6, 0xeb, 0xfd);
+    pub const slate_dark_a7: Color = Color.argb(0x40, 0xd9, 0xed, 0xff);
+    pub const slate_dark_a8: Color = Color.argb(0x5d, 0xd9, 0xed, 0xff);
+    pub const slate_dark_a10: Color = Color.argb(0x7b, 0xe5, 0xed, 0xfd);
+    pub const slate_dark_a11: Color = Color.argb(0xb5, 0xf1, 0xf7, 0xfe);
 
+    pub const blue8: Color = Color.argb(0xff, 0x5e, 0xb1, 0xef);
     pub const blue9: Color = Color.argb(0xff, 0x00, 0x90, 0xff);
+    pub const blue10: Color = Color.argb(0xff, 0x05, 0x88, 0xf0);
+    pub const blue_a3: Color = Color.argb(0x19, 0x00, 0x8f, 0xf5);
+    pub const blue_a4: Color = Color.argb(0x2a, 0x00, 0x9e, 0xff);
+    pub const blue_a6: Color = Color.argb(0x53, 0x00, 0x88, 0xf6);
+    pub const blue_a11: Color = Color.argb(0xf2, 0x00, 0x6d, 0xcb);
+    pub const blue_dark8: Color = Color.argb(0xff, 0x28, 0x70, 0xbd);
+    pub const blue_dark10: Color = Color.argb(0xff, 0x3b, 0x9e, 0xff);
+    pub const blue_dark_a3: Color = Color.argb(0x3a, 0x00, 0x77, 0xff);
+    pub const blue_dark_a4: Color = Color.argb(0x57, 0x00, 0x75, 0xff);
+    pub const blue_dark_a6: Color = Color.argb(0x7f, 0x0f, 0x89, 0xfd);
+    pub const blue_dark_a11: Color = Color.argb(0xff, 0x70, 0xb8, 0xff);
     pub const red9: Color = Color.argb(0xff, 0xe5, 0x48, 0x4d);
 
     pub const ink: Color = slate12;
@@ -98,15 +124,15 @@ pub const ColorScheme = struct {
 
     pub const light: ColorScheme = .{
         .brightness = .light,
-        .background = colors.slate2,
+        .background = colors.white,
         .foreground = colors.ink,
         .primary = colors.accent,
         .on_primary = colors.white,
-        .surface = colors.slate1,
+        .surface = colors.surface_light,
         .surface_high = colors.white,
-        .surface_low = colors.slate3,
-        .border = colors.slate7,
-        .muted = colors.slate11,
+        .surface_low = colors.slate2,
+        .border = colors.slate_a7,
+        .muted = colors.slate_a11,
         .error_color = colors.red9,
         .on_error = colors.white,
     };
@@ -116,14 +142,14 @@ pub const ColorScheme = struct {
         .background = colors.slate_dark1,
         .foreground = colors.slate_dark12,
         .primary = colors.blue9,
-        .on_primary = colors.black,
-        .surface = colors.slate_dark2,
-        .surface_high = colors.slate_dark3,
-        .surface_low = colors.slate_dark1,
-        .border = colors.slate_dark7,
-        .muted = colors.slate_dark11,
+        .on_primary = colors.white,
+        .surface = colors.surface_dark,
+        .surface_high = colors.slate_dark2,
+        .surface_low = colors.slate_dark2,
+        .border = colors.slate_dark_a7,
+        .muted = colors.slate_dark_a11,
         .error_color = colors.red9,
-        .on_error = colors.black,
+        .on_error = colors.white,
     };
 };
 
@@ -161,11 +187,11 @@ pub const ButtonTheme = struct {
     pressed_background: ?Color = null,
     disabled_background: ?Color = null,
     disabled_foreground: ?Color = null,
-    // Radix size-2 button: 32px tall, space-3 horizontal padding, radius-2.
-    // Our control height is text-driven (14px label with ~20px line height),
-    // so 6px of vertical padding approximates the 32px Radix height.
+    focused_border_width: f32 = 2,
+    // Radix size-2 button: 20px label line plus 6px vertical padding,
+    // space-3 horizontal padding, and radius-2.
     padding_x: f32 = scale.space(3),
-    padding_y: f32 = 6,
+    padding_y: f32 = (scale.space(6) - scale.lineHeight(2)) / 2,
     radius: f32 = scale.radius(2),
 };
 
@@ -178,9 +204,19 @@ pub const InputTheme = struct {
     // Radix size-2 text field: 32px tall, space-2 horizontal padding,
     // radius-2, font-size-2.
     padding_x: f32 = scale.space(2),
-    padding_y: f32 = 6,
+    padding_y: f32 = (scale.space(6) - scale.lineHeight(2)) / 2,
     radius: f32 = scale.radius(2),
     font_size: f32 = scale.fontSize(2),
+    line_height: f32 = scale.lineHeight(2),
+};
+
+pub const SeparatorTheme = struct {
+    color: ?Color = null,
+};
+
+pub const ScrollbarTheme = struct {
+    track: ?Color = null,
+    thumb: ?Color = null,
 };
 
 pub const Theme = struct {
@@ -188,12 +224,52 @@ pub const Theme = struct {
     text_theme: TextTheme = .{},
     button_theme: ButtonTheme = .{},
     input_theme: InputTheme = .{},
+    separator_theme: SeparatorTheme = .{},
+    scrollbar_theme: ScrollbarTheme = .{},
 
     pub const light: Theme = .{
         .color_scheme = .light,
+        .button_theme = .{
+            .background = colors.blue9,
+            .foreground = colors.white,
+            .hover_background = colors.blue10,
+            .hover_foreground = colors.white,
+            .focused_border = colors.blue8,
+            .pressed_background = colors.blue10,
+            .disabled_background = colors.slate_a3,
+            .disabled_foreground = colors.slate_a8,
+        },
+        .input_theme = .{
+            .background = colors.surface_light,
+            .foreground = colors.slate12,
+            .placeholder = colors.slate_a10,
+            .border = colors.slate_a7,
+            .focused_border = colors.blue8,
+        },
+        .separator_theme = .{ .color = colors.slate_a6 },
+        .scrollbar_theme = .{ .track = colors.slate_a3, .thumb = colors.slate_a8 },
     };
     pub const dark: Theme = .{
         .color_scheme = .dark,
+        .button_theme = .{
+            .background = colors.blue9,
+            .foreground = colors.white,
+            .hover_background = colors.blue_dark10,
+            .hover_foreground = colors.white,
+            .focused_border = colors.blue_dark8,
+            .pressed_background = colors.blue_dark10,
+            .disabled_background = colors.slate_dark_a3,
+            .disabled_foreground = colors.slate_dark_a8,
+        },
+        .input_theme = .{
+            .background = colors.surface_dark,
+            .foreground = colors.slate_dark12,
+            .placeholder = colors.slate_dark_a10,
+            .border = colors.slate_dark_a7,
+            .focused_border = colors.blue_dark8,
+        },
+        .separator_theme = .{ .color = colors.slate_dark_a6 },
+        .scrollbar_theme = .{ .track = colors.slate_dark_a3, .thumb = colors.slate_dark_a8 },
     };
     pub const default: Theme = light;
 

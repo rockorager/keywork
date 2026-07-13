@@ -16,7 +16,6 @@ const Rect = model.Rect;
 const Constraints = model.Constraints;
 const TextMeasurer = model.TextMeasurer;
 const ResolvedTextStyle = model.ResolvedTextStyle;
-const input_min_width = model.input_min_width;
 const LayoutError = model.LayoutError;
 const scrollState = model.scrollState;
 const listState = model.listState;
@@ -808,6 +807,8 @@ fn layoutElementInto(
                 .scroll_content = child.rect.size(),
                 .scroll_offset = .{ .x = state.offset_x, .y = state.offset_y },
                 .scrollbar_alpha = state.scrollbar_alpha,
+                .scrollbar_track_color = scroll_widget.scrollbar_track_color.?,
+                .scrollbar_color = scroll_widget.scrollbar_color.?,
             });
         },
         .list => |list_widget| {
@@ -859,6 +860,8 @@ fn layoutElementInto(
                 .scroll_content = .{ .width = content_width, .height = content_height },
                 .scroll_offset = .{ .x = 0, .y = state.offset },
                 .scrollbar_alpha = state.scrollbar_alpha,
+                .scrollbar_track_color = list_widget.scrollbar_track_color.?,
+                .scrollbar_color = list_widget.scrollbar_color.?,
             });
         },
         .text_input => |input_widget| {
@@ -870,12 +873,16 @@ fn layoutElementInto(
                 break :blk node.text_buffer.items;
             } else value;
             const text_value = if (visible_value.len > 0) visible_value else input_widget.placeholder;
-            const style: ResolvedTextStyle = .{ .color = input_widget.foreground, .font_size = input_widget.font_size };
+            const style: ResolvedTextStyle = .{
+                .color = input_widget.foreground,
+                .font_size = input_widget.font_size,
+                .line_height = input_widget.line_height,
+            };
             const measured = try measurer.measureText(text_value, style);
             const value_size = try measurer.measureText(visible_value, style);
             const fill_width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else 0;
             const requested = Size{
-                .width = @max(input_min_width, @max(measured.width + input_widget.padding_x * 2, fill_width)),
+                .width = @max(measured.width + input_widget.padding_x * 2, fill_width),
                 .height = measured.height + input_widget.padding_y * 2,
             };
             const size_value = constraints.clamp(requested);

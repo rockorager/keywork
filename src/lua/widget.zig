@@ -96,6 +96,7 @@ const GestureOptions = struct {
     hover_background: ?keywork.Color = null,
     pressed_background: ?keywork.Color = null,
     focused_border: ?keywork.Color = null,
+    focused_border_width: f32 = 2,
     cursor: keywork.CursorShape = .default,
     activation: keywork.Widget.ClickActivation = .press,
 
@@ -163,6 +164,7 @@ const TextInputOptions = struct {
     padding_y: ?f32 = null,
     radius: ?f32 = null,
     font_size: ?f32 = null,
+    line_height: ?f32 = null,
 
     fn style(self: TextInputOptions) keywork.Widget.TextInput.Style {
         const plain = if (self.variant) |variant| std.mem.eql(u8, variant, "plain") else false;
@@ -176,6 +178,7 @@ const TextInputOptions = struct {
             .padding_y = self.padding_y orelse if (plain) 0 else null,
             .radius = self.radius orelse if (plain) 0 else null,
             .font_size = self.font_size,
+            .line_height = self.line_height,
         };
     }
 };
@@ -195,7 +198,7 @@ const ParseContext = struct {
     fn resolveIcon(self: ParseContext, options: IconOptions) struct { size: f32, color: ?keywork.Color, symbolic: bool } {
         const color = options.color orelse self.icon.color;
         return .{
-            .size = options.size orelse self.icon.size orelse 16,
+            .size = options.size orelse self.icon.size orelse keywork.scale.space(4),
             // No explicit or ambient color renders the icon's own palette.
             .color = color,
             .symbolic = options.symbolic orelse self.icon.symbolic orelse false,
@@ -283,9 +286,9 @@ const SpacerOptions = struct {
 };
 
 const SpinnerOptions = struct {
-    size: f32 = 20,
+    size: f32 = keywork.scale.space(4),
     color: ?keywork.Color = null,
-    period_ms: u32 = 900,
+    period_ms: u32 = 800,
 };
 
 const LuaCallback = struct {
@@ -824,6 +827,7 @@ pub fn parse(
             .hover_style = options.hoverStyle(),
             .pressed_style = options.pressedStyle(),
             .focused_border = options.focused_border,
+            .focused_border_width = options.focused_border_width,
             .cursor = options.cursor,
             .activation = options.activation,
         } };

@@ -853,13 +853,13 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
 
     // 20 Radix body rows at 24px in a 120px viewport: content 480, scroll
     // range 360.
-    // Thumb: track 114 (120 minus a 3px margin each end), length
-    // max(12, 114*120/480) = 28.5, travel 85.5.
-    const drag_scale: f32 = 360.0 / 85.5;
+    // Radix size-1 thumb: track 112 (120 minus a 4px margin each end),
+    // length max(16, 112*120/480) = 28, travel 84.
+    const drag_scale: f32 = 360.0 / 84.0;
     // The viewport shrink-wraps its child's width; the thumb hugs its
     // right edge.
     const viewport = runtime.root.?.rect;
-    const thumb_x = viewport.x + viewport.width - 6;
+    const thumb_x = viewport.x + viewport.width - 8;
 
     // The thumb rests hidden; scroll activity reveals it without moving
     // the content, so it can be grabbed.

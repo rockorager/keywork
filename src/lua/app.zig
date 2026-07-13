@@ -3554,9 +3554,9 @@ test "lua resolves theme families and component tokens" {
 
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=40 color=#ff111113") != null);
-    // Input geometry follows the default input theme: 14px text plus 6px
+    // Input geometry follows the default input theme: a 20px line plus 6px
     // vertical and 8px horizontal padding (Radix size-2 text field).
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=26 color=#ff223344") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=32 color=#ff223344") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=8 y=6 value=\"Name\" color=#ff445566") != null);
 }
 
@@ -3568,6 +3568,14 @@ test "lua default theme exposes paired Radix size 2 typography" {
     const script =
         \\local kw = require("keywork")
         \\local theme = kw.resolve_theme(kw.theme_data(), "light")
+        \\assert(theme.text.body.size == 16 and theme.text.body.line_height == 24)
+        \\assert(theme.components.button.padding_x == 12 and theme.components.button.padding_y == 6 and theme.components.button.radius == 4)
+        \\assert(theme.components.input.padding_x == 8 and theme.components.input.padding_y == 6 and theme.components.input.line_height == 20)
+        \\assert(theme.components.chip.min_height == 24 and theme.components.chip.font_size == 12 and theme.components.chip.line_height == 16)
+        \\assert(theme.components.menu.padding == 8 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
+        \\assert(theme.components.menu.separator.margin == 8 and theme.components.menu.separator.inset == 4)
+        \\assert(theme.components.separator.thickness == 1)
+        \\assert(theme.components.scrollbar.track == theme.colors.slate_a3 and theme.components.scrollbar.thumb == theme.colors.slate_a8)
         \\return kw.app({
         \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),
         \\})

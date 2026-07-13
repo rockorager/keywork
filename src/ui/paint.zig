@@ -92,11 +92,12 @@ fn paintNode(
         },
         .text_input => {
             const border = if (node.focused) node.focused_border else node.border;
+            const border_width: f32 = if (node.focused) 2 else 1;
             if (node.box_radius > 0) {
-                try paintRoundedBox(allocator, display_list, raster_cache, node.rect, node.background, border, 1, node.box_radius, scale);
+                try paintRoundedBox(allocator, display_list, raster_cache, node.rect, node.background, border, border_width, node.box_radius, scale);
             } else {
                 try display_list.fillRect(allocator, node.rect, node.background);
-                try paintBorder(allocator, display_list, node.rect, border, 1);
+                try paintBorder(allocator, display_list, node.rect, border, border_width);
             }
             const value = node.text orelse "";
             const visible_text = if (value.len > 0) value else node.placeholder orelse "";
@@ -106,7 +107,11 @@ fn paintNode(
             try display_list.text(allocator, .{
                 .x = node.rect.x + node.padding_x,
                 .y = node.rect.y + node.padding_y,
-            }, visible_text, .{ .color = text_color, .font_size = node.text_style.font_size });
+            }, visible_text, .{
+                .color = text_color,
+                .font_size = node.text_style.font_size,
+                .line_height = node.text_style.line_height,
+            });
             if (node.focused) {
                 const caret_x = node.caret_x orelse node.rect.x + node.padding_x;
                 try display_list.fillRect(allocator, .{
@@ -279,7 +284,8 @@ test "damage paint does not emit children outside an intersecting viewport" {
 
 const spinner_dots = 8;
 /// Floor for trailing dot brightness so the whole ring stays visible.
-const spinner_trail_floor: f32 = 0.15;
+const spinner_trail_floor: f32 = 0.25;
+const spinner_opacity: f32 = 0.65;
 
 /// A ring of dots at fixed positions; the sweep phase picks the brightest
 /// dot and brightness trails off behind it. Dot positions never move, so
@@ -299,7 +305,7 @@ fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_l
         // brightest as the sweep passes it and dims with age behind it.
         const angle = fraction * std.math.tau - std.math.tau / 4.0;
         const age = @mod(node.spinner_progress - fraction + 1, 1);
-        const intensity = spinner_trail_floor + (1 - spinner_trail_floor) * (1 - age);
+        const intensity = spinner_opacity * (spinner_trail_floor + (1 - spinner_trail_floor) * (1 - age));
         var color = node.foreground;
         color.a = @intFromFloat(@round(@as(f32, @floatFromInt(color.a)) * intensity));
         if (color.a == 0) continue;
@@ -313,16 +319,18 @@ fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_l
     }
 }
 
-pub const scrollbar_thickness: f32 = 6;
-pub const scrollbar_margin: f32 = 3;
-const scrollbar_min_thumb: f32 = 12;
-pub const scrollbar_color: Color = Color.argb(0xb4, 0x80, 0x80, 0x88);
+pub const scrollbar_thickness: f32 = model.scale.space(1);
+pub const scrollbar_margin: f32 = model.scale.space(1);
+const scrollbar_min_thumb: f32 = model.scale.space(4);
+pub const scrollbar_track_color: Color = colors.slate_a3;
+pub const scrollbar_color: Color = colors.slate_a8;
 /// Extra pointer slop around the painted thumb so the thin bar is
 /// grabbable.
-const scrollbar_hit_slop: f32 = 4;
+const scrollbar_hit_slop: f32 = (model.scale.space(4) - scrollbar_thickness) / 2;
 pub const ScrollbarAxis = enum { vertical, horizontal };
 
 const ScrollbarGeometry = struct {
+    track: Rect,
     thumb: Rect,
     /// Scroll offset change per pixel of thumb travel along the track;
     /// zero when the thumb fills the track and cannot move.
@@ -356,6 +364,12 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
     const along = if (travel > 0) travel * (offset / max_offset) else 0;
     return switch (axis) {
         .vertical => .{
+            .track = .{
+                .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
+                .y = node.rect.y + scrollbar_margin,
+                .width = scrollbar_thickness,
+                .height = track,
+            },
             .thumb = .{
                 .x = node.rect.x + node.rect.width - scrollbar_thickness - scrollbar_margin,
                 .y = node.rect.y + scrollbar_margin + along,
@@ -365,6 +379,12 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
             .drag_scale = if (travel > 0) max_offset / travel else 0,
         },
         .horizontal => .{
+            .track = .{
+                .x = node.rect.x + scrollbar_margin,
+                .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
+                .width = track,
+                .height = scrollbar_thickness,
+            },
             .thumb = .{
                 .x = node.rect.x + scrollbar_margin + along,
                 .y = node.rect.y + node.rect.height - scrollbar_thickness - scrollbar_margin,
@@ -376,26 +396,27 @@ fn scrollbarGeometry(node: *const RenderNode, axis: ScrollbarAxis) ?ScrollbarGeo
     };
 }
 
-/// Paints proportional scrollbar thumbs for axes whose content overflows
-/// the viewport, from the geometry recorded during layout. Thumbs are
-/// pill-shaped overlays painted over the content's edge.
+/// Paints scrollbar tracks and proportional thumbs for axes whose content
+/// overflows the viewport. They are rounded overlays on the content's edge.
 fn paintScrollbars(allocator: std.mem.Allocator, node: *const RenderNode, display_list: *DisplayList, raster_cache: *RasterCache, scale: f32) !void {
     std.debug.assert(node.kind.isViewport());
-    const color = fadedScrollbarColor(node.scrollbar_alpha) orelse return;
+    const track_color = fadedScrollbarColor(node.scrollbar_track_color, node.scrollbar_alpha);
+    const thumb_color = fadedScrollbarColor(node.scrollbar_color, node.scrollbar_alpha) orelse return;
     inline for ([_]ScrollbarAxis{ .vertical, .horizontal }) |axis| {
         if (scrollbarGeometry(node, axis)) |geometry| {
-            try paintRoundedBox(allocator, display_list, raster_cache, geometry.thumb, color, null, 0, scrollbar_thickness / 2, scale);
+            if (track_color) |color| try paintRoundedBox(allocator, display_list, raster_cache, geometry.track, color, null, 0, model.scale.radius(1), scale);
+            try paintRoundedBox(allocator, display_list, raster_cache, geometry.thumb, thumb_color, null, 0, model.scale.radius(1), scale);
         }
     }
 }
 
 /// Thumb color at the node's current fade alpha; null when it has faded
 /// out entirely and nothing should paint.
-fn fadedScrollbarColor(alpha: f32) ?Color {
+fn fadedScrollbarColor(base: Color, alpha: f32) ?Color {
     std.debug.assert(alpha >= 0 and alpha <= 1);
-    const scaled: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(scrollbar_color.a)) * alpha));
+    const scaled: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(base.a)) * alpha));
     if (scaled == 0) return null;
-    var color = scrollbar_color;
+    var color = base;
     color.a = scaled;
     return color;
 }

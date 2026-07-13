@@ -35,6 +35,8 @@ pub fn parseField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) key
     theme.text_theme = parseTextTheme(lua_state, theme_table, theme.text_theme);
     theme.button_theme = parseButtonTheme(lua_state, theme_table, theme.button_theme);
     theme.input_theme = parseInputTheme(lua_state, theme_table, theme.input_theme);
+    theme.separator_theme = parseSeparatorTheme(lua_state, theme_table, theme.separator_theme);
+    theme.scrollbar_theme = parseScrollbarTheme(lua_state, theme_table, theme.scrollbar_theme);
     return theme;
 }
 
@@ -109,7 +111,7 @@ fn parseButtonTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.B
     parseButtonStateTheme(lua_state, button_table, "hover", &result.hover_background, &result.hover_foreground);
     parseButtonStateTheme(lua_state, button_table, "pressed", &result.pressed_background, null);
     parseButtonStateTheme(lua_state, button_table, "disabled", &result.disabled_background, &result.disabled_foreground);
-    parseButtonFocusTheme(lua_state, button_table, &result.focused_border);
+    parseButtonFocusTheme(lua_state, button_table, &result.focused_border, &result.focused_border_width);
     return result;
 }
 
@@ -128,12 +130,13 @@ fn parseButtonStateTheme(
     if (foreground) |field| field.* = getOptionalColorField(lua_state, state_table, "foreground") orelse field.*;
 }
 
-fn parseButtonFocusTheme(lua_state: *c.lua_State, button_table: c_int, border: *?keywork.Color) void {
+fn parseButtonFocusTheme(lua_state: *c.lua_State, button_table: c_int, border: *?keywork.Color, border_width: *f32) void {
     c.lua_getfield(lua_state, button_table, "focused");
     defer pop(lua_state, 1);
     if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
     const focused_table = c.lua_gettop(lua_state);
     border.* = getOptionalColorField(lua_state, focused_table, "border") orelse border.*;
+    border_width.* = getNumberField(lua_state, focused_table, "border_width", border_width.*);
 }
 
 fn parseInputTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.InputTheme) keywork.InputTheme {
@@ -157,7 +160,37 @@ fn parseInputTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.In
     result.padding_y = getNumberField(lua_state, input_table, "padding_y", result.padding_y);
     result.radius = getNumberField(lua_state, input_table, "radius", result.radius);
     result.font_size = getNumberField(lua_state, input_table, "font_size", result.font_size);
+    result.line_height = getNumberField(lua_state, input_table, "line_height", result.line_height);
     return result;
+}
+
+fn parseSeparatorTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.SeparatorTheme) keywork.SeparatorTheme {
+    c.lua_getfield(lua_state, theme_table, "components");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const components_table = c.lua_gettop(lua_state);
+
+    c.lua_getfield(lua_state, components_table, "separator");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const separator_table = c.lua_gettop(lua_state);
+    return .{ .color = getOptionalColorField(lua_state, separator_table, "color") orelse base.color };
+}
+
+fn parseScrollbarTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.ScrollbarTheme) keywork.ScrollbarTheme {
+    c.lua_getfield(lua_state, theme_table, "components");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const components_table = c.lua_gettop(lua_state);
+
+    c.lua_getfield(lua_state, components_table, "scrollbar");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const scrollbar_table = c.lua_gettop(lua_state);
+    return .{
+        .track = getOptionalColorField(lua_state, scrollbar_table, "track") orelse base.track,
+        .thumb = getOptionalColorField(lua_state, scrollbar_table, "thumb") orelse base.thumb,
+    };
 }
 
 fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: f32) f32 {

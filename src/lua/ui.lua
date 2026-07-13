@@ -7,6 +7,8 @@ local space_scale = { 4, 8, 12, 16, 24, 32, 40, 48, 64 }
 local font_size_scale = { 12, 14, 16, 18, 20, 24, 28, 35, 60 }
 local line_height_scale = { 16, 20, 24, 26, 28, 30, 36, 40, 60 }
 local radius_scale = { 3, 4, 6, 8, 12, 16 }
+local control_padding_y = (space_scale[6] - line_height_scale[2]) / 2
+local badge_gap = space_scale[1] * 1.5
 
 local default_theme = {
   schemes = {
@@ -27,6 +29,16 @@ local default_theme = {
         slate10 = 0xff80838d,
         slate11 = 0xff60646c,
         slate12 = 0xff1c2024,
+        slate_a1 = 0x03000055,
+        slate_a2 = 0x06000055,
+        slate_a3 = 0x0f000033,
+        slate_a4 = 0x1700002d,
+        slate_a6 = 0x2600002f,
+        slate_a7 = 0x3200062e,
+        slate_a8 = 0x46000830,
+        slate_a9 = 0x7400051d,
+        slate_a10 = 0x7f00071b,
+        slate_a11 = 0x9f000714,
 
         blue1 = 0xfffbfdff,
         blue2 = 0xfff4faff,
@@ -40,17 +52,22 @@ local default_theme = {
         blue10 = 0xff0588f0,
         blue11 = 0xff0d74ce,
         blue12 = 0xff113264,
+        blue_a3 = 0x19008ff5,
+        blue_a4 = 0x2a009eff,
+        blue_a5 = 0x3d0093ff,
+        blue_a6 = 0x530088f6,
+        blue_a11 = 0xf2006dcb,
 
         red = 0xffe5484d,
         orange = 0xfff76b15,
         yellow = 0xffffe629,
         green = 0xff30a46c,
-        mint = 0xff00a2c7,
-        teal = 0xff00a2c7,
+        mint = 0xff86ead4,
+        teal = 0xff12a594,
         cyan = 0xff00a2c7,
         blue = "blue9",
-        indigo = 0xff6e56cf,
-        purple = 0xff6e56cf,
+        indigo = 0xff3e63dd,
+        purple = 0xff8e4ec6,
         pink = 0xffd6409f,
         brown = 0xffad7f58,
         gray = "slate9",
@@ -61,41 +78,51 @@ local default_theme = {
         gray6 = "slate3",
 
         label = "slate12",
-        secondary_label = "slate11",
-        tertiary_label = "slate10",
-        quaternary_label = "slate9",
-        system_background = "slate2",
-        secondary_system_background = "slate1",
+        secondary_label = "slate_a11",
+        tertiary_label = "slate_a10",
+        quaternary_label = "slate_a9",
+        surface_translucent = 0xd9ffffff,
+        system_background = "white",
+        secondary_system_background = "surface_translucent",
         tertiary_system_background = "white",
-        system_fill = 0x1700002d,
-        secondary_system_fill = 0x0f000033,
-        tertiary_system_fill = 0x06000055,
-        quaternary_system_fill = 0x03000055,
-        separator = "slate7",
-        opaque_separator = "slate7",
+        system_fill = "slate_a4",
+        secondary_system_fill = "slate_a3",
+        tertiary_system_fill = "slate_a2",
+        quaternary_system_fill = "slate_a1",
+        separator = "slate_a6",
+        opaque_separator = "slate6",
 
         background = "system_background",
         surface = "secondary_system_background",
         surface_high = "tertiary_system_background",
-        surface_low = "gray6",
+        surface_low = "slate2",
         text = "label",
         text_secondary = "secondary_label",
         text_tertiary = "tertiary_label",
-        placeholder = "tertiary_label",
-        border = "separator",
+        placeholder = "slate_a10",
+        border = "slate_a7",
         fill = "system_fill",
         fill_secondary = "secondary_system_fill",
 
-        accent = "blue",
+        accent8 = "blue8",
+        accent9 = "blue9",
+        accent10 = "blue10",
+        accent_a3 = "blue_a3",
+        accent_a4 = "blue_a4",
+        accent_a5 = "blue_a5",
+        accent_a6 = "blue_a6",
+        accent_a11 = "blue_a11",
+        accent = "accent9",
+        focus8 = "accent8",
         on_accent = "white",
         success = "green",
-        on_success = "black",
+        on_success = "white",
         warning = "yellow",
         on_warning = "black",
         danger = "red",
-        on_danger = "black",
+        on_danger = "white",
         info = "cyan",
-        on_info = "black",
+        on_info = "white",
 
         foreground = "text",
         muted = "text_secondary",
@@ -122,6 +149,15 @@ local default_theme = {
         slate10 = 0xff777b84,
         slate11 = 0xffb0b4ba,
         slate12 = 0xffedeef0,
+        slate_a2 = 0x09d8f4f6,
+        slate_a3 = 0x14ddeaf8,
+        slate_a4 = 0x1dd3edf8,
+        slate_a6 = 0x30d6ebfd,
+        slate_a7 = 0x40d9edff,
+        slate_a8 = 0x5dd9edff,
+        slate_a9 = 0x6ddfebfd,
+        slate_a10 = 0x7be5edfd,
+        slate_a11 = 0xb5f1f7fe,
 
         blue1 = 0xff0d1520,
         blue2 = 0xff111927,
@@ -135,17 +171,22 @@ local default_theme = {
         blue10 = 0xff3b9eff,
         blue11 = 0xff70b8ff,
         blue12 = 0xffc2e6ff,
+        blue_a3 = 0x3a0077ff,
+        blue_a4 = 0x570075ff,
+        blue_a5 = 0x6b0081fd,
+        blue_a6 = 0x7f0f89fd,
+        blue_a11 = 0xff70b8ff,
 
         red = 0xffe5484d,
         orange = 0xfff76b15,
         yellow = 0xffffe629,
         green = 0xff30a46c,
-        mint = 0xff00a2c7,
-        teal = 0xff00a2c7,
+        mint = 0xff86ead4,
+        teal = 0xff12a594,
         cyan = 0xff00a2c7,
         blue = "blue9",
-        indigo = 0xff6e56cf,
-        purple = 0xff6e56cf,
+        indigo = 0xff3e63dd,
+        purple = 0xff8e4ec6,
         pink = 0xffd6409f,
         brown = 0xffad7f58,
         gray = "slate9",
@@ -156,41 +197,51 @@ local default_theme = {
         gray6 = "slate3",
 
         label = "slate12",
-        secondary_label = "slate11",
-        tertiary_label = "slate10",
-        quaternary_label = "slate9",
+        secondary_label = "slate_a11",
+        tertiary_label = "slate_a10",
+        quaternary_label = "slate_a9",
+        surface_translucent = 0x40000000,
         system_background = "slate1",
-        secondary_system_background = "slate2",
-        tertiary_system_background = "slate3",
-        system_fill = 0x1dd3edf8,
-        secondary_system_fill = 0x14ddeaf8,
-        tertiary_system_fill = 0x09d8f4f6,
-        quaternary_system_fill = 0x00d8f4f6,
-        separator = "slate7",
-        opaque_separator = "slate7",
+        secondary_system_background = "surface_translucent",
+        tertiary_system_background = "slate2",
+        system_fill = "slate_a4",
+        secondary_system_fill = "slate_a3",
+        tertiary_system_fill = "slate_a2",
+        quaternary_system_fill = 0x00000000,
+        separator = "slate_a6",
+        opaque_separator = "slate6",
 
         background = "system_background",
         surface = "secondary_system_background",
         surface_high = "tertiary_system_background",
-        surface_low = "black",
+        surface_low = "slate2",
         text = "label",
         text_secondary = "secondary_label",
         text_tertiary = "tertiary_label",
-        placeholder = "tertiary_label",
-        border = "separator",
+        placeholder = "slate_a10",
+        border = "slate_a7",
         fill = "system_fill",
         fill_secondary = "secondary_system_fill",
 
-        accent = "blue",
-        on_accent = "black",
+        accent8 = "blue8",
+        accent9 = "blue9",
+        accent10 = "blue10",
+        accent_a3 = "blue_a3",
+        accent_a4 = "blue_a4",
+        accent_a5 = "blue_a5",
+        accent_a6 = "blue_a6",
+        accent_a11 = "blue_a11",
+        accent = "accent9",
+        focus8 = "accent8",
+        on_accent = "white",
         success = "green",
-        on_success = "black",
+        on_success = "white",
         warning = "yellow",
         on_warning = "black",
         danger = "red",
-        on_danger = "black",
+        on_danger = "white",
         info = "cyan",
-        on_info = "black",
+        on_info = "white",
 
         foreground = "text",
         muted = "text_secondary",
@@ -215,30 +266,30 @@ local default_theme = {
 
   components = {
     button = {
-      -- Radix size-2 button: 32px tall, space-3 horizontal padding, radius-2.
-      -- Control height is text-driven, so 6px vertical padding approximates
-      -- the 32px Radix height at a 14px label size.
+      -- Radix size-2 button: 20px label line plus 6px vertical padding,
+      -- space-3 horizontal padding, and radius-2.
       padding_x = space_scale[3],
-      padding_y = 6,
+      padding_y = control_padding_y,
       radius = radius_scale[2],
       default = {
         background = "accent",
         foreground = "on_accent",
       },
       hover = {
-        background = "text",
-        foreground = "background",
+        background = "accent10",
+        foreground = "on_accent",
       },
       pressed = {
-        background = "text",
-        foreground = "background",
+        background = "accent10",
+        foreground = "on_accent",
       },
       disabled = {
-        background = "surface_low",
-        foreground = "text_secondary",
+        background = "slate_a3",
+        foreground = "slate_a8",
       },
       focused = {
-        border = "accent",
+        border = "focus8",
+        border_width = 2,
       },
     },
 
@@ -246,48 +297,79 @@ local default_theme = {
       -- Radix size-2 text field: 32px tall, space-2 horizontal padding,
       -- radius-2, font-size-2.
       padding_x = space_scale[2],
-      padding_y = 6,
+      padding_y = control_padding_y,
       radius = radius_scale[2],
       font_size = font_size_scale[2],
-      background = "surface_high",
+      line_height = line_height_scale[2],
+      background = "surface",
       foreground = "text",
-      placeholder = "placeholder",
-      border = "border",
-      focused_border = "accent",
+      placeholder = "slate_a10",
+      border = "slate_a7",
+      focused_border = "focus8",
     },
 
     chip = {
-      -- Compact pill control: space-2 horizontal padding, space-1 vertical,
-      -- radius-2. Height stays text-driven unless min_height is set.
+      -- Radix size-2 Badge geometry and soft colors.
       padding_x = space_scale[2],
       padding_y = space_scale[1],
       radius = radius_scale[2],
+      min_height = space_scale[5],
+      font_size = font_size_scale[1],
+      line_height = line_height_scale[1],
+      icon_size = space_scale[3],
+      gap = badge_gap,
+      background = "accent_a3",
+      foreground = "accent_a11",
+      hover_background = "accent_a4",
+      pressed_background = "accent_a5",
+      focused_border = "focus8",
+      focused_border_width = 2,
+      selected_background = "accent9",
+      selected_foreground = "on_accent",
+      selected_hover_background = "accent10",
+      selected_pressed_background = "accent10",
     },
 
     menu = {
-      background = "surface",
-      border = "border",
-      border_width = 1,
+      -- Radix size-2 menu content and the soft highlighted-item variant.
+      background = "surface_high",
       radius = radius_scale[4],
-      padding = space_scale[1],
+      padding = space_scale[2],
       item = {
         padding_x = space_scale[3],
-        padding_y = space_scale[2],
-        radius = radius_scale[4],
-        hover_background = "fill_secondary",
-        selected_background = "fill",
-        selected_hover_background = "fill",
+        padding_y = control_padding_y,
+        min_height = space_scale[6],
+        radius = radius_scale[2],
+        font_size = font_size_scale[2],
+        line_height = line_height_scale[2],
+        hover_background = "accent_a4",
+        selected_background = "accent_a4",
+        selected_hover_background = "accent_a4",
       },
       label = {
         padding_x = space_scale[3],
-        padding_y = space_scale[2],
-        foreground = "text_secondary",
+        padding_y = control_padding_y,
+        min_height = space_scale[6],
+        font_size = font_size_scale[2],
+        line_height = line_height_scale[2],
+        foreground = "slate_a10",
       },
       separator = {
-        color = "border",
+        color = "slate_a6",
         thickness = 1,
-        margin = space_scale[1],
+        margin = space_scale[2],
+        inset = space_scale[1],
       },
+    },
+
+    separator = {
+      color = "slate_a6",
+      thickness = 1,
+    },
+
+    scrollbar = {
+      track = "slate_a3",
+      thumb = "slate_a8",
     },
   },
 }
@@ -403,6 +485,7 @@ local function resolve_button(button, colors, space, radius)
     },
     focused = {
       border = resolve_color(button.focused and button.focused.border, colors),
+      border_width = button.focused and button.focused.border_width,
     },
   }
 end
@@ -414,6 +497,7 @@ local function resolve_input(input, colors, space, radius)
     padding_y = resolve_space(input.padding_y, space),
     radius = resolve_radius(input.radius, radius),
     font_size = input.font_size,
+    line_height = input.line_height,
     background = resolve_color(input.background, colors),
     foreground = resolve_color(input.foreground, colors),
     placeholder = resolve_color(input.placeholder, colors),
@@ -429,12 +513,20 @@ local function resolve_chip(chip, colors, space, radius)
     padding_y = resolve_space(chip.padding_y, space),
     radius = resolve_radius(chip.radius, radius),
     min_height = resolve_space(chip.min_height, space),
+    font_size = chip.font_size,
+    line_height = chip.line_height,
+    icon_size = resolve_space(chip.icon_size, space),
+    gap = resolve_space(chip.gap, space),
     background = resolve_color(chip.background, colors),
     foreground = resolve_color(chip.foreground, colors),
     hover_background = resolve_color(chip.hover_background, colors),
+    pressed_background = resolve_color(chip.pressed_background, colors),
+    focused_border = resolve_color(chip.focused_border, colors),
+    focused_border_width = chip.focused_border_width,
     selected_background = resolve_color(chip.selected_background, colors),
     selected_foreground = resolve_color(chip.selected_foreground, colors),
     selected_hover_background = resolve_color(chip.selected_hover_background, colors),
+    selected_pressed_background = resolve_color(chip.selected_pressed_background, colors),
   }
 end
 
@@ -452,7 +544,10 @@ local function resolve_menu(menu, colors, space, radius)
     item = {
       padding_x = resolve_space(item.padding_x, space),
       padding_y = resolve_space(item.padding_y, space),
+      min_height = resolve_space(item.min_height, space),
       radius = resolve_radius(item.radius, radius),
+      font_size = item.font_size,
+      line_height = item.line_height,
       hover_background = resolve_color(item.hover_background, colors),
       selected_background = resolve_color(item.selected_background, colors),
       selected_hover_background = resolve_color(item.selected_hover_background, colors),
@@ -460,13 +555,33 @@ local function resolve_menu(menu, colors, space, radius)
     label = {
       padding_x = resolve_space(label.padding_x, space),
       padding_y = resolve_space(label.padding_y, space),
+      min_height = resolve_space(label.min_height, space),
+      font_size = label.font_size,
+      line_height = label.line_height,
       foreground = resolve_color(label.foreground, colors),
     },
     separator = {
       color = resolve_color(separator.color, colors),
       thickness = separator.thickness,
       margin = resolve_space(separator.margin, space),
+      inset = resolve_space(separator.inset, space),
     },
+  }
+end
+
+local function resolve_separator(separator, colors)
+  separator = separator or {}
+  return {
+    color = resolve_color(separator.color, colors),
+    thickness = separator.thickness,
+  }
+end
+
+local function resolve_scrollbar(scrollbar, colors)
+  scrollbar = scrollbar or {}
+  return {
+    track = resolve_color(scrollbar.track, colors),
+    thumb = resolve_color(scrollbar.thumb, colors),
   }
 end
 
@@ -493,6 +608,8 @@ function ui.resolve_theme(theme, state_or_scheme)
     input = resolve_input(theme.components and theme.components.input, colors, space, radius),
     chip = resolve_chip(theme.components and theme.components.chip, colors, space, radius),
     menu = resolve_menu(theme.components and theme.components.menu, colors, space, radius),
+    separator = resolve_separator(theme.components and theme.components.separator, colors),
+    scrollbar = resolve_scrollbar(theme.components and theme.components.scrollbar, colors),
   }
 
   return {
@@ -621,7 +738,21 @@ function ui.container(options, child)
     child = options.child
   end
   if options.padding then
-    child = ui.padding({ insets = options.padding, child = child })
+    local padding = options.padding
+    if type(padding) == "number" then
+      child = ui.padding({ all = padding, child = child })
+    else
+      child = ui.padding({
+        all = padding.all,
+        x = padding.x,
+        y = padding.y,
+        left = padding.left,
+        right = padding.right,
+        top = padding.top,
+        bottom = padding.bottom,
+        child = child,
+      })
+    end
   end
   return ui.box({
     background = options.background,
@@ -642,6 +773,9 @@ function ui.gesture(options)
     id = options.id,
     child = options.child,
     hover_background = options.hover_background,
+    pressed_background = options.pressed_background,
+    focused_border = options.focused_border,
+    focused_border_width = options.focused_border_width,
     cursor = options.cursor,
     activation = options.activation,
     on_tap = options.on_tap,
@@ -676,6 +810,7 @@ function ui.pressable(options)
     hover_background = options.hover_background,
     pressed_background = options.pressed_background,
     focused_border = options.focused_border,
+    focused_border_width = options.focused_border_width,
     cursor = options.cursor,
     activation = options.activation,
     on_tap = options.on_tap,
@@ -788,6 +923,7 @@ function ui.text_input(options)
     padding_y = options.padding_y,
     radius = options.radius,
     font_size = options.font_size,
+    line_height = options.line_height,
   }
 end
 
@@ -939,7 +1075,7 @@ end
 function ui.icon_label(icon_name, text, options)
   options = options or {}
   -- No size default here: a nil size falls through to the enclosing
-  -- icon_theme context or the bridge's base 16px default.
+  -- icon_theme context or the bridge's Radix space-4 default.
   local children = { ui.icon({
     name = icon_name,
     size = options.size,
@@ -951,7 +1087,7 @@ function ui.icon_label(icon_name, text, options)
   end
   -- "baseline" centers the icon on the text's cap-height midline (like
   -- macOS symbol alignment) instead of the text box's geometric center.
-  return ui.row({ spacing = options.spacing or 6, align = options.align or "baseline", children = children })
+  return ui.row({ spacing = options.spacing or space_scale[2], align = options.align or "baseline", children = children })
 end
 
 local function build_chip(options, theme)
@@ -966,29 +1102,37 @@ local function build_chip(options, theme)
     color = options.selected_color or chip_theme.selected_foreground or color
   end
   local hover_background = options.hover_background or chip_theme.hover_background
+  local pressed_background = options.pressed_background or chip_theme.pressed_background
   if selected then
     hover_background = options.selected_hover_background or chip_theme.selected_hover_background
+    pressed_background = options.selected_pressed_background or chip_theme.selected_pressed_background
   end
 
   local padding = options.padding
   if not padding then
-    padding = { x = chip_theme.padding_x or 8, y = chip_theme.padding_y or 4 }
+    padding = { x = chip_theme.padding_x or space_scale[2], y = chip_theme.padding_y or space_scale[1] }
   end
 
   local child = options.child
   if not child then
     if options.icon then
       child = ui.icon_label(options.icon, options.label, {
-        size = options.icon_size or options.size,
+        size = options.icon_size or options.size or chip_theme.icon_size,
         color = color,
-        label_size = options.label_size,
-        font_size = options.font_size,
-        line_height = options.line_height,
+        label_size = options.label_size or chip_theme.font_size,
+        font_size = options.font_size or chip_theme.font_size,
+        line_height = options.line_height or chip_theme.line_height,
         role = options.role,
-        spacing = options.spacing,
+        spacing = options.spacing or chip_theme.gap,
       })
     else
-      child = ui.label(options.label or "", { color = color, size = options.label_size, font_size = options.font_size, line_height = options.line_height, role = options.role })
+      child = ui.label(options.label or "", {
+        color = color,
+        size = options.label_size or chip_theme.font_size,
+        font_size = options.font_size or chip_theme.font_size,
+        line_height = options.line_height or chip_theme.line_height,
+        role = options.role,
+      })
     end
   end
   return ui.gesture({
@@ -1006,6 +1150,9 @@ local function build_chip(options, theme)
       padding = padding,
     }, child),
     hover_background = hover_background,
+    pressed_background = pressed_background,
+    focused_border = options.focused_border or chip_theme.focused_border,
+    focused_border_width = options.focused_border_width or chip_theme.focused_border_width,
     cursor = options.cursor,
     activation = options.activation,
     on_tap = options.on_tap,
@@ -1073,8 +1220,13 @@ local function build_menu_item(options, theme)
   end
   local padding = options.padding
   if not padding then
-    padding = { x = item_theme.padding_x or 12, y = item_theme.padding_y or 8 }
+    padding = { x = item_theme.padding_x or space_scale[3], y = item_theme.padding_y or control_padding_y }
   end
+  local child = ui.default_text_style({
+    font_size = item_theme.font_size or font_size_scale[2],
+    line_height = item_theme.line_height or line_height_scale[2],
+    child = options.child,
+  })
   return ui.pressable({
     id = options.id,
     hover_background = hover_background,
@@ -1085,8 +1237,9 @@ local function build_menu_item(options, theme)
     child = ui.container({
       background = background,
       radius = options.radius or item_theme.radius,
+      min_height = options.min_height or item_theme.min_height,
       padding = padding,
-    }, options.child),
+    }, child),
   })
 end
 
@@ -1107,12 +1260,26 @@ local function build_menu_label(options, theme)
   local label_theme = menu_theme.label or {}
   local child = options.child or ui.label(options.text or "", {
     color = options.color or label_theme.foreground,
+    font_size = label_theme.font_size or font_size_scale[2],
+    line_height = label_theme.line_height or line_height_scale[2],
   })
+  if options.child then
+    child = ui.default_text_style({
+      color = options.color or label_theme.foreground,
+      font_size = label_theme.font_size or font_size_scale[2],
+      line_height = label_theme.line_height or line_height_scale[2],
+      child = child,
+    })
+  end
   local padding = options.padding
   if not padding then
-    padding = { x = label_theme.padding_x or 12, y = label_theme.padding_y or 8 }
+    padding = { x = label_theme.padding_x or space_scale[3], y = label_theme.padding_y or control_padding_y }
   end
-  return ui.padding({ insets = padding, child = child })
+  return ui.container({
+    min_height = options.min_height or label_theme.min_height,
+    padding = padding,
+    child = child,
+  })
 end
 
 local MenuLabel = ui.stateful({
@@ -1129,11 +1296,14 @@ end
 local function build_menu_separator(options, theme)
   local menu_theme = theme and theme.components and theme.components.menu or {}
   local separator_theme = menu_theme.separator or {}
-  return ui.separator({
-    color = options.color or separator_theme.color,
-    thickness = options.thickness or separator_theme.thickness or 1,
-    margin = options.margin or separator_theme.margin or 4,
-    axis = options.axis,
+  return ui.padding({
+    x = options.inset or separator_theme.inset or space_scale[1],
+    child = ui.separator({
+      color = options.color or separator_theme.color,
+      thickness = options.thickness or separator_theme.thickness or 1,
+      margin = options.margin or separator_theme.margin or space_scale[2],
+      axis = options.axis,
+    }),
   })
 end
 
@@ -1153,11 +1323,21 @@ function ui.icon_button(options)
     id = options.id,
     theme = options.theme,
     icon = options.icon,
-    icon_size = options.size,
+    icon_size = options.size or space_scale[4],
     color = options.color,
     background = options.background,
     border = options.border,
-    padding = options.padding or { all = 6 },
+    hover_background = options.hover_background,
+    pressed_background = options.pressed_background,
+    focused_border = options.focused_border,
+    focused_border_width = options.focused_border_width,
+    selected = options.selected,
+    selected_background = options.selected_background,
+    selected_color = options.selected_color,
+    selected_hover_background = options.selected_hover_background,
+    selected_pressed_background = options.selected_pressed_background,
+    padding = options.padding or { all = space_scale[2] },
+    radius = options.radius,
     on_tap = options.on_tap,
     on_tap_down = options.on_tap_down,
     on_tap_up = options.on_tap_up,

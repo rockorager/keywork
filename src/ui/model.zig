@@ -33,12 +33,11 @@ pub const RasterCache = display.RasterCache;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
 
-pub const input_min_width = 220;
 pub const LayoutError = anyerror;
 
 /// Default component themes; widget-level defaults reference these so the
 /// theme structs in types.zig stay the single source of truth.
-const default_input_theme: types.InputTheme = .{};
+const default_input_theme = Theme.light.input_theme;
 
 pub const Widget = union(enum) {
     keyed: Keyed,
@@ -150,6 +149,7 @@ pub const Widget = union(enum) {
         hover_style: ?ClickableStyle = null,
         pressed_style: ?ClickableStyle = null,
         focused_border: ?Color = null,
+        focused_border_width: f32 = 2,
         cursor: CursorShape = .default,
     };
 
@@ -285,12 +285,14 @@ pub const Widget = union(enum) {
 
     /// A scrollable viewport: the child is laid out unbounded along the
     /// scrollable axes, clipped to the viewport, and offset by the
-    /// element-owned scroll position. Scrollbar thumbs are painted for
-    /// axes with overflowing content.
+    /// element-owned scroll position. Scrollbars are painted for axes with
+    /// overflowing content.
     pub const Scroll = struct {
         id: []const u8,
         child: *const Widget,
         axes: ScrollAxes = .vertical,
+        scrollbar_track_color: ?Color = null,
+        scrollbar_color: ?Color = null,
     };
 
     /// A virtualized vertical list: only the items visible in the
@@ -307,6 +309,8 @@ pub const Widget = union(enum) {
         /// layout, the list scrolls the minimum distance to bring the
         /// item fully into view. Selection state itself lives in the app.
         selected: ?usize = null,
+        scrollbar_track_color: ?Color = null,
+        scrollbar_color: ?Color = null,
     };
 
     pub const ItemBuilder = struct {
@@ -360,15 +364,16 @@ pub const Widget = union(enum) {
         on_submit: ?TextChangeCallback = null,
         obscured: bool = false,
         clear_on_submit: bool = false,
-        foreground: Color = colors.ink,
-        background: Color = colors.white,
-        border: Color = colors.ink,
-        focused_border: Color = colors.accent,
-        placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
+        foreground: Color = default_input_theme.foreground orelse colors.ink,
+        background: Color = default_input_theme.background orelse colors.white,
+        border: Color = default_input_theme.border orelse colors.ink,
+        focused_border: Color = default_input_theme.focused_border orelse colors.accent,
+        placeholder_foreground: Color = default_input_theme.placeholder orelse colors.slate_a10,
         padding_x: f32 = default_input_theme.padding_x,
         padding_y: f32 = default_input_theme.padding_y,
         radius: f32 = default_input_theme.radius,
         font_size: f32 = default_input_theme.font_size,
+        line_height: f32 = default_input_theme.line_height,
         autofocus: bool = false,
         style: Style = .{},
 
@@ -382,6 +387,7 @@ pub const Widget = union(enum) {
             padding_y: ?f32 = null,
             radius: ?f32 = null,
             font_size: ?f32 = null,
+            line_height: ?f32 = null,
         };
     };
 
@@ -398,9 +404,9 @@ pub const Widget = union(enum) {
     /// sweeps once per period. Its presence keeps per-frame demand
     /// registered, so it only belongs in trees doing visible work.
     pub const Spinner = struct {
-        size: f32 = 20,
+        size: f32 = scale.space(4),
         color: ?Color = null,
-        period_ms: u32 = 900,
+        period_ms: u32 = 800,
     };
 
     pub const Children = struct {
@@ -1008,6 +1014,7 @@ fn buildButtonWidget(
         .child = try Widget.alloc(allocator, padded),
         .background = background,
         .border = if (focused) buttonFocusedBorder(theme) else null,
+        .border_width = if (focused) theme.button_theme.focused_border_width else 1,
         .radius = theme.button_theme.radius,
     } };
     if (!enabled) return surface;
@@ -1137,6 +1144,8 @@ pub const RenderNode = struct {
     scroll_id: ?[]const u8 = null,
     scroll_content: Size = .{ .width = 0, .height = 0 },
     scroll_offset: Point = .{ .x = 0, .y = 0 },
+    scrollbar_track_color: Color = colors.slate_a3,
+    scrollbar_color: Color = colors.slate_a8,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -1149,16 +1158,16 @@ pub const RenderNode = struct {
     box_radius: f32 = 0,
     separator_axis: Widget.Separator.Axis = .horizontal,
     separator_margin: f32 = 0,
-    /// Scrollbar thumb opacity for viewport nodes, copied from the scroll
+    /// Scrollbar opacity for viewport nodes, copied from the scroll
     /// state at layout and written directly by animation ticks between
-    /// layouts. Zero hides the thumb from painting and pointer hits.
+    /// layouts. Zero hides the scrollbar from painting and pointer hits.
     scrollbar_alpha: f32 = 1,
     /// Sweep phase of a spinner node in 0..1.
     spinner_progress: f32 = 0,
     placeholder: ?[]const u8 = null,
     border: Color = colors.ink,
     focused_border: Color = colors.accent,
-    placeholder_foreground: Color = Color.argb(0xff, 0x77, 0x77, 0x7d),
+    placeholder_foreground: Color = default_input_theme.placeholder orelse colors.slate_a10,
     padding_x: f32 = default_input_theme.padding_x,
     padding_y: f32 = default_input_theme.padding_y,
     focused: bool = false,
@@ -1676,7 +1685,7 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .focus, .widget = element_widget, .focused = scope.interaction.isFocused(element_widget.focus.node), .children = children };
         },
         .scroll => |scroll_widget| {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(ScrollState);
             errdefer allocator.destroy(state);
@@ -1687,7 +1696,7 @@ pub fn buildElementTreeScoped(
             return .{ .kind = .scroll, .widget = element_widget, .state = state, .children = children };
         },
         .list => {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(ListState);
             errdefer allocator.destroy(state);
@@ -1979,10 +1988,11 @@ pub fn updateElementTreeScoped(
             element.focused = scope.interaction.isFocused(element.widget.focus.node);
         },
         .scroll => |scroll_widget| {
-            try updateSingleChildElement(allocator, scope, element, widget.*, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
+            const themed_widget = try cloneWidgetForElementThemed(scope.allocator, widget.*, scope.theme, scope.default_text_style);
+            try updateSingleChildElement(allocator, scope, element, themed_widget, scroll_widget.child, scrollChildConstraints(constraints, scroll_widget.axes));
         },
         .list => {
-            var element_widget = try cloneWidgetForElement(allocator, widget.*);
+            var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = listState(element);
             const range = listVisibleRange(element_widget.list, state.offset, state.viewport_height);
@@ -2635,7 +2645,8 @@ fn widgetLayoutEqual(a: Widget, b: Widget) bool {
                 a_input.obscured == b_input.obscured and
                 a_input.padding_x == b_input.padding_x and
                 a_input.padding_y == b_input.padding_y and
-                a_input.font_size == b_input.font_size;
+                a_input.font_size == b_input.font_size and
+                a_input.line_height == b_input.line_height;
         },
         .separator => |separator| separator.thickness == b.separator.thickness and
             separator.margin == b.separator.margin and
@@ -2685,6 +2696,10 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
                 a_box.border_width == b_box.border_width and
                 a_box.radius == b_box.radius;
         },
+        .scroll => |scroll| std.meta.eql(scroll.scrollbar_track_color, b.scroll.scrollbar_track_color) and
+            std.meta.eql(scroll.scrollbar_color, b.scroll.scrollbar_color),
+        .list => |list| std.meta.eql(list.scrollbar_track_color, b.list.scrollbar_track_color) and
+            std.meta.eql(list.scrollbar_color, b.list.scrollbar_color),
         .text_input => |a_input| blk: {
             const b_input = b.text_input;
             break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
@@ -2697,7 +2712,8 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
                 a_input.padding_x == b_input.padding_x and
                 a_input.padding_y == b_input.padding_y and
                 a_input.radius == b_input.radius and
-                a_input.font_size == b_input.font_size;
+                a_input.font_size == b_input.font_size and
+                a_input.line_height == b_input.line_height;
         },
         .separator => |separator| std.meta.eql(separator, b.separator),
         .spinner => |spinner| std.meta.eql(spinner, b.spinner),
@@ -2772,9 +2788,18 @@ fn cloneWidgetForElementThemed(allocator: std.mem.Allocator, widget: Widget, the
             input_widget.padding_y = input_widget.style.padding_y orelse theme.input_theme.padding_y;
             input_widget.radius = input_widget.style.radius orelse theme.input_theme.radius;
             input_widget.font_size = input_widget.style.font_size orelse theme.input_theme.font_size;
+            input_widget.line_height = input_widget.style.line_height orelse theme.input_theme.line_height;
         },
-        .separator => |*separator| separator.color = separator.color orelse theme.color_scheme.border,
-        .spinner => |*spinner_widget| spinner_widget.color = spinner_widget.color orelse theme.color_scheme.primary,
+        .separator => |*separator| separator.color = separator.color orelse theme.separator_theme.color orelse theme.color_scheme.border,
+        .spinner => |*spinner_widget| spinner_widget.color = spinner_widget.color orelse theme.color_scheme.foreground,
+        .scroll => |*scroll_widget| {
+            scroll_widget.scrollbar_track_color = scroll_widget.scrollbar_track_color orelse theme.scrollbar_theme.track orelse theme.color_scheme.surface_low;
+            scroll_widget.scrollbar_color = scroll_widget.scrollbar_color orelse theme.scrollbar_theme.thumb orelse theme.color_scheme.muted;
+        },
+        .list => |*list_widget| {
+            list_widget.scrollbar_track_color = list_widget.scrollbar_track_color orelse theme.scrollbar_theme.track orelse theme.color_scheme.surface_low;
+            list_widget.scrollbar_color = list_widget.scrollbar_color orelse theme.scrollbar_theme.thumb orelse theme.color_scheme.muted;
+        },
         else => {},
     }
     return result;
@@ -2801,7 +2826,10 @@ fn clickableStyledChild(clickable_widget: Widget.Clickable, interaction: Interac
     if (clickable_widget.focused_border) |border| {
         if (interaction.isFocused(.named(clickable_widget.id))) {
             switch (child) {
-                .box => child.box.border = border,
+                .box => {
+                    child.box.border = border;
+                    child.box.border_width = clickable_widget.focused_border_width;
+                },
                 else => {},
             }
         }
@@ -2922,6 +2950,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .hover_style = clickableStateStyle(clickable_widget.hover_style, clickable_widget.child),
                 .pressed_style = clickableStateStyle(clickable_widget.pressed_style, clickable_widget.child),
                 .focused_border = clickable_widget.focused_border,
+                .focused_border_width = clickable_widget.focused_border_width,
                 .cursor = clickable_widget.cursor,
             } };
         },
@@ -2955,7 +2984,13 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
         },
         .scroll => |scroll_widget| blk: {
             const id = try allocator.dupe(u8, scroll_widget.id);
-            break :blk .{ .scroll = .{ .id = id, .child = scroll_widget.child, .axes = scroll_widget.axes } };
+            break :blk .{ .scroll = .{
+                .id = id,
+                .child = scroll_widget.child,
+                .axes = scroll_widget.axes,
+                .scrollbar_track_color = scroll_widget.scrollbar_track_color,
+                .scrollbar_color = scroll_widget.scrollbar_color,
+            } };
         },
         .list => |list_widget| blk: {
             const id = try allocator.dupe(u8, list_widget.id);
@@ -2967,6 +3002,8 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .item_extent = list_widget.item_extent,
                 .build_item = builder,
                 .selected = list_widget.selected,
+                .scrollbar_track_color = list_widget.scrollbar_track_color,
+                .scrollbar_color = list_widget.scrollbar_color,
             } };
         },
         .text_input => |input_widget| blk: {
@@ -2998,6 +3035,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .padding_y = input_widget.padding_y,
                 .radius = input_widget.radius,
                 .font_size = input_widget.font_size,
+                .line_height = input_widget.line_height,
                 .autofocus = input_widget.autofocus,
                 .style = input_widget.style,
             } };
@@ -3172,6 +3210,7 @@ pub const ScrollbarAxis = paint_model.ScrollbarAxis;
 pub const ScrollbarThumbHit = paint_model.ScrollbarThumbHit;
 pub const hitTestScrollbarThumb = paint_model.hitTestScrollbarThumb;
 const roundedRectAlpha = paint_model.roundedRectAlpha;
+const scrollbar_track_color = paint_model.scrollbar_track_color;
 const scrollbar_color = paint_model.scrollbar_color;
 const scrollbar_thickness = paint_model.scrollbar_thickness;
 const scrollbar_margin = paint_model.scrollbar_margin;
@@ -3380,15 +3419,18 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
     raster_cache.beginFrame();
     defer raster_cache.endFrame(retained_allocator);
     try paintScaled(retained_allocator, root, &display_list, &raster_cache, 1);
+    var saw_track = false;
     var saw_thumb = false;
     for (display_list.commands.items) |command| {
         switch (command) {
             .alpha_image => |image| {
+                if (std.meta.eql(image.color, scrollbar_track_color) and image.rect.height == scrollbar_thickness) saw_track = true;
                 if (std.meta.eql(image.color, scrollbar_color) and image.rect.height == scrollbar_thickness) saw_thumb = true;
             },
             else => {},
         }
     }
+    try std.testing.expect(saw_track);
     try std.testing.expect(saw_thumb);
 }
 
@@ -3609,6 +3651,23 @@ test "text input paint clips its content" {
     try std.testing.expectEqual(@as(?Rect, null), last_clip);
 }
 
+test "text input uses intrinsic width when unconstrained" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const input = widgets.textInput("input", "", "Name");
+    const constraints: Constraints = .{ .max_width = std.math.inf(f32), .max_height = 40 };
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &input, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+
+    // Four 14px fixed-measurer glyphs plus 8px on each side.
+    try std.testing.expectEqual(@as(f32, 44), root.rect.width);
+    try std.testing.expectEqual(@as(f32, 32), root.rect.height);
+}
+
 test "layout, paint, and hit test a padded column" {
     const allocator = std.testing.allocator;
 
@@ -3660,7 +3719,8 @@ test "button widget composes styled clickable content" {
     try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.children[0].kind);
     try std.testing.expectEqualStrings("confirm", root.children[0].clickable_id.?);
     try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].children[0].kind);
-    try std.testing.expectEqual(colors.ink, root.children[0].children[0].background);
+    try std.testing.expectEqual(colors.blue10, root.children[0].children[0].background);
+    try std.testing.expectEqual(@as(f32, 32), root.rect.height);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].children[0].kind);
     try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].children[0].text.?);
 }
@@ -4191,6 +4251,7 @@ test "button uses ambient focused border" {
 
     const box_node = root.children[0].children[0].children[0];
     try std.testing.expectEqual(colors.black, box_node.box_border.?);
+    try std.testing.expectEqual(@as(f32, 2), box_node.box_border_width);
 }
 
 test "button without action is disabled and skipped by focus traversal" {
@@ -4270,9 +4331,9 @@ test "theme widget provides ambient text and input styling" {
     const text_node = root.children[0].children[0];
     const input_node = root.children[0].children[1];
     try std.testing.expectEqual(Theme.dark.color_scheme.foreground, text_node.foreground);
-    try std.testing.expectEqual(Theme.dark.color_scheme.surface_high, input_node.background);
-    try std.testing.expectEqual(Theme.dark.color_scheme.border, input_node.border);
-    try std.testing.expectEqual(Theme.dark.color_scheme.muted, input_node.placeholder_foreground);
+    try std.testing.expectEqual(Theme.dark.input_theme.background.?, input_node.background);
+    try std.testing.expectEqual(Theme.dark.input_theme.border.?, input_node.border);
+    try std.testing.expectEqual(Theme.dark.input_theme.placeholder.?, input_node.placeholder_foreground);
 }
 
 test "text input derives focus from ambient focus node" {

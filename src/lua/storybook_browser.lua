@@ -19,7 +19,12 @@ local Browser = kw.stateful({
   build = function(self, context)
     local book = self.props.book
     local stories = book.stories or {}
-    local colors = context.theme.colors
+    local theme = context.theme
+    local colors = theme.colors
+    local space = theme.space
+    local font_size = theme.font_size
+    local line_height = theme.line_height
+    local menu = theme.components.menu
     local selected = stories[self.selected]
     if not selected and #stories > 0 then
       self.selected = 1
@@ -32,13 +37,14 @@ local Browser = kw.stateful({
       local group = story.group or "Stories"
       if group ~= previous_group then
         story_items[#story_items + 1] = kw.padding({
-          left = 12,
-          right = 12,
-          top = previous_group and 16 or 8,
-          bottom = 6,
+          left = menu.label.padding_x,
+          right = menu.label.padding_x,
+          top = menu.label.padding_y + (previous_group and space[2] or 0),
+          bottom = menu.label.padding_y,
           child = kw.text(string.upper(group), {
-            color = colors.muted,
-            font_size = 11,
+            color = menu.label.foreground,
+            font_size = menu.label.font_size,
+            line_height = menu.label.line_height,
             max_lines = 1,
           }),
         })
@@ -48,7 +54,7 @@ local Browser = kw.stateful({
       local is_selected = index == self.selected
       story_items[#story_items + 1] = kw.pressable({
         id = "storybook-story:" .. story.id,
-        hover_background = colors.fill,
+        hover_background = menu.item.hover_background,
         cursor = "pointer",
         on_tap = function()
           self:set_state(function(state)
@@ -56,11 +62,14 @@ local Browser = kw.stateful({
           end)
         end,
         child = kw.container({
-          background = is_selected and colors.blue3 or 0x00000000,
-          radius = 6,
-          padding = { left = 12, right = 12, top = 8, bottom = 8 },
+          background = is_selected and menu.item.selected_background or 0x00000000,
+          radius = menu.item.radius,
+          min_height = menu.item.min_height,
+          padding = { x = menu.item.padding_x, y = menu.item.padding_y },
           child = kw.text(story.name, {
-            color = is_selected and colors.blue11 or colors.text,
+            color = colors.text,
+            font_size = menu.item.font_size,
+            line_height = menu.item.line_height,
             max_lines = 1,
           }),
         }),
@@ -69,7 +78,7 @@ local Browser = kw.stateful({
 
     if #story_items == 0 then
       story_items[1] = kw.padding({
-        all = 12,
+        all = space[3],
         child = kw.text("No stories", { color = colors.muted }),
       })
     end
@@ -81,32 +90,34 @@ local Browser = kw.stateful({
         align = "stretch",
         children = {
           kw.padding({
-            left = 16,
-            right = 16,
-            top = 16,
-            bottom = 12,
+            left = space[4],
+            right = space[4],
+            top = space[4],
+            bottom = space[3],
             child = kw.column({
-              spacing = 4,
+              spacing = space[1],
               children = {
                 kw.text(book.title or "Storybook", {
                   color = colors.text,
-                  font_size = 18,
+                  font_size = font_size[4],
+                  line_height = line_height[4],
                   max_lines = 1,
                 }),
                 kw.text(string.format("%d %s", #stories, #stories == 1 and "story" or "stories"), {
                   color = colors.muted,
-                  font_size = 12,
+                  font_size = font_size[1],
+                  line_height = line_height[1],
                 }),
               },
             }),
           }),
-          kw.separator({ color = colors.border }),
+          kw.separator({}),
           kw.expanded(kw.scroll({
             id = "storybook-stories",
             child = kw.padding({
-              left = 8,
-              right = 8,
-              bottom = 12,
+              left = space[2],
+              right = space[2],
+              bottom = space[3],
               child = kw.column({
                 align = "stretch",
                 children = story_items,
@@ -152,28 +163,31 @@ local Browser = kw.stateful({
           kw.container({
             background = colors.surface,
             border = colors.border,
-            padding = { left = 20, right = 20, top = 12, bottom = 12 },
+            padding = { x = space[5], y = space[3] },
             child = kw.row({
               align = "center",
               children = {
                 kw.expanded(kw.column({
-                  spacing = 2,
+                  spacing = space[1],
                   children = {
                     kw.text(selected.name, {
                       color = colors.text,
-                      font_size = 16,
+                      font_size = font_size[3],
+                      line_height = line_height[3],
                       max_lines = 1,
                     }),
                     kw.text(selected.id, {
                       color = colors.muted,
-                      font_size = 12,
+                      font_size = font_size[1],
+                      line_height = line_height[1],
                       max_lines = 1,
                     }),
                   },
                 })),
                 kw.text(string.format("%g × %s  ·  %gx  ·  %s", viewport.width, viewport.content_height and "content" or string.format("%g", viewport.height), viewport.scale, scheme), {
                   color = colors.muted,
-                  font_size = 12,
+                  font_size = font_size[1],
+                  line_height = line_height[1],
                   max_lines = 1,
                 }),
               },
@@ -181,7 +195,7 @@ local Browser = kw.stateful({
           }),
           kw.expanded(kw.container({
             background = colors.surface_low,
-            padding = { all = 24 },
+            padding = { all = space[5] },
             align = "center",
             child = preview,
           })),
