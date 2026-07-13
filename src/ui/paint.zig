@@ -322,8 +322,8 @@ fn paintSpinner(allocator: std.mem.Allocator, node: *const RenderNode, display_l
 pub const scrollbar_thickness: f32 = model.scale.space(1);
 pub const scrollbar_margin: f32 = model.scale.space(1);
 const scrollbar_min_thumb: f32 = model.scale.space(4);
-pub const scrollbar_track_color: Color = colors.slate_a3;
-pub const scrollbar_color: Color = colors.slate_a8;
+pub const scrollbar_track_color: Color = colors.slate3;
+pub const scrollbar_color: Color = colors.slate8;
 /// Extra pointer slop around the painted thumb so the thin bar is
 /// grabbable.
 const scrollbar_hit_slop: f32 = (model.scale.space(4) - scrollbar_thickness) / 2;

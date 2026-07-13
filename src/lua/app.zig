@@ -3560,7 +3560,7 @@ test "lua resolves theme families and component tokens" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=8 y=6 value=\"Name\" color=#ff445566") != null);
 }
 
-test "lua default theme exposes paired Radix size 2 typography" {
+test "lua default theme exposes opaque Radix component tokens" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3575,7 +3575,19 @@ test "lua default theme exposes paired Radix size 2 typography" {
         \\assert(theme.components.menu.padding == 8 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
         \\assert(theme.components.menu.separator.margin == 8 and theme.components.menu.separator.inset == 4)
         \\assert(theme.components.separator.thickness == 1)
-        \\assert(theme.components.scrollbar.track == theme.colors.slate_a3 and theme.components.scrollbar.thumb == theme.colors.slate_a8)
+        \\for _, scheme in ipairs({ "light", "dark" }) do
+        \\  local resolved = kw.resolve_theme(kw.theme_data(), scheme)
+        \\  assert(resolved.colors.surface == resolved.colors.slate2)
+        \\  assert(resolved.colors.text_secondary == resolved.colors.slate11)
+        \\  assert(resolved.colors.text_tertiary == resolved.colors.slate10)
+        \\  assert(resolved.colors.border == resolved.colors.slate7)
+        \\  assert(resolved.colors.fill == resolved.colors.slate4)
+        \\  assert(resolved.components.chip.background == resolved.colors.blue3)
+        \\  assert(resolved.components.menu.item.selected_background == resolved.colors.blue4)
+        \\  assert(resolved.components.separator.color == resolved.colors.slate6)
+        \\  assert(resolved.components.scrollbar.track == resolved.colors.slate3)
+        \\  assert(resolved.components.scrollbar.thumb == resolved.colors.slate8)
+        \\end
         \\return kw.app({
         \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),
         \\})
