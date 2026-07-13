@@ -487,6 +487,7 @@ fn PopupManager(comptime Backend: type) type {
             /// force the compositor to resize the popup.
             requested_width: u31,
             requested_height: u31,
+            insets: wayland_window.PopupInsets,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             /// Borrowed from the main element tree; refreshed on every
@@ -577,6 +578,9 @@ fn PopupManager(comptime Backend: type) type {
             const size = try self.measureContent(request.popup);
             const width = try wayland_window.frameDimension(size.width);
             const height = try wayland_window.frameDimension(size.height);
+            const insets = try wayland_window.PopupInsets.fromShadow(request.popup.shadow);
+            const buffer_width = try insets.bufferWidth(width);
+            const buffer_height = try insets.bufferHeight(height);
             const rect = request.anchor_rect;
 
             const surface = try self.allocator.create(PopupSurface);
@@ -598,6 +602,7 @@ fn PopupManager(comptime Backend: type) type {
                 .edge = request.popup.placement.edge,
                 .alignment = request.popup.placement.alignment,
                 .gap = @intFromFloat(@round(request.popup.placement.gap)),
+                .insets = insets,
             });
             errdefer self.backend.destroyWindow(win);
 
@@ -607,6 +612,7 @@ fn PopupManager(comptime Backend: type) type {
                 .anchor_rect = request.anchor_rect,
                 .requested_width = width,
                 .requested_height = height,
+                .insets = insets,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
@@ -614,7 +620,7 @@ fn PopupManager(comptime Backend: type) type {
             surface.runtime = try runtime_mod.Runtime.initWithRasterCache(
                 self.allocator,
                 win.renderBackend(),
-                .{ .max_width = size.width, .max_height = size.height },
+                .{ .max_width = @floatFromInt(buffer_width), .max_height = @floatFromInt(buffer_height) },
                 .{ .ptr = surface, .vtable = &popup_host_vtable },
                 self.runtime.color_scheme,
                 self.runtime.rasterCache(),
@@ -647,7 +653,10 @@ fn PopupManager(comptime Backend: type) type {
             const size = try self.measureContent(request.popup);
             const width = try wayland_window.frameDimension(size.width);
             const height = try wayland_window.frameDimension(size.height);
-            if (width == popup.requested_width and height == popup.requested_height) return;
+            const insets = try wayland_window.PopupInsets.fromShadow(request.popup.shadow);
+            _ = try insets.bufferWidth(width);
+            _ = try insets.bufferHeight(height);
+            if (width == popup.requested_width and height == popup.requested_height and std.meta.eql(insets, popup.insets)) return;
 
             const rect = request.anchor_rect;
             const token = self.next_reposition_token;
@@ -663,9 +672,11 @@ fn PopupManager(comptime Backend: type) type {
                 .edge = request.popup.placement.edge,
                 .alignment = request.popup.placement.alignment,
                 .gap = @intFromFloat(@round(request.popup.placement.gap)),
+                .insets = insets,
             }, token);
             popup.requested_width = width;
             popup.requested_height = height;
+            popup.insets = insets;
         }
 
         fn destroyPopup(self: *Self, index: usize) void {
@@ -725,13 +736,25 @@ fn PopupManager(comptime Backend: type) type {
         fn popupBuildWidget(ptr: *anyopaque, scope: *keywork.BuildScope, context: keywork.AppContext) anyerror!keywork.Widget {
             const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
             scope.state_invalidator = .{ .ptr = surface, .call_fn = invalidatePopupState };
-            return surface.popup.builder.build(scope, .{
-                .constraints = .{ .max_width = context.window_width, .max_height = context.window_height },
+            const horizontal: f32 = @floatFromInt(surface.insets.left + surface.insets.right);
+            const vertical: f32 = @floatFromInt(surface.insets.top + surface.insets.bottom);
+            var content_context = context;
+            content_context.window_width = @max(0, context.window_width - horizontal);
+            content_context.window_height = @max(0, context.window_height - vertical);
+            scope.app_context = content_context;
+            const content = try surface.popup.builder.build(scope, .{
+                .constraints = .{ .max_width = content_context.window_width, .max_height = content_context.window_height },
                 .theme = scope.theme,
                 .default_text_style = scope.default_text_style,
                 .interaction = scope.interaction,
-                .app_context = context,
+                .app_context = content_context,
             });
+            return keywork.widgets.padding(scope.allocator, .{
+                .left = @floatFromInt(surface.insets.left),
+                .top = @floatFromInt(surface.insets.top),
+                .right = @floatFromInt(surface.insets.right),
+                .bottom = @floatFromInt(surface.insets.bottom),
+            }, content);
         }
 
         fn invalidatePopupState(ptr: *anyopaque) anyerror!void {

@@ -16,6 +16,14 @@ local default_theme = {
       colors = {
         black = 0xff000000,
         white = 0xffffffff,
+        black_a1 = 0x0d000000,
+        black_a2 = 0x1a000000,
+        black_a3 = 0x26000000,
+        black_a4 = 0x33000000,
+        black_a5 = 0x4d000000,
+        black_a6 = 0x59000000,
+        black_a7 = 0x70000000,
+        black_a11 = 0xb8000000,
 
         slate1 = 0xfffcfcfd,
         slate2 = 0xfff9f9fb,
@@ -33,6 +41,7 @@ local default_theme = {
         slate_a2 = 0x06000055,
         slate_a3 = 0x0f000033,
         slate_a4 = 0x1700002d,
+        slate_a5 = 0x1f000038,
         slate_a6 = 0x2600002f,
         slate_a7 = 0x3200062e,
         slate_a8 = 0x46000830,
@@ -136,11 +145,52 @@ local default_theme = {
         error = "danger",
         on_error = "on_danger",
       },
+      -- Public Radix outer shadow layers. Shadow-1 is inset-only and remains
+      -- unavailable until Keywork supports inner shadows.
+      shadow = {
+        [2] = {
+          { spread = 1, color = "slate_a3" },
+          { spread = 0.5, color = "black_a1" },
+          { offset_y = 1, blur = 1, color = "slate_a2" },
+          { offset_y = 2, blur = 1, spread = -1, color = "black_a1" },
+          { offset_y = 1, blur = 3, color = "black_a1" },
+        },
+        [3] = {
+          { spread = 1, color = "slate_a3" },
+          { offset_y = 2, blur = 3, spread = -2, color = "slate_a3" },
+          { offset_y = 3, blur = 12, spread = -4, color = "black_a2" },
+          { offset_y = 4, blur = 16, spread = -8, color = "black_a2" },
+        },
+        [4] = {
+          { spread = 1, color = "slate_a3" },
+          { offset_y = 8, blur = 40, color = "black_a1" },
+          { offset_y = 12, blur = 32, spread = -16, color = "slate_a3" },
+        },
+        [5] = {
+          { spread = 1, color = "slate_a3" },
+          { offset_y = 12, blur = 60, color = "black_a3" },
+          { offset_y = 12, blur = 32, spread = -16, color = "slate_a5" },
+        },
+        [6] = {
+          { spread = 1, color = "slate_a3" },
+          { offset_y = 12, blur = 60, color = "black_a3" },
+          { offset_y = 16, blur = 64, color = "slate_a2" },
+          { offset_y = 16, blur = 36, spread = -20, color = "slate_a7" },
+        },
+      },
     },
     dark = {
       colors = {
         black = 0xff000000,
         white = 0xffffffff,
+        black_a1 = 0x0d000000,
+        black_a2 = 0x1a000000,
+        black_a3 = 0x26000000,
+        black_a4 = 0x33000000,
+        black_a5 = 0x4d000000,
+        black_a6 = 0x59000000,
+        black_a7 = 0x70000000,
+        black_a11 = 0xb8000000,
 
         slate1 = 0xff111113,
         slate2 = 0xff18191b,
@@ -157,6 +207,7 @@ local default_theme = {
         slate_a2 = 0x09d8f4f6,
         slate_a3 = 0x14ddeaf8,
         slate_a4 = 0x1dd3edf8,
+        slate_a5 = 0x25d9edff,
         slate_a6 = 0x30d6ebfd,
         slate_a7 = 0x40d9edff,
         slate_a8 = 0x5dd9edff,
@@ -260,6 +311,37 @@ local default_theme = {
         error = "danger",
         on_error = "on_danger",
       },
+      shadow = {
+        [2] = {
+          { spread = 1, color = "slate_a6" },
+          { spread = 0.5, color = "black_a3" },
+          { offset_y = 1, blur = 1, color = "black_a6" },
+          { offset_y = 2, blur = 1, spread = -1, color = "black_a6" },
+          { offset_y = 1, blur = 3, color = "black_a5" },
+        },
+        [3] = {
+          { spread = 1, color = "slate_a6" },
+          { offset_y = 2, blur = 3, spread = -2, color = "black_a3" },
+          { offset_y = 3, blur = 8, spread = -2, color = "black_a6" },
+          { offset_y = 4, blur = 12, spread = -4, color = "black_a7" },
+        },
+        [4] = {
+          { spread = 1, color = "slate_a6" },
+          { offset_y = 8, blur = 40, color = "black_a3" },
+          { offset_y = 12, blur = 32, spread = -16, color = "black_a5" },
+        },
+        [5] = {
+          { spread = 1, color = "slate_a6" },
+          { offset_y = 12, blur = 60, color = "black_a5" },
+          { offset_y = 12, blur = 32, spread = -16, color = "black_a7" },
+        },
+        [6] = {
+          { spread = 1, color = "slate_a6" },
+          { offset_y = 12, blur = 60, color = "black_a4" },
+          { offset_y = 16, blur = 64, color = "black_a6" },
+          { offset_y = 16, blur = 36, spread = -20, color = "black_a11" },
+        },
+      },
     },
   },
 
@@ -342,11 +424,11 @@ local default_theme = {
 
     menu = {
       -- Radix size-2 menu content and the soft highlighted-item variant.
+      -- Shadow-5 supplies the subtle one-pixel surface boundary.
       background = "surface_high",
-      border = "panel_border",
-      border_width = 1,
       radius = radius_scale[4],
       padding = space_scale[2],
+      shadow = 5,
       item = {
         padding_x = space_scale[3],
         padding_y = control_padding_y,
@@ -473,6 +555,23 @@ local function resolve_radius(value, radius)
   return resolve_ref(value, radius)
 end
 
+local function resolve_shadows(shadows, colors)
+  local result = {}
+  for level, layers in pairs(shadows or {}) do
+    result[level] = {}
+    for index, layer in ipairs(layers) do
+      result[level][index] = {
+        color = resolve_color(layer.color, colors),
+        offset_x = layer.offset_x or 0,
+        offset_y = layer.offset_y or 0,
+        blur = layer.blur or 0,
+        spread = layer.spread or 0,
+      }
+    end
+  end
+  return result
+end
+
 local function resolve_button(button, colors, space, radius)
   button = button or {}
   return {
@@ -542,7 +641,7 @@ local function resolve_chip(chip, colors, space, radius)
   }
 end
 
-local function resolve_menu(menu, colors, space, radius)
+local function resolve_menu(menu, colors, space, radius, shadow)
   menu = menu or {}
   local item = menu.item or {}
   local label = menu.label or {}
@@ -553,6 +652,7 @@ local function resolve_menu(menu, colors, space, radius)
     border_width = menu.border_width,
     radius = resolve_radius(menu.radius, radius),
     padding = resolve_space(menu.padding, space),
+    shadow = type(menu.shadow) == "number" and shadow[menu.shadow] or menu.shadow,
     item = {
       padding_x = resolve_space(item.padding_x, space),
       padding_y = resolve_space(item.padding_y, space),
@@ -615,11 +715,12 @@ function ui.resolve_theme(theme, state_or_scheme)
   local font_size = copy_table(theme.font_size or {})
   local line_height = copy_table(theme.line_height or {})
   local radius = copy_table(theme.radius or {})
+  local shadow = resolve_shadows(scheme.shadow or theme.shadow, colors)
   local components = {
     button = resolve_button(theme.components and theme.components.button, colors, space, radius),
     input = resolve_input(theme.components and theme.components.input, colors, space, radius),
     chip = resolve_chip(theme.components and theme.components.chip, colors, space, radius),
-    menu = resolve_menu(theme.components and theme.components.menu, colors, space, radius),
+    menu = resolve_menu(theme.components and theme.components.menu, colors, space, radius, shadow),
     separator = resolve_separator(theme.components and theme.components.separator, colors),
     scrollbar = resolve_scrollbar(theme.components and theme.components.scrollbar, colors),
   }
@@ -632,6 +733,7 @@ function ui.resolve_theme(theme, state_or_scheme)
     font_size = font_size,
     line_height = line_height,
     radius = radius,
+    shadow = shadow,
     components = components,
   }
 end
@@ -735,6 +837,7 @@ function ui.box(style, child)
     border = style.border,
     border_width = style.border_width,
     radius = style.radius,
+    shadow = style.shadow,
     min_width = style.min_width,
     min_height = style.min_height,
     align = style.align,
@@ -771,6 +874,7 @@ function ui.container(options, child)
     border = options.border,
     border_width = options.border_width,
     radius = options.radius,
+    shadow = options.shadow,
     min_width = options.min_width,
     min_height = options.min_height,
     align = options.align,
@@ -886,6 +990,7 @@ function ui.popup(options)
     gap = options.gap,
     width = options.width,
     height = options.height,
+    shadow = options.shadow,
     on_close = options.on_close,
   }
 end
@@ -1194,6 +1299,7 @@ local function build_menu(options, theme)
     border = options.border or menu_theme.border,
     border_width = options.border_width or menu_theme.border_width,
     radius = options.radius or menu_theme.radius,
+    shadow = options.shadow or menu_theme.shadow,
     padding = options.padding or menu_theme.padding,
     child = options.child,
   })

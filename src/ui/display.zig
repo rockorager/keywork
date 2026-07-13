@@ -37,6 +37,7 @@ pub const PaintCommand = union(enum) {
         alpha: []const u8,
         color: Color,
         cache_key: u64,
+        dither: bool = false,
     };
 
     /// Full-color image with straight (non-premultiplied) alpha, pixels in
@@ -287,6 +288,33 @@ pub const DisplayList = struct {
         color: Color,
         cache_key: u64,
     ) !void {
+        try self.appendAlphaImage(allocator, rect, width, height, alpha, color, cache_key, false);
+    }
+
+    pub fn alphaImageDithered(
+        self: *DisplayList,
+        allocator: std.mem.Allocator,
+        rect: Rect,
+        width: u32,
+        height: u32,
+        alpha: []const u8,
+        color: Color,
+        cache_key: u64,
+    ) !void {
+        try self.appendAlphaImage(allocator, rect, width, height, alpha, color, cache_key, true);
+    }
+
+    fn appendAlphaImage(
+        self: *DisplayList,
+        allocator: std.mem.Allocator,
+        rect: Rect,
+        width: u32,
+        height: u32,
+        alpha: []const u8,
+        color: Color,
+        cache_key: u64,
+        dither: bool,
+    ) !void {
         try self.commands.append(allocator, .{ .alpha_image = .{
             .rect = rect,
             .width = width,
@@ -294,6 +322,7 @@ pub const DisplayList = struct {
             .alpha = alpha,
             .color = color,
             .cache_key = cache_key,
+            .dither = dither,
         } });
     }
 

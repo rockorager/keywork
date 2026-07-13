@@ -730,6 +730,7 @@ fn layoutElementInto(
                 .box_border = box_widget.border,
                 .box_border_width = box_widget.border_width,
                 .box_radius = box_widget.radius,
+                .box_shadow = box_widget.shadow,
             });
         },
         .clickable => |clickable_widget| {
@@ -1387,6 +1388,29 @@ test "text paint overhang contributes to retained damage" {
     const expected: Rect = .{ .x = 4, .y = -6, .width = 48, .height = 48 };
     try std.testing.expectEqual(expected, text.paint_bounds.?);
     try std.testing.expectEqual(expected, text.damage.?);
+}
+
+test "changing a box shadow damages old and new overhangs" {
+    var old_shadow: model.BoxShadow = .{};
+    try old_shadow.append(.{ .color = colors.black, .offset_x = 2, .blur = 4 });
+    var new_shadow: model.BoxShadow = .{};
+    try new_shadow.append(.{ .color = colors.black, .offset_x = -2, .blur = 4 });
+    var box: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 20, .y = 10, .width = 10, .height = 10 },
+        .box_shadow = old_shadow,
+        .needs_paint = true,
+    };
+    box.paint_bounds = box.derivePaintBounds();
+
+    commitRenderNode(&box, .{
+        .kind = .box,
+        .rect = box.rect,
+        .box_shadow = new_shadow,
+    });
+
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 2, .width = 30, .height = 26 }, box.damage.?);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 2, .width = 26, .height = 26 }, box.paint_bounds.?);
 }
 
 test "removing an overflowing child damages its retained paint bounds" {

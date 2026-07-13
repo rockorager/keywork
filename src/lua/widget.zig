@@ -77,6 +77,7 @@ const BoxOptions = struct {
     border: ?keywork.Color = null,
     border_width: f32 = 1,
     radius: f32 = 0,
+    shadow: ?keywork.BoxShadow = null,
     min_width: f32 = 0,
     min_height: f32 = 0,
     @"align": ?keywork.Widget.Alignment = null,
@@ -123,6 +124,7 @@ const PopupOptions = struct {
     gap: f32 = 0,
     width: ?f32 = null,
     height: ?f32 = null,
+    shadow: ?keywork.BoxShadow = null,
 };
 
 const FocusScopeOptions = struct {
@@ -789,6 +791,7 @@ pub fn parse(
             .border = options.border,
             .border_width = options.border_width,
             .radius = options.radius,
+            .shadow = options.shadow,
             .min_width = options.min_width,
             .min_height = options.min_height,
             .horizontal_align = options.horizontalAlign(),
@@ -870,6 +873,7 @@ pub fn parse(
             .popup = .{
                 .builder = builder.popupBuilder(),
                 .placement = .{ .edge = options.edge, .alignment = options.alignment, .gap = options.gap },
+                .shadow = options.shadow,
                 .width = options.width,
                 .height = options.height,
                 .on_close = on_close,

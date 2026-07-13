@@ -6,6 +6,8 @@ const display = @import("display.zig");
 const animation = @import("animation.zig");
 
 pub const Color = types.Color;
+pub const ShadowLayer = types.ShadowLayer;
+pub const BoxShadow = types.BoxShadow;
 pub const colors = types.colors;
 pub const scale = types.scale;
 pub const TextStyle = types.TextStyle;
@@ -123,6 +125,7 @@ pub const Widget = union(enum) {
         border: ?Color = null,
         border_width: f32 = 1,
         radius: f32 = 0,
+        shadow: ?BoxShadow = null,
         min_width: f32 = 0,
         min_height: f32 = 0,
         horizontal_align: Alignment = .start,
@@ -177,6 +180,8 @@ pub const Widget = union(enum) {
     pub const Popup = struct {
         builder: PopupBuilder,
         placement: PopupPlacement = .{},
+        /// Surface gutter reserved for a shadow painted by popup content.
+        shadow: ?BoxShadow = null,
         /// Explicit size overrides; content is measured when null.
         width: ?f32 = null,
         height: ?f32 = null,
@@ -191,6 +196,7 @@ pub const Widget = union(enum) {
             return .{
                 .builder = builder,
                 .placement = self.placement,
+                .shadow = self.shadow,
                 .width = self.width,
                 .height = self.height,
                 .on_close = on_close,
@@ -1156,6 +1162,7 @@ pub const RenderNode = struct {
     box_border: ?Color = null,
     box_border_width: f32 = 1,
     box_radius: f32 = 0,
+    box_shadow: ?BoxShadow = null,
     separator_axis: Widget.Separator.Axis = .horizontal,
     separator_margin: f32 = 0,
     /// Scrollbar opacity for viewport nodes, copied from the scroll
@@ -1260,7 +1267,9 @@ pub const RenderNode = struct {
                     .height = self.rect.height + overhang * 2,
                 };
             } else null,
-            .box => if (self.background.a > 0 or self.box_border != null) self.rect else null,
+            .box => if (self.box_shadow) |shadow|
+                if (shadow.isVisible()) shadow.paintBounds(self.rect) else if (self.background.a > 0 or self.box_border != null) self.rect else null
+            else if (self.background.a > 0 or self.box_border != null) self.rect else null,
             .separator => if (self.background.a > 0) self.rect else null,
             .text_input, .spinner, .scroll, .list, .render_object => self.rect,
             else => null,
@@ -2694,7 +2703,8 @@ fn widgetPaintEqual(a: Widget, b: Widget) bool {
             break :blk std.meta.eql(a_box.background, b_box.background) and
                 std.meta.eql(a_box.border, b_box.border) and
                 a_box.border_width == b_box.border_width and
-                a_box.radius == b_box.radius;
+                a_box.radius == b_box.radius and
+                std.meta.eql(a_box.shadow, b_box.shadow);
         },
         .scroll => |scroll| std.meta.eql(scroll.scrollbar_track_color, b.scroll.scrollbar_track_color) and
             std.meta.eql(scroll.scrollbar_color, b.scroll.scrollbar_color),
@@ -4624,12 +4634,15 @@ test "anchored elements declare popups with laid-out anchor rects" {
         }
     };
     const label: Widget = .{ .text = .{ .value = "Clock" } };
+    var popup_shadow: BoxShadow = .{};
+    try popup_shadow.append(.{ .color = colors.black, .blur = 3 });
     const anchored: Widget = .{ .anchored = .{
         .id = "clock",
         .child = &label,
         .popup = .{
             .builder = .{ .ptr = undefined, .build_fn = popup_builder.build },
             .placement = .{ .edge = .top, .alignment = .center, .gap = 4 },
+            .shadow = popup_shadow,
         },
     } };
     const padded: Widget = .{ .padding = .{ .insets = .{ .left = 10, .top = 5 }, .child = &anchored } };
@@ -4653,6 +4666,7 @@ test "anchored elements declare popups with laid-out anchor rects" {
     try std.testing.expectEqual(Widget.PopupPlacement.Edge.top, request.popup.placement.edge);
     try std.testing.expectEqual(Widget.Alignment.center, request.popup.placement.alignment);
     try std.testing.expectEqual(@as(f32, 4), request.popup.placement.gap);
+    try std.testing.expectEqual(popup_shadow, request.popup.shadow.?);
 }
 
 test "anchored without popup declares nothing and stays hit-testable" {

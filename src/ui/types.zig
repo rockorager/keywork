@@ -22,7 +22,111 @@ pub const Color = packed struct(u32) {
             .b = @intCast((@as(u32, self.b) * source_alpha + @as(u32, destination.b) * inverse_alpha + 127) / 255),
         };
     }
+
+    /// Source-over with a caller-supplied quantization threshold. CPU
+    /// rasterizers use this for smooth alpha masks whose low-contrast output
+    /// would otherwise collapse into visible 8-bit bands.
+    pub fn blendOverDithered(self: Color, destination: Color, coverage: u8, threshold: u8) Color {
+        const source_alpha = (@as(u32, self.a) * coverage + 127) / 255;
+        const inverse_alpha = 255 - source_alpha;
+        return .{
+            .a = @intCast(source_alpha + divideDithered(@as(u32, destination.a) * inverse_alpha, threshold)),
+            .r = divideDithered(@as(u32, self.r) * source_alpha + @as(u32, destination.r) * inverse_alpha, threshold),
+            .g = divideDithered(@as(u32, self.g) * source_alpha + @as(u32, destination.g) * inverse_alpha, threshold),
+            .b = divideDithered(@as(u32, self.b) * source_alpha + @as(u32, destination.b) * inverse_alpha, threshold),
+        };
+    }
+
+    fn divideDithered(numerator: u32, threshold: u8) u8 {
+        const base = numerator / 255;
+        const remainder = numerator % 255;
+        return @intCast(base + @intFromBool(remainder > threshold));
+    }
 };
+
+pub const ShadowLayer = struct {
+    color: Color = .argb(0, 0, 0, 0),
+    offset_x: f32 = 0,
+    offset_y: f32 = 0,
+    blur: f32 = 0,
+    spread: f32 = 0,
+
+    pub fn normalized(self: ShadowLayer) ShadowLayer {
+        var result = self;
+        if (!std.math.isFinite(result.offset_x)) result.offset_x = 0;
+        if (!std.math.isFinite(result.offset_y)) result.offset_y = 0;
+        if (!std.math.isFinite(result.blur) or result.blur < 0) result.blur = 0;
+        if (!std.math.isFinite(result.spread)) result.spread = 0;
+        return result;
+    }
+
+    /// Three box-blur passes use a radius near blur / 2. Include their
+    /// rounding allowance so paint bounds remain conservative at fractional
+    /// scales as well as integer scales.
+    pub fn blurSupport(self: ShadowLayer) f32 {
+        const blur_value = self.normalized().blur;
+        return if (blur_value > 0) @ceil(blur_value * 1.5 + 1.5) else 0;
+    }
+};
+
+pub const BoxShadow = struct {
+    pub const max_layers = 6;
+    layers: [max_layers]ShadowLayer = [_]ShadowLayer{.{}} ** max_layers,
+    count: u8 = 0,
+
+    pub fn append(self: *BoxShadow, layer: ShadowLayer) !void {
+        if (self.count == max_layers) return error.TooManyShadowLayers;
+        self.layers[self.count] = layer.normalized();
+        self.count += 1;
+    }
+
+    pub fn isVisible(self: BoxShadow) bool {
+        for (self.layers[0..self.count]) |layer| {
+            if (layer.color.a > 0) return true;
+        }
+        return false;
+    }
+
+    /// Conservative logical overhang for the outer-only shadow masks.
+    pub fn insets(self: BoxShadow) EdgeInsets {
+        var result: EdgeInsets = .{};
+        for (self.layers[0..self.count]) |raw| {
+            const layer = raw.normalized();
+            if (layer.color.a == 0) continue;
+            const support = layer.blurSupport();
+            const extent = layer.spread + support;
+            result.left = @max(result.left, extent - layer.offset_x);
+            result.right = @max(result.right, extent + layer.offset_x);
+            result.top = @max(result.top, extent - layer.offset_y);
+            result.bottom = @max(result.bottom, extent + layer.offset_y);
+        }
+        result.left = @max(0, result.left);
+        result.top = @max(0, result.top);
+        result.right = @max(0, result.right);
+        result.bottom = @max(0, result.bottom);
+        return result;
+    }
+
+    pub fn paintBounds(self: BoxShadow, rect: Rect) Rect {
+        const value = self.insets();
+        return .{ .x = rect.x - value.left, .y = rect.y - value.top, .width = rect.width + value.horizontal(), .height = rect.height + value.vertical() };
+    }
+};
+
+test "box shadow clamps blur and derives asymmetric paint bounds" {
+    var shadow: BoxShadow = .{};
+    try shadow.append(.{ .color = Color.argb(255, 0, 0, 0), .offset_x = 3, .offset_y = -2, .blur = std.math.nan(f32), .spread = 1 });
+    try std.testing.expectEqual(@as(f32, 0), shadow.layers[0].blur);
+    try std.testing.expectEqual(Rect{ .x = 0, .y = 7, .width = 24, .height = 13 }, shadow.paintBounds(.{ .x = 0, .y = 10, .width = 20, .height = 10 }));
+}
+
+test "box shadow blur support is conservative and ignores transparent layers" {
+    var shadow: BoxShadow = .{};
+    try shadow.append(.{ .blur = 60, .offset_y = 12 });
+    try std.testing.expectEqual(EdgeInsets{}, shadow.insets());
+    try shadow.append(.{ .color = Color.argb(38, 0, 0, 0), .blur = 60, .offset_y = 12 });
+    try std.testing.expectEqual(EdgeInsets{ .left = 92, .top = 80, .right = 92, .bottom = 104 }, shadow.insets());
+}
 
 pub const colors = struct {
     pub const transparent: Color = Color.argb(0x00, 0x00, 0x00, 0x00);

@@ -66,6 +66,7 @@ fn decodeValue(comptime T: type, lua_state: *c.lua_State, index: c_int, allocato
         .@"struct" => {
             if (T == keywork.Color) return try decodeColor(lua_state, index);
             if (T == keywork.EdgeInsets) return try decodeInsets(lua_state, index, allocator);
+            if (T == keywork.BoxShadow) return try decodeBoxShadow(lua_state, index, allocator);
             return try decode(T, lua_state, index, allocator);
         },
         .@"enum" => |info| {
@@ -93,6 +94,24 @@ fn decodeValue(comptime T: type, lua_state: *c.lua_State, index: c_int, allocato
         },
         else => @compileError("unsupported Lua value type: " ++ @typeName(T)),
     }
+}
+
+fn decodeBoxShadow(lua_state: *c.lua_State, index: c_int, allocator: std.mem.Allocator) !keywork.BoxShadow {
+    const table = absoluteIndex(lua_state, index);
+    if (c.lua_type(lua_state, table) != c.LUA_TTABLE) return error.ExpectedLuaTable;
+    const length: usize = @intCast(c.lua_objlen(lua_state, table));
+    if (length > keywork.BoxShadow.max_layers) return error.TooManyShadowLayers;
+    var result: keywork.BoxShadow = .{};
+    for (1..length + 1) |i| {
+        c.lua_rawgeti(lua_state, table, @intCast(i));
+        const layer = decode(keywork.ShadowLayer, lua_state, -1, allocator) catch |err| {
+            pop(lua_state, 1);
+            return err;
+        };
+        pop(lua_state, 1);
+        try result.append(layer);
+    }
+    return result;
 }
 
 pub fn decodeColor(lua_state: *c.lua_State, index: c_int) !keywork.Color {
@@ -124,6 +143,31 @@ fn decodeInsets(lua_state: *c.lua_State, index: c_int, allocator: std.mem.Alloca
         .right = options.right orelse x,
         .bottom = options.bottom orelse y,
     };
+}
+
+test "box shadow decoding owns bounded normalized layers" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state,
+        \\return {
+        \\  { color = 0x26000000, offset_x = 2, offset_y = 3, blur = 12, spread = -4 },
+        \\  { color = 0x0d000000, blur = -1 },
+        \\}
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
+    const shadow = try decodeBoxShadow(lua_state, -1, std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 2), shadow.count);
+    try std.testing.expectEqual(@as(f32, 12), shadow.layers[0].blur);
+    try std.testing.expectEqual(@as(f32, -4), shadow.layers[0].spread);
+    try std.testing.expectEqual(@as(f32, 0), shadow.layers[1].blur);
+}
+
+test "box shadow decoding rejects excess layers" {
+    const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(lua_state);
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return {{},{},{},{},{},{},{}}"));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
+    try std.testing.expectError(error.TooManyShadowLayers, decodeBoxShadow(lua_state, -1, std.testing.allocator));
 }
 
 const stringFromStack = lua_value.stringFromStack;

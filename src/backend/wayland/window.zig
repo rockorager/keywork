@@ -60,6 +60,37 @@ pub const PopupOptions = struct {
     edge: keywork.Widget.PopupPlacement.Edge = .bottom,
     alignment: keywork.Widget.Alignment = .start,
     gap: i32 = 0,
+    insets: PopupInsets = .{},
+};
+
+pub const PopupInsets = struct {
+    left: u31 = 0,
+    top: u31 = 0,
+    right: u31 = 0,
+    bottom: u31 = 0,
+
+    pub fn fromShadow(shadow: ?keywork.BoxShadow) !PopupInsets {
+        const value = if (shadow) |present| present.insets() else return .{};
+        return .{
+            .left = try ceilSide(value.left),
+            .top = try ceilSide(value.top),
+            .right = try ceilSide(value.right),
+            .bottom = try ceilSide(value.bottom),
+        };
+    }
+
+    pub fn bufferWidth(self: PopupInsets, content: u31) !u31 {
+        return std.math.cast(u31, try std.math.add(u32, content, try std.math.add(u32, self.left, self.right))) orelse error.DimensionOverflow;
+    }
+
+    pub fn bufferHeight(self: PopupInsets, content: u31) !u31 {
+        return std.math.cast(u31, try std.math.add(u32, content, try std.math.add(u32, self.top, self.bottom))) orelse error.DimensionOverflow;
+    }
+
+    fn ceilSide(value: f32) !u31 {
+        if (!std.math.isFinite(value) or value < 0 or @as(f64, value) > std.math.maxInt(u31)) return error.DimensionOverflow;
+        return @intFromFloat(@ceil(value));
+    }
 };
 
 /// Protocol state shared by every renderer targeting a Wayland surface.
@@ -93,6 +124,7 @@ pub const Surface = struct {
     repaint_pending: bool = false,
     frame_callback: ?*wl.Callback = null,
     frame_done_pending: bool = false,
+    popup_insets: PopupInsets = .{},
 
     pub const Pending = packed struct {
         repaint: bool = false,
@@ -162,6 +194,8 @@ pub const Surface = struct {
         // instead of an xdg parent.
         if (parent.shell_role == .layer) parent.shell_role.layer.surface.getPopup(popup);
 
+        try configurePopupGeometry(compositor, surface, xdg_surface, options);
+
         const scale_objects = createScaleObjects(connection, surface);
         errdefer scale_objects.deinit();
 
@@ -171,8 +205,9 @@ pub const Surface = struct {
             .viewport = scale_objects.viewport,
             .fractional_scale = scale_objects.fractional_scale,
             .shell_role = .{ .popup = .{ .surface = xdg_surface, .popup = popup } },
-            .width = options.width,
-            .height = options.height,
+            .width = try options.insets.bufferWidth(options.width),
+            .height = try options.insets.bufferHeight(options.height),
+            .popup_insets = options.insets,
             .scale = if (scale_objects.fractional_scale != null or parent.fractional_scale == null) parent.scale else 1,
         };
     }
@@ -192,6 +227,8 @@ pub const Surface = struct {
         const positioner = try wm_base.createPositioner();
         defer positioner.destroy();
         configurePopupPositioner(positioner, options);
+        try configurePopupGeometry(connection.compositor orelse return error.NoWlCompositor, self.surface, role.surface, options);
+        self.popup_insets = options.insets;
         role.popup.reposition(positioner, token);
     }
 
@@ -479,8 +516,8 @@ pub const Surface = struct {
     fn popupListener(_: *xdg.Popup, event: xdg.Popup.Event, self: *Surface) void {
         switch (event) {
             .configure => |configure| {
-                if (configure.width > 0) self.width = @intCast(configure.width);
-                if (configure.height > 0) self.height = @intCast(configure.height);
+                if (configure.width > 0) self.width = self.popup_insets.bufferWidth(@intCast(configure.width)) catch self.width;
+                if (configure.height > 0) self.height = self.popup_insets.bufferHeight(@intCast(configure.height)) catch self.height;
             },
             .popup_done => self.closed = true,
             .repositioned => {},
@@ -1198,6 +1235,26 @@ fn configurePopupPositioner(positioner: *xdg.Positioner, options: PopupOptions) 
     positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_x = true, .flip_y = true });
     const offset = popupOffset(options.edge, options.gap);
     positioner.setOffset(offset.x, offset.y);
+}
+
+fn configurePopupGeometry(compositor: *wl.Compositor, surface: *wl.Surface, xdg_surface: *xdg.Surface, options: PopupOptions) !void {
+    const left: i32 = @intCast(options.insets.left);
+    const top: i32 = @intCast(options.insets.top);
+    const width: i32 = @intCast(options.width);
+    const height: i32 = @intCast(options.height);
+    xdg_surface.setWindowGeometry(left, top, width, height);
+    const region = try compositor.createRegion();
+    defer region.destroy();
+    region.add(left, top, width, height);
+    surface.setInputRegion(region);
+}
+
+test "popup insets round outward and compute buffer dimensions" {
+    var shadow: keywork.BoxShadow = .{};
+    try shadow.append(.{ .color = keywork.Color.argb(255, 0, 0, 0), .offset_x = 0.25, .offset_y = -0.25, .blur = 1 });
+    const insets = try PopupInsets.fromShadow(shadow);
+    try std.testing.expectEqual(PopupInsets{ .left = 3, .top = 4, .right = 4, .bottom = 3 }, insets);
+    try std.testing.expectEqual(@as(u31, 27), try insets.bufferWidth(20));
 }
 
 fn layer(value: wayland_options.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {

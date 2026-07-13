@@ -66,6 +66,7 @@ fn paintNode(
             try render_object.paint(.{ .allocator = allocator, .rect = node.rect, .scale = scale, .display_list = display_list, .raster_cache = raster_cache });
         },
         .box => {
+            if (node.box_shadow) |shadow| try paintBoxShadow(allocator, display_list, raster_cache, node.rect, node.box_radius, shadow, scale);
             if (node.box_radius > 0) {
                 try paintRoundedBox(allocator, display_list, raster_cache, node.rect, node.background, node.box_border, node.box_border_width, node.box_radius, scale);
             } else {
@@ -143,6 +144,185 @@ fn paintNode(
         try paintScrollbars(allocator, node, display_list, raster_cache, scale);
         try display_list.popClip(allocator);
     }
+}
+
+fn paintBoxShadow(allocator: std.mem.Allocator, display_list: *DisplayList, raster_cache: *RasterCache, rect: Rect, radius: f32, shadow: model.BoxShadow, scale: f32) !void {
+    const render_scale = if (std.math.isFinite(scale) and scale > 0) scale else 1;
+    var index: usize = shadow.count;
+    while (index > 0) {
+        index -= 1;
+        const layer = shadow.layers[index].normalized();
+        if (layer.color.a == 0) continue;
+        const support = layer.blurSupport();
+        const shape_width = rect.width + layer.spread * 2;
+        const shape_height = rect.height + layer.spread * 2;
+        if (shape_width <= 0 or shape_height <= 0) continue;
+        const destination: Rect = .{
+            .x = rect.x + layer.offset_x - layer.spread - support,
+            .y = rect.y + layer.offset_y - layer.spread - support,
+            .width = shape_width + support * 2,
+            .height = shape_height + support * 2,
+        };
+        const width: usize = @max(1, @as(usize, @intFromFloat(@ceil(destination.width * render_scale))));
+        const height: usize = @max(1, @as(usize, @intFromFloat(@ceil(destination.height * render_scale))));
+        const padding = support * render_scale;
+        const scaled_radius = @max(0, (radius + layer.spread) * render_scale);
+        const desired_blur_radius: usize = @intFromFloat(@round(layer.blur * render_scale / 2));
+        const blur_radius = @min(desired_blur_radius, @as(usize, @intFromFloat(@floor(padding / 3))));
+        const cache_key = shadowCacheKey(width, height, scaled_radius, padding, blur_radius, layer.color.a);
+        const alpha = if (raster_cache.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
+            cached
+        else
+            try raster_cache.insertAlpha(allocator, cache_key, @intCast(width), @intCast(height), try shadowAlpha(allocator, width, height, padding, scaled_radius, blur_radius, layer.color.a));
+        var color = layer.color;
+        color.a = 255;
+        try display_list.alphaImageDithered(allocator, destination, @intCast(width), @intCast(height), alpha, color, cache_key);
+    }
+}
+
+fn shadowAlpha(allocator: std.mem.Allocator, width: usize, height: usize, padding: f32, radius: f32, blur_radius: usize, opacity: u8) ![]u8 {
+    var surface = try z2d.Surface.init(.image_surface_alpha8, allocator, @intCast(width), @intCast(height));
+    defer surface.deinit(allocator);
+    var path: z2d.Path = .empty;
+    defer path.deinit(allocator);
+    try appendRoundedRectPath(&path, allocator, padding, padding, @max(0, @as(f64, @floatFromInt(width)) - padding * 2), @max(0, @as(f64, @floatFromInt(height)) - padding * 2), radius);
+    const pattern: z2d.Pattern = .{ .opaque_pattern = .{ .pixel = .{ .alpha8 = .{ .a = 255 } } } };
+    try z2d.painter.fill(allocator, &surface, &pattern, path.nodes.items, .{});
+    const coverage = try allocator.alloc(u16, width * height);
+    defer allocator.free(coverage);
+    for (surface.image_surface_alpha8.buf, coverage) |pixel, *value| value.* = @as(u16, pixel.a) * 257;
+    if (blur_radius > 0) {
+        const scratch = try allocator.alloc(u16, coverage.len);
+        defer allocator.free(scratch);
+        for (0..3) |_| {
+            boxBlurHorizontal(coverage, scratch, width, height, blur_radius);
+            boxBlurVertical(scratch, coverage, width, height, blur_radius);
+        }
+    }
+    const alpha = try allocator.alloc(u8, width * height);
+    errdefer allocator.free(alpha);
+    for (coverage, alpha, 0..) |value, *result, index| {
+        result.* = ditheredShadowAlpha(value, opacity, index % width, index / width);
+    }
+    return alpha;
+}
+
+fn boxBlurHorizontal(source: []const u16, destination: []u16, width: usize, height: usize, radius: usize) void {
+    const divisor: u64 = @intCast(radius * 2 + 1);
+    for (0..height) |y| {
+        const row = y * width;
+        var sum: u64 = 0;
+        for (0..@min(width, radius + 1)) |x| sum += source[row + x];
+        for (0..width) |x| {
+            destination[row + x] = @intCast((sum + divisor / 2) / divisor);
+            if (x >= radius) sum -= source[row + x - radius];
+            const added = x + radius + 1;
+            if (added < width) sum += source[row + added];
+        }
+    }
+}
+
+fn boxBlurVertical(source: []const u16, destination: []u16, width: usize, height: usize, radius: usize) void {
+    const divisor: u64 = @intCast(radius * 2 + 1);
+    for (0..width) |x| {
+        var sum: u64 = 0;
+        for (0..@min(height, radius + 1)) |y| sum += source[y * width + x];
+        for (0..height) |y| {
+            destination[y * width + x] = @intCast((sum + divisor / 2) / divisor);
+            if (y >= radius) sum -= source[(y - radius) * width + x];
+            const added = y + radius + 1;
+            if (added < height) sum += source[added * width + x];
+        }
+    }
+}
+
+const bayer8 = [64]u8{
+    0,  48, 12, 60, 3,  51, 15, 63,
+    32, 16, 44, 28, 35, 19, 47, 31,
+    8,  56, 4,  52, 11, 59, 7,  55,
+    40, 24, 36, 20, 43, 27, 39, 23,
+    2,  50, 14, 62, 1,  49, 13, 61,
+    34, 18, 46, 30, 33, 17, 45, 29,
+    10, 58, 6,  54, 9,  57, 5,  53,
+    42, 26, 38, 22, 41, 25, 37, 21,
+};
+
+fn ditheredShadowAlpha(coverage: u16, opacity: u8, x: usize, y: usize) u8 {
+    const denominator = std.math.maxInt(u16);
+    const scaled = @as(u32, coverage) * opacity;
+    const base = scaled / denominator;
+    if (base == 255) return 255;
+    const remainder = scaled % denominator;
+    // Quantize the combined shape coverage and layer opacity only once. The
+    // ordered threshold turns sub-byte coverage into a stable spatial
+    // average instead of a visible contour in a low-contrast shadow.
+    const rank = bayer8[(y % 8) * 8 + (x % 8)];
+    const threshold = (@as(u32, rank) * 2 + 1) * denominator / (bayer8.len * 2);
+    return @intCast(base + @intFromBool(remainder > threshold));
+}
+
+fn shadowCacheKey(width: usize, height: usize, radius: f32, padding: f32, blur_radius: usize, opacity: u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("box-shadow");
+    hasher.update(std.mem.asBytes(&width));
+    hasher.update(std.mem.asBytes(&height));
+    hasher.update(std.mem.asBytes(&radius));
+    hasher.update(std.mem.asBytes(&padding));
+    hasher.update(std.mem.asBytes(&blur_radius));
+    hasher.update(std.mem.asBytes(&opacity));
+    return hasher.final();
+}
+
+test "box shadows paint back to front and share masks at the same opacity" {
+    var shadow: model.BoxShadow = .{};
+    try shadow.append(.{ .color = colors.white, .offset_x = 1, .blur = 4 });
+    try shadow.append(.{ .color = colors.ink, .offset_x = 2, .blur = 4 });
+    const node: RenderNode = .{ .kind = .box, .rect = .{ .x = 10, .y = 10, .width = 20, .height = 20 }, .box_shadow = shadow };
+    var list: DisplayList = .{};
+    defer list.deinit(std.testing.allocator);
+    var cache: RasterCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    cache.beginFrame();
+    defer cache.endFrame(std.testing.allocator);
+    try paint(std.testing.allocator, &node, &list, &cache);
+    try std.testing.expectEqual(@as(usize, 2), list.commands.items.len);
+    try std.testing.expectEqual(colors.ink, list.commands.items[0].alpha_image.color);
+    try std.testing.expectEqual(colors.white, list.commands.items[1].alpha_image.color);
+    try std.testing.expectEqual(list.commands.items[0].alpha_image.cache_key, list.commands.items[1].alpha_image.cache_key);
+    try std.testing.expect(list.commands.items[0].alpha_image.dither);
+}
+
+test "box shadow masks bake opacity before dither" {
+    var shadow: model.BoxShadow = .{};
+    try shadow.append(.{ .color = Color.argb(64, 0, 0, 0), .blur = 4 });
+    try shadow.append(.{ .color = Color.argb(128, 0, 0, 0), .blur = 4 });
+    const node: RenderNode = .{ .kind = .box, .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 }, .box_shadow = shadow };
+    var list: DisplayList = .{};
+    defer list.deinit(std.testing.allocator);
+    var cache: RasterCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    cache.beginFrame();
+    defer cache.endFrame(std.testing.allocator);
+    try paint(std.testing.allocator, &node, &list, &cache);
+    try std.testing.expectEqual(@as(usize, 2), list.commands.items.len);
+    try std.testing.expectEqual(@as(u8, 255), list.commands.items[0].alpha_image.color.a);
+    try std.testing.expectEqual(@as(u8, 255), list.commands.items[1].alpha_image.color.a);
+    try std.testing.expect(list.commands.items[0].alpha_image.cache_key != list.commands.items[1].alpha_image.cache_key);
+}
+
+test "blurred shadow mask falls off outside source" {
+    const alpha = try shadowAlpha(std.testing.allocator, 20, 20, 6, 0, 2, 255);
+    defer std.testing.allocator.free(alpha);
+    try std.testing.expect(alpha[10 * 20 + 10] > alpha[10 * 20 + 3]);
+    try std.testing.expect(alpha[10 * 20 + 3] > 0);
+    try std.testing.expect(alpha[10 * 20] < alpha[10 * 20 + 3]);
+}
+
+test "unblurred shadow mask preserves transparent padding" {
+    const alpha = try shadowAlpha(std.testing.allocator, 10, 10, 2, 0, 0, 255);
+    defer std.testing.allocator.free(alpha);
+    try std.testing.expectEqual(@as(u8, 0), alpha[0]);
+    try std.testing.expectEqual(@as(u8, 255), alpha[5 * 10 + 5]);
 }
 
 test "damage paint emits only intersecting node commands" {

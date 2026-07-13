@@ -140,7 +140,11 @@ fn alphaImage(
             const column = x - dst_x0;
             const coverage = image.alpha[row * image_width + column];
             if (coverage == 0) continue;
-            blendPixel(pixels, width, x, y, image.color, coverage);
+            if (image.dither) {
+                blendAlphaImagePixel(pixels, width, x, y, image.color, coverage);
+            } else {
+                blendPixel(pixels, width, x, y, image.color, coverage);
+            }
         }
     }
 }
@@ -192,6 +196,24 @@ fn blendPixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Colo
     const index = y * width + x;
     const dst: keywork.Color = @bitCast(pixels[index]);
     pixels[index] = @bitCast(color.blendOver(dst, coverage));
+}
+
+fn blendAlphaImagePixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Color, coverage: u8) void {
+    const bayer8 = [64]u8{
+        0,  48, 12, 60, 3,  51, 15, 63,
+        32, 16, 44, 28, 35, 19, 47, 31,
+        8,  56, 4,  52, 11, 59, 7,  55,
+        40, 24, 36, 20, 43, 27, 39, 23,
+        2,  50, 14, 62, 1,  49, 13, 61,
+        34, 18, 46, 30, 33, 17, 45, 29,
+        10, 58, 6,  54, 9,  57, 5,  53,
+        42, 26, 38, 22, 41, 25, 37, 21,
+    };
+    const rank = bayer8[(y % 8) * 8 + (x % 8)];
+    const threshold: u8 = @intCast((@as(u16, rank) * 2 + 1) * 255 / (bayer8.len * 2));
+    const index = y * width + x;
+    const dst: keywork.Color = @bitCast(pixels[index]);
+    pixels[index] = @bitCast(color.blendOverDithered(dst, coverage, threshold));
 }
 
 fn clampPixel(value: f32, max_value: u31) usize {
