@@ -1154,7 +1154,7 @@ local function build_chip(options, theme)
       min_height = options.min_height or chip_theme.min_height,
       align = options.align,
       horizontal_align = options.horizontal_align,
-      vertical_align = options.vertical_align,
+      vertical_align = options.vertical_align or "center",
       padding = padding,
     }, child),
     hover_background = hover_background,
