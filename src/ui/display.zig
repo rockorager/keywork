@@ -9,6 +9,13 @@ const Rect = types.Rect;
 const ResolvedTextStyle = types.ResolvedTextStyle;
 const Size = types.Size;
 
+/// A8 pixels with rows padded for direct use by CPU compositors. Pixel data
+/// remains logically `width * height`; callers must use `stride` between rows.
+pub const AlphaMask = struct {
+    pixels: []align(4) const u8,
+    stride: u32,
+};
+
 pub const PaintCommand = union(enum) {
     fill_rect: FillRect,
     text: TextRun,
@@ -34,7 +41,8 @@ pub const PaintCommand = union(enum) {
         rect: Rect,
         width: u32,
         height: u32,
-        alpha: []const u8,
+        alpha: []align(4) const u8,
+        stride: u32,
         color: Color,
         cache_key: u64,
         dither: bool = false,
@@ -69,7 +77,8 @@ pub const RasterCache = struct {
     const AlphaEntry = struct {
         width: u32,
         height: u32,
-        alpha: []u8,
+        alpha: []align(4) u8,
+        stride: u32,
         used: u64,
     };
 
@@ -176,33 +185,51 @@ pub const RasterCache = struct {
         return pixels;
     }
 
-    pub fn cachedAlphaImage(self: *RasterCache, cache_key: u64, width: u32, height: u32) ?[]const u8 {
+    pub fn cachedAlphaImage(self: *RasterCache, cache_key: u64, width: u32, height: u32) ?AlphaMask {
         std.debug.assert(self.in_frame);
         const entry = self.alpha.getPtr(cache_key) orelse return null;
         if (entry.width != width or entry.height != height) return null;
         entry.used = self.touch();
-        return entry.alpha;
+        return .{ .pixels = entry.alpha, .stride = entry.stride };
     }
 
-    pub fn insertAlpha(self: *RasterCache, allocator: std.mem.Allocator, cache_key: u64, width: u32, height: u32, alpha: []u8) ![]const u8 {
+    pub fn insertAlpha(self: *RasterCache, allocator: std.mem.Allocator, cache_key: u64, width: u32, height: u32, alpha: []u8) !AlphaMask {
         std.debug.assert(self.in_frame);
-        var owned = true;
-        errdefer if (owned) allocator.free(alpha);
+        var input_owned = true;
+        defer if (input_owned) allocator.free(alpha);
+
+        const tight_len = try std.math.mul(usize, width, height);
+        if (alpha.len != tight_len) return error.InvalidImage;
+        const stride = std.mem.alignForward(usize, width, 4);
+        const storage_len = try std.math.mul(usize, stride, height);
+        const storage = try allocator.alignedAlloc(u8, .@"4", storage_len);
+        errdefer allocator.free(storage);
+        @memset(storage, 0);
+        for (0..height) |row| {
+            @memcpy(storage[row * stride ..][0..width], alpha[row * width ..][0..width]);
+        }
+        allocator.free(alpha);
+        input_owned = false;
+
         const result = try self.alpha.getOrPut(allocator, cache_key);
         if (result.found_existing and result.value_ptr.width == width and result.value_ptr.height == height) {
-            if (alpha.ptr != result.value_ptr.alpha.ptr) allocator.free(alpha);
-            owned = false;
+            allocator.free(storage);
             result.value_ptr.used = self.touch();
-            return result.value_ptr.alpha;
+            return .{ .pixels = result.value_ptr.alpha, .stride = result.value_ptr.stride };
         }
         if (result.found_existing) {
             self.byte_usage -= result.value_ptr.alpha.len;
             allocator.free(result.value_ptr.alpha);
         }
-        result.value_ptr.* = .{ .width = width, .height = height, .alpha = alpha, .used = self.touch() };
-        owned = false;
-        self.byte_usage += alpha.len;
-        return alpha;
+        result.value_ptr.* = .{
+            .width = width,
+            .height = height,
+            .alpha = storage,
+            .stride = @intCast(stride),
+            .used = self.touch(),
+        };
+        self.byte_usage += storage.len;
+        return .{ .pixels = storage, .stride = @intCast(stride) };
     }
 
     fn trim(self: *RasterCache, allocator: std.mem.Allocator) void {
@@ -284,7 +311,7 @@ pub const DisplayList = struct {
         rect: Rect,
         width: u32,
         height: u32,
-        alpha: []const u8,
+        alpha: AlphaMask,
         color: Color,
         cache_key: u64,
     ) !void {
@@ -297,7 +324,7 @@ pub const DisplayList = struct {
         rect: Rect,
         width: u32,
         height: u32,
-        alpha: []const u8,
+        alpha: AlphaMask,
         color: Color,
         cache_key: u64,
     ) !void {
@@ -310,7 +337,7 @@ pub const DisplayList = struct {
         rect: Rect,
         width: u32,
         height: u32,
-        alpha: []const u8,
+        alpha: AlphaMask,
         color: Color,
         cache_key: u64,
         dither: bool,
@@ -319,7 +346,8 @@ pub const DisplayList = struct {
             .rect = rect,
             .width = width,
             .height = height,
-            .alpha = alpha,
+            .alpha = alpha.pixels,
+            .stride = alpha.stride,
             .color = color,
             .cache_key = cache_key,
             .dither = dither,
@@ -333,7 +361,7 @@ pub const DisplayList = struct {
 
 test "raster cache evicts least recently used entry to byte limit" {
     const allocator = std.testing.allocator;
-    var cache = RasterCache.init(8);
+    var cache = RasterCache.init(32);
     defer cache.deinit(allocator);
 
     {
@@ -365,7 +393,11 @@ test "raster cache retains current frame working set until end frame" {
 
     cache.beginFrame();
     const pixels = try cache.insertAlpha(allocator, 1, 1, 4, try allocator.dupe(u8, &.{ 4, 3, 2, 1 }));
-    try std.testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1 }, pixels);
+    try std.testing.expectEqual(@as(u32, 4), pixels.stride);
+    try std.testing.expectEqual(@as(u8, 4), pixels.pixels[0]);
+    try std.testing.expectEqual(@as(u8, 3), pixels.pixels[4]);
+    try std.testing.expectEqual(@as(u8, 2), pixels.pixels[8]);
+    try std.testing.expectEqual(@as(u8, 1), pixels.pixels[12]);
     try std.testing.expect(cache.byte_usage > cache.byte_limit);
     cache.endFrame(allocator);
 
@@ -373,6 +405,18 @@ test "raster cache retains current frame working set until end frame" {
     defer cache.endFrame(allocator);
     try std.testing.expect(cache.cachedAlphaImage(1, 1, 4) == null);
     try std.testing.expect(cache.byte_usage <= cache.byte_limit);
+}
+
+test "raster cache pads alpha rows for CPU compositors" {
+    const allocator = std.testing.allocator;
+    var cache: RasterCache = .{};
+    defer cache.deinit(allocator);
+
+    cache.beginFrame();
+    defer cache.endFrame(allocator);
+    const mask = try cache.insertAlpha(allocator, 1, 2, 2, try allocator.dupe(u8, &.{ 1, 2, 3, 4 }));
+    try std.testing.expectEqual(@as(u32, 4), mask.stride);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 0, 0, 3, 4, 0, 0 }, mask.pixels);
 }
 
 test "frame color pixels are released after present without entering cache" {

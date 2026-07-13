@@ -3,6 +3,7 @@
 const std = @import("std");
 const keywork = @import("../ui.zig");
 const TextRenderer = @import("text.zig");
+const c = @import("pixman_c");
 
 pub fn rasterize(
     renderer: *TextRenderer,
@@ -13,6 +14,18 @@ pub fn rasterize(
     commands: []const keywork.PaintCommand,
     base_clip: ?TextRenderer.PixelClip,
 ) !void {
+    const pixel_count = try std.math.mul(usize, width, height);
+    if (pixels.len < pixel_count) return error.InvalidImage;
+    const stride = try std.math.mul(i32, @as(i32, @intCast(width)), @sizeOf(u32));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        @intCast(width),
+        @intCast(height),
+        @ptrCast(pixels.ptr),
+        stride,
+    ) orelse return error.OutOfMemory;
+    defer _ = c.pixman_image_unref(target);
+
     const background = if (commands.len > 0) fullFrameFill(commands[0], width, height, scale) else null;
     const clear_color = background orelse keywork.colors.transparent;
     if (base_clip) |clip| {
@@ -24,9 +37,9 @@ pub fn rasterize(
     const first_command: usize = if (background != null) 1 else 0;
     for (commands[first_command..]) |command| {
         switch (command) {
-            .fill_rect => |fill| fillRect(pixels, width, height, scale, fill.rect, fill.color, clip),
+            .fill_rect => |fill| try fillRect(target, pixels, width, height, scale, fill.rect, fill.color, clip),
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
-            .alpha_image => |image| alphaImage(pixels, width, height, scale, image, clip),
+            .alpha_image => |image| try alphaImage(target, pixels, width, height, scale, image, clip),
             .color_image => |image| colorImage(pixels, width, height, scale, image, clip),
             .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
@@ -74,7 +87,7 @@ fn clearRegion(pixels: []u32, width: u31, height: u31, clip: TextRenderer.PixelC
     }
 }
 
-fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Rect, color: keywork.Color, clip: ?TextRenderer.PixelClip) void {
+fn fillRect(target: *c.pixman_image_t, pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Rect, color: keywork.Color, clip: ?TextRenderer.PixelClip) !void {
     var x0 = clampPixel(@floor(rect.x * scale), width);
     var y0 = clampPixel(@floor(rect.y * scale), height);
     var x1 = clampPixel(@ceil((rect.x + rect.width) * scale), width);
@@ -89,11 +102,14 @@ fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Re
 
     if (color.a == 0) return;
     if (color.a < 255) {
-        var y = y0;
-        while (y < y1) : (y += 1) {
-            var x = x0;
-            while (x < x1) : (x += 1) blendPixel(pixels, width, x, y, color, 255);
-        }
+        const pixman_color = premultipliedColor(color);
+        const box: c.pixman_box32_t = .{
+            .x1 = @intCast(x0),
+            .y1 = @intCast(y0),
+            .x2 = @intCast(x1),
+            .y2 = @intCast(y1),
+        };
+        if (c.pixman_image_fill_boxes(@intCast(c.PIXMAN_OP_OVER), target, &pixman_color, 1, &box) == 0) return error.CompositeFailed;
         return;
     }
 
@@ -108,16 +124,21 @@ fn fillRect(pixels: []u32, width: u31, height: u31, scale: f32, rect: keywork.Re
 }
 
 fn alphaImage(
+    target: *c.pixman_image_t,
     pixels: []u32,
     width: u31,
     height: u31,
     scale: f32,
     image: keywork.PaintCommand.AlphaImage,
     clip: ?TextRenderer.PixelClip,
-) void {
+) !void {
     if (image.width == 0 or image.height == 0) return;
     const image_width: usize = @intCast(image.width);
     const image_height: usize = @intCast(image.height);
+    const image_stride: usize = @intCast(image.stride);
+    if (image_stride < image_width or image_stride % 4 != 0) return error.InvalidImage;
+    const image_size = try std.math.mul(usize, image_stride, image_height);
+    if (image.alpha.len < image_size) return error.InvalidImage;
     const dst_x0 = clampPixel(@floor(image.rect.x * scale), width);
     const dst_y0 = clampPixel(@floor(image.rect.y * scale), height);
     var start_x = dst_x0;
@@ -132,21 +153,46 @@ fn alphaImage(
     }
     if (start_x >= dst_x1 or start_y >= dst_y1) return;
 
-    var y = start_y;
-    while (y < dst_y1) : (y += 1) {
-        const row = y - dst_y0;
-        var x = start_x;
-        while (x < dst_x1) : (x += 1) {
-            const column = x - dst_x0;
-            const coverage = image.alpha[row * image_width + column];
-            if (coverage == 0) continue;
-            if (image.dither) {
+    if (image.dither) {
+        var y = start_y;
+        while (y < dst_y1) : (y += 1) {
+            const row = y - dst_y0;
+            var x = start_x;
+            while (x < dst_x1) : (x += 1) {
+                const column = x - dst_x0;
+                const coverage = image.alpha[row * image_stride + column];
+                if (coverage == 0) continue;
                 blendAlphaImagePixel(pixels, width, x, y, image.color, coverage);
-            } else {
-                blendPixel(pixels, width, x, y, image.color, coverage);
             }
         }
+        return;
     }
+
+    const mask = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8),
+        @intCast(image.width),
+        @intCast(image.height),
+        @ptrCast(@constCast(image.alpha.ptr)),
+        @intCast(image.stride),
+    ) orelse return error.OutOfMemory;
+    defer _ = c.pixman_image_unref(mask);
+    const pixman_color = premultipliedColor(image.color);
+    const source = c.pixman_image_create_solid_fill(&pixman_color) orelse return error.OutOfMemory;
+    defer _ = c.pixman_image_unref(source);
+    c.pixman_image_composite32(
+        @intCast(c.PIXMAN_OP_OVER),
+        source,
+        mask,
+        target,
+        0,
+        0,
+        @intCast(start_x - dst_x0),
+        @intCast(start_y - dst_y0),
+        @intCast(start_x),
+        @intCast(start_y),
+        @intCast(dst_x1 - start_x),
+        @intCast(dst_y1 - start_y),
+    );
 }
 
 fn colorImage(
@@ -198,6 +244,22 @@ fn blendPixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Colo
     pixels[index] = @bitCast(color.blendOver(dst, coverage));
 }
 
+/// Pixman colors use premultiplied 16-bit channels. Expanding an 8-bit
+/// premultiplied value preserves the exact ARGB8888 result pixman writes.
+fn premultipliedColor(color: keywork.Color) c.pixman_color_t {
+    const alpha: u32 = color.a;
+    return .{
+        .red = expand8(@intCast((@as(u32, color.r) * alpha + 127) / 255)),
+        .green = expand8(@intCast((@as(u32, color.g) * alpha + 127) / 255)),
+        .blue = expand8(@intCast((@as(u32, color.b) * alpha + 127) / 255)),
+        .alpha = expand8(color.a),
+    };
+}
+
+fn expand8(value: u8) u16 {
+    return @as(u16, value) * 257;
+}
+
 fn blendAlphaImagePixel(pixels: []u32, width: u31, x: usize, y: usize, color: keywork.Color, coverage: u8) void {
     const bayer8 = [64]u8{
         0,  48, 12, 60, 3,  51, 15, 63,
@@ -228,7 +290,16 @@ test "translucent rectangle blends without lowering destination alpha" {
     const height: u31 = 2;
     var pixels: [width * height]u32 = @splat(@bitCast(keywork.colors.black));
 
-    fillRect(
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        width,
+        height,
+        @ptrCast(&pixels),
+        width * @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    try fillRect(
+        target,
         &pixels,
         width,
         height,
@@ -240,6 +311,121 @@ test "translucent rectangle blends without lowering destination alpha" {
 
     const expected: u32 = @bitCast(keywork.Color.argb(255, 128, 128, 128));
     try std.testing.expectEqualSlices(u32, &@as([width * height]u32, @splat(expected)), &pixels);
+}
+
+test "pixman composites padded alpha mask rows" {
+    const width: u31 = 3;
+    const height: u31 = 2;
+    var pixels: [width * height]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        width,
+        height,
+        @ptrCast(&pixels),
+        width * @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    var alpha: [8]u8 align(4) = .{ 255, 0, 255, 99, 0, 255, 0, 99 };
+
+    try alphaImage(target, &pixels, width, height, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .width = width,
+        .height = height,
+        .alpha = &alpha,
+        .stride = 4,
+        .color = keywork.colors.white,
+        .cache_key = 0,
+    }, null);
+
+    const black: u32 = @bitCast(keywork.colors.black);
+    const white: u32 = @bitCast(keywork.colors.white);
+    try std.testing.expectEqualSlices(u32, &.{ white, black, white, black, white, black }, &pixels);
+}
+
+test "dithered alpha masks ignore row padding" {
+    const width: u31 = 3;
+    const height: u31 = 2;
+    var pixels: [width * height]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        width,
+        height,
+        @ptrCast(&pixels),
+        width * @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    var alpha: [8]u8 align(4) = .{ 0, 0, 0, 255, 0, 0, 0, 255 };
+
+    try alphaImage(target, &pixels, width, height, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .width = width,
+        .height = height,
+        .alpha = &alpha,
+        .stride = 4,
+        .color = keywork.colors.white,
+        .cache_key = 0,
+        .dither = true,
+    }, null);
+
+    const black: u32 = @bitCast(keywork.colors.black);
+    try std.testing.expectEqualSlices(u32, &@as([width * height]u32, @splat(black)), &pixels);
+}
+
+test "pixman alpha mask clipping preserves source offset" {
+    const width: u31 = 3;
+    const height: u31 = 1;
+    var pixels: [width * height]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        width,
+        height,
+        @ptrCast(&pixels),
+        width * @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    var alpha: [4]u8 align(4) = .{ 0, 255, 0, 99 };
+
+    try alphaImage(target, &pixels, width, height, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .width = width,
+        .height = height,
+        .alpha = &alpha,
+        .stride = 4,
+        .color = keywork.colors.white,
+        .cache_key = 0,
+    }, .{ .x0 = 1, .y0 = 0, .x1 = 2, .y1 = 1 });
+
+    const black: u32 = @bitCast(keywork.colors.black);
+    const white: u32 = @bitCast(keywork.colors.white);
+    try std.testing.expectEqualSlices(u32, &.{ black, white, black }, &pixels);
+}
+
+test "pixman fill composites over translucent destination" {
+    const width: u31 = 1;
+    const height: u31 = 1;
+    const destination = keywork.Color.argb(128, 64, 0, 0);
+    var pixels = [1]u32{@bitCast(destination)};
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        width,
+        height,
+        @ptrCast(&pixels),
+        @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+
+    try fillRect(
+        target,
+        &pixels,
+        width,
+        height,
+        1,
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        keywork.Color.argb(128, 0, 0, 255),
+        null,
+    );
+
+    try std.testing.expectEqual(@as(u32, @bitCast(keywork.Color.argb(192, 32, 0, 128))), pixels[0]);
 }
 
 test "opaque leading full-frame fill can replace clear" {

@@ -3304,7 +3304,10 @@ test "raster cache reuses alpha image data across display lists" {
         defer raster_cache.endFrame(allocator);
         const alpha = raster_cache.cachedAlphaImage(42, 2, 2).?;
         try second_list.alphaImage(allocator, .{ .x = 2, .y = 2, .width = 2, .height = 2 }, 2, 2, alpha, colors.black, 42);
-        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, second_list.commands.items[0].alpha_image.alpha);
+        const image = second_list.commands.items[0].alpha_image;
+        try std.testing.expectEqual(@as(u32, 4), image.stride);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, image.alpha[0..2]);
+        try std.testing.expectEqualSlices(u8, &.{ 3, 4 }, image.alpha[image.stride..][0..2]);
         try std.testing.expectEqual(bytes_after_first, raster_cache.byte_usage);
         try std.testing.expectEqual(@as(u32, 1), raster_cache.alpha.count());
     }

@@ -107,6 +107,14 @@ pub fn build(b: *std.Build) void {
     text_c.linkSystemLibrary("harfbuzz", .{ .use_pkg_config = .force });
     const text_c_module = text_c.createModule();
 
+    const pixman_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ffi/pixman_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pixman_c.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
+    const pixman_c_module = pixman_c.createModule();
+
     const lua = luajit.add(b, target, optimize);
 
     const app_module = b.createModule(.{
@@ -129,6 +137,7 @@ pub fn build(b: *std.Build) void {
     app_module.addCSourceFile(.{ .file = b.path("src/ffi/pipewire_c.c") });
     app_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
     app_module.addImport("text_c", text_c_module);
+    app_module.addImport("pixman_c", pixman_c_module);
     linkKeyworkSystemLibraries(app_module);
 
     const luajit_c = b.addTranslateC(.{
@@ -206,6 +215,7 @@ fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("fontconfig", .{});
     module.linkSystemLibrary("freetype", .{});
     module.linkSystemLibrary("harfbuzz", .{});
+    module.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
 }
 
 fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) void {

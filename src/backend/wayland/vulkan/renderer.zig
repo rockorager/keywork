@@ -1140,14 +1140,16 @@ pub const Renderer = struct {
 
         const coverage_size: vk.DeviceSize = if (glyph.channels == 4)
             @intCast(glyph.coverage.len)
-        else
-            @intCast(glyph.coverage.len * 4);
+        else blk: {
+            const pixel_count = try std.math.mul(usize, glyph.width, glyph.rows);
+            break :blk @intCast(try std.math.mul(usize, pixel_count, 4));
+        };
         if (self.staging_used + coverage_size > self.staging_buffer.size) return error.GlyphUploadTooLarge;
         if (glyph.channels == 4) {
             // Color glyphs are already premultiplied BGRA.
             try self.writeBuffer(self.staging_buffer, self.staging_used, glyph.coverage);
         } else {
-            try self.stageMaskTexels(glyph.coverage);
+            try self.stageMaskTexels(glyph.coverage, glyph.width, glyph.rows, glyph.width);
         }
 
         self.copyStagingToAtlas(slot, coverage_size);
@@ -1156,14 +1158,22 @@ pub const Renderer = struct {
 
     /// Writes an alpha coverage mask into staging as premultiplied-white
     /// BGRA texels, so a single atlas format serves masks and color images.
-    fn stageMaskTexels(self: *Self, coverage: []const u8) !void {
-        const texels = try self.allocator.alloc(u8, coverage.len * 4);
+    fn stageMaskTexels(self: *Self, coverage: []const u8, width: u32, height: u32, stride: u32) !void {
+        if (stride < width) return error.InvalidImage;
+        const source_size = try std.math.mul(usize, stride, height);
+        if (coverage.len < source_size) return error.InvalidImage;
+        const pixel_count = try std.math.mul(usize, width, height);
+        const texels = try self.allocator.alloc(u8, try std.math.mul(usize, pixel_count, 4));
         defer self.allocator.free(texels);
-        for (coverage, 0..) |value, index| {
-            texels[index * 4 + 0] = value;
-            texels[index * 4 + 1] = value;
-            texels[index * 4 + 2] = value;
-            texels[index * 4 + 3] = value;
+        for (0..height) |y| {
+            for (0..width) |x| {
+                const value = coverage[y * stride + x];
+                const index = y * width + x;
+                texels[index * 4 + 0] = value;
+                texels[index * 4 + 1] = value;
+                texels[index * 4 + 2] = value;
+                texels[index * 4 + 3] = value;
+            }
         }
         try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
     }
@@ -1201,7 +1211,9 @@ pub const Renderer = struct {
 
     fn ensureAtlasImage(self: *Self, image: keywork.PaintCommand.AlphaImage) !AtlasSlot {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
-        if (image.alpha.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
+        if (image.stride < image.width) return error.InvalidImage;
+        const source_size = try std.math.mul(usize, image.stride, image.height);
+        if (image.alpha.len < source_size) return error.InvalidImage;
 
         const key: AtlasKey = .{ .alpha_image = image.cache_key };
         if (self.atlas_slots.get(key)) |slot| return slot;
@@ -1212,9 +1224,10 @@ pub const Renderer = struct {
 
         self.prepareAtlasUpload();
 
-        const image_size: vk.DeviceSize = @intCast(image.alpha.len * 4);
+        const pixel_count = try std.math.mul(usize, image.width, image.height);
+        const image_size: vk.DeviceSize = @intCast(try std.math.mul(usize, pixel_count, 4));
         if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
-        try self.stageMaskTexels(image.alpha);
+        try self.stageMaskTexels(image.alpha, image.width, image.height, image.stride);
 
         self.copyStagingToAtlas(slot, image_size);
         return slot;
@@ -1232,7 +1245,7 @@ pub const Renderer = struct {
 
         const coverage = [_]u8{0xff} ** (solid_block_size * solid_block_size);
         if (self.staging_used + coverage.len * 4 > self.staging_buffer.size) return error.ImageUploadTooLarge;
-        try self.stageMaskTexels(&coverage);
+        try self.stageMaskTexels(&coverage, solid_block_size, solid_block_size, solid_block_size);
 
         self.copyStagingToAtlas(slot, coverage.len * 4);
         return slot;
