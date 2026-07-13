@@ -570,15 +570,14 @@ test "backend capability gates damage-only display lists" {
         const right_color = keywork.Color.argb(255, 4, 5, 6);
 
         fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const empty = keywork.widgets.spacer(0);
             const left: keywork.Widget = .{ .box = .{
-                .child = &empty,
+                .child = try keywork.Widget.alloc(scope.allocator, keywork.widgets.spacer(0)),
                 .background = left_color,
                 .min_width = 20,
                 .min_height = 20,
             } };
             const right: keywork.Widget = .{ .box = .{
-                .child = &empty,
+                .child = try keywork.Widget.alloc(scope.allocator, keywork.widgets.spacer(0)),
                 .background = right_color,
                 .min_width = 20,
                 .min_height = 20,
