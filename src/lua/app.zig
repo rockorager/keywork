@@ -3584,6 +3584,8 @@ test "lua default theme exposes opaque Radix component tokens" {
         \\  assert(resolved.colors.fill == resolved.colors.slate4)
         \\  assert(resolved.components.chip.background == resolved.colors.blue3)
         \\  assert(resolved.components.menu.item.selected_background == resolved.colors.blue4)
+        \\  assert(resolved.components.menu.border == resolved.colors.panel_border)
+        \\  assert(resolved.components.menu.border_width == 1)
         \\  assert(resolved.components.separator.color == resolved.colors.slate6)
         \\  assert(resolved.components.scrollbar.track == resolved.colors.slate3)
         \\  assert(resolved.components.scrollbar.thumb == resolved.colors.slate8)

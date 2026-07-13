@@ -90,6 +90,7 @@ local default_theme = {
         quaternary_system_fill = "slate1",
         separator = "slate6",
         opaque_separator = "slate6",
+        panel_border = "slate3",
 
         background = "system_background",
         surface = "secondary_system_background",
@@ -213,6 +214,7 @@ local default_theme = {
         quaternary_system_fill = "slate1",
         separator = "slate6",
         opaque_separator = "slate6",
+        panel_border = "slate6",
 
         background = "system_background",
         surface = "secondary_system_background",
@@ -341,6 +343,8 @@ local default_theme = {
     menu = {
       -- Radix size-2 menu content and the soft highlighted-item variant.
       background = "surface_high",
+      border = "panel_border",
+      border_width = 1,
       radius = radius_scale[4],
       padding = space_scale[2],
       item = {
