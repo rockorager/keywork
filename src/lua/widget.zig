@@ -124,7 +124,6 @@ const PopupOptions = struct {
     gap: f32 = 0,
     width: ?f32 = null,
     height: ?f32 = null,
-    shadow: ?keywork.BoxShadow = null,
 };
 
 const FocusScopeOptions = struct {
@@ -873,7 +872,6 @@ pub fn parse(
             .popup = .{
                 .builder = builder.popupBuilder(),
                 .placement = .{ .edge = options.edge, .alignment = options.alignment, .gap = options.gap },
-                .shadow = options.shadow,
                 .width = options.width,
                 .height = options.height,
                 .on_close = on_close,

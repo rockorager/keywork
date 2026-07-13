@@ -424,11 +424,11 @@ local default_theme = {
 
     menu = {
       -- Radix size-2 menu content and the soft highlighted-item variant.
-      -- Shadow-5 supplies the subtle one-pixel surface boundary.
       background = "surface_high",
+      border = "panel_border",
+      border_width = 1,
       radius = radius_scale[4],
       padding = space_scale[2],
-      shadow = 5,
       item = {
         padding_x = space_scale[3],
         padding_y = control_padding_y,
@@ -990,7 +990,6 @@ function ui.popup(options)
     gap = options.gap,
     width = options.width,
     height = options.height,
-    shadow = options.shadow,
     on_close = options.on_close,
   }
 end

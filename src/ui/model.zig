@@ -180,8 +180,6 @@ pub const Widget = union(enum) {
     pub const Popup = struct {
         builder: PopupBuilder,
         placement: PopupPlacement = .{},
-        /// Surface gutter reserved for a shadow painted by popup content.
-        shadow: ?BoxShadow = null,
         /// Explicit size overrides; content is measured when null.
         width: ?f32 = null,
         height: ?f32 = null,
@@ -196,7 +194,6 @@ pub const Widget = union(enum) {
             return .{
                 .builder = builder,
                 .placement = self.placement,
-                .shadow = self.shadow,
                 .width = self.width,
                 .height = self.height,
                 .on_close = on_close,
@@ -4637,15 +4634,12 @@ test "anchored elements declare popups with laid-out anchor rects" {
         }
     };
     const label: Widget = .{ .text = .{ .value = "Clock" } };
-    var popup_shadow: BoxShadow = .{};
-    try popup_shadow.append(.{ .color = colors.black, .blur = 3 });
     const anchored: Widget = .{ .anchored = .{
         .id = "clock",
         .child = &label,
         .popup = .{
             .builder = .{ .ptr = undefined, .build_fn = popup_builder.build },
             .placement = .{ .edge = .top, .alignment = .center, .gap = 4 },
-            .shadow = popup_shadow,
         },
     } };
     const padded: Widget = .{ .padding = .{ .insets = .{ .left = 10, .top = 5 }, .child = &anchored } };
@@ -4669,7 +4663,6 @@ test "anchored elements declare popups with laid-out anchor rects" {
     try std.testing.expectEqual(Widget.PopupPlacement.Edge.top, request.popup.placement.edge);
     try std.testing.expectEqual(Widget.Alignment.center, request.popup.placement.alignment);
     try std.testing.expectEqual(@as(f32, 4), request.popup.placement.gap);
-    try std.testing.expectEqual(popup_shadow, request.popup.shadow.?);
 }
 
 test "anchored without popup declares nothing and stays hit-testable" {
