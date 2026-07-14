@@ -19,25 +19,25 @@ local Service = {}
 Service.__index = Service
 
 local function reset(svc)
-  svc.scope = nil
-  svc.task = nil
-  svc.state = nil
-  svc.subscribers = {}
-  svc.count = 0
+    svc.scope = nil
+    svc.task = nil
+    svc.state = nil
+    svc.subscribers = {}
+    svc.count = 0
 end
 
 local function dead(svc)
-  return svc.scope == nil or svc.scope:canceled()
+    return svc.scope == nil or svc.scope:canceled()
 end
 
 --- Stores the current snapshot and notifies every subscriber. Called by
 --- the service body; also callable from outside for testing or manual
 --- refresh.
 function Service:publish(value)
-  self.state = value
-  for _, on_change in pairs(self.subscribers) do
-    on_change(value)
-  end
+    self.state = value
+    for _, on_change in pairs(self.subscribers) do
+        on_change(value)
+    end
 end
 
 --- Subscribes `on_change` for the lifetime of `scope` and returns the
@@ -46,37 +46,37 @@ end
 --- subscription, and the last release stops the service. A service whose
 --- body settled (finished or failed) is restarted by the next use.
 function Service:use(scope, on_change)
-  if dead(self) then
-    reset(self)
-    self.scope = loop.scope()
-    self.task = self.scope:spawn(self.start, self)
-  elseif self.task and self.task:status() ~= "running" then
-    -- A settled body may have left spawned children in its scope;
-    -- respawning next to them would duplicate the service's work, so a
-    -- restart is a full teardown: cancel the old scope and start fresh.
-    self.scope:cancel()
-    self.scope = loop.scope()
-    self.task = self.scope:spawn(self.start, self)
-  end
-
-  local key = {}
-  self.subscribers[key] = on_change
-  self.count = self.count + 1
-
-  local released = false
-  scope:on_cancel(function()
-    if released then
-      return
+    if dead(self) then
+        reset(self)
+        self.scope = loop.scope()
+        self.task = self.scope:spawn(self.start, self)
+    elseif self.task and self.task:status() ~= "running" then
+        -- A settled body may have left spawned children in its scope;
+        -- respawning next to them would duplicate the service's work, so a
+        -- restart is a full teardown: cancel the old scope and start fresh.
+        self.scope:cancel()
+        self.scope = loop.scope()
+        self.task = self.scope:spawn(self.start, self)
     end
-    released = true
-    self.subscribers[key] = nil
-    self.count = self.count - 1
-    if self.count == 0 and self.scope then
-      self.scope:cancel()
-    end
-  end)
 
-  return self.state
+    local key = {}
+    self.subscribers[key] = on_change
+    self.count = self.count + 1
+
+    local released = false
+    scope:on_cancel(function()
+        if released then
+            return
+        end
+        released = true
+        self.subscribers[key] = nil
+        self.count = self.count - 1
+        if self.count == 0 and self.scope then
+            self.scope:cancel()
+        end
+    end)
+
+    return self.state
 end
 
 local service = {}
@@ -85,17 +85,17 @@ local service = {}
 --- updates the start function but keeps the entry, so module reloads
 --- don't orphan running services.
 function service.define(name, start)
-  assert(type(name) == "string", "service name must be a string")
-  assert(type(start) == "function", "service start must be a function")
-  local existing = registry[name]
-  if existing then
-    existing.start = start
-    return existing
-  end
-  local svc = setmetatable({ name = name, start = start }, Service)
-  reset(svc)
-  registry[name] = svc
-  return svc
+    assert(type(name) == "string", "service name must be a string")
+    assert(type(start) == "function", "service start must be a function")
+    local existing = registry[name]
+    if existing then
+        existing.start = start
+        return existing
+    end
+    local svc = setmetatable({ name = name, start = start }, Service)
+    reset(svc)
+    registry[name] = svc
+    return svc
 end
 
 return service

@@ -161,6 +161,12 @@ pub fn build(b: *std.Build) void {
     exe.rdynamic = true;
 
     b.installArtifact(exe);
+    b.installDirectory(.{
+        .source_dir = b.path("types"),
+        .install_dir = .prefix,
+        .install_subdir = "share/keywork/emmylua",
+        .include_extensions = &.{".lua"},
+    });
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {

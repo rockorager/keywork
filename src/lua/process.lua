@@ -11,30 +11,30 @@ local process = ...
 --- runtime buffers pipe output, so reading the two pipes sequentially
 --- cannot deadlock.
 function process.capture(spec)
-  if spec.argv == nil then
-    spec = { argv = spec }
-  end
-  local proc, err = process.spawn({
-    argv = spec.argv,
-    stdout = "pipe",
-    stderr = "pipe",
-  })
-  if not proc then
-    return nil, err
-  end
-  local stdout = {}
-  for chunk in proc:stdout() do
-    table.insert(stdout, chunk)
-  end
-  local stderr = {}
-  for chunk in proc:stderr() do
-    table.insert(stderr, chunk)
-  end
-  local result = proc:wait()
-  if not result then
-    return nil, "canceled"
-  end
-  result.stdout = table.concat(stdout)
-  result.stderr = table.concat(stderr)
-  return result
+    if spec.argv == nil then
+        spec = { argv = spec }
+    end
+    local proc, err = process.spawn({
+        argv = spec.argv,
+        stdout = "pipe",
+        stderr = "pipe",
+    })
+    if not proc then
+        return nil, err
+    end
+    local stdout = {}
+    for chunk in proc:stdout() do
+        table.insert(stdout, chunk)
+    end
+    local stderr = {}
+    for chunk in proc:stderr() do
+        table.insert(stderr, chunk)
+    end
+    local result = proc:wait()
+    if not result then
+        return nil, "canceled"
+    end
+    result.stdout = table.concat(stdout)
+    result.stderr = table.concat(stderr)
+    return result
 end

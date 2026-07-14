@@ -1,0 +1,16 @@
+[tool_alias]
+emmylua_ls = "github:EmmyLuaLs/emmylua-analyzer-rust"
+emmylua_check = "github:EmmyLuaLs/emmylua-analyzer-rust"
+luafmt = "github:EmmyLuaLs/emmylua-analyzer-rust"
+
+[tools.emmylua_ls]
+version = "0.24.0"
+matching_regex = "^emmylua_ls-"
+
+[tools.emmylua_check]
+version = "0.24.0"
+matching_regex = "^emmylua_check-"
+
+[tools.luafmt]
+version = "0.24.0"
+matching_regex = "^luafmt-"
