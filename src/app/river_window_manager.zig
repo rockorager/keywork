@@ -129,7 +129,6 @@ const Runtime = struct {
         errdefer host.unbindInvalidator();
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         if (self.manager == null) return error.NoRiverWindowManager;
-        if (self.xkb_bindings == null) return error.NoRiverXkbBindings;
         if (self.fatal) return error.RiverInitializationFailed;
     }
 
@@ -330,10 +329,11 @@ const Runtime = struct {
         errdefer self.allocator.destroy(seat);
         seat.* = .{ .runtime = self, .id = try self.allocateId(), .object = object };
         object.setListener(*Seat, seatListener, seat);
-        const xkb_bindings = self.xkb_bindings orelse return error.NoRiverXkbBindings;
-        if (xkb_bindings.getVersion() >= river.XkbBindingsV1.get_seat_since_version) {
-            seat.xkb_seat = try xkb_bindings.getSeat(object);
-            seat.xkb_seat.?.setListener(*Seat, xkbSeatListener, seat);
+        if (self.xkb_bindings) |xkb_bindings| {
+            if (xkb_bindings.getVersion() >= river.XkbBindingsV1.get_seat_since_version) {
+                seat.xkb_seat = try xkb_bindings.getSeat(object);
+                seat.xkb_seat.?.setListener(*Seat, xkbSeatListener, seat);
+            }
         }
         try self.attachLayerShellSeat(seat);
         try self.seats.append(self.allocator, seat);
@@ -500,7 +500,7 @@ const Runtime = struct {
             .events = if (include_events) self.events.items else &.{},
             .session_locked = self.session_locked,
             .window_management_version = self.manager.?.getVersion(),
-            .xkb_bindings_version = self.xkb_bindings.?.getVersion(),
+            .xkb_bindings_version = if (self.xkb_bindings) |bindings| bindings.getVersion() else 0,
             .layer_shell_version = if (self.layer_shell) |layer_shell| layer_shell.getVersion() else 0,
         };
     }
@@ -765,6 +765,7 @@ const Runtime = struct {
 
     fn reconcileBindings(self: *Runtime) !void {
         try self.host.refresh();
+        if (self.xkb_bindings == null) return;
         const declarations = try self.host.bindings(self.allocator);
         defer policy.freeBindings(self.allocator, declarations);
         const pointer_declarations = try self.host.pointerBindings(self.allocator);
