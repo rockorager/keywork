@@ -1,4 +1,4 @@
-//! Headless client for River's external window-management protocol.
+//! Policy-neutral client for River's external window-management protocol.
 
 const std = @import("std");
 const wayland = @import("wayland");
@@ -20,18 +20,26 @@ const Phase = enum {
 
 const Window = struct {
     runtime: *Runtime,
+    id: u32,
     object: *river.WindowV1,
     node: *river.NodeV1,
     title: ?[]u8 = null,
     app_id: ?[]u8 = null,
     identifier: ?[]u8 = null,
-    placement: ?policy.Placement = null,
-    is_new: bool = true,
+    parent: ?u32 = null,
+    dimensions: ?policy.Dimensions = null,
+    dimensions_hint: ?policy.DimensionsHint = null,
+    decoration_hint: ?policy.DecorationHint = null,
+    unreliable_pid: ?i32 = null,
+    presentation_hint: ?policy.PresentationMode = null,
     closed: bool = false,
 };
 
 const Output = struct {
+    runtime: *Runtime,
+    id: u32,
     object: *river.OutputV1,
+    wl_output: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
     width: i32 = 0,
@@ -39,19 +47,41 @@ const Output = struct {
     removed: bool = false,
 };
 
+const Seat = struct {
+    runtime: *Runtime,
+    id: u32,
+    object: *river.SeatV1,
+    xkb_seat: ?*river.XkbBindingsSeatV1 = null,
+    wl_seat: ?u32 = null,
+    pointer_position: ?policy.Point = null,
+    modifiers: ?u32 = null,
+    bindings: std.ArrayList(*Binding) = .empty,
+    pointer_bindings: std.ArrayList(*PointerBinding) = .empty,
+    removed: bool = false,
+};
+
 const Binding = struct {
+    runtime: *Runtime,
+    seat: *Seat,
     object: *river.XkbBindingV1,
     id: []u8,
     keysym: u32,
     modifiers: u32,
-    pressed: bool = false,
+    layout: ?u32,
 };
 
-const Seat = struct {
-    object: *river.SeatV1,
-    bindings: std.ArrayList(*Binding) = .empty,
-    interacted_window: ?*river.WindowV1 = null,
-    removed: bool = false,
+const PointerBinding = struct {
+    runtime: *Runtime,
+    seat: *Seat,
+    object: *river.PointerBindingV1,
+    id: []u8,
+    button: u32,
+    modifiers: u32,
+};
+
+const InputInvocation = union(enum) {
+    xkb: struct { binding: *Binding, event: policy.BindingEvent },
+    pointer: struct { binding: *PointerBinding, event: policy.BindingEvent },
 };
 
 const Runtime = struct {
@@ -66,9 +96,11 @@ const Runtime = struct {
     windows: std.ArrayList(*Window) = .empty,
     outputs: std.ArrayList(*Output) = .empty,
     seats: std.ArrayList(*Seat) = .empty,
-    actions: std.ArrayList(policy.Action) = .empty,
-    focused_window: ?*Window = null,
+    events: std.ArrayList(policy.Event) = .empty,
+    input_invocations: std.ArrayList(InputInvocation) = .empty,
+    next_id: u32 = 1,
     phase: Phase = .idle,
+    session_locked: bool = false,
     unavailable: bool = false,
     finished: bool = false,
     exit_requested: bool = false,
@@ -87,6 +119,8 @@ const Runtime = struct {
             .registry = registry,
         };
         registry.setListener(*Runtime, registryListener, self);
+        try host.bindInvalidator(self, Runtime.invalidate);
+        errdefer host.unbindInvalidator();
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         if (self.manager == null) return error.NoRiverWindowManager;
         if (self.xkb_bindings == null) return error.NoRiverXkbBindings;
@@ -99,7 +133,8 @@ const Runtime = struct {
         if (self.xkb_bindings) |bindings| bindings.destroy();
         self.registry.destroy();
         self.display.disconnect();
-        self.actions.deinit(self.allocator);
+        self.input_invocations.deinit(self.allocator);
+        self.events.deinit(self.allocator);
     }
 
     fn destroyChildren(self: *Runtime) void {
@@ -112,6 +147,19 @@ const Runtime = struct {
             self.allocator.destroy(output);
         }
         self.outputs.deinit(self.allocator);
+    }
+
+    fn allocateId(self: *Runtime) !u32 {
+        if (self.next_id == std.math.maxInt(u32)) return error.RiverObjectIdExhausted;
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+
+    fn recordEvent(self: *Runtime, event: policy.Event) void {
+        self.events.append(self.allocator, event) catch {
+            self.fatal = true;
+        };
     }
 
     fn stop(self: *Runtime) void {
@@ -132,12 +180,6 @@ const Runtime = struct {
         if (!self.shouldStop()) {
             if (self.manager) |manager| manager.manageDirty();
         }
-    }
-
-    fn requestAction(ctx: *anyopaque, action: policy.Action) anyerror!void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        try self.actions.append(self.allocator, action);
-        try invalidate(self);
     }
 
     fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
@@ -216,7 +258,14 @@ const Runtime = struct {
             .finished => self.finished = true,
             .manage_start => self.manage(),
             .render_start => self.render(),
-            .session_locked, .session_unlocked => {},
+            .session_locked => {
+                self.session_locked = true;
+                self.recordEvent(.session_locked);
+            },
+            .session_unlocked => {
+                self.session_locked = false;
+                self.recordEvent(.session_unlocked);
+            },
             .window => |new| self.addWindow(new.id) catch {
                 self.fatal = true;
             },
@@ -233,25 +282,38 @@ const Runtime = struct {
         const window = try self.allocator.create(Window);
         errdefer self.allocator.destroy(window);
         const node = try object.getNode();
-        window.* = .{ .runtime = self, .object = object, .node = node };
+        window.* = .{
+            .runtime = self,
+            .id = try self.allocateId(),
+            .object = object,
+            .node = node,
+        };
         object.setListener(*Window, windowListener, window);
         try self.windows.append(self.allocator, window);
+        self.recordEvent(.{ .window_added = window.id });
     }
 
     fn addOutput(self: *Runtime, object: *river.OutputV1) !void {
         const output = try self.allocator.create(Output);
         errdefer self.allocator.destroy(output);
-        output.* = .{ .object = object };
+        output.* = .{ .runtime = self, .id = try self.allocateId(), .object = object };
         object.setListener(*Output, outputListener, output);
         try self.outputs.append(self.allocator, output);
+        self.recordEvent(.{ .output_added = output.id });
     }
 
     fn addSeat(self: *Runtime, object: *river.SeatV1) !void {
         const seat = try self.allocator.create(Seat);
         errdefer self.allocator.destroy(seat);
-        seat.* = .{ .object = object };
+        seat.* = .{ .runtime = self, .id = try self.allocateId(), .object = object };
         object.setListener(*Seat, seatListener, seat);
+        const xkb_bindings = self.xkb_bindings orelse return error.NoRiverXkbBindings;
+        if (xkb_bindings.getVersion() >= river.XkbBindingsV1.get_seat_since_version) {
+            seat.xkb_seat = try xkb_bindings.getSeat(object);
+            seat.xkb_seat.?.setListener(*Seat, xkbSeatListener, seat);
+        }
         try self.seats.append(self.allocator, seat);
+        self.recordEvent(.{ .seat_added = seat.id });
     }
 
     fn manage(self: *Runtime) void {
@@ -262,22 +324,37 @@ const Runtime = struct {
         }
         self.phase = .manage;
         defer {
+            self.events.clearRetainingCapacity();
             manager.manageFinish();
             self.phase = .idle;
         }
         if (self.fatal) return;
 
-        self.removeClosedObjects();
         self.invokeBindings();
-        self.applyActions();
-        self.removeClosedObjects();
         self.reconcileBindings() catch |err| {
-            // A failed reload leaves the last successfully loaded root
-            // committed, so keep managing with that policy.
+            // A failed reload leaves the last successfully loaded root committed.
             log.err("failed to refresh River key bindings; keeping the previous bindings: {}", .{err});
         };
-        self.updateFocus();
-        self.updateLayout();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const context = self.buildContext(allocator, true) catch {
+            self.fatal = true;
+            return;
+        };
+        const commands = self.host.manage(allocator, context) catch |err| {
+            log.err("River manage callback failed; submitting no changes: {}", .{err});
+            self.removeClosedObjects();
+            return;
+        };
+        self.validateManageCommands(commands) catch |err| {
+            log.err("River manage commands are invalid; submitting no changes: {}", .{err});
+            self.removeClosedObjects();
+            return;
+        };
+        self.applyManageCommands(commands);
+        self.removeClosedObjects();
     }
 
     fn render(self: *Runtime) void {
@@ -293,23 +370,258 @@ const Runtime = struct {
         }
         if (self.fatal) return;
 
-        var previous: ?*river.NodeV1 = null;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const context = self.buildContext(allocator, false) catch {
+            self.fatal = true;
+            return;
+        };
+        const commands = self.host.render(allocator, context) catch |err| {
+            log.err("River render callback failed; submitting no changes: {}", .{err});
+            return;
+        };
+        self.validateRenderCommands(commands) catch |err| {
+            log.err("River render commands are invalid; submitting no changes: {}", .{err});
+            return;
+        };
+        self.applyRenderCommands(commands);
+    }
+
+    fn buildContext(self: *Runtime, allocator: std.mem.Allocator, include_events: bool) !policy.Context {
+        var window_count: usize = 0;
+        for (self.windows.items) |window| if (!window.closed) {
+            window_count += 1;
+        };
+        const windows = try allocator.alloc(policy.Window, window_count);
+        var window_index: usize = 0;
         for (self.windows.items) |window| {
             if (window.closed) continue;
-            const placement = window.placement orelse continue;
-            if (!placement.visible) {
-                window.object.hide();
-                continue;
-            }
-            window.node.setPosition(placement.x, placement.y);
-            window.object.show();
-            if (previous) |node| {
-                window.node.placeAbove(node);
-            } else {
-                window.node.placeBottom();
-            }
-            previous = window.node;
+            windows[window_index] = .{
+                .id = window.id,
+                .title = window.title,
+                .app_id = window.app_id,
+                .identifier = window.identifier,
+                .parent = window.parent,
+                .dimensions = window.dimensions,
+                .dimensions_hint = window.dimensions_hint,
+                .decoration_hint = window.decoration_hint,
+                .unreliable_pid = window.unreliable_pid,
+                .presentation_hint = window.presentation_hint,
+            };
+            window_index += 1;
         }
+
+        var output_count: usize = 0;
+        for (self.outputs.items) |output| if (!output.removed) {
+            output_count += 1;
+        };
+        const outputs = try allocator.alloc(policy.Output, output_count);
+        var output_index: usize = 0;
+        for (self.outputs.items) |output| {
+            if (output.removed) continue;
+            outputs[output_index] = .{
+                .id = output.id,
+                .wl_output = output.wl_output,
+                .x = output.x,
+                .y = output.y,
+                .width = output.width,
+                .height = output.height,
+            };
+            output_index += 1;
+        }
+
+        var seat_count: usize = 0;
+        for (self.seats.items) |seat| if (!seat.removed) {
+            seat_count += 1;
+        };
+        const seats = try allocator.alloc(policy.Seat, seat_count);
+        var seat_index: usize = 0;
+        for (self.seats.items) |seat| {
+            if (seat.removed) continue;
+            seats[seat_index] = .{
+                .id = seat.id,
+                .wl_seat = seat.wl_seat,
+                .pointer_position = seat.pointer_position,
+                .modifiers = seat.modifiers,
+            };
+            seat_index += 1;
+        }
+
+        return .{
+            .windows = windows,
+            .outputs = outputs,
+            .seats = seats,
+            .events = if (include_events) self.events.items else &.{},
+            .session_locked = self.session_locked,
+            .window_management_version = self.manager.?.getVersion(),
+            .xkb_bindings_version = self.xkb_bindings.?.getVersion(),
+        };
+    }
+
+    fn validateManageCommands(self: *Runtime, commands: []const policy.ManageCommand) !void {
+        for (commands) |command| switch (command) {
+            .close => |value| _ = try self.requireWindow(value.window),
+            .propose_dimensions => |value| {
+                _ = try self.requireWindow(value.window);
+                if (value.width < 0 or value.height < 0) return error.InvalidDimensions;
+            },
+            .use_csd,
+            .use_ssd,
+            .inform_resize_start,
+            .inform_resize_end,
+            .inform_maximized,
+            .inform_unmaximized,
+            .inform_fullscreen,
+            .inform_not_fullscreen,
+            .exit_fullscreen,
+            => |value| _ = try self.requireWindow(value.window),
+            .set_tiled => |value| _ = try self.requireWindow(value.window),
+            .set_capabilities => |value| _ = try self.requireWindow(value.window),
+            .fullscreen => |value| {
+                _ = try self.requireWindow(value.window);
+                _ = try self.requireOutput(value.output);
+            },
+            .set_dimension_bounds => |value| {
+                const window = try self.requireWindow(value.window);
+                if (window.object.getVersion() < river.WindowV1.set_dimension_bounds_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+                if (value.max_width < 0 or value.max_height < 0) return error.InvalidDimensions;
+            },
+            .focus_window => |value| {
+                _ = try self.requireSeat(value.seat);
+                _ = try self.requireWindow(value.window);
+            },
+            .clear_focus,
+            .op_start_pointer,
+            .op_end,
+            => |value| _ = try self.requireSeat(value.seat),
+            .pointer_warp => |value| {
+                const seat = try self.requireSeat(value.seat);
+                if (seat.object.getVersion() < river.SeatV1.pointer_warp_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+            .set_xcursor_theme => |value| {
+                const seat = try self.requireSeat(value.seat);
+                if (seat.object.getVersion() < river.SeatV1.set_xcursor_theme_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+            .ensure_next_key_eaten, .cancel_ensure_next_key_eaten => |value| {
+                const seat = try self.requireSeat(value.seat);
+                const xkb_seat = seat.xkb_seat orelse return error.UnsupportedRiverProtocolVersion;
+                if (xkb_seat.getVersion() < river.XkbBindingsSeatV1.ensure_next_key_eaten_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+            .modifiers_watch => |value| {
+                const seat = try self.requireSeat(value.seat);
+                const xkb_seat = seat.xkb_seat orelse return error.UnsupportedRiverProtocolVersion;
+                if (xkb_seat.getVersion() < river.XkbBindingsSeatV1.modifiers_watch_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+            .exit_session => {
+                const manager = self.manager orelse return error.NoRiverWindowManager;
+                if (manager.getVersion() < river.WindowManagerV1.exit_session_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+        };
+    }
+
+    fn applyManageCommands(self: *Runtime, commands: []const policy.ManageCommand) void {
+        for (commands) |command| switch (command) {
+            .close => |value| self.findWindowId(value.window).?.object.close(),
+            .propose_dimensions => |value| self.findWindowId(value.window).?.object.proposeDimensions(value.width, value.height),
+            .use_csd => |value| self.findWindowId(value.window).?.object.useCsd(),
+            .use_ssd => |value| self.findWindowId(value.window).?.object.useSsd(),
+            .set_tiled => |value| self.findWindowId(value.window).?.object.setTiled(riverEdges(value.edges)),
+            .inform_resize_start => |value| self.findWindowId(value.window).?.object.informResizeStart(),
+            .inform_resize_end => |value| self.findWindowId(value.window).?.object.informResizeEnd(),
+            .set_capabilities => |value| self.findWindowId(value.window).?.object.setCapabilities(riverCapabilities(value.capabilities)),
+            .inform_maximized => |value| self.findWindowId(value.window).?.object.informMaximized(),
+            .inform_unmaximized => |value| self.findWindowId(value.window).?.object.informUnmaximized(),
+            .inform_fullscreen => |value| self.findWindowId(value.window).?.object.informFullscreen(),
+            .inform_not_fullscreen => |value| self.findWindowId(value.window).?.object.informNotFullscreen(),
+            .fullscreen => |value| self.findWindowId(value.window).?.object.fullscreen(self.findOutputId(value.output).?.object),
+            .exit_fullscreen => |value| self.findWindowId(value.window).?.object.exitFullscreen(),
+            .set_dimension_bounds => |value| self.findWindowId(value.window).?.object.setDimensionBounds(value.max_width, value.max_height),
+            .focus_window => |value| self.findSeatId(value.seat).?.object.focusWindow(self.findWindowId(value.window).?.object),
+            .clear_focus => |value| self.findSeatId(value.seat).?.object.clearFocus(),
+            .op_start_pointer => |value| self.findSeatId(value.seat).?.object.opStartPointer(),
+            .op_end => |value| self.findSeatId(value.seat).?.object.opEnd(),
+            .pointer_warp => |value| self.findSeatId(value.seat).?.object.pointerWarp(value.x, value.y),
+            .set_xcursor_theme => |value| self.findSeatId(value.seat).?.object.setXcursorTheme(value.name, value.size),
+            .ensure_next_key_eaten => |value| self.findSeatId(value.seat).?.xkb_seat.?.ensureNextKeyEaten(),
+            .cancel_ensure_next_key_eaten => |value| self.findSeatId(value.seat).?.xkb_seat.?.cancelEnsureNextKeyEaten(),
+            .modifiers_watch => |value| self.findSeatId(value.seat).?.xkb_seat.?.modifiersWatch(@bitCast(value.modifiers)),
+            .exit_session => {
+                self.exit_requested = true;
+                self.manager.?.exitSession();
+            },
+        };
+    }
+
+    fn validateRenderCommands(self: *Runtime, commands: []const policy.RenderCommand) !void {
+        for (commands) |command| switch (command) {
+            .hide,
+            .show,
+            .place_top,
+            .place_bottom,
+            => |value| _ = try self.requireWindow(value.window),
+            .set_position => |value| _ = try self.requireWindow(value.window),
+            .set_borders => |value| {
+                _ = try self.requireWindow(value.window);
+                if (value.width < 0) return error.InvalidBorder;
+            },
+            .place_above, .place_below => |value| {
+                _ = try self.requireWindow(value.window);
+                _ = try self.requireWindow(value.other);
+            },
+            .set_clip_box => |value| {
+                const window = try self.requireWindow(value.window);
+                if (window.object.getVersion() < river.WindowV1.set_clip_box_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+                if (value.width < 0 or value.height < 0) return error.InvalidClipBox;
+            },
+            .set_content_clip_box => |value| {
+                const window = try self.requireWindow(value.window);
+                if (window.object.getVersion() < river.WindowV1.set_content_clip_box_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+                if (value.width < 0 or value.height < 0) return error.InvalidClipBox;
+            },
+            .set_presentation_mode => |value| {
+                const output = try self.requireOutput(value.output);
+                if (output.object.getVersion() < river.OutputV1.set_presentation_mode_since_version)
+                    return error.UnsupportedRiverProtocolVersion;
+            },
+        };
+    }
+
+    fn applyRenderCommands(self: *Runtime, commands: []const policy.RenderCommand) void {
+        for (commands) |command| switch (command) {
+            .hide => |value| self.findWindowId(value.window).?.object.hide(),
+            .show => |value| self.findWindowId(value.window).?.object.show(),
+            .set_borders => |value| {
+                const color = value.color;
+                self.findWindowId(value.window).?.object.setBorders(
+                    riverEdges(value.edges),
+                    value.width,
+                    color.r,
+                    color.g,
+                    color.b,
+                    color.a,
+                );
+            },
+            .set_position => |value| self.findWindowId(value.window).?.node.setPosition(value.x, value.y),
+            .place_top => |value| self.findWindowId(value.window).?.node.placeTop(),
+            .place_bottom => |value| self.findWindowId(value.window).?.node.placeBottom(),
+            .place_above => |value| self.findWindowId(value.window).?.node.placeAbove(self.findWindowId(value.other).?.node),
+            .place_below => |value| self.findWindowId(value.window).?.node.placeBelow(self.findWindowId(value.other).?.node),
+            .set_clip_box => |value| self.findWindowId(value.window).?.object.setClipBox(value.x, value.y, value.width, value.height),
+            .set_content_clip_box => |value| self.findWindowId(value.window).?.object.setContentClipBox(value.x, value.y, value.width, value.height),
+            .set_presentation_mode => |value| self.findOutputId(value.output).?.object.setPresentationMode(switch (value.mode) {
+                .vsync => .vsync,
+                .async => .async,
+            }),
+        };
     }
 
     fn removeClosedObjects(self: *Runtime) void {
@@ -331,7 +643,9 @@ const Runtime = struct {
                 window_index += 1;
                 continue;
             }
-            if (self.focused_window == window) self.focused_window = null;
+            for (self.windows.items) |child| {
+                if (child.parent == window.id) child.parent = null;
+            }
             _ = self.windows.orderedRemove(window_index);
             self.destroyWindow(window, true);
         }
@@ -363,7 +677,12 @@ const Runtime = struct {
     fn destroySeat(self: *Runtime, seat: *Seat, destroy_object: bool) void {
         for (seat.bindings.items) |binding| self.destroyBinding(binding, destroy_object);
         seat.bindings.deinit(self.allocator);
-        if (destroy_object) seat.object.destroy();
+        for (seat.pointer_bindings.items) |binding| self.destroyPointerBinding(binding, destroy_object);
+        seat.pointer_bindings.deinit(self.allocator);
+        if (destroy_object) {
+            if (seat.xkb_seat) |xkb_seat| xkb_seat.destroy();
+            seat.object.destroy();
+        }
         self.allocator.destroy(seat);
     }
 
@@ -373,75 +692,35 @@ const Runtime = struct {
         self.allocator.destroy(binding);
     }
 
-    fn invokeBindings(self: *Runtime) void {
-        for (self.seats.items) |seat| {
-            for (seat.bindings.items) |binding| {
-                if (!binding.pressed) continue;
-                binding.pressed = false;
-                self.host.invokeBinding(binding.id) catch |err| {
-                    log.err("River binding '{s}' failed: {}", .{ binding.id, err });
-                };
-            }
-        }
+    fn destroyPointerBinding(self: *Runtime, binding: *PointerBinding, destroy_object: bool) void {
+        if (destroy_object) binding.object.destroy();
+        self.allocator.free(binding.id);
+        self.allocator.destroy(binding);
     }
 
-    fn applyActions(self: *Runtime) void {
-        defer self.actions.clearRetainingCapacity();
-        for (self.actions.items) |action| switch (action) {
-            .close_focused => if (self.focused_window) |window| window.object.close(),
-            .focus_next => self.focusNext(),
-            .exit_session => if (self.manager) |manager| {
-                if (manager.getVersion() >= river.WindowManagerV1.exit_session_since_version) {
-                    self.exit_requested = true;
-                    manager.exitSession();
-                } else {
-                    log.err("River compositor does not support exit_session", .{});
-                }
+    fn invokeBindings(self: *Runtime) void {
+        defer self.input_invocations.clearRetainingCapacity();
+        for (self.input_invocations.items) |invocation| switch (invocation) {
+            .xkb => |value| self.host.invokeBinding(value.binding.id, value.event, value.binding.seat.id) catch |err| {
+                log.err("River binding '{s}' callback failed: {}", .{ value.binding.id, err });
+            },
+            .pointer => |value| self.host.invokePointerBinding(value.binding.id, value.event, value.binding.seat.id) catch |err| {
+                log.err("River pointer binding '{s}' callback failed: {}", .{ value.binding.id, err });
             },
         };
-    }
-
-    fn focusNext(self: *Runtime) void {
-        if (self.windows.items.len == 0) {
-            self.focused_window = null;
-            return;
-        }
-        const current = self.focused_window orelse {
-            self.focused_window = self.windows.items[0];
-            return;
-        };
-        for (self.windows.items, 0..) |window, index| {
-            if (window != current) continue;
-            self.focused_window = self.windows.items[(index + 1) % self.windows.items.len];
-            return;
-        }
-        self.focused_window = self.windows.items[0];
-    }
-
-    fn updateFocus(self: *Runtime) void {
-        for (self.seats.items) |seat| {
-            if (seat.interacted_window) |object| {
-                if (self.findWindow(object)) |window| self.focused_window = window;
-                seat.interacted_window = null;
-            }
-        }
-        if (self.focused_window == null and self.windows.items.len > 0) {
-            self.focused_window = self.windows.items[0];
-        }
-        for (self.seats.items) |seat| {
-            if (self.focused_window) |window| {
-                seat.object.focusWindow(window.object);
-            } else {
-                seat.object.clearFocus();
-            }
-        }
     }
 
     fn reconcileBindings(self: *Runtime) !void {
         try self.host.refresh();
         const declarations = try self.host.bindings(self.allocator);
         defer policy.freeBindings(self.allocator, declarations);
-        for (self.seats.items) |seat| try self.reconcileSeatBindings(seat, declarations);
+        const pointer_declarations = try self.host.pointerBindings(self.allocator);
+        defer policy.freePointerBindings(self.allocator, pointer_declarations);
+        for (self.seats.items) |seat| {
+            if (seat.removed) continue;
+            try self.reconcileSeatBindings(seat, declarations);
+            try self.reconcilePointerBindings(seat, pointer_declarations);
+        }
     }
 
     fn reconcileSeatBindings(self: *Runtime, seat: *Seat, declarations: []const policy.Binding) !void {
@@ -449,7 +728,9 @@ const Runtime = struct {
         while (index < seat.bindings.items.len) {
             const binding = seat.bindings.items[index];
             const declaration = findBindingDeclaration(declarations, binding.id);
-            if (declaration != null and declaration.?.keysym == binding.keysym and declaration.?.modifiers == binding.modifiers) {
+            if (declaration != null and declaration.?.keysym == binding.keysym and
+                declaration.?.modifiers == binding.modifiers and declaration.?.layout == binding.layout)
+            {
                 index += 1;
                 continue;
             }
@@ -473,115 +754,78 @@ const Runtime = struct {
         const id = try self.allocator.dupe(u8, declaration.id);
         errdefer self.allocator.free(id);
         binding.* = .{
+            .runtime = self,
+            .seat = seat,
             .object = object,
             .id = id,
             .keysym = declaration.keysym,
             .modifiers = declaration.modifiers,
+            .layout = declaration.layout,
         };
         object.setListener(*Binding, bindingListener, binding);
         try seat.bindings.append(self.allocator, binding);
+        if (declaration.layout) |layout| object.setLayoutOverride(layout);
         object.enable();
     }
 
-    fn updateLayout(self: *Runtime) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        const outputs = allocator.alloc(policy.Output, self.outputs.items.len) catch {
-            self.fatal = true;
-            return;
-        };
-        for (self.outputs.items, 0..) |output, index| outputs[index] = .{
-            .id = output.object.getId(),
-            .x = output.x,
-            .y = output.y,
-            .width = output.width,
-            .height = output.height,
-        };
-        const windows = allocator.alloc(policy.Window, self.windows.items.len) catch {
-            self.fatal = true;
-            return;
-        };
-        for (self.windows.items, 0..) |window, index| windows[index] = .{
-            .id = window.object.getId(),
-            .title = window.title,
-            .app_id = window.app_id,
-            .identifier = window.identifier,
-        };
-        const context: policy.Context = .{
-            .outputs = outputs,
-            .windows = windows,
-            .focused_window = if (self.focused_window) |window| window.object.getId() else null,
-        };
-
-        const placements = self.host.layout(allocator, context) catch |err| {
-            log.err("River layout failed, using the fallback layout: {}", .{err});
-            self.fallbackLayout();
-            self.proposeLayout();
-            return;
-        };
-        self.applyPlacements(placements) catch |err| {
-            log.err("River layout is invalid, using the fallback layout: {}", .{err});
-            self.fallbackLayout();
-        };
-        self.proposeLayout();
-    }
-
-    fn applyPlacements(self: *Runtime, placements: []const policy.Placement) !void {
-        for (self.windows.items) |window| window.placement = null;
-        for (placements) |placement| {
-            const window = self.findWindowId(placement.window_id) orelse return error.UnknownWindow;
-            if (window.placement != null) return error.DuplicateWindow;
-            window.placement = placement;
-        }
-        for (self.windows.items) |window| {
-            if (window.placement != null) continue;
-            const hidden: policy.Placement = .{
-                .window_id = window.object.getId(),
-                .x = 0,
-                .y = 0,
-                .width = 640,
-                .height = 480,
-            };
-            window.placement = .{
-                .window_id = hidden.window_id,
-                .x = hidden.x,
-                .y = hidden.y,
-                .width = hidden.width,
-                .height = hidden.height,
-                .visible = false,
-            };
-        }
-    }
-
-    fn fallbackLayout(self: *Runtime) void {
-        const count = self.windows.items.len;
-        if (count == 0) return;
-        const output = if (self.outputs.items.len > 0) self.outputs.items[0] else null;
-        const x = if (output) |item| item.x else 0;
-        const y = if (output) |item| item.y else 0;
-        const total_width: i32 = if (output) |item| @max(1, item.width) else 1280;
-        const height: i32 = if (output) |item| @max(1, item.height) else 720;
-        const width = @max(1, @divTrunc(total_width, @as(i32, @intCast(count))));
-        for (self.windows.items, 0..) |window, index| window.placement = .{
-            .window_id = window.object.getId(),
-            .x = x + width * @as(i32, @intCast(index)),
-            .y = y,
-            .width = if (index + 1 == count) total_width - width * @as(i32, @intCast(index)) else width,
-            .height = height,
-        };
-    }
-
-    fn proposeLayout(self: *Runtime) void {
-        for (self.windows.items) |window| {
-            const placement = window.placement orelse continue;
-            if (window.is_new) {
-                window.object.setCapabilities(.{});
-                window.object.setTiled(.{ .top = true, .bottom = true, .left = true, .right = true });
-                window.is_new = false;
+    fn reconcilePointerBindings(self: *Runtime, seat: *Seat, declarations: []const policy.PointerBinding) !void {
+        var index: usize = 0;
+        while (index < seat.pointer_bindings.items.len) {
+            const binding = seat.pointer_bindings.items[index];
+            const declaration = findPointerBindingDeclaration(declarations, binding.id);
+            if (declaration != null and declaration.?.button == binding.button and
+                declaration.?.modifiers == binding.modifiers)
+            {
+                index += 1;
+                continue;
             }
-            window.object.proposeDimensions(placement.width, placement.height);
+            _ = seat.pointer_bindings.orderedRemove(index);
+            self.destroyPointerBinding(binding, true);
         }
+
+        for (declarations) |declaration| {
+            if (findPointerBinding(seat.pointer_bindings.items, declaration.id) != null) continue;
+            try self.addPointerBinding(seat, declaration);
+        }
+    }
+
+    fn addPointerBinding(self: *Runtime, seat: *Seat, declaration: policy.PointerBinding) !void {
+        const modifiers: river.SeatV1.Modifiers = @bitCast(declaration.modifiers);
+        const object = try seat.object.getPointerBinding(declaration.button, modifiers);
+        errdefer object.destroy();
+        const binding = try self.allocator.create(PointerBinding);
+        errdefer self.allocator.destroy(binding);
+        const id = try self.allocator.dupe(u8, declaration.id);
+        errdefer self.allocator.free(id);
+        binding.* = .{
+            .runtime = self,
+            .seat = seat,
+            .object = object,
+            .id = id,
+            .button = declaration.button,
+            .modifiers = declaration.modifiers,
+        };
+        object.setListener(*PointerBinding, pointerBindingListener, binding);
+        try seat.pointer_bindings.append(self.allocator, binding);
+        object.enable();
+    }
+
+    fn requireWindow(self: *Runtime, id: u32) !*Window {
+        const window = self.findWindowId(id) orelse return error.UnknownWindow;
+        if (window.closed) return error.ClosedWindow;
+        return window;
+    }
+
+    fn requireOutput(self: *Runtime, id: u32) !*Output {
+        const output = self.findOutputId(id) orelse return error.UnknownOutput;
+        if (output.removed) return error.RemovedOutput;
+        return output;
+    }
+
+    fn requireSeat(self: *Runtime, id: u32) !*Seat {
+        const seat = self.findSeatId(id) orelse return error.UnknownSeat;
+        if (seat.removed) return error.RemovedSeat;
+        return seat;
     }
 
     fn findWindow(self: *Runtime, object: *river.WindowV1) ?*Window {
@@ -590,30 +834,110 @@ const Runtime = struct {
     }
 
     fn findWindowId(self: *Runtime, id: u32) ?*Window {
-        for (self.windows.items) |window| if (window.object.getId() == id) return window;
+        for (self.windows.items) |window| if (window.id == id) return window;
+        return null;
+    }
+
+    fn findOutput(self: *Runtime, object: *river.OutputV1) ?*Output {
+        for (self.outputs.items) |output| if (output.object == object) return output;
+        return null;
+    }
+
+    fn findOutputId(self: *Runtime, id: u32) ?*Output {
+        for (self.outputs.items) |output| if (output.id == id) return output;
+        return null;
+    }
+
+    fn findSeat(self: *Runtime, object: *river.SeatV1) ?*Seat {
+        for (self.seats.items) |seat| if (seat.object == object) return seat;
+        return null;
+    }
+
+    fn findSeatId(self: *Runtime, id: u32) ?*Seat {
+        for (self.seats.items) |seat| if (seat.id == id) return seat;
         return null;
     }
 
     fn windowListener(_: *river.WindowV1, event: river.WindowV1.Event, window: *Window) void {
+        const runtime = window.runtime;
         switch (event) {
-            .closed => window.closed = true,
-            .dimensions => {},
-            .app_id => |app_id| replaceOptionalString(window.runtime.allocator, &window.app_id, app_id.app_id) catch {
-                window.runtime.fatal = true;
+            .closed => {
+                window.closed = true;
+                runtime.recordEvent(.{ .window_closed = window.id });
             },
-            .title => |title| replaceOptionalString(window.runtime.allocator, &window.title, title.title) catch {
-                window.runtime.fatal = true;
+            .dimensions_hint => |hint| window.dimensions_hint = .{
+                .min_width = hint.min_width,
+                .min_height = hint.min_height,
+                .max_width = hint.max_width,
+                .max_height = hint.max_height,
             },
-            .identifier => |identifier| replaceOptionalString(window.runtime.allocator, &window.identifier, identifier.identifier) catch {
-                window.runtime.fatal = true;
+            .dimensions => |dimensions| window.dimensions = .{
+                .width = dimensions.width,
+                .height = dimensions.height,
             },
-            else => {},
+            .app_id => |app_id| replaceOptionalString(runtime.allocator, &window.app_id, app_id.app_id) catch {
+                runtime.fatal = true;
+            },
+            .title => |title| replaceOptionalString(runtime.allocator, &window.title, title.title) catch {
+                runtime.fatal = true;
+            },
+            .parent => |parent| window.parent = if (parent.parent) |object|
+                if (runtime.findWindow(object)) |value| value.id else null
+            else
+                null,
+            .decoration_hint => |hint| window.decoration_hint = switch (hint.hint) {
+                .only_supports_csd => .only_supports_csd,
+                .prefers_csd => .prefers_csd,
+                .prefers_ssd => .prefers_ssd,
+                .no_preference => .no_preference,
+                else => null,
+            },
+            .pointer_move_requested => |request| {
+                const object = request.seat orelse return;
+                const seat = runtime.findSeat(object) orelse return;
+                runtime.recordEvent(.{ .pointer_move_requested = .{ .window = window.id, .seat = seat.id } });
+            },
+            .pointer_resize_requested => |request| {
+                const object = request.seat orelse return;
+                const seat = runtime.findSeat(object) orelse return;
+                runtime.recordEvent(.{ .pointer_resize_requested = .{
+                    .window = window.id,
+                    .seat = seat.id,
+                    .edges = @bitCast(request.edges),
+                } });
+            },
+            .show_window_menu_requested => |request| runtime.recordEvent(.{ .show_window_menu_requested = .{
+                .window = window.id,
+                .x = request.x,
+                .y = request.y,
+            } }),
+            .maximize_requested => runtime.recordEvent(.{ .maximize_requested = window.id }),
+            .unmaximize_requested => runtime.recordEvent(.{ .unmaximize_requested = window.id }),
+            .fullscreen_requested => |request| runtime.recordEvent(.{ .fullscreen_requested = .{
+                .window = window.id,
+                .output = if (request.output) |object| if (runtime.findOutput(object)) |value| value.id else null else null,
+            } }),
+            .exit_fullscreen_requested => runtime.recordEvent(.{ .exit_fullscreen_requested = window.id }),
+            .minimize_requested => runtime.recordEvent(.{ .minimize_requested = window.id }),
+            .unreliable_pid => |pid| window.unreliable_pid = pid.unreliable_pid,
+            .presentation_hint => |hint| window.presentation_hint = switch (hint.hint) {
+                .vsync => .vsync,
+                .async => .async,
+                else => null,
+            },
+            .identifier => |identifier| replaceString(runtime.allocator, &window.identifier, identifier.identifier) catch {
+                runtime.fatal = true;
+            },
         }
     }
 
     fn outputListener(_: *river.OutputV1, event: river.OutputV1.Event, output: *Output) void {
         switch (event) {
-            .removed => output.removed = true,
+            .removed => {
+                output.removed = true;
+                output.runtime.recordEvent(.{ .output_removed = output.id });
+            },
+            .wl_output => |value| output.wl_output = value.name,
             .position => |position| {
                 output.x = position.x;
                 output.y = position.y;
@@ -622,22 +946,87 @@ const Runtime = struct {
                 output.width = dimensions.width;
                 output.height = dimensions.height;
             },
-            .wl_output => {},
         }
     }
 
     fn seatListener(_: *river.SeatV1, event: river.SeatV1.Event, seat: *Seat) void {
+        const runtime = seat.runtime;
         switch (event) {
-            .removed => seat.removed = true,
-            .window_interaction => |interaction| seat.interacted_window = interaction.window,
-            else => {},
+            .removed => {
+                seat.removed = true;
+                runtime.recordEvent(.{ .seat_removed = seat.id });
+            },
+            .wl_seat => |value| seat.wl_seat = value.name,
+            .pointer_enter => |value| {
+                const object = value.window orelse return;
+                const window = runtime.findWindow(object) orelse return;
+                runtime.recordEvent(.{ .pointer_enter = .{ .seat = seat.id, .window = window.id } });
+            },
+            .pointer_leave => runtime.recordEvent(.{ .pointer_leave = seat.id }),
+            .window_interaction => |value| {
+                const object = value.window orelse return;
+                const window = runtime.findWindow(object) orelse return;
+                runtime.recordEvent(.{ .window_interaction = .{ .seat = seat.id, .window = window.id } });
+            },
+            .shell_surface_interaction => {},
+            .op_delta => |value| runtime.recordEvent(.{ .op_delta = .{
+                .seat = seat.id,
+                .dx = value.dx,
+                .dy = value.dy,
+            } }),
+            .op_release => runtime.recordEvent(.{ .op_release = seat.id }),
+            .pointer_position => |value| seat.pointer_position = .{ .x = value.x, .y = value.y },
         }
     }
 
     fn bindingListener(_: *river.XkbBindingV1, event: river.XkbBindingV1.Event, binding: *Binding) void {
+        const binding_event: policy.BindingEvent = switch (event) {
+            .pressed => .pressed,
+            .released => .released,
+            .stop_repeat => .stop_repeat,
+        };
+        binding.runtime.input_invocations.append(binding.runtime.allocator, .{ .xkb = .{
+            .binding = binding,
+            .event = binding_event,
+        } }) catch {
+            binding.runtime.fatal = true;
+        };
+    }
+
+    fn pointerBindingListener(
+        _: *river.PointerBindingV1,
+        event: river.PointerBindingV1.Event,
+        binding: *PointerBinding,
+    ) void {
+        const binding_event: policy.BindingEvent = switch (event) {
+            .pressed => .pressed,
+            .released => .released,
+        };
+        binding.runtime.input_invocations.append(binding.runtime.allocator, .{ .pointer = .{
+            .binding = binding,
+            .event = binding_event,
+        } }) catch {
+            binding.runtime.fatal = true;
+        };
+    }
+
+    fn xkbSeatListener(
+        _: *river.XkbBindingsSeatV1,
+        event: river.XkbBindingsSeatV1.Event,
+        seat: *Seat,
+    ) void {
         switch (event) {
-            .pressed => binding.pressed = true,
-            .released, .stop_repeat => {},
+            .ate_unbound_key => seat.runtime.recordEvent(.{ .ate_unbound_key = seat.id }),
+            .modifiers_update => |value| {
+                const old: u32 = @bitCast(value.old);
+                const new: u32 = @bitCast(value.new);
+                seat.modifiers = new;
+                seat.runtime.recordEvent(.{ .modifiers_update = .{
+                    .seat = seat.id,
+                    .old = old,
+                    .new = new,
+                } });
+            },
         }
     }
 };
@@ -650,10 +1039,6 @@ pub fn run(
     var runtime: Runtime = undefined;
     try runtime.init(allocator, host);
     defer runtime.deinit();
-    const control: policy.Control = .{ .ptr = &runtime, .vtable = &control_vtable };
-    host.setControl(control);
-    defer host.setControl(null);
-    try host.bindInvalidator(&runtime, Runtime.invalidate);
     defer host.unbindInvalidator();
 
     if (runtime.unavailable) return error.RiverWindowManagementUnavailable;
@@ -670,9 +1055,23 @@ pub fn run(
     if (runtime.fatal) return error.RiverWindowManagerFailed;
 }
 
-const control_vtable: policy.Control.VTable = .{
-    .request_action = Runtime.requestAction,
-};
+fn riverEdges(edges: policy.Edges) river.WindowV1.Edges {
+    return .{
+        .top = edges.top,
+        .bottom = edges.bottom,
+        .left = edges.left,
+        .right = edges.right,
+    };
+}
+
+fn riverCapabilities(capabilities: policy.Capabilities) river.WindowV1.Capabilities {
+    return .{
+        .window_menu = capabilities.window_menu,
+        .maximize = capabilities.maximize,
+        .fullscreen = capabilities.fullscreen,
+        .minimize = capabilities.minimize,
+    };
+}
 
 fn findBinding(bindings: []*Binding, id: []const u8) ?*Binding {
     for (bindings) |binding| if (std.mem.eql(u8, binding.id, id)) return binding;
@@ -684,12 +1083,35 @@ fn findBindingDeclaration(bindings: []const policy.Binding, id: []const u8) ?pol
     return null;
 }
 
+fn findPointerBinding(bindings: []*PointerBinding, id: []const u8) ?*PointerBinding {
+    for (bindings) |binding| if (std.mem.eql(u8, binding.id, id)) return binding;
+    return null;
+}
+
+fn findPointerBindingDeclaration(
+    bindings: []const policy.PointerBinding,
+    id: []const u8,
+) ?policy.PointerBinding {
+    for (bindings) |binding| if (std.mem.eql(u8, binding.id, id)) return binding;
+    return null;
+}
+
 fn replaceOptionalString(
     allocator: std.mem.Allocator,
     destination: *?[]u8,
     source: ?[*:0]const u8,
 ) !void {
     const replacement = if (source) |value| try allocator.dupe(u8, std.mem.span(value)) else null;
+    if (destination.*) |old| allocator.free(old);
+    destination.* = replacement;
+}
+
+fn replaceString(
+    allocator: std.mem.Allocator,
+    destination: *?[]u8,
+    source: [*:0]const u8,
+) !void {
+    const replacement = try allocator.dupe(u8, std.mem.span(source));
     if (destination.*) |old| allocator.free(old);
     destination.* = replacement;
 }

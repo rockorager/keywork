@@ -87,7 +87,6 @@ pub const App = struct {
     dbus_host: lua_dbus.Host = undefined,
     loop_host: lua_loop.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
-    river_host: lua_river.Host = .{},
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
@@ -1006,9 +1005,11 @@ pub const App = struct {
 const river_policy_vtable: river_policy.Host.VTable = .{
     .refresh = riverPolicyRefresh,
     .bindings = riverPolicyBindings,
-    .layout = riverPolicyLayout,
+    .pointer_bindings = riverPolicyPointerBindings,
+    .manage = riverPolicyManage,
+    .render = riverPolicyRender,
     .invoke_binding = riverPolicyInvokeBinding,
-    .set_control = riverPolicySetControl,
+    .invoke_pointer_binding = riverPolicyInvokePointerBinding,
     .bind_invalidator = riverPolicyBindInvalidator,
     .unbind_invalidator = riverPolicyUnbindInvalidator,
 };
@@ -1023,23 +1024,47 @@ fn riverPolicyBindings(ptr: *anyopaque, allocator: std.mem.Allocator) ![]river_p
     return lua_river.parseBindings(app.state, app.script_ref, allocator);
 }
 
-fn riverPolicyLayout(
+fn riverPolicyPointerBindings(ptr: *anyopaque, allocator: std.mem.Allocator) ![]river_policy.PointerBinding {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return lua_river.parsePointerBindings(app.state, app.script_ref, allocator);
+}
+
+fn riverPolicyManage(
     ptr: *anyopaque,
     allocator: std.mem.Allocator,
     context: river_policy.Context,
-) ![]river_policy.Placement {
+) ![]river_policy.ManageCommand {
     const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river.buildLayout(app.state, app.script_ref, allocator, context);
+    return lua_river.manage(app.state, app.script_ref, allocator, context);
 }
 
-fn riverPolicyInvokeBinding(ptr: *anyopaque, id: []const u8) !void {
+fn riverPolicyRender(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    context: river_policy.Context,
+) ![]river_policy.RenderCommand {
     const app: *App = @ptrCast(@alignCast(ptr));
-    try lua_river.invokeBinding(app.state, app.script_ref, id);
+    return lua_river.render(app.state, app.script_ref, allocator, context);
 }
 
-fn riverPolicySetControl(ptr: *anyopaque, control: ?river_policy.Control) void {
+fn riverPolicyInvokeBinding(
+    ptr: *anyopaque,
+    id: []const u8,
+    event: river_policy.BindingEvent,
+    seat: u32,
+) !void {
     const app: *App = @ptrCast(@alignCast(ptr));
-    app.river_host.control = control;
+    try lua_river.invokeBinding(app.state, app.script_ref, id, event, seat);
+}
+
+fn riverPolicyInvokePointerBinding(
+    ptr: *anyopaque,
+    id: []const u8,
+    event: river_policy.BindingEvent,
+    seat: u32,
+) !void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    try lua_river.invokePointerBinding(app.state, app.script_ref, id, event, seat);
 }
 
 fn riverPolicyBindInvalidator(
@@ -1517,8 +1542,7 @@ fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn riverModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    lua_river.pushModule(lua_state, &app.river_host);
+    lua_river.pushModule(lua_state);
     return 1;
 }
 
@@ -1765,18 +1789,47 @@ test "river app exposes window-management policy" {
         \\return river.app({
         \\  manager = river.window_manager({
         \\    bindings = {
-        \\      ["Super+q"] = function() binding_ran = true end,
+        \\      ["Super+q"] = {
+        \\        layout = 1,
+        \\        pressed = function(seat, event)
+        \\          binding_ran = seat == 4 and event == "pressed"
+        \\        end,
+        \\      },
         \\    },
-        \\    layout = function(context)
+        \\    pointer_bindings = {
+        \\      {
+        \\        id = "move",
+        \\        button = 272,
+        \\        modifiers = { super = true },
+        \\        pressed = function(seat, event)
+        \\          pointer_binding_ran = seat == 4 and event == "pressed"
+        \\        end,
+        \\      },
+        \\    },
+        \\    manage = function(context)
+        \\      versions_seen = context.window_management_version == 4
+        \\        and context.xkb_bindings_version == 3
         \\      local output = context.outputs[1]
         \\      local result = {}
         \\      for index, window in ipairs(context.windows) do
         \\        result[index] = {
+        \\          "propose_dimensions",
+        \\          window = window.id,
+        \\          width = 400,
+        \\          height = output.height,
+        \\        }
+        \\      end
+        \\      return result
+        \\    end,
+        \\    render = function(context)
+        \\      local output = context.outputs[1]
+        \\      local result = {}
+        \\      for index, window in ipairs(context.windows) do
+        \\        result[index] = {
+        \\          "set_position",
         \\          window = window.id,
         \\          x = output.x + (index - 1) * 400,
         \\          y = output.y,
-        \\          width = 400,
-        \\          height = output.height,
         \\        }
         \\      end
         \\      return result
@@ -1796,23 +1849,43 @@ test "river app exposes window-management policy" {
     try std.testing.expectEqual(@as(usize, 1), bindings.len);
     try std.testing.expectEqualStrings("Super+q", bindings[0].id);
     try std.testing.expectEqual(@as(u32, 64), bindings[0].modifiers);
+    try std.testing.expectEqual(@as(?u32, 1), bindings[0].layout);
+    const pointer_bindings = try host.pointerBindings(allocator);
+    defer river_policy.freePointerBindings(allocator, pointer_bindings);
+    try std.testing.expectEqual(@as(usize, 1), pointer_bindings.len);
+    try std.testing.expectEqualStrings("move", pointer_bindings[0].id);
+    try std.testing.expectEqual(@as(u32, 272), pointer_bindings[0].button);
+    try std.testing.expectEqual(@as(u32, 64), pointer_bindings[0].modifiers);
 
-    const placements = try host.layout(allocator, .{
+    const context: river_policy.Context = .{
         .outputs = &.{.{ .id = 1, .x = 10, .y = 20, .width = 800, .height = 600 }},
         .windows = &.{
             .{ .id = 2, .title = "first" },
             .{ .id = 3, .title = "second" },
         },
-        .focused_window = 2,
-    });
-    defer allocator.free(placements);
-    try std.testing.expectEqual(@as(usize, 2), placements.len);
-    try std.testing.expectEqual(@as(i32, 10), placements[0].x);
-    try std.testing.expectEqual(@as(i32, 410), placements[1].x);
-    try std.testing.expectEqual(@as(i32, 600), placements[1].height);
+        .seats = &.{.{ .id = 4 }},
+        .events = &.{.{ .window_added = 2 }},
+        .session_locked = false,
+        .window_management_version = 4,
+        .xkb_bindings_version = 3,
+    };
+    const manage_commands = try host.manage(allocator, context);
+    defer allocator.free(manage_commands);
+    try expectLuaBoolean(&app, "versions_seen", true);
+    try std.testing.expectEqual(@as(usize, 2), manage_commands.len);
+    try std.testing.expectEqual(@as(i32, 400), manage_commands[0].propose_dimensions.width);
+    try std.testing.expectEqual(@as(i32, 600), manage_commands[1].propose_dimensions.height);
 
-    try host.invokeBinding("Super+q");
+    const render_commands = try host.render(allocator, context);
+    defer allocator.free(render_commands);
+    try std.testing.expectEqual(@as(usize, 2), render_commands.len);
+    try std.testing.expectEqual(@as(i32, 10), render_commands[0].set_position.x);
+    try std.testing.expectEqual(@as(i32, 410), render_commands[1].set_position.x);
+
+    try host.invokeBinding("Super+q", .pressed, 4);
     try expectLuaBoolean(&app, "binding_ran", true);
+    try host.invokePointerBinding("move", .pressed, 4);
+    try expectLuaBoolean(&app, "pointer_binding_ran", true);
 }
 
 test "storybook root catalogs and renders a selected story" {
