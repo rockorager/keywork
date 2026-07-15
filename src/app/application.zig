@@ -4,6 +4,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const app_options = @import("options.zig");
 const runner = @import("runner.zig");
+const river_input_manager = @import("river_input_manager.zig");
 const river_window_manager = @import("river_window_manager.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const lua_module = @import("../lua/app.zig");
@@ -39,6 +40,12 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         try self.lua.bindEventLoop(&self.loop);
         defer self.lua.unbindEventLoop();
         return river_window_manager.run(self.allocator, &self.loop, &river_host);
+    }
+    if (window.kind == .river_input) {
+        var river_host = self.lua.riverInputHost();
+        try self.lua.bindEventLoop(&self.loop);
+        defer self.lua.unbindEventLoop();
+        return river_input_manager.run(self.allocator, &self.loop, &river_host);
     }
 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;

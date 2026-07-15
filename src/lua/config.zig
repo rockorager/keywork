@@ -11,6 +11,7 @@ const pop = lua_value.pop;
 pub const AppKind = enum {
     ui,
     river_window_manager,
+    river_input,
 };
 
 pub const Config = struct {
@@ -47,6 +48,8 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     if (try checkStringField(lua_state, table_index, "kind")) |kind| {
         if (std.mem.eql(u8, kind, "river-window-manager")) {
             config.kind = .river_window_manager;
+        } else if (std.mem.eql(u8, kind, "river-input")) {
+            config.kind = .river_input;
         } else {
             return invalidAppRoot("unknown app kind '{s}'", .{kind});
         }

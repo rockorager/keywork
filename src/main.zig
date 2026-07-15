@@ -98,6 +98,7 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("app/application.zig");
+    _ = @import("app/river_input_manager.zig");
     _ = @import("app/runner.zig");
     _ = @import("app/storybook.zig");
     _ = @import("backend/memory.zig");
@@ -112,6 +113,7 @@ test {
     _ = @import("lua/json.zig");
     _ = @import("lua/pipewire.zig");
     _ = @import("lua/process.zig");
+    _ = @import("lua/river_input.zig");
     _ = @import("lua/storybook.zig");
     _ = @import("lua/xdg.zig");
     _ = @import("app/platform.zig");

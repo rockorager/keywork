@@ -14,6 +14,7 @@ const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_pipewire = @import("pipewire.zig");
 const lua_river = @import("river.zig");
+const lua_river_input = @import("river_input.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
@@ -22,6 +23,7 @@ const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
 const platform_mod = @import("../app/platform.zig");
+const river_input_policy = @import("../app/river_input_policy.zig");
 const river_policy = @import("../app/river_policy.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
@@ -226,6 +228,10 @@ pub const App = struct {
 
     pub fn riverPolicyHost(self: *App) river_policy.Host {
         return .{ .ptr = self, .vtable = &river_policy_vtable };
+    }
+
+    pub fn riverInputHost(self: *App) river_input_policy.Host {
+        return .{ .ptr = self, .vtable = &river_input_policy_vtable };
     }
 
     pub fn bindPlatform(self: *App, platform: platform_mod.Platform) void {
@@ -684,6 +690,11 @@ pub const App = struct {
             const validation_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
             defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, validation_ref);
             try lua_river.validate(self.state, validation_ref, self.allocator);
+        } else if (config.kind == .river_input) {
+            c.lua_pushvalue(self.state, root);
+            const validation_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+            defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, validation_ref);
+            try lua_river_input.validate(self.state, validation_ref);
         }
         const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         errdefer if (!committed) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, script_ref);
@@ -1013,6 +1024,22 @@ const river_policy_vtable: river_policy.Host.VTable = .{
     .bind_invalidator = riverPolicyBindInvalidator,
     .unbind_invalidator = riverPolicyUnbindInvalidator,
 };
+
+const river_input_policy_vtable: river_input_policy.Host.VTable = .{
+    .refresh = riverPolicyRefresh,
+    .update = riverInputUpdate,
+    .bind_invalidator = riverPolicyBindInvalidator,
+    .unbind_invalidator = riverPolicyUnbindInvalidator,
+};
+
+fn riverInputUpdate(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    context: river_input_policy.Context,
+) ![]river_input_policy.Command {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return lua_river_input.update(app.state, app.script_ref, allocator, context);
+}
 
 fn riverPolicyRefresh(ptr: *anyopaque) !void {
     const app: *App = @ptrCast(@alignCast(ptr));
@@ -1868,6 +1895,7 @@ test "river app exposes window-management policy" {
         .session_locked = false,
         .window_management_version = 4,
         .xkb_bindings_version = 3,
+        .layer_shell_version = 1,
     };
     const manage_commands = try host.manage(allocator, context);
     defer allocator.free(manage_commands);
@@ -1886,6 +1914,69 @@ test "river app exposes window-management policy" {
     try expectLuaBoolean(&app, "binding_ran", true);
     try host.invokePointerBinding("move", .pressed, 4);
     try expectLuaBoolean(&app, "pointer_binding_ran", true);
+}
+
+test "river input app exposes snapshots and ordered commands" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local river = require("keywork.river")
+        \\return river.input_app({
+        \\  update = function(context)
+        \\    local device = context.devices[1]
+        \\    input_snapshot_seen = context.input_management_version == 1
+        \\      and context.libinput_config_version == 1
+        \\      and context.xkb_config_version == 1
+        \\      and device.type == "pointer"
+        \\      and device.libinput.tap.current == "enabled"
+        \\      and context.events[1].type == "device_added"
+        \\    return {
+        \\      { "create_seat", name = "gaming" },
+        \\      { "assign_to_seat", device = device.id, name = "gaming" },
+        \\      { "set_scroll_factor", device = device.id, factor = 0.5 },
+        \\      { "set_tap", device = device.id, state = "disabled" },
+        \\      { "create_accel_config", id = "curve", profile = "custom" },
+        \\      { "set_accel_points", config = "curve", type = "motion", step = 0.25, points = { 0.1, 0.5, 1.0 } },
+        \\    }
+        \\  end,
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "river-input.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(lua_config.AppKind.river_input, app.window_config.kind);
+
+    var libinput: river_input_policy.LibinputState = .{};
+    libinput.tap = .{ .support = 3, .default = .disabled, .current = .enabled };
+    const context: river_input_policy.Context = .{
+        .devices = &.{.{
+            .id = 7,
+            .type = .pointer,
+            .name = "touchpad",
+            .libinput = libinput,
+        }},
+        .outputs = &.{.{ .id = 8, .registry_name = 24, .name = "HEADLESS-1" }},
+        .keymaps = &.{},
+        .accel_configs = &.{},
+        .events = &.{.{ .device_added = 7 }},
+        .input_management_version = 1,
+        .libinput_config_version = 1,
+        .xkb_config_version = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const commands = try app.riverInputHost().update(arena.allocator(), context);
+    try expectLuaBoolean(&app, "input_snapshot_seen", true);
+    try std.testing.expectEqual(@as(usize, 6), commands.len);
+    try std.testing.expectEqualStrings("gaming", commands[0].create_seat.name);
+    try std.testing.expectEqual(@as(u32, 7), commands[1].assign_to_seat.device);
+    try std.testing.expectEqual(@as(f64, 0.5), commands[2].set_scroll_factor.factor);
+    try std.testing.expectEqual(river_input_policy.BinaryState.disabled, commands[3].set_tap.state);
+    try std.testing.expectEqual(river_input_policy.AccelProfile.custom, commands[4].create_accel_config.profile);
+    try std.testing.expectEqualSlices(f64, &.{ 0.1, 0.5, 1.0 }, commands[5].set_accel_points.points);
 }
 
 test "storybook root catalogs and renders a selected story" {

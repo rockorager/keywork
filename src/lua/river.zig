@@ -9,9 +9,10 @@ const xkb = @import("xkb_c");
 const pop = lua_value.pop;
 
 pub fn pushModule(lua_state: *c.lua_State) void {
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 3);
     const module = c.lua_gettop(lua_state);
     lua_value.setClosureField(lua_state, module, "app", luaRiverApp, 0);
+    lua_value.setClosureField(lua_state, module, "input_app", luaRiverInputApp, 0);
     lua_value.setClosureField(lua_state, module, "window_manager", luaWindowManager, 0);
 }
 
@@ -20,6 +21,15 @@ fn luaRiverApp(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
     lua_value.setStringField(lua_state, 1, "type", "app");
     lua_value.setStringField(lua_state, 1, "kind", "river-window-manager");
+    c.lua_pushvalue(lua_state, 1);
+    return 1;
+}
+
+fn luaRiverInputApp(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.luaL_checktype(lua_state, 1, c.LUA_TTABLE);
+    lua_value.setStringField(lua_state, 1, "type", "app");
+    lua_value.setStringField(lua_state, 1, "kind", "river-input");
     c.lua_pushvalue(lua_state, 1);
     return 1;
 }
@@ -374,6 +384,9 @@ fn parseManageCommand(
         .seat = try integerField(u32, lua_state, table, "seat"),
         .modifiers = try modifiersField(lua_state, table),
     } };
+    if (std.mem.eql(u8, op, "set_layer_shell_default")) return .{ .set_layer_shell_default = .{
+        .output = try integerField(u32, lua_state, table, "output"),
+    } };
     if (std.mem.eql(u8, op, "exit_session")) return .exit_session;
     return error.UnknownRiverManageCommand;
 }
@@ -501,21 +514,23 @@ fn pushManager(lua_state: *c.lua_State, root_ref: c_int) !c_int {
 }
 
 fn pushContext(lua_state: *c.lua_State, context: river_policy.Context) void {
-    c.lua_createtable(lua_state, 0, 7);
+    c.lua_createtable(lua_state, 0, 8);
     const table = c.lua_gettop(lua_state);
     lua_value.setBooleanField(lua_state, table, "session_locked", context.session_locked);
     lua_value.setIntegerField(lua_state, table, "window_management_version", context.window_management_version);
     lua_value.setIntegerField(lua_state, table, "xkb_bindings_version", context.xkb_bindings_version);
+    lua_value.setIntegerField(lua_state, table, "layer_shell_version", context.layer_shell_version);
 
     c.lua_createtable(lua_state, @intCast(context.outputs.len), 0);
     for (context.outputs, 1..) |output, index| {
-        c.lua_createtable(lua_state, 0, 6);
+        c.lua_createtable(lua_state, 0, 7);
         lua_value.setIntegerField(lua_state, -1, "id", output.id);
         setOptionalInteger(lua_state, -1, "wl_output", output.wl_output);
         lua_value.setIntegerField(lua_state, -1, "x", output.x);
         lua_value.setIntegerField(lua_state, -1, "y", output.y);
         lua_value.setIntegerField(lua_state, -1, "width", output.width);
         lua_value.setIntegerField(lua_state, -1, "height", output.height);
+        setOptionalRectangle(lua_state, -1, "non_exclusive_area", output.non_exclusive_area);
         c.lua_rawseti(lua_state, -2, @intCast(index));
     }
     c.lua_setfield(lua_state, table, "outputs");
@@ -539,10 +554,11 @@ fn pushContext(lua_state: *c.lua_State, context: river_policy.Context) void {
 
     c.lua_createtable(lua_state, @intCast(context.seats.len), 0);
     for (context.seats, 1..) |seat, index| {
-        c.lua_createtable(lua_state, 0, 4);
+        c.lua_createtable(lua_state, 0, 5);
         lua_value.setIntegerField(lua_state, -1, "id", seat.id);
         setOptionalInteger(lua_state, -1, "wl_seat", seat.wl_seat);
         setOptionalInteger(lua_state, -1, "modifiers", seat.modifiers);
+        setOptionalEnum(lua_state, -1, "layer_shell_focus", seat.layer_shell_focus);
         const seat_table = c.lua_gettop(lua_state);
         if (seat.pointer_position) |point| {
             c.lua_createtable(lua_state, 0, 2);
@@ -600,6 +616,17 @@ fn pushEvent(lua_state: *c.lua_State, event: river_policy.Event) void {
             lua_value.setIntegerField(lua_state, table, "old", value.old);
             lua_value.setIntegerField(lua_state, table, "new", value.new);
         },
+        .layer_shell_non_exclusive_area => |value| {
+            lua_value.setIntegerField(lua_state, table, "output", value.output);
+            lua_value.setIntegerField(lua_state, table, "x", value.area.x);
+            lua_value.setIntegerField(lua_state, table, "y", value.area.y);
+            lua_value.setIntegerField(lua_state, table, "width", value.area.width);
+            lua_value.setIntegerField(lua_state, table, "height", value.area.height);
+        },
+        .layer_shell_focus => |value| {
+            lua_value.setIntegerField(lua_state, table, "seat", value.seat);
+            lua_value.setStringField(lua_state, table, "focus", @tagName(value.focus));
+        },
     }
 }
 
@@ -651,6 +678,23 @@ fn setOptionalDimensions(
         c.lua_createtable(lua_state, 0, 2);
         lua_value.setIntegerField(lua_state, -1, "width", dimensions.width);
         lua_value.setIntegerField(lua_state, -1, "height", dimensions.height);
+    } else c.lua_pushnil(lua_state);
+    c.lua_setfield(lua_state, absolute_table, name);
+}
+
+fn setOptionalRectangle(
+    lua_state: *c.lua_State,
+    table: c_int,
+    name: [*:0]const u8,
+    value: ?river_policy.Rectangle,
+) void {
+    const absolute_table = lua_value.absoluteIndex(lua_state, table);
+    if (value) |rectangle| {
+        c.lua_createtable(lua_state, 0, 4);
+        lua_value.setIntegerField(lua_state, -1, "x", rectangle.x);
+        lua_value.setIntegerField(lua_state, -1, "y", rectangle.y);
+        lua_value.setIntegerField(lua_state, -1, "width", rectangle.width);
+        lua_value.setIntegerField(lua_state, -1, "height", rectangle.height);
     } else c.lua_pushnil(lua_state);
     c.lua_setfield(lua_state, absolute_table, name);
 }

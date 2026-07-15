@@ -39,11 +39,13 @@ const Output = struct {
     runtime: *Runtime,
     id: u32,
     object: *river.OutputV1,
+    layer_shell: ?*river.LayerShellOutputV1 = null,
     wl_output: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
     width: i32 = 0,
     height: i32 = 0,
+    non_exclusive_area: ?policy.Rectangle = null,
     removed: bool = false,
 };
 
@@ -52,9 +54,11 @@ const Seat = struct {
     id: u32,
     object: *river.SeatV1,
     xkb_seat: ?*river.XkbBindingsSeatV1 = null,
+    layer_shell: ?*river.LayerShellSeatV1 = null,
     wl_seat: ?u32 = null,
     pointer_position: ?policy.Point = null,
     modifiers: ?u32 = null,
+    layer_shell_focus: ?policy.LayerShellFocus = null,
     bindings: std.ArrayList(*Binding) = .empty,
     pointer_bindings: std.ArrayList(*PointerBinding) = .empty,
     removed: bool = false,
@@ -91,8 +95,10 @@ const Runtime = struct {
     registry: *wl.Registry,
     manager: ?*river.WindowManagerV1 = null,
     xkb_bindings: ?*river.XkbBindingsV1 = null,
+    layer_shell: ?*river.LayerShellV1 = null,
     manager_global: ?u32 = null,
     xkb_global: ?u32 = null,
+    layer_shell_global: ?u32 = null,
     windows: std.ArrayList(*Window) = .empty,
     outputs: std.ArrayList(*Output) = .empty,
     seats: std.ArrayList(*Seat) = .empty,
@@ -129,6 +135,7 @@ const Runtime = struct {
 
     fn deinit(self: *Runtime) void {
         self.destroyChildren();
+        if (self.layer_shell) |layer_shell| layer_shell.destroy();
         if (self.manager) |manager| manager.destroy();
         if (self.xkb_bindings) |bindings| bindings.destroy();
         self.registry.destroy();
@@ -143,6 +150,7 @@ const Runtime = struct {
         for (self.windows.items) |window| self.destroyWindow(window, true);
         self.windows.deinit(self.allocator);
         for (self.outputs.items) |output| {
+            if (output.layer_shell) |layer_shell| layer_shell.destroy();
             output.object.destroy();
             self.allocator.destroy(output);
         }
@@ -244,10 +252,24 @@ const Runtime = struct {
                         return;
                     };
                     self.xkb_global = global.name;
+                } else if (std.mem.eql(u8, interface, std.mem.span(river.LayerShellV1.interface.name))) {
+                    self.layer_shell = registry.bind(
+                        global.name,
+                        river.LayerShellV1,
+                        @min(global.version, river.LayerShellV1.generated_version),
+                    ) catch {
+                        self.fatal = true;
+                        return;
+                    };
+                    self.layer_shell_global = global.name;
+                    self.attachLayerShellObjects() catch {
+                        self.fatal = true;
+                    };
                 }
             },
             .global_remove => |removed| {
-                if (self.manager_global == removed.name or self.xkb_global == removed.name) self.fatal = true;
+                if (self.manager_global == removed.name or self.xkb_global == removed.name or
+                    self.layer_shell_global == removed.name) self.fatal = true;
             },
         }
     }
@@ -298,6 +320,7 @@ const Runtime = struct {
         errdefer self.allocator.destroy(output);
         output.* = .{ .runtime = self, .id = try self.allocateId(), .object = object };
         object.setListener(*Output, outputListener, output);
+        try self.attachLayerShellOutput(output);
         try self.outputs.append(self.allocator, output);
         self.recordEvent(.{ .output_added = output.id });
     }
@@ -312,8 +335,28 @@ const Runtime = struct {
             seat.xkb_seat = try xkb_bindings.getSeat(object);
             seat.xkb_seat.?.setListener(*Seat, xkbSeatListener, seat);
         }
+        try self.attachLayerShellSeat(seat);
         try self.seats.append(self.allocator, seat);
         self.recordEvent(.{ .seat_added = seat.id });
+    }
+
+    fn attachLayerShellObjects(self: *Runtime) !void {
+        for (self.outputs.items) |output| try self.attachLayerShellOutput(output);
+        for (self.seats.items) |seat| try self.attachLayerShellSeat(seat);
+    }
+
+    fn attachLayerShellOutput(self: *Runtime, output: *Output) !void {
+        if (output.layer_shell != null) return;
+        const layer_shell = self.layer_shell orelse return;
+        output.layer_shell = try layer_shell.getOutput(output.object);
+        output.layer_shell.?.setListener(*Output, layerShellOutputListener, output);
+    }
+
+    fn attachLayerShellSeat(self: *Runtime, seat: *Seat) !void {
+        if (seat.layer_shell != null) return;
+        const layer_shell = self.layer_shell orelse return;
+        seat.layer_shell = try layer_shell.getSeat(seat.object);
+        seat.layer_shell.?.setListener(*Seat, layerShellSeatListener, seat);
     }
 
     fn manage(self: *Runtime) void {
@@ -427,6 +470,7 @@ const Runtime = struct {
                 .y = output.y,
                 .width = output.width,
                 .height = output.height,
+                .non_exclusive_area = output.non_exclusive_area,
             };
             output_index += 1;
         }
@@ -444,6 +488,7 @@ const Runtime = struct {
                 .wl_seat = seat.wl_seat,
                 .pointer_position = seat.pointer_position,
                 .modifiers = seat.modifiers,
+                .layer_shell_focus = seat.layer_shell_focus,
             };
             seat_index += 1;
         }
@@ -456,6 +501,7 @@ const Runtime = struct {
             .session_locked = self.session_locked,
             .window_management_version = self.manager.?.getVersion(),
             .xkb_bindings_version = self.xkb_bindings.?.getVersion(),
+            .layer_shell_version = if (self.layer_shell) |layer_shell| layer_shell.getVersion() else 0,
         };
     }
 
@@ -518,6 +564,10 @@ const Runtime = struct {
                 if (xkb_seat.getVersion() < river.XkbBindingsSeatV1.modifiers_watch_since_version)
                     return error.UnsupportedRiverProtocolVersion;
             },
+            .set_layer_shell_default => |value| {
+                const output = try self.requireOutput(value.output);
+                if (output.layer_shell == null) return error.UnsupportedRiverProtocolVersion;
+            },
             .exit_session => {
                 const manager = self.manager orelse return error.NoRiverWindowManager;
                 if (manager.getVersion() < river.WindowManagerV1.exit_session_since_version)
@@ -552,6 +602,7 @@ const Runtime = struct {
             .ensure_next_key_eaten => |value| self.findSeatId(value.seat).?.xkb_seat.?.ensureNextKeyEaten(),
             .cancel_ensure_next_key_eaten => |value| self.findSeatId(value.seat).?.xkb_seat.?.cancelEnsureNextKeyEaten(),
             .modifiers_watch => |value| self.findSeatId(value.seat).?.xkb_seat.?.modifiersWatch(@bitCast(value.modifiers)),
+            .set_layer_shell_default => |value| self.findOutputId(value.output).?.layer_shell.?.setDefault(),
             .exit_session => {
                 self.exit_requested = true;
                 self.manager.?.exitSession();
@@ -658,6 +709,7 @@ const Runtime = struct {
                 continue;
             }
             _ = self.outputs.orderedRemove(output_index);
+            if (output.layer_shell) |layer_shell| layer_shell.destroy();
             output.object.destroy();
             self.allocator.destroy(output);
         }
@@ -680,6 +732,7 @@ const Runtime = struct {
         for (seat.pointer_bindings.items) |binding| self.destroyPointerBinding(binding, destroy_object);
         seat.pointer_bindings.deinit(self.allocator);
         if (destroy_object) {
+            if (seat.layer_shell) |layer_shell| layer_shell.destroy();
             if (seat.xkb_seat) |xkb_seat| xkb_seat.destroy();
             seat.object.destroy();
         }
@@ -949,6 +1002,27 @@ const Runtime = struct {
         }
     }
 
+    fn layerShellOutputListener(
+        _: *river.LayerShellOutputV1,
+        event: river.LayerShellOutputV1.Event,
+        output: *Output,
+    ) void {
+        switch (event) {
+            .non_exclusive_area => |area| {
+                output.non_exclusive_area = .{
+                    .x = area.x,
+                    .y = area.y,
+                    .width = area.width,
+                    .height = area.height,
+                };
+                output.runtime.recordEvent(.{ .layer_shell_non_exclusive_area = .{
+                    .output = output.id,
+                    .area = output.non_exclusive_area.?,
+                } });
+            },
+        }
+    }
+
     fn seatListener(_: *river.SeatV1, event: river.SeatV1.Event, seat: *Seat) void {
         const runtime = seat.runtime;
         switch (event) {
@@ -977,6 +1051,20 @@ const Runtime = struct {
             .op_release => runtime.recordEvent(.{ .op_release = seat.id }),
             .pointer_position => |value| seat.pointer_position = .{ .x = value.x, .y = value.y },
         }
+    }
+
+    fn layerShellSeatListener(
+        _: *river.LayerShellSeatV1,
+        event: river.LayerShellSeatV1.Event,
+        seat: *Seat,
+    ) void {
+        const focus: policy.LayerShellFocus = switch (event) {
+            .focus_exclusive => .exclusive,
+            .focus_non_exclusive => .non_exclusive,
+            .focus_none => .none,
+        };
+        seat.layer_shell_focus = focus;
+        seat.runtime.recordEvent(.{ .layer_shell_focus = .{ .seat = seat.id, .focus = focus } });
     }
 
     fn bindingListener(_: *river.XkbBindingV1, event: river.XkbBindingV1.Event, binding: *Binding) void {

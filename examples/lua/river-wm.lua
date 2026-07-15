@@ -39,14 +39,15 @@ local function manage(context)
     local commands = {}
     local output = context.outputs[1]
     if output and #context.windows > 0 then
-        local width = math.floor(output.width / #context.windows)
+        local area = output.non_exclusive_area or output
+        local width = math.floor(area.width / #context.windows)
         for index, window in ipairs(context.windows) do
-            local x = output.x + (index - 1) * width
+            local x = area.x + (index - 1) * width
             table.insert(commands, {
                 "propose_dimensions",
                 window = window.id,
-                width = index == #context.windows and output.x + output.width - x or width,
-                height = output.height,
+                width = index == #context.windows and area.x + area.width - x or width,
+                height = area.height,
             })
             table.insert(commands, {
                 "set_tiled",
@@ -58,6 +59,10 @@ local function manage(context)
                 window = window.id,
             })
         end
+    end
+
+    if output and context.layer_shell_version > 0 then
+        table.insert(commands, { "set_layer_shell_default", output = output.id })
     end
 
     for _, seat in ipairs(context.seats) do
@@ -99,10 +104,11 @@ local function render(context)
     end
 
     local commands = {}
-    local width = math.floor(output.width / #context.windows)
+    local area = output.non_exclusive_area or output
+    local width = math.floor(area.width / #context.windows)
     for index, window in ipairs(context.windows) do
-        local x = output.x + (index - 1) * width
-        table.insert(commands, { "set_position", window = window.id, x = x, y = output.y })
+        local x = area.x + (index - 1) * width
+        table.insert(commands, { "set_position", window = window.id, x = x, y = area.y })
         table.insert(commands, { "show", window = window.id })
         if index == 1 then
             table.insert(commands, { "place_bottom", window = window.id })

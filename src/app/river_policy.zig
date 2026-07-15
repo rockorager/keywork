@@ -19,6 +19,13 @@ pub const Point = struct {
     y: i32,
 };
 
+pub const Rectangle = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+};
+
 pub const DecorationHint = enum {
     only_supports_csd,
     prefers_csd,
@@ -29,6 +36,12 @@ pub const DecorationHint = enum {
 pub const PresentationMode = enum {
     vsync,
     async,
+};
+
+pub const LayerShellFocus = enum {
+    exclusive,
+    non_exclusive,
+    none,
 };
 
 pub const Window = struct {
@@ -51,6 +64,7 @@ pub const Output = struct {
     y: i32,
     width: i32,
     height: i32,
+    non_exclusive_area: ?Rectangle = null,
 };
 
 pub const Seat = struct {
@@ -58,6 +72,7 @@ pub const Seat = struct {
     wl_seat: ?u32 = null,
     pointer_position: ?Point = null,
     modifiers: ?u32 = null,
+    layer_shell_focus: ?LayerShellFocus = null,
 };
 
 pub const SeatWindowEvent = struct {
@@ -89,6 +104,8 @@ pub const Event = union(enum) {
     op_release: u32,
     ate_unbound_key: u32,
     modifiers_update: struct { seat: u32, old: u32, new: u32 },
+    layer_shell_non_exclusive_area: struct { output: u32, area: Rectangle },
+    layer_shell_focus: struct { seat: u32, focus: LayerShellFocus },
 };
 
 pub const Context = struct {
@@ -99,6 +116,7 @@ pub const Context = struct {
     session_locked: bool,
     window_management_version: u32,
     xkb_bindings_version: u32,
+    layer_shell_version: u32,
 };
 
 pub const Edges = struct {
@@ -144,6 +162,7 @@ pub const ManageCommand = union(enum) {
     ensure_next_key_eaten: SeatTarget,
     cancel_ensure_next_key_eaten: SeatTarget,
     modifiers_watch: struct { seat: u32, modifiers: u32 },
+    set_layer_shell_default: struct { output: u32 },
     exit_session,
 };
 
