@@ -13,6 +13,7 @@ const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_pipewire = @import("pipewire.zig");
+const lua_river = @import("river.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
@@ -21,6 +22,7 @@ const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
 const platform_mod = @import("../app/platform.zig");
+const river_policy = @import("../app/river_policy.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
 
@@ -85,6 +87,7 @@ pub const App = struct {
     dbus_host: lua_dbus.Host = undefined,
     loop_host: lua_loop.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
+    river_host: lua_river.Host = .{},
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
@@ -220,6 +223,10 @@ pub const App = struct {
 
     pub fn bindInvalidator(self: *App, invalidator: runtime_mod.Invalidator) void {
         self.invalidator = invalidator;
+    }
+
+    pub fn riverPolicyHost(self: *App) river_policy.Host {
+        return .{ .ptr = self, .vtable = &river_policy_vtable };
     }
 
     pub fn bindPlatform(self: *App, platform: platform_mod.Platform) void {
@@ -671,6 +678,14 @@ pub const App = struct {
         var committed = false;
         errdefer if (!committed) config.deinit(self.allocator);
         errdefer if (!committed) if (catalog) |*value| value.deinit(self.allocator);
+        if (self.script_ref >= 0 and self.root_kind == .application and config.kind != self.window_config.kind)
+            return error.AppKindChanged;
+        if (config.kind == .river_window_manager) {
+            c.lua_pushvalue(self.state, root);
+            const validation_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+            defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, validation_ref);
+            try lua_river.validate(self.state, validation_ref, self.allocator);
+        }
         const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         errdefer if (!committed) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, script_ref);
         const browser_ref = if (self.storybook_browser) try self.createStorybookBrowserRef(script_ref) else -1;
@@ -988,6 +1003,65 @@ pub const App = struct {
     }
 };
 
+const river_policy_vtable: river_policy.Host.VTable = .{
+    .refresh = riverPolicyRefresh,
+    .bindings = riverPolicyBindings,
+    .layout = riverPolicyLayout,
+    .invoke_binding = riverPolicyInvokeBinding,
+    .set_control = riverPolicySetControl,
+    .bind_invalidator = riverPolicyBindInvalidator,
+    .unbind_invalidator = riverPolicyUnbindInvalidator,
+};
+
+fn riverPolicyRefresh(ptr: *anyopaque) !void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    try app.ensureLoaded();
+}
+
+fn riverPolicyBindings(ptr: *anyopaque, allocator: std.mem.Allocator) ![]river_policy.Binding {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return lua_river.parseBindings(app.state, app.script_ref, allocator);
+}
+
+fn riverPolicyLayout(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    context: river_policy.Context,
+) ![]river_policy.Placement {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return lua_river.buildLayout(app.state, app.script_ref, allocator, context);
+}
+
+fn riverPolicyInvokeBinding(ptr: *anyopaque, id: []const u8) !void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    try lua_river.invokeBinding(app.state, app.script_ref, id);
+}
+
+fn riverPolicySetControl(ptr: *anyopaque, control: ?river_policy.Control) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.river_host.control = control;
+}
+
+fn riverPolicyBindInvalidator(
+    ptr: *anyopaque,
+    invalidator_ptr: *anyopaque,
+    invalidate: *const fn (ptr: *anyopaque) anyerror!void,
+) !void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.bindInvalidator(.{
+        .ptr = invalidator_ptr,
+        .invalidate_fn = invalidate,
+        .invalidate_state_fn = invalidate,
+    });
+    errdefer app.unbindRuntime();
+    if (app.event_loop != null) try app.startLifecycle();
+}
+
+fn riverPolicyUnbindInvalidator(ptr: *anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.unbindRuntime();
+}
+
 const process_host_vtable: lua_process.Host.VTable = .{
     .allocator = hostAllocator,
     .luaState = hostLuaState,
@@ -1186,6 +1260,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
         .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
         .{ .name = "keywork.pipewire", .loader = pipewireModuleLoader, .uses_app = true },
+        .{ .name = "keywork.river", .loader = riverModuleLoader, .uses_app = true },
         .{ .name = "keywork.audio", .loader = audioModuleLoader },
         .{ .name = "keywork.log", .loader = logModuleLoader },
         .{ .name = "keywork.json", .loader = jsonModuleLoader, .uses_app = true },
@@ -1440,6 +1515,13 @@ fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn riverModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    lua_river.pushModule(lua_state, &app.river_host);
+    return 1;
+}
+
 fn jsonModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
@@ -1671,6 +1753,66 @@ test "script must return a valid keywork.app root" {
         defer app.deinit();
         try std.testing.expectError(error.InvalidAppRoot, app.ensureLoaded());
     }
+}
+
+test "river app exposes window-management policy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local river = require("keywork.river")
+        \\return river.app({
+        \\  manager = river.window_manager({
+        \\    bindings = {
+        \\      ["Super+q"] = function() binding_ran = true end,
+        \\    },
+        \\    layout = function(context)
+        \\      local output = context.outputs[1]
+        \\      local result = {}
+        \\      for index, window in ipairs(context.windows) do
+        \\        result[index] = {
+        \\          window = window.id,
+        \\          x = output.x + (index - 1) * 400,
+        \\          y = output.y,
+        \\          width = 400,
+        \\          height = output.height,
+        \\        }
+        \\      end
+        \\      return result
+        \\    end,
+        \\  }),
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "river.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(lua_config.AppKind.river_window_manager, app.window_config.kind);
+
+    const host = app.riverPolicyHost();
+    const bindings = try host.bindings(allocator);
+    defer river_policy.freeBindings(allocator, bindings);
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    try std.testing.expectEqualStrings("Super+q", bindings[0].id);
+    try std.testing.expectEqual(@as(u32, 64), bindings[0].modifiers);
+
+    const placements = try host.layout(allocator, .{
+        .outputs = &.{.{ .id = 1, .x = 10, .y = 20, .width = 800, .height = 600 }},
+        .windows = &.{
+            .{ .id = 2, .title = "first" },
+            .{ .id = 3, .title = "second" },
+        },
+        .focused_window = 2,
+    });
+    defer allocator.free(placements);
+    try std.testing.expectEqual(@as(usize, 2), placements.len);
+    try std.testing.expectEqual(@as(i32, 10), placements[0].x);
+    try std.testing.expectEqual(@as(i32, 410), placements[1].x);
+    try std.testing.expectEqual(@as(i32, 600), placements[1].height);
+
+    try host.invokeBinding("Super+q");
+    try expectLuaBoolean(&app, "binding_ran", true);
 }
 
 test "storybook root catalogs and renders a selected story" {

@@ -20,6 +20,9 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
+    const river = b.dependency("river", .{});
+    scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
+    scanner.addCustomProtocol(river.path("protocol/river-xkb-bindings-v1.xml"));
     // Generate current core surface events, then negotiate every global down
     // to the version advertised by the compositor at runtime.
     scanner.generate("wl_compositor", 7);
@@ -36,6 +39,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("ext_session_lock_manager_v1", 1);
     scanner.generate("zxdg_decoration_manager_v1", 1);
+    scanner.generate("river_window_manager_v1", 4);
+    scanner.generate("river_xkb_bindings_v1", 3);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const stb_lib = stb.add(b, target, optimize);

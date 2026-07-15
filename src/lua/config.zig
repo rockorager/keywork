@@ -8,7 +8,13 @@ const c = @import("luajit_c");
 
 const pop = lua_value.pop;
 
+pub const AppKind = enum {
+    ui,
+    river_window_manager,
+};
+
 pub const Config = struct {
+    kind: AppKind = .ui,
     app_id: ?[:0]u8 = null,
     title: ?[:0]u8 = null,
     backend: ?app_options.BackendKind = null,
@@ -37,6 +43,14 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     const root_type = (try checkStringField(lua_state, table_index, "type")) orelse
         return invalidAppRoot("script must return keywork.app(...) as its root", .{});
     if (!std.mem.eql(u8, root_type, "app")) return invalidAppRoot("script root must be an app, got '{s}'", .{root_type});
+
+    if (try checkStringField(lua_state, table_index, "kind")) |kind| {
+        if (std.mem.eql(u8, kind, "river-window-manager")) {
+            config.kind = .river_window_manager;
+        } else {
+            return invalidAppRoot("unknown app kind '{s}'", .{kind});
+        }
+    }
 
     if (try checkStringField(lua_state, table_index, "backend")) |name| {
         config.backend = backendFromName(name) orelse
@@ -68,7 +82,18 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     c.lua_getfield(lua_state, table_index, "windows");
     config.has_windows = c.lua_type(lua_state, -1) == c.LUA_TFUNCTION;
     pop(lua_state, 1);
-    if (!child_is_widget and !config.has_windows) return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
+    if (config.kind == .ui and !child_is_widget and !config.has_windows)
+        return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
+    if (config.kind == .river_window_manager) {
+        c.lua_getfield(lua_state, table_index, "manager");
+        defer pop(lua_state, 1);
+        if (c.lua_type(lua_state, -1) != c.LUA_TTABLE)
+            return invalidAppRoot("river.app requires a river.window_manager in 'manager'", .{});
+        const manager_type = (try checkStringField(lua_state, c.lua_gettop(lua_state), "type")) orelse
+            return invalidAppRoot("river.app requires a river.window_manager in 'manager'", .{});
+        if (!std.mem.eql(u8, manager_type, "river-window-manager"))
+            return invalidAppRoot("river.app manager must be river.window_manager(...)", .{});
+    }
 
     const app_id = try checkStringField(lua_state, table_index, "app_id");
     const title = try checkStringField(lua_state, table_index, "title");
