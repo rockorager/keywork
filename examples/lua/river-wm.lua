@@ -6,6 +6,8 @@ local process = require("keywork.process")
 local focused = {}
 local focus_next = {}
 local close_focused = {}
+local floating = {}
+local toggle_floating = {}
 local exit_session = false
 
 local function contains_window(context, id)
@@ -36,23 +38,66 @@ local function manage(context)
         end
     end
 
+    for _, window in ipairs(context.windows) do
+        if window.app_id == "org.keywork.effects" then
+            floating[window.id] = true
+        end
+    end
+    for id in pairs(floating) do
+        if not contains_window(context, id) then
+            floating[id] = nil
+        end
+    end
+    for _, seat in ipairs(context.seats) do
+        if not contains_window(context, focused[seat.id]) then
+            focused[seat.id] = next_window(context)
+        end
+        if toggle_floating[seat.id] then
+            local window = focused[seat.id]
+            if window then
+                floating[window] = not floating[window]
+            end
+            toggle_floating[seat.id] = nil
+        end
+    end
+
     local commands = {}
     local output = context.outputs[1]
     if output and #context.windows > 0 then
         local area = output.non_exclusive_area or output
-        local width = math.floor(area.width / #context.windows)
-        for index, window in ipairs(context.windows) do
-            local x = area.x + (index - 1) * width
+        local tiled_count = 0
+        for _, window in ipairs(context.windows) do
+            if not floating[window.id] then
+                tiled_count = tiled_count + 1
+            end
+        end
+        local tiled_index = 0
+        for _, window in ipairs(context.windows) do
+            local width
+            local height
+            if floating[window.id] then
+                width = math.max(1, math.floor(area.width * 0.7))
+                height = math.max(1, math.floor(area.height * 0.7))
+            else
+                tiled_index = tiled_index + 1
+                width = math.floor(area.width / tiled_count)
+                local x = area.x + (tiled_index - 1) * width
+                if tiled_index == tiled_count then
+                    width = area.x + area.width - x
+                end
+                height = area.height
+            end
             table.insert(commands, {
                 "propose_dimensions",
                 window = window.id,
-                width = index == #context.windows and area.x + area.width - x or width,
-                height = area.height,
+                width = width,
+                height = height,
             })
             table.insert(commands, {
                 "set_tiled",
                 window = window.id,
-                edges = { top = true, bottom = true, left = true, right = true },
+                edges = floating[window.id] and {} or
+                    { top = true, bottom = true, left = true, right = true },
             })
             table.insert(commands, {
                 "set_capabilities",
@@ -66,9 +111,6 @@ local function manage(context)
     end
 
     for _, seat in ipairs(context.seats) do
-        if not contains_window(context, focused[seat.id]) then
-            focused[seat.id] = next_window(context)
-        end
         if focus_next[seat.id] then
             focused[seat.id] = next_window(context, focused[seat.id])
             focus_next[seat.id] = nil
@@ -105,18 +147,48 @@ local function render(context)
 
     local commands = {}
     local area = output.non_exclusive_area or output
-    local width = math.floor(area.width / #context.windows)
-    for index, window in ipairs(context.windows) do
-        local x = area.x + (index - 1) * width
-        table.insert(commands, { "set_position", window = window.id, x = x, y = area.y })
-        table.insert(commands, { "show", window = window.id })
+    local tiled_count = 0
+    for _, window in ipairs(context.windows) do
+        if not floating[window.id] then
+            tiled_count = tiled_count + 1
+        end
+    end
+    local order = {}
+    local tiled_index = 0
+    for _, window in ipairs(context.windows) do
+        if not floating[window.id] then
+            tiled_index = tiled_index + 1
+            local width = math.floor(area.width / tiled_count)
+            local x = area.x + (tiled_index - 1) * width
+            table.insert(commands, { "set_position", window = window.id, x = x, y = area.y })
+            table.insert(commands, { "show", window = window.id })
+            table.insert(order, window.id)
+        end
+    end
+    local floating_index = 0
+    for _, window in ipairs(context.windows) do
+        if floating[window.id] then
+            floating_index = floating_index + 1
+            local width = math.max(1, math.floor(area.width * 0.7))
+            local height = math.max(1, math.floor(area.height * 0.7))
+            local offset = (floating_index - 1) * 32
+            local x = area.x + math.floor((area.width - width) / 2) + offset
+            local y = area.y + math.floor((area.height - height) / 2) + offset
+            x = math.min(x, area.x + area.width - width)
+            y = math.min(y, area.y + area.height - height)
+            table.insert(commands, { "set_position", window = window.id, x = x, y = y })
+            table.insert(commands, { "show", window = window.id })
+            table.insert(order, window.id)
+        end
+    end
+    for index, window in ipairs(order) do
         if index == 1 then
-            table.insert(commands, { "place_bottom", window = window.id })
+            table.insert(commands, { "place_bottom", window = window })
         else
             table.insert(commands, {
                 "place_above",
-                window = window.id,
-                other = context.windows[index - 1].id,
+                window = window,
+                other = order[index - 1],
             })
         end
     end
@@ -131,6 +203,17 @@ return river.app({
             end,
             ["Super+g"] = function()
                 assert(process.spawn({ argv = { "ghostty" } }))
+            end,
+            ["Super+Shift+g"] = function()
+                assert(process.spawn({
+                    argv = {
+                        "ghostty",
+                        "--class=org.keywork.effects",
+                    },
+                }))
+            end,
+            ["Super+space"] = function(seat)
+                toggle_floating[seat] = true
             end,
             ["Super+j"] = function(seat)
                 focus_next[seat] = true
