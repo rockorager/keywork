@@ -111,6 +111,8 @@ const Runtime = struct {
     finished: bool = false,
     exit_requested: bool = false,
     fatal: bool = false,
+    event_loop: ?*event_loop.EventLoop = null,
+    source_handle: ?event_loop.EventLoop.SourceHandle = null,
 
     fn init(self: *Runtime, allocator: std.mem.Allocator, host: *policy.Host) !void {
         const display = try wl.Display.connect(null);
@@ -170,11 +172,13 @@ const Runtime = struct {
     }
 
     fn stop(self: *Runtime) void {
-        if (self.unavailable or self.finished) return;
+        if (self.unavailable or self.finished or self.exit_requested) return;
         const manager = self.manager orelse return;
         manager.stop();
+        self.flush() catch return;
         while (!self.finished) {
             if (self.display.dispatch() != .SUCCESS) return;
+            self.flush() catch return;
         }
     }
 
@@ -185,44 +189,43 @@ const Runtime = struct {
     fn invalidate(ctx: *anyopaque) anyerror!void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         if (!self.shouldStop()) {
-            if (self.manager) |manager| manager.manageDirty();
+            if (self.manager) |manager| {
+                manager.manageDirty();
+                try self.flush();
+            }
         }
     }
 
-    fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
-        var dispatched_pending = false;
-        while (!self.display.prepareRead()) {
-            if (self.display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
-            dispatched_pending = true;
-        }
-
+    fn flush(self: *Runtime) !void {
         const events: u32 = switch (self.display.flush()) {
             .SUCCESS => linux.EPOLL.IN,
             .AGAIN => linux.EPOLL.IN | linux.EPOLL.OUT,
             else => {
-                self.display.cancelRead();
+                self.fatal = true;
                 return error.FlushFailed;
             },
         };
-        return .{ .events = events, .dispatched_pending = dispatched_pending };
+        if (self.event_loop) |loop| if (self.source_handle) |handle| loop.modifySource(handle, events);
     }
 
-    fn eventLoopFinish(ctx: *anyopaque, events: u32) !bool {
+    fn eventLoopCallback(ctx: *anyopaque, loop: *event_loop.EventLoop, events: u32) !void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         if (events & linux.EPOLL.IN != 0) {
-            if (self.display.readEvents() != .SUCCESS) {
-                if (self.exit_requested) return false;
-                return error.ReadEventsFailed;
+            if (self.display.dispatch() != .SUCCESS) {
+                if (self.exit_requested) {
+                    loop.quit();
+                    return;
+                }
+                self.fatal = true;
+                return error.DispatchFailed;
             }
-        } else {
-            self.display.cancelRead();
+        } else if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
+            if (!self.exit_requested) self.fatal = true;
+            loop.quit();
+            return;
         }
-        if (self.display.dispatchPending() != .SUCCESS) {
-            if (self.exit_requested) return false;
-            return error.DispatchFailed;
-        }
-        return !self.shouldStop();
+        try self.flush();
+        if (self.shouldStop()) loop.quit();
     }
 
     fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Runtime) void {
@@ -1120,28 +1123,74 @@ const Runtime = struct {
     }
 };
 
+/// Owns one River window-management protocol session. Its display is an
+/// ordinary eagerly-flushed event-loop source, allowing a separate UI
+/// display to retain the loop's prepare-read integration.
+pub const Client = struct {
+    runtime: Runtime = undefined,
+    host: *policy.Host = undefined,
+
+    pub fn init(self: *Client, allocator: std.mem.Allocator, host: *policy.Host) !void {
+        self.* = .{ .host = host };
+        try self.runtime.init(allocator, host);
+        if (self.runtime.unavailable) {
+            self.runtime.deinit();
+            host.unbindInvalidator();
+            return error.RiverWindowManagementUnavailable;
+        }
+    }
+
+    pub fn deinit(self: *Client) void {
+        std.debug.assert(self.runtime.source_handle == null);
+        self.runtime.deinit();
+        self.host.unbindInvalidator();
+    }
+
+    pub fn install(self: *Client, loop: *event_loop.EventLoop) !void {
+        std.debug.assert(self.runtime.event_loop == null);
+        std.debug.assert(self.runtime.source_handle == null);
+        self.runtime.event_loop = loop;
+        errdefer self.runtime.event_loop = null;
+        self.runtime.source_handle = try loop.addFd(.{
+            .fd = self.runtime.display.getFd(),
+            .events = linux.EPOLL.IN,
+            .ctx = &self.runtime,
+            .callback = Runtime.eventLoopCallback,
+            .pump_with_wayland = true,
+        });
+        errdefer {
+            loop.removeSource(self.runtime.source_handle.?);
+            self.runtime.source_handle = null;
+        }
+        try self.runtime.flush();
+    }
+
+    pub fn uninstall(self: *Client) void {
+        const loop = self.runtime.event_loop orelse return;
+        if (self.runtime.source_handle) |handle| loop.removeSource(handle);
+        self.runtime.source_handle = null;
+        self.runtime.event_loop = null;
+    }
+
+    pub fn finish(self: *Client) !void {
+        self.runtime.stop();
+        if (self.runtime.unavailable) return error.RiverWindowManagementUnavailable;
+        if (self.runtime.fatal) return error.RiverWindowManagerFailed;
+    }
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     loop: *event_loop.EventLoop,
     host: *policy.Host,
 ) !void {
-    var runtime: Runtime = undefined;
-    try runtime.init(allocator, host);
-    defer runtime.deinit();
-    defer host.unbindInvalidator();
-
-    if (runtime.unavailable) return error.RiverWindowManagementUnavailable;
-    try loop.setWayland(.{
-        .fd = runtime.display.getFd(),
-        .ctx = &runtime,
-        .prepare = Runtime.eventLoopPrepare,
-        .finish = Runtime.eventLoopFinish,
-    });
-    defer loop.clearWayland();
+    var client: Client = undefined;
+    try client.init(allocator, host);
+    defer client.deinit();
+    try client.install(loop);
+    defer client.uninstall();
     try loop.run();
-    runtime.stop();
-    if (runtime.unavailable) return error.RiverWindowManagementUnavailable;
-    if (runtime.fatal) return error.RiverWindowManagerFailed;
+    try client.finish();
 }
 
 fn riverEdges(edges: policy.Edges) river.WindowV1.Edges {

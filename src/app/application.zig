@@ -10,6 +10,7 @@ const event_loop = @import("../linux/event_loop.zig");
 const lua_module = @import("../lua/app.zig");
 
 const Application = @This();
+const log = std.log.scoped(.keywork_application);
 
 allocator: std.mem.Allocator,
 loop: event_loop.EventLoop,
@@ -36,6 +37,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
     const window = self.lua.window_config;
 
     if (window.kind == .river_window_manager) {
+        if (window.has_ui) return self.runRiverUi(init_io, run_options);
         var river_host = self.lua.riverPolicyHost();
         try self.lua.bindEventLoop(&self.loop);
         defer self.lua.unbindEventLoop();
@@ -47,6 +49,52 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         defer self.lua.unbindEventLoop();
         return river_input_manager.run(self.allocator, &self.loop, &river_host);
     }
+
+    return self.runUi(init_io, run_options, true, false);
+}
+
+fn runRiverUi(self: *Application, init_io: std.Io, run_options: cli.Options) !void {
+    // Bind application resources before either protocol client starts. The
+    // UI runner still owns its UI invalidator, but not this shared loop bind.
+    try self.lua.bindEventLoop(&self.loop);
+    var app_loop_bound = true;
+    defer if (app_loop_bound) self.lua.unbindEventLoop();
+
+    var river_host = self.lua.riverPolicyHost();
+    var river_client: river_window_manager.Client = undefined;
+    river_client.init(self.allocator, &river_host) catch |err| switch (err) {
+        error.NoRiverWindowManager => {
+            log.info("River window-management protocol unavailable; running UI only", .{});
+            // The failed River initialization unbound its invalidator. Rebind
+            // through the ordinary UI path so lifecycle hooks and resources
+            // start against the UI invalidator instead.
+            self.lua.unbindEventLoop();
+            app_loop_bound = false;
+            return self.runUi(init_io, run_options, true, false);
+        },
+        else => return err,
+    };
+    defer river_client.deinit();
+    try river_client.install(&self.loop);
+    defer river_client.uninstall();
+
+    self.runUi(init_io, run_options, false, true) catch |err| {
+        // Prefer a specific River terminal error when it is what stopped a
+        // UI configure wait or the shared event loop.
+        river_client.finish() catch |river_err| return river_err;
+        return err;
+    };
+    try river_client.finish();
+}
+
+fn runUi(
+    self: *Application,
+    init_io: std.Io,
+    run_options: cli.Options,
+    bind_event_loop: bool,
+    keep_headless_alive: bool,
+) !void {
+    const window = self.lua.window_config;
 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;
     // Apps declaring a window set need a windowing backend by default.
@@ -76,8 +124,12 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .bind_platform = lua_module.App.bindPlatformOpaque,
         .unbind_platform = lua_module.App.unbindPlatformOpaque,
         .unbind_runtime = lua_module.App.unbindRuntimeOpaque,
-        .bind_event_loop = lua_module.App.bindEventLoopOpaque,
-        .unbind_event_loop = lua_module.App.unbindEventLoopOpaque,
-        .should_run_headless = lua_module.App.shouldRunHeadlessOpaque,
+        .bind_event_loop = if (bind_event_loop) lua_module.App.bindEventLoopOpaque else null,
+        .unbind_event_loop = if (bind_event_loop) lua_module.App.unbindEventLoopOpaque else null,
+        .should_run_headless = if (keep_headless_alive) alwaysRunHeadless else lua_module.App.shouldRunHeadlessOpaque,
     });
+}
+
+fn alwaysRunHeadless(_: *anyopaque) bool {
+    return true;
 }

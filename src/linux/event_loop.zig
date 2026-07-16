@@ -69,6 +69,11 @@ pub const EventLoop = struct {
         ctx: *anyopaque,
         callback: SourceCallback,
         destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void = null,
+        /// Dispatch this source alongside the Wayland connection while a
+        /// client waits synchronously for surface configuration. This is for
+        /// protocol peers whose replies can unblock that configuration, not
+        /// for general application sources.
+        pump_with_wayland: bool = false,
     };
 
     pub const SourceHandle = struct {
@@ -404,6 +409,85 @@ pub const EventLoop = struct {
         self.wayland = null;
     }
 
+    /// Blocks for one turn of the primary Wayland connection and any
+    /// protocol peers that explicitly participate in configure waits. The
+    /// Wayland read is always finished before peer callbacks run, so those
+    /// callbacks may safely make synchronous calls on the primary display.
+    ///
+    /// Phase hooks and unrelated sources are intentionally omitted: callers
+    /// use this only inside a synchronous configure wait, including waits
+    /// nested in an end-turn hook. A wake is queued after dispatch so the
+    /// regular loop gets another turn to drain semantic events and reconcile
+    /// invalidations produced here.
+    pub fn pumpWayland(self: *EventLoop) !bool {
+        const wayland = self.wayland orelse return error.NoWaylandSource;
+        if (self.stop_requested) return false;
+
+        var poll_fds: std.ArrayList(linux.pollfd) = .empty;
+        defer poll_fds.deinit(self.allocator);
+        var source_tokens: std.ArrayList(u64) = .empty;
+        defer source_tokens.deinit(self.allocator);
+
+        try poll_fds.append(self.allocator, .{ .fd = wayland.fd, .events = 0, .revents = 0 });
+        for (self.sources.items, 0..) |slot, index| {
+            const source = slot.source orelse continue;
+            if (!source.pump_with_wayland) continue;
+            try poll_fds.append(self.allocator, .{
+                .fd = source.fd,
+                .events = pollEvents(source.events),
+                .revents = 0,
+            });
+            try source_tokens.append(self.allocator, sourceToken(@intCast(index), slot.generation));
+        }
+
+        const prepared = try wayland.prepare(wayland.ctx);
+        var read_prepared = true;
+        errdefer {
+            if (read_prepared) _ = wayland.finish(wayland.ctx, 0) catch true;
+        }
+        poll_fds.items[0].events = pollEvents(prepared.events);
+
+        if (!prepared.dispatched_pending) {
+            while (true) {
+                const result = linux.poll(poll_fds.items.ptr, @intCast(poll_fds.items.len), -1);
+                switch (linux.errno(result)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return error.PollFailed,
+                }
+            }
+        }
+
+        read_prepared = false;
+        const keep_running = try wayland.finish(
+            wayland.ctx,
+            if (prepared.dispatched_pending) 0 else epollEvents(poll_fds.items[0].revents),
+        );
+
+        const entered_dispatch = !self.dispatching;
+        if (entered_dispatch) self.dispatching = true;
+        defer if (entered_dispatch) {
+            self.dispatching = false;
+            self.flushPendingDestroy();
+        };
+
+        if (!prepared.dispatched_pending) {
+            for (poll_fds.items[1..], source_tokens.items) |poll_fd, token| {
+                if (poll_fd.revents == 0) continue;
+                const index: usize = @intCast(@as(u32, @truncate(token)));
+                const generation: u32 = @truncate(token >> 32);
+                if (index >= self.sources.items.len) continue;
+                const slot = self.sources.items[index];
+                if (slot.generation != generation) continue;
+                const source = slot.source orelse continue;
+                try source.callback(source.ctx, self, epollEvents(poll_fd.revents));
+            }
+        }
+
+        try self.wake();
+        return keep_running and !self.stop_requested;
+    }
+
     pub fn setAfterPlatformHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
         self.after_platform_context = context;
         self.after_platform_hook = hook;
@@ -594,6 +678,14 @@ fn drainWake(fd: i32) void {
             else => return,
         }
     }
+}
+
+fn pollEvents(events: u32) i16 {
+    return @bitCast(@as(u16, @truncate(events)));
+}
+
+fn epollEvents(events: i16) u32 {
+    return @as(u16, @bitCast(events));
 }
 
 fn epollWait(fd: i32, events: *[EventLoop.max_events]linux.epoll_event, timeout_ms: i32) !usize {
@@ -1012,4 +1104,73 @@ test "Wayland events dispatched during prepare run without polling" {
     try loop.run();
 
     try std.testing.expectEqualStrings("pfae", context.order[0..context.len]);
+}
+
+test "configure pump finishes Wayland before dispatching protocol peers" {
+    const PumpTest = struct {
+        order: [2]u8 = undefined,
+        len: usize = 0,
+        wayland_fd: i32,
+        peer_fd: i32,
+
+        fn append(self: *@This(), value: u8) void {
+            self.order[self.len] = value;
+            self.len += 1;
+        }
+
+        fn prepare(_: *anyopaque) !EventLoop.WaylandPrepare {
+            return .{ .events = linux.EPOLL.IN };
+        }
+
+        fn finish(ctx: *anyopaque, events: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expect(events & linux.EPOLL.IN != 0);
+            var byte: [1]u8 = undefined;
+            _ = linux.read(self.wayland_fd, &byte, byte.len);
+            self.append('w');
+            return true;
+        }
+
+        fn peer(ctx: *anyopaque, _: *EventLoop, events: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expect(events & linux.EPOLL.IN != 0);
+            var byte: [1]u8 = undefined;
+            _ = linux.read(self.peer_fd, &byte, byte.len);
+            self.append('p');
+        }
+    };
+
+    var wayland_fds: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&wayland_fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer {
+        for (wayland_fds) |fd| _ = linux.close(fd);
+    }
+    var peer_fds: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&peer_fds, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer {
+        for (peer_fds) |fd| _ = linux.close(fd);
+    }
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: PumpTest = .{ .wayland_fd = wayland_fds[0], .peer_fd = peer_fds[0] };
+    try loop.setWayland(.{
+        .fd = wayland_fds[0],
+        .ctx = &context,
+        .prepare = PumpTest.prepare,
+        .finish = PumpTest.finish,
+    });
+    _ = try loop.addFd(.{
+        .fd = peer_fds[0],
+        .events = linux.EPOLL.IN,
+        .ctx = &context,
+        .callback = PumpTest.peer,
+        .pump_with_wayland = true,
+    });
+    const byte = [_]u8{1};
+    _ = linux.write(wayland_fds[1], &byte, byte.len);
+    _ = linux.write(peer_fds[1], &byte, byte.len);
+
+    try std.testing.expect(try loop.pumpWayland());
+    try std.testing.expectEqualStrings("wp", context.order[0..context.len]);
 }

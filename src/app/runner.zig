@@ -157,6 +157,15 @@ fn runWayland(
         .decorations = options.decorations,
         .layer_shell = options.layer_shell,
     });
+    try loop.setWayland(.{
+        .fd = backend.eventLoopFd(),
+        .ctx = backend,
+        .prepare = Backend.eventLoopPrepare,
+        .finish = Backend.eventLoopFinish,
+    });
+    defer loop.clearWayland();
+    backend.bindEventLoop(loop);
+    defer backend.unbindEventLoop();
     try backend.waitForAllConfigured();
     const configured_size = win.currentSize();
     initial_constraints = .{ .max_width = configured_size.width, .max_height = configured_size.height };
@@ -211,13 +220,6 @@ fn runWayland(
     }
     try runtime.repaint();
 
-    try loop.setWayland(.{
-        .fd = backend.eventLoopFd(),
-        .ctx = backend,
-        .prepare = Backend.eventLoopPrepare,
-        .finish = Backend.eventLoopFinish,
-    });
-    defer loop.clearWayland();
     try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
@@ -761,6 +763,15 @@ fn runWaylandWindowed(
     if (options.session_lock) try backend.beginSessionLock();
     if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
     defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
+    try loop.setWayland(.{
+        .fd = backend.eventLoopFd(),
+        .ctx = backend,
+        .prepare = Backend.eventLoopPrepare,
+        .finish = Backend.eventLoopFinishKeepAlive,
+    });
+    defer loop.clearWayland();
+    backend.bindEventLoop(loop);
+    defer backend.unbindEventLoop();
 
     if (settings_client) |*settings| settings.finishColorSchemeRead();
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
@@ -795,13 +806,6 @@ fn runWaylandWindowed(
 
     // Loop lifetime is the manager's decision, not the backend's: zero
     // live windows is a valid state while the app waits for outputs.
-    try loop.setWayland(.{
-        .fd = backend.eventLoopFd(),
-        .ctx = backend,
-        .prepare = Backend.eventLoopPrepare,
-        .finish = Backend.eventLoopFinishKeepAlive,
-    });
-    defer loop.clearWayland();
     try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;

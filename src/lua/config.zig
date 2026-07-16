@@ -31,6 +31,9 @@ pub const Config = struct {
     /// The script declares its window set via a `windows` function, so
     /// it needs a windowing backend even without app-level layer_shell.
     has_windows: bool = false,
+    /// The app declares either a widget child or a window set. River window
+    /// managers may omit UI entirely or combine it with their policy.
+    has_ui: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.app_id) |value| allocator.free(value);
@@ -80,13 +83,22 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     pop(lua_state, 1);
 
     c.lua_getfield(lua_state, table_index, "child");
-    const child_is_widget = c.lua_type(lua_state, -1) == c.LUA_TTABLE and isWidgetTable(lua_state, c.lua_gettop(lua_state));
+    const child_type = c.lua_type(lua_state, -1);
+    const child_is_widget = child_type == c.LUA_TTABLE and isWidgetTable(lua_state, c.lua_gettop(lua_state));
+    if (child_type != c.LUA_TNIL and !child_is_widget)
+        return invalidAppRoot("app option 'child' must be a widget", .{});
     pop(lua_state, 1);
     c.lua_getfield(lua_state, table_index, "windows");
-    config.has_windows = c.lua_type(lua_state, -1) == c.LUA_TFUNCTION;
+    const windows_type = c.lua_type(lua_state, -1);
+    config.has_windows = windows_type == c.LUA_TFUNCTION;
+    if (windows_type != c.LUA_TNIL and !config.has_windows)
+        return invalidAppRoot("app option 'windows' must be a function", .{});
     pop(lua_state, 1);
-    if (config.kind == .ui and !child_is_widget and !config.has_windows)
+    config.has_ui = child_is_widget or config.has_windows;
+    if (config.kind == .ui and !config.has_ui)
         return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
+    if (config.kind == .river_input and config.has_ui)
+        return invalidAppRoot("river.input_app does not support a child or windows function", .{});
     if (config.kind == .river_window_manager) {
         c.lua_getfield(lua_state, table_index, "manager");
         defer pop(lua_state, 1);

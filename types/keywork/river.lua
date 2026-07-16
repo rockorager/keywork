@@ -317,8 +317,10 @@
 
 ---@class keywork.river.WindowManager
 
----@class keywork.river.AppOptions
+---@class keywork.river.AppOptions: keywork.AppBaseOptions
 ---@field manager keywork.river.WindowManager
+---@field child?  keywork.Widget
+---@field windows? fun(context: keywork.WindowsContext): keywork.WindowOptions[]
 ---@field start?  fun()
 ---@field stop?   fun()
 
