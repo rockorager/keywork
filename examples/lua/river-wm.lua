@@ -129,6 +129,9 @@ return river.app({
             ["Super+Return"] = function()
                 assert(process.spawn({ argv = { "foot" } }))
             end,
+            ["Super+g"] = function()
+                assert(process.spawn({ argv = { "ghostty" } }))
+            end,
             ["Super+j"] = function(seat)
                 focus_next[seat] = true
             end,
