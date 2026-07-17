@@ -22,7 +22,6 @@ pub fn Backend(comptime RendererAdapter: type) type {
         windows: std.ArrayList(*Window),
         clipboard: ?*data_device.Clipboard = null,
         session_lock: ?window.SessionLock = null,
-        event_loop: ?*event_loop.EventLoop = null,
 
         pub const PointerButtonHandler = WaylandInput.PointerButtonHandler;
         pub const PointerMoveHandler = WaylandInput.PointerMoveHandler;
@@ -193,22 +192,8 @@ pub fn Backend(comptime RendererAdapter: type) type {
             return self.connection.display.getFd();
         }
 
-        pub fn bindEventLoop(self: *Self, loop: *event_loop.EventLoop) void {
-            std.debug.assert(self.event_loop == null);
-            self.event_loop = loop;
-        }
-
-        pub fn unbindEventLoop(self: *Self) void {
-            self.event_loop = null;
-        }
-
         pub fn waitForAllConfigured(self: *Self) !void {
-            while (!self.allConfigured() and !self.allClosed() and !self.sessionLockFinished()) {
-                if (!try self.dispatchConfigureWait()) {
-                    if (!self.allConfigured() and !self.allClosed() and !self.sessionLockFinished())
-                        return error.EventLoopStopped;
-                }
-            }
+            while (!self.allConfigured() and !self.allClosed() and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
             if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (self.allClosed()) return error.WindowClosed;
             for (self.windows.items) |win| {
@@ -217,34 +202,18 @@ pub fn Backend(comptime RendererAdapter: type) type {
             }
         }
         pub fn waitForConfigured(self: *Self, win: *Window) !void {
-            while (!win.protocol.configured and !win.protocol.closed and !self.sessionLockFinished()) {
-                if (!try self.dispatchConfigureWait()) {
-                    if (!win.protocol.configured and !win.protocol.closed and !self.sessionLockFinished())
-                        return error.EventLoopStopped;
-                }
-            }
+            while (!win.protocol.configured and !win.protocol.closed and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
             if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (win.protocol.closed) return error.WindowClosed;
             _ = win.protocol.flushPending();
             self.input.setTargetScale(&win.input_target, win.protocol.scale);
         }
         pub fn waitForConfigureAfter(self: *Self, win: *Window, generation: u64) !void {
-            while (win.protocol.configureGeneration() == generation and !win.protocol.closed and !self.sessionLockFinished()) {
-                if (!try self.dispatchConfigureWait()) {
-                    if (win.protocol.configureGeneration() == generation and !win.protocol.closed and !self.sessionLockFinished())
-                        return error.EventLoopStopped;
-                }
-            }
+            while (win.protocol.configureGeneration() == generation and !win.protocol.closed and !self.sessionLockFinished()) if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
             if (self.sessionLockFinished()) return error.SessionLockFinished;
             if (win.protocol.closed) return error.WindowClosed;
             _ = win.protocol.flushPending();
             self.input.setTargetScale(&win.input_target, win.protocol.scale);
-        }
-
-        fn dispatchConfigureWait(self: *Self) !bool {
-            if (self.event_loop) |loop| return loop.pumpWayland();
-            if (self.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
-            return true;
         }
 
         pub fn eventLoopPrepare(ctx: *anyopaque) !event_loop.EventLoop.WaylandPrepare {
@@ -340,7 +309,10 @@ pub fn Backend(comptime RendererAdapter: type) type {
             }
             fn present(ptr: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
                 const self: *Window = @ptrCast(@alignCast(ptr));
-                try self.backend.waitForConfigured(self);
+                while (!self.protocol.configured and !self.protocol.closed) {
+                    if (self.backend.connection.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+                }
+                if (self.protocol.closed) return error.WindowClosed;
                 return RendererAdapter.present(self, frame);
             }
             fn measureText(ptr: *anyopaque, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {

@@ -13,8 +13,6 @@ const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_pipewire = @import("pipewire.zig");
-const lua_river = @import("river.zig");
-const lua_river_input = @import("river_input.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
@@ -23,8 +21,6 @@ const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
 const platform_mod = @import("../app/platform.zig");
-const river_input_policy = @import("../app/river_input_policy.zig");
-const river_policy = @import("../app/river_policy.zig");
 const runtime_mod = @import("../ui/runtime.zig");
 const c = @import("luajit_c");
 
@@ -91,10 +87,7 @@ pub const App = struct {
     pipewire_host: lua_pipewire.Host = undefined,
     socket_host: lua_socket.Host = undefined,
     event_loop: ?*event_loop.EventLoop = null,
-    /// Invalidates the UI runtime or declarative window manager.
     invalidator: ?runtime_mod.Invalidator = null,
-    /// Invalidates the River policy transaction independently of the UI.
-    river_invalidator: ?runtime_mod.Invalidator = null,
     /// Desktop services (clipboard, activation tokens, interactive
     /// move/resize) bridged from the windowing backend; null on
     /// headless backends.
@@ -214,7 +207,7 @@ pub const App = struct {
         for (self.dbus_buses.items) |bus| try bus.register();
         for (self.pipewire_connections.items) |connection| try connection.register();
         if (self.pending_scope_cancels.items.len > 0) try self.armScopeCancelTimer(loop);
-        if (self.hasInvalidator()) try self.startLifecycle();
+        if (self.invalidator != null) try self.startLifecycle();
         if (self.quit_requested) {
             self.quit_requested = false;
             loop.quit();
@@ -229,44 +222,6 @@ pub const App = struct {
         self.invalidator = invalidator;
     }
 
-    fn bindRiverInvalidator(self: *App, invalidator: runtime_mod.Invalidator) void {
-        self.river_invalidator = invalidator;
-    }
-
-    fn hasInvalidator(self: *const App) bool {
-        return self.invalidator != null or self.river_invalidator != null;
-    }
-
-    fn invalidate(self: *App) !void {
-        var first_error: ?anyerror = null;
-        if (self.invalidator) |invalidator| invalidator.invalidate() catch |err| {
-            first_error = err;
-        };
-        if (self.river_invalidator) |invalidator| invalidator.invalidate() catch |err| {
-            if (first_error == null) first_error = err;
-        };
-        if (first_error) |err| return err;
-    }
-
-    fn invalidateState(self: *App) !void {
-        var first_error: ?anyerror = null;
-        if (self.invalidator) |invalidator| invalidator.invalidateState() catch |err| {
-            first_error = err;
-        };
-        if (self.river_invalidator) |invalidator| invalidator.invalidateState() catch |err| {
-            if (first_error == null) first_error = err;
-        };
-        if (first_error) |err| return err;
-    }
-
-    pub fn riverPolicyHost(self: *App) river_policy.Host {
-        return .{ .ptr = self, .vtable = &river_policy_vtable };
-    }
-
-    pub fn riverInputHost(self: *App) river_input_policy.Host {
-        return .{ .ptr = self, .vtable = &river_input_policy_vtable };
-    }
-
     pub fn bindPlatform(self: *App, platform: platform_mod.Platform) void {
         self.platform = platform;
     }
@@ -276,13 +231,8 @@ pub const App = struct {
     }
 
     pub fn unbindRuntime(self: *App) void {
+        self.stopLifecycleLog();
         self.invalidator = null;
-        if (self.river_invalidator == null) self.stopLifecycleLog();
-    }
-
-    fn unbindRiverInvalidator(self: *App) void {
-        self.river_invalidator = null;
-        if (self.invalidator == null) self.stopLifecycleLog();
     }
 
     pub fn unbindEventLoop(self: *App) void {
@@ -721,21 +671,6 @@ pub const App = struct {
         var committed = false;
         errdefer if (!committed) config.deinit(self.allocator);
         errdefer if (!committed) if (catalog) |*value| value.deinit(self.allocator);
-        if (self.script_ref >= 0 and self.root_kind == .application) {
-            if (config.kind != self.window_config.kind or config.has_ui != self.window_config.has_ui)
-                return error.AppKindChanged;
-        }
-        if (config.kind == .river_window_manager) {
-            c.lua_pushvalue(self.state, root);
-            const validation_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
-            defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, validation_ref);
-            try lua_river.validate(self.state, validation_ref, self.allocator);
-        } else if (config.kind == .river_input) {
-            c.lua_pushvalue(self.state, root);
-            const validation_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
-            defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, validation_ref);
-            try lua_river_input.validate(self.state, validation_ref);
-        }
         const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         errdefer if (!committed) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, script_ref);
         const browser_ref = if (self.storybook_browser) try self.createStorybookBrowserRef(script_ref) else -1;
@@ -760,7 +695,7 @@ pub const App = struct {
         self.script_dirty = false;
         committed = true;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
-        if (self.event_loop != null and self.hasInvalidator()) try self.startLifecycle();
+        if (self.event_loop != null and self.invalidator != null) try self.startLifecycle();
     }
 
     fn createStorybookBrowserRef(self: *App, script_ref: c_int) !c_int {
@@ -861,7 +796,8 @@ pub const App = struct {
 
     fn invalidateWidgetState(ptr: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ptr));
-        try self.invalidateState();
+        const invalidator = self.invalidator orelse return;
+        try invalidator.invalidateState();
     }
 
     fn createWidgetScope(ptr: *anyopaque) anyerror!*LuaScope {
@@ -1052,107 +988,6 @@ pub const App = struct {
     }
 };
 
-const river_policy_vtable: river_policy.Host.VTable = .{
-    .refresh = riverPolicyRefresh,
-    .bindings = riverPolicyBindings,
-    .pointer_bindings = riverPolicyPointerBindings,
-    .manage = riverPolicyManage,
-    .render = riverPolicyRender,
-    .invoke_binding = riverPolicyInvokeBinding,
-    .invoke_pointer_binding = riverPolicyInvokePointerBinding,
-    .bind_invalidator = riverPolicyBindInvalidator,
-    .unbind_invalidator = riverPolicyUnbindInvalidator,
-};
-
-const river_input_policy_vtable: river_input_policy.Host.VTable = .{
-    .refresh = riverPolicyRefresh,
-    .update = riverInputUpdate,
-    .bind_invalidator = riverPolicyBindInvalidator,
-    .unbind_invalidator = riverPolicyUnbindInvalidator,
-};
-
-fn riverInputUpdate(
-    ptr: *anyopaque,
-    allocator: std.mem.Allocator,
-    context: river_input_policy.Context,
-) ![]river_input_policy.Command {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river_input.update(app.state, app.script_ref, allocator, context);
-}
-
-fn riverPolicyRefresh(ptr: *anyopaque) !void {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    try app.ensureLoaded();
-}
-
-fn riverPolicyBindings(ptr: *anyopaque, allocator: std.mem.Allocator) ![]river_policy.Binding {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river.parseBindings(app.state, app.script_ref, allocator);
-}
-
-fn riverPolicyPointerBindings(ptr: *anyopaque, allocator: std.mem.Allocator) ![]river_policy.PointerBinding {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river.parsePointerBindings(app.state, app.script_ref, allocator);
-}
-
-fn riverPolicyManage(
-    ptr: *anyopaque,
-    allocator: std.mem.Allocator,
-    context: river_policy.Context,
-) ![]river_policy.ManageCommand {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river.manage(app.state, app.script_ref, allocator, context);
-}
-
-fn riverPolicyRender(
-    ptr: *anyopaque,
-    allocator: std.mem.Allocator,
-    context: river_policy.Context,
-) ![]river_policy.RenderCommand {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    return lua_river.render(app.state, app.script_ref, allocator, context);
-}
-
-fn riverPolicyInvokeBinding(
-    ptr: *anyopaque,
-    id: []const u8,
-    event: river_policy.BindingEvent,
-    seat: u32,
-) !void {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    try lua_river.invokeBinding(app.state, app.script_ref, id, event, seat);
-}
-
-fn riverPolicyInvokePointerBinding(
-    ptr: *anyopaque,
-    id: []const u8,
-    event: river_policy.BindingEvent,
-    seat: u32,
-) !void {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    try lua_river.invokePointerBinding(app.state, app.script_ref, id, event, seat);
-}
-
-fn riverPolicyBindInvalidator(
-    ptr: *anyopaque,
-    invalidator_ptr: *anyopaque,
-    invalidate: *const fn (ptr: *anyopaque) anyerror!void,
-) !void {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    app.bindRiverInvalidator(.{
-        .ptr = invalidator_ptr,
-        .invalidate_fn = invalidate,
-        .invalidate_state_fn = invalidate,
-    });
-    errdefer app.unbindRiverInvalidator();
-    if (app.event_loop != null) try app.startLifecycle();
-}
-
-fn riverPolicyUnbindInvalidator(ptr: *anyopaque) void {
-    const app: *App = @ptrCast(@alignCast(ptr));
-    app.unbindRiverInvalidator();
-}
-
 const process_host_vtable: lua_process.Host.VTable = .{
     .allocator = hostAllocator,
     .luaState = hostLuaState,
@@ -1189,7 +1024,8 @@ const loop_host_vtable: lua_loop.Host.VTable = .{
 
 fn loopHostInvalidate(ptr: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ptr));
-    try app.invalidate();
+    const invalidator = app.invalidator orelse return;
+    try invalidator.invalidate();
 }
 
 fn loopHostAddFdWatch(ptr: *anyopaque, fd: i32, events: u32) anyerror!*FdWatch {
@@ -1262,7 +1098,8 @@ fn scriptChanged(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, ma
     const app: *App = @ptrCast(@alignCast(ctx));
     std.log.scoped(.keywork_luajit).info("reload requested for {s} mask=0x{x}", .{ path, mask });
     app.script_dirty = true;
-    try app.invalidate();
+    const invalidator = app.invalidator orelse return;
+    try invalidator.invalidate();
 }
 
 /// First byte of a LuaJIT (and PUC Lua) bytecode dump.
@@ -1349,7 +1186,6 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
         .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
         .{ .name = "keywork.pipewire", .loader = pipewireModuleLoader, .uses_app = true },
-        .{ .name = "keywork.river", .loader = riverModuleLoader, .uses_app = true },
         .{ .name = "keywork.audio", .loader = audioModuleLoader },
         .{ .name = "keywork.log", .loader = logModuleLoader },
         .{ .name = "keywork.json", .loader = jsonModuleLoader, .uses_app = true },
@@ -1604,12 +1440,6 @@ fn pipewireModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn riverModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    lua_river.pushModule(lua_state);
-    return 1;
-}
-
 fn jsonModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
@@ -1665,7 +1495,7 @@ fn luaReload(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
     app.script_dirty = true;
-    app.invalidate() catch |err| {
+    if (app.invalidator) |invalidator| invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("reload invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "reload failed");
     };
@@ -1761,7 +1591,8 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    app.invalidate() catch |err| {
+    const invalidator = app.invalidator orelse return 0;
+    invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "invalidate failed");
     };
@@ -1840,217 +1671,6 @@ test "script must return a valid keywork.app root" {
         defer app.deinit();
         try std.testing.expectError(error.InvalidAppRoot, app.ensureLoaded());
     }
-}
-
-test "river app exposes window-management policy" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const script =
-        \\local kw = require("keywork")
-        \\local river = require("keywork.river")
-        \\return river.app({
-        \\  child = kw.text("desktop shell"),
-        \\  manager = river.window_manager({
-        \\    bindings = {
-        \\      ["Super+q"] = {
-        \\        layout = 1,
-        \\        pressed = function(seat, event)
-        \\          binding_ran = seat == 4 and event == "pressed"
-        \\        end,
-        \\      },
-        \\    },
-        \\    pointer_bindings = {
-        \\      {
-        \\        id = "move",
-        \\        button = 272,
-        \\        modifiers = { super = true },
-        \\        pressed = function(seat, event)
-        \\          pointer_binding_ran = seat == 4 and event == "pressed"
-        \\        end,
-        \\      },
-        \\    },
-        \\    manage = function(context)
-        \\      versions_seen = context.window_management_version == 4
-        \\        and context.xkb_bindings_version == 3
-        \\      local output = context.outputs[1]
-        \\      local result = {}
-        \\      for index, window in ipairs(context.windows) do
-        \\        result[index] = {
-        \\          "propose_dimensions",
-        \\          window = window.id,
-        \\          width = 400,
-        \\          height = output.height,
-        \\        }
-        \\      end
-        \\      return result
-        \\    end,
-        \\    render = function(context)
-        \\      local output = context.outputs[1]
-        \\      local result = {}
-        \\      for index, window in ipairs(context.windows) do
-        \\        result[index] = {
-        \\          "set_position",
-        \\          window = window.id,
-        \\          x = output.x + (index - 1) * 400,
-        \\          y = output.y,
-        \\        }
-        \\      end
-        \\      return result
-        \\    end,
-        \\  }),
-        \\})
-        \\
-    ;
-    var app = try initTestApp(allocator, &tmp, "river.lua", script);
-    defer app.deinit();
-    try app.ensureLoaded();
-    try std.testing.expectEqual(lua_config.AppKind.river_window_manager, app.window_config.kind);
-    try std.testing.expect(app.window_config.has_ui);
-
-    const host = app.riverPolicyHost();
-    const bindings = try host.bindings(allocator);
-    defer river_policy.freeBindings(allocator, bindings);
-    try std.testing.expectEqual(@as(usize, 1), bindings.len);
-    try std.testing.expectEqualStrings("Super+q", bindings[0].id);
-    try std.testing.expectEqual(@as(u32, 64), bindings[0].modifiers);
-    try std.testing.expectEqual(@as(?u32, 1), bindings[0].layout);
-    const pointer_bindings = try host.pointerBindings(allocator);
-    defer river_policy.freePointerBindings(allocator, pointer_bindings);
-    try std.testing.expectEqual(@as(usize, 1), pointer_bindings.len);
-    try std.testing.expectEqualStrings("move", pointer_bindings[0].id);
-    try std.testing.expectEqual(@as(u32, 272), pointer_bindings[0].button);
-    try std.testing.expectEqual(@as(u32, 64), pointer_bindings[0].modifiers);
-
-    const context: river_policy.Context = .{
-        .outputs = &.{.{ .id = 1, .x = 10, .y = 20, .width = 800, .height = 600 }},
-        .windows = &.{
-            .{ .id = 2, .title = "first" },
-            .{ .id = 3, .title = "second" },
-        },
-        .seats = &.{.{ .id = 4 }},
-        .events = &.{.{ .window_added = 2 }},
-        .session_locked = false,
-        .window_management_version = 4,
-        .xkb_bindings_version = 3,
-        .layer_shell_version = 1,
-    };
-    const manage_commands = try host.manage(allocator, context);
-    defer allocator.free(manage_commands);
-    try expectLuaBoolean(&app, "versions_seen", true);
-    try std.testing.expectEqual(@as(usize, 2), manage_commands.len);
-    try std.testing.expectEqual(@as(i32, 400), manage_commands[0].propose_dimensions.width);
-    try std.testing.expectEqual(@as(i32, 600), manage_commands[1].propose_dimensions.height);
-
-    const render_commands = try host.render(allocator, context);
-    defer allocator.free(render_commands);
-    try std.testing.expectEqual(@as(usize, 2), render_commands.len);
-    try std.testing.expectEqual(@as(i32, 10), render_commands[0].set_position.x);
-    try std.testing.expectEqual(@as(i32, 410), render_commands[1].set_position.x);
-
-    try host.invokeBinding("Super+q", .pressed, 4);
-    try expectLuaBoolean(&app, "binding_ran", true);
-    try host.invokePointerBinding("move", .pressed, 4);
-    try expectLuaBoolean(&app, "pointer_binding_ran", true);
-}
-
-test "river app cannot change UI mode on reload" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const manager_only =
-        \\local river = require("keywork.river")
-        \\return river.app({ manager = river.window_manager({
-        \\  manage = function() return {} end,
-        \\  render = function() return {} end,
-        \\}) })
-        \\
-    ;
-    var app = try initTestApp(allocator, &tmp, "river-reload.lua", manager_only);
-    defer app.deinit();
-    try app.ensureLoaded();
-    try std.testing.expect(!app.window_config.has_ui);
-
-    const with_ui =
-        \\local kw = require("keywork")
-        \\local river = require("keywork.river")
-        \\return river.app({
-        \\  child = kw.text("shell"),
-        \\  manager = river.window_manager({
-        \\    manage = function() return {} end,
-        \\    render = function() return {} end,
-        \\  }),
-        \\})
-        \\
-    ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "river-reload.lua", .data = with_ui });
-    app.script_dirty = true;
-    try std.testing.expectError(error.AppKindChanged, app.ensureLoaded());
-}
-
-test "river input app exposes snapshots and ordered commands" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const script =
-        \\local river = require("keywork.river")
-        \\return river.input_app({
-        \\  update = function(context)
-        \\    local device = context.devices[1]
-        \\    input_snapshot_seen = context.input_management_version == 1
-        \\      and context.libinput_config_version == 1
-        \\      and context.xkb_config_version == 1
-        \\      and device.type == "pointer"
-        \\      and device.libinput.tap.current == "enabled"
-        \\      and context.events[1].type == "device_added"
-        \\    return {
-        \\      { "create_seat", name = "gaming" },
-        \\      { "assign_to_seat", device = device.id, name = "gaming" },
-        \\      { "set_scroll_factor", device = device.id, factor = 0.5 },
-        \\      { "set_tap", device = device.id, state = "disabled" },
-        \\      { "create_accel_config", id = "curve", profile = "custom" },
-        \\      { "set_accel_points", config = "curve", type = "motion", step = 0.25, points = { 0.1, 0.5, 1.0 } },
-        \\    }
-        \\  end,
-        \\})
-        \\
-    ;
-    var app = try initTestApp(allocator, &tmp, "river-input.lua", script);
-    defer app.deinit();
-    try app.ensureLoaded();
-    try std.testing.expectEqual(lua_config.AppKind.river_input, app.window_config.kind);
-
-    var libinput: river_input_policy.LibinputState = .{};
-    libinput.tap = .{ .support = 3, .default = .disabled, .current = .enabled };
-    const context: river_input_policy.Context = .{
-        .devices = &.{.{
-            .id = 7,
-            .type = .pointer,
-            .name = "touchpad",
-            .libinput = libinput,
-        }},
-        .outputs = &.{.{ .id = 8, .registry_name = 24, .name = "HEADLESS-1" }},
-        .keymaps = &.{},
-        .accel_configs = &.{},
-        .events = &.{.{ .device_added = 7 }},
-        .input_management_version = 1,
-        .libinput_config_version = 1,
-        .xkb_config_version = 1,
-    };
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const commands = try app.riverInputHost().update(arena.allocator(), context);
-    try expectLuaBoolean(&app, "input_snapshot_seen", true);
-    try std.testing.expectEqual(@as(usize, 6), commands.len);
-    try std.testing.expectEqualStrings("gaming", commands[0].create_seat.name);
-    try std.testing.expectEqual(@as(u32, 7), commands[1].assign_to_seat.device);
-    try std.testing.expectEqual(@as(f64, 0.5), commands[2].set_scroll_factor.factor);
-    try std.testing.expectEqual(river_input_policy.BinaryState.disabled, commands[3].set_tap.state);
-    try std.testing.expectEqual(river_input_policy.AccelProfile.custom, commands[4].create_accel_config.profile);
-    try std.testing.expectEqualSlices(f64, &.{ 0.1, 0.5, 1.0 }, commands[5].set_accel_points.points);
 }
 
 test "storybook root catalogs and renders a selected story" {
@@ -3468,49 +3088,6 @@ test "lua stateful widget prefers its build scope invalidator" {
     try runtime.click(.{ .x = 2, .y = 2 });
     try std.testing.expectEqual(@as(usize, 1), scoped_invalidator.calls);
     try std.testing.expectEqual(@as(usize, 0), global_invalidator.calls);
-}
-
-test "app invalidation reaches UI and River policy" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var app = try initTestApp(
-        allocator,
-        &tmp,
-        "dual-invalidator.lua",
-        "local kw = require('keywork'); return kw.app({ child = kw.text('x') })\n",
-    );
-    defer app.deinit();
-
-    const Counter = struct {
-        calls: usize = 0,
-
-        fn invalidate(ptr: *anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-        }
-    };
-
-    var ui: Counter = .{};
-    app.bindInvalidator(.{
-        .ptr = &ui,
-        .invalidate_fn = Counter.invalidate,
-        .invalidate_state_fn = Counter.invalidate,
-    });
-    var river: Counter = .{};
-    const river_host = app.riverPolicyHost();
-    try river_host.bindInvalidator(&river, Counter.invalidate);
-
-    try app.invalidate();
-    try std.testing.expectEqual(@as(usize, 1), ui.calls);
-    try std.testing.expectEqual(@as(usize, 1), river.calls);
-
-    app.unbindRuntime();
-    try app.invalidate();
-    try std.testing.expectEqual(@as(usize, 1), ui.calls);
-    try std.testing.expectEqual(@as(usize, 2), river.calls);
-    river_host.unbindInvalidator();
 }
 
 test "lua stateful widget dispose runs when removed" {

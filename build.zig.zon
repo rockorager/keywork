@@ -8,10 +8,6 @@
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
             .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
         },
-        .river = .{
-            .url = "git+https://codeberg.org/river/river#f6d961773711dc29d3eb5b60bd14744a6a33894f",
-            .hash = "river-0.4.5-_G6Njt6_CwB4aHyFxnYjZq2_hQLBK4iJd4MkvgWF6RZm",
-        },
         .uucode = .{
             .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
             .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
