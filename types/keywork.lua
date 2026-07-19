@@ -496,6 +496,7 @@
 ---@field height?      number | 'content'
 ---@field output?      string                    Output name from `context.outputs`.
 ---@field layer_shell? keywork.LayerShellOptions
+---@field background_blur? boolean                Blur content behind the full surface when supported.
 ---@field on_close?    fun()
 ---@field child        keywork.Widget
 
@@ -507,6 +508,7 @@
 ---@field height?       number
 ---@field decorations?  'server' | 'client'
 ---@field layer_shell?  keywork.LayerShellOptions
+---@field background_blur? boolean                Default for windows and their popups.
 ---@field session_lock? boolean
 ---@field start?        fun()
 ---@field stop?         fun()

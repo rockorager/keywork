@@ -19,6 +19,8 @@ pub const WindowDeclaration = struct {
     /// height. Normal xdg-toplevel windows do not support this policy.
     content_height: bool = false,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    /// Null inherits the app-level background blur preference.
+    background_blur: ?bool = null,
     /// Output name (e.g. "DP-1") the window should appear on; null lets
     /// the compositor choose.
     output: ?[]const u8 = null,

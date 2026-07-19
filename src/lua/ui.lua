@@ -983,6 +983,7 @@ ui.window = setmetatable({}, {
             height = options.height,
             output = options.output,
             layer_shell = options.layer_shell,
+            background_blur = options.background_blur,
             on_close = options.on_close,
             child = options.child,
         }

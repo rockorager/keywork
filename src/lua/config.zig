@@ -18,6 +18,8 @@ pub const Config = struct {
     /// default (server-side).
     decorations: ?wayland_options.Decorations = null,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    /// Ask the compositor to blur content behind the full window surface.
+    background_blur: bool = false,
     /// Request ext-session-lock and make every declared window a lock
     /// surface. Each window must name an output.
     session_lock: bool = false,
@@ -44,6 +46,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     }
     if (try checkNumberField(lua_state, table_index, "width")) |value| config.width = @floatCast(value);
     if (try checkNumberField(lua_state, table_index, "height")) |value| config.height = @floatCast(value);
+    config.background_blur = try checkBoolField(lua_state, table_index, "background_blur");
     config.session_lock = try checkBoolField(lua_state, table_index, "session_lock");
     if (try checkStringField(lua_state, table_index, "decorations")) |name| {
         config.decorations = if (std.mem.eql(u8, name, "server"))

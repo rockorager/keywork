@@ -38,6 +38,7 @@ pub fn Backend(comptime RendererAdapter: type) type {
             height: u31 = 480,
             decorations: wayland_options.Decorations = .server,
             layer_shell: ?wayland_options.LayerShellOptions = null,
+            background_blur: bool = false,
             output: ?*wl.Output = null,
             session_lock: ?*window.SessionLock = null,
         };

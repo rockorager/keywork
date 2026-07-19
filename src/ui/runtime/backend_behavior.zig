@@ -109,6 +109,9 @@ pub fn presentFrame(self: anytype) !void {
         .scale = render_scale,
         .damage = &.{damage},
         .display_list = self.display_list.commands.items,
+        // Source-over painting cannot reduce the alpha established by the
+        // full-frame background.
+        .fully_opaque = background.a == 255,
         .partial_display_list = partial_paint_bounds != null,
     });
     self.presented_size = frame_size;

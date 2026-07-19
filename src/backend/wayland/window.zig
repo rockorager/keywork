@@ -78,6 +78,14 @@ pub const Surface = struct {
     /// toplevel it decorates. Null on layer/popup roles or when the
     /// compositor lacks the protocol.
     decoration: ?*zxdg.ToplevelDecorationV1 = null,
+    /// Surface-scoped compositor blur. Null when it was not requested or
+    /// ext-background-effect-v1 is unavailable.
+    background_effect: ?*ext.BackgroundEffectSurfaceV1 = null,
+    background_blur: bool = false,
+    background_blur_width: ?u31 = null,
+    background_blur_height: ?u31 = null,
+    opaque_width: ?u31 = null,
+    opaque_height: ?u31 = null,
     layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
     configured: bool = false,
     configure_generation: u64 = 0,
@@ -107,6 +115,8 @@ pub const Surface = struct {
         errdefer shell_role.destroy();
         const decoration = try createDecoration(connection.decoration_manager, shell_role, options.decorations);
         errdefer if (decoration) |toplevel_decoration| toplevel_decoration.destroy();
+        const background_effect = try createBackgroundEffect(connection, surface, options.background_blur);
+        errdefer if (background_effect) |effect| effect.destroy();
         if (options.layer_shell) |layer_options| {
             if (layer_options.pointer_interactivity == .none) {
                 const empty_region = try compositor.createRegion();
@@ -124,6 +134,8 @@ pub const Surface = struct {
             .fractional_scale = scale_objects.fractional_scale,
             .shell_role = shell_role,
             .decoration = decoration,
+            .background_effect = background_effect,
+            .background_blur = options.background_blur,
             .layer_keyboard_interactivity = if (options.layer_shell) |layer_options|
                 layer_options.keyboard_interactivity
             else
@@ -162,6 +174,8 @@ pub const Surface = struct {
         // instead of an xdg parent.
         if (parent.shell_role == .layer) parent.shell_role.layer.surface.getPopup(popup);
 
+        const background_effect = try createBackgroundEffect(connection, surface, parent.background_blur);
+        errdefer if (background_effect) |effect| effect.destroy();
         const scale_objects = createScaleObjects(connection, surface);
         errdefer scale_objects.deinit();
 
@@ -171,6 +185,8 @@ pub const Surface = struct {
             .viewport = scale_objects.viewport,
             .fractional_scale = scale_objects.fractional_scale,
             .shell_role = .{ .popup = .{ .surface = xdg_surface, .popup = popup } },
+            .background_effect = background_effect,
+            .background_blur = parent.background_blur,
             .width = options.width,
             .height = options.height,
             .scale = if (scale_objects.fractional_scale != null or parent.fractional_scale == null) parent.scale else 1,
@@ -201,6 +217,7 @@ pub const Surface = struct {
         if (self.frame_callback) |callback| callback.destroy();
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
+        if (self.background_effect) |effect| effect.destroy();
         if (self.decoration) |decoration| decoration.destroy();
         self.shell_role.destroy();
         self.surface.destroy();
@@ -249,7 +266,9 @@ pub const Surface = struct {
     /// Configures the mapping from the physical render buffer to the
     /// surface's logical coordinate space. Fractional scaling uses a
     /// viewport; the core fallback uses an integer buffer scale.
-    pub fn configureBuffer(self: *Surface, logical_width: u31, logical_height: u31) void {
+    pub fn configureBuffer(self: *Surface, logical_width: u31, logical_height: u31, fully_opaque: bool) !void {
+        try self.configureOpaqueRegion(logical_width, logical_height, fully_opaque);
+        try self.configureBackgroundBlur(logical_width, logical_height);
         if (self.viewport) |viewport| {
             if (self.surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
                 self.surface.setBufferScale(1);
@@ -260,6 +279,48 @@ pub const Surface = struct {
         if (self.surface.getVersion() < wl.Surface.set_buffer_scale_since_version) return;
         const scale: i32 = @intFromFloat(@max(1, self.scale));
         self.surface.setBufferScale(scale);
+    }
+
+    /// Regions use logical surface coordinates and are copied by Wayland.
+    /// Queue changed geometry immediately before the renderer's surface
+    /// commit so pixels, opacity, and blur stay atomic.
+    fn configureOpaqueRegion(self: *Surface, logical_width: u31, logical_height: u31, fully_opaque: bool) !void {
+        if (!fully_opaque) {
+            if (self.opaque_width == null) return;
+            self.surface.setOpaqueRegion(null);
+            self.opaque_width = null;
+            self.opaque_height = null;
+            return;
+        }
+        if (self.opaque_width == logical_width and self.opaque_height == logical_height) return;
+        const compositor = self.connection.compositor orelse return error.NoWlCompositor;
+        const region = try compositor.createRegion();
+        defer region.destroy();
+        region.add(0, 0, @intCast(logical_width), @intCast(logical_height));
+        self.surface.setOpaqueRegion(region);
+        self.opaque_width = logical_width;
+        self.opaque_height = logical_height;
+    }
+
+    fn configureBackgroundBlur(self: *Surface, logical_width: u31, logical_height: u31) !void {
+        const effect = self.background_effect orelse return;
+        if (self.background_blur_width == logical_width and self.background_blur_height == logical_height) return;
+        const compositor = self.connection.compositor orelse return error.NoWlCompositor;
+        const region = try compositor.createRegion();
+        defer region.destroy();
+        region.add(0, 0, @intCast(logical_width), @intCast(logical_height));
+        effect.setBlurRegion(region);
+        self.background_blur_width = logical_width;
+        self.background_blur_height = logical_height;
+    }
+
+    fn attachBackgroundEffect(self: *Surface, manager: *ext.BackgroundEffectManagerV1) void {
+        if (!self.background_blur or self.background_effect != null or !self.connection.background_effect_capabilities.blur) return;
+        self.background_effect = manager.getBackgroundEffect(self.surface) catch |err| {
+            log.warn("failed to create background effect: {}", .{err});
+            return;
+        };
+        self.repaint_pending = true;
     }
 
     /// Damage is expressed in buffer pixels when supported. Very old core
@@ -550,6 +611,16 @@ fn createDecoration(
     return decoration;
 }
 
+fn createBackgroundEffect(
+    connection: *const Connection,
+    surface: *wl.Surface,
+    enabled: bool,
+) !?*ext.BackgroundEffectSurfaceV1 {
+    if (!enabled or !connection.background_effect_capabilities.blur) return null;
+    const effect_manager = connection.background_effect_manager orelse return null;
+    return try effect_manager.getBackgroundEffect(surface);
+}
+
 fn resizeEdge(edge: wayland_options.ResizeEdge) xdg.Toplevel.ResizeEdge {
     return switch (edge) {
         .top => .top,
@@ -632,6 +703,8 @@ pub const Connection = struct {
     data_device_manager: ?*wl.DataDeviceManager = null,
     activation: ?*xdg.ActivationV1 = null,
     session_lock_manager: ?*ext.SessionLockManagerV1 = null,
+    background_effect_manager: ?*ext.BackgroundEffectManagerV1 = null,
+    background_effect_capabilities: ext.BackgroundEffectManagerV1.Capability = .{},
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
     seat: ?*wl.Seat = null,
     /// True once the first seat global has been bound. Survives takeSeat()
@@ -674,11 +747,12 @@ pub const Connection = struct {
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         if (self.compositor == null) return error.NoWlCompositor;
         if (needs.shm and self.shm == null) return error.NoWlShm;
-        // Seat and output listeners were installed during the first
-        // roundtrip; their bind requests are only flushed after that
-        // roundtrip ends. A second collects the initial seat capabilities
-        // and output name/mode/scale bursts so callers see complete state.
-        if (self.seat_selected or (needs.outputs and self.outputs.items.len > 0)) {
+        // Seat, output, and background-effect listeners were installed
+        // during the first roundtrip; their bind requests are only flushed
+        // after it ends. A second collects the initial seat and effect
+        // capabilities plus output property bursts so callers see complete
+        // state.
+        if (self.seat_selected or self.background_effect_manager != null or (needs.outputs and self.outputs.items.len > 0)) {
             if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         }
         return self;
@@ -697,6 +771,7 @@ pub const Connection = struct {
         if (self.seat) |seat| destroySeat(seat);
         releaseOutputs(self.allocator, &self.outputs);
         if (self.decoration_manager) |manager| manager.destroy();
+        if (self.background_effect_manager) |manager| manager.destroy();
         if (self.session_lock_manager) |manager| manager.destroy();
         if (self.activation) |activation| activation.destroy();
         if (self.data_device_manager) |manager| manager.destroy();
@@ -831,6 +906,17 @@ fn connectionSeatListener(_: *wl.Seat, event: wl.Seat.Event, self: *Connection) 
     }
 }
 
+fn backgroundEffectManagerListener(_: *ext.BackgroundEffectManagerV1, event: ext.BackgroundEffectManagerV1.Event, self: *Connection) void {
+    switch (event) {
+        .capabilities => |capabilities| {
+            self.background_effect_capabilities = capabilities.flags;
+            if (!capabilities.flags.blur) return;
+            const manager = self.background_effect_manager orelse return;
+            for (self.surfaces.items) |surface| surface.attachBackgroundEffect(manager);
+        },
+    }
+}
+
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Connection) void {
     switch (event) {
         .global => |global| {
@@ -864,6 +950,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Con
             } else if (std.mem.orderZ(u8, global.interface, ext.SessionLockManagerV1.interface.name) == .eq) {
                 if (self.session_lock_manager == null)
                     self.session_lock_manager = registry.bind(global.name, ext.SessionLockManagerV1, @min(global.version, ext.SessionLockManagerV1.generated_version)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, ext.BackgroundEffectManagerV1.interface.name) == .eq) {
+                if (self.background_effect_manager != null) return;
+                const manager = registry.bind(global.name, ext.BackgroundEffectManagerV1, @min(global.version, ext.BackgroundEffectManagerV1.generated_version)) catch return;
+                self.background_effect_manager = manager;
+                manager.setListener(*Connection, backgroundEffectManagerListener, self);
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
                 if (self.decoration_manager == null)
                     self.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, @min(global.version, zxdg.DecorationManagerV1.generated_version)) catch return;
@@ -1268,6 +1359,19 @@ pub fn eventLoopFinish(
 
 pub fn frameLogicalDimension(dimension: f32, fallback: u31) !u31 {
     return frameDimension(if (dimension > 0) dimension else @as(f32, @floatFromInt(fallback)));
+}
+
+/// A fractional frame may round up to a larger Wayland surface. It cannot be
+/// advertised as fully opaque because the renderer does not promise coverage
+/// outside the original frame bounds.
+pub fn frameCoversLogicalDimensions(size: keywork.Size, width: u31, height: u31) bool {
+    return size.width == @as(f32, @floatFromInt(width)) and
+        size.height == @as(f32, @floatFromInt(height));
+}
+
+test "only integral frame bounds cover rounded Wayland dimensions" {
+    try std.testing.expect(frameCoversLogicalDimensions(.{ .width = 320, .height = 240 }, 320, 240));
+    try std.testing.expect(!frameCoversLogicalDimensions(.{ .width = 319.5, .height = 240 }, 320, 240));
 }
 
 pub fn scaledFrameDimension(logical_dimension: u31, scale: f32) !u31 {

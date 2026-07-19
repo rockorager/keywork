@@ -37,6 +37,7 @@ pub const Options = struct {
     backend: app_options.BackendKind = .log,
     decorations: wayland_options.Decorations = .server,
     layer_shell: ?wayland_options.LayerShellOptions = null,
+    background_blur: bool = false,
     session_lock: bool = false,
     log_writer: *std.Io.Writer,
     runtime_context: ?*anyopaque = null,
@@ -156,6 +157,7 @@ fn runWayland(
         .height = try layerSurfaceDimension(options.layer_shell, options.height),
         .decorations = options.decorations,
         .layer_shell = options.layer_shell,
+        .background_blur = options.background_blur,
     });
     try backend.waitForAllConfigured();
     const configured_size = win.currentSize();
@@ -1111,6 +1113,7 @@ fn WindowManager(comptime Backend: type) type {
         fn createManaged(self: *Self, decl: app_windows.WindowDeclaration) !void {
             // Null declaration fields inherit the app-level defaults.
             const layer_shell = decl.layer_shell orelse self.options.layer_shell;
+            const background_blur = decl.background_blur orelse self.options.background_blur;
             const width = decl.width orelse self.options.width;
             if (decl.content_height and layer_shell == null) return error.ContentSizeRequiresLayerShell;
             const height_cap = if (decl.content_height)
@@ -1131,6 +1134,7 @@ fn WindowManager(comptime Backend: type) type {
                 .height = try layerSurfaceDimension(layer_shell, height_cap),
                 .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
+                .background_blur = background_blur,
                 .output = output,
                 .session_lock = if (self.options.session_lock) self.backend.sessionLockHandle() else null,
             });

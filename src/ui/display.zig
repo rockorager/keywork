@@ -460,6 +460,8 @@ pub const RenderBackend = struct {
         scale: f32,
         damage: []const Rect,
         display_list: []const PaintCommand,
+        /// Every pixel in the frame is guaranteed to have full alpha.
+        fully_opaque: bool = false,
         /// The display list omits commands outside damage. A backend that
         /// advertised this capability must preserve those pixels or fail.
         partial_display_list: bool = false,

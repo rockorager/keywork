@@ -546,6 +546,17 @@ pub const App = struct {
         }
         pop(self.state, 1);
 
+        c.lua_getfield(self.state, table, "background_blur");
+        switch (c.lua_type(self.state, -1)) {
+            c.LUA_TNIL => {},
+            c.LUA_TBOOLEAN => decl.background_blur = c.lua_toboolean(self.state, -1) != 0,
+            else => {
+                pop(self.state, 1);
+                return error.WindowBackgroundBlurInvalid;
+            },
+        }
+        pop(self.state, 1);
+
         c.lua_getfield(self.state, table, "child");
         if (c.lua_isnil(self.state, -1)) return error.WindowChildMissing;
         try self.captureWindowChild(staged_children, id);
@@ -1773,7 +1784,7 @@ test "keywork core excludes optional capability modules" {
         \\assert(type(require("keywork.pipewire").connect) == "function")
         \\assert(type(require("keywork.audio").monitor) == "function")
         \\assert(type(require("keywork.log").info) == "function")
-        \\local options = { child = kw.text("x") }
+        \\local options = { background_blur = true, child = kw.text("x") }
         \\local root = kw.app(options)
         \\assert(root == options)
         \\assert(root.type == "app")
@@ -1783,6 +1794,7 @@ test "keywork core excludes optional capability modules" {
     var app = try initTestApp(allocator, &tmp, "app-callable.lua", script);
     defer app.deinit();
     try app.ensureLoaded();
+    try std.testing.expect(app.window_config.background_blur);
 }
 
 test "application lifecycle hooks run exactly once per load" {
@@ -3693,9 +3705,9 @@ test "lua window declarations preserve numeric sizes and accept content height" 
         \\return kw.app({
         \\  windows = function()
         \\    return {
-        \\      kw.window({ id = "fixed", width = 320, height = 180, child = kw.text("fixed") }),
+        \\      kw.window({ id = "fixed", width = 320, height = 180, background_blur = true, child = kw.text("fixed") }),
         \\      kw.window({
-        \\        id = "content", width = 380, height = "content",
+        \\        id = "content", width = 380, height = "content", background_blur = false,
         \\        layer_shell = { layer = "overlay", anchor = { "top", "right" }, pointer = "none" },
         \\        child = kw.text("content"),
         \\      }),
@@ -3714,9 +3726,11 @@ test "lua window declarations preserve numeric sizes and accept content height" 
     try std.testing.expectEqual(@as(?f32, 320), declarations[0].width);
     try std.testing.expectEqual(@as(?f32, 180), declarations[0].height);
     try std.testing.expect(!declarations[0].content_height);
+    try std.testing.expectEqual(@as(?bool, true), declarations[0].background_blur);
     try std.testing.expectEqual(@as(?f32, 380), declarations[1].width);
     try std.testing.expectEqual(@as(?f32, null), declarations[1].height);
     try std.testing.expect(declarations[1].content_height);
+    try std.testing.expectEqual(@as(?bool, false), declarations[1].background_blur);
     try std.testing.expect(declarations[1].layer_shell != null);
     try std.testing.expect(declarations[1].layer_shell.?.pointer_interactivity == .none);
 }

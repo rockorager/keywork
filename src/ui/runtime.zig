@@ -385,14 +385,16 @@ pub const Runtime = struct {
 
 const TestBackend = struct {
     presents: usize = 0,
+    last_opaque: bool = false,
 
     fn backend(self: *@This()) RenderBackend {
         return .{ .ptr = self, .vtable = &.{ .present = present, .measure_text = measureText, .scale = scale } };
     }
 
-    fn present(ptr: *anyopaque, _: RenderBackend.Frame) !bool {
+    fn present(ptr: *anyopaque, frame: RenderBackend.Frame) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.presents += 1;
+        self.last_opaque = frame.fully_opaque;
         return false;
     }
 
@@ -410,6 +412,34 @@ fn initTestRuntime(app: anytype, backend: anytype, constraints: Constraints) !Ru
     const TestApp = @TypeOf(app.*);
     const host: AppHost = .{ .ptr = app, .vtable = &.{ .build_widget = TestApp.buildWidget } };
     return Runtime.init(std.testing.allocator, backend.backend(), constraints, host, .no_preference);
+}
+
+test "frame opacity follows the full-frame background" {
+    const TestApp = struct {
+        fn buildWidget(_: *anyopaque, _: *BuildScope, _: AppContext) !keywork.Widget {
+            return keywork.widgets.spacer(0);
+        }
+    };
+
+    var app: TestApp = .{};
+    {
+        var backend: TestBackend = .{};
+        var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
+        defer runtime.deinit();
+
+        runtime.setFrameBackground(keywork.colors.black);
+        try runtime.repaint();
+        try std.testing.expect(backend.last_opaque);
+    }
+    {
+        var backend: TestBackend = .{};
+        var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
+        defer runtime.deinit();
+
+        runtime.setFrameBackground(keywork.colors.transparent);
+        try runtime.repaint();
+        try std.testing.expect(!backend.last_opaque);
+    }
 }
 
 test "popLastGrapheme removes one extended grapheme cluster" {

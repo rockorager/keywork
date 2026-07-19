@@ -73,7 +73,8 @@ const RendererAdapter = struct {
         } else {
             protocol.damagePixels(0, 0, width, height);
         }
-        protocol.configureBuffer(logical_width, logical_height);
+        const fully_opaque = frame.fully_opaque and window.frameCoversLogicalDimensions(frame.size, logical_width, logical_height);
+        try protocol.configureBuffer(logical_width, logical_height, fully_opaque);
         protocol.surface.commit();
         buffer.busy = true;
         win.renderer.frame_counter += 1;

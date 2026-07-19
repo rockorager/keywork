@@ -35,7 +35,8 @@ const RendererAdapter = struct {
         const logical_height = try window.frameLogicalDimension(frame.size.height, protocol.height);
         const width = try window.scaledFrameDimension(logical_width, protocol.scale);
         const height = try window.scaledFrameDimension(logical_height, protocol.scale);
-        protocol.configureBuffer(logical_width, logical_height);
+        const fully_opaque = frame.fully_opaque and window.frameCoversLogicalDimensions(frame.size, logical_width, logical_height);
+        try protocol.configureBuffer(logical_width, logical_height, fully_opaque);
         // Mesa's Wayland WSI commits inside vkQueuePresentKHR.
         try protocol.armFrameCallback();
         const pending = try win.renderer.present(frame.display_list, protocol.scale, width, height);

@@ -52,6 +52,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .backend = backend,
         .decorations = window.decorations orelse .server,
         .layer_shell = layer_shell,
+        .background_blur = window.background_blur,
         .session_lock = window.session_lock,
         .log_writer = &stdout_writer.interface,
         .runtime_context = &self.lua,
