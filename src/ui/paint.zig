@@ -167,8 +167,7 @@ fn paintBoxShadow(allocator: std.mem.Allocator, display_list: *DisplayList, rast
         const height: usize = @max(1, @as(usize, @intFromFloat(@ceil(destination.height * render_scale))));
         const padding = support * render_scale;
         const scaled_radius = @max(0, (radius + layer.spread) * render_scale);
-        const desired_blur_radius: usize = @intFromFloat(@round(layer.blur * render_scale / 2));
-        const blur_radius = @min(desired_blur_radius, @as(usize, @intFromFloat(@floor(padding / 3))));
+        const blur_radius = layer.blur * render_scale;
         const cache_key = shadowCacheKey(width, height, scaled_radius, padding, blur_radius, layer.color.a);
         const alpha = if (raster_cache.cachedAlphaImage(cache_key, @intCast(width), @intCast(height))) |cached|
             cached
@@ -180,60 +179,90 @@ fn paintBoxShadow(allocator: std.mem.Allocator, display_list: *DisplayList, rast
     }
 }
 
-fn shadowAlpha(allocator: std.mem.Allocator, width: usize, height: usize, padding: f32, radius: f32, blur_radius: usize, opacity: u8) ![]u8 {
-    var surface = try z2d.Surface.init(.image_surface_alpha8, allocator, @intCast(width), @intCast(height));
-    defer surface.deinit(allocator);
-    var path: z2d.Path = .empty;
-    defer path.deinit(allocator);
-    try appendRoundedRectPath(&path, allocator, padding, padding, @max(0, @as(f64, @floatFromInt(width)) - padding * 2), @max(0, @as(f64, @floatFromInt(height)) - padding * 2), radius);
-    const pattern: z2d.Pattern = .{ .opaque_pattern = .{ .pixel = .{ .alpha8 = .{ .a = 255 } } } };
-    try z2d.painter.fill(allocator, &surface, &pattern, path.nodes.items, .{});
-    const coverage = try allocator.alloc(u16, width * height);
-    defer allocator.free(coverage);
-    for (surface.image_surface_alpha8.buf, coverage) |pixel, *value| value.* = @as(u16, pixel.a) * 257;
-    if (blur_radius > 0) {
-        const scratch = try allocator.alloc(u16, coverage.len);
-        defer allocator.free(scratch);
-        for (0..3) |_| {
-            boxBlurHorizontal(coverage, scratch, width, height, blur_radius);
-            boxBlurVertical(scratch, coverage, width, height, blur_radius);
-        }
-    }
+fn shadowAlpha(allocator: std.mem.Allocator, width: usize, height: usize, padding: f32, radius: f32, blur_radius: f32, opacity: u8) ![]u8 {
+    std.debug.assert(width > 0 and height > 0);
+    const shape_left: f64 = padding;
+    const shape_top: f64 = padding;
+    const shape_width = @max(0, @as(f64, @floatFromInt(width)) - shape_left * 2);
+    const shape_height = @max(0, @as(f64, @floatFromInt(height)) - shape_top * 2);
+    const shape_radius = @min(@as(f64, radius), @min(shape_width, shape_height) / 2);
+    const blur: f64 = blur_radius;
     const alpha = try allocator.alloc(u8, width * height);
     errdefer allocator.free(alpha);
-    for (coverage, alpha, 0..) |value, *result, index| {
-        result.* = ditheredShadowAlpha(value, opacity, index % width, index / width);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const coverage = roundedBoxShadowCoverage(
+                @as(f64, @floatFromInt(x)) + 0.5,
+                @as(f64, @floatFromInt(y)) + 0.5,
+                shape_left,
+                shape_top,
+                shape_width,
+                shape_height,
+                shape_radius,
+                blur,
+            );
+            alpha[y * width + x] = ditheredShadowAlpha(coverage, opacity, x, y);
+        }
     }
     return alpha;
 }
 
-fn boxBlurHorizontal(source: []const u16, destination: []u16, width: usize, height: usize, radius: usize) void {
-    const divisor: u64 = @intCast(radius * 2 + 1);
-    for (0..height) |y| {
-        const row = y * width;
-        var sum: u64 = 0;
-        for (0..@min(width, radius + 1)) |x| sum += source[row + x];
-        for (0..width) |x| {
-            destination[row + x] = @intCast((sum + divisor / 2) / divisor);
-            if (x >= radius) sum -= source[row + x - radius];
-            const added = x + radius + 1;
-            if (added < width) sum += source[row + added];
-        }
-    }
+fn roundedRectCoverage(pixel_x: f64, pixel_y: f64, left: f64, top: f64, width: f64, height: f64, radius: f64) f64 {
+    const half_width = width / 2;
+    const half_height = height / 2;
+    const distance_x = @abs(pixel_x - (left + half_width)) - @max(half_width - radius, 0);
+    const distance_y = @abs(pixel_y - (top + half_height)) - @max(half_height - radius, 0);
+    const outside_x = @max(distance_x, 0);
+    const outside_y = @max(distance_y, 0);
+    const signed_distance = @sqrt(outside_x * outside_x + outside_y * outside_y) +
+        @min(@max(distance_x, distance_y), 0) - radius;
+    return std.math.clamp(0.5 - signed_distance, 0, 1);
 }
 
-fn boxBlurVertical(source: []const u16, destination: []u16, width: usize, height: usize, radius: usize) void {
-    const divisor: u64 = @intCast(radius * 2 + 1);
-    for (0..width) |x| {
-        var sum: u64 = 0;
-        for (0..@min(height, radius + 1)) |y| sum += source[y * width + x];
-        for (0..height) |y| {
-            destination[y * width + x] = @intCast((sum + divisor / 2) / divisor);
-            if (y >= radius) sum -= source[(y - radius) * width + x];
-            const added = y + radius + 1;
-            if (added < height) sum += source[added * width + x];
-        }
+/// Evaluate the rounded shape's Gaussian convolution directly. Repeated box
+/// blurs leave a denser edge and a more visible halo at large radii.
+fn roundedBoxShadowCoverage(pixel_x: f64, pixel_y: f64, left: f64, top: f64, width: f64, height: f64, radius: f64, blur_radius: f64) f64 {
+    if (blur_radius <= 0) return roundedRectCoverage(pixel_x, pixel_y, left, top, width, height, radius);
+
+    const sigma = blur_radius * 0.5;
+    const half_width = width * 0.5;
+    const half_height = height * 0.5;
+    const x = pixel_x - (left + half_width);
+    const y = pixel_y - (top + half_height);
+    const start = std.math.clamp(-3 * sigma, y - half_height, y + half_height);
+    const end = std.math.clamp(3 * sigma, y - half_height, y + half_height);
+    const step = (end - start) * 0.25;
+    var sample_y = start + step * 0.5;
+    var coverage: f64 = 0;
+    for (0..4) |_| {
+        coverage += roundedBoxShadowX(x, y - sample_y, sigma, radius, half_width, half_height) *
+            gaussian(sample_y, sigma) * step;
+        sample_y += step;
     }
+    return std.math.clamp(coverage, 0, 1);
+}
+
+fn roundedBoxShadowX(x: f64, y: f64, sigma: f64, radius: f64, half_width: f64, half_height: f64) f64 {
+    const delta = @min(half_height - radius - @abs(y), 0);
+    const curved = half_width - radius + @sqrt(@max(0, radius * radius - delta * delta));
+    const scale = @sqrt(0.5) / sigma;
+    const lower = 0.5 + 0.5 * erfApprox((x - curved) * scale);
+    const upper = 0.5 + 0.5 * erfApprox((x + curved) * scale);
+    return upper - lower;
+}
+
+fn gaussian(value: f64, sigma: f64) f64 {
+    return @exp(-(value * value) / (2 * sigma * sigma)) /
+        (@sqrt(2 * std.math.pi) * sigma);
+}
+
+fn erfApprox(value: f64) f64 {
+    const sign: f64 = if (value < 0) -1 else if (value > 0) 1 else 0;
+    const absolute = @abs(value);
+    var denominator = 1 +
+        (0.278393 + (0.230389 + 0.078108 * absolute * absolute) * absolute) * absolute;
+    denominator *= denominator;
+    return sign - sign / (denominator * denominator);
 }
 
 const bayer8 = [64]u8{
@@ -247,21 +276,20 @@ const bayer8 = [64]u8{
     42, 26, 38, 22, 41, 25, 37, 21,
 };
 
-fn ditheredShadowAlpha(coverage: u16, opacity: u8, x: usize, y: usize) u8 {
-    const denominator = std.math.maxInt(u16);
-    const scaled = @as(u32, coverage) * opacity;
-    const base = scaled / denominator;
-    if (base == 255) return 255;
-    const remainder = scaled % denominator;
+fn ditheredShadowAlpha(coverage: f64, opacity: u8, x: usize, y: usize) u8 {
+    const scaled = std.math.clamp(coverage, 0, 1) * @as(f64, @floatFromInt(opacity));
+    const base = @floor(scaled);
+    if (base >= 255) return 255;
+    const remainder = scaled - base;
     // Quantize the combined shape coverage and layer opacity only once. The
     // ordered threshold turns sub-byte coverage into a stable spatial
     // average instead of a visible contour in a low-contrast shadow.
     const rank = bayer8[(y % 8) * 8 + (x % 8)];
-    const threshold = (@as(u32, rank) * 2 + 1) * denominator / (bayer8.len * 2);
-    return @intCast(base + @intFromBool(remainder > threshold));
+    const threshold = @as(f64, @floatFromInt(@as(u16, rank) * 2 + 1)) / (bayer8.len * 2);
+    return @intFromFloat(base + @as(f64, @floatFromInt(@intFromBool(remainder > threshold))));
 }
 
-fn shadowCacheKey(width: usize, height: usize, radius: f32, padding: f32, blur_radius: usize, opacity: u8) u64 {
+fn shadowCacheKey(width: usize, height: usize, radius: f32, padding: f32, blur_radius: f32, opacity: u8) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update("box-shadow");
     hasher.update(std.mem.asBytes(&width));
@@ -311,10 +339,11 @@ test "box shadow masks bake opacity before dither" {
 }
 
 test "blurred shadow mask falls off outside source" {
-    const alpha = try shadowAlpha(std.testing.allocator, 20, 20, 6, 0, 2, 255);
+    const alpha = try shadowAlpha(std.testing.allocator, 20, 20, 6, 0, 4, 255);
     defer std.testing.allocator.free(alpha);
     try std.testing.expect(alpha[10 * 20 + 10] > alpha[10 * 20 + 3]);
     try std.testing.expect(alpha[10 * 20 + 3] > 0);
+    try std.testing.expect(alpha[10 * 20] > 0);
     try std.testing.expect(alpha[10 * 20] < alpha[10 * 20 + 3]);
 }
 

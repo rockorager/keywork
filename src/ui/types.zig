@@ -60,9 +60,10 @@ pub const ShadowLayer = struct {
         return result;
     }
 
-    /// Three box-blur passes use a radius near blur / 2. Include their
-    /// rounding allowance so paint bounds remain conservative at fractional
-    /// scales as well as integer scales.
+    /// The analytic shadow uses half the blur value as its Gaussian sigma,
+    /// so three sigma needs 1.5 times the blur value. Include an
+    /// antialiasing and rounding allowance so paint bounds remain
+    /// conservative at fractional scales as well as integer scales.
     pub fn blurSupport(self: ShadowLayer) f32 {
         const blur_value = self.normalized().blur;
         return if (blur_value > 0) @ceil(blur_value * 1.5 + 1.5) else 0;
