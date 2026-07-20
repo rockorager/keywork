@@ -3663,6 +3663,7 @@ test "lua default theme exposes opaque Radix component tokens" {
         \\for _, scheme in ipairs({ "light", "dark" }) do
         \\  local resolved = kw.resolve_theme(kw.theme_data(), scheme)
         \\  assert(resolved.colors.surface == resolved.colors.slate2)
+        \\  assert(resolved.colors.backdrop_surface == (scheme == "light" and 0x59ffffff or resolved.colors.black_a6))
         \\  assert(resolved.colors.text_secondary == resolved.colors.slate11)
         \\  assert(resolved.colors.text_tertiary == resolved.colors.slate10)
         \\  assert(resolved.colors.border == resolved.colors.slate7)
