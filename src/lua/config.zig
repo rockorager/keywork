@@ -23,8 +23,8 @@ pub const Config = struct {
     /// Request ext-session-lock and make every declared window a lock
     /// surface. Each window must name an output.
     session_lock: bool = false,
-    /// The script declares its window set via a `windows` function, so
-    /// it needs a windowing backend even without app-level layer_shell.
+    /// The script declares at least one window, either through single-window
+    /// `child` sugar or a `windows` function.
     has_windows: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -69,9 +69,9 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     const child_is_widget = c.lua_type(lua_state, -1) == c.LUA_TTABLE and isWidgetTable(lua_state, c.lua_gettop(lua_state));
     pop(lua_state, 1);
     c.lua_getfield(lua_state, table_index, "windows");
-    config.has_windows = c.lua_type(lua_state, -1) == c.LUA_TFUNCTION;
+    config.has_windows = child_is_widget or c.lua_type(lua_state, -1) == c.LUA_TFUNCTION;
     pop(lua_state, 1);
-    if (!child_is_widget and !config.has_windows) return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
+    if (!config.has_windows) return invalidAppRoot("keywork.app requires a widget child or a windows function", .{});
 
     const app_id = try checkStringField(lua_state, table_index, "app_id");
     const title = try checkStringField(lua_state, table_index, "title");

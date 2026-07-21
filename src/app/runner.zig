@@ -907,6 +907,8 @@ fn WindowManager(comptime Backend: type) type {
             layer_shell: bool,
             content_height: bool,
             size_negotiator: ?LayerSizeNegotiator = null,
+            runtime_ready: bool,
+            state_invalidation_pending: bool,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             popups: PopupManager(Backend),
@@ -1157,6 +1159,8 @@ fn WindowManager(comptime Backend: type) type {
                 .layer_shell = layer_shell != null,
                 .content_height = decl.content_height,
                 .size_negotiator = if (decl.content_height) try .init(size) else null,
+                .runtime_ready = false,
+                .state_invalidation_pending = false,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined },
                 .popups = .{
@@ -1182,12 +1186,17 @@ fn WindowManager(comptime Backend: type) type {
                 self.raster_cache,
             );
             errdefer managed.runtime.deinit();
+            managed.runtime_ready = true;
             managed.queue.runtime = &managed.runtime;
             managed.queue.configure_hook = .{ .ctx = managed, .func = managedConfigure };
             managed.queue.popup_manager = managed.popups.hooks();
             managed.popups.runtime = &managed.runtime;
             if (managed.layer_shell) managed.runtime.setFrameBackground(keywork.colors.transparent);
             managed.runtime.setDeferredRepaint(true);
+            if (managed.state_invalidation_pending) {
+                managed.state_invalidation_pending = false;
+                try managed.runtime.invalidateState();
+            }
             if (managed.content_height) {
                 managed.runtime.setContentSizing(.{ .height = true });
                 managed.runtime.setRootSizeHandler(managed, managedRootSize);
@@ -1258,6 +1267,10 @@ fn WindowManager(comptime Backend: type) type {
 
         fn invalidateManagedState(ptr: *anyopaque) anyerror!void {
             const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
+            if (!managed.runtime_ready) {
+                managed.state_invalidation_pending = true;
+                return;
+            }
             try managed.runtime.invalidateState();
         }
     };
@@ -1266,6 +1279,20 @@ fn WindowManager(comptime Backend: type) type {
 fn layerSurfaceDimension(layer_shell: ?wayland_options.LayerShellOptions, value: f32) !u31 {
     if (layer_shell != null and value <= 0) return 0;
     return wayland_window.frameDimension(value);
+}
+
+test "managed windows defer state invalidation during runtime initialization" {
+    const TestWindowBackend = struct {
+        const Window = opaque {};
+    };
+    const Manager = WindowManager(TestWindowBackend);
+    var managed: Manager.ManagedWindow = undefined;
+    managed.runtime_ready = false;
+    managed.state_invalidation_pending = false;
+
+    try Manager.invalidateManagedState(&managed);
+
+    try std.testing.expect(managed.state_invalidation_pending);
 }
 
 test "layer surfaces may delegate both dimensions to anchors" {
