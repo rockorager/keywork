@@ -92,6 +92,15 @@ pub fn build(b: *std.Build) void {
     dbus_c.linkSystemLibrary("dbus-1", .{ .use_pkg_config = .force });
     const dbus_c_module = dbus_c.createModule();
 
+    requirePkgConfigVersion(b, "libcurl", "7.45.0");
+    const curl_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ffi/curl_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    curl_c.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
+    const curl_c_module = curl_c.createModule();
+
     const pipewire_c = b.addTranslateC(.{
         .root_source_file = b.path("src/ffi/pipewire_c.h"),
         .target = target,
@@ -135,6 +144,7 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("z2d", z2d_module);
     app_module.addImport("xkb_c", xkb_c_module);
     app_module.addImport("dbus_c", dbus_c_module);
+    app_module.addImport("curl_c", curl_c_module);
     app_module.addImport("pipewire_c", pipewire_c_module);
     app_module.addCSourceFile(.{ .file = b.path("src/ffi/pipewire_c.c") });
     app_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
@@ -220,6 +230,7 @@ fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("vulkan", .{});
     module.linkSystemLibrary("xkbcommon", .{});
     module.linkSystemLibrary("dbus-1", .{});
+    module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
     module.linkSystemLibrary("fontconfig", .{});
     module.linkSystemLibrary("freetype", .{});
     module.linkSystemLibrary("harfbuzz", .{});

@@ -1,4 +1,4 @@
-//! Lua unix domain stream sockets for keywork.loop.connect.
+//! Unix-domain byte streams used by keywork.net.connect.
 
 const std = @import("std");
 const event_loop = @import("../linux/event_loop.zig");
@@ -57,7 +57,8 @@ pub const LuaSocket = struct {
 
     pub fn connect(path: []const u8) !i32 {
         var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
-        if (path.len == 0 or path.len >= address.path.len) return error.PathTooLong;
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+        if (path.len >= address.path.len) return error.PathTooLong;
         @memset(&address.path, 0);
         @memcpy(address.path[0..path.len], path);
 
@@ -200,15 +201,6 @@ fn socketCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void 
     }
 }
 
-pub fn installApi(lua_state: *c.lua_State, loop_table: c_int, host: *Host) void {
-    c.lua_pushlightuserdata(lua_state, host);
-    lua_value.setClosureField(lua_state, loop_table, "connect", luaConnect, 1);
-}
-
-fn hostFromLua(lua_state: *c.lua_State) Host {
-    return lua_value.upvaluePointer(*Host, lua_state, 1).*;
-}
-
 const socket_type: [*:0]const u8 = "keywork.socket";
 const socket_methods = [_]lua_handle.Method{
     .{ .name = "next", .func = luaSocketNext },
@@ -219,21 +211,16 @@ const socket_methods = [_]lua_handle.Method{
     .{ .name = "closed", .func = luaSocketClosed },
 };
 
-fn luaConnect(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    const host = hostFromLua(lua_state);
-    lua_task.raiseIfCanceled(lua_state);
-    const path = lua_value.checkString(lua_state, 1);
-
+pub fn connectPath(lua_state: *c.lua_State, host: Host, path: []const u8) c_int {
     // A missing or refusing socket is an expected runtime failure, so
     // connect reports nil, err instead of raising.
     const fd = LuaSocket.connect(path) catch |err| {
-        log.warn("loop.connect {s} failed: {}", .{ path, err });
+        log.warn("net.connect {s} failed: {}", .{ path, err });
         return lua_value.pushNilError(lua_state, err);
     };
     const socket = host.addSocket(fd) catch |err| {
         _ = linux.close(fd);
-        log.warn("loop.connect failed: {}", .{err});
+        log.warn("net.connect failed: {}", .{err});
         return lua_value.pushNilError(lua_state, err);
     };
     lua_task.adoptResource(LuaSocket, lua_state, socket);

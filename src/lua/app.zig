@@ -8,10 +8,12 @@ const event_loop = @import("../linux/event_loop.zig");
 const icon_theme = @import("../linux/icon_theme.zig");
 const linux_syscall = @import("../linux/syscall.zig");
 const lua_config = @import("config.zig");
+const lua_curl = @import("curl.zig");
 const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
+const lua_net = @import("net.zig");
 const lua_pipewire = @import("pipewire.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
@@ -31,6 +33,7 @@ const BuildScope = keywork.BuildScope;
 const invalid_fd: i32 = -1;
 const LuaProcess = lua_process.LuaProcess;
 const LuaSocket = lua_socket.LuaSocket;
+const NetConnection = lua_net.Connection;
 const DbusBus = lua_dbus.Bus;
 const PipeWireConnection = lua_pipewire.Connection;
 const FdWatch = lua_loop.FdWatch;
@@ -74,6 +77,7 @@ pub const App = struct {
     channels: std.ArrayList(*Channel) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
     sockets: std.ArrayList(*LuaSocket) = .empty,
+    net_connections: std.ArrayList(*NetConnection) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
     pipewire_connections: std.ArrayList(*PipeWireConnection) = .empty,
     tasks: std.ArrayList(*LuaTask) = .empty,
@@ -86,6 +90,8 @@ pub const App = struct {
     loop_host: lua_loop.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
     socket_host: lua_socket.Host = undefined,
+    net_host: lua_net.Host = undefined,
+    curl_runtime: ?*lua_curl.Runtime = null,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
     /// Desktop services (clipboard, activation tokens, interactive
@@ -164,6 +170,9 @@ pub const App = struct {
         self.processes.deinit(self.allocator);
         for (self.sockets.items) |socket| socket.destroy(self.allocator, self.state);
         self.sockets.deinit(self.allocator);
+        for (self.net_connections.items) |connection| connection.destroy(self.allocator, self.state);
+        self.net_connections.deinit(self.allocator);
+        if (self.curl_runtime) |runtime| runtime.destroy();
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
         for (self.pipewire_connections.items) |connection| connection.destroy(self.allocator, self.state);
@@ -204,6 +213,8 @@ pub const App = struct {
         for (self.timers.items) |timer| try timer.register();
         for (self.processes.items) |process| try self.registerProcess(process);
         for (self.sockets.items) |socket| try socket.register();
+        for (self.net_connections.items) |connection| try connection.register();
+        if (self.curl_runtime) |runtime| try runtime.register();
         for (self.dbus_buses.items) |bus| try bus.register();
         for (self.pipewire_connections.items) |connection| try connection.register();
         if (self.pending_scope_cancels.items.len > 0) try self.armScopeCancelTimer(loop);
@@ -247,6 +258,8 @@ pub const App = struct {
         for (self.timers.items) |timer| timer.unregister(loop);
         for (self.processes.items) |process| process.unregister(loop);
         for (self.sockets.items) |socket| socket.unregister(loop);
+        for (self.net_connections.items) |connection| connection.unregister(loop);
+        if (self.curl_runtime) |runtime| runtime.unregister();
         for (self.dbus_buses.items) |bus| bus.unregister();
         for (self.pipewire_connections.items) |connection| connection.unregister(loop);
         self.event_loop = null;
@@ -309,6 +322,7 @@ pub const App = struct {
         for (self.timers.items) |timer| if (!timer.canceled and !timer.expired) return true;
         for (self.processes.items) |process| if (!process.canceled and !process.exited) return true;
         for (self.sockets.items) |socket| if (!socket.canceled and socket.fd != invalid_fd) return true;
+        for (self.net_connections.items) |connection| if (connection.live()) return true;
         for (self.dbus_buses.items) |bus| if (!bus.closed) return true;
         for (self.pipewire_connections.items) |connection| if (!connection.closed) return true;
         return false;
@@ -762,6 +776,7 @@ pub const App = struct {
         for (self.channels.items) |channel| channel.cancel(self.state, .silent);
         for (self.processes.items) |process| process.cancel(self.state, .silent);
         for (self.sockets.items) |socket| socket.cancel(self.state, .silent);
+        for (self.net_connections.items) |connection| connection.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
         for (self.pipewire_connections.items) |connection| connection.cancel(self.state, .silent);
     }
@@ -921,6 +936,43 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &socket_host_vtable };
     }
 
+    fn addNetConnection(self: *App, options: lua_net.ConnectOptions, waiter_ref: c_int) !*NetConnection {
+        const runtime = try self.ensureCurlRuntime();
+        const connection = try self.allocator.create(NetConnection);
+        connection.* = NetConnection.init(self.netHost(), runtime, options, waiter_ref) catch |err| {
+            self.allocator.destroy(connection);
+            return err;
+        };
+        errdefer connection.discardSetup(self.allocator);
+
+        try self.net_connections.append(self.allocator, connection);
+        errdefer _ = self.net_connections.pop();
+        try runtime.add(&connection.transfer);
+        return connection;
+    }
+
+    fn ensureCurlRuntime(self: *App) !*lua_curl.Runtime {
+        if (self.curl_runtime) |runtime| {
+            if (self.event_loop != null and !runtime.registered) try runtime.register();
+            return runtime;
+        }
+        const runtime = try lua_curl.Runtime.create(self.allocator, .{
+            .ptr = self,
+            .event_loop_fn = hostEventLoop,
+        });
+        self.curl_runtime = runtime;
+        if (self.event_loop != null) runtime.register() catch |err| {
+            self.curl_runtime = null;
+            runtime.destroy();
+            return err;
+        };
+        return runtime;
+    }
+
+    fn netHost(self: *App) lua_net.Host {
+        return .{ .ptr = self, .vtable = &net_host_vtable };
+    }
+
     fn addDbusBus(self: *App, kind: lua_dbus.Kind) !*DbusBus {
         const bus = try DbusBus.create(self.dbusHost(), kind);
         errdefer bus.destroy(self.allocator, self.state);
@@ -1076,6 +1128,18 @@ const socket_host_vtable: lua_socket.Host.VTable = .{
     .addSocket = socketHostAddSocket,
 };
 
+const net_host_vtable: lua_net.Host.VTable = .{
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
+    .addConnection = netHostAddConnection,
+};
+
+fn netHostAddConnection(ptr: *anyopaque, options: lua_net.ConnectOptions, waiter_ref: c_int) anyerror!*NetConnection {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addNetConnection(options, waiter_ref);
+}
+
 fn socketHostAddSocket(ptr: *anyopaque, fd: i32) anyerror!*LuaSocket {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addSocket(fd);
@@ -1194,6 +1258,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         .{ .name = "keywork", .loader = keyworkModuleLoader, .uses_app = true },
         .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
         .{ .name = "keywork.loop", .loader = loopModuleLoader, .uses_app = true },
+        .{ .name = "keywork.net", .loader = netModuleLoader, .uses_app = true },
         .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
         .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
         .{ .name = "keywork.pipewire", .loader = pipewireModuleLoader, .uses_app = true },
@@ -1389,8 +1454,6 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const loop_table = c.lua_gettop(lua_state);
     app.loop_host = app.loopHost();
     lua_loop.installResourceApis(lua_state, loop_table, &app.loop_host);
-    app.socket_host = app.socketHost();
-    lua_socket.installApi(lua_state, loop_table, &app.socket_host);
     return 1;
 }
 
@@ -1404,6 +1467,15 @@ fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     if (c.luaL_loadbuffer(lua_state, embedded_process_source.ptr, embedded_process_source.len, "@keywork/process.lua") != 0) return c.lua_error(lua_state);
     c.lua_pushvalue(lua_state, -2);
     if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return c.lua_error(lua_state);
+    return 1;
+}
+
+fn netModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    app.net_host = app.netHost();
+    app.socket_host = app.socketHost();
+    lua_net.pushModule(lua_state, &app.net_host, &app.socket_host);
     return 1;
 }
 
@@ -1773,12 +1845,15 @@ test "keywork core excludes optional capability modules" {
         \\assert(kw.audio == nil)
         \\assert(kw.log == nil)
         \\assert(package.loaded["keywork.loop"] == nil)
+        \\assert(package.loaded["keywork.net"] == nil)
         \\assert(package.loaded["keywork.process"] == nil)
         \\assert(package.loaded["keywork.dbus"] == nil)
         \\assert(package.loaded["keywork.pipewire"] == nil)
         \\assert(package.loaded["keywork.audio"] == nil)
         \\assert(package.loaded["keywork.log"] == nil)
         \\assert(type(require("keywork.loop").timer) == "function")
+        \\assert(require("keywork.loop").connect == nil)
+        \\assert(type(require("keywork.net").connect) == "function")
         \\assert(type(require("keywork.process").spawn) == "function")
         \\assert(type(require("keywork.dbus").session) == "function")
         \\assert(type(require("keywork.pipewire").connect) == "function")
@@ -1795,6 +1870,7 @@ test "keywork core excludes optional capability modules" {
     defer app.deinit();
     try app.ensureLoaded();
     try std.testing.expect(app.window_config.background_blur);
+    try std.testing.expect(app.window_config.has_windows);
 }
 
 test "application lifecycle hooks run exactly once per load" {
@@ -4313,15 +4389,165 @@ fn testAccept(listener: i32) !i32 {
     return @intCast(result);
 }
 
-test "lua loop.connect reports a missing socket path as nil, err" {
+const TestTcpListener = struct {
+    fd: i32,
+    port: u16,
+};
+
+fn testTcpListener() !TestTcpListener {
+    const socket_result = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(socket_result);
+    errdefer _ = linux.close(fd);
+
+    var address: linux.sockaddr.in = .{
+        .port = 0,
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.ListenFailed;
+
+    var address_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(fd, @ptrCast(&address), &address_len)) != .SUCCESS) return error.GetSockNameFailed;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, address.port) };
+}
+
+const TestTcpServer = struct {
+    listener: i32,
+    failure: ?anyerror = null,
+
+    fn run(self: *TestTcpServer) void {
+        self.serve() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn serve(self: *TestTcpServer) !void {
+        var listener_poll = [_]std.posix.pollfd{.{
+            .fd = self.listener,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&listener_poll, 5000) == 0) return error.ServerAcceptTimeout;
+        const connection = try testAccept(self.listener);
+        defer _ = linux.close(connection);
+
+        var connection_poll = [_]std.posix.pollfd{.{
+            .fd = connection,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&connection_poll, 5000) == 0) return error.ServerReadTimeout;
+
+        var request: [4]u8 = undefined;
+        var received: usize = 0;
+        while (received < request.len) {
+            const result = linux.read(connection, request[received..].ptr, request.len - received);
+            switch (linux.errno(result)) {
+                .SUCCESS => {
+                    if (result == 0) return error.ServerPeerClosed;
+                    received += result;
+                },
+                .INTR => continue,
+                else => return error.ServerReadFailed,
+            }
+        }
+        if (!std.mem.eql(u8, &request, "ping")) return error.ServerUnexpectedRequest;
+
+        var sent: usize = 0;
+        while (sent < 4) {
+            const result = linux.write(connection, "pong".ptr + sent, 4 - sent);
+            switch (linux.errno(result)) {
+                .SUCCESS => sent += result,
+                .INTR => continue,
+                else => return error.ServerWriteFailed,
+            }
+        }
+    }
+};
+
+test "lua net.connect provides an asynchronous TCP byte stream" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const listener = try testTcpListener();
+    defer _ = linux.close(listener.fd);
+    const refused_listener = try testTcpListener();
+    _ = linux.close(refused_listener.fd);
+    var server: TestTcpServer = .{ .listener = listener.fd };
+    const server_thread = try std.Thread.spawn(.{}, TestTcpServer.run, .{&server});
+    var joined = false;
+    defer if (!joined) server_thread.join();
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local net = require("keywork.net")
+        \\net_done = false
+        \\net_received = ""
+        \\loop.spawn(function()
+        \\  local failed, failure_err = net.connect("tcp://127.0.0.1:{d}", {{
+        \\    connect_timeout = 2,
+        \\  }})
+        \\  net_failure_ok = failed == nil and type(failure_err) == "string" and failure_err ~= ""
+        \\  if not net_failure_ok then
+        \\    if failed then failed:close() end
+        \\    net_done = true
+        \\    return
+        \\  end
+        \\  local connection, err = net.connect("tcp://127.0.0.1:{d}", {{
+        \\    connect_timeout = 2,
+        \\  }})
+        \\  if not connection then
+        \\    net_error = err
+        \\    net_done = true
+        \\    return
+        \\  end
+        \\  assert(connection:write("ping"))
+        \\  for chunk in connection:chunks() do
+        \\    net_received = net_received .. chunk
+        \\  end
+        \\  net_closed = connection:closed()
+        \\  net_done = true
+        \\end)
+        \\return kw.app({{ child = kw.text("network") }})
+        \\
+    , .{ refused_listener.port, listener.port });
+    defer allocator.free(script);
+    var app = try initTestApp(allocator, &tmp, "net-connect.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(usize, 1), app.net_connections.items.len);
+    try std.testing.expect(app.curl_runtime != null);
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+    try runUntilLuaBoolean(&loop, &app, "net_done", 5000);
+
+    server_thread.join();
+    joined = true;
+    if (server.failure) |err| return err;
+    try expectLuaBoolean(&app, "net_done", true);
+    try expectLuaBoolean(&app, "net_failure_ok", true);
+    try expectLuaBoolean(&app, "net_closed", true);
+    c.lua_getglobal(app.state, "net_received");
+    defer pop(app.state, 1);
+    try std.testing.expectEqualStrings("pong", try stringFromStack(app.state, -1));
+    try std.testing.expect(!app.hasLiveAsyncResources());
+}
+
+test "lua net.connect reports a missing Unix socket path as nil, err" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script =
         \\local kw = require("keywork")
-        \\local loop = require("keywork.loop")
-        \\sock_result, sock_err = loop.connect("/nonexistent/keywork/test.sock")
+        \\local net = require("keywork.net")
+        \\sock_result, sock_err = net.connect("unix:///nonexistent/keywork/test.sock")
         \\return kw.app({ child = kw.text("connect") })
         \\
     ;
@@ -4354,7 +4580,8 @@ test "lua socket streams chunks and finishes on peer EOF" {
     const script = try std.fmt.allocPrint(allocator,
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\sock = assert(loop.connect("{s}"))
+        \\local net = require("keywork.net")
+        \\sock = assert(net.connect("unix:{s}"))
         \\assert(sock:write("ping"))
         \\received = ""
         \\done = false
@@ -4416,7 +4643,8 @@ test "lua socket close resumes a parked reader and ends iteration" {
     const script = try std.fmt.allocPrint(allocator,
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
-        \\local sock = assert(loop.connect("{s}"))
+        \\local net = require("keywork.net")
+        \\local sock = assert(net.connect("unix:{s}"))
         \\stream_ended = false
         \\local reader = loop.spawn(function()
         \\  for _ in sock:chunks() do end
@@ -4462,16 +4690,17 @@ test "lua socket write parks under backpressure and resumes when flushed" {
     const script = try std.fmt.allocPrint(allocator,
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
+        \\local net = require("keywork.net")
         \\local big = string.rep("x", 4 * 1024 * 1024)
         \\total = #big
-        \\sock = assert(loop.connect("{s}"))
+        \\sock = assert(net.connect("unix:{s}"))
         \\write_ok = false
         \\wrote = false
         \\loop.spawn(function()
         \\  write_ok = sock:write(big)
         \\  wrote = true
         \\end)
-        \\local sock2 = assert(loop.connect("{s}"))
+        \\local sock2 = assert(net.connect("unix:{s}"))
         \\local ok, err = pcall(sock2.write, sock2, big)
         \\main_write_raised = not ok and err:find("coroutine", 1, true) ~= nil
         \\sock2:close()

@@ -129,27 +129,6 @@ function Channel:cancel() end
 ---@return boolean
 function Channel:canceled() end
 
----@class keywork.loop.Socket
-local Socket = {}
-
----@return string? chunk
-function Socket:next() end
-
----@return fun(): string?
-function Socket:chunks() end
-
----@param data string
----@return true? ok
----@return string? error
-function Socket:write(data) end
-
-function Socket:close() end
-
-function Socket:cancel() end
-
----@return boolean
-function Socket:closed() end
-
 local M = {}
 
 ---@param options keywork.loop.TimerOptions
@@ -181,11 +160,5 @@ function M.sleep(milliseconds) end
 ---@generic T
 ---@return keywork.loop.Channel<T>
 function M.channel() end
-
---- Connects to a Unix-domain stream socket.
----@param path string
----@return keywork.loop.Socket? socket
----@return string? error
-function M.connect(path) end
 
 return M
