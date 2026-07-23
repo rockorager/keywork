@@ -128,6 +128,16 @@ pub fn keyInput(self: anytype, input: keywork.KeyInput) !void {
             try self.invalidate();
         },
         .text => |bytes| try editFocusedTextInput(self, .{ .append = bytes }),
+        .paste => {
+            const reader = self.clipboard_reader orelse return;
+            const context = self.clipboard_reader_context orelse return;
+            const text = reader(context, self.allocator) catch |err| {
+                log.warn("clipboard paste failed: {}", .{err});
+                return;
+            } orelse return;
+            defer self.allocator.free(text);
+            try editFocusedTextInput(self, .{ .append = text });
+        },
         .backspace => try editFocusedTextInput(self, .pop_grapheme),
         .space => {
             const target = focus_scroll.focusedTarget(self) orelse return;

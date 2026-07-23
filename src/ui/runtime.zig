@@ -117,6 +117,8 @@ pub const Runtime = struct {
     presented_scale: f32 = 0,
     repaint_scheduler: ?RepaintScheduler = null,
     repaint_scheduler_context: ?*anyopaque = null,
+    clipboard_reader: ?ClipboardReader = null,
+    clipboard_reader_context: ?*anyopaque = null,
     /// Monotonic time source for animations; injectable so tests drive
     /// frames deterministically.
     clock: animation.Clock = .{},
@@ -127,6 +129,7 @@ pub const Runtime = struct {
     animations_active: bool = false,
 
     pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
+    pub const ClipboardReader = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
 
     pub const ContentAxes = packed struct {
         width: bool = false,
@@ -280,6 +283,11 @@ pub const Runtime = struct {
 
     pub fn setRepaintScheduler(self: *Runtime, context: *anyopaque, scheduler: RepaintScheduler) void {
         backend_behavior.setRepaintScheduler(self, context, scheduler);
+    }
+
+    pub fn setClipboardReader(self: *Runtime, context: *anyopaque, reader: ClipboardReader) void {
+        self.clipboard_reader_context = context;
+        self.clipboard_reader = reader;
     }
 
     pub fn invalidate(self: *Runtime) !void {
@@ -1638,6 +1646,10 @@ test "obscured input masks graphemes and clears after submit" {
         fn submittedText(self: *const @This()) []const u8 {
             return self.submitted[0..self.submitted_len];
         }
+
+        fn readClipboard(_: *anyopaque, allocator: std.mem.Allocator) !?[]u8 {
+            return try allocator.dupe(u8, "ae\xcc\x81");
+        }
     };
 
     var app: TestApp = .{};
@@ -1645,8 +1657,8 @@ test "obscured input masks graphemes and clears after submit" {
     var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
-    try runtime.keyInput(.{ .text = "a" });
-    try runtime.keyInput(.{ .text = "e\xcc\x81" });
+    runtime.setClipboardReader(&app, TestApp.readClipboard);
+    try runtime.keyInput(.paste);
     try std.testing.expectEqualStrings("••", renderedInputText(runtime.root.?).?);
     try runtime.keyInput(.enter);
     try std.testing.expectEqualStrings("ae\xcc\x81", app.submittedText());

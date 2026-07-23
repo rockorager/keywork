@@ -29,7 +29,7 @@ pub fn shortcutKeyForInput(input: KeyInput) ?ShortcutKey {
         // Plain tab may be bound as a shortcut (unbound it falls through
         // to focus traversal); shift-tab always keeps reverse traversal.
         .tab => |tab| if (tab.reverse) null else .tab,
-        .text => null,
+        .text, .paste => null,
     };
 }
 

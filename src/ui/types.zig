@@ -638,6 +638,7 @@ pub const Constraints = struct {
 
 pub const KeyInput = union(enum) {
     text: []const u8,
+    paste,
     backspace,
     enter,
     space,

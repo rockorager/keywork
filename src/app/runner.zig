@@ -29,6 +29,12 @@ fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorS
     runtime_mod.Runtime.colorSchemeChanged(ctx, uiColorScheme(color_scheme));
 }
 
+fn setRuntimeClipboard(runtime: *runtime_mod.Runtime, backend: anytype) void {
+    const Backend = @TypeOf(backend.*);
+    const platform = platform_mod.WaylandPlatform(Backend).platform(backend);
+    runtime.setClipboardReader(platform.ptr, platform.vtable.clipboard_read);
+}
+
 pub const Options = struct {
     title: [:0]const u8 = "Keywork",
     app_id: [:0]const u8 = "dev.keywork.Keywork",
@@ -177,6 +183,7 @@ fn runWayland(
         &raster_cache,
     );
     defer runtime.deinit();
+    setRuntimeClipboard(&runtime, backend);
     if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
     defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
     if (options.layer_shell != null) runtime.setFrameBackground(keywork.colors.transparent);
@@ -622,6 +629,7 @@ fn PopupManager(comptime Backend: type) type {
                 self.runtime.rasterCache(),
             );
             errdefer surface.runtime.deinit();
+            setRuntimeClipboard(&surface.runtime, self.backend);
             surface.queue.runtime = &surface.runtime;
             surface.queue.popup_manager = self.hooks();
             // Popups clear to transparent like layer-shell surfaces: the content
@@ -1186,6 +1194,7 @@ fn WindowManager(comptime Backend: type) type {
                 self.raster_cache,
             );
             errdefer managed.runtime.deinit();
+            setRuntimeClipboard(&managed.runtime, self.backend);
             managed.runtime_ready = true;
             managed.queue.runtime = &managed.runtime;
             managed.queue.configure_hook = .{ .ctx = managed, .func = managedConfigure };

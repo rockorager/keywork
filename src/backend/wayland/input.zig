@@ -766,6 +766,8 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     const state = self.xkb_state orelse return keyInputFromEvdev(key, self.shift_down);
     const keycode: xkb.xkb_keycode_t = key + 8;
     const keysym = xkb.xkb_state_key_get_one_sym(state, keycode);
+    const modifiers = self.currentModifiers();
+    if (modifiers.ctrl and !modifiers.alt and !modifiers.super and (keysym == xkb.XKB_KEY_v or keysym == xkb.XKB_KEY_V)) return .paste;
     if (hasUnconsumedShortcutModifier(state, keycode)) return null;
     switch (keysym) {
         xkb.XKB_KEY_BackSpace => return .backspace,
@@ -855,7 +857,7 @@ fn storedRepeatInput(self: *Self, input: keywork.KeyInput) ?keywork.KeyInput {
         .backspace => .backspace,
         .up => .up,
         .down => .down,
-        .enter, .space, .tab, .escape => null,
+        .enter, .space, .tab, .escape, .paste => null,
     };
 }
 
@@ -928,7 +930,7 @@ fn keyInputFromEvdev(key: u32, shift: bool) ?keywork.KeyInput {
 fn inputCanRepeat(input: keywork.KeyInput) bool {
     return switch (input) {
         .text, .backspace, .up, .down => true,
-        .enter, .space, .tab, .escape => false,
+        .enter, .space, .tab, .escape, .paste => false,
     };
 }
 
@@ -986,6 +988,7 @@ test "Wayland key translation does not turn shortcut chords into text edits" {
     const ctrl_mask: xkb.xkb_mod_mask_t = @as(xkb.xkb_mod_mask_t, 1) << @intCast(ctrl_index);
     _ = xkb.xkb_state_update_mask(state, ctrl_mask, 0, 0, 0, 0, 0);
     try std.testing.expect(input.keyInputFromWaylandKey(30) == null);
+    try std.testing.expect(input.keyInputFromWaylandKey(47).? == .paste);
     try std.testing.expect(input.keyInputFromWaylandKey(57) == null);
     try std.testing.expect(input.keyInputFromWaylandKey(14) == null);
 
