@@ -124,10 +124,12 @@ pub const Target = struct {
     }
 };
 
-/// Multiplier for finger and continuous axis deltas. libinput's touchpad
-/// deltas track finger travel 1:1, which feels sluggish for scrolling
-/// content; toolkits conventionally boost them.
-const touchpad_scroll_speed = 3.0;
+/// A wheel detent scrolls roughly three lines. High-resolution wheels report
+/// fractions of a detent through axis_value120 and retain that precision.
+const wheel_scroll_step: f32 = 100;
+/// Finger, continuous, and legacy axis-only events arrive as surface-local
+/// motion deltas. Boost them without quantizing so touchpads remain smooth.
+const smooth_scroll_speed: f32 = 3;
 
 /// Kinetic scroll tuning. Velocity decays exponentially per millisecond,
 /// matching the feel of common toolkits.
@@ -151,6 +153,8 @@ const PendingPointer = struct {
     button_count: usize = 0,
     scroll_dx: f32 = 0,
     scroll_dy: f32 = 0,
+    scroll_steps_x: ?f32 = null,
+    scroll_steps_y: ?f32 = null,
     scrolled: bool = false,
     scroll_source: wl.Pointer.AxisSource = .wheel,
     /// Timestamp of the frame's axis events, for velocity estimation.
@@ -391,9 +395,24 @@ fn pointerListener(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) v
             self.pending_pointer.scroll_time_ms = axis.time;
         },
         .axis_source => |axis_source| self.pending_pointer.scroll_source = axis_source.axis_source,
+        .axis_discrete => |axis| {
+            const steps: f32 = @floatFromInt(axis.discrete);
+            switch (axis.axis) {
+                .vertical_scroll => self.pending_pointer.scroll_steps_y = steps,
+                .horizontal_scroll => self.pending_pointer.scroll_steps_x = steps,
+                else => {},
+            }
+        },
+        .axis_value120 => |axis| {
+            const steps = @as(f32, @floatFromInt(axis.value120)) / 120.0;
+            switch (axis.axis) {
+                .vertical_scroll => self.pending_pointer.scroll_steps_y = steps,
+                .horizontal_scroll => self.pending_pointer.scroll_steps_x = steps,
+                else => {},
+            }
+        },
         .axis_stop => self.pending_pointer.scroll_stopped = true,
         .frame => self.flushPointerFrame(),
-        else => {},
     }
     // Pointers below version 5 never send frame; each event is its
     // own logical group.
@@ -428,12 +447,9 @@ fn flushPointerFrame(self: *Self) void {
         if (pending.scrolled) {
             // Direct scrolling always overrides a running fling.
             self.stopFling();
-            const speed: f32 = switch (pending.scroll_source) {
-                .finger, .continuous => touchpad_scroll_speed,
-                else => 1.0,
-            };
-            const dx = pending.scroll_dx * speed;
-            const dy = pending.scroll_dy * speed;
+            const delta = normalizedScrollDelta(pending);
+            const dx = delta.x;
+            const dy = delta.y;
             dispatchScroll(self.pointer_target, .{ .position = point, .dx = dx, .dy = dy, .modifiers = self.currentModifiers() });
             if (pending.scroll_source == .finger) {
                 self.trackScrollVelocity(dx, dy, pending.scroll_time_ms);
@@ -446,6 +462,18 @@ fn flushPointerFrame(self: *Self) void {
             self.resetScrollVelocity();
         }
     }
+}
+
+fn normalizedScrollDelta(pending: PendingPointer) keywork.Point {
+    const discrete = pending.scroll_source == .wheel or pending.scroll_source == .wheel_tilt;
+    return .{
+        .x = if (discrete) normalizedWheelAxis(pending.scroll_dx, pending.scroll_steps_x) else pending.scroll_dx * smooth_scroll_speed,
+        .y = if (discrete) normalizedWheelAxis(pending.scroll_dy, pending.scroll_steps_y) else pending.scroll_dy * smooth_scroll_speed,
+    };
+}
+
+fn normalizedWheelAxis(raw: f32, steps: ?f32) f32 {
+    return if (steps) |value| value * wheel_scroll_step else raw * smooth_scroll_speed;
 }
 
 /// Folds one finger-scroll frame into the velocity moving average, in
@@ -963,6 +991,36 @@ fn digitFromKey(key: u32, shift: bool) []const u8 {
         11 => "0",
         else => unreachable,
     };
+}
+
+test "Wayland scroll normalization distinguishes wheels from smooth motion" {
+    const wheel = normalizedScrollDelta(.{
+        .scroll_source = .wheel,
+        .scroll_dx = -15,
+        .scroll_dy = 15,
+        .scroll_steps_x = -0.5,
+        .scroll_steps_y = 1,
+    });
+    try std.testing.expectEqual(keywork.Point{ .x = -50, .y = 100 }, wheel);
+
+    const high_resolution_wheel = normalizedScrollDelta(.{
+        .scroll_source = .wheel,
+        .scroll_dy = 4,
+        .scroll_steps_y = 0.25,
+    });
+    try std.testing.expectEqual(@as(f32, 25), high_resolution_wheel.y);
+
+    const finger = normalizedScrollDelta(.{
+        .scroll_source = .finger,
+        .scroll_dx = -2.5,
+        .scroll_dy = 4,
+    });
+    try std.testing.expectEqual(keywork.Point{ .x = -7.5, .y = 12 }, finger);
+
+    // Old compositors may provide only the raw axis vector. Preserve smooth
+    // motion rather than guessing a detent count from an arbitrary value.
+    const legacy_wheel = normalizedScrollDelta(.{ .scroll_source = .wheel, .scroll_dy = 15 });
+    try std.testing.expectEqual(@as(f32, 45), legacy_wheel.y);
 }
 
 fn initTestInput(layout: [*:0]const u8) !Self {
