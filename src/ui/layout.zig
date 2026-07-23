@@ -21,6 +21,7 @@ const scrollState = model.scrollState;
 const listState = model.listState;
 const textInputState = model.textInputState;
 const listVisibleRange = model.listVisibleRange;
+const listItemConstraints = model.listItemConstraints;
 const scrollChildConstraints = model.scrollChildConstraints;
 
 fn ensureRenderNode(allocator: std.mem.Allocator, element: *Element) !*RenderNode {
@@ -814,9 +815,10 @@ fn layoutElementInto(
         },
         .list => |list_widget| {
             const state = listState(element);
-            const content_height = list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
+            try state.prepare(allocator, list_widget, constraints.max_width);
+            var content_height = state.contentExtent(list_widget);
             const available_height = if (std.math.isFinite(constraints.max_height)) constraints.max_height else content_height;
-            const height = @min(available_height, content_height);
+            var height = @min(available_height, content_height);
             state.viewport_height = height;
 
             // Follow the controlled selection: when it changes (or first
@@ -824,34 +826,94 @@ fn layoutElementInto(
             // fully into view. Free scrolling in between is left alone.
             if (list_widget.selected) |selected| {
                 if (state.last_selected != selected and selected < list_widget.item_count) {
-                    const top = list_widget.item_extent * @as(f32, @floatFromInt(selected));
-                    const bottom = top + list_widget.item_extent;
+                    const top = state.itemStart(list_widget, selected);
+                    const bottom = top + state.itemExtent(list_widget, selected);
+                    state.follow_alignment = null;
                     if (top < state.offset) {
                         state.offset = top;
+                        state.follow_alignment = .top;
                     } else if (bottom > state.offset + height) {
                         state.offset = bottom - height;
+                        state.follow_alignment = .bottom;
                     }
                 }
                 state.last_selected = selected;
             } else {
                 state.last_selected = null;
+                state.follow_alignment = null;
+            }
+
+            // Keep the selected edge anchored while estimates converge. The
+            // anchor is cleared as soon as the measured window stabilizes,
+            // after which an unchanged selection never fights free scrolling.
+            if (state.follow_alignment) |alignment| {
+                if (list_widget.selected) |selected| {
+                    if (selected < list_widget.item_count) {
+                        const top = state.itemStart(list_widget, selected);
+                        state.offset = switch (alignment) {
+                            .top => top,
+                            .bottom => top + state.itemExtent(list_widget, selected) - height,
+                        };
+                    }
+                }
             }
 
             state.offset = std.math.clamp(state.offset, 0, @max(0, content_height - height));
+            const scroll_anchor = if (list_widget.item_extent == null and state.follow_alignment == null)
+                state.captureScrollAnchor(list_widget)
+            else
+                null;
 
-            // A drifted window is rebuilt by the next dirty-state pass; this
-            // pass lays out whatever window is currently built.
-            const ideal = listVisibleRange(list_widget, state.offset, height);
-            if (ideal.first != state.first or ideal.count != state.built) state.range_stale = true;
-
-            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+            const item_constraints = listItemConstraints(list_widget, constraints);
             const children = try ensureChildSlice(allocator, node, element.children.len);
             var content_width: f32 = 0;
+            var measurements_changed = false;
             for (element.children, 0..) |*child_element, index| {
-                const child_y = origin.y - state.offset + @as(f32, @floatFromInt(state.first + index)) * list_widget.item_extent;
+                const item_index = state.first + index;
+                const child_y = origin.y - state.offset + state.itemStart(list_widget, item_index);
                 children[index] = try layoutElement(allocator, child_element, item_constraints, .{ .x = origin.x, .y = child_y }, measurer);
                 content_width = @max(content_width, children[index].rect.width);
+                if (list_widget.item_extent == null) {
+                    measurements_changed = state.recordMeasurement(item_index, children[index].rect.height) or measurements_changed;
+                }
             }
+
+            const geometry_changed = list_widget.item_extent == null and state.finishMeasurements(measurements_changed);
+            if (geometry_changed) {
+                content_height = state.contentExtent(list_widget);
+                const measured_available = if (std.math.isFinite(constraints.max_height)) constraints.max_height else content_height;
+                height = @min(measured_available, content_height);
+                state.viewport_height = height;
+                if (state.follow_alignment) |alignment| {
+                    if (list_widget.selected) |selected| {
+                        if (selected < list_widget.item_count) {
+                            const top = state.itemStart(list_widget, selected);
+                            state.offset = switch (alignment) {
+                                .top => top,
+                                .bottom => top + state.itemExtent(list_widget, selected) - height,
+                            };
+                        }
+                    }
+                } else if (scroll_anchor) |anchor| {
+                    state.restoreScrollAnchor(list_widget, anchor);
+                }
+                state.offset = std.math.clamp(state.offset, 0, @max(0, content_height - height));
+
+                // Measurement can move prefix positions and the anchored
+                // offset. Reposition retained rows now so an unchanged
+                // visible window does not need another convergence pass.
+                for (children, 0..) |child, index| {
+                    const item_index = state.first + index;
+                    moveNode(child, origin.x, origin.y - state.offset + state.itemStart(list_widget, item_index));
+                }
+            }
+
+            // A drifted window is rebuilt by the next dirty-state pass.
+            const ideal = listVisibleRange(list_widget, state, state.offset, height);
+            const window_stale = ideal.first != state.first or ideal.count != state.built;
+            state.range_stale = window_stale;
+            if (!window_stale) state.follow_alignment = null;
+
             const width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else content_width;
             const viewport = constraints.clamp(.{ .width = width, .height = height });
             commitRenderNode(node, .{

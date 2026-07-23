@@ -934,11 +934,14 @@ pub fn parse(
     if (std.mem.eql(u8, kind, "list")) {
         const ListOptions = struct {
             count: usize = 0,
-            item_height: f32 = 16,
+            item_height: ?f32 = null,
             selected: ?usize = null,
         };
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const options = try lua_codec.decode(ListOptions, lua_state, table, allocator);
+        if (options.item_height) |height| {
+            if (!std.math.isFinite(height) or height <= 0) return error.InvalidListItemHeight;
+        }
         c.lua_getfield(lua_state, table, "build_item");
         defer pop(lua_state, 1);
         if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.ExpectedLuaFunction;

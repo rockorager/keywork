@@ -298,15 +298,17 @@ pub const Widget = union(enum) {
         scrollbar_color: ?Color = null,
     };
 
-    /// A virtualized vertical list: only the items visible in the
-    /// viewport (plus a small buffer) are built as elements. Items have a
-    /// fixed extent so the content height and visible range are derivable
-    /// without building everything. Item state does not survive scrolling
-    /// out of the built window.
+    /// A virtualized vertical list: only the items visible in the viewport
+    /// (plus a small buffer) are built as elements. A supplied item extent is
+    /// the fixed-height fast path; otherwise child heights are measured and
+    /// estimated lazily. Item state does not survive scrolling out of the
+    /// built window.
     pub const List = struct {
         id: []const u8,
         item_count: usize,
-        item_extent: f32,
+        /// Fixed item height fast path. Null measures children lazily and
+        /// caches their individual extents, like Flutter's ListView.builder.
+        item_extent: ?f32,
         build_item: ItemBuilder,
         /// Controlled selection: when set and changed since the last
         /// layout, the list scrolls the minimum distance to bring the
@@ -845,7 +847,7 @@ pub const widgets = struct {
         return .{ .scroll = .{ .id = id, .child = try Widget.alloc(allocator, child) } };
     }
 
-    pub fn list(id: []const u8, item_count: usize, item_extent: f32, build_item: Widget.ItemBuilder) Widget {
+    pub fn list(id: []const u8, item_count: usize, item_extent: ?f32, build_item: Widget.ItemBuilder) Widget {
         return .{ .list = .{ .id = id, .item_count = item_count, .item_extent = item_extent, .build_item = build_item } };
     }
 
@@ -1323,6 +1325,13 @@ pub fn scrollState(element: *Element) *ScrollState {
 /// matches the offset/viewport; the runtime schedules another dirty-state
 /// pass to rebuild it.
 pub const ListState = struct {
+    const FollowAlignment = enum { top, bottom };
+
+    pub const ScrollAnchor = struct {
+        index: usize,
+        offset_within_item: f32,
+    };
+
     offset: f32 = 0,
     viewport_height: f32 = 0,
     first: usize = 0,
@@ -1332,8 +1341,165 @@ pub const ListState = struct {
     /// triggers the follow scroll, so free scrolling in between is left
     /// alone.
     last_selected: ?usize = null,
+    /// Variable-height lists retain measured extents by absolute item index.
+    /// Values from an old width remain useful estimates after reflow, while
+    /// measured marks values authoritative at measured_width.
+    heights: std.ArrayList(f32) = .empty,
+    measured: std.DynamicBitSetUnmanaged = .{},
+    ever_measured: std.DynamicBitSetUnmanaged = .{},
+    prefix: std.ArrayList(f32) = .empty,
+    measured_width: ?f32 = null,
+    estimated_item_extent: f32 = 16,
+    follow_alignment: ?FollowAlignment = null,
     scrollbar_alpha: f32 = 0,
     scrollbar_fade: animation.Timeline = .{},
+
+    pub fn deinit(self: *ListState, allocator: std.mem.Allocator) void {
+        self.heights.deinit(allocator);
+        self.measured.deinit(allocator);
+        self.ever_measured.deinit(allocator);
+        self.prefix.deinit(allocator);
+    }
+
+    /// Keeps variable-height geometry synchronized with the item count.
+    /// Layout additionally supplies the authoritative child width; other
+    /// tree walks pass null because flex layout may narrow their constraints.
+    /// Fixed-height lists never allocate this cache.
+    pub fn prepare(self: *ListState, allocator: std.mem.Allocator, list_widget: Widget.List, width: ?f32) !void {
+        if (list_widget.item_extent != null) {
+            if (self.heights.capacity != 0 or self.prefix.capacity != 0 or self.measured.bit_length != 0 or self.ever_measured.bit_length != 0) {
+                self.heights.deinit(allocator);
+                self.measured.deinit(allocator);
+                self.ever_measured.deinit(allocator);
+                self.prefix.deinit(allocator);
+                self.heights = .empty;
+                self.measured = .{};
+                self.ever_measured = .{};
+                self.prefix = .empty;
+            }
+            self.measured_width = null;
+            self.follow_alignment = null;
+            return;
+        }
+
+        const old_count = self.heights.items.len;
+        const count_changed = old_count != list_widget.item_count;
+        const prefix_uninitialized = self.prefix.items.len != list_widget.item_count + 1;
+        if (count_changed or prefix_uninitialized) {
+            try self.heights.resize(allocator, list_widget.item_count);
+            if (list_widget.item_count > old_count) {
+                @memset(self.heights.items[old_count..], self.estimated_item_extent);
+            }
+            try self.measured.resize(allocator, list_widget.item_count, false);
+            try self.ever_measured.resize(allocator, list_widget.item_count, false);
+            try self.prefix.resize(allocator, list_widget.item_count + 1);
+            self.rebuildPrefix();
+        }
+
+        if (width) |layout_width| {
+            if (self.measured_width == null or self.measured_width.? != layout_width) {
+                self.measured.unsetAll();
+                self.measured_width = layout_width;
+            }
+        }
+    }
+
+    fn rebuildPrefix(self: *ListState) void {
+        if (self.prefix.items.len == 0) return;
+        self.prefix.items[0] = 0;
+        for (self.heights.items, 0..) |height, index| {
+            self.prefix.items[index + 1] = self.prefix.items[index] + height;
+        }
+    }
+
+    pub fn itemStart(self: *const ListState, list_widget: Widget.List, index: usize) f32 {
+        if (list_widget.item_extent) |extent| return extent * @as(f32, @floatFromInt(index));
+        if (index < self.prefix.items.len) return self.prefix.items[index];
+        return self.estimated_item_extent * @as(f32, @floatFromInt(index));
+    }
+
+    pub fn itemExtent(self: *const ListState, list_widget: Widget.List, index: usize) f32 {
+        if (list_widget.item_extent) |extent| return extent;
+        if (index < self.heights.items.len) return self.heights.items[index];
+        return self.estimated_item_extent;
+    }
+
+    pub fn contentExtent(self: *const ListState, list_widget: Widget.List) f32 {
+        if (list_widget.item_extent) |extent| return extent * @as(f32, @floatFromInt(list_widget.item_count));
+        if (self.prefix.items.len > list_widget.item_count) return self.prefix.items[list_widget.item_count];
+        return self.estimated_item_extent * @as(f32, @floatFromInt(list_widget.item_count));
+    }
+
+    pub fn captureScrollAnchor(self: *const ListState, list_widget: Widget.List) ?ScrollAnchor {
+        if (list_widget.item_count == 0) return null;
+        const index = self.itemAtOffset(self.offset);
+        return .{
+            .index = index,
+            .offset_within_item = self.offset - self.itemStart(list_widget, index),
+        };
+    }
+
+    pub fn restoreScrollAnchor(self: *ListState, list_widget: Widget.List, anchor: ScrollAnchor) void {
+        if (anchor.index >= list_widget.item_count) return;
+        const offset_within_item = std.math.clamp(anchor.offset_within_item, 0, self.itemExtent(list_widget, anchor.index));
+        self.offset = self.itemStart(list_widget, anchor.index) + offset_within_item;
+    }
+
+    fn itemAtOffset(self: *const ListState, offset: f32) usize {
+        std.debug.assert(self.heights.items.len > 0);
+        var low: usize = 0;
+        var high = self.heights.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.prefix.items[middle + 1] <= offset) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return @min(low, self.heights.items.len - 1);
+    }
+
+    /// Records one laid-out row. Prefix positions are rebuilt once after the
+    /// whole retained window has been measured.
+    pub fn recordMeasurement(self: *ListState, index: usize, height: f32) bool {
+        if (index >= self.heights.items.len) return false;
+        const measured_height = if (std.math.isFinite(height)) @max(0, height) else self.estimated_item_extent;
+        const changed = @abs(self.heights.items[index] - measured_height) > 0.01;
+        self.heights.items[index] = measured_height;
+        self.measured.set(index);
+        self.ever_measured.set(index);
+        return changed;
+    }
+
+    /// Updates the rolling estimate and positions after a layout pass.
+    pub fn finishMeasurements(self: *ListState, measurements_changed: bool) bool {
+        if (!measurements_changed) return false;
+
+        var total: f32 = 0;
+        var count: usize = 0;
+        for (self.heights.items, 0..) |height, index| {
+            if (!self.measured.isSet(index)) continue;
+            total += height;
+            count += 1;
+        }
+
+        var changed = measurements_changed;
+        if (count > 0) {
+            const estimate = total / @as(f32, @floatFromInt(count));
+            if (std.math.isFinite(estimate) and estimate > 0 and @abs(self.estimated_item_extent - estimate) > 0.01) {
+                self.estimated_item_extent = estimate;
+                changed = true;
+            }
+            for (self.heights.items, 0..) |*height, index| {
+                if (self.ever_measured.isSet(index)) continue;
+                if (@abs(height.* - self.estimated_item_extent) > 0.01) changed = true;
+                height.* = self.estimated_item_extent;
+            }
+        }
+        if (changed) self.rebuildPrefix();
+        return changed;
+    }
 };
 
 pub fn listState(element: *Element) *ListState {
@@ -1456,17 +1622,36 @@ const ListRange = struct {
     count: usize,
 };
 
-pub fn listVisibleRange(list_widget: Widget.List, offset: f32, viewport_height: f32) ListRange {
-    if (list_widget.item_count == 0 or list_widget.item_extent <= 0) return .{ .first = 0, .count = 0 };
-    const height = if (std.math.isFinite(viewport_height))
-        viewport_height
-    else
-        list_widget.item_extent * @as(f32, @floatFromInt(list_widget.item_count));
-    const first_visible: usize = @intFromFloat(@max(0, @floor(offset / list_widget.item_extent)));
-    const first = @min(first_visible -| list_buffer_items, list_widget.item_count - 1);
-    const visible: usize = @intFromFloat(@ceil(height / list_widget.item_extent) + 1);
-    const count = @min(visible + list_buffer_items * 2, list_widget.item_count - first);
-    return .{ .first = first, .count = count };
+pub fn listVisibleRange(list_widget: Widget.List, state: *const ListState, offset: f32, viewport_height: f32) ListRange {
+    if (list_widget.item_count == 0) return .{ .first = 0, .count = 0 };
+    if (list_widget.item_extent) |item_extent| {
+        if (item_extent <= 0) return .{ .first = 0, .count = 0 };
+        const height = if (std.math.isFinite(viewport_height))
+            viewport_height
+        else
+            item_extent * @as(f32, @floatFromInt(list_widget.item_count));
+        const first_visible: usize = @intFromFloat(@max(0, @floor(offset / item_extent)));
+        const first = @min(first_visible -| list_buffer_items, list_widget.item_count - 1);
+        const visible: usize = @intFromFloat(@ceil(height / item_extent) + 1);
+        const count = @min(visible + list_buffer_items * 2, list_widget.item_count - first);
+        return .{ .first = first, .count = count };
+    }
+
+    const content_extent = state.contentExtent(list_widget);
+    const height = if (std.math.isFinite(viewport_height)) @max(0, viewport_height) else content_extent;
+    const clamped_offset = std.math.clamp(offset, 0, @max(0, content_extent));
+    const first_visible = state.itemAtOffset(clamped_offset);
+    const last_visible = state.itemAtOffset(@min(content_extent, clamped_offset + height));
+    const first = first_visible -| list_buffer_items;
+    const end = @min(list_widget.item_count, last_visible + 1 +| list_buffer_items);
+    return .{ .first = first, .count = end - first };
+}
+
+pub fn listItemConstraints(list_widget: Widget.List, constraints: Constraints) Constraints {
+    return .{
+        .max_width = constraints.max_width,
+        .max_height = list_widget.item_extent orelse std.math.inf(f32),
+    };
 }
 
 fn buildListChildren(
@@ -1476,7 +1661,7 @@ fn buildListChildren(
     range: ListRange,
     constraints: Constraints,
 ) ![]Element {
-    const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+    const item_constraints = listItemConstraints(list_widget, constraints);
     const children = try allocator.alloc(Element, range.count);
     var initialized: usize = 0;
     errdefer {
@@ -1513,7 +1698,7 @@ fn reconcileListWindow(
     retained: RetainedRows,
 ) ![]Element {
     std.debug.assert(element.kind == .list);
-    const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+    const item_constraints = listItemConstraints(list_widget, constraints);
     const old_first = listState(element).first;
     const old_children = element.children;
     element.children = &.{};
@@ -1705,9 +1890,13 @@ pub fn buildElementTreeScoped(
             var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = try allocator.create(ListState);
-            errdefer allocator.destroy(state);
             state.* = .{ .viewport_height = constraints.max_height };
-            const range = listVisibleRange(element_widget.list, state.offset, constraints.max_height);
+            errdefer {
+                state.deinit(allocator);
+                allocator.destroy(state);
+            }
+            try state.prepare(allocator, element_widget.list, null);
+            const range = listVisibleRange(element_widget.list, state, state.offset, constraints.max_height);
             state.first = range.first;
             state.built = range.count;
             const children = try buildListChildren(allocator, scope, element_widget.list, range, constraints);
@@ -1926,7 +2115,11 @@ pub fn destroyElementTree(allocator: std.mem.Allocator, element: *Element) void 
                 allocator.destroy(input_state);
             },
             .scroll => allocator.destroy(@as(*ScrollState, @ptrCast(@alignCast(state)))),
-            .list => allocator.destroy(@as(*ListState, @ptrCast(@alignCast(state)))),
+            .list => {
+                const list_state: *ListState = @ptrCast(@alignCast(state));
+                list_state.deinit(allocator);
+                allocator.destroy(list_state);
+            },
             .spinner => allocator.destroy(@as(*SpinnerState, @ptrCast(@alignCast(state)))),
             else => unreachable,
         }
@@ -2001,7 +2194,8 @@ pub fn updateElementTreeScoped(
             var element_widget = try cloneWidgetForElementThemed(allocator, widget.*, scope.theme, scope.default_text_style);
             errdefer destroyElementWidget(allocator, &element_widget);
             const state = listState(element);
-            const range = listVisibleRange(element_widget.list, state.offset, state.viewport_height);
+            try state.prepare(allocator, element_widget.list, null);
+            const range = listVisibleRange(element_widget.list, state, state.offset, state.viewport_height);
             const children = try reconcileListWindow(allocator, scope, element, element_widget.list, range, constraints, .rebuild);
             element.children = children;
             state.first = range.first;
@@ -2126,12 +2320,13 @@ pub fn rebuildDirtyElementTreeScoped(
         .scroll => |scroll_widget| return try rebuildDirtySingleChildElement(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes)),
         .list => |list_widget| {
             const state = listState(element);
-            const rebuilt_children = try rebuildDirtyChildren(allocator, scope, element.children, .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent });
+            try state.prepare(allocator, list_widget, null);
+            const rebuilt_children = try rebuildDirtyChildren(allocator, scope, element.children, listItemConstraints(list_widget, constraints));
             if (!state.range_stale) {
                 if (rebuilt_children) markElementLayoutDirty(element);
                 return rebuilt_children;
             }
-            const range = listVisibleRange(list_widget, state.offset, state.viewport_height);
+            const range = listVisibleRange(list_widget, state, state.offset, state.viewport_height);
             const children = try reconcileListWindow(allocator, scope, element, list_widget, range, constraints, .reuse);
             element.children = children;
             state.first = range.first;
@@ -2286,7 +2481,7 @@ pub fn refreshInteractionElements(
         .scroll => |scroll_widget| return try refreshInteractionSingleChild(allocator, scope, element, scrollChildConstraints(constraints, scroll_widget.axes), ids),
         .list => |list_widget| {
             var refreshed = false;
-            const item_constraints: Constraints = .{ .max_width = constraints.max_width, .max_height = list_widget.item_extent };
+            const item_constraints = listItemConstraints(list_widget, constraints);
             for (element.children) |*child| {
                 if (try refreshInteractionElements(allocator, scope, child, item_constraints, ids)) refreshed = true;
             }
@@ -3276,6 +3471,34 @@ const TestListItems = struct {
     }
 };
 
+const VariableListItems = struct {
+    heights: []const f32,
+
+    fn builder(self: *const @This()) Widget.ItemBuilder {
+        return .{ .ptr = self, .build_fn = build };
+    }
+
+    fn build(ptr: *const anyopaque, scope: *BuildScope, index: usize) !Widget {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return widgets.sized(scope.allocator, widgets.text("row"), null, self.heights[index]);
+    }
+};
+
+fn convergeTestList(
+    allocator: std.mem.Allocator,
+    build_allocator: std.mem.Allocator,
+    element: *Element,
+    constraints: Constraints,
+) !*RenderNode {
+    for (0..8) |_| {
+        const root = try layoutElement(allocator, element, constraints, .{ .x = 0, .y = 0 }, .fixed);
+        if (!anyListRangeStale(element)) return root;
+        var scope: BuildScope = .{ .allocator = build_allocator };
+        _ = try rebuildDirtyElementTreeScoped(allocator, &scope, element, constraints);
+    }
+    return error.ListDidNotStabilize;
+}
+
 const test_red: Color = Color.argb(0xff, 0xff, 0x00, 0x00);
 
 test "raster cache reuses alpha image data across display lists" {
@@ -3579,6 +3802,175 @@ test "list follows controlled selection and leaves free scrolling alone" {
     markElementLayoutDirty(&element);
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     try std.testing.expectEqual(@as(f32, 16), state.offset);
+}
+
+test "variable-height list measures, stacks, scrolls, and invalidates on width change" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const heights = [_]f32{ 10, 20, 30, 40, 50, 60 };
+    const items: VariableListItems = .{ .heights = &heights };
+    const list_widget = widgets.list("variable-list", heights.len, null, items.builder());
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 45 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+
+    var root = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    const state = listState(&element);
+    try std.testing.expectEqual(@as(usize, 5), state.measured.count());
+    for (root.children[1..], 1..) |child, index| {
+        const previous = root.children[index - 1];
+        try std.testing.expectApproxEqAbs(previous.rect.y + previous.rect.height, child.rect.y, 0.01);
+    }
+
+    // Scrolling into the final row builds and measures it without losing the
+    // absolute item indices of the retained contiguous window.
+    state.offset = 110;
+    _ = dirtyScrollElement(&element, "variable-list");
+    root = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    try std.testing.expectEqual(@as(usize, 2), state.first);
+    try std.testing.expectEqual(@as(usize, heights.len), state.measured.count());
+    try std.testing.expectApproxEqAbs(@as(f32, 210), state.contentExtent(element.widget.list), 0.01);
+    for (root.children[1..], 1..) |child, index| {
+        const previous = root.children[index - 1];
+        try std.testing.expectApproxEqAbs(previous.rect.y + previous.rect.height, child.rect.y, 0.01);
+    }
+
+    // Non-layout tree walks synchronize count but cannot know the width a
+    // flex child will actually receive, so they must retain measurements.
+    try state.prepare(retained_allocator, element.widget.list, null);
+    try std.testing.expectEqual(@as(usize, heights.len), state.measured.count());
+
+    // Cached heights are width-specific; a reflow makes every row an
+    // estimate again, while retaining prior heights as useful estimates.
+    try state.prepare(retained_allocator, element.widget.list, 80);
+    try std.testing.expectEqual(@as(usize, 0), state.measured.count());
+    try std.testing.expectApproxEqAbs(@as(f32, 210), state.contentExtent(element.widget.list), 0.01);
+}
+
+test "variable-height list keeps the visible row anchored as estimates change" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    var heights: [1000]f32 = undefined;
+    @memset(heights[0..], 10);
+    @memset(heights[490..520], 80);
+    const items: VariableListItems = .{ .heights = &heights };
+    const list_widget = widgets.list("variable-anchor", heights.len, null, items.builder());
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+
+    const state = listState(&element);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), state.estimated_item_extent, 0.01);
+
+    // Jump to row 500 under the initial estimate. Measuring the much taller
+    // rows around it changes the global estimate, but row 500 must remain at
+    // the same viewport position instead of jumping to another item.
+    state.offset = 5000;
+    _ = dirtyScrollElement(&element, "variable-anchor");
+    const root = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    const anchor = state.captureScrollAnchor(element.widget.list).?;
+    try std.testing.expectEqual(@as(usize, 500), anchor.index);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), anchor.offset_within_item, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), root.children[500 - state.first].rect.y, 0.01);
+}
+
+test "variable-height list follows appends then preserves free scrolling" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const heights = [_]f32{ 12, 24, 18, 36, 20, 28, 16, 40, 22, 30, 26, 44, 32 };
+    const items: VariableListItems = .{ .heights = &heights };
+    var list_widget = widgets.list("variable-follow", 12, null, items.builder());
+    list_widget.list.selected = 11;
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 50 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+
+    const state = listState(&element);
+    const selected_bottom = state.itemStart(element.widget.list, 11) + state.itemExtent(element.widget.list, 11);
+    try std.testing.expectApproxEqAbs(selected_bottom, state.offset + constraints.max_height, 0.01);
+
+    // Once estimates have converged, an unchanged selected value does not
+    // snap a user who scrolls upward back to the selected row.
+    state.offset = 20;
+    _ = dirtyScrollElement(&element, "variable-follow");
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), state.offset, 0.01);
+
+    // A newly appended selected row follows its bottom while its own height
+    // and the preceding estimates converge.
+    var appended_widget = widgets.list("variable-follow", heights.len, null, items.builder());
+    appended_widget.list.selected = heights.len - 1;
+    var update_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try updateElementTreeScoped(retained_allocator, &update_scope, &element, &appended_widget, constraints);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    const appended_bottom = state.itemStart(element.widget.list, heights.len - 1) + state.itemExtent(element.widget.list, heights.len - 1);
+    try std.testing.expectApproxEqAbs(appended_bottom, state.offset + constraints.max_height, 0.01);
+}
+
+test "variable-height cache resizes through empty lists" {
+    var state: ListState = .{};
+    defer state.deinit(std.testing.allocator);
+    const items: TestListItems = .{};
+
+    const growing = widgets.list("resize", 4, null, items.builder());
+    try state.prepare(std.testing.allocator, growing.list, 100);
+    try std.testing.expectEqual(@as(usize, 4), state.heights.items.len);
+    try std.testing.expectEqual(@as(usize, 5), state.prefix.items.len);
+    _ = state.recordMeasurement(3, 32);
+
+    const shrinking = widgets.list("resize", 2, null, items.builder());
+    try state.prepare(std.testing.allocator, shrinking.list, 100);
+    try std.testing.expectEqual(@as(usize, 2), state.heights.items.len);
+    try std.testing.expectEqual(@as(usize, 3), state.prefix.items.len);
+
+    // Shrunk indices become new unknown rows if the count grows again.
+    try state.prepare(std.testing.allocator, growing.list, 100);
+    try std.testing.expect(!state.measured.isSet(3));
+    try std.testing.expect(!state.ever_measured.isSet(3));
+
+    const empty = widgets.list("resize", 0, null, items.builder());
+    try state.prepare(std.testing.allocator, empty.list, 100);
+    try std.testing.expectEqual(@as(usize, 0), state.heights.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.prefix.items.len);
+    const range = listVisibleRange(empty.list, &state, 0, 100);
+    try std.testing.expectEqual(@as(usize, 0), range.count);
+}
+
+test "variable-height cache retains prior row estimates across width changes" {
+    var state: ListState = .{};
+    defer state.deinit(std.testing.allocator);
+    const items: TestListItems = .{};
+    const list_widget = widgets.list("reflow", 4, null, items.builder());
+
+    try state.prepare(std.testing.allocator, list_widget.list, 100);
+    var changed = state.recordMeasurement(0, 10);
+    changed = state.recordMeasurement(1, 20) or changed;
+    _ = state.finishMeasurements(changed);
+
+    try state.prepare(std.testing.allocator, list_widget.list, 80);
+    try std.testing.expectEqual(@as(usize, 0), state.measured.count());
+    try std.testing.expectEqual(@as(usize, 2), state.ever_measured.count());
+
+    // The first row reflows, updating the global estimate for unknown rows.
+    // Row 1 keeps its old width-specific height as a better per-row estimate
+    // until it is measured at the new width.
+    _ = state.finishMeasurements(state.recordMeasurement(0, 30));
+    try std.testing.expectApproxEqAbs(@as(f32, 20), state.heights.items[1], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), state.heights.items[2], 0.01);
 }
 
 test "tight flex reports an error under unbounded scroll constraints" {

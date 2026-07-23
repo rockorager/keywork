@@ -650,7 +650,7 @@
 ---@class keywork.ListOptions
 ---@field id           string
 ---@field count?       integer                             Defaults to zero.
----@field item_height? number
+---@field item_height? number                              Fixed item height. Omit to lazily measure variable-height items.
 ---@field selected?    integer                             One-based; nil or zero means no selection.
 ---@field build_item   fun(index: integer): keywork.Widget
 
