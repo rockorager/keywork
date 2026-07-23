@@ -18,6 +18,7 @@ const lua_pipewire = @import("pipewire.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
+const lua_testing = @import("testing.zig");
 const lua_value = @import("value.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
@@ -50,6 +51,7 @@ pub const WindowConfig = lua_config.Config;
 pub const RootKind = enum {
     application,
     storybook,
+    test_script,
 };
 
 pub const App = struct {
@@ -146,6 +148,12 @@ pub const App = struct {
     pub fn initStorybookBrowser(allocator: std.mem.Allocator, path: []const u8) !App {
         var app = try initStorybook(allocator, path);
         app.storybook_browser = true;
+        return app;
+    }
+
+    pub fn initTest(allocator: std.mem.Allocator, path: []const u8) !App {
+        var app = try init(allocator, path);
+        app.root_kind = .test_script;
         return app;
     }
 
@@ -337,6 +345,17 @@ pub const App = struct {
         return if (self.storybook_catalog) |*catalog| catalog else error.NotStorybook;
     }
 
+    pub fn runTests(self: *App, filter: ?[]const u8) ![]lua_testing.Result {
+        std.debug.assert(self.root_kind == .test_script);
+        try self.ensureLoaded();
+        return lua_testing.run(self.state, self.allocator, filter);
+    }
+
+    pub fn lastLuaError(self: *App) ?[]const u8 {
+        if (c.lua_gettop(self.state) == 0) return null;
+        return stringFromStack(self.state, -1) catch null;
+    }
+
     pub fn selectStory(self: *App, id: []const u8) !void {
         const catalog = try self.storyCatalog();
         _ = catalog.find(id) orelse return error.UnknownStory;
@@ -353,6 +372,7 @@ pub const App = struct {
         state_invalidator: ?keywork.Widget.Callback,
     ) !keywork.Widget {
         try self.ensureLoaded();
+        if (self.root_kind == .test_script) return error.TestScriptHasNoWidget;
         if (self.root_kind == .storybook) {
             if (self.storybook_browser) return self.buildStorybookBrowser(allocator, runtime_state, render_scale, state_invalidator);
             return self.buildSelectedStory(allocator, runtime_state, render_scale, state_invalidator);
@@ -682,6 +702,16 @@ pub const App = struct {
         defer self.allocator.free(source);
         const chunk = scriptChunk(source);
         if (c.luaL_loadbuffer(self.state, chunk.ptr, chunk.len, self.chunk_name.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
+        if (self.root_kind == .test_script) {
+            if (c.lua_pcall(self.state, 0, 0, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
+            c.lua_pushboolean(self.state, 1);
+            const script_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+            if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
+            self.script_ref = script_ref;
+            self.script_dirty = false;
+            _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
+            return;
+        }
         if (c.lua_pcall(self.state, 0, 1, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
         errdefer c.lua_settop(self.state, 0);
 
@@ -692,6 +722,7 @@ pub const App = struct {
         switch (self.root_kind) {
             .application => config = try lua_config.parseRoot(self.state, self.allocator, root),
             .storybook => catalog = try lua_storybook.parseRoot(self.state, self.allocator, root),
+            .test_script => unreachable,
         }
         var committed = false;
         errdefer if (!committed) config.deinit(self.allocator);
@@ -839,9 +870,9 @@ pub const App = struct {
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
         var len: usize = 0;
         const message_ptr = c.lua_tolstring(self.state, -1, &len);
-        if (message_ptr) |ptr| {
+        if (message_ptr) |ptr| if (self.root_kind != .test_script) {
             std.log.scoped(.keywork_luajit).warn("{s}", .{ptr[0..len]});
-        }
+        };
         return err;
     }
 
@@ -1254,6 +1285,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         name: [*:0]const u8,
         loader: c.lua_CFunction,
         uses_app: bool = false,
+        test_only: bool = false,
     }{
         .{ .name = "keywork", .loader = keyworkModuleLoader, .uses_app = true },
         .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
@@ -1271,8 +1303,10 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         .{ .name = "keywork.xdg.applications", .loader = xdgApplicationsModuleLoader },
         .{ .name = "keywork.notify", .loader = notifyModuleLoader },
         .{ .name = "keywork.portal", .loader = portalModuleLoader },
+        .{ .name = "keywork.test", .loader = lua_testing.moduleLoader, .test_only = true },
     };
     for (modules) |module| {
+        if (module.test_only and app.root_kind != .test_script) continue;
         if (module.uses_app) c.lua_pushlightuserdata(lua_state, app);
         lua_value.setClosureField(lua_state, preload_table, module.name, module.loader, @intFromBool(module.uses_app));
     }
@@ -1859,6 +1893,7 @@ test "keywork core excludes optional capability modules" {
         \\assert(type(require("keywork.pipewire").connect) == "function")
         \\assert(type(require("keywork.audio").monitor) == "function")
         \\assert(type(require("keywork.log").info) == "function")
+        \\assert(not pcall(require, "keywork.test"))
         \\local options = { background_blur = true, child = kw.text("x") }
         \\local root = kw.app(options)
         \\assert(root == options)
@@ -1871,6 +1906,57 @@ test "keywork core excludes optional capability modules" {
     try app.ensureLoaded();
     try std.testing.expect(app.window_config.background_blur);
     try std.testing.expect(app.window_config.has_windows);
+}
+
+test "test scripts register cases and report assertion diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local test = require("keywork.test")
+        \\local kw = require("keywork")
+        \\local cleanup_count = 0
+        \\test.describe("values", function()
+        \\  test.after_each(function() cleanup_count = cleanup_count + 1 end)
+        \\  test.case("compares nested tables", function(t)
+        \\    t:type(kw.text, "function")
+        \\    t:equal({ nested = { value = 42 } }, { nested = { value = 42 } })
+        \\  end)
+        \\  test.case("reports the mismatch path", function(t)
+        \\    t:defer(function() cleanup_count = cleanup_count + 10 end)
+        \\    t:equal({ nested = { value = 41 } }, { nested = { value = 42 } })
+        \\  end)
+        \\  test.case("reports unexpected errors", function()
+        \\    error("boom")
+        \\  end)
+        \\  test.skip("waits for later", "not implemented")
+        \\end)
+        \\function test_cleanup_count() return cleanup_count end
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "values.test.lua", .data = script });
+    const script_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "values.test.lua" });
+    defer allocator.free(script_path);
+
+    var app = try App.initTest(allocator, script_path);
+    defer app.deinit();
+    const results = try app.runTests(null);
+    defer lua_testing.deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqual(lua_testing.Status.pass, results[0].status);
+    try std.testing.expectEqualStrings("values > compares nested tables", results[0].name);
+    try std.testing.expectEqual(lua_testing.Status.fail, results[1].status);
+    try std.testing.expect(std.mem.indexOf(u8, results[1].message.?, "$.nested.value") != null);
+    try std.testing.expectEqual(lua_testing.Status.error_status, results[2].status);
+    try std.testing.expect(std.mem.indexOf(u8, results[2].message.?, "boom") != null);
+    try std.testing.expectEqual(lua_testing.Status.skip, results[3].status);
+
+    c.lua_getglobal(app.state, "test_cleanup_count");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 1, 0));
+    defer pop(app.state, 1);
+    try std.testing.expectEqual(@as(c.lua_Integer, 13), c.lua_tointeger(app.state, -1));
 }
 
 test "application lifecycle hooks run exactly once per load" {

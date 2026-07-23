@@ -4,6 +4,7 @@ const std = @import("std");
 const cli = @import("app/cli.zig");
 const Application = @import("app/application.zig");
 const storybook = @import("app/storybook.zig");
+const testing = @import("app/testing.zig");
 
 pub const std_options: std.Options = .{
     .logFn = logWithTimestamp,
@@ -93,6 +94,28 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+        .test_command => |test_options| {
+            defer allocator.free(test_options.paths);
+            var stdout_buffer: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+            defer stdout.interface.flush() catch {};
+            if (test_options.help) {
+                try stdout.interface.writeAll(cli.test_usage);
+                return;
+            }
+            const successful = testing.run(allocator, init.io, test_options, &stdout.interface) catch |err| {
+                stdout.interface.flush() catch {};
+                var stderr_buffer: [256]u8 = undefined;
+                var stderr = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+                stderr.interface.print("test: {s}\n", .{@errorName(err)}) catch {};
+                stderr.interface.flush() catch {};
+                std.process.exit(1);
+            };
+            if (!successful) {
+                stdout.interface.flush() catch {};
+                std.process.exit(1);
+            }
+        },
     }
 }
 
@@ -100,6 +123,7 @@ test {
     _ = @import("app/application.zig");
     _ = @import("app/runner.zig");
     _ = @import("app/storybook.zig");
+    _ = @import("app/testing.zig");
     _ = @import("backend/memory.zig");
     _ = @import("backend/wayland/input.zig");
     _ = @import("backend/wayland/shm.zig");
