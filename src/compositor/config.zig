@@ -227,6 +227,7 @@ pub const Problem = enum {
     invalid_trigger,
     invalid_modifier,
     duplicate_modifier,
+    duplicate_binding,
     invalid_key,
     unknown_action,
     invalid_action_arguments,
@@ -525,6 +526,17 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                         .problem = problemForError(err),
                     } };
                 };
+                for (bindings.items) |existing| {
+                    if (existing.modifiers == binding.modifiers and
+                        existing.keysym == binding.keysym)
+                    {
+                        arena.deinit();
+                        return .{ .diagnostic = .{
+                            .line = line_number,
+                            .problem = .duplicate_binding,
+                        } };
+                    }
+                }
                 try bindings.append(arena_allocator, binding);
             },
             .input => |index| parseInputSetting(&input_rules.items[index].settings, name, value) catch |err| {
@@ -1161,6 +1173,7 @@ pub fn problemMessage(problem: Problem) []const u8 {
         .invalid_trigger => "invalid binding trigger",
         .invalid_modifier => "unknown binding modifier",
         .duplicate_modifier => "duplicate binding modifier",
+        .duplicate_binding => "duplicate binding trigger",
         .invalid_key => "unknown key name",
         .unknown_action => "unknown binding action",
         .invalid_action_arguments => "invalid arguments for binding action",
@@ -1464,4 +1477,14 @@ test "configuration rejects malformed syntax and unknown sections" {
     try std.testing.expectEqual(Problem.duplicate_modifier, modifier.diagnostic.problem);
     const window_target = try parse(std.testing.allocator, "[bindings]\nbind=super+q close all\n");
     try std.testing.expectEqual(Problem.invalid_window_target, window_target.diagnostic.problem);
+}
+
+test "configuration rejects unreachable duplicate binding triggers" {
+    const result = try parse(std.testing.allocator,
+        \\[bindings]
+        \\bind=super+q close focused
+        \\bind=super+q toggle-fullscreen focused
+    );
+    try std.testing.expectEqual(@as(usize, 3), result.diagnostic.line);
+    try std.testing.expectEqual(Problem.duplicate_binding, result.diagnostic.problem);
 }
