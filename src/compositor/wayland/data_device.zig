@@ -583,6 +583,10 @@ fn startDrag(
         const adapter: *SourceResource = @ptrCast(@alignCast(data));
         if (adapter.manager != self) return;
         const source = self.sources.get(adapter.id) orelse return;
+        if (resource.getVersion() >= 3 and !source.actions_set) {
+            resource.postError(.invalid_source, "drag-and-drop actions were not set");
+            return;
+        }
         if (source.used) {
             device_resource.postError(.used_source, "data source was already used");
             return;
