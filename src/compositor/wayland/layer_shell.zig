@@ -143,6 +143,7 @@ pub fn refresh(self: *Self) void {
     self.arrange();
 }
 
+/// Copies the listener and retains its context until replacement, clear, or deinit.
 pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
     self.policy_listener = listener;
     self.notifyPolicy();
@@ -152,6 +153,7 @@ pub fn clearPolicyListener(self: *Self) void {
     self.policy_listener = null;
 }
 
+/// Copies the listener and retains its context until clearRepaintListener or deinit.
 pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
     std.debug.assert(self.repaint_listener == null);
     self.repaint_listener = listener;

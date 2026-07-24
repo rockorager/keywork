@@ -501,6 +501,8 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearDeviceListener.
+/// Existing devices are reported synchronously before this function returns.
 pub fn setDeviceListener(self: *Self, listener: DeviceListener) void {
     std.debug.assert(self.device_listener == null);
     self.device_listener = listener;
@@ -514,6 +516,7 @@ pub fn clearDeviceListener(self: *Self) void {
     self.device_listener = null;
 }
 
+/// Copies the listener and retains its context until clearKeyboardStateListener.
 pub fn setKeyboardStateListener(self: *Self, listener: KeyboardStateListener) void {
     std.debug.assert(self.keyboard_state_listener == null);
     self.keyboard_state_listener = listener;
@@ -524,6 +527,7 @@ pub fn clearKeyboardStateListener(self: *Self) void {
     self.keyboard_state_listener = null;
 }
 
+/// Copies the listener and retains its context until clearKeyboardEventListener.
 pub fn setKeyboardEventListener(self: *Self, listener: KeyboardEventListener) void {
     std.debug.assert(self.keyboard_event_listener == null);
     self.keyboard_event_listener = listener;

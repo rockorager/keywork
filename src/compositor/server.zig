@@ -2924,6 +2924,7 @@ fn reportInputStatus(device_name: []const u8, setting_name: []const u8, status: 
     }
 }
 
+/// Copies the listener and retains its context until replacement or deinit.
 pub fn setXwaylandDisplayListener(self: *Self, listener: XwaylandDisplayListener) void {
     self.xwayland_display_listener = listener;
 }

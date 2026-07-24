@@ -66,6 +66,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until removeSeatListener.
 pub fn addSeatListener(self: *Self, listener: SeatListener) error{OutOfMemory}!void {
     for (self.listeners.items) |existing| std.debug.assert(existing.context != listener.context);
     try self.listeners.append(self.allocator, listener);

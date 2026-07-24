@@ -212,6 +212,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearListener or deinit.
 pub fn setListener(self: *Self, listener: Listener) void {
     std.debug.assert(self.listener == null);
     self.listener = listener;

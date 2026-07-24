@@ -447,6 +447,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearRepaintListener or deinit.
 pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
     std.debug.assert(self.repaint_listener == null);
     self.repaint_listener = listener;

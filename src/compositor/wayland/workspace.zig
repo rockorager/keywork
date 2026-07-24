@@ -360,6 +360,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearActivationListener.
 pub fn setActivationListener(self: *Self, listener: ActivationListener) void {
     std.debug.assert(self.activation_listener == null);
     self.activation_listener = listener;

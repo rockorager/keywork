@@ -470,6 +470,7 @@ pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
     self.default_output_id = output_id;
 }
 
+/// Copies the listener and retains its context until clearWindowListener.
 pub fn setWindowListener(self: *Self, listener: WindowListener) void {
     std.debug.assert(self.window_listener == null);
     self.window_listener = listener;
@@ -480,6 +481,7 @@ pub fn clearWindowListener(self: *Self) void {
     self.window_listener = null;
 }
 
+/// Copies the observer and retains its context until removeWindowObserver.
 pub fn addWindowObserver(self: *Self, observer: WindowObserver) error{OutOfMemory}!void {
     for (self.window_observers.items) |existing| {
         std.debug.assert(existing.context != observer.context);

@@ -526,6 +526,7 @@ pub fn fromResource(resource: *wl.Seat) *Self {
     return @ptrCast(@alignCast(data));
 }
 
+/// Copies the listener and retains its context until clearSeatResourceListener.
 pub fn setSeatResourceListener(self: *Self, listener: SeatResourceListener) void {
     std.debug.assert(self.seat_resource_listener == null);
     self.seat_resource_listener = listener;
@@ -581,6 +582,7 @@ pub fn acceptsPointerEnterSerial(
     return false;
 }
 
+/// Copies the listener and retains its context until clearRepaintListener.
 pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
     std.debug.assert(self.repaint_listener == null);
     self.repaint_listener = listener;
@@ -591,6 +593,7 @@ pub fn clearRepaintListener(self: *Self) void {
     self.repaint_listener = null;
 }
 
+/// Copies the listener and retains its context until removeKeyboardFocusListener.
 pub fn addKeyboardFocusListener(
     self: *Self,
     listener: KeyboardFocusListener,

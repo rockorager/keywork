@@ -130,6 +130,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearInvalidationListener.
 pub fn setInvalidationListener(self: *Self, listener: InvalidationListener) void {
     std.debug.assert(self.listener == null);
     self.listener = listener;

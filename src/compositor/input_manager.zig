@@ -83,6 +83,8 @@ pub fn deviceIterator(self: *Self) DeviceIterator {
     return .{ .devices = self.devices.items };
 }
 
+/// Retains the caller-owned listener until removeDeviceListener. Existing
+/// devices are reported synchronously before this function returns.
 pub fn addDeviceListener(self: *Self, listener: *DeviceListener) error{OutOfMemory}!void {
     for (self.device_listeners.items) |registered| std.debug.assert(registered != listener);
     try self.device_listeners.append(self.allocator, listener);

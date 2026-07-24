@@ -910,6 +910,7 @@ pub fn finishExternalDrag(self: *Self, generation: u64, performed: bool) void {
     self.notifyDragSelectionChanged();
 }
 
+/// Copies the listener and retains its context until removeDragSelectionListener.
 pub fn addDragSelectionListener(self: *Self, listener: SelectionListener) error{OutOfMemory}!void {
     for (self.drag_selection_listeners.items) |existing| {
         std.debug.assert(existing.context != listener.context);
@@ -1563,6 +1564,7 @@ fn sendSelectionToDevice(
     device.resource.sendSelection(offer);
 }
 
+/// Copies the listener and retains its context until removeSelectionListener.
 pub fn addSelectionListener(self: *Self, listener: SelectionListener) error{OutOfMemory}!void {
     for (self.selection_listeners.items) |existing| {
         std.debug.assert(existing.context != listener.context);

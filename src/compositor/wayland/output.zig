@@ -273,6 +273,7 @@ pub fn boundResources(self: *const Self) []const *wl.Output {
     return self.resources.items;
 }
 
+/// Copies the listener and retains its context until clearBindListener or deinit.
 pub fn setBindListener(self: *Self, listener: BindListener) void {
     std.debug.assert(self.bind_listener == null);
     self.bind_listener = listener;

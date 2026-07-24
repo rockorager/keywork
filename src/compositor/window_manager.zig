@@ -355,6 +355,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Copies the listener and retains its context until clearGeometryTransitionListener.
 pub fn setGeometryTransitionListener(self: *Self, listener: GeometryTransitionListener) void {
     std.debug.assert(self.geometry_listener == null);
     self.geometry_listener = listener;
@@ -365,6 +366,7 @@ pub fn clearGeometryTransitionListener(self: *Self) void {
     self.geometry_listener = null;
 }
 
+/// Copies the listener and retains its context until clearSessionListener.
 pub fn setSessionListener(self: *Self, listener: SessionListener) void {
     std.debug.assert(self.session_listener == null);
     self.session_listener = listener;

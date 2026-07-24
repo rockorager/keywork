@@ -527,6 +527,7 @@ fn sendSelectionToDevice(
     device.resource.sendSelection(offer);
 }
 
+/// Copies the listener and retains its context until removeSelectionListener.
 pub fn addSelectionListener(self: *Self, listener: SelectionListener) error{OutOfMemory}!void {
     for (self.selection_listeners.items) |existing| {
         std.debug.assert(existing.context != listener.context);
