@@ -320,10 +320,15 @@ const Constraint = struct {
     }
 
     fn setPendingRegion(self: *Constraint, region_resource: ?*wl.Region) !void {
-        self.pending_region.clear();
-        self.pending_region_set = region_resource != null;
         if (region_resource) |region| {
-            try self.pending_region.copyFrom(&WaylandRegion.fromResource(region).value);
+            var replacement = Region.init();
+            defer replacement.deinit();
+            try replacement.copyFrom(&WaylandRegion.fromResource(region).value);
+            std.mem.swap(Region, &self.pending_region, &replacement);
+            self.pending_region_set = true;
+        } else {
+            self.pending_region.clear();
+            self.pending_region_set = false;
         }
         self.pending_region_changed = true;
     }
