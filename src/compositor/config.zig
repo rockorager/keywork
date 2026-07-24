@@ -438,6 +438,8 @@ fn loadPath(
     };
 }
 
+/// Parses `source` into a diagnostic or an allocator-backed snapshot. The
+/// caller owns a returned snapshot and must call `Snapshot.deinit`.
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();

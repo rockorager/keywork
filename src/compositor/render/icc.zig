@@ -85,6 +85,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
     return parse(profile);
 }
 
+/// Loads a display transform. The caller must deinitialize the returned value
+/// with the same allocator; matrix profiles do not retain the profile file.
 pub fn loadOutputProfile(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -112,6 +114,8 @@ fn outputProfile(
     return .{ .matrix = matrix };
 }
 
+/// Compiles an allocator-owned calibration LUT. The caller must deinitialize
+/// the returned value with the same allocator.
 pub fn loadCalibrationLut(
     allocator: std.mem.Allocator,
     path: []const u8,

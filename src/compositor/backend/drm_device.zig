@@ -134,6 +134,8 @@ pub fn deviceId(self: *const Self) ?render.DrmDeviceId {
     };
 }
 
+/// Opens a non-master descriptor for this DRM device. The caller owns and must
+/// close the returned descriptor.
 pub fn openNonMasterFd(self: *Self) !std.posix.fd_t {
     if (self.failed or self.device == null or !self.session.isActive()) return error.SessionInactive;
     const fd = try std.posix.openatZ(std.posix.AT.FDCWD, self.device_path.?, .{
@@ -145,6 +147,9 @@ pub fn openNonMasterFd(self: *Self) !std.posix.fd_t {
     return fd;
 }
 
+/// Creates and tracks a DRM lease. The caller owns the returned descriptor;
+/// the lessee ID remains tracked until passed to `revokeLease` or revoked by
+/// the kernel.
 pub fn createLease(self: *Self, outputs_to_lease: []const *DrmOutput) !Lease {
     if (self.failed or self.device == null or !self.session.isActive()) return error.SessionInactive;
     if (outputs_to_lease.len == 0) return error.EmptyLease;

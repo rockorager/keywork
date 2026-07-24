@@ -1888,6 +1888,9 @@ fn handlePageFlip(
     listener.ready(listener.context);
 }
 
+/// Discovers connected outputs and returns allocator-owned selections. The
+/// caller must release the result with `deinitSelections` using the same
+/// allocator.
 pub fn selectOutputs(
     allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
@@ -2050,6 +2053,7 @@ pub fn selectOutputs(
     return selections.toOwnedSlice(allocator);
 }
 
+/// Releases selections returned by `selectOutputs`.
 pub fn deinitSelections(allocator: std.mem.Allocator, selections: []Selection) void {
     for (selections) |selection| {
         allocator.free(selection.modes);
