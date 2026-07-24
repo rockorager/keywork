@@ -16,6 +16,7 @@ const Xwm = @import("xwayland/xwm.zig");
 const ConfigureTransaction = @import("window_manager/ConfigureTransaction.zig");
 const XwaylandController = @import("window_manager/XwaylandController.zig");
 const types = @import("window_manager/types.zig");
+const floating_placement = @import("window_manager/floating_placement.zig");
 const floating_resize = @import("window_manager/floating_resize.zig");
 const layout_mod = @import("window_manager/layout.zig");
 const workspace_mod = @import("window_manager/workspace.zig");
@@ -2107,7 +2108,7 @@ fn relayout(self: *Self) void {
             const restore_size = window.floating_restore_size;
             const size = restore_size orelse
                 if (window.floating_override orelse false)
-                    manualFloatingSize(bounds.size, current)
+                    floating_placement.manualSize(bounds.size, current.width, current.height)
                 else
                     current_size;
             if (restore_size) |expected| {
@@ -2115,7 +2116,7 @@ fn relayout(self: *Self) void {
             }
             window.placement = .{
                 .id = member,
-                .rect = floatingRect(bounds, size, window.floating_position),
+                .rect = floating_placement.rect(bounds, size, window.floating_position),
                 .visible = true,
             };
         }
@@ -2141,7 +2142,7 @@ fn relayout(self: *Self) void {
                 }
                 window.placement = .{
                     .id = member,
-                    .rect = floatingRect(
+                    .rect = floating_placement.rect(
                         parent_placement.rect,
                         size,
                         window.floating_position,
@@ -2469,23 +2470,6 @@ fn dragCoordinate(value: f64) i32 {
     )));
 }
 
-fn centeredRect(parent: types.Rect, size: types.Size) types.Rect {
-    return .{
-        .x = centeredCoordinate(parent.x, parent.size.width, size.width),
-        .y = centeredCoordinate(parent.y, parent.size.height, size.height),
-        .size = size,
-    };
-}
-
-fn floatingRect(parent: types.Rect, size: types.Size, position: ?Scene.Position) types.Rect {
-    var rect = centeredRect(parent, size);
-    if (position) |value| {
-        rect.x = value.x;
-        rect.y = value.y;
-    }
-    return rect;
-}
-
 fn pointInLayoutPlan(x: f64, y: f64, plan: types.LayoutPlan) bool {
     const rect = visibleLayoutRect(plan) orelse return false;
     return x >= @as(f64, @floatFromInt(rect.x)) and
@@ -2587,24 +2571,6 @@ fn visibleLayoutRect(plan: types.LayoutPlan) ?types.Rect {
         .y = @intCast(top),
         .size = types.Size.init(@intCast(right - left), @intCast(bottom - top)),
     };
-}
-
-fn centeredCoordinate(parent_start: i32, parent_length: u32, child_length: u32) i32 {
-    const doubled = 2 * @as(i64, parent_start) + parent_length - child_length;
-    return @intCast(std.math.clamp(
-        @divFloor(doubled, 2),
-        std.math.minInt(i32),
-        std.math.maxInt(i32),
-    ));
-}
-
-fn manualFloatingSize(bounds: types.Size, current: XdgShell.Dimensions) types.Size {
-    const maximum_width: u32 = @intCast(@max(1, @divFloor(@as(i64, bounds.width) * 2, 3)));
-    const maximum_height: u32 = @intCast(@max(1, @divFloor(@as(i64, bounds.height) * 2, 3)));
-    return types.Size.init(
-        @min(@as(u32, @intCast(@max(1, current.width))), maximum_width),
-        @min(@as(u32, @intCast(@max(1, current.height))), maximum_height),
-    );
 }
 
 fn directionalDelta(origin: types.Rect, candidate: types.Rect, direction: Direction) i64 {
@@ -2941,43 +2907,6 @@ test "XDG toplevel with one fixed dimension wants floating" {
         .{ .width = 784, .height = 0 },
         .{ .width = 784, .height = 0 },
     ));
-}
-
-test "transient toplevel is centered over its parent" {
-    const parent: types.Rect = .{
-        .x = 100,
-        .y = 50,
-        .size = types.Size.init(800, 600),
-    };
-    try std.testing.expectEqual(
-        types.Rect{ .x = 250, .y = 200, .size = types.Size.init(500, 300) },
-        centeredRect(parent, types.Size.init(500, 300)),
-    );
-    try std.testing.expectEqual(
-        types.Rect{ .x = 0, .y = 0, .size = types.Size.init(1000, 700) },
-        centeredRect(parent, types.Size.init(1000, 700)),
-    );
-    try std.testing.expectEqual(
-        types.Rect{ .x = 700, .y = 400, .size = types.Size.init(500, 300) },
-        floatingRect(parent, types.Size.init(500, 300), .{ .x = 700, .y = 400 }),
-    );
-}
-
-test "manually floated windows are capped to two thirds of the usable area" {
-    try std.testing.expectEqual(
-        types.Size.init(800, 600),
-        manualFloatingSize(
-            types.Size.init(1200, 900),
-            .{ .width = 1200, .height = 900 },
-        ),
-    );
-    try std.testing.expectEqual(
-        types.Size.init(640, 480),
-        manualFloatingSize(
-            types.Size.init(1200, 900),
-            .{ .width = 640, .height = 480 },
-        ),
-    );
 }
 
 test "tiling drag hit testing honors visibility and layout clipping" {

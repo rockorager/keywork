@@ -488,6 +488,7 @@ test {
     _ = @import("window_manager.zig");
     _ = @import("window_animation.zig");
     _ = @import("window_manager/ConfigureTransaction.zig");
+    _ = @import("window_manager/floating_placement.zig");
     _ = @import("window_manager/floating_resize.zig");
     _ = @import("builtin_keybindings.zig");
     _ = @import("config.zig");
