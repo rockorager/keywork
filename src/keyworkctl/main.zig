@@ -95,13 +95,6 @@ fn run(init: std.process.Init) !void {
     defer init.gpa.free(address);
     var client = try varlink.Client.connect(init.gpa, init.io, address);
     defer client.deinit();
-    switch (command) {
-        .quit => {
-            try client.notify(control.quit_method, Empty{});
-            return;
-        },
-        else => {},
-    }
     var reply = switch (command) {
         .focus => |direction| try client.call(control.focus_method, .{ .direction = direction }),
         .move_focused => |direction| try client.call(control.move_focused_method, .{ .direction = direction }),
@@ -116,7 +109,7 @@ fn run(init: std.process.Init) !void {
         .set_unfocused_border => |border| try client.call(control.set_unfocused_border_method, .{ .border = border }),
         .set_log_level => |level| try client.call(control.set_log_level_method, .{ .level = level }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
-        .quit => unreachable,
+        .quit => try client.call(control.quit_method, Empty{}),
     };
     defer reply.deinit();
     if (reply.value.@"error") |name| {
@@ -181,14 +174,20 @@ fn parseWindowParameters(
 fn writeWindows(writer: *std.Io.Writer, windows: []const control.Window) !void {
     if (windows.len == 0) return writer.writeAll("No windows.\n");
     for (windows) |window| {
-        try writer.print("{s}{s}", .{ if (window.focused) "* " else "  ", window.id });
-        if (window.app_id) |app_id| try writer.print(" {s}", .{app_id});
-        if (window.title) |title| try writer.print(" \"{s}\"", .{title});
-        try writer.print("\n  {s}, {s} workspace {d}, ", .{
-            windowProtocolName(window.protocol),
-            window.output,
-            window.workspace,
-        });
+        try writer.writeAll(if (window.focused) "* " else "  ");
+        try writeDisplayString(writer, window.id);
+        if (window.app_id) |app_id| {
+            try writer.writeByte(' ');
+            try writeDisplayString(writer, app_id);
+        }
+        if (window.title) |title| {
+            try writer.writeAll(" \"");
+            try writeDisplayString(writer, title);
+            try writer.writeByte('"');
+        }
+        try writer.print("\n  {s}, ", .{windowProtocolName(window.protocol)});
+        try writeDisplayString(writer, window.output);
+        try writer.print(" workspace {d}, ", .{window.workspace});
         if (window.rect) |rect| {
             try writer.print("{d},{d} {d}x{d}", .{ rect.x, rect.y, rect.width, rect.height });
         } else {
@@ -203,6 +202,24 @@ fn writeWindows(writer: *std.Io.Writer, windows: []const control.Window) !void {
         if (window.minimized) try writer.writeAll(", minimized");
         try writer.writeByte('\n');
     }
+}
+
+fn writeDisplayString(writer: *std.Io.Writer, value: []const u8) !void {
+    const hexadecimal = "0123456789abcdef";
+    for (value) |byte| switch (byte) {
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => if (std.ascii.isControl(byte)) {
+            try writer.writeAll("\\x");
+            try writer.writeByte(hexadecimal[byte >> 4]);
+            try writer.writeByte(hexadecimal[byte & 0x0f]);
+        } else {
+            try writer.writeByte(byte);
+        },
+    };
 }
 
 fn writeWindowsJson(writer: *std.Io.Writer, windows: []const control.Window) !void {
@@ -776,6 +793,32 @@ test "window snapshots decode and render human-readable output" {
         \\  xwayland, HEADLESS-1 workspace 2, unplaced, hidden, floating, minimized
         \\
     , writer.written());
+}
+
+test "window snapshots escape terminal control sequences" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    const windows = [_]control.Window{.{
+        .id = "00000001:00000003",
+        .protocol = .xdg_shell,
+        .title = "bad\n\x1b]52;clipboard\x07\"title",
+        .app_id = "org.example\\bad\tapp",
+        .output = "HEADLESS-1",
+        .workspace = 1,
+        .focused = true,
+        .visible = true,
+        .floating = false,
+        .fullscreen = false,
+        .maximized = false,
+        .minimized = false,
+    }};
+
+    try writeWindows(&writer.writer, &windows);
+    try std.testing.expectEqualStrings(
+        "* 00000001:00000003 org.example\\\\bad\\tapp \"bad\\n\\x1b]52;clipboard\\x07\\\"title\"\n" ++
+            "  xdg-shell, HEADLESS-1 workspace 1, unplaced, visible, tiled\n",
+        writer.written(),
+    );
 }
 
 test "window snapshots render machine-readable JSON" {
