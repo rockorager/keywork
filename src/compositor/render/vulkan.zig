@@ -5971,7 +5971,6 @@ fn deviceMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
 fn ensureWorkBuffer(self: *Self, submission: *Submission, required_size: usize) Error!void {
     if (submission.work_capacity >= required_size) return;
     std.debug.assert(!submission.fence_pending);
-    self.destroyWorkBuffer(submission);
 
     const buffer = self.device_wrapper.createBuffer(self.device, &.{
         .size = required_size,
@@ -6003,6 +6002,7 @@ fn ensureWorkBuffer(self: *Self, submission: *Submission, required_size: usize) 
     const mapped: [*]u8 = @ptrCast(mapped_opaque orelse return error.VulkanFailure);
     errdefer self.device_wrapper.unmapMemory(self.device, memory);
 
+    self.destroyWorkBuffer(submission);
     submission.work_buffer = buffer;
     submission.work_memory = memory;
     submission.work_mapped = mapped;
@@ -6030,7 +6030,6 @@ fn destroyWorkBuffer(self: *Self, submission: *Submission) void {
 fn ensureInstanceBuffer(self: *Self, submission: *Submission, required_size: usize) Error!void {
     if (submission.instance_capacity >= required_size) return;
     std.debug.assert(!submission.fence_pending);
-    self.destroyInstanceBuffer(submission);
 
     const buffer = self.device_wrapper.createBuffer(self.device, &.{
         .size = required_size,
@@ -6062,6 +6061,7 @@ fn ensureInstanceBuffer(self: *Self, submission: *Submission, required_size: usi
     const mapped: [*]u8 = @ptrCast(mapped_opaque orelse return error.VulkanFailure);
     errdefer self.device_wrapper.unmapMemory(self.device, memory);
 
+    self.destroyInstanceBuffer(submission);
     submission.instance_buffer = buffer;
     submission.instance_memory = memory;
     submission.instance_mapped = mapped;
