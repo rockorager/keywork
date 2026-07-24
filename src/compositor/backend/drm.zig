@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const cursor_resample = @import("cursor_resample.zig");
 const display_color = @import("display_color.zig");
 const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
@@ -739,7 +740,13 @@ pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
                 return false;
             };
         }
-        rescaleCursor(cursor.buffer, cursor.size, &self.cursor_buffers[index]);
+        const buffer = &self.cursor_buffers[index];
+        cursor_resample.resample(
+            cursor.buffer,
+            cursor.size,
+            buffer.pixels,
+            buffer.stride_pixels,
+        );
         if (c.drmModeSetCursor(fd, self.crtc_id, self.cursor_buffers[index].handle, self.cursor_width, self.cursor_height) != 0) {
             self.failCursor(error.SetCursorFailed);
             return false;
@@ -3035,80 +3042,6 @@ fn scaleSigned(value: i32, scale: render.Scale) i32 {
         @divTrunc(product - half, render.Scale.denominator));
 }
 
-fn rescaleCursor(source: render.PixelBuffer, size: render.Size, destination: *Buffer) void {
-    @memset(destination.pixels, 0);
-    if (std.meta.eql(source.size, size)) {
-        for (0..size.height) |y| {
-            @memcpy(
-                destination.pixels[y * destination.stride_pixels ..][0..size.width],
-                source.pixels[y * source.stride_pixels ..][0..size.width],
-            );
-        }
-        return;
-    }
-    for (0..size.height) |y| {
-        const vertical = cursorSample(y, source.size.height, size.height);
-        for (0..size.width) |x| {
-            const horizontal = cursorSample(x, source.size.width, size.width);
-            const top_left = source.pixels[vertical.first * source.stride_pixels + horizontal.first];
-            const top_right = source.pixels[vertical.first * source.stride_pixels + horizontal.second];
-            const bottom_left = source.pixels[vertical.second * source.stride_pixels + horizontal.first];
-            const bottom_right = source.pixels[vertical.second * source.stride_pixels + horizontal.second];
-            destination.pixels[y * destination.stride_pixels + x] =
-                interpolateCursorPixel(
-                    top_left,
-                    top_right,
-                    bottom_left,
-                    bottom_right,
-                    horizontal.weight,
-                    vertical.weight,
-                );
-        }
-    }
-}
-
-const CursorSample = struct {
-    first: usize,
-    second: usize,
-    weight: f64,
-};
-
-fn cursorSample(destination: usize, source_size: u32, destination_size: u32) CursorSample {
-    std.debug.assert(source_size > 0 and destination_size > 0);
-    const position = (@as(f64, @floatFromInt(destination)) + 0.5) *
-        @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(destination_size)) - 0.5;
-    const first_unclamped: i64 = @intFromFloat(@floor(position));
-    const maximum: i64 = source_size - 1;
-    return .{
-        .first = @intCast(std.math.clamp(first_unclamped, 0, maximum)),
-        .second = @intCast(std.math.clamp(first_unclamped + 1, 0, maximum)),
-        .weight = position - @floor(position),
-    };
-}
-
-fn interpolateCursorPixel(
-    top_left: u32,
-    top_right: u32,
-    bottom_left: u32,
-    bottom_right: u32,
-    horizontal: f64,
-    vertical: f64,
-) u32 {
-    var result: u32 = 0;
-    inline for (0..4) |component| {
-        const shift: u5 = @intCast(component * 8);
-        const top = @as(f64, @floatFromInt(@as(u8, @truncate(top_left >> shift)))) *
-            (1.0 - horizontal) +
-            @as(f64, @floatFromInt(@as(u8, @truncate(top_right >> shift)))) * horizontal;
-        const bottom = @as(f64, @floatFromInt(@as(u8, @truncate(bottom_left >> shift)))) *
-            (1.0 - horizontal) +
-            @as(f64, @floatFromInt(@as(u8, @truncate(bottom_right >> shift)))) * horizontal;
-        const value: u32 = @intFromFloat(@round(top * (1.0 - vertical) + bottom * vertical));
-        result |= value << shift;
-    }
-    return result;
-}
-
 fn disableAtomicCursorPlanes(fd: std.posix.fd_t, crtc_id: u32) bool {
     const resources = c.drmModeGetPlaneResources(fd) orelse return false;
     defer c.drmModeFreePlaneResources(resources);
@@ -4037,33 +3970,6 @@ test "cursor coordinates preserve signed fractional output-local positions" {
         cursorLocalPosition(124, 52, 100, 50, scale, 6, 5),
     );
     try std.testing.expectEqual(@as(i32, 36), scaleSigned(24, scale));
-}
-
-test "cursor rescale interpolates pixels and clears plane padding" {
-    const source_pixels = [_]u32{ 1, 2, 3, 4 };
-    var destination_pixels = [_]u32{9} ** 12;
-    var destination: Buffer = .{
-        .pixels = &destination_pixels,
-        .stride_pixels = 4,
-    };
-    rescaleCursor(.{
-        .size = .{ .width = 2, .height = 2 },
-        .stride_pixels = 2,
-        .pixels = @constCast(&source_pixels),
-    }, .{ .width = 3, .height = 3 }, &destination);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 2, 0 }, destination_pixels[0..4]);
-    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 3, 0 }, destination_pixels[4..8]);
-    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 4, 0 }, destination_pixels[8..12]);
-
-    @memset(&destination_pixels, 9);
-    rescaleCursor(.{
-        .size = .{ .width = 2, .height = 2 },
-        .stride_pixels = 2,
-        .pixels = @constCast(&source_pixels),
-    }, .{ .width = 2, .height = 2 }, &destination);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0, 0 }, destination_pixels[0..4]);
-    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 0, 0 }, destination_pixels[4..8]);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, destination_pixels[8..12]);
 }
 
 test "preferred DRM mode wins over the first mode" {
