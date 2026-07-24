@@ -13,6 +13,7 @@ const XdgShell = @import("wayland/xdg_shell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const WorkspaceProtocol = @import("wayland/workspace.zig");
 const Xwm = @import("xwayland/xwm.zig");
+const ConfigureTransaction = @import("window_manager/ConfigureTransaction.zig");
 const XwaylandController = @import("window_manager/XwaylandController.zig");
 const types = @import("window_manager/types.zig");
 const floating_resize = @import("window_manager/floating_resize.zig");
@@ -42,7 +43,7 @@ workspace_protocol: *WorkspaceProtocol,
 windows: WindowStore = .{},
 known_xwayland: std.AutoHashMapUnmanaged(Xwm.WindowId, KnownXwaylandWindow) = .empty,
 workspaces: std.ArrayList(OutputWorkspace) = .empty,
-transaction: Transaction = .{},
+transaction: ConfigureTransaction = .{},
 geometry_listener: ?GeometryTransitionListener = null,
 configure_timer: *wl.EventSource,
 layer_focus: LayerShell.FocusClass = .none,
@@ -229,57 +230,6 @@ const OutputWorkspace = struct {
     number: u8,
     active: bool,
     workspace: workspace_mod.Workspace = .{},
-};
-
-/// Pure transaction barrier. Removing an expected participant is equivalent to
-/// it committing, which prevents an unmap from stranding a render transaction.
-pub const Transaction = struct {
-    state: State = .idle,
-    remaining: u32 = 0,
-    dirty: bool = false,
-
-    pub const State = enum { idle, inflight, timed_out };
-
-    pub fn begin(self: *Transaction, count: u32) void {
-        std.debug.assert(self.state == .idle);
-        self.remaining = count;
-        self.state = if (count == 0) .idle else .inflight;
-    }
-
-    pub fn change(self: *Transaction) bool {
-        if (self.state == .inflight) {
-            self.dirty = true;
-            return false;
-        }
-        return true;
-    }
-
-    pub fn configured(self: *Transaction) bool {
-        if (self.state != .inflight) return false;
-        std.debug.assert(self.remaining > 0);
-        self.remaining -= 1;
-        if (self.remaining != 0) return false;
-        self.state = .idle;
-        return true;
-    }
-
-    pub fn removed(self: *Transaction, was_pending: bool) bool {
-        return if (was_pending) self.configured() else false;
-    }
-
-    pub fn timeout(self: *Transaction) bool {
-        if (self.state != .inflight) return false;
-        self.state = .timed_out;
-        self.remaining = 0;
-        return true;
-    }
-
-    pub fn consumeDirty(self: *Transaction) bool {
-        const value = self.dirty;
-        self.dirty = false;
-        if (self.state == .timed_out) self.state = .idle;
-        return value;
-    }
 };
 
 pub fn init(
@@ -2723,7 +2673,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
         window.serial = null;
         const complete = self.transaction.configured();
         // A gated commit may arrive after the configure barrier timed out.
-        if (complete or self.transaction.state != .inflight) self.publish();
+        if (complete or !self.transaction.isInflight()) self.publish();
     }
     if (pending_activation) _ = self.activateWindow(managed);
     return true;
@@ -2876,20 +2826,6 @@ pub fn xwaylandWindowDisplayed(self: *Self, id: Xwm.WindowId) bool {
     return displayed(window.mapped, window.minimized, self.workspaces.items[window.workspace].active, window.placement);
 }
 
-test "transaction coalesces, completes, times out, and tolerates removal" {
-    var transaction: Transaction = .{};
-    transaction.begin(2);
-    try std.testing.expect(!transaction.change());
-    try std.testing.expect(!transaction.configured());
-    try std.testing.expect(transaction.removed(true));
-    try std.testing.expect(transaction.consumeDirty());
-    transaction.begin(1);
-    try std.testing.expect(transaction.timeout());
-    try std.testing.expectEqual(Transaction.State.timed_out, transaction.state);
-    _ = transaction.consumeDirty();
-    try std.testing.expectEqual(Transaction.State.idle, transaction.state);
-}
-
 test "each output owns ten numbered workspaces" {
     var manager: Self = undefined;
     manager.allocator = std.testing.allocator;
@@ -2909,12 +2845,6 @@ test "each output owns ten numbered workspaces" {
     try std.testing.expectEqual(@as(usize, 10), manager.workspaceFor(second).?);
     try std.testing.expectEqual(@as(usize, 9), manager.workspaceNumber(first, 10).?);
     try std.testing.expectEqual(@as(usize, 19), manager.workspaceNumber(second, 10).?);
-}
-
-test "Xwayland does not enter configure barrier" {
-    var transaction: Transaction = .{};
-    transaction.begin(0);
-    try std.testing.expectEqual(Transaction.State.idle, transaction.state);
 }
 
 test "hidden windows are suspended and not displayed" {
