@@ -1228,11 +1228,11 @@ function ui.icon_label(icon_name, text, options)
             })
         )
     end
-    -- "baseline" centers the icon on the text's cap-height midline (like
+    -- "cap_center" centers the icon on the text's cap-height midline (like
     -- macOS symbol alignment) instead of the text box's geometric center.
     return ui.row({
         spacing = options.spacing or space_scale[2],
-        align = options.align or "baseline",
+        align = options.align or "cap_center",
         children = children,
     })
 end

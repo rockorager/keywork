@@ -1220,6 +1220,11 @@ fn layoutLinearElements(
 
     // A cross-axis min constraint (e.g. from an enclosing tight fit)
     // raises the extent children align and stretch against.
+    const row_baseline = if (kind == .row and cross_align == .baseline)
+        try rowBaselineMetrics(children, measurer)
+    else
+        null;
+    if (row_baseline) |metrics| cross = @max(cross, metrics.extent);
     cross = @max(cross, switch (kind) {
         .row => constraints.min_height,
         .column => constraints.min_width,
@@ -1268,7 +1273,7 @@ fn layoutLinearElements(
     }
 
     // Positioning pass.
-    const cap_center: ?f32 = if (kind == .row and cross_align == .baseline)
+    const cap_center: ?f32 = if (kind == .row and cross_align == .cap_center)
         try rowCapHeightCenter(children, cross, measurer)
     else
         null;
@@ -1287,7 +1292,7 @@ fn layoutLinearElements(
                 else => unreachable,
             };
         } else {
-            const aligned_cross = alignedCrossOffset(kind, cross_align, cross, child, cap_center);
+            const aligned_cross = try alignedCrossOffset(kind, cross_align, cross, child, row_baseline, cap_center, measurer);
             const new_x = switch (kind) {
                 .row => cursor.x,
                 .column => origin.x + aligned_cross,
@@ -1349,7 +1354,55 @@ pub fn constrainSized(parent: Constraints, sized_widget: Widget.Sized) Constrain
     };
 }
 
-fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignment, cross: f32, child: *const RenderNode, cap_center: ?f32) f32 {
+const RowBaselineMetrics = struct {
+    offset: f32,
+    extent: f32,
+};
+
+fn textBaseline(style: ResolvedTextStyle, measurer: TextMeasurer) LayoutError!f32 {
+    const metrics = try measurer.textMetrics(style.font_size);
+    const line_height = style.line_height orelse metrics.line_height;
+    return (line_height - metrics.line_height) / 2 + metrics.ascender;
+}
+
+/// Returns the first text baseline relative to the node's top edge. Render
+/// wrappers propagate their first descendant baseline with its layout offset.
+fn firstBaseline(node: *const RenderNode, measurer: TextMeasurer) LayoutError!?f32 {
+    return switch (node.kind) {
+        .text => try textBaseline(node.text_style, measurer),
+        .text_input => node.padding_y + try textBaseline(node.text_style, measurer),
+        .scroll, .list => null,
+        else => for (node.children) |child| {
+            if (try firstBaseline(child, measurer)) |baseline| {
+                break child.rect.y - node.rect.y + baseline;
+            }
+        } else null,
+    };
+}
+
+fn rowBaselineMetrics(children: []const *RenderNode, measurer: TextMeasurer) LayoutError!?RowBaselineMetrics {
+    var found = false;
+    var offset: f32 = 0;
+    var below: f32 = 0;
+    for (children) |child| {
+        const baseline = try firstBaseline(child, measurer) orelse continue;
+        found = true;
+        offset = @max(offset, baseline);
+        below = @max(below, @max(0, child.rect.height - baseline));
+    }
+    if (!found) return null;
+    return .{ .offset = offset, .extent = offset + below };
+}
+
+fn alignedCrossOffset(
+    kind: RenderNode.Kind,
+    alignment: Widget.CrossAxisAlignment,
+    cross: f32,
+    child: *const RenderNode,
+    row_baseline: ?RowBaselineMetrics,
+    cap_center: ?f32,
+    measurer: TextMeasurer,
+) LayoutError!f32 {
     const child_cross = switch (kind) {
         .row => child.rect.height,
         .column => child.rect.width,
@@ -1359,7 +1412,14 @@ fn alignedCrossOffset(kind: RenderNode.Kind, alignment: Widget.CrossAxisAlignmen
         .start, .stretch => 0,
         .center => @max(0, cross - child_cross) / 2,
         .end => @max(0, cross - child_cross),
-        .baseline => switch (child.kind) {
+        .baseline => if (kind == .row and row_baseline != null)
+            if (try firstBaseline(child, measurer)) |baseline|
+                row_baseline.?.offset - baseline
+            else
+                @max(0, cross - child_cross) / 2
+        else
+            @max(0, cross - child_cross) / 2,
+        .cap_center => switch (child.kind) {
             .text, .text_input => @max(0, cross - child_cross) / 2,
             else => if (cap_center) |center|
                 center - child_cross / 2

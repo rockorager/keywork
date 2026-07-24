@@ -6,7 +6,7 @@
 ---@alias keywork.ColorScheme 'light'|'dark'|'no-preference'
 ---@alias keywork.ResolvedColorScheme 'light'|'dark'
 ---@alias keywork.Alignment 'start'|'center'|'end'
----@alias keywork.CrossAxisAlignment keywork.Alignment|'stretch'|'baseline'
+---@alias keywork.CrossAxisAlignment keywork.Alignment|'stretch'|'baseline'|'cap_center'
 ---@alias keywork.MainAxisAlignment keywork.Alignment|'space_between'|'space_around'|'space_evenly'
 ---@alias keywork.CursorShape 'default'|'pointer'|'text'
 ---@alias keywork.PointerButton 'left'|'right'|'middle'|'back'|'forward'

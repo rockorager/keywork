@@ -426,11 +426,15 @@ pub const Widget = union(enum) {
         center,
         end,
         stretch,
+        /// Rows only: align children that expose a first-line text baseline.
+        /// Layout-neutral wrappers propagate their child's baseline; children
+        /// without one fall back to center alignment.
+        baseline,
         /// Rows only: text children center as usual, while other children
         /// (icons) center on the first text child's cap-height midline,
         /// matching how macOS aligns symbol icons next to text. Falls back
         /// to center when the row has no text child.
-        baseline,
+        cap_center,
     };
 
     pub const MainAxisAlignment = enum {
@@ -4349,6 +4353,43 @@ test "row centers children on the cross axis" {
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 8), root.children[0].rect.y);
     try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
+}
+
+test "row baseline aligns mixed text sizes through an expanded wrapper" {
+    const allocator = std.testing.allocator;
+
+    const username: Widget = .{ .text = .{
+        .value = "username",
+        .font_size = 16,
+        .line_height = 24,
+    } };
+    const timestamp: Widget = .{ .text = .{
+        .value = "12:12 PM",
+        .font_size = 12,
+        .line_height = 14,
+    } };
+    const expanded_timestamp: Widget = .{ .flexible = .{ .child = &timestamp } };
+    const children = [_]Widget{ username, expanded_timestamp };
+    const row: Widget = .{ .row = .{
+        .children = &children,
+        .gap = 6,
+        .cross_align = .baseline,
+    } };
+
+    var built_arena = std.heap.ArenaAllocator.init(allocator);
+    defer built_arena.deinit();
+    var build_scope: BuildScope = .{ .allocator = built_arena.allocator() };
+    var built_element = try buildElementTreeScoped(allocator, &build_scope, &row, .{ .max_width = 200, .max_height = 80 });
+    defer destroyElementTree(allocator, &built_element);
+    const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
+
+    const username_node = root.children[0];
+    const timestamp_node = root.children[1].children[0];
+    const username_baseline = username_node.rect.y + 4 + 12.8;
+    const timestamp_baseline = timestamp_node.rect.y + 1 + 9.6;
+    try std.testing.expectApproxEqAbs(username_baseline, timestamp_baseline, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.2), timestamp_node.rect.y, 0.001);
+    try std.testing.expectEqual(@as(f32, 24), root.rect.height);
 }
 
 test "text role resolves themed font size for layout and paint" {
