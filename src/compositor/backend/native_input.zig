@@ -1757,16 +1757,16 @@ fn pointerScrollAxis(
         device.info.id,
         time,
         axis,
-        wl.Fixed.fromDouble(value),
+        @enumFromInt(saturatingI32(value * 256)),
     );
     if (source == .wheel) {
         const value_120 = c.libinput_event_pointer_get_scroll_value_v120(event, libinput_axis) * factor;
-        const discrete: i32 = @intFromFloat(@round(value_120 / 120));
+        const discrete = saturatingI32(@round(value_120 / 120));
         self.listener.pointer_axis_value120(
             self.listener.context,
             device.info.id,
             axis,
-            @intFromFloat(@round(value_120)),
+            saturatingI32(@round(value_120)),
         );
         if (discrete != 0) {
             self.listener.pointer_axis_discrete(self.listener.context, device.info.id, axis, discrete);
@@ -2039,14 +2039,17 @@ fn tabletPadEventRoute(
 
 fn protocolValue120(value: f64) ?i32 {
     if (!std.math.isFinite(value)) return null;
-    const rounded = @round(value);
-    const clamped = std.math.clamp(
-        rounded,
-        @as(f64, @floatFromInt(std.math.minInt(i32))),
-        @as(f64, @floatFromInt(std.math.maxInt(i32))),
-    );
-    const result: i32 = @intFromFloat(clamped);
+    const result = saturatingI32(@round(value));
     return if (result == 0) null else result;
+}
+
+fn saturatingI32(value: f64) i32 {
+    if (std.math.isNan(value)) return 0;
+    const minimum: f64 = @floatFromInt(std.math.minInt(i32));
+    const maximum: f64 = @floatFromInt(std.math.maxInt(i32));
+    if (value <= minimum) return std.math.minInt(i32);
+    if (value >= maximum) return std.math.maxInt(i32);
+    return @intFromFloat(value);
 }
 
 fn tabletToolAxes(
@@ -2410,6 +2413,14 @@ test "tablet pad dial deltas use nonzero value120 units" {
     try std.testing.expectEqual(@as(?i32, -30), protocolValue120(-30.4));
     try std.testing.expectEqual(@as(?i32, null), protocolValue120(0.1));
     try std.testing.expectEqual(@as(?i32, null), protocolValue120(std.math.nan(f64)));
+}
+
+test "protocol integers saturate out-of-range input" {
+    try std.testing.expectEqual(@as(i32, 30), saturatingI32(30.9));
+    try std.testing.expectEqual(@as(i32, -30), saturatingI32(-30.9));
+    try std.testing.expectEqual(std.math.maxInt(i32), saturatingI32(std.math.inf(f64)));
+    try std.testing.expectEqual(std.math.minInt(i32), saturatingI32(-std.math.inf(f64)));
+    try std.testing.expectEqual(@as(i32, 0), saturatingI32(std.math.nan(f64)));
 }
 
 test "libinput configuration status mapping" {
