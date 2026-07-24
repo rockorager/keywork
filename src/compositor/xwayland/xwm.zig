@@ -1699,6 +1699,14 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
 
 fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
     const response_type = event.*.response_type & 0x7f;
+    if (event.*.response_type & 0x80 != 0) {
+        const protocol_root = switch (response_type) {
+            c.XCB_UNMAP_NOTIFY => @as(*const c.xcb_unmap_notify_event_t, @ptrCast(event)).event,
+            c.XCB_CONFIGURE_REQUEST => @as(*const c.xcb_configure_request_event_t, @ptrCast(event)).parent,
+            else => null,
+        };
+        if (!acceptsSyntheticEvent(response_type, protocol_root, self.screen.root)) return;
+    }
     if (response_type == self.xfixes_event_base + c.XCB_XFIXES_SELECTION_NOTIFY) {
         self.clipboard_selection.handleXfixesNotify(@ptrCast(event));
         self.primary_selection.handleXfixesNotify(@ptrCast(event));
@@ -1724,6 +1732,20 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         },
         else => {},
     }
+}
+
+fn acceptsSyntheticEvent(
+    response_type: u8,
+    protocol_root: ?c.xcb_window_t,
+    root: c.xcb_window_t,
+) bool {
+    return switch (response_type) {
+        // Client messages and selection replies are defined as sent events.
+        c.XCB_CLIENT_MESSAGE, c.XCB_SELECTION_NOTIFY => true,
+        // ICCCM withdrawal and reconfiguration fallbacks are sent to the root.
+        c.XCB_UNMAP_NOTIFY, c.XCB_CONFIGURE_REQUEST => protocol_root == root,
+        else => false,
+    };
 }
 
 fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
@@ -2240,6 +2262,19 @@ fn expectedDestroyedWindowError(x_error: *const c.xcb_generic_error_t) bool {
 
 test "XWM atom table covers every atom" {
     try std.testing.expectEqual(atom_count, atom_names.len);
+}
+
+test "synthetic X11 events admit only protocol-defined client messages" {
+    const root: c.xcb_window_t = 42;
+    try std.testing.expect(acceptsSyntheticEvent(c.XCB_CLIENT_MESSAGE, null, root));
+    try std.testing.expect(acceptsSyntheticEvent(c.XCB_SELECTION_NOTIFY, null, root));
+    try std.testing.expect(acceptsSyntheticEvent(c.XCB_UNMAP_NOTIFY, root, root));
+    try std.testing.expect(acceptsSyntheticEvent(c.XCB_CONFIGURE_REQUEST, root, root));
+    try std.testing.expect(!acceptsSyntheticEvent(c.XCB_UNMAP_NOTIFY, 7, root));
+    try std.testing.expect(!acceptsSyntheticEvent(c.XCB_CONFIGURE_REQUEST, 7, root));
+    try std.testing.expect(!acceptsSyntheticEvent(c.XCB_DESTROY_NOTIFY, null, root));
+    try std.testing.expect(!acceptsSyntheticEvent(c.XCB_CONFIGURE_NOTIFY, null, root));
+    try std.testing.expect(!acceptsSyntheticEvent(c.XCB_PROPERTY_NOTIFY, null, root));
 }
 
 test "EWMH state actions apply remove add and toggle" {
