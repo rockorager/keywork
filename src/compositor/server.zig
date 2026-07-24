@@ -164,6 +164,7 @@ xdg_shell: XdgShell,
 gtk_shell: GtkShell,
 xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
+layer_shell_initialized: bool,
 seat: Seat,
 transient_seat: TransientSeat,
 input_device_listener: InputManager.DeviceListener,
@@ -684,6 +685,7 @@ pub fn createWithVirtualOutput(
         .gtk_shell = undefined,
         .xdg_foreign = undefined,
         .layer_shell = undefined,
+        .layer_shell_initialized = false,
         .seat = undefined,
         .transient_seat = undefined,
         .input_device_listener = .{
@@ -1064,7 +1066,11 @@ pub fn createWithVirtualOutput(
         &self.xdg_shell,
         self.compositor.surfaceStore(),
     );
-    errdefer self.layer_shell.deinit();
+    self.layer_shell_initialized = true;
+    errdefer {
+        self.layer_shell.deinit();
+        self.layer_shell_initialized = false;
+    }
     try self.xdg_activation.init(allocator, io, display, &self.seat);
     errdefer self.xdg_activation.deinit();
     try self.data_device.init(
@@ -1505,6 +1511,7 @@ pub fn destroy(self: *Self) void {
     self.idle_notify.deinit();
     self.idle_notify_initialized = false;
     self.layer_shell.deinit();
+    self.layer_shell_initialized = false;
     self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
     self.gtk_shell.deinit();
@@ -1850,6 +1857,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id) catch self.terminate();
     }
+    if (self.layer_shell_initialized) self.layer_shell.outputRemoved(render_output.protocol_id);
     if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), protocol_output);

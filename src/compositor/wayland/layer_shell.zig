@@ -127,6 +127,18 @@ pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
     self.arrange();
 }
 
+pub fn outputRemoved(self: *Self, output_id: OutputLayout.Id) void {
+    var removed = false;
+    var iterator = self.states.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.meta.eql(entry.value.output_id, output_id)) continue;
+        if (entry.value.adapter.resource) |resource| resource.sendClosed();
+        std.debug.assert(self.removeState(entry.id));
+        removed = true;
+    }
+    if (removed) self.arrange();
+}
+
 pub fn refresh(self: *Self) void {
     self.arrange();
 }
@@ -485,14 +497,18 @@ fn surfaceDestroyed(context: *anyopaque) void {
     adapter.shell.remove(adapter.id);
 }
 fn remove(self: *Self, id: Id) void {
-    var state = self.states.remove(id) orelse return;
+    if (!self.removeState(id)) return;
+    self.arrange();
+}
+fn removeState(self: *Self, id: Id) bool {
+    var state = self.states.remove(id) orelse return false;
     self.xdg_shell.dismissLayerSurfacePopups(state.scene_id);
     self.scene.removeLayerSurface(state.scene_id);
     self.invalidateFocus(state.surface_id);
     if (state.adapter.surface) |surface| surface.releaseRole(state.adapter);
     state.serials.deinit(self.allocator);
     if (state.adapter.resource == null) self.allocator.destroy(state.adapter);
-    self.arrange();
+    return true;
 }
 
 fn invalidateFocus(self: *Self, id: Surface.Id) void {
