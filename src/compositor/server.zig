@@ -85,6 +85,7 @@ const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
 const Command = @import("command.zig").Command;
 const Config = @import("config.zig");
+const output_configuration = @import("output_configuration.zig");
 const Launcher = @import("launcher.zig");
 const Logging = @import("logging.zig");
 const Control = @import("control.zig");
@@ -1203,15 +1204,6 @@ const RenderOutputConfig = struct {
     make: []const u8 = "keywork",
     model: []const u8,
     drm_output: ?*DrmOutput = null,
-};
-
-const EffectiveOutputSettings = struct {
-    enabled: bool,
-    mode_index: usize,
-    requested_mode: ?Config.OutputMode = null,
-    x: i32,
-    y: i32,
-    scale: render.Scale,
 };
 
 const PreparedIccProfile = struct {
@@ -2886,36 +2878,6 @@ fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) boo
     return true;
 }
 
-fn overlayOutputSettings(
-    effective: *EffectiveOutputSettings,
-    settings: Config.OutputSettings,
-) void {
-    if (settings.enable) |enabled| effective.enabled = enabled;
-    if (settings.position) |position| {
-        effective.x = position.x;
-        effective.y = position.y;
-    }
-    if (settings.mode) |mode| effective.requested_mode = mode;
-    if (settings.scale_v120_numerator) |numerator| effective.scale = .{ .numerator = numerator };
-}
-
-fn resolveOutputMode(modes: []const DrmOutput.Mode, requested: Config.OutputMode) !usize {
-    var selected: ?usize = null;
-    for (modes, 0..) |mode, index| {
-        const size = mode.size();
-        if (size.width != requested.width or size.height != requested.height) continue;
-        if (selected == null or if (requested.refresh_millihertz) |refresh|
-            @abs(@as(i64, mode.refreshMillihertz()) - refresh) <
-                @abs(@as(i64, modes[selected.?].refreshMillihertz()) - refresh)
-        else
-            mode.preferred and !modes[selected.?].preferred)
-        {
-            selected = index;
-        }
-    }
-    return selected orelse error.OutputModeUnavailable;
-}
-
 fn outputDeviceMatch(output: *const DrmOutput) Config.OutputDeviceMatch {
     return .{
         .name = output.name(),
@@ -2925,53 +2887,31 @@ fn outputDeviceMatch(output: *const DrmOutput) Config.OutputDeviceMatch {
     };
 }
 
-fn overlayMatchingOutputRules(
-    effective: *EffectiveOutputSettings,
-    device: Config.OutputDeviceMatch,
-    rules: []const Config.OutputRule,
-) bool {
-    var matched = false;
-    for (rules) |rule| {
-        if (!rule.matcher.matches(device)) continue;
-        matched = true;
-        overlayOutputSettings(effective, rule.settings);
-    }
-    return matched;
-}
-
-fn configuredOutputChange(output: *DrmOutput, rules: []const Config.OutputRule) !?OutputManagement.Change {
-    var effective: EffectiveOutputSettings = .{
-        .enabled = output.enabled,
-        .mode_index = output.currentModeIndex(),
-        .x = output.logical_x,
-        .y = output.logical_y,
-        .scale = output.scale,
-    };
-    if (!overlayMatchingOutputRules(&effective, outputDeviceMatch(output), rules)) return null;
-    if (effective.requested_mode) |mode| {
-        effective.mode_index = try resolveOutputMode(output.availableModes(), mode);
-    }
-    if (effective.enabled and !drmOutputGeometryValid(
+fn configuredOutputChange(
+    output: *DrmOutput,
+    settings: output_configuration.ResolvedSettings,
+) !?OutputManagement.Change {
+    if (settings.enabled and !drmOutputGeometryValid(
         output,
-        effective.mode_index,
-        .{ .x = effective.x, .y = effective.y },
-        effective.scale,
+        settings.mode_index,
+        .{ .x = settings.x, .y = settings.y },
+        settings.scale,
     )) return error.InvalidOutputGeometry;
-    if (effective.enabled == output.enabled and effective.mode_index == output.currentModeIndex() and
-        effective.x == output.logical_x and effective.y == output.logical_y and
-        effective.scale.numerator == output.scale.numerator) return null;
+    if (settings.enabled == output.enabled and settings.mode_index == output.currentModeIndex() and
+        settings.x == output.logical_x and settings.y == output.logical_y and
+        settings.scale.numerator == output.scale.numerator) return null;
     return .{
         .output = output,
         .was_enabled = output.enabled,
-        .enabled = effective.enabled,
+        .enabled = settings.enabled,
         .old_x = output.logical_x,
         .old_y = output.logical_y,
         .old_scale = output.scale,
         .old_mode_index = output.currentModeIndex(),
-        .x = effective.x,
-        .y = effective.y,
-        .scale = effective.scale,
-        .mode_index = effective.mode_index,
+        .x = settings.x,
+        .y = settings.y,
+        .scale = settings.scale,
+        .mode_index = settings.mode_index,
     };
 }
 
@@ -2985,26 +2925,6 @@ fn drmOutputGeometryValid(
     if (mode_index >= modes.len) return false;
     const logical_size = scale.logicalSize(modes[mode_index].size()) catch return false;
     return Output.logicalGeometryValid(position, logical_size);
-}
-
-fn configuredOutputIccProfile(
-    output: *const DrmOutput,
-    rules: []const Config.OutputRule,
-) ?Config.OutputIccProfile {
-    var configured: ?Config.OutputIccProfile = null;
-    const device = outputDeviceMatch(output);
-    for (rules) |rule| {
-        if (!rule.matcher.matches(device)) continue;
-        if (rule.settings.icc_profile) |profile| configured = profile;
-    }
-    return configured;
-}
-
-fn requestedIccProfilePath(profile: Config.OutputIccProfile) ?[]const u8 {
-    return switch (profile) {
-        .none => null,
-        .path => |path| path,
-    };
 }
 
 fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?*DrmOutput) !void {
@@ -3021,9 +2941,26 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
     }
     for (self.drm_device.outputs()) |output| {
         if (only != null and only.? != output) continue;
-        if (try configuredOutputChange(output, rules)) |change| try changes.append(self.allocator, change);
-        const requested = configuredOutputIccProfile(output, rules) orelse continue;
-        const path = requestedIccProfilePath(requested);
+        const settings = try output_configuration.resolve(
+            .{
+                .enabled = output.enabled,
+                .mode_index = output.currentModeIndex(),
+                .x = output.logical_x,
+                .y = output.logical_y,
+                .scale = output.scale,
+            },
+            outputDeviceMatch(output),
+            output.availableModes(),
+            rules,
+        ) orelse continue;
+        if (try configuredOutputChange(output, settings)) |change| {
+            try changes.append(self.allocator, change);
+        }
+        const requested = settings.icc_profile orelse continue;
+        const path: ?[]const u8 = switch (requested) {
+            .none => null,
+            .path => |value| value,
+        };
         if (path == null and output.iccProfilePath() == null) continue;
         var profile = if (path) |value|
             Icc.loadOutputProfile(
@@ -10401,77 +10338,4 @@ test "input settings overlay in order and can restore defaults" {
     try std.testing.expectEqual(NativeInput.Toggle.disabled, effective.natural_scroll.?);
     try std.testing.expectEqual(@as(f64, 1), effective.scroll_factor);
     try std.testing.expectEqual(@as(i32, 30), effective.repeat_rate);
-}
-
-fn testOutputMode(width: u16, height: u16, refresh_hertz: u32, preferred: bool) DrmOutput.Mode {
-    var mode = std.mem.zeroes(DrmOutput.Mode);
-    mode.value.hdisplay = width;
-    mode.value.vdisplay = height;
-    mode.value.vrefresh = refresh_hertz;
-    mode.preferred = preferred;
-    return mode;
-}
-
-test "output settings overlay in order and preserve unspecified live fields" {
-    var effective: EffectiveOutputSettings = .{
-        .enabled = true,
-        .mode_index = 2,
-        .x = 41,
-        .y = -3,
-        .scale = .{ .numerator = 120 },
-    };
-    overlayOutputSettings(&effective, .{
-        .enable = false,
-        .position = .{ .x = 10, .y = 20 },
-        .scale_v120_numerator = 180,
-    });
-    overlayOutputSettings(&effective, .{ .enable = true, .position = .{ .x = 30, .y = 40 } });
-
-    try std.testing.expect(effective.enabled);
-    try std.testing.expectEqual(@as(usize, 2), effective.mode_index);
-    try std.testing.expectEqual(@as(i32, 30), effective.x);
-    try std.testing.expectEqual(@as(i32, 40), effective.y);
-    try std.testing.expectEqual(@as(u32, 180), effective.scale.numerator);
-}
-
-test "nonmatching output rules are omitted" {
-    var effective: EffectiveOutputSettings = .{
-        .enabled = true,
-        .mode_index = 0,
-        .x = 4,
-        .y = 5,
-        .scale = .{},
-    };
-    const rules = [_]Config.OutputRule{.{
-        .matcher = .{ .name = "DP-*" },
-        .settings = .{ .enable = false },
-    }};
-    try std.testing.expect(!overlayMatchingOutputRules(&effective, .{ .name = "HDMI-A-1" }, &rules));
-    try std.testing.expect(effective.enabled);
-}
-
-test "output mode resolution prefers preferred and closest refresh" {
-    const modes = [_]DrmOutput.Mode{
-        testOutputMode(1920, 1080, 60, false),
-        testOutputMode(1920, 1080, 75, true),
-        testOutputMode(1920, 1080, 120, false),
-        testOutputMode(1280, 720, 60, true),
-    };
-    try std.testing.expectEqual(@as(usize, 1), try resolveOutputMode(&modes, .{
-        .width = 1920,
-        .height = 1080,
-    }));
-    try std.testing.expectEqual(@as(usize, 2), try resolveOutputMode(&modes, .{
-        .width = 1920,
-        .height = 1080,
-        .refresh_millihertz = 110_000,
-    }));
-}
-
-test "output mode resolution rejects unavailable size" {
-    const modes = [_]DrmOutput.Mode{testOutputMode(1920, 1080, 60, true)};
-    try std.testing.expectError(error.OutputModeUnavailable, resolveOutputMode(&modes, .{
-        .width = 2560,
-        .height = 1440,
-    }));
 }

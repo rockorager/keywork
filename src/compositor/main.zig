@@ -465,6 +465,7 @@ test {
     _ = @import("presentation.zig");
     _ = @import("capture_geometry.zig");
     _ = @import("damage_geometry.zig");
+    _ = @import("output_configuration.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
