@@ -228,3 +228,22 @@ fi
 
 mkdir -p "${HOME}/.local/bin"
 ln -sfn "${zig_root}/zig" "${HOME}/.local/bin/zig"
+
+zigdoc_version=0.5.1
+zigdoc_platform=linux-x64
+zigdoc_archive="zigdoc-v${zigdoc_version}-${zigdoc_platform}.tar.gz"
+zigdoc_url="https://github.com/rockorager/zigdoc/releases/download/v${zigdoc_version}/${zigdoc_archive}"
+zigdoc_sha256=5bf35ad1dbd60ee0eaa6edb83b8ef950796b3348879b1f1df3d0719ffc9d0df2
+
+if [[ ! -x "${HOME}/.local/bin/zigdoc" ]]; then
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${zigdoc_archive}" "${zigdoc_url}"
+  echo "${zigdoc_sha256}  ${temporary_directory}/${zigdoc_archive}" | sha256sum --check
+  tar -xzf "${temporary_directory}/${zigdoc_archive}" -C "${temporary_directory}"
+  install -m 0755 \
+    "${temporary_directory}/zigdoc-v${zigdoc_version}-${zigdoc_platform}/zigdoc" \
+    "${HOME}/.local/bin/zigdoc"
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
