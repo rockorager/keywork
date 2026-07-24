@@ -56,17 +56,17 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
-    scanner.addCustomProtocol(b.path("protocol/input-method-unstable-v2.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wlr-data-control-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wlr-foreign-toplevel-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wlr-screencopy-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/gtk-shell.xml"));
-    scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-virtual-pointer-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-gamma-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-output-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/gtk-shell.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/virtual-keyboard-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 2);
@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     control.addAnonymousImport("control-interface", .{
-        .root_source_file = b.path("protocol/dev.rockorager.keywork.compositor.varlink"),
+        .root_source_file = b.path("protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
     });
 
     const compositor = b.createModule(.{
