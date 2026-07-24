@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const display_color = @import("display_color.zig");
 const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const Logging = @import("../logging.zig");
@@ -80,7 +81,7 @@ native_color_description: render.ColorDescription,
 sdr_color_description: render.ColorDescription,
 icc_profile: ?Icc.OutputProfile,
 icc_profile_path: ?[]u8,
-hdr_capabilities: HdrCapabilities,
+hdr_capabilities: display_color.HdrCapabilities,
 output_color_mode: OutputColorMode,
 output_color_dirty: bool,
 rejected_output_color_mode: ?OutputColorMode,
@@ -308,25 +309,6 @@ const AtomicCrtcColorProperties = struct {
 const AtomicColorProperties = struct {
     connector: AtomicConnectorColorProperties,
     crtc: AtomicCrtcColorProperties,
-};
-
-const HdrCapabilities = struct {
-    bt2020_rgb: bool = false,
-    static_metadata_type1: bool = false,
-    pq: bool = false,
-    hlg: bool = false,
-    min_luminance: ?u32 = null,
-    max_luminance: ?u32 = null,
-    max_frame_average_luminance: ?u32 = null,
-
-    fn supports(self: HdrCapabilities, transfer: render.TransferFunction) bool {
-        if (!self.bt2020_rgb or !self.static_metadata_type1) return false;
-        return switch (transfer) {
-            .st2084_pq => self.pq,
-            .hlg => self.hlg,
-            .bt1886, .gamma22, .srgb, .power => false,
-        };
-    }
 };
 
 const OutputColorMode = enum {
@@ -678,7 +660,11 @@ pub fn hdrOutputDescription(
     {
         return null;
     }
-    return hdrDescription(self.native_color_description, self.hdr_capabilities, transfer);
+    return display_color.hdrDescription(
+        self.native_color_description,
+        self.hdr_capabilities,
+        transfer,
+    );
 }
 
 pub fn refreshMillihertz(self: *const Self) i32 {
@@ -1407,7 +1393,11 @@ fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
         self.hdr_capabilities = hdrCapabilitiesFromInfo(info);
         self.destroyHdrMetadataBlobs(fd);
         self.color_description = if (self.output_color_mode.transfer()) |transfer|
-            hdrDescription(self.native_color_description, self.hdr_capabilities, transfer) orelse
+            display_color.hdrDescription(
+                self.native_color_description,
+                self.hdr_capabilities,
+                transfer,
+            ) orelse
                 self.sdr_color_description
         else
             self.sdr_color_description;
@@ -1444,32 +1434,10 @@ fn refreshSdrColorDescription(self: *Self) void {
         self.native_color_description;
 }
 
-fn hdrDescription(
-    sdr_description: render.ColorDescription,
-    capabilities: HdrCapabilities,
-    transfer: render.TransferFunction,
-) ?render.ColorDescription {
-    if (!capabilities.supports(transfer)) return null;
-    const maximum = capabilities.max_luminance orelse 1000;
-    return .{
-        .primaries = render.bt2020_chromaticities,
-        .named_primaries = .bt2020,
-        .transfer_function = transfer,
-        .min_luminance = capabilities.min_luminance orelse 50,
-        .max_luminance = maximum,
-        .reference_luminance = 203,
-        .mastering_primaries = sdr_description.primaries,
-        .mastering_min_luminance = capabilities.min_luminance,
-        .mastering_max_luminance = capabilities.max_luminance,
-        .max_cll = maximum,
-        .max_fall = capabilities.max_frame_average_luminance,
-    };
-}
-
-fn hdrCapabilitiesFromInfo(info: *const c.di_info) HdrCapabilities {
+fn hdrCapabilitiesFromInfo(info: *const c.di_info) display_color.HdrCapabilities {
     const metadata = c.di_info_get_hdr_static_metadata(info);
     const colorimetry = c.di_info_get_supported_signal_colorimetry(info);
-    return hdrCapabilitiesFromValues(.{
+    return display_color.hdrCapabilitiesFromValues(.{
         .bt2020_rgb = colorimetry.*.bt2020_rgb,
         .static_metadata_type1 = metadata.*.type1,
         .pq = metadata.*.pq,
@@ -1478,38 +1446,6 @@ fn hdrCapabilitiesFromInfo(info: *const c.di_info) HdrCapabilities {
         .max_luminance = metadata.*.desired_content_max_luminance,
         .max_frame_average_luminance = metadata.*.desired_content_max_frame_avg_luminance,
     });
-}
-
-const HdrCapabilityValues = struct {
-    bt2020_rgb: bool,
-    static_metadata_type1: bool,
-    pq: bool,
-    hlg: bool,
-    min_luminance: f32,
-    max_luminance: f32,
-    max_frame_average_luminance: f32,
-};
-
-fn hdrCapabilitiesFromValues(values: HdrCapabilityValues) HdrCapabilities {
-    return .{
-        .bt2020_rgb = values.bt2020_rgb,
-        .static_metadata_type1 = values.static_metadata_type1,
-        .pq = values.pq,
-        .hlg = values.hlg,
-        .min_luminance = scaledLuminance(values.min_luminance, 10000),
-        .max_luminance = scaledLuminance(values.max_luminance, 1),
-        .max_frame_average_luminance = scaledLuminance(
-            values.max_frame_average_luminance,
-            1,
-        ),
-    };
-}
-
-fn scaledLuminance(value: f32, scale: u32) ?u32 {
-    if (!std.math.isFinite(value) or value <= 0) return null;
-    const scaled = @as(f64, value) * @as(f64, @floatFromInt(scale));
-    const maximum: f64 = @floatFromInt(std.math.maxInt(u32));
-    return @intFromFloat(@round(@min(scaled, maximum)));
 }
 
 fn colorDescriptionFromInfo(info: *const c.di_info) render.ColorDescription {
@@ -1528,62 +1464,10 @@ fn colorDescriptionFromInfo(info: *const c.di_info) render.ColorDescription {
             primaries.*.default_white.y,
         };
     }
-    return colorDescriptionFromValues(values, c.di_info_get_default_gamma(info));
-}
-
-fn colorDescriptionFromValues(
-    primaries: ?[8]f32,
-    gamma: f32,
-) render.ColorDescription {
-    var result: render.ColorDescription = .{};
-    if (primaries) |values| {
-        var fixed: [8]i32 = undefined;
-        var valid = true;
-        for (values, &fixed) |value, *destination| {
-            if (!std.math.isFinite(value) or value < 0 or value > 1) {
-                valid = false;
-                break;
-            }
-            destination.* = @intFromFloat(@round(value * 1_000_000.0));
-        }
-        if (valid and fixed[1] > 0 and fixed[3] > 0 and fixed[5] > 0 and fixed[7] > 0) {
-            const chromaticities: render.Chromaticities = .{
-                .red_x = fixed[0],
-                .red_y = fixed[1],
-                .green_x = fixed[2],
-                .green_y = fixed[3],
-                .blue_x = fixed[4],
-                .blue_y = fixed[5],
-                .white_x = fixed[6],
-                .white_y = fixed[7],
-            };
-            if (approximatelySrgb(chromaticities)) {
-                result.primaries = render.srgb_chromaticities;
-                result.named_primaries = .srgb;
-            } else {
-                result.primaries = chromaticities;
-                result.named_primaries = null;
-            }
-        }
-    }
-    if (std.math.isFinite(gamma) and gamma >= 1 and gamma <= 10 and
-        @abs(gamma - 2.2) > 0.005)
-    {
-        result.transfer_function = .{
-            .power = @intFromFloat(@round(gamma * 10000.0)),
-        };
-    }
-    return result;
-}
-
-fn approximatelySrgb(chromaticities: render.Chromaticities) bool {
-    const tolerance = 1000;
-    const actual = chromaticities.values();
-    const expected = render.srgb_chromaticities.values();
-    for (actual, expected) |value, reference| {
-        if (@abs(value - reference) > tolerance) return false;
-    }
-    return true;
+    return display_color.colorDescriptionFromValues(
+        values,
+        c.di_info_get_default_gamma(info),
+    );
 }
 
 pub fn isPrimaryNode(path: []const u8) bool {
@@ -2320,78 +2204,20 @@ test "scanout framebuffer prefers an opaque format with the same memory layout" 
     try std.testing.expect(scanoutFramebufferFormat(&formats, c.DRM_FORMAT_XBGR8888, 9) == null);
 }
 
-test "EDID color values preserve valid primaries and gamma" {
-    const color_description = colorDescriptionFromValues(.{
-        0.680,
-        0.320,
-        0.265,
-        0.690,
-        0.150,
-        0.060,
-        0.3127,
-        0.3290,
-    }, 2.4);
-    try std.testing.expectEqual(@as(i32, 680000), color_description.primaries.red_x);
-    try std.testing.expectEqual(@as(i32, 329000), color_description.primaries.white_y);
-    try std.testing.expect(color_description.named_primaries == null);
-    try std.testing.expectEqual(render.TransferFunction{ .power = 24000 }, color_description.transfer_function);
-
-    const invalid = colorDescriptionFromValues(.{
-        0.680,
-        0,
-        0.265,
-        0.690,
-        0.150,
-        0.060,
-        0.3127,
-        0.3290,
-    }, std.math.nan(f32));
-    try std.testing.expectEqual(render.ColorDescription{}, invalid);
-    try std.testing.expectEqual(
-        render.TransferFunction.gamma22,
-        colorDescriptionFromValues(null, 2.2).transfer_function,
-    );
-
-    const quantized_srgb = colorDescriptionFromValues(.{
-        0.639648,
-        0.330078,
-        0.299805,
-        0.599609,
-        0.150391,
-        0.059570,
-        0.312500,
-        0.329102,
-    }, 2.2);
-    try std.testing.expectEqual(render.ColorDescription{}, quantized_srgb);
-}
-
-test "EDID HDR capabilities preserve supported transfers and luminance" {
-    const capabilities = hdrCapabilitiesFromValues(.{
-        .bt2020_rgb = true,
-        .static_metadata_type1 = true,
-        .pq = true,
-        .hlg = false,
-        .min_luminance = 0.005,
+test "HDR metadata converts output description to CTA values" {
+    const output_description: render.ColorDescription = .{
+        .primaries = render.bt2020_chromaticities,
+        .named_primaries = .bt2020,
+        .transfer_function = .st2084_pq,
+        .min_luminance = 50,
         .max_luminance = 1000,
-        .max_frame_average_luminance = 400,
-    });
-    try std.testing.expect(capabilities.supports(.st2084_pq));
-    try std.testing.expect(!capabilities.supports(.hlg));
-    try std.testing.expect(!capabilities.supports(.srgb));
-    try std.testing.expectEqual(@as(?u32, 50), capabilities.min_luminance);
-    try std.testing.expectEqual(@as(?u32, 1000), capabilities.max_luminance);
-    try std.testing.expectEqual(
-        @as(?u32, 400),
-        capabilities.max_frame_average_luminance,
-    );
-
-    var missing_colorimetry = capabilities;
-    missing_colorimetry.bt2020_rgb = false;
-    try std.testing.expect(!missing_colorimetry.supports(.st2084_pq));
-    try std.testing.expect(scaledLuminance(std.math.nan(f32), 1) == null);
-    try std.testing.expect(scaledLuminance(0, 1) == null);
-
-    const output_description = hdrDescription(.{}, capabilities, .st2084_pq).?;
+        .reference_luminance = 203,
+        .mastering_primaries = render.srgb_chromaticities,
+        .mastering_min_luminance = 50,
+        .mastering_max_luminance = 1000,
+        .max_cll = 1000,
+        .max_fall = 400,
+    };
     const metadata = hdrOutputMetadata(.pq, output_description);
     const info = metadata.unnamed_0.hdmi_metadata_type1;
     try std.testing.expectEqual(@as(u8, 2), info.eotf);
