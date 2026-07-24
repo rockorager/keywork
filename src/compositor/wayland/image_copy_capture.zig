@@ -415,7 +415,8 @@ const Frame = struct {
             return self.ready(expected, captured.timestamp);
         } else if (self.destination.dmabuf) |dmabuf| {
             if (self.owner.linux_dmabuf.allocationDevice() == null or
-                !std.meta.eql(dmabuf.size(), expected.size)) return self.fail(.buffer_constraints);
+                !std.meta.eql(dmabuf.size(), expected.size) or
+                !dmabuf.isCaptureCompatible()) return self.fail(.buffer_constraints);
             const timestamp = self.owner.listener.capture_dmabuf(
                 self.owner.listener.context,
                 target,

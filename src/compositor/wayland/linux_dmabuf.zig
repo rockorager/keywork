@@ -792,6 +792,14 @@ pub const Buffer = struct {
         return self.descriptor.format;
     }
 
+    pub fn isCaptureCompatible(self: *const Buffer) bool {
+        for (capture_formats) |candidate| {
+            if (candidate.format == self.descriptor.format and
+                candidate.modifier == self.descriptor.modifier) return true;
+        }
+        return false;
+    }
+
     pub fn yInverted(self: *const Buffer) bool {
         return self.descriptor.y_inverted;
     }
