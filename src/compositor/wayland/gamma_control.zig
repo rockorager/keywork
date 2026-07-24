@@ -12,6 +12,7 @@ const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
 
 allocator: std.mem.Allocator,
+io: std.Io,
 global: *wl.Global,
 outputs: *OutputLayout,
 security_context: *SecurityContext,
@@ -28,6 +29,7 @@ pub const Listener = struct {
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
+    io: std.Io,
     display: *wl.Server,
     outputs: *OutputLayout,
     security_context: *SecurityContext,
@@ -35,6 +37,7 @@ pub fn init(
 ) !void {
     self.* = .{
         .allocator = allocator,
+        .io = io,
         .global = undefined,
         .outputs = outputs,
         .security_context = security_context,
@@ -183,6 +186,7 @@ fn handleControlRequest(
             defer _ = std.c.close(set.fd);
             const output_id = control.output_id orelse return;
             const table = readGammaTable(
+                control.manager.io,
                 control.manager.allocator,
                 set.fd,
                 control.gamma_size,
@@ -224,31 +228,25 @@ fn handleControlDestroy(_: *zwlr.GammaControlV1, control: *Control) void {
 }
 
 fn readGammaTable(
+    io: std.Io,
     allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
     gamma_size: u32,
 ) error{ OutOfMemory, InvalidGamma, ReadGammaFailed }![]u16 {
     const value_count = std.math.mul(usize, gamma_size, 3) catch
         return error.InvalidGamma;
+    const byte_count = std.math.mul(usize, value_count, @sizeOf(u16)) catch
+        return error.InvalidGamma;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.ReadGammaFailed;
+    if (stat.kind != .file or stat.size != byte_count) return error.InvalidGamma;
     const table = allocator.alloc(u16, value_count) catch return error.OutOfMemory;
     errdefer allocator.free(table);
-    if (!setNonblocking(fd)) return error.ReadGammaFailed;
     const bytes = std.mem.sliceAsBytes(table);
-    const bytes_read = std.posix.read(fd, bytes) catch return error.ReadGammaFailed;
+    const bytes_read = file.readPositionalAll(io, bytes, 0) catch
+        return error.ReadGammaFailed;
     if (bytes_read != bytes.len) return error.InvalidGamma;
     return table;
-}
-
-fn setNonblocking(fd: std.posix.fd_t) bool {
-    const flags = std.c.fcntl(fd, std.posix.F.GETFL);
-    if (flags < 0) return false;
-    var status: std.posix.O = @bitCast(@as(u32, @intCast(flags)));
-    status.NONBLOCK = true;
-    return std.c.fcntl(
-        fd,
-        std.posix.F.SETFL,
-        @as(c_int, @intCast(@as(u32, @bitCast(status)))),
-    ) == 0;
 }
 
 const Control = struct {
@@ -306,6 +304,7 @@ test "removed output fails its control and resets gamma once" {
     var state: TestListenerState = .{};
     var manager: Self = .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .global = undefined,
         .outputs = &outputs,
         .security_context = undefined,
@@ -346,7 +345,7 @@ test "gamma table reader accepts three native-endian ramps" {
     const expected = [_]u16{ 0, 65535, 10, 20, 30, 40 };
     try file.writePositionalAll(std.testing.io, std.mem.asBytes(&expected), 0);
 
-    const actual = try readGammaTable(std.testing.allocator, fd, 2);
+    const actual = try readGammaTable(std.testing.io, std.testing.allocator, fd, 2);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualSlices(u16, &expected, actual);
 }
@@ -360,6 +359,19 @@ test "gamma table reader rejects a short payload" {
 
     try std.testing.expectError(
         error.InvalidGamma,
-        readGammaTable(std.testing.allocator, fd, 2),
+        readGammaTable(std.testing.io, std.testing.allocator, fd, 2),
+    );
+}
+
+test "gamma table reader rejects a trailing payload" {
+    const fd = try std.posix.memfd_create("keywork-gamma-long-test", 0);
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    defer file.close(std.testing.io);
+    const long = [_]u16{ 0, 1, 2, 3, 4, 5, 6 };
+    try file.writePositionalAll(std.testing.io, std.mem.asBytes(&long), 0);
+
+    try std.testing.expectError(
+        error.InvalidGamma,
+        readGammaTable(std.testing.io, std.testing.allocator, fd, 2),
     );
 }

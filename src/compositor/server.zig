@@ -880,6 +880,7 @@ pub fn createWithVirtualOutput(
         }
         try self.gamma_control.init(
             allocator,
+            io,
             display,
             &self.outputs,
             &self.security_context,
