@@ -87,10 +87,14 @@ const PopupPlacement = struct {
     dimensions: Dimensions,
 };
 
-const PendingPopupConfigure = struct {
-    serial: u32,
+const PopupConfigure = struct {
     rules: PositionerRules,
     placement: PopupPlacement,
+};
+
+const Configure = struct {
+    serial: u32,
+    popup: ?PopupConfigure = null,
 };
 
 pub const SizeHint = struct {
@@ -111,8 +115,8 @@ const XdgSurfaceState = struct {
     pending_geometry: ?Geometry = null,
     pending_geometry_changed: bool = false,
     current_geometry: ?Geometry = null,
-    configure_serials: std.ArrayList(u32) = .empty,
-    last_acked_serial: ?u32 = null,
+    configures: std.ArrayList(Configure) = .empty,
+    last_acked_configure: ?Configure = null,
     initial_configure_sent: bool = false,
     configured: bool = false,
     sent_capabilities: ?WindowCapabilities = null,
@@ -121,8 +125,25 @@ const XdgSurfaceState = struct {
     surface_alive: bool = true,
     toplevel_resource: ?*xdg.Toplevel = null,
 
+    fn acknowledgeConfigure(self: *XdgSurfaceState, serial: u32) bool {
+        const index = for (self.configures.items, 0..) |configure, i| {
+            if (configure.serial == serial) break i;
+        } else return false;
+
+        const configure = self.configures.items[index];
+        const consumed = index + 1;
+        std.mem.copyForwards(
+            Configure,
+            self.configures.items[0 .. self.configures.items.len - consumed],
+            self.configures.items[consumed..],
+        );
+        self.configures.items.len -= consumed;
+        self.last_acked_configure = configure;
+        return true;
+    }
+
     fn deinit(self: *XdgSurfaceState, allocator: std.mem.Allocator) void {
-        self.configure_serials.deinit(allocator);
+        self.configures.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -133,7 +154,6 @@ const PopupState = struct {
     scene_id: ?Scene.PopupId,
     resource: *xdg.Popup,
     rules: PositionerRules,
-    pending_configure: ?PendingPopupConfigure = null,
     ready: bool = false,
     mapped: bool = false,
     grabbed: bool = false,
@@ -728,7 +748,8 @@ pub fn configureWindowState(
         return error.InvalidWindow;
     const toplevel = state.toplevel_resource orelse return error.InvalidWindow;
     const serial = self.display.nextSerial();
-    state.configure_serials.append(self.allocator, serial) catch return error.OutOfMemory;
+    state.configures.append(self.allocator, .{ .serial = serial }) catch
+        return error.OutOfMemory;
 
     var state_values: [13]u32 = undefined;
     const states = toplevelStates(configuration, toplevel.getVersion(), &state_values);
@@ -1266,12 +1287,10 @@ fn sendPopupConfigure(
     const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse
         return error.InvalidParent;
     const serial = self.display.nextSerial();
-    try xdg_surface.configure_serials.append(self.allocator, serial);
-    popup.pending_configure = .{
+    try xdg_surface.configures.append(self.allocator, .{
         .serial = serial,
-        .rules = rules,
-        .placement = placement,
-    };
+        .popup = .{ .rules = rules, .placement = placement },
+    });
     if (reposition_token) |token| popup.resource.sendRepositioned(token);
     popup.resource.sendConfigure(
         placement.position.x,
@@ -1762,21 +1781,9 @@ const XdgSurfaceResource = struct {
 
     fn ackConfigure(self: *XdgSurfaceResource, serial: u32) void {
         const state = self.shell.xdg_surfaces.get(self.id) orelse return;
-        const index = for (state.configure_serials.items, 0..) |candidate, i| {
-            if (candidate == serial) break i;
-        } else {
+        if (!state.acknowledgeConfigure(serial)) {
             self.resource.postError(.invalid_serial, "unknown xdg_surface configure serial");
-            return;
-        };
-
-        const consumed = index + 1;
-        std.mem.copyForwards(
-            u32,
-            state.configure_serials.items[0 .. state.configure_serials.items.len - consumed],
-            state.configure_serials.items[consumed..],
-        );
-        state.configure_serials.items.len -= consumed;
-        state.last_acked_serial = serial;
+        }
     }
 
     fn beforeSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) Surface.CommitAction {
@@ -1823,7 +1830,7 @@ const XdgSurfaceResource = struct {
                 }
             }
         }
-        if (info.has_buffer and !state.configured and state.last_acked_serial == null) {
+        if (info.has_buffer and !state.configured and state.last_acked_configure == null) {
             self.resource.postError(
                 .unconfigured_buffer,
                 "buffer committed before the initial configure was acknowledged",
@@ -1879,8 +1886,8 @@ const XdgSurfaceResource = struct {
             state.initial_configure_sent = false;
             state.sent_capabilities = null;
             state.sent_bounds = null;
-            state.last_acked_serial = null;
-            state.configure_serials.clearRetainingCapacity();
+            state.last_acked_configure = null;
+            state.configures.clearRetainingCapacity();
             if (state.toplevel_resource) |resource| {
                 const toplevel: *ToplevelResource = @ptrCast(@alignCast(resource.getUserData().?));
                 if (toplevel.decoration) |decoration| decoration.configure_sent = false;
@@ -1904,10 +1911,14 @@ const XdgSurfaceResource = struct {
                 geometry,
             );
             const was_mapped = window.mapped;
-            const configure_serial = state.last_acked_serial;
-            if (configure_serial != null) {
+            const configure_serial = if (state.last_acked_configure) |configure|
+                configure.serial
+            else
+                null;
+            if (state.last_acked_configure) |configure| {
+                std.debug.assert(configure.popup == null);
                 state.configured = true;
-                state.last_acked_serial = null;
+                state.last_acked_configure = null;
             }
             state.mapped = state.configured;
             window.mapped = state.mapped;
@@ -1953,12 +1964,11 @@ const XdgSurfaceResource = struct {
         if (info.had_buffer and !info.has_buffer) {
             self.shell.unmapPopup(popup_id);
             popup.dismissed = false;
-            popup.pending_configure = null;
             state.mapped = false;
             state.configured = false;
             state.initial_configure_sent = false;
-            state.last_acked_serial = null;
-            state.configure_serials.clearRetainingCapacity();
+            state.last_acked_configure = null;
+            state.configures.clearRetainingCapacity();
             return;
         }
 
@@ -1971,16 +1981,12 @@ const XdgSurfaceResource = struct {
                 return;
             }
             const was_mapped = popup.mapped;
-            if (state.last_acked_serial) |serial| {
+            if (state.last_acked_configure) |configure| {
+                const pending = configure.popup orelse unreachable;
                 state.configured = true;
-                if (popup.pending_configure) |pending| {
-                    if (pending.serial == serial) {
-                        popup.rules = pending.rules;
-                        self.shell.scene.setPopupPosition(scene_id, pending.placement.position);
-                        popup.pending_configure = null;
-                    }
-                }
-                state.last_acked_serial = null;
+                popup.rules = pending.rules;
+                self.shell.scene.setPopupPosition(scene_id, pending.placement.position);
+                state.last_acked_configure = null;
             }
             self.shell.scene.setPopupContentGeometry(
                 scene_id,
@@ -2271,8 +2277,8 @@ const PopupResource = struct {
             xdg_surface.mapped = false;
             xdg_surface.configured = false;
             xdg_surface.initial_configure_sent = false;
-            xdg_surface.last_acked_serial = null;
-            xdg_surface.configure_serials.clearRetainingCapacity();
+            xdg_surface.last_acked_configure = null;
+            xdg_surface.configures.clearRetainingCapacity();
         }
         self.shell.removePopupState(self.id);
         self.allocator.destroy(self);
@@ -2563,8 +2569,8 @@ const ToplevelResource = struct {
             xdg_surface.initial_configure_sent = false;
             xdg_surface.sent_capabilities = null;
             xdg_surface.sent_bounds = null;
-            xdg_surface.last_acked_serial = null;
-            xdg_surface.configure_serials.clearRetainingCapacity();
+            xdg_surface.last_acked_configure = null;
+            xdg_surface.configures.clearRetainingCapacity();
             xdg_surface.toplevel_resource = null;
             self.xdg_surface_resource.toplevel_resource = null;
         }
@@ -2837,6 +2843,53 @@ fn clampI32(value: i64) i32 {
         @as(i64, std.math.minInt(i32)),
         @as(i64, std.math.maxInt(i32)),
     ));
+}
+
+test "popup configure acknowledgements retain the matched placement" {
+    var state: XdgSurfaceState = .{ .surface_id = undefined };
+    defer state.deinit(std.testing.allocator);
+
+    try state.configures.append(std.testing.allocator, .{
+        .serial = 11,
+        .popup = .{
+            .rules = .{ .offset = .{ .x = 1, .y = 2 } },
+            .placement = .{
+                .position = .{ .x = 10, .y = 20 },
+                .dimensions = .{ .width = 100, .height = 50 },
+            },
+        },
+    });
+    try state.configures.append(std.testing.allocator, .{
+        .serial = 12,
+        .popup = .{
+            .rules = .{ .offset = .{ .x = 3, .y = 4 } },
+            .placement = .{
+                .position = .{ .x = 30, .y = 40 },
+                .dimensions = .{ .width = 200, .height = 80 },
+            },
+        },
+    });
+
+    try std.testing.expect(state.acknowledgeConfigure(11));
+    try std.testing.expectEqual(@as(u32, 11), state.last_acked_configure.?.serial);
+    try std.testing.expectEqual(
+        Scene.Position{ .x = 10, .y = 20 },
+        state.last_acked_configure.?.popup.?.placement.position,
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.configures.items.len);
+    try std.testing.expectEqual(@as(u32, 12), state.configures.items[0].serial);
+    try std.testing.expectEqual(
+        Scene.Position{ .x = 30, .y = 40 },
+        state.configures.items[0].popup.?.placement.position,
+    );
+
+    try std.testing.expect(state.acknowledgeConfigure(12));
+    try std.testing.expectEqual(@as(u32, 12), state.last_acked_configure.?.serial);
+    try std.testing.expectEqual(
+        Scene.Position{ .x = 30, .y = 40 },
+        state.last_acked_configure.?.popup.?.placement.position,
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.configures.items.len);
 }
 
 test "xdg toplevel states are gated by protocol version" {
