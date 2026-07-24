@@ -452,10 +452,12 @@ test {
     _ = @import("render/color_math.zig");
     _ = @import("render/command_geometry.zig");
     _ = @import("render/dual_kawase.zig");
+    _ = @import("render/gpu_timing.zig");
     _ = @import("render/icc.zig");
     _ = @import("render/Renderer.zig");
     _ = @import("render/cpu.zig");
     _ = @import("render/vulkan.zig");
+    _ = @import("render/vulkan_format.zig");
     _ = @import("backend/headless.zig");
     _ = @import("backend/nested_wayland.zig");
     _ = @import("backend/drm.zig");
@@ -473,11 +475,14 @@ test {
     _ = @import("backdrop_blur_damage.zig");
     _ = @import("capture_geometry.zig");
     _ = @import("damage_geometry.zig");
+    _ = @import("FrameStatistics.zig");
+    _ = @import("input_configuration.zig");
     _ = @import("output_configuration.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
     _ = @import("systemd.zig");
+    _ = @import("window_geometry.zig");
     _ = @import("window_manager.zig");
     _ = @import("window_animation.zig");
     _ = @import("window_manager/floating_resize.zig");
@@ -512,6 +517,7 @@ test {
     _ = @import("wayland/image_copy_capture.zig");
     _ = @import("wayland/screencopy.zig");
     _ = @import("wayland/xwayland_shell.zig");
+    _ = @import("xwayland/selection.zig");
     _ = @import("xwayland/server.zig");
     _ = @import("xwayland/xwm.zig");
     _ = @import("wayland/workspace.zig");
