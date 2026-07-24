@@ -23,13 +23,32 @@ atoms: Atoms,
 wayland_selection: WaylandSelection,
 window: c.xcb_window_t,
 owner: c.xcb_window_t,
-targets_timestamp: c.xcb_timestamp_t,
-targets_pending: bool,
+targets_request: ?TargetsRequest,
 source: SelectionSource,
 mime_types: std.ArrayList([:0]u8),
 target_atoms: std.ArrayList(c.xcb_atom_t),
 outgoing_transfers: std.ArrayList(*OutgoingTransfer),
 incoming_transfers: std.ArrayList(*IncomingTransfer),
+
+const TargetsRequest = struct {
+    requestor: c.xcb_window_t,
+    owner: c.xcb_window_t,
+    timestamp: c.xcb_timestamp_t,
+
+    fn matches(
+        request: TargetsRequest,
+        event: *const c.xcb_selection_notify_event_t,
+        owner: c.xcb_window_t,
+        selection: c.xcb_atom_t,
+        target: c.xcb_atom_t,
+    ) bool {
+        return request.owner == owner and
+            request.requestor == event.requestor and
+            request.timestamp == event.time and
+            event.selection == selection and
+            event.target == target;
+    }
+};
 
 pub const Atoms = struct {
     selection: c.xcb_atom_t,
@@ -442,8 +461,7 @@ pub fn init(
         .wayland_selection = wayland_selection,
         .window = c.xcb_generate_id(connection),
         .owner = c.XCB_WINDOW_NONE,
-        .targets_timestamp = c.XCB_CURRENT_TIME,
-        .targets_pending = false,
+        .targets_request = null,
         .source = .{
             .context = self,
             .mime_types = sourceMimeTypes,
@@ -498,6 +516,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     self.wayland_selection.removeListener(self);
     self.clearExternalSource();
+    self.cancelTargetsRequest();
     while (self.outgoing_transfers.items.len > 0) {
         self.outgoing_transfers.items[self.outgoing_transfers.items.len - 1].destroy();
     }
@@ -587,15 +606,14 @@ pub fn handleRequestorDestroyed(self: *Self, window: c.xcb_window_t) void {
 
 pub fn handleXfixesNotify(self: *Self, event: *const c.xcb_xfixes_selection_notify_event_t) void {
     if (event.selection != self.atoms.selection or event.window != self.window) return;
+    self.cancelTargetsRequest();
     self.owner = event.owner;
     if (event.owner == self.window) {
-        self.targets_pending = false;
         self.clearExternalSource();
         return;
     }
     self.clearExternalSource();
     if (event.owner == c.XCB_WINDOW_NONE) {
-        self.targets_pending = false;
         while (self.incoming_transfers.items.len > 0) {
             self.incoming_transfers.items[self.incoming_transfers.items.len - 1].destroy();
         }
@@ -606,11 +624,19 @@ pub fn handleXfixesNotify(self: *Self, event: *const c.xcb_xfixes_selection_noti
 }
 
 pub fn handleNotify(self: *Self, event: *const c.xcb_selection_notify_event_t) void {
+    if (self.targets_request) |request| {
+        if (request.matches(event, self.owner, self.atoms.selection, self.atoms.targets)) {
+            self.targets_request = null;
+            defer {
+                _ = c.xcb_destroy_window(self.connection, request.requestor);
+                _ = c.xcb_flush(self.connection);
+            }
+            self.receiveTargets(request.requestor, event);
+            return;
+        }
+    }
     if (event.selection != self.atoms.selection) return;
-    if (event.requestor == self.window and event.target == self.atoms.targets) {
-        if (!self.targets_pending or event.time != self.targets_timestamp) return;
-        self.targets_pending = false;
-        self.receiveTargets(event);
+    if (event.target == self.atoms.targets) {
         return;
     }
     for (self.incoming_transfers.items) |transfer| {
@@ -688,29 +714,70 @@ fn discoverCurrentOwner(self: *Self) void {
 }
 
 fn requestTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
-    self.targets_timestamp = timestamp;
-    self.targets_pending = true;
-    _ = c.xcb_delete_property(self.connection, self.window, self.atoms.selection_data);
+    std.debug.assert(self.targets_request == null);
+    const requestor = c.xcb_generate_id(self.connection);
+    if (requestor == c.XCB_WINDOW_NONE) {
+        log.err("failed to allocate an X11 TARGETS requestor ID", .{});
+        return;
+    }
+    checkRequest(self.connection, c.xcb_create_window_checked(
+        self.connection,
+        c.XCB_COPY_FROM_PARENT,
+        requestor,
+        self.window,
+        0,
+        0,
+        1,
+        1,
+        0,
+        c.XCB_WINDOW_CLASS_INPUT_OUTPUT,
+        self.screen.root_visual,
+        0,
+        null,
+    )) catch {
+        log.err("failed to create an X11 TARGETS requestor window", .{});
+        return;
+    };
+    self.targets_request = .{
+        .requestor = requestor,
+        .owner = self.owner,
+        .timestamp = timestamp,
+    };
+    _ = c.xcb_delete_property(self.connection, requestor, self.atoms.selection_data);
     _ = c.xcb_convert_selection(
         self.connection,
-        self.window,
+        requestor,
         self.atoms.selection,
         self.atoms.targets,
         self.atoms.selection_data,
         timestamp,
     );
+    if (c.xcb_flush(self.connection) <= 0) {
+        log.err("failed to request X11 selection targets", .{});
+        self.cancelTargetsRequest();
+    }
+}
+
+fn cancelTargetsRequest(self: *Self) void {
+    const request = self.targets_request orelse return;
+    self.targets_request = null;
+    _ = c.xcb_destroy_window(self.connection, request.requestor);
     _ = c.xcb_flush(self.connection);
 }
 
-fn receiveTargets(self: *Self, event: *const c.xcb_selection_notify_event_t) void {
+fn receiveTargets(
+    self: *Self,
+    requestor: c.xcb_window_t,
+    event: *const c.xcb_selection_notify_event_t,
+) void {
     if (self.owner == self.window or self.owner == c.XCB_WINDOW_NONE) return;
-    if (event.property == c.XCB_ATOM_NONE) return;
+    if (event.property != self.atoms.selection_data) return;
     const reply = c.xcb_get_property_reply(
         self.connection,
         c.xcb_get_property(
             self.connection,
             1,
-            self.window,
+            requestor,
             self.atoms.selection_data,
             c.XCB_ATOM_ATOM,
             0,
@@ -934,13 +1001,13 @@ fn receiveIncrementalChunk(self: *Self, transfer: *IncomingTransfer) void {
 }
 
 fn updateOwner(self: *Self) void {
+    self.cancelTargetsRequest();
     if (!self.wayland_selection.hasSelection()) {
         self.releaseOwnership();
         _ = c.xcb_flush(self.connection);
         return;
     }
     self.owner = self.window;
-    self.targets_pending = false;
     _ = c.xcb_set_selection_owner(
         self.connection,
         self.window,
@@ -1115,4 +1182,25 @@ fn checkRequest(connection: *c.xcb_connection_t, cookie: c.xcb_void_cookie_t) !v
     const x_error = c.xcb_request_check(connection, cookie) orelse return;
     defer std.c.free(x_error);
     return error.X11RequestFailed;
+}
+
+test "TARGETS replies match their requestor generation" {
+    const request: TargetsRequest = .{
+        .requestor = 10,
+        .owner = 20,
+        .timestamp = 30,
+    };
+    var event = std.mem.zeroes(c.xcb_selection_notify_event_t);
+    event.requestor = request.requestor;
+    event.selection = 40;
+    event.target = 50;
+    event.time = request.timestamp;
+
+    try std.testing.expect(request.matches(&event, request.owner, 40, 50));
+
+    event.requestor = 11;
+    try std.testing.expect(!request.matches(&event, request.owner, 40, 50));
+
+    event.requestor = request.requestor;
+    try std.testing.expect(!request.matches(&event, 21, 40, 50));
 }
