@@ -66,6 +66,7 @@ const ManagerResource = struct {
 };
 
 const HeadResource = struct {
+    manager: *Self,
     head: *Head,
     resource: ?*zwlr.OutputHeadV1,
     finished: bool,
@@ -136,9 +137,10 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.configurations.items.len == 0);
-    for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
-    for (self.head_resources.items) |resource| std.debug.assert(resource.resource == null);
-    for (self.mode_resources.items) |resource| std.debug.assert(resource.resource == null);
+    std.debug.assert(self.managers.items.len == 0);
+    std.debug.assert(self.head_resources.items.len == 0);
+    std.debug.assert(self.mode_resources.items.len == 0);
+    for (self.heads.items) |head| std.debug.assert(head.connected);
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     self.deinitStorage();
@@ -150,21 +152,10 @@ fn deinitStorage(self: *Self) void {
         self.destroyConfiguration(self.configurations.items[0]);
     }
     self.configurations.deinit(self.allocator);
-    for (self.mode_resources.items) |resource| self.allocator.destroy(resource);
     self.mode_resources.deinit(self.allocator);
-    for (self.head_resources.items) |resource| self.allocator.destroy(resource);
     self.head_resources.deinit(self.allocator);
-    for (self.managers.items) |manager| self.allocator.destroy(manager);
     self.managers.deinit(self.allocator);
-    for (self.heads.items) |head| {
-        self.allocator.free(head.modes);
-        self.allocator.free(head.serial);
-        self.allocator.free(head.model);
-        self.allocator.free(head.make);
-        self.allocator.free(head.description);
-        self.allocator.free(head.name);
-        self.allocator.destroy(head);
-    }
+    for (self.heads.items) |head| self.deinitHeadStorage(head);
     self.heads.deinit(self.allocator);
 }
 
@@ -237,6 +228,7 @@ pub fn removeHead(self: *Self, output: *DrmOutput) void {
         resource.finished = true;
     }
     self.changed();
+    self.reclaimHead(head);
 }
 
 pub fn syncHead(self: *Self, output: *DrmOutput) void {
@@ -340,8 +332,14 @@ fn managerRequest(
 }
 
 fn managerDestroyed(_: *zwlr.OutputManagerV1, manager: *ManagerResource) void {
-    manager.resource = null;
-    manager.stopped = true;
+    const self = manager.manager;
+    for (self.managers.items, 0..) |candidate, index| {
+        if (candidate != manager) continue;
+        _ = self.managers.orderedRemove(index);
+        self.allocator.destroy(manager);
+        return;
+    }
+    unreachable;
 }
 
 fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void {
@@ -357,6 +355,7 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
     const managed = try self.allocator.create(HeadResource);
     errdefer self.allocator.destroy(managed);
     managed.* = .{
+        .manager = self,
         .head = head,
         .resource = head_resource,
         .finished = false,
@@ -439,6 +438,7 @@ fn headRequest(
 
 fn headDestroyed(_: *zwlr.OutputHeadV1, managed: *HeadResource) void {
     managed.resource = null;
+    managed.manager.reclaimHeadResource(managed);
 }
 
 fn modeRequest(
@@ -452,7 +452,61 @@ fn modeRequest(
 }
 
 fn modeDestroyed(_: *zwlr.OutputModeV1, managed: *ModeResource) void {
-    managed.resource = null;
+    const owner = managed.owner;
+    const self = owner.manager;
+    for (self.mode_resources.items, 0..) |candidate, index| {
+        if (candidate != managed) continue;
+        _ = self.mode_resources.orderedRemove(index);
+        self.allocator.destroy(managed);
+        self.reclaimHeadResource(owner);
+        return;
+    }
+    unreachable;
+}
+
+fn reclaimHeadResource(self: *Self, resource: *HeadResource) void {
+    if (resource.resource != null) return;
+    for (self.mode_resources.items) |mode| {
+        if (mode.owner == resource) return;
+    }
+    const head = resource.head;
+    for (self.head_resources.items, 0..) |candidate, index| {
+        if (candidate != resource) continue;
+        _ = self.head_resources.orderedRemove(index);
+        self.allocator.destroy(resource);
+        self.reclaimHead(head);
+        return;
+    }
+    unreachable;
+}
+
+fn reclaimHead(self: *Self, head: *Head) void {
+    if (head.connected) return;
+    for (self.head_resources.items) |resource| {
+        if (resource.head == head) return;
+    }
+    for (self.configurations.items) |configuration| {
+        for (configuration.heads.items) |configured| {
+            if (configured.head == head) return;
+        }
+    }
+    for (self.heads.items, 0..) |candidate, index| {
+        if (candidate != head) continue;
+        _ = self.heads.orderedRemove(index);
+        self.deinitHeadStorage(head);
+        return;
+    }
+    unreachable;
+}
+
+fn deinitHeadStorage(self: *Self, head: *Head) void {
+    self.allocator.free(head.modes);
+    self.allocator.free(head.serial);
+    self.allocator.free(head.model);
+    self.allocator.free(head.make);
+    self.allocator.free(head.description);
+    self.allocator.free(head.name);
+    self.allocator.destroy(head);
 }
 
 fn modeResource(
@@ -531,17 +585,20 @@ fn configurationDestroyed(_: *zwlr.OutputConfigurationV1, configuration: *Config
 }
 
 fn destroyConfiguration(self: *Self, configuration: *Configuration) void {
-    for (configuration.heads.items) |configured| {
-        if (configured.resource) |resource| resource.destroy();
-        self.allocator.destroy(configured);
-    }
-    configuration.heads.deinit(self.allocator);
     for (self.configurations.items, 0..) |candidate, index| {
         if (candidate != configuration) continue;
         _ = self.configurations.orderedRemove(index);
-        self.allocator.destroy(configuration);
-        return;
+        break;
+    } else unreachable;
+    while (configuration.heads.items.len > 0) {
+        const configured = configuration.heads.orderedRemove(configuration.heads.items.len - 1);
+        const head = configured.head;
+        if (configured.resource) |resource| resource.destroy();
+        self.allocator.destroy(configured);
+        self.reclaimHead(head);
     }
+    configuration.heads.deinit(self.allocator);
+    self.allocator.destroy(configuration);
 }
 
 fn configureHead(
@@ -894,7 +951,7 @@ test "output geometry validation uses the selected mode and scale" {
     ));
 }
 
-test "connected head storage survives disable and reconnect lifetimes" {
+test "disconnected head storage is reclaimed across reconnects" {
     const display = try wl.Server.create();
     defer display.destroy();
 
@@ -938,9 +995,73 @@ test "connected head storage survives disable and reconnect lifetimes" {
     try std.testing.expect(manager.heads.items[0].connected);
     try std.testing.expectEqual(@as(usize, 2), manager.heads.items[0].modes.len);
     try std.testing.expectEqual(@as(usize, 0), manager.heads.items[0].current_mode_index);
+    for (0..3) |_| {
+        manager.removeHead(&output);
+        try std.testing.expectEqual(@as(usize, 0), manager.heads.items.len);
+        try manager.addHead(&output);
+        try std.testing.expectEqual(@as(usize, 1), manager.heads.items.len);
+        try std.testing.expect(manager.heads.items[0].connected);
+    }
+}
+
+test "configuration retains disconnected head storage" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var context: u8 = 0;
+    var output: DrmOutput = undefined;
+    output.init(std.testing.allocator, std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+    const name = "eDP-1";
+    @memcpy(output.connector_name[0..name.len], name);
+    output.connector_name_length = name.len;
+    output.size = .{ .width = 1920, .height = 1080 };
+    output.physical_size = .{ .width = 300, .height = 170 };
+    output.mode.vrefresh = 60;
+    output.modes = try std.testing.allocator.alloc(DrmOutput.Mode, 1);
+    output.modes[0] = .{ .value = output.mode, .preferred = true };
+    output.mode_index = 0;
+
+    var security_context: SecurityContext = undefined;
+    try security_context.init(std.testing.allocator, display);
+    defer security_context.deinit();
+
+    var manager: Self = undefined;
+    try manager.init(
+        std.testing.allocator,
+        display,
+        &.{&output},
+        &security_context,
+        .{ .context = &context, .apply = testApply },
+    );
+    defer manager.deinit();
+
+    const configuration = try std.testing.allocator.create(Configuration);
+    configuration.* = .{
+        .manager = &manager,
+        .resource = undefined,
+        .serial = manager.serial,
+        .used = false,
+        .heads = .empty,
+    };
+    try manager.configurations.append(std.testing.allocator, configuration);
+    const configured = try std.testing.allocator.create(ConfiguredHead);
+    configured.* = .{
+        .configuration = configuration,
+        .head = manager.heads.items[0],
+        .enabled = false,
+        .resource = null,
+    };
+    try configuration.heads.append(std.testing.allocator, configured);
+
     manager.removeHead(&output);
+    try std.testing.expectEqual(@as(usize, 1), manager.heads.items.len);
     try std.testing.expect(!manager.heads.items[0].connected);
-    try manager.addHead(&output);
-    try std.testing.expectEqual(@as(usize, 2), manager.heads.items.len);
-    try std.testing.expect(manager.heads.items[1].connected);
+    manager.destroyConfiguration(configuration);
+    try std.testing.expectEqual(@as(usize, 0), manager.heads.items.len);
 }
