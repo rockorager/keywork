@@ -69,7 +69,6 @@ fn handleManagerRequest(
 const Dialog = struct {
     manager: *Self,
     window_id: ?XdgShell.WindowId,
-    resource_alive: bool,
 
     fn create(
         manager: *Self,
@@ -115,7 +114,6 @@ const Dialog = struct {
         self.* = .{
             .manager = manager,
             .window_id = toplevel.window_id,
-            .resource_alive = true,
         };
         manager.dialogs.append(manager.allocator, self) catch {
             manager.allocator.destroy(self);
@@ -147,8 +145,6 @@ const Dialog = struct {
     fn handleDestroy(_: *xdg.DialogV1, self: *Dialog) void {
         if (self.window_id) |window_id| {
             self.manager.xdg_shell.setDialogState(window_id, false, false);
-            self.resource_alive = false;
-            return;
         }
         self.destroy();
     }
@@ -174,7 +170,6 @@ fn windowDestroyed(context: *anyopaque, window_id: XdgShell.WindowId) void {
         const candidate = dialog.window_id orelse continue;
         if (!std.meta.eql(candidate, window_id)) continue;
         dialog.window_id = null;
-        if (!dialog.resource_alive) dialog.destroy();
         return;
     }
 }
