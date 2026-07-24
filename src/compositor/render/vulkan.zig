@@ -226,6 +226,25 @@ const PreparedImage = struct {
     cache_id: ?u64,
     desired_version: u64,
     newly_imported: bool = false,
+
+    fn uploadRectangleCount(self: PreparedImage) usize {
+        if (self.upload_damage) |damage| {
+            std.debug.assert(damage.len > 0);
+            return damage.len;
+        }
+        return 1;
+    }
+
+    fn uploadRectangle(self: PreparedImage, index: usize) render.Rect {
+        if (self.upload_damage) |damage| return damage[index];
+        std.debug.assert(index == 0);
+        return .{
+            .x = 0,
+            .y = 0,
+            .width = self.buffer.size.width,
+            .height = self.buffer.size.height,
+        };
+    }
 };
 
 const CalibrationTexture = struct {
@@ -379,12 +398,121 @@ const RecordedFrame = struct {
     draw_runs: std.ArrayList(DrawRun) = .empty,
     blur_ops: std.ArrayList(BlurOp) = .empty,
 
+    const Input = struct {
+        resource_epoch: u64,
+        submission: *const Submission,
+        output_initialized: bool,
+        blur_initialized: u16,
+        render_area: render.Rect,
+        prepared_images: []const PreparedImage,
+        draw_runs: []const DrawRun,
+        blur_ops: []const BlurOp,
+    };
+
     fn deinit(self: *RecordedFrame, allocator: std.mem.Allocator) void {
         self.uploads.deinit(allocator);
         self.upload_rectangles.deinit(allocator);
         self.draw_runs.deinit(allocator);
         self.blur_ops.deinit(allocator);
         self.* = undefined;
+    }
+
+    fn matches(
+        self: *const RecordedFrame,
+        input: Input,
+    ) bool {
+        if (!self.valid or
+            self.resource_epoch != input.resource_epoch or
+            self.output_initialized != input.output_initialized or
+            self.blur_initialized != input.blur_initialized or
+            !std.meta.eql(self.render_area, input.render_area) or
+            self.work_buffer != input.submission.work_buffer or
+            self.instance_buffer != input.submission.instance_buffer or
+            self.timestamp_query_pool != input.submission.timestamp_query_pool or
+            self.draw_runs.items.len != input.draw_runs.len or
+            self.blur_ops.items.len != input.blur_ops.len)
+        {
+            return false;
+        }
+        for (self.draw_runs.items, input.draw_runs) |recorded_run, run| {
+            if (!std.meta.eql(recorded_run, run)) return false;
+        }
+        for (self.blur_ops.items, input.blur_ops) |recorded_op, op| {
+            if (!std.meta.eql(recorded_op, op)) return false;
+        }
+
+        var upload_index: usize = 0;
+        var rectangle_index: usize = 0;
+        for (input.prepared_images) |prepared| {
+            const offset = prepared.upload_offset orelse continue;
+            if (upload_index >= self.uploads.items.len) return false;
+            const upload = self.uploads.items[upload_index];
+            upload_index += 1;
+            const rectangle_count = prepared.uploadRectangleCount();
+            if (upload.image != prepared.texture.image or
+                upload.initialized != prepared.texture.initialized or
+                !std.meta.eql(upload.buffer_size, prepared.buffer.size) or
+                upload.stride_pixels != prepared.buffer.stride_pixels or
+                upload.offset != offset or
+                upload.first_rectangle != rectangle_index or
+                upload.rectangle_count != rectangle_count)
+            {
+                return false;
+            }
+            for (0..rectangle_count) |index| {
+                if (rectangle_index >= self.upload_rectangles.items.len or
+                    !std.meta.eql(
+                        self.upload_rectangles.items[rectangle_index],
+                        prepared.uploadRectangle(index),
+                    ))
+                {
+                    return false;
+                }
+                rectangle_index += 1;
+            }
+        }
+        return upload_index == self.uploads.items.len and
+            rectangle_index == self.upload_rectangles.items.len;
+    }
+
+    fn replace(
+        self: *RecordedFrame,
+        allocator: std.mem.Allocator,
+        input: Input,
+    ) error{OutOfMemory}!void {
+        self.valid = false;
+        self.uploads.clearRetainingCapacity();
+        self.upload_rectangles.clearRetainingCapacity();
+        self.draw_runs.clearRetainingCapacity();
+        self.blur_ops.clearRetainingCapacity();
+
+        for (input.prepared_images) |prepared| {
+            const offset = prepared.upload_offset orelse continue;
+            const first_rectangle = self.upload_rectangles.items.len;
+            const rectangle_count = prepared.uploadRectangleCount();
+            for (0..rectangle_count) |index| {
+                try self.upload_rectangles.append(allocator, prepared.uploadRectangle(index));
+            }
+            try self.uploads.append(allocator, .{
+                .image = prepared.texture.image,
+                .initialized = prepared.texture.initialized,
+                .buffer_size = prepared.buffer.size,
+                .stride_pixels = prepared.buffer.stride_pixels,
+                .offset = offset,
+                .first_rectangle = first_rectangle,
+                .rectangle_count = rectangle_count,
+            });
+        }
+        try self.draw_runs.appendSlice(allocator, input.draw_runs);
+        try self.blur_ops.appendSlice(allocator, input.blur_ops);
+        self.resource_epoch = input.resource_epoch;
+        self.output_initialized = input.output_initialized;
+        self.blur_initialized = input.blur_initialized;
+        self.render_area = input.render_area;
+        self.work_buffer = input.submission.work_buffer;
+        self.instance_buffer = input.submission.instance_buffer;
+        self.timestamp_query_pool = input.submission.timestamp_query_pool;
+        self.valid = true;
     }
 };
 
@@ -3282,14 +3410,16 @@ fn renderFrameWithCompletion(
     const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
     std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
-    const cache_hit = reusable and self.recordedFrameMatches(
-        submission,
-        &output.recorded_frame,
-        output.initialized,
-        output.blur_initialized,
-        frame_render_area,
-        self.prepared_images.items,
-    );
+    const cache_hit = reusable and output.recorded_frame.matches(.{
+        .resource_epoch = self.resource_epoch,
+        .submission = submission,
+        .output_initialized = output.initialized,
+        .blur_initialized = output.blur_initialized,
+        .render_area = frame_render_area,
+        .prepared_images = self.prepared_images.items,
+        .draw_runs = self.draw_runs.items,
+        .blur_ops = self.blur_ops.items,
+    });
     std.debug.assert(!reusable or output.command_buffer != .null_handle);
     const command_buffer = output.command_buffer;
     if (!cache_hit) {
@@ -3798,13 +3928,18 @@ fn renderFrameWithCompletion(
                 // direct composed-frame copy can also initialize only the
                 // encoded image, making this frame's initial layouts unique.
                 output.recorded_frame.valid = false;
-            } else try self.rememberRecordedFrame(
-                submission,
-                &output.recorded_frame,
-                output.initialized,
-                output.blur_initialized,
-                frame_render_area,
-                self.prepared_images.items,
+            } else try output.recorded_frame.replace(
+                self.allocator,
+                .{
+                    .resource_epoch = self.resource_epoch,
+                    .submission = submission,
+                    .output_initialized = output.initialized,
+                    .blur_initialized = output.blur_initialized,
+                    .render_area = frame_render_area,
+                    .prepared_images = self.prepared_images.items,
+                    .draw_runs = self.draw_runs.items,
+                    .blur_ops = self.blur_ops.items,
+                },
             );
         }
     }
@@ -4990,132 +5125,6 @@ fn prepareImportedTexture(
         .cache_id = source.id,
         .desired_version = source.version,
         .newly_imported = true,
-    };
-}
-
-fn recordedFrameMatches(
-    self: *const Self,
-    submission: *const Submission,
-    recorded: *const RecordedFrame,
-    output_initialized: bool,
-    blur_initialized: u16,
-    render_area: render.Rect,
-    prepared_images: []const PreparedImage,
-) bool {
-    if (!recorded.valid or
-        recorded.resource_epoch != self.resource_epoch or
-        recorded.output_initialized != output_initialized or
-        recorded.blur_initialized != blur_initialized or
-        !std.meta.eql(recorded.render_area, render_area) or
-        recorded.work_buffer != submission.work_buffer or
-        recorded.instance_buffer != submission.instance_buffer or
-        recorded.timestamp_query_pool != submission.timestamp_query_pool or
-        recorded.draw_runs.items.len != self.draw_runs.items.len or
-        recorded.blur_ops.items.len != self.blur_ops.items.len)
-    {
-        return false;
-    }
-    for (recorded.draw_runs.items, self.draw_runs.items) |recorded_run, run| {
-        if (!std.meta.eql(recorded_run, run)) return false;
-    }
-    for (recorded.blur_ops.items, self.blur_ops.items) |recorded_op, op| {
-        if (!std.meta.eql(recorded_op, op)) return false;
-    }
-
-    var upload_index: usize = 0;
-    var rectangle_index: usize = 0;
-    for (prepared_images) |prepared| {
-        const offset = prepared.upload_offset orelse continue;
-        if (upload_index >= recorded.uploads.items.len) return false;
-        const upload = recorded.uploads.items[upload_index];
-        upload_index += 1;
-        const rectangle_count = uploadRectangleCount(prepared);
-        if (upload.image != prepared.texture.image or
-            upload.initialized != prepared.texture.initialized or
-            !std.meta.eql(upload.buffer_size, prepared.buffer.size) or
-            upload.stride_pixels != prepared.buffer.stride_pixels or
-            upload.offset != offset or
-            upload.first_rectangle != rectangle_index or
-            upload.rectangle_count != rectangle_count)
-        {
-            return false;
-        }
-        for (0..rectangle_count) |index| {
-            if (rectangle_index >= recorded.upload_rectangles.items.len or
-                !std.meta.eql(
-                    recorded.upload_rectangles.items[rectangle_index],
-                    uploadRectangle(prepared, index),
-                ))
-            {
-                return false;
-            }
-            rectangle_index += 1;
-        }
-    }
-    return upload_index == recorded.uploads.items.len and
-        rectangle_index == recorded.upload_rectangles.items.len;
-}
-
-fn rememberRecordedFrame(
-    self: *Self,
-    submission: *const Submission,
-    recorded: *RecordedFrame,
-    output_initialized: bool,
-    blur_initialized: u16,
-    render_area: render.Rect,
-    prepared_images: []const PreparedImage,
-) error{OutOfMemory}!void {
-    recorded.valid = false;
-    recorded.uploads.clearRetainingCapacity();
-    recorded.upload_rectangles.clearRetainingCapacity();
-    recorded.draw_runs.clearRetainingCapacity();
-    recorded.blur_ops.clearRetainingCapacity();
-
-    for (prepared_images) |prepared| {
-        const offset = prepared.upload_offset orelse continue;
-        const first_rectangle = recorded.upload_rectangles.items.len;
-        const rectangle_count = uploadRectangleCount(prepared);
-        for (0..rectangle_count) |index| {
-            try recorded.upload_rectangles.append(self.allocator, uploadRectangle(prepared, index));
-        }
-        try recorded.uploads.append(self.allocator, .{
-            .image = prepared.texture.image,
-            .initialized = prepared.texture.initialized,
-            .buffer_size = prepared.buffer.size,
-            .stride_pixels = prepared.buffer.stride_pixels,
-            .offset = offset,
-            .first_rectangle = first_rectangle,
-            .rectangle_count = rectangle_count,
-        });
-    }
-    try recorded.draw_runs.appendSlice(self.allocator, self.draw_runs.items);
-    try recorded.blur_ops.appendSlice(self.allocator, self.blur_ops.items);
-    recorded.resource_epoch = self.resource_epoch;
-    recorded.output_initialized = output_initialized;
-    recorded.blur_initialized = blur_initialized;
-    recorded.render_area = render_area;
-    recorded.work_buffer = submission.work_buffer;
-    recorded.instance_buffer = submission.instance_buffer;
-    recorded.timestamp_query_pool = submission.timestamp_query_pool;
-    recorded.valid = true;
-}
-
-fn uploadRectangleCount(prepared: PreparedImage) usize {
-    if (prepared.upload_damage) |damage| {
-        std.debug.assert(damage.len > 0);
-        return damage.len;
-    }
-    return 1;
-}
-
-fn uploadRectangle(prepared: PreparedImage, index: usize) render.Rect {
-    if (prepared.upload_damage) |damage| return damage[index];
-    std.debug.assert(index == 0);
-    return .{
-        .x = 0,
-        .y = 0,
-        .width = prepared.buffer.size.width,
-        .height = prepared.buffer.size.height,
     };
 }
 
@@ -7266,26 +7275,43 @@ test "recorded Vulkan frames match only identical command topology" {
     submission.timestamp_query_pool = .null_handle;
     const render_area: render.Rect = .{ .x = 0, .y = 0, .width = 2, .height = 1 };
 
-    try renderer.rememberRecordedFrame(&submission, &recorded, true, 0, render_area, &prepared);
-    try std.testing.expect(renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 1, render_area, &prepared));
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, .{ .x = 1, .y = 0, .width = 1, .height = 1 }, &prepared));
+    var input: RecordedFrame.Input = .{
+        .resource_epoch = renderer.resource_epoch,
+        .submission = &submission,
+        .output_initialized = true,
+        .blur_initialized = 0,
+        .render_area = render_area,
+        .prepared_images = &prepared,
+        .draw_runs = renderer.draw_runs.items,
+        .blur_ops = renderer.blur_ops.items,
+    };
+    try recorded.replace(std.testing.allocator, input);
+    try std.testing.expect(recorded.matches(input));
+    input.blur_initialized = 1;
+    try std.testing.expect(!recorded.matches(input));
+    input.blur_initialized = 0;
+    input.render_area = .{ .x = 1, .y = 0, .width = 1, .height = 1 };
+    try std.testing.expect(!recorded.matches(input));
+    input.render_area = render_area;
 
     try renderer.blur_ops.append(std.testing.allocator, .{
         .run_index = 0,
         .sample_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
     });
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
+    input.blur_ops = renderer.blur_ops.items;
+    try std.testing.expect(!recorded.matches(input));
     renderer.blur_ops.clearRetainingCapacity();
+    input.blur_ops = renderer.blur_ops.items;
 
     damage[0].x = 1;
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!recorded.matches(input));
     damage[0].x = 0;
     renderer.draw_runs.items[0].instance_count = 2;
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!recorded.matches(input));
     renderer.draw_runs.items[0].instance_count = 1;
     renderer.advanceResourceEpoch();
-    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
+    input.resource_epoch = renderer.resource_epoch;
+    try std.testing.expect(!recorded.matches(input));
 }
 
 test "Vulkan renderer clears and clips solid rectangles" {
