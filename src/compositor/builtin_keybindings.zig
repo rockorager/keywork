@@ -69,6 +69,7 @@ pub fn setLauncher(self: *Self, launcher: *Launcher) void {
 }
 
 pub fn setConfiguredBindings(self: *Self, bindings: []const Config.Binding) void {
+    self.cancelRepeat();
     self.bindings = bindings;
 }
 
