@@ -55,7 +55,7 @@ drag_cursor_client: ?*wl.Client,
 cursor_surface_count: usize,
 pointer_grab: ?PointerGrab,
 pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
-pressed_keys: std.ArrayList(u32),
+pressed_keys: PressedKeyState,
 grabbed_keys: std.ArrayList(GrabbedKey),
 modifiers: Modifiers,
 last_user_action: ?UserAction,
@@ -86,6 +86,140 @@ const Modifiers = struct {
 const GrabbedKey = struct {
     key: u32,
     token: u64,
+};
+
+const PressedKeyState = struct {
+    key_codes: std.ArrayList(u32) = .empty,
+    owners: std.ArrayList(Owners) = .empty,
+
+    const Source = enum { physical, virtual };
+
+    const Owners = struct {
+        physical: bool = false,
+        virtual: usize = 0,
+
+        fn any(self: Owners) bool {
+            return self.physical or self.virtual != 0;
+        }
+    };
+
+    fn deinit(self: *PressedKeyState, allocator: std.mem.Allocator) void {
+        self.assertValid();
+        self.owners.deinit(allocator);
+        self.key_codes.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn update(
+        self: *PressedKeyState,
+        allocator: std.mem.Allocator,
+        key_code: u32,
+        state: wl.Keyboard.KeyState,
+        source: Source,
+    ) error{OutOfMemory}!bool {
+        self.assertValid();
+        switch (state) {
+            .pressed => {
+                if (self.find(key_code)) |index| {
+                    const owner = &self.owners.items[index];
+                    switch (source) {
+                        .physical => {
+                            if (owner.physical) return false;
+                            owner.physical = true;
+                        },
+                        .virtual => owner.virtual = std.math.add(usize, owner.virtual, 1) catch
+                            unreachable,
+                    }
+                    return false;
+                }
+                try self.key_codes.ensureUnusedCapacity(allocator, 1);
+                try self.owners.ensureUnusedCapacity(allocator, 1);
+                self.key_codes.appendAssumeCapacity(key_code);
+                self.owners.appendAssumeCapacity(switch (source) {
+                    .physical => .{ .physical = true },
+                    .virtual => .{ .virtual = 1 },
+                });
+                return true;
+            },
+            .released => {
+                const index = self.find(key_code) orelse return false;
+                const owner = &self.owners.items[index];
+                switch (source) {
+                    .physical => {
+                        if (!owner.physical) return false;
+                        owner.physical = false;
+                    },
+                    .virtual => {
+                        if (owner.virtual == 0) return false;
+                        owner.virtual -= 1;
+                    },
+                }
+                if (owner.any()) return false;
+                self.remove(index);
+                return true;
+            },
+            .repeated => return true,
+            else => return false,
+        }
+    }
+
+    fn replacePhysical(
+        self: *PressedKeyState,
+        allocator: std.mem.Allocator,
+        key_codes: []const u32,
+    ) error{OutOfMemory}!void {
+        self.assertValid();
+        try self.key_codes.ensureUnusedCapacity(allocator, key_codes.len);
+        try self.owners.ensureUnusedCapacity(allocator, key_codes.len);
+        for (self.owners.items) |*owner| owner.physical = false;
+        for (key_codes) |key_code| {
+            if (self.find(key_code)) |index| {
+                self.owners.items[index].physical = true;
+                continue;
+            }
+            self.key_codes.appendAssumeCapacity(key_code);
+            self.owners.appendAssumeCapacity(.{ .physical = true });
+        }
+        self.removeUnowned();
+    }
+
+    fn clearPhysical(self: *PressedKeyState) void {
+        self.assertValid();
+        for (self.owners.items) |*owner| owner.physical = false;
+        self.removeUnowned();
+    }
+
+    fn contains(self: *const PressedKeyState, key_code: u32) bool {
+        return self.find(key_code) != null;
+    }
+
+    fn find(self: *const PressedKeyState, key_code: u32) ?usize {
+        self.assertValid();
+        for (self.key_codes.items, 0..) |candidate, index| {
+            if (candidate == key_code) return index;
+        }
+        return null;
+    }
+
+    fn removeUnowned(self: *PressedKeyState) void {
+        var index: usize = 0;
+        while (index < self.owners.items.len) {
+            if (self.owners.items[index].any()) {
+                index += 1;
+            } else {
+                self.remove(index);
+            }
+        }
+    }
+
+    fn remove(self: *PressedKeyState, index: usize) void {
+        _ = self.key_codes.orderedRemove(index);
+        _ = self.owners.orderedRemove(index);
+    }
+
+    fn assertValid(self: *const PressedKeyState) void {
+        std.debug.assert(self.key_codes.items.len == self.owners.items.len);
+    }
 };
 
 const UserAction = struct {
@@ -295,7 +429,7 @@ pub fn init(
         .cursor_surface_count = 0,
         .pointer_grab = null,
         .pressed_pointer_buttons = .empty,
-        .pressed_keys = .empty,
+        .pressed_keys = .{},
         .grabbed_keys = .empty,
         .modifiers = .{},
         .last_user_action = null,
@@ -902,9 +1036,8 @@ pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
 }
 
 pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMemory}!void {
-    self.pressed_keys.clearRetainingCapacity();
-    self.grabbed_keys.clearRetainingCapacity();
-    try self.pressed_keys.appendSlice(self.allocator, pressed_keys);
+    try self.pressed_keys.replacePhysical(self.allocator, pressed_keys);
+    self.removeStaleGrabbedKeys();
     if (self.parent_focused) return;
     self.parent_focused = true;
     self.notifyKeyboardFocus();
@@ -922,10 +1055,11 @@ pub fn parentKeyboardLeave(self: *Self) void {
     if (self.parent_focused) self.sendLeave();
     self.parent_focused = false;
     self.notifyKeyboardFocus();
-    self.pressed_keys.clearRetainingCapacity();
-    self.grabbed_keys.clearRetainingCapacity();
+    self.pressed_keys.clearPhysical();
+    self.removeStaleGrabbedKeys();
 }
 
+/// Updates the primary keyboard stream, already aggregated across physical devices.
 pub fn key(
     self: *Self,
     time: u32,
@@ -935,6 +1069,8 @@ pub fn key(
     try self.keyWithGrab(time, key_code, state, true);
 }
 
+/// Updates one independently deduplicated virtual-keyboard stream.
+/// Releasing a key accepted from this stream does not allocate.
 pub fn virtualKey(
     self: *Self,
     time: u32,
@@ -951,14 +1087,20 @@ fn keyWithGrab(
     state: wl.Keyboard.KeyState,
     allow_grab: bool,
 ) error{OutOfMemory}!void {
+    const source: PressedKeyState.Source = if (allow_grab) .physical else .virtual;
+    if (!try self.pressed_keys.update(self.allocator, key_code, state, source)) return;
+    errdefer if (state == .pressed) {
+        std.debug.assert(self.pressed_keys.update(
+            self.allocator,
+            key_code,
+            .released,
+            source,
+        ) catch unreachable);
+    };
+
     var route_to_grab: ?u64 = null;
     switch (state) {
         .pressed => {
-            for (self.pressed_keys.items) |pressed| {
-                if (pressed == key_code) return;
-            }
-            try self.pressed_keys.append(self.allocator, key_code);
-            errdefer _ = self.pressed_keys.pop();
             if (allow_grab) {
                 if (self.keyboard_grab) |grab| {
                     try self.grabbed_keys.append(self.allocator, .{
@@ -970,18 +1112,11 @@ fn keyWithGrab(
             }
         },
         .released => {
-            for (self.pressed_keys.items, 0..) |pressed, index| {
-                if (pressed != key_code) continue;
-                _ = self.pressed_keys.orderedRemove(index);
+            for (self.grabbed_keys.items, 0..) |grabbed, index| {
+                if (grabbed.key != key_code) continue;
+                route_to_grab = grabbed.token;
+                _ = self.grabbed_keys.orderedRemove(index);
                 break;
-            } else return;
-            if (allow_grab) {
-                for (self.grabbed_keys.items, 0..) |grabbed, index| {
-                    if (grabbed.key != key_code) continue;
-                    route_to_grab = grabbed.token;
-                    _ = self.grabbed_keys.orderedRemove(index);
-                    break;
-                }
             }
         },
         .repeated => for (self.grabbed_keys.items) |grabbed| {
@@ -1029,6 +1164,17 @@ fn keyWithGrab(
         if (resource.getClient() != surface.getClient()) continue;
         if (state == .repeated and resource.getVersion() < 10) continue;
         resource.sendKey(serial, time, key_code, state);
+    }
+}
+
+fn removeStaleGrabbedKeys(self: *Self) void {
+    var index: usize = 0;
+    while (index < self.grabbed_keys.items.len) {
+        if (self.pressed_keys.contains(self.grabbed_keys.items[index].key)) {
+            index += 1;
+        } else {
+            _ = self.grabbed_keys.orderedRemove(index);
+        }
     }
 }
 
@@ -1866,7 +2012,7 @@ fn sendEnter(self: *Self) void {
 }
 
 fn sendEnterTo(self: *Self, resource: *wl.Keyboard, surface: *wl.Surface, serial: u32) void {
-    var keys = wl.Array.fromArrayList(u32, self.pressed_keys);
+    var keys = wl.Array.fromArrayList(u32, self.pressed_keys.key_codes);
     resource.sendEnter(serial, surface, &keys);
     self.sendModifiers(resource, serial);
 }
@@ -2279,6 +2425,37 @@ test "protocol serial ordering handles wraparound" {
     try std.testing.expect(serialIsOlder(9, 10));
     try std.testing.expect(!serialIsOlder(1, std.math.maxInt(u32)));
     try std.testing.expect(serialIsOlder(std.math.maxInt(u32), 1));
+}
+
+test "pressed key transitions aggregate physical and virtual sources" {
+    var state: PressedKeyState = .{};
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expect(try state.update(std.testing.allocator, 30, .pressed, .physical));
+    try std.testing.expect(!try state.update(std.testing.allocator, 30, .pressed, .virtual));
+    try std.testing.expect(!try state.update(std.testing.allocator, 30, .released, .physical));
+    try std.testing.expect(try state.update(std.testing.allocator, 30, .released, .virtual));
+
+    try std.testing.expect(try state.update(std.testing.allocator, 31, .pressed, .virtual));
+    try std.testing.expect(!try state.update(std.testing.allocator, 31, .pressed, .physical));
+    try std.testing.expect(!try state.update(std.testing.allocator, 31, .released, .virtual));
+    try std.testing.expect(try state.update(std.testing.allocator, 31, .released, .physical));
+
+    try std.testing.expectEqual(@as(usize, 0), state.key_codes.items.len);
+}
+
+test "physical key replacement preserves virtual ownership" {
+    var state: PressedKeyState = .{};
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expect(try state.update(std.testing.allocator, 40, .pressed, .virtual));
+    try state.replacePhysical(std.testing.allocator, &.{ 40, 41 });
+    try std.testing.expectEqualSlices(u32, &.{ 40, 41 }, state.key_codes.items);
+
+    state.clearPhysical();
+    try std.testing.expectEqualSlices(u32, &.{40}, state.key_codes.items);
+    try std.testing.expect(try state.update(std.testing.allocator, 40, .released, .virtual));
+    try std.testing.expectEqual(@as(usize, 0), state.key_codes.items.len);
 }
 
 test "seat capability generations invalidate existing input resources" {
