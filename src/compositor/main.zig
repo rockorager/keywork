@@ -6,7 +6,7 @@ const OutputBackend = @import("backend/output.zig");
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
 const Logging = @import("logging.zig");
-const Renderer = @import("render/renderer.zig").Renderer;
+const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
@@ -452,7 +452,7 @@ test {
     _ = @import("render/color_math.zig");
     _ = @import("render/command_geometry.zig");
     _ = @import("render/icc.zig");
-    _ = @import("render/renderer.zig");
+    _ = @import("render/Renderer.zig");
     _ = @import("render/cpu.zig");
     _ = @import("render/vulkan.zig");
     _ = @import("backend/headless.zig");

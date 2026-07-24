@@ -75,7 +75,7 @@ const DrmOutput = @import("backend/drm.zig");
 const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
 const Icc = @import("render/icc.zig");
-const renderer_types = @import("render/renderer.zig");
+const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
@@ -222,7 +222,7 @@ window_manager: WindowManager,
 window_manager_initialized: bool,
 window_transitions: std.ArrayList(WindowTransition),
 animation_now: i96,
-renderer: renderer_types.Renderer,
+renderer: Renderer,
 socket_buffer: [11]u8,
 listening: bool,
 xwayland_display_listener: ?XwaylandDisplayListener,
@@ -588,7 +588,7 @@ const WindowTransition = struct {
 
 const maximum_window_transitions = 64;
 
-fn allocateBackdropCaptureId(frame: *const OutputFrame) renderer_types.Renderer.Error!u32 {
+fn allocateBackdropCaptureId(frame: *const OutputFrame) Renderer.Error!u32 {
     const id = frame.next_backdrop_capture_id.*;
     if (id == std.math.maxInt(u32)) return error.InvalidTarget;
     frame.next_backdrop_capture_id.* = id + 1;
@@ -598,7 +598,7 @@ fn allocateBackdropCaptureId(frame: *const OutputFrame) renderer_types.Renderer.
 pub fn create(
     allocator: std.mem.Allocator,
     io: std.Io,
-    renderer_kind: renderer_types.Renderer.Kind,
+    renderer_kind: Renderer.Kind,
     output_kind: OutputBackend.Kind,
     drm_device_path: ?[]const u8,
 ) !*Self {
@@ -615,7 +615,7 @@ pub fn create(
 pub fn createWithVirtualOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
-    renderer_kind: renderer_types.Renderer.Kind,
+    renderer_kind: Renderer.Kind,
     output_kind: OutputBackend.Kind,
     drm_device_path: ?[]const u8,
     virtual_output: VirtualOutputConfig,
@@ -773,7 +773,7 @@ pub fn createWithVirtualOutput(
         );
         self.drm_device_initialized = true;
     }
-    self.renderer = renderer_types.Renderer.initForDevice(
+    self.renderer = Renderer.initForDevice(
         allocator,
         renderer_kind,
         if (output_kind == .drm) self.drm_device.deviceId() else null,
@@ -6624,7 +6624,7 @@ fn captureScreencopyDmabuf(
 
 fn finishDmabufCapture(
     buffer: *LinuxDmabuf.Buffer,
-    completion: renderer_types.Renderer.FrameCompletion,
+    completion: Renderer.FrameCompletion,
 ) error{CaptureSyncFailed}!void {
     const sync_file_fd = completion.sync_file_fd orelse return;
     defer _ = std.c.close(sync_file_fd);
@@ -6737,7 +6737,7 @@ fn captureCursor(
     self: *Self,
     target: ImageCopyCapture.CursorTarget,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!?std.posix.fd_t {
+) Renderer.Error!?std.posix.fd_t {
     const completion = try self.captureCursorTarget(target, .{ .pixels = pixel_buffer });
     return completion.sync_file_fd;
 }
@@ -6746,7 +6746,7 @@ fn captureCursorTarget(
     self: *Self,
     target: ImageCopyCapture.CursorTarget,
     render_target: render.Target,
-) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+) Renderer.Error!Renderer.FrameCompletion {
     const state = self.cursorCaptureState(target) orelse return error.InvalidTarget;
     if (!std.meta.eql(render_target.size(), state.size)) return error.InvalidTarget;
     const render_output = switch (target.source) {
@@ -6781,7 +6781,7 @@ fn captureCursorTarget(
 fn finishCaptureTarget(
     self: *Self,
     target: render.Target,
-) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+) Renderer.Error!Renderer.FrameCompletion {
     return switch (target) {
         .pixels => self.renderer.finishFrameReadback(),
         .dmabuf => self.renderer.finishFrameScanout(null),
@@ -6838,7 +6838,7 @@ fn captureOutput(
     output_id: OutputLayout.Id,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!?std.posix.fd_t {
+) Renderer.Error!?std.posix.fd_t {
     return self.captureOutputRegion(output_id, null, paint_cursors, pixel_buffer);
 }
 
@@ -6848,7 +6848,7 @@ fn captureOutputRegion(
     local_region: ?render.Rect,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!?std.posix.fd_t {
+) Renderer.Error!?std.posix.fd_t {
     const completion = try self.captureOutputTarget(
         output_id,
         local_region,
@@ -6863,7 +6863,7 @@ fn captureFullOutputTarget(
     output_id: OutputLayout.Id,
     paint_cursors: bool,
     render_target: render.Target,
-) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+) Renderer.Error!Renderer.FrameCompletion {
     return self.captureOutputTarget(output_id, null, paint_cursors, render_target);
 }
 
@@ -6873,7 +6873,7 @@ fn captureOutputTarget(
     local_region: ?render.Rect,
     paint_cursors: bool,
     render_target: render.Target,
-) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+) Renderer.Error!Renderer.FrameCompletion {
     const render_output = self.renderOutputForProtocol(output_id) orelse
         return error.InvalidTarget;
     const output = self.outputs.get(output_id) orelse return error.InvalidTarget;
@@ -6977,7 +6977,7 @@ fn composedCaptureMatchesCursors(
     return true;
 }
 
-const ToplevelCaptureError = renderer_types.Renderer.Error || error{Stopped};
+const ToplevelCaptureError = Renderer.Error || error{Stopped};
 
 fn captureToplevel(
     self: *Self,
@@ -6992,7 +6992,7 @@ fn captureToplevelTarget(
     self: *Self,
     window_id: XdgShell.WindowId,
     render_target: render.Target,
-) ToplevelCaptureError!renderer_types.Renderer.FrameCompletion {
+) ToplevelCaptureError!Renderer.FrameCompletion {
     const info = self.xdg_shell.windowInfo(window_id) orelse return error.Stopped;
     if (!info.mapped) return error.Stopped;
     const surface_id = self.xdg_shell.windowSurface(window_id) orelse return error.Stopped;
@@ -7211,7 +7211,7 @@ fn expandBackdropBlurDamage(
     }
 }
 
-fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
+fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     self.animation_now = nowNanoseconds(self.io);
     if (self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) {
         finishAllWindowTransitions(self);
@@ -7638,7 +7638,7 @@ fn renderDesktopContents(
     frame: *const OutputFrame,
     paint_primary_cursor: bool,
     paint_tablet_cursors: bool,
-) renderer_types.Renderer.Error!DesktopContents {
+) Renderer.Error!DesktopContents {
     const fullscreen_entry = self.topFullscreenForOutput(frame.visible_rect);
     const top_fullscreen = if (fullscreen_entry) |entry| entry.id else null;
     const lower_layers_occluded = if (fullscreen_entry) |entry|
@@ -7757,7 +7757,7 @@ fn presentSessionLockFrame(
     frame: *const OutputFrame,
     render_fence_fd: ?std.posix.fd_t,
     capture_source: ?ComposedCaptureSource,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     const presented = frame.render_output.backend.present(
         frame.presentation_damage.?,
@@ -7817,7 +7817,7 @@ fn renderSessionLockContents(
     frame: *const OutputFrame,
     paint_primary_cursor: bool,
     paint_tablet_cursors: bool,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| {
         try self.renderSurfaceTree(
@@ -7855,7 +7855,7 @@ fn renderSeatCursor(
     frame: *const OutputFrame,
     seat: *Seat,
     locked: bool,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const info = self.seatCursorInfo(seat, locked) orelse return;
     try self.renderCursor(frame, info);
 }
@@ -7864,7 +7864,7 @@ fn renderTabletCursors(
     self: *Self,
     frame: *const OutputFrame,
     locked: bool,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     var cursors = self.tablet.cursorIterator();
     while (cursors.next()) |info| {
         if (!self.tabletCursorVisible(info.focus_surface, locked)) continue;
@@ -7876,7 +7876,7 @@ fn renderCursor(
     self: *Self,
     frame: *const OutputFrame,
     info: Seat.CursorInfo,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     switch (info) {
         .surface => |surface| try self.renderSurfaceTree(
             frame,
@@ -7966,7 +7966,7 @@ fn renderLayerSurfaces(
     self: *Self,
     frame: *const OutputFrame,
     layer: Scene.Layer,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     var surfaces = self.scene.layerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
@@ -8009,7 +8009,7 @@ fn renderLayerSurfaces(
 fn renderTilingDragPreview(
     self: *Self,
     frame: *const OutputFrame,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const preview = self.window_manager.tilingDragPreview() orelse return;
     const command = [_]render.Command{tilingDragPreviewCommand(.{
         .x = preview.x,
@@ -8040,7 +8040,7 @@ fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
     }
 }
 
-fn renderLayerPopups(self: *Self, frame: *const OutputFrame) renderer_types.Renderer.Error!void {
+fn renderLayerPopups(self: *Self, frame: *const OutputFrame) Renderer.Error!void {
     inline for (.{
         Scene.Layer.background,
         Scene.Layer.bottom,
@@ -8093,7 +8093,7 @@ fn renderCommands(
     self: *Self,
     frame: *const OutputFrame,
     commands: []const render.Command,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     _ = frame;
     try self.renderer.append(commands);
 }
@@ -8105,7 +8105,7 @@ fn renderShadow(
     corner_radius: u32,
     shadow: Scene.Shadow,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const shadow_command = [_]render.Command{
         .{ .shadow = .{
             .rect = rect.translated(shadow.offset.x, shadow.offset.y),
@@ -8129,7 +8129,7 @@ fn renderShadows(
     rect: render.Rect,
     effects: Scene.Effects,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     if (effects.shadow) |shadow| {
         try self.renderShadow(frame, rect, effects.corner_radius, shadow, clip);
     }
@@ -8146,7 +8146,7 @@ fn renderRetainedSnapshot(
     source_rect: ?render.SourceRect,
     clip: ?render.Rect,
     rounded_clip: ?render.RoundedClip,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     try self.renderCommands(frame, &.{.{ .crossfade = .{
         .destination = destination,
         .old = source,
@@ -8165,7 +8165,7 @@ fn renderElasticGrowthSnapshot(
     transition: *const WindowTransition,
     animated_destination: render.Rect,
     rounded_clip: ?render.RoundedClip,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const old = transition.old_rect;
     const target = transition.target_rect;
     const horizontal = target.width > old.width and target.height == old.height;
@@ -8253,7 +8253,7 @@ fn renderWindowTransition(
     configured_effects: Scene.Effects,
     configured_borders: ?Scene.Borders,
     mark_surfaces: bool,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     if (!std.meta.eql(transition.output_id, frame.render_output.protocol_id)) return;
     const factor = if (transition.phase != .waiting)
         WindowAnimation.progress(
@@ -8385,7 +8385,7 @@ fn renderWindowTransition(
 fn renderDetachedWindowTransitions(
     self: *Self,
     frame: *const OutputFrame,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     for (self.window_transitions.items) |*transition| {
         if (transition.kind != .disappearance or !transition.detached) continue;
         try self.renderWindowTransition(
@@ -8403,7 +8403,7 @@ fn renderWindow(
     frame: *const OutputFrame,
     id: Scene.Id,
     window: *const Scene.Window,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const root_buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         window.surface_id,
@@ -8489,7 +8489,7 @@ fn renderWindowPopups(
     self: *Self,
     frame: *const OutputFrame,
     window_id: Scene.Id,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     var popups = self.scene.popupIterator(window_id);
     while (popups.next()) |entry| {
         const popup = entry.popup;
@@ -8520,7 +8520,7 @@ fn renderSurfaceTree(
     y: i32,
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const capture_id = try self.renderSurfaceTreeCapture(frame, surface_id, x, y, rounded_clip, clip);
     try self.renderSurfaceTreeContents(frame, surface_id, x, y, rounded_clip, clip, capture_id);
 }
@@ -8533,7 +8533,7 @@ fn renderSurfaceTreeCapture(
     y: i32,
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!?u32 {
+) Renderer.Error!?u32 {
     if (self.surfaceTreeBlurBounds(frame, surface_id, x, y, rounded_clip, clip)) |rect| {
         const blur = Scene.background_blur;
         const capture_id = try allocateBackdropCaptureId(frame);
@@ -8559,7 +8559,7 @@ fn renderSurfaceTreeContents(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
     capture_id: ?u32,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
@@ -8704,7 +8704,7 @@ fn renderSurfaceBackgroundEffect(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
     capture_id: ?u32,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const blur = Scene.background_blur;
     const surfaces = self.compositor.surfaceStore();
     const buffer = Surface.currentBuffer(surfaces, surface_id) orelse return;
@@ -8822,7 +8822,7 @@ fn renderBorders(
     borders: ?Scene.Borders,
     corner_radius: u32,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     const configured = borders orelse return;
     var commands: [4]render.Command = undefined;
     const border_commands = window_geometry.makeBorderCommands(
@@ -8842,7 +8842,7 @@ fn renderWindowDecorations(
     window: *const Scene.Window,
     layer: Scene.DecorationLayer,
     clip: ?render.Rect,
-) renderer_types.Renderer.Error!void {
+) Renderer.Error!void {
     var decorations = self.scene.decorationIterator(window_id, layer);
     while (decorations.next()) |entry| {
         if (!entry.decoration.mapped) continue;

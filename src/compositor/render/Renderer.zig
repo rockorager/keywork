@@ -1,5 +1,7 @@
 //! Runtime-selected renderer.
 
+const Renderer = @This();
+
 const std = @import("std");
 const CpuRenderer = @import("cpu.zig");
 const VulkanRenderer = @import("vulkan.zig");
@@ -9,573 +11,571 @@ const render_types = @import("types.zig");
 const command_geometry = @import("command_geometry.zig");
 const gpu_timing = @import("gpu_timing.zig");
 
-pub const Renderer = struct {
-    allocator: std.mem.Allocator,
-    backend: Backend,
-    commands: std.ArrayList(render_types.Command),
-    visible_commands: std.ArrayList(render_types.Command),
-    sampled_tags: std.ArrayList(u64),
-    active_frame: ?ActiveFrame,
+allocator: std.mem.Allocator,
+backend: Backend,
+commands: std.ArrayList(render_types.Command),
+visible_commands: std.ArrayList(render_types.Command),
+sampled_tags: std.ArrayList(u64),
+active_frame: ?ActiveFrame,
 
-    pub const Kind = enum {
-        cpu,
-        vulkan,
-    };
-
-    pub const WorkingFormat = enum {
-        argb8888,
-        rgba16f_linear,
-    };
-
-    pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
-    pub const GpuTiming = gpu_timing.Timing;
-    pub const FrameCompletion = render_types.FrameCompletion;
-
-    const Backend = union(enum) {
-        cpu: CpuRenderer,
-        vulkan: VulkanRenderer,
-    };
-
-    const ActiveFrame = struct {
-        target: render_types.Target,
-        damage: ?[]const render_types.Rect,
-        scale: render_types.Scale,
-        origin: render_types.Position,
-        color_description: render_types.ColorDescription,
-        output_calibration: ?render_types.OutputCalibration = null,
-    };
-
-    pub fn init(allocator: std.mem.Allocator, kind: Kind) VulkanRenderer.InitError!Renderer {
-        return initForDevice(allocator, kind, null);
-    }
-
-    pub fn initForDevice(
-        allocator: std.mem.Allocator,
-        kind: Kind,
-        drm_device_id: ?render_types.DrmDeviceId,
-    ) VulkanRenderer.InitError!Renderer {
-        return .{
-            .allocator = allocator,
-            .backend = switch (kind) {
-                .cpu => .{ .cpu = CpuRenderer.init(allocator) },
-                .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator, drm_device_id) },
-            },
-            .commands = .empty,
-            .visible_commands = .empty,
-            .sampled_tags = .empty,
-            .active_frame = null,
-        };
-    }
-
-    pub fn deinit(self: *Renderer) void {
-        std.debug.assert(self.active_frame == null);
-        self.commands.deinit(self.allocator);
-        self.visible_commands.deinit(self.allocator);
-        self.sampled_tags.deinit(self.allocator);
-        switch (self.backend) {
-            .cpu => |*renderer| renderer.deinit(),
-            .vulkan => |*renderer| renderer.deinit(),
-        }
-        self.* = undefined;
-    }
-
-    pub fn supportsPartialDamage(self: *const Renderer) bool {
-        return switch (self.backend) {
-            .cpu, .vulkan => true,
-        };
-    }
-
-    pub fn supportsBackdropCaptureReuse(self: *const Renderer) bool {
-        return switch (self.backend) {
-            .cpu => false,
-            .vulkan => true,
-        };
-    }
-
-    pub fn supportsColorManagement(self: *const Renderer) bool {
-        return switch (self.backend) {
-            .cpu => false,
-            .vulkan => true,
-        };
-    }
-
-    pub fn workingFormat(self: *const Renderer) WorkingFormat {
-        return switch (self.backend) {
-            .cpu => .argb8888,
-            .vulkan => .rgba16f_linear,
-        };
-    }
-
-    pub fn beginFrame(
-        self: *Renderer,
-        target: render_types.Target,
-        scale: render_types.Scale,
-        origin: render_types.Position,
-        damage: ?[]const render_types.Rect,
-        color_description: render_types.ColorDescription,
-    ) Error!void {
-        // Damage and buffers referenced by appended commands must remain valid through finishFrame.
-        std.debug.assert(self.active_frame == null);
-        std.debug.assert(self.commands.items.len == 0);
-        self.sampled_tags.clearRetainingCapacity();
-        try validateTarget(target);
-        if (scale.numerator == 0 or scale.numerator > std.math.maxInt(i32)) {
-            return error.InvalidTarget;
-        }
-        self.active_frame = .{
-            .target = target,
-            .damage = damage,
-            .scale = scale,
-            .origin = origin,
-            .color_description = color_description,
-        };
-    }
-
-    pub fn dmabufAccess(self: *Renderer) ?render_types.DmabufRenderer {
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| renderer.dmabufAccess(),
-        };
-    }
-
-    pub fn dmabufDeviceId(self: *const Renderer) ?render_types.DrmDeviceId {
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| renderer.dmabufDeviceId(),
-        };
-    }
-
-    pub fn dmabufSourceFormats(self: *const Renderer) []const render_types.DmabufFormatModifier {
-        return switch (self.backend) {
-            .cpu => &.{
-                .{ .format = @intFromEnum(render_types.DmabufFormat.argb8888), .modifier = 0 },
-                .{ .format = @intFromEnum(render_types.DmabufFormat.xrgb8888), .modifier = 0 },
-                .{ .format = @intFromEnum(render_types.DmabufFormat.abgr8888), .modifier = 0 },
-                .{ .format = @intFromEnum(render_types.DmabufFormat.xbgr8888), .modifier = 0 },
-            },
-            .vulkan => |*renderer| renderer.dmabufSourceFormats(),
-        };
-    }
-
-    pub fn dmabufSourceValidator(self: *Renderer) ?render_types.DmabufSourceValidator {
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| renderer.dmabufSourceValidator(),
-        };
-    }
-
-    pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| renderer.offscreenAccess(),
-        };
-    }
-
-    pub fn append(self: *Renderer, commands: []const render_types.Command) Error!void {
-        const active = self.active_frame orelse unreachable;
-        const command_count = std.math.add(
-            usize,
-            self.commands.items.len,
-            commands.len,
-        ) catch return error.OutOfMemory;
-        try self.sampled_tags.ensureTotalCapacity(self.allocator, command_count);
-        try self.commands.ensureTotalCapacity(self.allocator, command_count);
-        const translated = active.origin.x != 0 or active.origin.y != 0;
-        const scaled = active.scale.numerator != render_types.Scale.denominator;
-        if (!translated and !scaled) {
-            self.commands.appendSliceAssumeCapacity(commands);
-            return;
-        }
-
-        for (commands) |command| {
-            const local_command = translateCommand(command, active.origin);
-            self.commands.appendAssumeCapacity(if (scaled)
-                scaleCommand(local_command, active.scale)
-            else
-                local_command);
-        }
-    }
-
-    pub fn finishFrame(self: *Renderer) Error!void {
-        const active = self.active_frame orelse unreachable;
-        errdefer self.cancelFrame();
-        const commands = try pruneOccludedCommands(
-            self.allocator,
-            &self.visible_commands,
-            self.commands.items,
-            active.target.size(),
-        );
-        try self.renderDirect(.{
-            .size = active.target.size(),
-            .commands = commands,
-            .damage = active.damage,
-            .output_color_description = active.color_description,
-            .output_calibration = active.output_calibration,
-        }, active.target);
-        self.rememberSampledCommands(commands);
-        self.active_frame = null;
-        self.commands.clearRetainingCapacity();
-    }
-
-    /// Finish a frame whose CPU pixel target may be populated asynchronously.
-    /// A returned sync-file remains owned by the caller. When it becomes
-    /// readable, the caller must invoke completeFrameReadback with this target
-    /// as the submission source and the current destination storage. A null
-    /// descriptor means the target was populated before this function returned.
-    pub fn finishFrameReadback(self: *Renderer) Error!FrameCompletion {
-        const active = self.active_frame orelse unreachable;
-        errdefer self.cancelFrame();
-        const target = switch (active.target) {
-            .pixels => |pixels| pixels,
-            .offscreen, .dmabuf => return error.InvalidTarget,
-        };
-        if (active.damage != null) return error.InvalidTarget;
-        const commands = try pruneOccludedCommands(
-            self.allocator,
-            &self.visible_commands,
-            self.commands.items,
-            target.size,
-        );
-        const frame: render_types.Frame = .{
-            .size = target.size,
-            .commands = commands,
-            .output_color_description = active.color_description,
-            .output_calibration = active.output_calibration,
-        };
-        const completion: FrameCompletion = switch (self.backend) {
-            .cpu => |*renderer| completed: {
-                try renderer.render(frame, target);
-                break :completed .{};
-            },
-            .vulkan => |*renderer| try renderer.renderFrameReadback(frame, target),
-        };
-        self.rememberSampledCommands(commands);
-        self.active_frame = null;
-        self.commands.clearRetainingCapacity();
-        return completion;
-    }
-
-    /// Wait for a readback submitted with source and optionally copy it into
-    /// destination. Source storage only identifies the pending submission and
-    /// is not accessed.
-    pub fn completeFrameReadback(
-        self: *Renderer,
-        source: render_types.PixelBuffer,
-        destination: ?render_types.PixelBuffer,
-    ) Error!void {
-        return switch (self.backend) {
-            .cpu => {},
-            .vulkan => |*renderer| renderer.completeFrameReadback(source, destination),
-        };
-    }
-
-    /// Export all or part of a retained, fully composed frame without replaying
-    /// its scene commands. Source region is in source pixel coordinates and its
-    /// size must match the target. Returns null when the selected backend or color
-    /// conversion cannot use the retained frame directly.
-    pub fn copyComposedFrame(
-        self: *Renderer,
-        source: render_types.Target,
-        source_region: ?render_types.Rect,
-        target: render_types.Target,
-        color_description: render_types.ColorDescription,
-    ) Error!?FrameCompletion {
-        std.debug.assert(self.active_frame == null);
-        try validateTarget(source);
-        try validateTarget(target);
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| try renderer.copyComposedFrame(
-                source,
-                source_region,
-                target,
-                color_description,
-            ),
-        };
-    }
-
-    /// Returns the frame's buffer-path statistics and an owned sync-file when
-    /// an external display consumer needs asynchronous completion. Rendering
-    /// to a GPU-resident target without an external consumer may remain in
-    /// flight without a descriptor; the renderer synchronizes before reuse.
-    /// The caller must close a returned descriptor after handing it off.
-    pub fn finishFrameScanout(
-        self: *Renderer,
-        gpu_sample_tag: ?u64,
-    ) Error!FrameCompletion {
-        return self.finishFrameScanoutCommands(gpu_sample_tag, false);
-    }
-
-    /// Finish a frame after its final image command was validated for an
-    /// output overlay plane. The caller must not present the resulting primary
-    /// buffer without that exact overlay state.
-    pub fn finishFrameScanoutWithoutTopmost(
-        self: *Renderer,
-        gpu_sample_tag: ?u64,
-    ) Error!FrameCompletion {
-        return self.finishFrameScanoutCommands(gpu_sample_tag, true);
-    }
-
-    fn finishFrameScanoutCommands(
-        self: *Renderer,
-        gpu_sample_tag: ?u64,
-        exclude_topmost: bool,
-    ) Error!FrameCompletion {
-        const active = self.active_frame orelse unreachable;
-        errdefer self.cancelFrame();
-        const unpruned_commands = if (exclude_topmost) commands: {
-            const last_command = self.commands.getLastOrNull() orelse unreachable;
-            switch (last_command) {
-                .image => {},
-                else => unreachable,
-            }
-            break :commands self.commands.items[0 .. self.commands.items.len - 1];
-        } else self.commands.items;
-        // An excluded overlay must not hide primary-plane content needed when
-        // the overlay is removed or rejected by a later atomic commit.
-        const commands = try pruneOccludedCommands(
-            self.allocator,
-            &self.visible_commands,
-            unpruned_commands,
-            active.target.size(),
-        );
-        const frame: render_types.Frame = .{
-            .size = active.target.size(),
-            .commands = commands,
-            .damage = active.damage,
-            .output_color_description = active.color_description,
-            .output_calibration = active.output_calibration,
-        };
-        const completion: FrameCompletion = switch (self.backend) {
-            .cpu => |*renderer| switch (active.target) {
-                .pixels => |pixels| blk: {
-                    try renderer.render(frame, pixels);
-                    break :blk .{};
-                },
-                .offscreen, .dmabuf => return error.InvalidTarget,
-            },
-            .vulkan => |*renderer| try renderer.renderFrameScanout(
-                frame,
-                active.target,
-                gpu_sample_tag,
-            ),
-        };
-        self.rememberSampledCommands(commands);
-        if (exclude_topmost) {
-            self.rememberSampledCommand(self.commands.getLast());
-        }
-        self.active_frame = null;
-        self.commands.clearRetainingCapacity();
-        return completion;
-    }
-
-    pub fn takeGpuTiming(self: *Renderer) ?GpuTiming {
-        return switch (self.backend) {
-            .cpu => null,
-            .vulkan => |*renderer| renderer.takeGpuTiming(),
-        };
-    }
-
-    pub fn discardGpuTimings(self: *Renderer) void {
-        switch (self.backend) {
-            .cpu => {},
-            .vulkan => |*renderer| renderer.discardGpuTimings(),
-        }
-    }
-
-    pub fn directScanoutCandidate(self: *Renderer) render_types.DirectScanoutCandidate {
-        const active = self.active_frame orelse return .{ .rejected = .no_fullscreen_surface };
-        const last_command = self.commands.getLastOrNull() orelse
-            return .{ .rejected = .no_fullscreen_surface };
-        const image = switch (last_command) {
-            .image => |image| image,
-            else => return .{ .rejected = .no_fullscreen_surface },
-        };
-        if (image.x != 0 or image.y != 0 or
-            !std.meta.eql(image.size, active.target.size()))
-        {
-            return .{ .rejected = .no_fullscreen_surface };
-        }
-        if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
-            return .{ .rejected = .non_opaque_surface };
-        }
-        if (image.source != null or image.transform != .normal or
-            image.rounded_clip != null or image.clip != null)
-        {
-            return .{ .rejected = .surface_transform };
-        }
-        const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
-        if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
-        if (image.buffer.source_cache == null) {
-            return .{ .rejected = .missing_buffer_identity };
-        }
-        if (!std.meta.eql(image.buffer.color_description, active.color_description)) {
-            return .{ .rejected = .color_conversion };
-        }
-        if (active.output_calibration != null) return .{ .rejected = .color_conversion };
-        return .{ .candidate = image.buffer };
-    }
-
-    pub fn overlayScanoutCandidate(self: *Renderer) render_types.OverlayScanoutCandidate {
-        const active = self.active_frame orelse return .{ .rejected = .no_topmost_surface };
-        const last_command = self.commands.getLastOrNull() orelse
-            return .{ .rejected = .no_topmost_surface };
-        const image = switch (last_command) {
-            .image => |image| image,
-            else => return .{ .rejected = .no_topmost_surface },
-        };
-        if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
-            return .{ .rejected = .non_opaque_surface };
-        }
-        if (image.rounded_clip != null or image.clip != null) {
-            return .{ .rejected = .clipped_surface };
-        }
-        if (image.source != null or image.transform != .normal) {
-            return .{ .rejected = .transformed_surface };
-        }
-        if (!std.meta.eql(image.size, image.buffer.size)) {
-            return .{ .rejected = .scaled_surface };
-        }
-        const right = @as(i64, image.x) + image.size.width;
-        const bottom = @as(i64, image.y) + image.size.height;
-        if (image.x < 0 or image.y < 0 or right > active.target.size().width or
-            bottom > active.target.size().height or image.size.width == 0 or image.size.height == 0)
-        {
-            return .{ .rejected = .outside_output };
-        }
-        const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
-        const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
-            return .{ .rejected = .non_rgb_surface };
-        const rgb_representation: render_types.ColorRepresentation = .{};
-        if (format.isPackedRgb()) {
-            if (!std.meta.eql(image.buffer.color_representation, rgb_representation)) {
-                return .{ .rejected = .non_rgb_surface };
-            }
-        } else if (image.buffer.color_representation.coefficients == .identity or
-            image.buffer.color_representation.chroma_location != .type_0)
-        {
-            return .{ .rejected = .color_conversion };
-        }
-        if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
-        if (image.buffer.source_cache == null) {
-            return .{ .rejected = .missing_buffer_identity };
-        }
-        if (!std.meta.eql(image.buffer.color_description, active.color_description) or
-            active.output_calibration != null)
-        {
-            return .{ .rejected = .color_conversion };
-        }
-
-        var buffer = image.buffer;
-        buffer.dmabuf.?.force_opaque = true;
-        return .{ .candidate = .{
-            .buffer = buffer,
-            .destination = .{
-                .x = image.x,
-                .y = image.y,
-                .width = image.size.width,
-                .height = image.size.height,
-            },
-        } };
-    }
-
-    pub fn preferredOutputTransfer(self: *const Renderer) ?render_types.TransferFunction {
-        std.debug.assert(self.active_frame != null);
-        var hlg = false;
-        for (self.commands.items) |command| switch (command) {
-            .image => |image| switch (image.buffer.color_description.transfer_function) {
-                .st2084_pq => return .st2084_pq,
-                .hlg => hlg = true,
-                .bt1886, .gamma22, .srgb, .power => {},
-            },
-            else => {},
-        };
-        return if (hlg) .hlg else null;
-    }
-
-    pub fn setOutputColorDescription(
-        self: *Renderer,
-        description: render_types.ColorDescription,
-    ) void {
-        const active = if (self.active_frame) |*frame| frame else unreachable;
-        active.color_description = description;
-    }
-
-    pub fn setOutputCalibration(
-        self: *Renderer,
-        calibration: ?render_types.OutputCalibration,
-    ) void {
-        const active = if (self.active_frame) |*frame| frame else unreachable;
-        active.output_calibration = calibration;
-    }
-
-    pub fn cancelFrame(self: *Renderer) void {
-        std.debug.assert(self.active_frame != null);
-        self.active_frame = null;
-        self.commands.clearRetainingCapacity();
-    }
-
-    /// Finish a frame whose topmost image is presented directly by the output.
-    pub fn finishFrameDirectScanout(self: *Renderer) void {
-        std.debug.assert(self.active_frame != null);
-        self.rememberSampledCommand(self.commands.getLast());
-        self.cancelFrame();
-    }
-
-    pub fn wasSampled(self: *const Renderer, tag: u64) bool {
-        std.debug.assert(self.active_frame == null);
-        return std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null;
-    }
-
-    fn rememberSampledCommands(
-        self: *Renderer,
-        commands: []const render_types.Command,
-    ) void {
-        for (commands) |command| self.rememberSampledCommand(command);
-    }
-
-    fn rememberSampledCommand(self: *Renderer, command: render_types.Command) void {
-        const tag = switch (command) {
-            .image => |image| image.sample_tag orelse return,
-            else => return,
-        };
-        if (std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null) return;
-        self.sampled_tags.appendAssumeCapacity(tag);
-    }
-
-    pub fn render(
-        self: *Renderer,
-        frame: render_types.Frame,
-        target: render_types.PixelBuffer,
-    ) Error!void {
-        try self.beginFrame(
-            .{ .pixels = target },
-            frame.scale,
-            frame.origin,
-            frame.damage,
-            frame.output_color_description,
-        );
-        var active = true;
-        errdefer if (active) self.cancelFrame();
-        try self.append(frame.commands);
-        active = false;
-        try self.finishFrame();
-    }
-
-    fn renderDirect(
-        self: *Renderer,
-        frame: render_types.Frame,
-        target: render_types.Target,
-    ) Error!void {
-        return switch (self.backend) {
-            .cpu => |*renderer| switch (target) {
-                .pixels => |pixels| renderer.render(frame, pixels),
-                .offscreen, .dmabuf => error.InvalidTarget,
-            },
-            .vulkan => |*renderer| renderer.renderFrame(frame, target),
-        };
-    }
+pub const Kind = enum {
+    cpu,
+    vulkan,
 };
+
+pub const WorkingFormat = enum {
+    argb8888,
+    rgba16f_linear,
+};
+
+pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
+pub const GpuTiming = gpu_timing.Timing;
+pub const FrameCompletion = render_types.FrameCompletion;
+
+const Backend = union(enum) {
+    cpu: CpuRenderer,
+    vulkan: VulkanRenderer,
+};
+
+const ActiveFrame = struct {
+    target: render_types.Target,
+    damage: ?[]const render_types.Rect,
+    scale: render_types.Scale,
+    origin: render_types.Position,
+    color_description: render_types.ColorDescription,
+    output_calibration: ?render_types.OutputCalibration = null,
+};
+
+pub fn init(allocator: std.mem.Allocator, kind: Kind) VulkanRenderer.InitError!Renderer {
+    return initForDevice(allocator, kind, null);
+}
+
+pub fn initForDevice(
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    drm_device_id: ?render_types.DrmDeviceId,
+) VulkanRenderer.InitError!Renderer {
+    return .{
+        .allocator = allocator,
+        .backend = switch (kind) {
+            .cpu => .{ .cpu = CpuRenderer.init(allocator) },
+            .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator, drm_device_id) },
+        },
+        .commands = .empty,
+        .visible_commands = .empty,
+        .sampled_tags = .empty,
+        .active_frame = null,
+    };
+}
+
+pub fn deinit(self: *Renderer) void {
+    std.debug.assert(self.active_frame == null);
+    self.commands.deinit(self.allocator);
+    self.visible_commands.deinit(self.allocator);
+    self.sampled_tags.deinit(self.allocator);
+    switch (self.backend) {
+        .cpu => |*renderer| renderer.deinit(),
+        .vulkan => |*renderer| renderer.deinit(),
+    }
+    self.* = undefined;
+}
+
+pub fn supportsPartialDamage(self: *const Renderer) bool {
+    return switch (self.backend) {
+        .cpu, .vulkan => true,
+    };
+}
+
+pub fn supportsBackdropCaptureReuse(self: *const Renderer) bool {
+    return switch (self.backend) {
+        .cpu => false,
+        .vulkan => true,
+    };
+}
+
+pub fn supportsColorManagement(self: *const Renderer) bool {
+    return switch (self.backend) {
+        .cpu => false,
+        .vulkan => true,
+    };
+}
+
+pub fn workingFormat(self: *const Renderer) WorkingFormat {
+    return switch (self.backend) {
+        .cpu => .argb8888,
+        .vulkan => .rgba16f_linear,
+    };
+}
+
+pub fn beginFrame(
+    self: *Renderer,
+    target: render_types.Target,
+    scale: render_types.Scale,
+    origin: render_types.Position,
+    damage: ?[]const render_types.Rect,
+    color_description: render_types.ColorDescription,
+) Error!void {
+    // Damage and buffers referenced by appended commands must remain valid through finishFrame.
+    std.debug.assert(self.active_frame == null);
+    std.debug.assert(self.commands.items.len == 0);
+    self.sampled_tags.clearRetainingCapacity();
+    try validateTarget(target);
+    if (scale.numerator == 0 or scale.numerator > std.math.maxInt(i32)) {
+        return error.InvalidTarget;
+    }
+    self.active_frame = .{
+        .target = target,
+        .damage = damage,
+        .scale = scale,
+        .origin = origin,
+        .color_description = color_description,
+    };
+}
+
+pub fn dmabufAccess(self: *Renderer) ?render_types.DmabufRenderer {
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| renderer.dmabufAccess(),
+    };
+}
+
+pub fn dmabufDeviceId(self: *const Renderer) ?render_types.DrmDeviceId {
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| renderer.dmabufDeviceId(),
+    };
+}
+
+pub fn dmabufSourceFormats(self: *const Renderer) []const render_types.DmabufFormatModifier {
+    return switch (self.backend) {
+        .cpu => &.{
+            .{ .format = @intFromEnum(render_types.DmabufFormat.argb8888), .modifier = 0 },
+            .{ .format = @intFromEnum(render_types.DmabufFormat.xrgb8888), .modifier = 0 },
+            .{ .format = @intFromEnum(render_types.DmabufFormat.abgr8888), .modifier = 0 },
+            .{ .format = @intFromEnum(render_types.DmabufFormat.xbgr8888), .modifier = 0 },
+        },
+        .vulkan => |*renderer| renderer.dmabufSourceFormats(),
+    };
+}
+
+pub fn dmabufSourceValidator(self: *Renderer) ?render_types.DmabufSourceValidator {
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| renderer.dmabufSourceValidator(),
+    };
+}
+
+pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| renderer.offscreenAccess(),
+    };
+}
+
+pub fn append(self: *Renderer, commands: []const render_types.Command) Error!void {
+    const active = self.active_frame orelse unreachable;
+    const command_count = std.math.add(
+        usize,
+        self.commands.items.len,
+        commands.len,
+    ) catch return error.OutOfMemory;
+    try self.sampled_tags.ensureTotalCapacity(self.allocator, command_count);
+    try self.commands.ensureTotalCapacity(self.allocator, command_count);
+    const translated = active.origin.x != 0 or active.origin.y != 0;
+    const scaled = active.scale.numerator != render_types.Scale.denominator;
+    if (!translated and !scaled) {
+        self.commands.appendSliceAssumeCapacity(commands);
+        return;
+    }
+
+    for (commands) |command| {
+        const local_command = translateCommand(command, active.origin);
+        self.commands.appendAssumeCapacity(if (scaled)
+            scaleCommand(local_command, active.scale)
+        else
+            local_command);
+    }
+}
+
+pub fn finishFrame(self: *Renderer) Error!void {
+    const active = self.active_frame orelse unreachable;
+    errdefer self.cancelFrame();
+    const commands = try pruneOccludedCommands(
+        self.allocator,
+        &self.visible_commands,
+        self.commands.items,
+        active.target.size(),
+    );
+    try self.renderDirect(.{
+        .size = active.target.size(),
+        .commands = commands,
+        .damage = active.damage,
+        .output_color_description = active.color_description,
+        .output_calibration = active.output_calibration,
+    }, active.target);
+    self.rememberSampledCommands(commands);
+    self.active_frame = null;
+    self.commands.clearRetainingCapacity();
+}
+
+/// Finish a frame whose CPU pixel target may be populated asynchronously.
+/// A returned sync-file remains owned by the caller. When it becomes
+/// readable, the caller must invoke completeFrameReadback with this target
+/// as the submission source and the current destination storage. A null
+/// descriptor means the target was populated before this function returned.
+pub fn finishFrameReadback(self: *Renderer) Error!FrameCompletion {
+    const active = self.active_frame orelse unreachable;
+    errdefer self.cancelFrame();
+    const target = switch (active.target) {
+        .pixels => |pixels| pixels,
+        .offscreen, .dmabuf => return error.InvalidTarget,
+    };
+    if (active.damage != null) return error.InvalidTarget;
+    const commands = try pruneOccludedCommands(
+        self.allocator,
+        &self.visible_commands,
+        self.commands.items,
+        target.size,
+    );
+    const frame: render_types.Frame = .{
+        .size = target.size,
+        .commands = commands,
+        .output_color_description = active.color_description,
+        .output_calibration = active.output_calibration,
+    };
+    const completion: FrameCompletion = switch (self.backend) {
+        .cpu => |*renderer| completed: {
+            try renderer.render(frame, target);
+            break :completed .{};
+        },
+        .vulkan => |*renderer| try renderer.renderFrameReadback(frame, target),
+    };
+    self.rememberSampledCommands(commands);
+    self.active_frame = null;
+    self.commands.clearRetainingCapacity();
+    return completion;
+}
+
+/// Wait for a readback submitted with source and optionally copy it into
+/// destination. Source storage only identifies the pending submission and
+/// is not accessed.
+pub fn completeFrameReadback(
+    self: *Renderer,
+    source: render_types.PixelBuffer,
+    destination: ?render_types.PixelBuffer,
+) Error!void {
+    return switch (self.backend) {
+        .cpu => {},
+        .vulkan => |*renderer| renderer.completeFrameReadback(source, destination),
+    };
+}
+
+/// Export all or part of a retained, fully composed frame without replaying
+/// its scene commands. Source region is in source pixel coordinates and its
+/// size must match the target. Returns null when the selected backend or color
+/// conversion cannot use the retained frame directly.
+pub fn copyComposedFrame(
+    self: *Renderer,
+    source: render_types.Target,
+    source_region: ?render_types.Rect,
+    target: render_types.Target,
+    color_description: render_types.ColorDescription,
+) Error!?FrameCompletion {
+    std.debug.assert(self.active_frame == null);
+    try validateTarget(source);
+    try validateTarget(target);
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| try renderer.copyComposedFrame(
+            source,
+            source_region,
+            target,
+            color_description,
+        ),
+    };
+}
+
+/// Returns the frame's buffer-path statistics and an owned sync-file when
+/// an external display consumer needs asynchronous completion. Rendering
+/// to a GPU-resident target without an external consumer may remain in
+/// flight without a descriptor; the renderer synchronizes before reuse.
+/// The caller must close a returned descriptor after handing it off.
+pub fn finishFrameScanout(
+    self: *Renderer,
+    gpu_sample_tag: ?u64,
+) Error!FrameCompletion {
+    return self.finishFrameScanoutCommands(gpu_sample_tag, false);
+}
+
+/// Finish a frame after its final image command was validated for an
+/// output overlay plane. The caller must not present the resulting primary
+/// buffer without that exact overlay state.
+pub fn finishFrameScanoutWithoutTopmost(
+    self: *Renderer,
+    gpu_sample_tag: ?u64,
+) Error!FrameCompletion {
+    return self.finishFrameScanoutCommands(gpu_sample_tag, true);
+}
+
+fn finishFrameScanoutCommands(
+    self: *Renderer,
+    gpu_sample_tag: ?u64,
+    exclude_topmost: bool,
+) Error!FrameCompletion {
+    const active = self.active_frame orelse unreachable;
+    errdefer self.cancelFrame();
+    const unpruned_commands = if (exclude_topmost) commands: {
+        const last_command = self.commands.getLastOrNull() orelse unreachable;
+        switch (last_command) {
+            .image => {},
+            else => unreachable,
+        }
+        break :commands self.commands.items[0 .. self.commands.items.len - 1];
+    } else self.commands.items;
+    // An excluded overlay must not hide primary-plane content needed when
+    // the overlay is removed or rejected by a later atomic commit.
+    const commands = try pruneOccludedCommands(
+        self.allocator,
+        &self.visible_commands,
+        unpruned_commands,
+        active.target.size(),
+    );
+    const frame: render_types.Frame = .{
+        .size = active.target.size(),
+        .commands = commands,
+        .damage = active.damage,
+        .output_color_description = active.color_description,
+        .output_calibration = active.output_calibration,
+    };
+    const completion: FrameCompletion = switch (self.backend) {
+        .cpu => |*renderer| switch (active.target) {
+            .pixels => |pixels| blk: {
+                try renderer.render(frame, pixels);
+                break :blk .{};
+            },
+            .offscreen, .dmabuf => return error.InvalidTarget,
+        },
+        .vulkan => |*renderer| try renderer.renderFrameScanout(
+            frame,
+            active.target,
+            gpu_sample_tag,
+        ),
+    };
+    self.rememberSampledCommands(commands);
+    if (exclude_topmost) {
+        self.rememberSampledCommand(self.commands.getLast());
+    }
+    self.active_frame = null;
+    self.commands.clearRetainingCapacity();
+    return completion;
+}
+
+pub fn takeGpuTiming(self: *Renderer) ?GpuTiming {
+    return switch (self.backend) {
+        .cpu => null,
+        .vulkan => |*renderer| renderer.takeGpuTiming(),
+    };
+}
+
+pub fn discardGpuTimings(self: *Renderer) void {
+    switch (self.backend) {
+        .cpu => {},
+        .vulkan => |*renderer| renderer.discardGpuTimings(),
+    }
+}
+
+pub fn directScanoutCandidate(self: *Renderer) render_types.DirectScanoutCandidate {
+    const active = self.active_frame orelse return .{ .rejected = .no_fullscreen_surface };
+    const last_command = self.commands.getLastOrNull() orelse
+        return .{ .rejected = .no_fullscreen_surface };
+    const image = switch (last_command) {
+        .image => |image| image,
+        else => return .{ .rejected = .no_fullscreen_surface },
+    };
+    if (image.x != 0 or image.y != 0 or
+        !std.meta.eql(image.size, active.target.size()))
+    {
+        return .{ .rejected = .no_fullscreen_surface };
+    }
+    if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
+        return .{ .rejected = .non_opaque_surface };
+    }
+    if (image.source != null or image.transform != .normal or
+        image.rounded_clip != null or image.clip != null)
+    {
+        return .{ .rejected = .surface_transform };
+    }
+    const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+    if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
+    if (image.buffer.source_cache == null) {
+        return .{ .rejected = .missing_buffer_identity };
+    }
+    if (!std.meta.eql(image.buffer.color_description, active.color_description)) {
+        return .{ .rejected = .color_conversion };
+    }
+    if (active.output_calibration != null) return .{ .rejected = .color_conversion };
+    return .{ .candidate = image.buffer };
+}
+
+pub fn overlayScanoutCandidate(self: *Renderer) render_types.OverlayScanoutCandidate {
+    const active = self.active_frame orelse return .{ .rejected = .no_topmost_surface };
+    const last_command = self.commands.getLastOrNull() orelse
+        return .{ .rejected = .no_topmost_surface };
+    const image = switch (last_command) {
+        .image => |image| image,
+        else => return .{ .rejected = .no_topmost_surface },
+    };
+    if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
+        return .{ .rejected = .non_opaque_surface };
+    }
+    if (image.rounded_clip != null or image.clip != null) {
+        return .{ .rejected = .clipped_surface };
+    }
+    if (image.source != null or image.transform != .normal) {
+        return .{ .rejected = .transformed_surface };
+    }
+    if (!std.meta.eql(image.size, image.buffer.size)) {
+        return .{ .rejected = .scaled_surface };
+    }
+    const right = @as(i64, image.x) + image.size.width;
+    const bottom = @as(i64, image.y) + image.size.height;
+    if (image.x < 0 or image.y < 0 or right > active.target.size().width or
+        bottom > active.target.size().height or image.size.width == 0 or image.size.height == 0)
+    {
+        return .{ .rejected = .outside_output };
+    }
+    const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+    const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
+        return .{ .rejected = .non_rgb_surface };
+    const rgb_representation: render_types.ColorRepresentation = .{};
+    if (format.isPackedRgb()) {
+        if (!std.meta.eql(image.buffer.color_representation, rgb_representation)) {
+            return .{ .rejected = .non_rgb_surface };
+        }
+    } else if (image.buffer.color_representation.coefficients == .identity or
+        image.buffer.color_representation.chroma_location != .type_0)
+    {
+        return .{ .rejected = .color_conversion };
+    }
+    if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
+    if (image.buffer.source_cache == null) {
+        return .{ .rejected = .missing_buffer_identity };
+    }
+    if (!std.meta.eql(image.buffer.color_description, active.color_description) or
+        active.output_calibration != null)
+    {
+        return .{ .rejected = .color_conversion };
+    }
+
+    var buffer = image.buffer;
+    buffer.dmabuf.?.force_opaque = true;
+    return .{ .candidate = .{
+        .buffer = buffer,
+        .destination = .{
+            .x = image.x,
+            .y = image.y,
+            .width = image.size.width,
+            .height = image.size.height,
+        },
+    } };
+}
+
+pub fn preferredOutputTransfer(self: *const Renderer) ?render_types.TransferFunction {
+    std.debug.assert(self.active_frame != null);
+    var hlg = false;
+    for (self.commands.items) |command| switch (command) {
+        .image => |image| switch (image.buffer.color_description.transfer_function) {
+            .st2084_pq => return .st2084_pq,
+            .hlg => hlg = true,
+            .bt1886, .gamma22, .srgb, .power => {},
+        },
+        else => {},
+    };
+    return if (hlg) .hlg else null;
+}
+
+pub fn setOutputColorDescription(
+    self: *Renderer,
+    description: render_types.ColorDescription,
+) void {
+    const active = if (self.active_frame) |*frame| frame else unreachable;
+    active.color_description = description;
+}
+
+pub fn setOutputCalibration(
+    self: *Renderer,
+    calibration: ?render_types.OutputCalibration,
+) void {
+    const active = if (self.active_frame) |*frame| frame else unreachable;
+    active.output_calibration = calibration;
+}
+
+pub fn cancelFrame(self: *Renderer) void {
+    std.debug.assert(self.active_frame != null);
+    self.active_frame = null;
+    self.commands.clearRetainingCapacity();
+}
+
+/// Finish a frame whose topmost image is presented directly by the output.
+pub fn finishFrameDirectScanout(self: *Renderer) void {
+    std.debug.assert(self.active_frame != null);
+    self.rememberSampledCommand(self.commands.getLast());
+    self.cancelFrame();
+}
+
+pub fn wasSampled(self: *const Renderer, tag: u64) bool {
+    std.debug.assert(self.active_frame == null);
+    return std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null;
+}
+
+fn rememberSampledCommands(
+    self: *Renderer,
+    commands: []const render_types.Command,
+) void {
+    for (commands) |command| self.rememberSampledCommand(command);
+}
+
+fn rememberSampledCommand(self: *Renderer, command: render_types.Command) void {
+    const tag = switch (command) {
+        .image => |image| image.sample_tag orelse return,
+        else => return,
+    };
+    if (std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null) return;
+    self.sampled_tags.appendAssumeCapacity(tag);
+}
+
+pub fn render(
+    self: *Renderer,
+    frame: render_types.Frame,
+    target: render_types.PixelBuffer,
+) Error!void {
+    try self.beginFrame(
+        .{ .pixels = target },
+        frame.scale,
+        frame.origin,
+        frame.damage,
+        frame.output_color_description,
+    );
+    var active = true;
+    errdefer if (active) self.cancelFrame();
+    try self.append(frame.commands);
+    active = false;
+    try self.finishFrame();
+}
+
+fn renderDirect(
+    self: *Renderer,
+    frame: render_types.Frame,
+    target: render_types.Target,
+) Error!void {
+    return switch (self.backend) {
+        .cpu => |*renderer| switch (target) {
+            .pixels => |pixels| renderer.render(frame, pixels),
+            .offscreen, .dmabuf => error.InvalidTarget,
+        },
+        .vulkan => |*renderer| renderer.renderFrame(frame, target),
+    };
+}
 
 fn validateTarget(target: render_types.Target) Renderer.Error!void {
     const size = target.size();

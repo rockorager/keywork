@@ -5,7 +5,7 @@ const FrameStatistics = @This();
 const std = @import("std");
 const ControlProtocol = @import("keywork-control");
 const Region = @import("region.zig");
-const renderer_types = @import("render/renderer.zig");
+const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 
 const sample_capacity = 1024;
@@ -166,7 +166,7 @@ fn addLatency(self: *FrameStatistics, latency: FrameLatency) void {
 
 pub fn addGpuExecution(
     self: *FrameStatistics,
-    timing: renderer_types.Renderer.GpuTiming,
+    timing: Renderer.GpuTiming,
 ) void {
     self.gpu_execution_samples[self.gpu_execution_next] = .{
         .total_microseconds = nanosecondsToMicroseconds(timing.total_nanoseconds),
@@ -233,7 +233,7 @@ pub fn snapshot(
     name: []const u8,
     size: render.Size,
     refresh_millihertz: i32,
-    working_format: renderer_types.Renderer.WorkingFormat,
+    working_format: Renderer.WorkingFormat,
 ) ControlProtocol.OutputStatistics {
     return .{
         .name = name,
@@ -449,7 +449,7 @@ fn controlFramePath(path: ?FramePath) ControlProtocol.FramePath {
 }
 
 fn controlWorkingFormat(
-    format: renderer_types.Renderer.WorkingFormat,
+    format: Renderer.WorkingFormat,
 ) ControlProtocol.BufferFormat {
     return switch (format) {
         .argb8888 => .argb8888,
