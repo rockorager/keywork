@@ -582,7 +582,7 @@ pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
     if (radius == 0) return 0;
     const level = configuredBlurLevel(radius, downsample_level);
     const scale: u32 = @as(u32, 1) << @intCast(level);
-    return (ceilDiv(radius, scale) + 3) * scale;
+    return (ceilDiv(radius, scale) +| 3) *| scale;
 }
 
 fn dualKawaseArgb(
@@ -1853,6 +1853,10 @@ test "CPU dual Kawase blur derives levels and footprints from radius" {
     try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
     try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16, null));
     try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        backdropBlurFootprint(std.math.maxInt(u32), null),
+    );
 }
 
 test "CPU dual Kawase pyramid preserves a uniform odd-sized image" {

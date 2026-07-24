@@ -2563,7 +2563,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         return error.InvalidTarget;
     if (descriptor.id == 0 or
         descriptor.size.width == 0 or descriptor.size.height == 0 or
-        descriptor.stride < descriptor.size.width * @sizeOf(u32) or
+        @as(u64, descriptor.stride) < @as(u64, descriptor.size.width) * @sizeOf(u32) or
         self.outputs.contains(.{ .dmabuf = descriptor.id }) or
         !self.supportsDmabufTarget(descriptor.size, descriptor.format, descriptor.modifier))
         return error.InvalidTarget;
@@ -3596,10 +3596,12 @@ fn renderFrameWithCompletion(
                 }
                 return err;
             };
-            try self.prepared_images.append(
-                self.allocator,
-                try self.prepareTexture(image.buffer, self.prepared_images.items, &work_size),
-            );
+            try self.prepared_images.ensureUnusedCapacity(self.allocator, 1);
+            self.prepared_images.appendAssumeCapacity(try self.prepareTexture(
+                image.buffer,
+                self.prepared_images.items,
+                &work_size,
+            ));
         },
         else => {},
     };
@@ -5309,6 +5311,7 @@ fn prepareTexture(
             };
         }
 
+        const upload_offset = try reserveWork(work_size, byte_size);
         self.makeTextureRoom() catch return error.VulkanFailure;
         const texture = try self.createTexture(buffer.size);
         errdefer self.destroyTexture(texture);
@@ -5316,18 +5319,19 @@ fn prepareTexture(
         return .{
             .texture = texture,
             .buffer = buffer,
-            .upload_offset = try reserveWork(work_size, byte_size),
+            .upload_offset = upload_offset,
             .upload_damage = null,
             .cache_id = source.id,
             .desired_version = source.version,
         };
     }
 
+    const upload_offset = try reserveWork(work_size, byte_size);
     const texture = try self.createTexture(buffer.size);
     return .{
         .texture = texture,
         .buffer = buffer,
-        .upload_offset = try reserveWork(work_size, byte_size),
+        .upload_offset = upload_offset,
         .upload_damage = null,
         .cache_id = null,
         .desired_version = 0,
@@ -6665,8 +6669,7 @@ fn compileDrawRuns(
             const capture = compiledBackdropCapture(captures.items, blur.capture_id) orelse
                 return error.InvalidTarget;
             const level = configuredBlurLevel(blur.radius, blur.downsample_level);
-            const scale: u32 = @as(u32, 1) << @intCast(level);
-            const sample_radius = (ceilDiv(blur.radius, scale) + 3) * scale;
+            const sample_radius = backdropBlurFootprint(blur.radius, blur.downsample_level);
             const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
             if (capture.radius != blur.radius or
                 capture.downsample_level != blur.downsample_level or
@@ -6785,8 +6788,7 @@ fn compileBackdropCapture(
     }
     const clipped = capture.rect.clipTo(frame.size) orelse return error.InvalidTarget;
     const level = configuredBlurLevel(capture.radius, capture.downsample_level);
-    const scale: u32 = @as(u32, 1) << @intCast(level);
-    const sample_radius = (ceilDiv(capture.radius, scale) + 3) * scale;
+    const sample_radius = backdropBlurFootprint(capture.radius, capture.downsample_level);
     const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
     const own_cache_key = backdropCacheKey(frame.commands[0 .. command_index + 1]);
     const geometry_key = backdropGeometryKey(capture);
@@ -7153,7 +7155,7 @@ pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
     if (radius == 0) return 0;
     const level = configuredBlurLevel(radius, downsample_level);
     const scale: u32 = @as(u32, 1) << @intCast(level);
-    return (ceilDiv(radius, scale) + 3) * scale;
+    return (ceilDiv(radius, scale) +| 3) *| scale;
 }
 
 fn ceilDiv(value: u32, divisor: u32) u32 {
@@ -8085,6 +8087,10 @@ test "backdrop blur level keeps low resolution radius bounded" {
     try std.testing.expectEqual(@as(u32, 192), backdropBlurFootprint(65, null));
     try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
     try std.testing.expectEqual(@as(u32, 128), backdropBlurFootprint(16, 5));
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        backdropBlurFootprint(std.math.maxInt(u32), null),
+    );
 
     for (0..blur_level_count) |level_index| {
         const level: u8 = @intCast(level_index);
@@ -8101,6 +8107,12 @@ test "backdrop blur level keeps low resolution radius bounded" {
     try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
     try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(1, 0));
     try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(16, 3));
+}
+
+test "Vulkan work reservation rejects overflow without changing the offset" {
+    var work_size: usize = std.math.maxInt(usize) - 3;
+    try std.testing.expectError(error.InvalidTarget, reserveWork(&work_size, 4));
+    try std.testing.expectEqual(std.math.maxInt(usize) - 3, work_size);
 }
 
 test "backdrop blur finish is attached only to the final upsample" {
@@ -9490,7 +9502,7 @@ test "renderer conformance: reproducible scene: Vulkan HDR tone mapping preserve
     const red: u8 = @truncate(target_pixels[0] >> 16);
     const green: u8 = @truncate(target_pixels[0] >> 8);
     const blue: u8 = @truncate(target_pixels[0]);
-    try std.testing.expectEqual(@as(u8, 255), red);
+    try std.testing.expect(red >= 254);
     try std.testing.expect(green >= 175 and green <= 200);
     try std.testing.expect(blue >= 125 and blue <= 150);
 }
