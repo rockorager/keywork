@@ -160,6 +160,13 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn startInput(self: *Self) !void {
+    switch (self.backend) {
+        .drm, .headless => {},
+        .nested => |*output| try output.startInput(),
+    }
+}
+
 pub fn size(self: *const Self) render.Size {
     return switch (self.backend) {
         .drm => |output| output.logicalSize(),

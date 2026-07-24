@@ -18,6 +18,11 @@ const buffer_count = 3;
 const scale_roundtrip_limit = 8;
 const max_render_scale_120 = 480;
 
+const SeatGlobal = struct {
+    name: u32,
+    version: u32,
+};
+
 io: std.Io,
 display: ?*wl.Display,
 registry: ?*wl.Registry,
@@ -29,6 +34,7 @@ fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
 presentation_manager: ?*wp.Presentation,
 relative_pointer_manager: ?*zwp.RelativePointerManagerV1,
 presentation_clock_id: ?u32,
+seat_global: ?SeatGlobal,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -137,6 +143,7 @@ pub fn init(
         .presentation_manager = null,
         .relative_pointer_manager = null,
         .presentation_clock_id = null,
+        .seat_global = null,
         .seat = null,
         .keyboard = null,
         .pointer = null,
@@ -216,8 +223,6 @@ pub fn init(
     self.buffer_size = self.render_scale.apply(size) catch return error.InvalidDimensions;
     try self.createBuffers(io);
 
-    self.registry.?.destroy();
-    self.registry = null;
     self.event_source = try child_display.getEventLoop().addFd(
         *Self,
         display.getFd(),
@@ -225,6 +230,24 @@ pub fn init(
         handleParentFd,
         self,
     );
+}
+
+/// Starts parent input forwarding after the child compositor has initialized
+/// every subsystem reachable from the output listener.
+pub fn startInput(self: *Self) !void {
+    const registry = self.registry orelse return;
+    if (self.seat_global) |global| {
+        const seat = try registry.bind(global.name, wl.Seat, global.version);
+        self.seat = seat;
+        seat.setListener(*Self, handleSeatEvent, self);
+    }
+    registry.destroy();
+    self.registry = null;
+    switch (self.display.?.flush()) {
+        .SUCCESS => {},
+        .AGAIN => try self.event_source.?.fdUpdate(.{ .readable = true, .writable = true }),
+        else => return error.ParentDisplayFailed,
+    }
 }
 
 pub fn deinit(self: *Self) void {
@@ -509,21 +532,17 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
                     self.ensureRelativePointer();
                 }
             } else if (std.mem.eql(u8, interface, std.mem.span(wl.Seat.interface.name))) {
-                if (self.seat == null) {
-                    const seat = self.registry.?.bind(
-                        global.name,
-                        wl.Seat,
-                        @min(global.version, wl.Seat.generated_version),
-                    ) catch {
-                        self.failed = true;
-                        return;
-                    };
-                    self.seat = seat;
-                    seat.setListener(*Self, handleSeatEvent, self);
-                }
+                if (self.seat_global == null) self.seat_global = .{
+                    .name = global.name,
+                    .version = @min(global.version, wl.Seat.generated_version),
+                };
             }
         },
-        .global_remove => {},
+        .global_remove => |removed| {
+            if (self.seat_global) |global| {
+                if (global.name == removed.name) self.seat_global = null;
+            }
+        },
     }
 }
 
