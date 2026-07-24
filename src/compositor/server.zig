@@ -91,6 +91,7 @@ const Control = @import("control.zig");
 const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 const WindowAnimation = @import("window_animation.zig");
+const capture_geometry = @import("capture_geometry.zig");
 
 const c = @cImport({
     @cInclude("linux/sync_file.h");
@@ -6713,7 +6714,7 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
     const self: *Self = @ptrCast(@alignCast(context));
     const render_output = self.renderOutputForProtocol(target.output) orelse return null;
     if (target.region) |region| {
-        const physical = scaledScreencopyRegion(
+        const physical = capture_geometry.scaledRegion(
             region,
             render_output.backend.renderScale(),
             render_output.backend.modeSize(),
@@ -7544,19 +7545,19 @@ fn cursorCaptureState(
         },
     };
     const pointer = target.seat.pointerPosition() orelse return null;
-    const pointer_x = floorToI32(pointer.x);
-    const pointer_y = floorToI32(pointer.y);
+    const pointer_x = capture_geometry.floorToI32(pointer.x);
+    const pointer_y = capture_geometry.floorToI32(pointer.y);
     const bounds = self.cursorBounds(cursor) orelse return null;
     const size = scale.apply(.{ .width = bounds.width, .height = bounds.height }) catch
         return null;
     if (size.width == 0 or size.height == 0) return null;
     const position: render.Position = .{
-        .x = scaleCaptureCoordinate(@as(i64, pointer_x) - source_bounds.x, scale),
-        .y = scaleCaptureCoordinate(@as(i64, pointer_y) - source_bounds.y, scale),
+        .x = capture_geometry.scaleCoordinate(@as(i64, pointer_x) - source_bounds.x, scale),
+        .y = capture_geometry.scaleCoordinate(@as(i64, pointer_y) - source_bounds.y, scale),
     };
     const image_origin: render.Position = .{
-        .x = scaleCaptureCoordinate(@as(i64, bounds.x) - source_bounds.x, scale),
-        .y = scaleCaptureCoordinate(@as(i64, bounds.y) - source_bounds.y, scale),
+        .x = capture_geometry.scaleCoordinate(@as(i64, bounds.x) - source_bounds.x, scale),
+        .y = capture_geometry.scaleCoordinate(@as(i64, bounds.y) - source_bounds.y, scale),
     };
     return .{
         .cursor = cursor,
@@ -7626,108 +7627,6 @@ fn finishCaptureTarget(
         .dmabuf => self.renderer.finishFrameScanout(null),
         .offscreen => error.InvalidTarget,
     };
-}
-
-fn floorToI32(value: f64) i32 {
-    const floored = @floor(value);
-    if (floored <= std.math.minInt(i32)) return std.math.minInt(i32);
-    if (floored >= std.math.maxInt(i32)) return std.math.maxInt(i32);
-    return @intFromFloat(floored);
-}
-
-fn scaleCaptureCoordinate(value: i64, scale: render.Scale) i32 {
-    const product = @as(i128, value) * scale.numerator;
-    const rounded = if (product >= 0)
-        @divTrunc(product + render.Scale.denominator / 2, render.Scale.denominator)
-    else
-        -@divTrunc(-product + render.Scale.denominator / 2, render.Scale.denominator);
-    return @intCast(std.math.clamp(
-        rounded,
-        std.math.minInt(i32),
-        std.math.maxInt(i32),
-    ));
-}
-
-fn scaledScreencopyRegion(
-    logical: render.Rect,
-    scale: render.Scale,
-    output_size: render.Size,
-) ?render.Rect {
-    const left = scaleCaptureCoordinate(logical.x, scale);
-    const top = scaleCaptureCoordinate(logical.y, scale);
-    const right = scaleCaptureCoordinate(@as(i64, logical.x) + logical.width, scale);
-    const bottom = scaleCaptureCoordinate(@as(i64, logical.y) + logical.height, scale);
-    if (left < 0 or top < 0 or right <= left or bottom <= top or
-        right > output_size.width or bottom > output_size.height) return null;
-    return .{
-        .x = left,
-        .y = top,
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
-}
-
-test "cursor capture metadata preserves fractional image placement" {
-    const scale: render.Scale = .{ .numerator = 180 };
-    const position = scaleCaptureCoordinate(8, scale);
-    const image_origin = scaleCaptureCoordinate(3, scale);
-    const hotspot = position -| image_origin;
-    try std.testing.expectEqual(@as(i32, 12), position);
-    try std.testing.expectEqual(@as(i32, 5), image_origin);
-    try std.testing.expectEqual(image_origin, position -| hotspot);
-    try std.testing.expectEqual(@as(i32, -5), scaleCaptureCoordinate(-3, scale));
-}
-
-test "screencopy region follows full output fractional pixel boundaries" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = 2, .y = 0, .width = 1, .height = 3 },
-        scaledScreencopyRegion(
-            .{ .x = 1, .y = 0, .width = 1, .height = 2 },
-            .{ .numerator = 180 },
-            .{ .width = 6, .height = 6 },
-        ).?,
-    );
-    try std.testing.expectEqual(
-        render.Rect{ .x = 9, .y = 6, .width = 3, .height = 6 },
-        scaledScreencopyRegion(
-            .{ .x = 6, .y = 4, .width = 2, .height = 4 },
-            .{ .numerator = 180 },
-            .{ .width = 12, .height = 12 },
-        ).?,
-    );
-}
-
-test "capture cursor matching ignores cursors outside the selected region" {
-    const output_rect: render.Rect = .{ .x = 1000, .y = 500, .width = 800, .height = 600 };
-    const capture_rect = captureLogicalRect(output_rect, .{
-        .x = 100,
-        .y = 50,
-        .width = 200,
-        .height = 100,
-    });
-    try std.testing.expectEqual(
-        render.Rect{ .x = 1100, .y = 550, .width = 200, .height = 100 },
-        capture_rect,
-    );
-    try std.testing.expect(cursorMismatchAffectsCapture(
-        false,
-        true,
-        .{ .x = 1200, .y = 600, .width = 32, .height = 32 },
-        capture_rect,
-    ));
-    try std.testing.expect(!cursorMismatchAffectsCapture(
-        false,
-        true,
-        .{ .x = 1500, .y = 900, .width = 32, .height = 32 },
-        capture_rect,
-    ));
-    try std.testing.expect(!cursorMismatchAffectsCapture(
-        false,
-        false,
-        .{ .x = 1200, .y = 600, .width = 32, .height = 32 },
-        capture_rect,
-    ));
-    try std.testing.expect(cursorMismatchAffectsCapture(false, true, null, capture_rect));
 }
 
 test "output capture uses pixel dimensions at fractional scale" {
@@ -7840,7 +7739,7 @@ fn captureOutputTarget(
     const scale = render_output.backend.renderScale();
     const output_size = render_output.backend.modeSize();
     const source_region = if (local_region) |region|
-        scaledScreencopyRegion(region, scale, output_size) orelse
+        capture_geometry.scaledRegion(region, scale, output_size) orelse
             return error.InvalidTarget
     else
         null;
@@ -7871,7 +7770,7 @@ fn captureOutputTarget(
         }
     }
     const output_rect = output.logicalRect();
-    const visible_rect = captureLogicalRect(output_rect, local_region);
+    const visible_rect = capture_geometry.logicalRect(output_rect, local_region);
     try self.renderer.beginFrame(
         render_target,
         scale,
@@ -7910,11 +7809,11 @@ fn composedCaptureMatchesCursors(
     local_region: ?render.Rect,
     paint_cursors: bool,
 ) bool {
-    const capture_rect = captureLogicalRect(output_rect, local_region);
+    const capture_rect = capture_geometry.logicalRect(output_rect, local_region);
     const locked = self.session_lock.isLocked();
     if (source.primary_cursor_painted != paint_cursors) {
         if (self.seatCursorInfo(&self.seat, locked)) |cursor| {
-            if (cursorMismatchAffectsCapture(
+            if (capture_geometry.cursorMismatchAffects(
                 source.primary_cursor_painted,
                 paint_cursors,
                 self.cursorBounds(cursor),
@@ -7926,7 +7825,7 @@ fn composedCaptureMatchesCursors(
         var cursors = self.tablet.cursorIterator();
         while (cursors.next()) |info| {
             if (!self.tabletCursorVisible(info.focus_surface, locked)) continue;
-            if (cursorMismatchAffectsCapture(
+            if (capture_geometry.cursorMismatchAffects(
                 source.tablet_cursors_painted,
                 paint_cursors,
                 self.cursorBounds(info.cursor),
@@ -7935,27 +7834,6 @@ fn composedCaptureMatchesCursors(
         }
     }
     return true;
-}
-
-fn captureLogicalRect(output_rect: render.Rect, local_region: ?render.Rect) render.Rect {
-    const region = local_region orelse return output_rect;
-    return .{
-        .x = output_rect.x +| region.x,
-        .y = output_rect.y +| region.y,
-        .width = region.width,
-        .height = region.height,
-    };
-}
-
-fn cursorMismatchAffectsCapture(
-    source_painted: bool,
-    capture_paints: bool,
-    cursor_bounds: ?render.Rect,
-    capture_rect: render.Rect,
-) bool {
-    if (source_painted == capture_paints) return false;
-    const bounds = cursor_bounds orelse return true;
-    return bounds.intersection(capture_rect) != null;
 }
 
 const ToplevelCaptureError = renderer_types.Renderer.Error || error{Stopped};
@@ -8062,7 +7940,10 @@ fn addSurfaceTreeBounds(
                 .width = buffer.logical_size.width,
                 .height = buffer.logical_size.height,
             };
-            bounds.* = if (bounds.*) |current| try unionCaptureBounds(current, rect) else rect;
+            bounds.* = if (bounds.*) |current|
+                try capture_geometry.unionBounds(current, rect)
+            else
+                rect;
         },
         .child => |child| try self.addSurfaceTreeBounds(
             child.surface_id,
@@ -8071,39 +7952,6 @@ fn addSurfaceTreeBounds(
             bounds,
         ),
     };
-}
-
-fn unionCaptureBounds(a: render.Rect, b: render.Rect) error{Overflow}!render.Rect {
-    const left = @min(a.x, b.x);
-    const top = @min(a.y, b.y);
-    const right = @max(
-        @as(i64, a.x) + a.width,
-        @as(i64, b.x) + b.width,
-    );
-    const bottom = @max(
-        @as(i64, a.y) + a.height,
-        @as(i64, b.y) + b.height,
-    );
-    const width = right - left;
-    const height = bottom - top;
-    if (width <= 0 or height <= 0 or
-        width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) return error.Overflow;
-    return .{
-        .x = left,
-        .y = top,
-        .width = @intCast(width),
-        .height = @intCast(height),
-    };
-}
-
-test "capture bounds include negative child offsets" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = -20, .y = 5, .width = 120, .height = 70 },
-        try unionCaptureBounds(
-            .{ .x = 0, .y = 10, .width = 100, .height = 50 },
-            .{ .x = -20, .y = 5, .width = 30, .height = 70 },
-        ),
-    );
 }
 
 fn handleRenderTimer(output_context: *RenderOutput) c_int {
