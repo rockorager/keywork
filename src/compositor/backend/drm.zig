@@ -86,8 +86,7 @@ output_color_dirty: bool,
 rejected_output_color_mode: ?OutputColorMode,
 hdr_failed: bool,
 color_fallback_pending: bool,
-hdr_metadata_blob: u32,
-hdr_metadata_blob_mode: ?OutputColorMode,
+hdr_metadata_blobs: [2]u32,
 description_value: [description_capacity]u8,
 description_length: usize,
 logical_x: i32,
@@ -342,6 +341,14 @@ const OutputColorMode = enum {
             .hlg => .hlg,
         };
     }
+
+    fn hdrMetadataIndex(self: OutputColorMode) usize {
+        return switch (self) {
+            .sdr => unreachable,
+            .pq => 0,
+            .hlg => 1,
+        };
+    }
 };
 
 pub const DirectScanoutResult = union(enum) {
@@ -469,8 +476,7 @@ pub fn init(
         .rejected_output_color_mode = null,
         .hdr_failed = false,
         .color_fallback_pending = false,
-        .hdr_metadata_blob = 0,
-        .hdr_metadata_blob_mode = null,
+        .hdr_metadata_blobs = .{ 0, 0 },
         .description_value = undefined,
         .description_length = 0,
         .logical_x = 0,
@@ -499,7 +505,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
-    std.debug.assert(self.hdr_metadata_blob == 0);
+    for (self.hdr_metadata_blobs) |blob| std.debug.assert(blob == 0);
     std.debug.assert(self.shadow_pixels.len == 0);
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
     std.debug.assert(self.overlay_pending == null and self.overlay_displayed == null);
@@ -1399,7 +1405,7 @@ fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
         self.native_color_description = colorDescriptionFromInfo(info);
         self.refreshSdrColorDescription();
         self.hdr_capabilities = hdrCapabilitiesFromInfo(info);
-        self.destroyHdrMetadataBlob(fd);
+        self.destroyHdrMetadataBlobs(fd);
         self.color_description = if (self.output_color_mode.transfer()) |transfer|
             hdrDescription(self.native_color_description, self.hdr_capabilities, transfer) orelse
                 self.sdr_color_description
@@ -1613,7 +1619,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     _ = self.disableCursor(fd);
     for (&self.cursor_buffers) |*buffer| self.destroyBuffer(fd, buffer);
     const restore_color_state = self.output_color_mode != .sdr or self.output_color_dirty;
-    self.destroyHdrMetadataBlob(fd);
+    self.destroyHdrMetadataBlobs(fd);
     self.output_color_mode = .sdr;
     self.output_color_dirty = restore_color_state;
     self.rejected_output_color_mode = null;
@@ -3557,10 +3563,8 @@ fn outputMetadataBlob(
     output_description: render.ColorDescription,
 ) !u32 {
     if (mode == .sdr) return 0;
-    if (self.hdr_metadata_blob != 0 and self.hdr_metadata_blob_mode == mode) {
-        return self.hdr_metadata_blob;
-    }
-    self.destroyHdrMetadataBlob(fd);
+    const cached = &self.hdr_metadata_blobs[mode.hdrMetadataIndex()];
+    if (cached.* != 0) return cached.*;
     var metadata = hdrOutputMetadata(mode, output_description);
     var blob_id: u32 = 0;
     if (c.drmModeCreatePropertyBlob(fd, &metadata, @sizeOf(@TypeOf(metadata)), &blob_id) != 0 or
@@ -3568,16 +3572,15 @@ fn outputMetadataBlob(
     {
         return error.CreatePropertyBlobFailed;
     }
-    self.hdr_metadata_blob = blob_id;
-    self.hdr_metadata_blob_mode = mode;
+    cached.* = blob_id;
     return blob_id;
 }
 
-fn destroyHdrMetadataBlob(self: *Self, fd: std.posix.fd_t) void {
-    if (self.hdr_metadata_blob != 0) {
-        _ = c.drmModeDestroyPropertyBlob(fd, self.hdr_metadata_blob);
-        self.hdr_metadata_blob = 0;
-        self.hdr_metadata_blob_mode = null;
+fn destroyHdrMetadataBlobs(self: *Self, fd: std.posix.fd_t) void {
+    for (&self.hdr_metadata_blobs) |*blob| {
+        if (blob.* == 0) continue;
+        _ = c.drmModeDestroyPropertyBlob(fd, blob.*);
+        blob.* = 0;
     }
 }
 
