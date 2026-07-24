@@ -462,6 +462,7 @@ test {
     _ = @import("backend/display_color.zig");
     _ = @import("backend/drm_plane_assignment.zig");
     _ = @import("backend/drm_device.zig");
+    _ = @import("backend/KeymapCompiler.zig");
     _ = @import("backend/native_input.zig");
     _ = @import("backend/output.zig");
     _ = @import("backend/session.zig");

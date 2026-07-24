@@ -4,16 +4,15 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const KeymapCompiler = @import("KeymapCompiler.zig");
 const Session = @import("session.zig");
 const render = @import("../render/types.zig");
+const xkb = KeymapCompiler.xkb;
 
 const c = @cImport({
     @cInclude("libinput.h");
     @cInclude("libudev.h");
     @cInclude("linux/input-event-codes.h");
-    @cInclude("stdlib.h");
-    @cInclude("xkbcommon/xkbcommon.h");
-    @cInclude("xkbcommon/xkbcommon-names.h");
 });
 const wl = wayland.server.wl;
 
@@ -138,112 +137,8 @@ pub const ScrollMethods = packed struct(u32) {
 };
 pub const CalibrationMatrix = [6]f32;
 
-pub const KeymapFormat = enum(u32) {
-    text_v1 = 1,
-    text_v2 = 2,
-};
-
-pub const Keymap = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    native: *c.struct_xkb_keymap,
-    file: std.Io.File,
-    size: u32,
-    references: usize = 1,
-
-    pub fn ref(self: *Keymap) *Keymap {
-        self.references = std.math.add(usize, self.references, 1) catch unreachable;
-        return self;
-    }
-
-    pub fn unref(self: *Keymap) void {
-        std.debug.assert(self.references > 0);
-        self.references -= 1;
-        if (self.references != 0) return;
-        self.file.close(self.io);
-        c.xkb_keymap_unref(self.native);
-        self.allocator.destroy(self);
-    }
-};
-
-pub const KeymapCompiler = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    context: *c.struct_xkb_context,
-
-    pub fn init(self: *KeymapCompiler, allocator: std.mem.Allocator, io: std.Io) !void {
-        self.* = .{
-            .allocator = allocator,
-            .io = io,
-            .context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
-                return error.XkbContextFailed,
-        };
-    }
-
-    pub fn deinit(self: *KeymapCompiler) void {
-        c.xkb_context_unref(self.context);
-        self.* = undefined;
-    }
-
-    pub fn defaultKeymap(self: *KeymapCompiler) !*Keymap {
-        const native = c.xkb_keymap_new_from_names2(
-            self.context,
-            null,
-            c.XKB_KEYMAP_FORMAT_TEXT_V1,
-            c.XKB_KEYMAP_COMPILE_NO_FLAGS,
-        ) orelse return error.XkbKeymapFailed;
-        return self.wrap(native);
-    }
-
-    pub fn compile(self: *KeymapCompiler, format: KeymapFormat, text: []const u8) !?*Keymap {
-        if (text.len == 0) return null;
-        const native = c.xkb_keymap_new_from_buffer(
-            self.context,
-            text.ptr,
-            text.len,
-            @as(c.enum_xkb_keymap_format, @intFromEnum(format)),
-            c.XKB_KEYMAP_COMPILE_NO_FLAGS,
-        ) orelse return null;
-        return try self.wrap(native);
-    }
-
-    fn wrap(self: *KeymapCompiler, native: *c.struct_xkb_keymap) !*Keymap {
-        errdefer c.xkb_keymap_unref(native);
-        const text_pointer = c.xkb_keymap_get_as_string(
-            native,
-            c.XKB_KEYMAP_FORMAT_TEXT_V1,
-        ) orelse return error.SerializeKeymapFailed;
-        defer c.free(text_pointer);
-        const text = std.mem.span(text_pointer);
-        const size = std.math.add(usize, text.len, 1) catch return error.KeymapTooLarge;
-        if (size > std.math.maxInt(u32)) return error.KeymapTooLarge;
-
-        const fd = try std.posix.memfd_create(
-            "keywork-keymap",
-            std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-        );
-        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-        errdefer file.close(self.io);
-        try file.setLength(self.io, size);
-        try file.writeStreamingAll(self.io, text.ptr[0..size]);
-        const seals = std.os.linux.F.SEAL_SHRINK |
-            std.os.linux.F.SEAL_GROW |
-            std.os.linux.F.SEAL_WRITE |
-            std.os.linux.F.SEAL_SEAL;
-        if (std.c.fcntl(fd, std.os.linux.F.ADD_SEALS, @as(c_int, seals)) < 0) {
-            return error.SealKeymapFailed;
-        }
-        const keymap = try self.allocator.create(Keymap);
-        keymap.* = .{
-            .allocator = self.allocator,
-            .io = self.io,
-            .native = native,
-            .file = file,
-            .size = @intCast(size),
-        };
-        return keymap;
-    }
-};
+pub const KeymapFormat = KeymapCompiler.Format;
+pub const Keymap = KeymapCompiler.Keymap;
 
 pub const KeyboardState = struct {
     keymap: *const Keymap,
@@ -448,7 +343,7 @@ const TabletTool = struct {
 
 const Keyboard = struct {
     keymap: *Keymap,
-    state: *c.struct_xkb_state,
+    state: *xkb.struct_xkb_state,
 };
 
 pub const DeviceMap = struct {
@@ -688,10 +583,10 @@ pub fn deviceModifiers(self: *Self, id: DeviceId) ?Modifiers {
     const device = self.findInputDeviceById(id) orelse return null;
     const keyboard = if (device.keyboard) |*value| value else return null;
     return .{
-        .depressed = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
-        .latched = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
-        .locked = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LOCKED),
-        .group = c.xkb_state_serialize_layout(keyboard.state, c.XKB_STATE_LAYOUT_EFFECTIVE),
+        .depressed = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_DEPRESSED),
+        .latched = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_LATCHED),
+        .locked = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_LOCKED),
+        .group = xkb.xkb_state_serialize_layout(keyboard.state, xkb.XKB_STATE_LAYOUT_EFFECTIVE),
     };
 }
 
@@ -704,13 +599,13 @@ pub fn deviceEffectiveModifiers(self: *Self, id: DeviceId) ?u32 {
 pub fn setKeyboardKeymap(self: *Self, id: DeviceId, keymap: *Keymap) !bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
-    const state = c.xkb_state_new(keymap.native) orelse return error.XkbStateFailed;
-    errdefer c.xkb_state_unref(state);
+    const state = xkb.xkb_state_new(keymap.native) orelse return error.XkbStateFailed;
+    errdefer xkb.xkb_state_unref(state);
     if (self.active_keyboard == id) try self.installKeymap(id, keymap);
     const old_keymap = keyboard.keymap;
     const old_state = keyboard.state;
     keyboard.* = .{ .keymap = keymap.ref(), .state = state };
-    c.xkb_state_unref(old_state);
+    xkb.xkb_state_unref(old_state);
     old_keymap.unref();
     if (self.active_keyboard == id) self.sendKeyboardModifiers(keyboard, true);
     self.notifyKeyboardState(device);
@@ -720,8 +615,8 @@ pub fn setKeyboardKeymap(self: *Self, id: DeviceId, keymap: *Keymap) !bool {
 pub fn setKeyboardLayoutIndex(self: *Self, id: DeviceId, index: i32) bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
-    if (index < 0 or index >= c.xkb_keymap_num_layouts(keyboard.keymap.native)) return true;
-    _ = c.xkb_state_update_latched_locked(
+    if (index < 0 or index >= xkb.xkb_keymap_num_layouts(keyboard.keymap.native)) return true;
+    _ = xkb.xkb_state_update_latched_locked(
         keyboard.state,
         0,
         0,
@@ -739,17 +634,17 @@ pub fn setKeyboardLayoutIndex(self: *Self, id: DeviceId, index: i32) bool {
 pub fn setKeyboardLayoutName(self: *Self, id: DeviceId, name: [*:0]const u8) bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
-    const index = c.xkb_keymap_layout_get_index(keyboard.keymap.native, name);
-    if (index == c.XKB_LAYOUT_INVALID) return true;
+    const index = xkb.xkb_keymap_layout_get_index(keyboard.keymap.native, name);
+    if (index == xkb.XKB_LAYOUT_INVALID) return true;
     return self.setKeyboardLayoutIndex(id, @intCast(index));
 }
 
 pub fn setKeyboardCapslock(self: *Self, id: DeviceId, enabled: bool) bool {
-    return self.setKeyboardLock(id, c.XKB_MOD_NAME_CAPS, enabled);
+    return self.setKeyboardLock(id, xkb.XKB_MOD_NAME_CAPS, enabled);
 }
 
 pub fn setKeyboardNumlock(self: *Self, id: DeviceId, enabled: bool) bool {
-    return self.setKeyboardLock(id, c.XKB_MOD_NAME_NUM, enabled);
+    return self.setKeyboardLock(id, xkb.XKB_MOD_NAME_NUM, enabled);
 }
 
 pub fn keyboardMatchesKeysym(
@@ -761,9 +656,9 @@ pub fn keyboardMatchesKeysym(
 ) bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
-    if (layout >= c.xkb_keymap_num_layouts(keyboard.keymap.native)) return false;
-    var base_symbols: [*c]const c.xkb_keysym_t = null;
-    const base_count = c.xkb_keymap_key_get_syms_by_level(
+    if (layout >= xkb.xkb_keymap_num_layouts(keyboard.keymap.native)) return false;
+    var base_symbols: [*c]const xkb.xkb_keysym_t = null;
+    const base_count = xkb.xkb_keymap_key_get_syms_by_level(
         keyboard.keymap.native,
         key_code + 8,
         layout,
@@ -1187,10 +1082,10 @@ fn addInputDevice(
         errdefer keymap.unref();
         keyboard = .{
             .keymap = keymap,
-            .state = c.xkb_state_new(keymap.native) orelse return error.XkbStateFailed,
+            .state = xkb.xkb_state_new(keymap.native) orelse return error.XkbStateFailed,
         };
     }
-    errdefer if (keyboard) |value| c.xkb_state_unref(value.state);
+    errdefer if (keyboard) |value| xkb.xkb_state_unref(value.state);
     var tablet_info: ?TabletInfo = null;
     if (device_type == .tablet) {
         var path: ?[:0]u8 = null;
@@ -1393,7 +1288,7 @@ fn removeAllInputDevices(self: *Self) void {
 fn deinitInputDevice(self: *Self, device: *InputDevice) void {
     self.removeTabletTools(device.info.id);
     if (device.keyboard) |*keyboard| {
-        c.xkb_state_unref(keyboard.state);
+        xkb.xkb_state_unref(keyboard.state);
         keyboard.keymap.unref();
     }
     if (device.tablet_info) |info| if (info.path) |path| self.allocator.free(path);
@@ -1437,10 +1332,10 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
         .forwarded;
     const binding_captured = binding_disposition == .captured;
     const old_state = stateSnapshot(keyboard);
-    _ = c.xkb_state_update_key(
+    _ = xkb.xkb_state_update_key(
         keyboard.state,
         key + 8,
-        if (pressed) c.XKB_KEY_DOWN else c.XKB_KEY_UP,
+        if (pressed) xkb.XKB_KEY_DOWN else xkb.XKB_KEY_UP,
     );
     const new_state = stateSnapshot(keyboard);
     if (!keyboardStatesEqual(old_state, new_state)) self.notifyKeyboardState(device);
@@ -1510,10 +1405,10 @@ fn updateActiveRepeatInfo(self: *Self, device: *const InputDevice) void {
 
 fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) void {
     const modifiers: Modifiers = .{
-        .depressed = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
-        .latched = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
-        .locked = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LOCKED),
-        .group = c.xkb_state_serialize_layout(keyboard.state, c.XKB_STATE_LAYOUT_EFFECTIVE),
+        .depressed = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_DEPRESSED),
+        .latched = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_LATCHED),
+        .locked = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_LOCKED),
+        .group = xkb.xkb_state_serialize_layout(keyboard.state, xkb.XKB_STATE_LAYOUT_EFFECTIVE),
     };
     if (!force and std.meta.eql(self.modifiers, modifiers)) return;
     const old_effective = effectiveModifiers(self.modifiers);
@@ -1540,12 +1435,12 @@ fn keyboardEvent(
     seat_level: bool,
 ) KeyboardEvent {
     const xkb_key_code = key_code + 8;
-    var symbols: [*c]const c.xkb_keysym_t = null;
-    const layout = c.xkb_state_key_get_layout(keyboard.state, xkb_key_code);
-    const count = if (layout == c.XKB_LAYOUT_INVALID)
+    var symbols: [*c]const xkb.xkb_keysym_t = null;
+    const layout = xkb.xkb_state_key_get_layout(keyboard.state, xkb_key_code);
+    const count = if (layout == xkb.XKB_LAYOUT_INVALID)
         0
     else
-        c.xkb_keymap_key_get_syms_by_level(keyboard.keymap.native, xkb_key_code, layout, 0, &symbols);
+        xkb.xkb_keymap_key_get_syms_by_level(keyboard.keymap.native, xkb_key_code, layout, 0, &symbols);
     const keysyms: []const u32 = if (count > 0 and symbols != null)
         symbols[0..@intCast(count)]
     else
@@ -1563,8 +1458,8 @@ fn keyboardEvent(
 
 fn effectiveKeyboardModifiers(keyboard: *const Keyboard) u32 {
     return effectiveModifiers(.{
-        .depressed = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
-        .latched = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
+        .depressed = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_DEPRESSED),
+        .latched = xkb.xkb_state_serialize_mods(keyboard.state, xkb.XKB_STATE_MODS_LATCHED),
     });
 }
 
@@ -1574,24 +1469,24 @@ fn effectiveModifiers(modifiers: Modifiers) u32 {
 
 fn isModifierKeysyms(keysyms: []const u32) bool {
     for (keysyms) |keysym| switch (keysym) {
-        c.XKB_KEY_Shift_L,
-        c.XKB_KEY_Shift_R,
-        c.XKB_KEY_Control_L,
-        c.XKB_KEY_Control_R,
-        c.XKB_KEY_Caps_Lock,
-        c.XKB_KEY_Shift_Lock,
-        c.XKB_KEY_Meta_L,
-        c.XKB_KEY_Meta_R,
-        c.XKB_KEY_Alt_L,
-        c.XKB_KEY_Alt_R,
-        c.XKB_KEY_Super_L,
-        c.XKB_KEY_Super_R,
-        c.XKB_KEY_Hyper_L,
-        c.XKB_KEY_Hyper_R,
-        c.XKB_KEY_Mode_switch,
-        c.XKB_KEY_Num_Lock,
-        c.XKB_KEY_ISO_Level3_Shift,
-        c.XKB_KEY_ISO_Level5_Shift,
+        xkb.XKB_KEY_Shift_L,
+        xkb.XKB_KEY_Shift_R,
+        xkb.XKB_KEY_Control_L,
+        xkb.XKB_KEY_Control_R,
+        xkb.XKB_KEY_Caps_Lock,
+        xkb.XKB_KEY_Shift_Lock,
+        xkb.XKB_KEY_Meta_L,
+        xkb.XKB_KEY_Meta_R,
+        xkb.XKB_KEY_Alt_L,
+        xkb.XKB_KEY_Alt_R,
+        xkb.XKB_KEY_Super_L,
+        xkb.XKB_KEY_Super_R,
+        xkb.XKB_KEY_Hyper_L,
+        xkb.XKB_KEY_Hyper_R,
+        xkb.XKB_KEY_Mode_switch,
+        xkb.XKB_KEY_Num_Lock,
+        xkb.XKB_KEY_ISO_Level3_Shift,
+        xkb.XKB_KEY_ISO_Level5_Shift,
         => return true,
         else => {},
     };
@@ -1631,10 +1526,10 @@ fn notifyKeyboardState(self: *Self, device: *const InputDevice) void {
 fn setKeyboardLock(self: *Self, id: DeviceId, name: [*:0]const u8, enabled: bool) bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
-    const index = c.xkb_keymap_mod_get_index(keyboard.keymap.native, name);
-    if (index == c.XKB_MOD_INVALID or index >= @bitSizeOf(c.xkb_mod_mask_t)) return true;
-    const mask = @as(c.xkb_mod_mask_t, 1) << @intCast(index);
-    _ = c.xkb_state_update_latched_locked(
+    const index = xkb.xkb_keymap_mod_get_index(keyboard.keymap.native, name);
+    if (index == xkb.XKB_MOD_INVALID or index >= @bitSizeOf(xkb.xkb_mod_mask_t)) return true;
+    const mask = @as(xkb.xkb_mod_mask_t, 1) << @intCast(index);
+    _ = xkb.xkb_state_update_latched_locked(
         keyboard.state,
         0,
         0,
@@ -1650,23 +1545,23 @@ fn setKeyboardLock(self: *Self, id: DeviceId, name: [*:0]const u8, enabled: bool
 }
 
 fn stateSnapshot(keyboard: *const Keyboard) KeyboardState {
-    const layout_index: u32 = c.xkb_state_serialize_layout(
+    const layout_index: u32 = xkb.xkb_state_serialize_layout(
         keyboard.state,
-        c.XKB_STATE_LAYOUT_EFFECTIVE,
+        xkb.XKB_STATE_LAYOUT_EFFECTIVE,
     );
     return .{
         .keymap = keyboard.keymap,
         .layout_index = layout_index,
-        .layout_name = c.xkb_keymap_layout_get_name(keyboard.keymap.native, layout_index),
-        .capslock_enabled = c.xkb_state_mod_name_is_active(
+        .layout_name = xkb.xkb_keymap_layout_get_name(keyboard.keymap.native, layout_index),
+        .capslock_enabled = xkb.xkb_state_mod_name_is_active(
             keyboard.state,
-            c.XKB_MOD_NAME_CAPS,
-            c.XKB_STATE_MODS_LOCKED,
+            xkb.XKB_MOD_NAME_CAPS,
+            xkb.XKB_STATE_MODS_LOCKED,
         ) > 0,
-        .numlock_enabled = c.xkb_state_mod_name_is_active(
+        .numlock_enabled = xkb.xkb_state_mod_name_is_active(
             keyboard.state,
-            c.XKB_MOD_NAME_NUM,
-            c.XKB_STATE_MODS_LOCKED,
+            xkb.XKB_MOD_NAME_NUM,
+            xkb.XKB_STATE_MODS_LOCKED,
         ) > 0,
     };
 }
@@ -2386,22 +2281,6 @@ test "function keys map to virtual terminals" {
     try std.testing.expectEqual(@as(?u32, null), virtualTerminalForKey(c.KEY_ENTER));
 }
 
-test "keymap compiler works without native input" {
-    var compiler: KeymapCompiler = undefined;
-    try compiler.init(std.testing.allocator, std.testing.io);
-    defer compiler.deinit();
-
-    const default = try compiler.defaultKeymap();
-    defer default.unref();
-    const text_pointer = c.xkb_keymap_get_as_string(
-        default.native,
-        c.XKB_KEYMAP_FORMAT_TEXT_V1,
-    ) orelse return error.SerializeKeymapFailed;
-    defer c.free(text_pointer);
-    const compiled = (try compiler.compile(.text_v1, std.mem.span(text_pointer))).?;
-    compiled.unref();
-}
-
 test "native pointer coordinates stay inside the output" {
     try std.testing.expectEqual(@as(f64, 0), clampCoordinate(-5, 100));
     try std.testing.expectEqual(@as(f64, 99), clampCoordinate(120, 100));
@@ -2445,7 +2324,7 @@ test "configuration value validation" {
 }
 
 test "modifier keysyms are classified for chord handling" {
-    try std.testing.expect(isModifierKeysyms(&.{c.XKB_KEY_Shift_L}));
-    try std.testing.expect(isModifierKeysyms(&.{c.XKB_KEY_ISO_Level3_Shift}));
-    try std.testing.expect(!isModifierKeysyms(&.{c.XKB_KEY_a}));
+    try std.testing.expect(isModifierKeysyms(&.{xkb.XKB_KEY_Shift_L}));
+    try std.testing.expect(isModifierKeysyms(&.{xkb.XKB_KEY_ISO_Level3_Shift}));
+    try std.testing.expect(!isModifierKeysyms(&.{xkb.XKB_KEY_a}));
 }
