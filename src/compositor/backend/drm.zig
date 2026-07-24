@@ -1526,7 +1526,9 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.pending = null;
     self.displayed = null;
     if (!self.retired) self.pending_page_flip = null;
-    self.releaseClientScanouts();
+    // A retired output remains callback-owned until its queued flip completes.
+    // Keep buffers submitted by that flip retained even after the connector is gone.
+    self.releaseClientScanoutsForTeardown();
     self.destroyScanoutFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
@@ -1756,6 +1758,7 @@ fn handlePageFlip(
     const self: *Self = @ptrCast(@alignCast(data.?));
     if (self.retired) {
         std.debug.assert(self.pending_page_flip != null);
+        self.releasePendingClientScanouts();
         self.pending_page_flip = null;
         return;
     }
@@ -3592,16 +3595,30 @@ fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
 }
 
 fn releaseClientScanouts(self: *Self) void {
-    if (self.direct_pending) |scanout| scanout.release();
+    self.releasePendingClientScanouts();
     if (self.direct_displayed) |scanout| scanout.release();
-    if (self.overlay_pending) |scanout| scanout.release();
     if (self.overlay_displayed) |scanout| scanout.release();
-    self.direct_pending = null;
     self.direct_displayed = null;
-    self.overlay_pending = null;
     self.overlay_displayed = null;
     self.discardValidatedOverlay();
     self.setDirectScanoutActive(false);
+}
+
+fn releaseClientScanoutsForTeardown(self: *Self) void {
+    if (!self.retired or self.pending_page_flip == null) return self.releaseClientScanouts();
+    if (self.direct_displayed) |scanout| scanout.release();
+    if (self.overlay_displayed) |scanout| scanout.release();
+    self.direct_displayed = null;
+    self.overlay_displayed = null;
+    self.discardValidatedOverlay();
+    self.setDirectScanoutActive(false);
+}
+
+fn releasePendingClientScanouts(self: *Self) void {
+    if (self.direct_pending) |scanout| scanout.release();
+    if (self.overlay_pending) |scanout| scanout.release();
+    self.direct_pending = null;
+    self.overlay_pending = null;
 }
 
 fn discardValidatedOverlay(self: *Self) void {
@@ -4231,8 +4248,49 @@ test "asynchronous page flips retain completion events" {
     );
 }
 
-test "retired DRM outputs wait for queued page flip callbacks" {
+test "retired DRM outputs retain pending scanouts through page flip callbacks" {
+    const Source = struct {
+        releases: usize = 0,
+
+        fn retain(_: *anyopaque) void {}
+
+        fn release(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.releases += 1;
+        }
+
+        fn begin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn end(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
+            return null;
+        }
+
+        fn dmabuf(self: *@This()) render.DmabufSource {
+            return .{
+                .context = self,
+                .format = 0,
+                .modifier = 0,
+                .planes = @splat(.{}),
+                .plane_count = 1,
+                .y_inverted = false,
+                .force_opaque = false,
+                .retain = @This().retain,
+                .release = @This().release,
+                .begin_cpu_read = @This().begin,
+                .end_cpu_read = @This().end,
+                .export_read_fence = @This().exportFence,
+            };
+        }
+    };
+
     var context: u8 = 0;
+    var source: Source = .{};
     var output: Self = undefined;
     output.init(std.testing.allocator, std.testing.io, .{
         .context = &context,
@@ -4244,12 +4302,23 @@ test "retired DRM outputs wait for queued page flip callbacks" {
     defer output.deinit();
     output.pending = 0;
     output.pending_page_flip = .vsync;
+    output.direct_pending = .{ .source = source.dmabuf(), .framebuffer_key = .{ .cache_id = 1, .format = 1 } };
+    output.overlay_pending = .{ .source = source.dmabuf(), .framebuffer_key = .{ .cache_id = 2, .format = 2 } };
+    output.direct_displayed = .{ .source = source.dmabuf(), .framebuffer_key = .{ .cache_id = 3, .format = 3 } };
+    output.overlay_displayed = .{ .source = source.dmabuf(), .framebuffer_key = .{ .cache_id = 4, .format = 4 } };
 
     output.retire();
+    output.releaseClientScanoutsForTeardown();
     try std.testing.expect(!output.retirementComplete());
+    try std.testing.expectEqual(@as(usize, 2), source.releases);
+    try std.testing.expect(output.direct_pending != null);
+    try std.testing.expect(output.overlay_pending != null);
 
     handlePageFlip(0, 0, 0, 0, &output);
     try std.testing.expect(output.retirementComplete());
+    try std.testing.expectEqual(@as(usize, 4), source.releases);
+    try std.testing.expect(output.direct_pending == null);
+    try std.testing.expect(output.overlay_pending == null);
 }
 
 test "CRTC selection preserves preferred and never selects claimed" {

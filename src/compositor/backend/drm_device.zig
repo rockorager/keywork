@@ -366,6 +366,9 @@ fn deactivate(self: *Self) void {
     }
     const device = self.device orelse return;
     for (self.active_outputs.items) |output| output.deactivate(device.fd);
+    // No callback can arrive after the event source is removed. Release any
+    // scanout retained for a retired output before destroying its state.
+    for (self.retired_outputs.items) |output| output.releaseClientBuffers();
     if (self.gbm_device) |*gbm_device| gbm_device.deinit();
     self.gbm_device = null;
     self.session.closeDevice(device) catch |err| log.err("failed to close DRM device: {t}", .{err});
