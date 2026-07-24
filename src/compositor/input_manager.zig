@@ -23,6 +23,8 @@ pub const Device = struct {
     seat_name: [:0]const u8 = default_seat_name,
 };
 
+/// Callbacks borrow the device for their duration. Added devices are already
+/// discoverable; removed devices are no longer discoverable but remain readable.
 pub const DeviceListener = struct {
     context: *anyopaque,
     added: *const fn (*anyopaque, *Device) void,
@@ -128,10 +130,12 @@ fn deviceRemoved(context: *anyopaque, id: NativeInput.DeviceId) void {
 }
 
 fn removeDevice(self: *Self, device: *Device) void {
-    for (self.device_listeners.items) |listener| listener.removed(listener.context, device);
     for (self.devices.items, 0..) |tracked, index| {
         if (tracked != device) continue;
         _ = self.devices.orderedRemove(index);
+        for (self.device_listeners.items) |listener| {
+            listener.removed(listener.context, device);
+        }
         self.allocator.free(device.name);
         self.allocator.destroy(device);
         return;
@@ -142,3 +146,68 @@ fn removeDevice(self: *Self, device: *Device) void {
 fn outOfMemory() void {
     log.err("failed to track native input device: out of memory", .{});
 }
+
+test "removed devices leave the registry before listeners run" {
+    var manager: Self = undefined;
+    try manager.init(std.testing.allocator, null);
+    var observer: RemovalObserver = .{ .manager = &manager };
+    observer.listener.context = &observer;
+    var listener_registered = false;
+    defer {
+        if (listener_registered) manager.removeDeviceListener(&observer.listener);
+        while (manager.devices.items.len > 0) manager.removeDevice(manager.devices.items[0]);
+        manager.deinit();
+    }
+
+    deviceAdded(&manager, .{
+        .id = 1,
+        .physical_id = 10,
+        .device_type = .keyboard,
+        .name = "first",
+        .vendor = 1,
+        .product = 2,
+    });
+    deviceAdded(&manager, .{
+        .id = 2,
+        .physical_id = 20,
+        .device_type = .keyboard,
+        .name = "second",
+        .vendor = 3,
+        .product = 4,
+    });
+
+    try manager.addDeviceListener(&observer.listener);
+    listener_registered = true;
+    deviceRemoved(&manager, 1);
+
+    try std.testing.expect(observer.called);
+    try std.testing.expect(!observer.removed_was_discoverable);
+    try std.testing.expect(observer.removed_was_readable);
+    try std.testing.expectEqual(@as(usize, 1), observer.registry_count);
+    try std.testing.expect(manager.findDevice(1) == null);
+    try std.testing.expect(manager.findDevice(2) != null);
+}
+
+const RemovalObserver = struct {
+    manager: *Self,
+    listener: DeviceListener = .{
+        .context = undefined,
+        .added = observerAdded,
+        .removed = observerRemoved,
+    },
+    called: bool = false,
+    removed_was_discoverable: bool = false,
+    removed_was_readable: bool = false,
+    registry_count: usize = 0,
+
+    fn observerAdded(_: *anyopaque, _: *Device) void {}
+
+    fn observerRemoved(context: *anyopaque, device: *Device) void {
+        const self: *RemovalObserver = @ptrCast(@alignCast(context));
+        self.called = true;
+        self.removed_was_discoverable = self.manager.findDevice(device.id) != null;
+        self.removed_was_readable = std.mem.eql(u8, device.name, "first");
+        var devices = self.manager.deviceIterator();
+        while (devices.next()) |_| self.registry_count += 1;
+    }
+};
