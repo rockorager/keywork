@@ -157,8 +157,8 @@ const Role = struct {
             .surface_destroyed = surfaceDestroyed,
         }) catch return error.Role;
         errdefer surface.releaseRole(self);
-        surface.assignReservedRole(.xwayland, self) catch unreachable;
         manager.roles.append(manager.allocator, self) catch return error.OutOfMemory;
+        surface.assignReservedRole(.xwayland, self) catch unreachable;
         resource.setHandler(*Role, handleRequest, handleResourceDestroy, self);
     }
 

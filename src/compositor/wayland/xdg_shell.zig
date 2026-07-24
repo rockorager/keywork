@@ -2119,7 +2119,7 @@ const PopupResource = struct {
             );
             return error.ResourceCreateFailed;
         }
-        surface.assignReservedRole(.xdg_popup, xdg_surface) catch {
+        if (surface.assignedRole()) |role| if (role != .xdg_popup) {
             xdg_surface.resource.postError(.already_constructed, "wl_surface already has a role");
             return error.ResourceCreateFailed;
         };
@@ -2139,7 +2139,6 @@ const PopupResource = struct {
         } else null;
         errdefer if (scene_id) |scene_popup_id| xdg_surface.shell.scene.removePopup(scene_popup_id);
         const order = xdg_surface.shell.next_popup_order;
-        xdg_surface.shell.next_popup_order +%= 1;
         const popup_id = xdg_surface.shell.popups.insert(xdg_surface.allocator, .{
             .xdg_surface_id = xdg_surface.id,
             .parent = if (parent_adapter) |adapter| .{ .xdg_surface = adapter.id } else .unattached,
@@ -2148,6 +2147,7 @@ const PopupResource = struct {
             .rules = rules,
             .order = order,
         }) catch return error.OutOfMemory;
+        xdg_surface.shell.next_popup_order +%= 1;
 
         self.* = .{
             .allocator = xdg_surface.allocator,
@@ -2156,6 +2156,7 @@ const PopupResource = struct {
             .xdg_surface_id = xdg_surface.id,
             .xdg_surface_resource = xdg_surface,
         };
+        surface.assignReservedRole(.xdg_popup, xdg_surface) catch unreachable;
         const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
         state.role = .{ .popup = popup_id };
         resource.setHandler(*PopupResource, handleRequest, handleDestroy, self);
@@ -2424,7 +2425,7 @@ const ToplevelResource = struct {
         id: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
         const surface = xdg_surface.surface orelse return error.ResourceCreateFailed;
-        surface.assignReservedRole(.xdg_toplevel, xdg_surface) catch {
+        if (surface.assignedRole()) |role| if (role != .xdg_toplevel) {
             xdg_surface.resource.postError(.already_constructed, "wl_surface already has a role");
             return;
         };
@@ -2457,6 +2458,7 @@ const ToplevelResource = struct {
             .xdg_surface_resource = xdg_surface,
             .decoration = null,
         };
+        surface.assignReservedRole(.xdg_toplevel, xdg_surface) catch unreachable;
         const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
         state.role = .{ .toplevel = window_id };
         state.toplevel_resource = resource;
