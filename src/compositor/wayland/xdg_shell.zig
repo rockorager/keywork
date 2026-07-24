@@ -12,6 +12,7 @@ const Surface = @import("surface.zig");
 const Subcompositor = @import("subcompositor.zig");
 const OutputLayout = @import("output_layout.zig");
 const GtkShell = @import("gtk_shell.zig");
+const XdgPositioner = @import("XdgPositioner.zig");
 const popup_placement = @import("xdg_popup_placement.zig");
 
 const wl = wayland.server.wl;
@@ -1463,7 +1464,7 @@ const WmBaseResource = struct {
                 }
                 resource.destroy();
             },
-            .create_positioner => |positioner| Positioner.create(
+            .create_positioner => |positioner| XdgPositioner.create(
                 self.allocator,
                 resource.getClient(),
                 resource.getVersion(),
@@ -1483,129 +1484,6 @@ const WmBaseResource = struct {
     fn handleDestroy(_: *xdg.WmBase, self: *WmBaseResource) void {
         _ = self.shell.bindings.remove(self.id);
         self.allocator.destroy(self);
-    }
-};
-
-const Positioner = struct {
-    allocator: std.mem.Allocator,
-    rules: PositionerRules,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        client: *wl.Client,
-        version: u32,
-        id: u32,
-    ) error{ OutOfMemory, ResourceCreateFailed }!void {
-        const resource = try xdg.Positioner.create(client, version, id);
-        errdefer resource.destroy();
-
-        const self = allocator.create(Positioner) catch return error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .rules = .{} };
-        resource.setHandler(*Positioner, handleRequest, handleDestroy, self);
-    }
-
-    fn handleRequest(
-        resource: *xdg.Positioner,
-        request: xdg.Positioner.Request,
-        self: *Positioner,
-    ) void {
-        switch (request) {
-            .destroy => resource.destroy(),
-            .set_size => |set| {
-                if (set.width <= 0 or set.height <= 0) {
-                    resource.postError(.invalid_input, "positioner size must be positive");
-                    return;
-                }
-                self.rules.size = .{ .width = set.width, .height = set.height };
-            },
-            .set_anchor_rect => |set| {
-                if (set.width < 0 or set.height < 0) {
-                    resource.postError(.invalid_input, "anchor rectangle size must not be negative");
-                    return;
-                }
-                self.rules.anchor_rect = .{
-                    .x = set.x,
-                    .y = set.y,
-                    .width = set.width,
-                    .height = set.height,
-                };
-            },
-            .set_anchor => |set| {
-                if (!validAnchor(set.anchor)) {
-                    resource.postError(.invalid_input, "invalid positioner anchor");
-                    return;
-                }
-                self.rules.anchor = set.anchor;
-            },
-            .set_gravity => |set| {
-                if (!validGravity(set.gravity)) {
-                    resource.postError(.invalid_input, "invalid positioner gravity");
-                    return;
-                }
-                self.rules.gravity = set.gravity;
-            },
-            .set_constraint_adjustment => |set| {
-                const adjustment: u32 = @bitCast(set.constraint_adjustment);
-                if (adjustment & ~@as(u32, 0x3f) != 0) {
-                    resource.postError(.invalid_input, "invalid constraint adjustment");
-                    return;
-                }
-                self.rules.adjustment = set.constraint_adjustment;
-            },
-            .set_offset => |set| self.rules.offset = .{ .x = set.x, .y = set.y },
-            .set_reactive => self.rules.reactive = true,
-            .set_parent_configure => |set| self.rules.parent_configure = set.serial,
-            .set_parent_size => |set| {
-                if (set.parent_width <= 0 or set.parent_height <= 0) {
-                    resource.postError(.invalid_input, "parent size must be positive");
-                    return;
-                }
-                self.rules.parent_size = .{
-                    .width = set.parent_width,
-                    .height = set.parent_height,
-                };
-            },
-        }
-    }
-
-    fn fromResource(resource: *xdg.Positioner) *Positioner {
-        return @ptrCast(@alignCast(resource.getUserData().?));
-    }
-
-    fn handleDestroy(_: *xdg.Positioner, self: *Positioner) void {
-        self.allocator.destroy(self);
-    }
-
-    fn validAnchor(anchor: xdg.Positioner.Anchor) bool {
-        return switch (anchor) {
-            .none,
-            .top,
-            .bottom,
-            .left,
-            .right,
-            .top_left,
-            .bottom_left,
-            .top_right,
-            .bottom_right,
-            => true,
-            else => false,
-        };
-    }
-
-    fn validGravity(gravity: xdg.Positioner.Gravity) bool {
-        return switch (gravity) {
-            .none,
-            .top,
-            .bottom,
-            .left,
-            .right,
-            .top_left,
-            .bottom_left,
-            .top_right,
-            .bottom_right,
-            => true,
-            else => false,
-        };
     }
 };
 
@@ -2126,7 +2004,7 @@ const PopupResource = struct {
                 break :popup .{ .popup = parent_scene_id };
             },
         } else null;
-        const rules = Positioner.fromResource(positioner_resource).rules;
+        const rules = XdgPositioner.fromResource(positioner_resource).rules;
         if (!rules.complete()) {
             xdg_surface.wm_base_resource.postError(
                 .invalid_positioner,
@@ -2257,7 +2135,7 @@ const PopupResource = struct {
             },
             .reposition => |reposition| {
                 if (popup.dismissed) return;
-                const rules = Positioner.fromResource(reposition.positioner).rules;
+                const rules = XdgPositioner.fromResource(reposition.positioner).rules;
                 if (!rules.complete()) {
                     self.xdg_surface_resource.wm_base_resource.postError(
                         .invalid_positioner,
