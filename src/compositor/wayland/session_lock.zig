@@ -186,17 +186,14 @@ pub fn refreshSecurity(self: *Self) void {
 fn finishLockIfSecure(self: *Self) void {
     const lock = self.active_lock orelse return;
     if (!self.session_locked or lock.outcome != .pending) return;
-    var output_count: usize = 0;
     var outputs = self.outputs.iterator();
     while (outputs.next()) |entry| {
-        output_count += 1;
         if (!self.secured_outputs.contains(entry.id) and
             !self.listener.output_secure_without_frame(self.listener.context, entry.id))
         {
             return;
         }
     }
-    if (output_count == 0) return;
     lock.outcome = .locked;
     lock.resource.?.sendLocked();
 }
