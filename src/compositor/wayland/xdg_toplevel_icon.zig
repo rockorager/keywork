@@ -97,8 +97,7 @@ fn setIcon(
             client.postImplementationError("invalid xdg_toplevel_icon_v1 resource");
             return;
         }
-        icon.immutable = true;
-        snapshot = icon.snapshot() catch |err| switch (err) {
+        snapshot = icon.snapshotForAssignment() catch |err| switch (err) {
             error.OutOfMemory => {
                 manager_resource.postNoMemory();
                 return;
@@ -207,6 +206,12 @@ const Icon = struct {
     }
 
     const SnapshotError = error{ OutOfMemory, InvalidBuffer };
+
+    fn snapshotForAssignment(self: *Icon) SnapshotError!?XdgShell.ToplevelIcon {
+        const result = try self.snapshot();
+        self.immutable = true;
+        return result;
+    }
 
     fn snapshot(self: *Icon) SnapshotError!?XdgShell.ToplevelIcon {
         if (self.name == null and self.buffers.items.len == 0) return null;
@@ -324,4 +329,28 @@ test "icon buffer variants are keyed by size and scale" {
     try std.testing.expect(sameVariant(64, 2, 64, 2));
     try std.testing.expect(!sameVariant(64, 2, 32, 2));
     try std.testing.expect(!sameVariant(64, 2, 64, 1));
+}
+
+test "icon becomes immutable only after its assignment snapshot succeeds" {
+    const name = try std.testing.allocator.dupeSentinel(u8, "terminal", 0);
+    defer std.testing.allocator.free(name);
+    var manager: Self = undefined;
+    var icon: Icon = .{
+        .manager = &manager,
+        .resource = undefined,
+        .name = name,
+    };
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    manager.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, icon.snapshotForAssignment());
+    try std.testing.expect(!icon.immutable);
+
+    manager.allocator = std.testing.allocator;
+    var snapshot = (try icon.snapshotForAssignment()).?;
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expect(icon.immutable);
 }
