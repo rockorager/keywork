@@ -67,7 +67,10 @@ pub const Info = struct {
     pub fn refreshMillihertz(self: Info) u32 {
         if (self.refresh_nanoseconds == 0) return 0;
         const numerator: u64 = std.time.ns_per_s * 1000;
-        return @intCast((numerator + self.refresh_nanoseconds / 2) / self.refresh_nanoseconds);
+        return @intCast(@min(
+            (numerator + self.refresh_nanoseconds / 2) / self.refresh_nanoseconds,
+            std.math.maxInt(u32),
+        ));
     }
 };
 
@@ -101,4 +104,8 @@ test "presentation refresh converts to output millihertz" {
     var variable_refresh = info;
     variable_refresh.refresh_nanoseconds = 0;
     try std.testing.expectEqual(@as(u32, 0), variable_refresh.refreshMillihertz());
+
+    var implausibly_fast = info;
+    implausibly_fast.refresh_nanoseconds = 1;
+    try std.testing.expectEqual(std.math.maxInt(u32), implausibly_fast.refreshMillihertz());
 }
