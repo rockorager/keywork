@@ -2179,6 +2179,7 @@ const PopupResource = struct {
                 resource.destroy();
             },
             .grab => |grab| {
+                if (popup.dismissed) return;
                 if (popup.mapped) {
                     resource.postError(.invalid_grab, "cannot grab a mapped xdg_popup");
                     return;
@@ -2239,6 +2240,7 @@ const PopupResource = struct {
                 popup.grabbed = true;
             },
             .reposition => |reposition| {
+                if (popup.dismissed) return;
                 const rules = Positioner.fromResource(reposition.positioner).rules;
                 if (!rules.complete()) {
                     self.xdg_surface_resource.wm_base_resource.postError(
