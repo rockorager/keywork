@@ -37,6 +37,7 @@ popups: PopupStore,
 next_popup_order: u64,
 window_listener: ?WindowListener,
 window_observers: std.ArrayList(WindowObserver),
+notifying_window_observers: bool,
 
 const BindingStore = slot_map.SlotMap(BindingState, enum { xdg_binding });
 const BindingId = BindingStore.Id;
@@ -377,6 +378,7 @@ pub const WindowListener = struct {
     request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 
+/// Observer registrations must remain unchanged during notification callbacks.
 pub const WindowObserver = struct {
     context: *anyopaque,
     committed: *const fn (*anyopaque, WindowId) void,
@@ -435,6 +437,7 @@ pub fn init(
         .next_popup_order = 0,
         .window_listener = null,
         .window_observers = .empty,
+        .notifying_window_observers = false,
     };
     errdefer self.bindings.deinit(allocator);
     errdefer self.xdg_surfaces.deinit(allocator);
@@ -484,6 +487,7 @@ pub fn clearWindowListener(self: *Self) void {
 
 /// Copies the observer and retains its context until removeWindowObserver.
 pub fn addWindowObserver(self: *Self, observer: WindowObserver) error{OutOfMemory}!void {
+    std.debug.assert(!self.notifying_window_observers);
     for (self.window_observers.items) |existing| {
         std.debug.assert(existing.context != observer.context);
     }
@@ -491,6 +495,7 @@ pub fn addWindowObserver(self: *Self, observer: WindowObserver) error{OutOfMemor
 }
 
 pub fn removeWindowObserver(self: *Self, context: *anyopaque) void {
+    std.debug.assert(!self.notifying_window_observers);
     for (self.window_observers.items, 0..) |observer, index| {
         if (observer.context != context) continue;
         _ = self.window_observers.orderedRemove(index);
@@ -1160,9 +1165,7 @@ fn notifyWindowMetadataChanged(self: *Self, window_id: WindowId) bool {
         listener.metadata_changed(listener.context, window_id)
     else
         false;
-    for (self.window_observers.items) |observer| {
-        observer.metadata_changed(observer.context, window_id);
-    }
+    self.notifyWindowObservers(.metadata_changed, window_id);
     return externally_managed;
 }
 
@@ -1171,24 +1174,37 @@ fn notifyWindowCommitted(self: *Self, window_id: WindowId, configure_serial: ?u3
         listener.committed(listener.context, window_id, configure_serial)
     else
         false;
-    for (self.window_observers.items) |observer| {
-        observer.committed(observer.context, window_id);
-    }
+    self.notifyWindowObservers(.committed, window_id);
     return externally_managed;
 }
 
 fn notifyWindowUnmapped(self: *Self, window_id: WindowId) void {
     if (self.window_listener) |listener| listener.unmapped(listener.context, window_id);
-    for (self.window_observers.items) |observer| observer.unmapped(observer.context, window_id);
+    self.notifyWindowObservers(.unmapped, window_id);
 }
 
 fn notifyWindowDestroyed(self: *Self, window_id: WindowId) void {
     if (self.window_listener) |listener| listener.destroyed(listener.context, window_id);
-    for (self.window_observers.items) |observer| observer.destroyed(observer.context, window_id);
+    self.notifyWindowObservers(.destroyed, window_id);
 }
 
 fn notifyWindowStateChanged(self: *Self, window_id: WindowId) void {
-    for (self.window_observers.items) |observer| observer.state_changed(observer.context, window_id);
+    self.notifyWindowObservers(.state_changed, window_id);
+}
+
+const WindowNotification = enum { committed, unmapped, destroyed, metadata_changed, state_changed };
+
+fn notifyWindowObservers(self: *Self, notification: WindowNotification, window_id: WindowId) void {
+    std.debug.assert(!self.notifying_window_observers);
+    self.notifying_window_observers = true;
+    defer self.notifying_window_observers = false;
+    for (self.window_observers.items) |observer| switch (notification) {
+        .committed => observer.committed(observer.context, window_id),
+        .unmapped => observer.unmapped(observer.context, window_id),
+        .destroyed => observer.destroyed(observer.context, window_id),
+        .metadata_changed => observer.metadata_changed(observer.context, window_id),
+        .state_changed => observer.state_changed(observer.context, window_id),
+    };
 }
 
 fn isTopmostPopup(self: *Self, id: PopupId) bool {
@@ -2771,6 +2787,7 @@ test "unmapping a toplevel reparents only its direct children" {
     shell.windows = .{};
     shell.window_listener = null;
     shell.window_observers = .empty;
+    shell.notifying_window_observers = false;
     defer shell.windows.deinit(allocator);
     defer shell.window_observers.deinit(allocator);
 
