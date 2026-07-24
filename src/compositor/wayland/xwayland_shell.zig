@@ -16,6 +16,7 @@ security_context: *SecurityContext,
 roles: std.ArrayList(*Role),
 associations: std.AutoHashMapUnmanaged(u64, Surface.Id),
 authorized_client: ?*wl.Client,
+last_serial: u64,
 client_destroy_listener: wl.Listener(*wl.Client),
 listener: Listener,
 
@@ -47,6 +48,7 @@ pub fn init(
         .roles = .empty,
         .associations = .empty,
         .authorized_client = null,
+        .last_serial = 0,
         .client_destroy_listener = wl.Listener(*wl.Client).init(clientDestroyed),
         .listener = listener,
     };
@@ -71,6 +73,7 @@ pub fn deinit(self: *Self) void {
 pub fn authorizeClient(self: *Self, client: *wl.Client) error{AlreadyAuthorized}!void {
     if (self.authorized_client != null) return error.AlreadyAuthorized;
     self.authorized_client = client;
+    self.last_serial = 0;
     client.addDestroyListener(&self.client_destroy_listener);
     self.security_context.authorizePrivateGlobal(self.global, client);
 }
@@ -175,7 +178,7 @@ const Role = struct {
                     resource.postError(.already_associated, "wl_surface is already associated");
                     return;
                 }
-                if (serial == 0 or self.serialInUse(serial)) {
+                if (self.serialInUse(serial) or !self.manager.claimSerial(serial)) {
                     resource.postError(.invalid_serial, "Xwayland surface serial is invalid");
                     return;
                 }
@@ -271,6 +274,12 @@ const Role = struct {
     }
 };
 
+fn claimSerial(self: *Self, serial: u64) bool {
+    if (serial == 0 or serial <= self.last_serial) return false;
+    self.last_serial = serial;
+    return true;
+}
+
 test "Xwayland serial combines low and high words" {
     const low: u32 = 0x89ab_cdef;
     const high: u32 = 0x0123_4567;
@@ -278,4 +287,15 @@ test "Xwayland serial combines low and high words" {
         @as(u64, 0x0123_4567_89ab_cdef),
         @as(u64, high) << 32 | low,
     );
+}
+
+test "Xwayland serials increase monotonically within a client epoch" {
+    var shell: Self = undefined;
+    shell.last_serial = 0;
+
+    try std.testing.expect(!shell.claimSerial(0));
+    try std.testing.expect(shell.claimSerial(10));
+    try std.testing.expect(!shell.claimSerial(10));
+    try std.testing.expect(!shell.claimSerial(9));
+    try std.testing.expect(shell.claimSerial(11));
 }
