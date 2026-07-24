@@ -132,7 +132,7 @@ static bool parse_audio_props(
 
 static void node_info(void *data, const struct pw_node_info *info) {
     struct kw_pw_node *node = data;
-    if (info->props != NULL) {
+    if ((info->change_mask & PW_NODE_CHANGE_MASK_PROPS) != 0 && info->props != NULL) {
         uint32_t device_id = property_id(info->props, PW_KEY_DEVICE_ID);
         uint32_t profile_device = property_id(info->props, "card.profile.device");
         uint32_t route_count = property_id(info->props, "device.routes");
@@ -883,7 +883,11 @@ static int set_audio_props(
             muted
         );
     }
-    if (route == NULL && node->route_managed)
+    /* Route enumeration is asynchronous. A matching route without controls,
+     * or a node that reports route management before its route arrives, must
+     * not fall back to node properties: WirePlumber will continue treating the
+     * device route as authoritative and the two volume values will diverge. */
+    if (!node->route_info_sent || route != NULL || node->route_managed)
         return -EAGAIN;
     return set_node_props(node, set_volume, volume, set_mute, muted);
 }
