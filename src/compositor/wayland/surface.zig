@@ -34,6 +34,7 @@ commit_timer_handler: ?CommitTimerHandler,
 background_effect_handler: ?BackgroundEffectHandler,
 explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
+notifying_commit_listeners: bool,
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
 pub const Id = Store.Id;
@@ -214,6 +215,7 @@ pub fn create(
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
+        .notifying_commit_listeners = false,
     };
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
@@ -683,6 +685,7 @@ pub const RoleIdentity = struct {
     context: *anyopaque,
 };
 
+/// Listener registrations must remain unchanged during commit notifications.
 pub const CommitListener = struct {
     context: *anyopaque,
     committed: ?*const fn (*anyopaque) void = null,
@@ -764,10 +767,13 @@ pub fn addCommitListener(
     self: *Self,
     listener: *CommitListener,
 ) error{OutOfMemory}!void {
+    std.debug.assert(!self.notifying_commit_listeners);
+    for (self.commit_listeners.items) |candidate| std.debug.assert(candidate != listener);
     try self.commit_listeners.append(self.allocator, listener);
 }
 
 pub fn removeCommitListener(self: *Self, listener: *CommitListener) void {
+    std.debug.assert(!self.notifying_commit_listeners);
     for (self.commit_listeners.items, 0..) |candidate, index| {
         if (candidate == listener) {
             _ = self.commit_listeners.orderedRemove(index);
@@ -852,9 +858,7 @@ pub fn discardCachedCommit(self: *Self) void {
     for (surface_state.cached_commits.items) |*cached| cached.deinit();
     surface_state.cached_commits.clearRetainingCapacity();
 
-    for (self.commit_listeners.items) |listener| {
-        if (listener.discarded) |discarded| discarded(listener.context);
-    }
+    notifyCommitListeners(self, .discarded);
 
     var index = surface_state.callbacks.items.len;
     while (index > 0) {
@@ -1275,9 +1279,20 @@ fn pendingAttachment(self: *const Self) PendingAttachment {
 }
 
 fn notifyCommitted(self: *Self) void {
-    for (self.commit_listeners.items) |listener| {
-        if (listener.committed) |committed| committed(listener.context);
-    }
+    notifyCommitListeners(self, .committed);
+}
+
+const CommitNotification = enum { committed, discarded, applied };
+
+fn notifyCommitListeners(self: *Self, notification: CommitNotification) void {
+    std.debug.assert(!self.notifying_commit_listeners);
+    self.notifying_commit_listeners = true;
+    defer self.notifying_commit_listeners = false;
+    for (self.commit_listeners.items) |listener| switch (notification) {
+        .committed => if (listener.committed) |committed| committed(listener.context),
+        .discarded => if (listener.discarded) |discarded| discarded(listener.context),
+        .applied => listener.applied(listener.context),
+    };
 }
 
 fn pendingCommitInfo(self: *Self) CommitInfo {
@@ -1744,7 +1759,7 @@ fn snapshotPendingAttachment(
 fn finishApplied(self: *Self, commit_info: CommitInfo) void {
     if (self.role_handler) |handler| handler.after_commit(handler.context, commit_info);
 
-    for (self.commit_listeners.items) |listener| listener.applied(listener.context);
+    notifyCommitListeners(self, .applied);
 
     if (self.role_handler) |handler| {
         if (handler.tree_applied) |tree_applied| tree_applied(handler.context, commit_info);
@@ -3121,6 +3136,7 @@ test "commit timing preserves synchronized and ordered application" {
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
+        .notifying_commit_listeners = false,
     };
     defer surface.commit_listeners.deinit(std.testing.allocator);
     defer {
@@ -3169,6 +3185,7 @@ test "commit timing moves a pending target to exactly one cached commit" {
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
+        .notifying_commit_listeners = false,
     };
     defer surface.commit_listeners.deinit(std.testing.allocator);
     defer {
@@ -3212,6 +3229,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
+        .notifying_commit_listeners = false,
     };
     defer surface.commit_listeners.deinit(std.testing.allocator);
     defer {
