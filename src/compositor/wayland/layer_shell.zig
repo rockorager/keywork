@@ -381,24 +381,33 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
         state.last_size = null;
         state.awaiting_initial_commit = true;
         state.pending = .{ .layer = state.initial_layer };
-        state.current = state.pending;
         self.scene.setLayerSurfaceMapped(state.scene_id, false);
+        self.commitPendingState(state) catch {
+            adapter.resource.?.postNoMemory();
+            self.invalidateFocus(state.surface_id);
+            self.arrange();
+            return;
+        };
         self.invalidateFocus(state.surface_id);
         self.arrange();
         return;
     }
-    state.awaiting_initial_commit = false;
-    state.current = state.pending;
-    self.scene.setLayerSurfaceLayer(state.scene_id, sceneLayer(state.current.layer)) catch {
+    self.commitPendingState(state) catch {
         adapter.resource.?.postNoMemory();
         return;
     };
+    state.awaiting_initial_commit = false;
     if (info.has_buffer) {
         state.mapped = true;
         self.scene.setLayerSurfaceMapped(state.scene_id, true);
         self.scene.layerSurfaceCommitted(state.scene_id);
     }
     self.arrange();
+}
+
+fn commitPendingState(self: *Self, state: *State) error{OutOfMemory}!void {
+    try self.scene.setLayerSurfaceLayer(state.scene_id, sceneLayer(state.pending.layer));
+    state.current = state.pending;
 }
 
 fn arrange(self: *Self) void {
@@ -694,4 +703,42 @@ test "geometry preserves a non-zero output origin" {
         Rect{ .x = 1290, .y = -195, .width = 100, .height = 50 },
         place(.{ .x = 1280, .y = -200, .width = 800, .height = 600 }, state, null),
     );
+}
+
+test "committing layer state is atomic with the scene stack" {
+    var scene: Scene = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+    const scene_id = try scene.addLayerSurface(
+        .{ .index = 1, .generation = 1 },
+        .top,
+    );
+    defer scene.removeLayerSurface(scene_id);
+
+    var shell: Self = undefined;
+    shell.scene = &scene;
+    var state: State = .{
+        .adapter = undefined,
+        .surface_id = .{ .index = 1, .generation = 1 },
+        .scene_id = scene_id,
+        .output_id = undefined,
+        .initial_layer = .top,
+        .pending = .{ .layer = .overlay },
+        .current = .{ .layer = .top },
+    };
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    scene.allocator = failing.allocator();
+    const result = shell.commitPendingState(&state);
+    scene.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(zwlr.LayerShellV1.Layer.top, state.current.layer);
+    try std.testing.expectEqual(Scene.Layer.top, scene.layerSurface(scene_id).?.layer);
+
+    try shell.commitPendingState(&state);
+    try std.testing.expectEqual(zwlr.LayerShellV1.Layer.overlay, state.current.layer);
+    try std.testing.expectEqual(Scene.Layer.overlay, scene.layerSurface(scene_id).?.layer);
 }
