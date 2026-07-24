@@ -454,6 +454,7 @@ test {
     _ = @import("render/dual_kawase.zig");
     _ = @import("render/gpu_timing.zig");
     _ = @import("render/icc.zig");
+    _ = @import("render/rect_region.zig");
     _ = @import("render/Renderer.zig");
     _ = @import("render/cpu.zig");
     _ = @import("render/vulkan.zig");

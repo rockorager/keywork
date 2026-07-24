@@ -83,6 +83,13 @@ pub const Rect = struct {
     width: u32,
     height: u32,
 
+    pub fn contains(self: Rect, other: Rect) bool {
+        return @as(i64, other.x) >= self.x and
+            @as(i64, other.y) >= self.y and
+            @as(i64, other.x) + other.width <= @as(i64, self.x) + self.width and
+            @as(i64, other.y) + other.height <= @as(i64, self.y) + self.height;
+    }
+
     pub fn intersection(self: Rect, other: Rect) ?Rect {
         const left = @max(@as(i64, self.x), other.x);
         const top = @max(@as(i64, self.y), other.y);
@@ -98,6 +105,25 @@ pub const Rect = struct {
         return .{
             .x = @intCast(left),
             .y = @intCast(top),
+            .width = @intCast(right - left),
+            .height = @intCast(bottom - top),
+        };
+    }
+
+    pub fn unionWith(self: Rect, other: Rect) Rect {
+        const left = @min(self.x, other.x);
+        const top = @min(self.y, other.y);
+        const right = @max(
+            @as(i64, self.x) + self.width,
+            @as(i64, other.x) + other.width,
+        );
+        const bottom = @max(
+            @as(i64, self.y) + self.height,
+            @as(i64, other.y) + other.height,
+        );
+        return .{
+            .x = left,
+            .y = top,
             .width = @intCast(right - left),
             .height = @intCast(bottom - top),
         };
@@ -1035,12 +1061,20 @@ test "rectangle intersection and translation preserve logical coordinates" {
     const first: Rect = .{ .x = 10, .y = 20, .width = 30, .height = 40 };
     const second: Rect = .{ .x = 25, .y = 5, .width = 30, .height = 30 };
 
+    try std.testing.expect(first.contains(.{ .x = 12, .y = 24, .width = 4, .height = 5 }));
+    try std.testing.expect(!first.contains(second));
     try std.testing.expectEqual(Rect{
         .x = 25,
         .y = 20,
         .width = 15,
         .height = 15,
     }, first.intersection(second).?);
+    try std.testing.expectEqual(Rect{
+        .x = 10,
+        .y = 5,
+        .width = 45,
+        .height = 55,
+    }, first.unionWith(second));
     try std.testing.expectEqual(Rect{
         .x = 7,
         .y = 24,

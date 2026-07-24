@@ -11,6 +11,7 @@ const blur_geometry = @import("blur_geometry.zig");
 const command_geometry = @import("command_geometry.zig");
 const color_math = @import("color_math.zig");
 const gpu_timing = @import("gpu_timing.zig");
+const rect_region = @import("rect_region.zig");
 const shaders = @import("vulkan_shaders.zig");
 const vulkan_format = @import("vulkan_format.zig");
 const sync = @cImport({
@@ -3407,7 +3408,7 @@ fn renderFrameWithCompletion(
     self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
-    const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
+    const frame_render_area = rect_region.damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
     std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
     const cache_hit = reusable and output.recorded_frame.matches(.{
@@ -4594,7 +4595,7 @@ fn prepareBackdropCaches(
             blur_op.cache_key != null and cache.geometry_key == blur_op.geometry_key)
         {
             if (damage) |rectangles| {
-                if (!damageIntersectsRect(rectangles, blur_op.sample_rect)) {
+                if (!rect_region.intersects(rectangles, blur_op.sample_rect)) {
                     blur_op.cache_hit = true;
                     blur_op.cache_rekey = true;
                 }
@@ -4603,7 +4604,7 @@ fn prepareBackdropCaches(
         next_cache_index += 1;
         if (!blur_op.cache_hit) {
             if (damage) |rectangles| {
-                if (!try damageCoversRect(self.allocator, rectangles, blur_op.sample_rect)) {
+                if (!try rect_region.covers(self.allocator, rectangles, blur_op.sample_rect)) {
                     incomplete_capture_damage = true;
                 }
             }
@@ -4625,66 +4626,6 @@ fn prepareBackdropCaches(
     }
     if (cache_changed) output.recorded_frame.valid = false;
     return incomplete_capture_damage;
-}
-
-fn damageCoversRect(
-    allocator: std.mem.Allocator,
-    damage: []const render.Rect,
-    rect: render.Rect,
-) error{OutOfMemory}!bool {
-    var uncovered: std.ArrayList(render.Rect) = .empty;
-    defer uncovered.deinit(allocator);
-    var next: std.ArrayList(render.Rect) = .empty;
-    defer next.deinit(allocator);
-    try uncovered.append(allocator, rect);
-
-    for (damage) |damaged| {
-        next.clearRetainingCapacity();
-        for (uncovered.items) |fragment| {
-            const overlap = fragment.intersection(damaged) orelse {
-                try next.append(allocator, fragment);
-                continue;
-            };
-            const fragment_right = @as(i64, fragment.x) + fragment.width;
-            const fragment_bottom = @as(i64, fragment.y) + fragment.height;
-            const overlap_right = @as(i64, overlap.x) + overlap.width;
-            const overlap_bottom = @as(i64, overlap.y) + overlap.height;
-            if (overlap.y > fragment.y) try next.append(allocator, .{
-                .x = fragment.x,
-                .y = fragment.y,
-                .width = fragment.width,
-                .height = @intCast(overlap.y - fragment.y),
-            });
-            if (overlap_bottom < fragment_bottom) try next.append(allocator, .{
-                .x = fragment.x,
-                .y = @intCast(overlap_bottom),
-                .width = fragment.width,
-                .height = @intCast(fragment_bottom - overlap_bottom),
-            });
-            if (overlap.x > fragment.x) try next.append(allocator, .{
-                .x = fragment.x,
-                .y = overlap.y,
-                .width = @intCast(overlap.x - fragment.x),
-                .height = overlap.height,
-            });
-            if (overlap_right < fragment_right) try next.append(allocator, .{
-                .x = @intCast(overlap_right),
-                .y = overlap.y,
-                .width = @intCast(fragment_right - overlap_right),
-                .height = overlap.height,
-            });
-        }
-        std.mem.swap(std.ArrayList(render.Rect), &uncovered, &next);
-        if (uncovered.items.len == 0) return true;
-    }
-    return false;
-}
-
-fn damageIntersectsRect(damage: []const render.Rect, rect: render.Rect) bool {
-    for (damage) |damaged| {
-        if (damaged.intersection(rect) != null) return true;
-    }
-    return false;
 }
 
 fn ensureBackdropCache(
@@ -5972,7 +5913,7 @@ fn compileDrawRuns(
             var raster_rects: [4]?render.Rect = @splat(null);
             if (shadow.cutout) |_| {
                 if (opaqueRoundedRectInterior(cutout.rect, cutout_radius)) |interior| {
-                    raster_rects = rectDifferenceStrips(clipped, interior);
+                    raster_rects = rect_region.differenceStrips(clipped, interior);
                 } else {
                     raster_rects[0] = clipped;
                 }
@@ -5996,9 +5937,9 @@ fn compileDrawRuns(
                 capture.downsample_level != blur.downsample_level or
                 !std.meta.eql(capture.finish, blur.finish) or
                 capture.level != level or
-                !rectContains(capture.sample_rect, sample_rect)) return error.InvalidTarget;
+                !capture.sample_rect.contains(sample_rect)) return error.InvalidTarget;
             self.markBackdropCaptureUsed(capture.op_index);
-            _ = damageBounds(frame.damage, clipped) orelse continue;
+            _ = rect_region.damageBounds(frame.damage, clipped) orelse continue;
             if (command_index + 1 < frame.commands.len) {
                 const next_image = switch (frame.commands[command_index + 1]) {
                     .image => |image| image,
@@ -6118,7 +6059,7 @@ fn compileBackdropCapture(
         if (base.radius != capture.radius or
             base.downsample_level != capture.downsample_level or
             !std.meta.eql(base.finish, capture.finish) or
-            !rectContains(base.sample_rect, sample_rect) or
+            !base.sample_rect.contains(sample_rect) or
             commandsAffectRect(
                 frame.commands[base.command_index + 1 .. command_index],
                 sample_rect,
@@ -6207,13 +6148,6 @@ fn compileBackdropCapture(
     };
 }
 
-fn rectContains(outer: render.Rect, inner: render.Rect) bool {
-    return @as(i64, inner.x) >= outer.x and
-        @as(i64, inner.y) >= outer.y and
-        @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
-        @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
-}
-
 fn opaqueRoundedRectInterior(rect: render.Rect, radius: u32) ?render.Rect {
     std.debug.assert(radius <= @min(rect.width, rect.height) / 2);
     const inset = radius * 2;
@@ -6224,43 +6158,6 @@ fn opaqueRoundedRectInterior(rect: render.Rect, radius: u32) ?render.Rect {
         .width = rect.width - inset,
         .height = rect.height - inset,
     };
-}
-
-fn rectDifferenceStrips(outer: render.Rect, removed: render.Rect) [4]?render.Rect {
-    var result: [4]?render.Rect = @splat(null);
-    const interior = outer.intersection(removed) orelse {
-        result[0] = outer;
-        return result;
-    };
-    const outer_right = @as(i64, outer.x) + outer.width;
-    const outer_bottom = @as(i64, outer.y) + outer.height;
-    const interior_right = @as(i64, interior.x) + interior.width;
-    const interior_bottom = @as(i64, interior.y) + interior.height;
-    if (interior.y > outer.y) result[0] = .{
-        .x = outer.x,
-        .y = outer.y,
-        .width = outer.width,
-        .height = @intCast(@as(i64, interior.y) - outer.y),
-    };
-    if (interior_bottom < outer_bottom) result[1] = .{
-        .x = outer.x,
-        .y = @intCast(interior_bottom),
-        .width = outer.width,
-        .height = @intCast(outer_bottom - interior_bottom),
-    };
-    if (interior.x > outer.x) result[2] = .{
-        .x = outer.x,
-        .y = interior.y,
-        .width = @intCast(@as(i64, interior.x) - outer.x),
-        .height = interior.height,
-    };
-    if (interior_right < outer_right) result[3] = .{
-        .x = @intCast(interior_right),
-        .y = interior.y,
-        .width = @intCast(outer_right - interior_right),
-        .height = interior.height,
-    };
-    return result;
 }
 
 fn emitDamaged(
@@ -6310,38 +6207,7 @@ fn emitDamaged(
     }
 }
 
-fn damageBounds(damage: ?[]const render.Rect, visible: render.Rect) ?render.Rect {
-    const rectangles = damage orelse return visible;
-    var bounds: ?render.Rect = null;
-    for (rectangles) |rectangle| {
-        const clipped = visible.intersection(rectangle) orelse continue;
-        bounds = if (bounds) |current| unionRect(current, clipped) else clipped;
-    }
-    return bounds;
-}
-
-fn unionRect(a: render.Rect, b: render.Rect) render.Rect {
-    const left = @min(a.x, b.x);
-    const top = @min(a.y, b.y);
-    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
-    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
-    return .{ .x = left, .y = top, .width = @intCast(right - left), .height = @intCast(bottom - top) };
-}
-
-test "Vulkan blur bounds only cover damaged visible pixels" {
-    const visible: render.Rect = .{ .x = 10, .y = 10, .width = 100, .height = 80 };
-    try std.testing.expectEqual(visible, damageBounds(null, visible).?);
-    try std.testing.expectEqual(
-        render.Rect{ .x = 12, .y = 15, .width = 88, .height = 55 },
-        damageBounds(&.{
-            .{ .x = 12, .y = 15, .width = 8, .height = 5 },
-            .{ .x = 90, .y = 60, .width = 10, .height = 10 },
-        }, visible).?,
-    );
-    try std.testing.expectEqual(null, damageBounds(&.{.{ .x = 0, .y = 0, .width = 5, .height = 5 }}, visible));
-}
-
-test "Vulkan shadow raster strips exclude only the opaque cutout interior" {
+test "Vulkan shadow cutout excludes only the rounded rectangle interior" {
     try std.testing.expectEqual(
         render.Rect{ .x = 22, .y = 32, .width = 76, .height = 56 },
         opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 12).?,
@@ -6353,28 +6219,6 @@ test "Vulkan shadow raster strips exclude only the opaque cutout interior" {
     try std.testing.expectEqual(
         @as(?render.Rect, null),
         opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 24, .height = 24 }, 12),
-    );
-
-    try std.testing.expectEqualSlices(
-        ?render.Rect,
-        &.{
-            .{ .x = 10, .y = 20, .width = 100, .height = 15 },
-            .{ .x = 10, .y = 65, .width = 100, .height = 35 },
-            .{ .x = 10, .y = 35, .width = 20, .height = 30 },
-            .{ .x = 70, .y = 35, .width = 40, .height = 30 },
-        },
-        &rectDifferenceStrips(
-            .{ .x = 10, .y = 20, .width = 100, .height = 80 },
-            .{ .x = 30, .y = 35, .width = 40, .height = 30 },
-        ),
-    );
-    try std.testing.expectEqualSlices(
-        ?render.Rect,
-        &.{ .{ .x = 10, .y = 20, .width = 100, .height = 80 }, null, null, null },
-        &rectDifferenceStrips(
-            .{ .x = 10, .y = 20, .width = 100, .height = 80 },
-            .{ .x = -20, .y = -20, .width = 10, .height = 10 },
-        ),
     );
 }
 
@@ -7108,18 +6952,6 @@ test "backdrop blur finish is attached only to the final upsample" {
     });
     try std.testing.expectEqualSlices(f32, &.{ 0.95, 1, 0, 0 }, &final.color);
     try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.92, 1.08, 0.01 }, &final.parameters);
-}
-
-test "damage coverage combines disjoint rectangles without accepting holes" {
-    const target: render.Rect = .{ .x = 2, .y = 3, .width = 6, .height = 4 };
-    try std.testing.expect(try damageCoversRect(std.testing.allocator, &.{
-        .{ .x = 2, .y = 3, .width = 3, .height = 4 },
-        .{ .x = 5, .y = 3, .width = 3, .height = 4 },
-    }, target));
-    try std.testing.expect(!try damageCoversRect(std.testing.allocator, &.{
-        .{ .x = 2, .y = 3, .width = 3, .height = 4 },
-        .{ .x = 6, .y = 3, .width = 2, .height = 4 },
-    }, target));
 }
 
 test "owner capture aliases base before owner shadow but not intersecting lower content" {

@@ -7,6 +7,7 @@ const headless = @import("../backend/headless.zig");
 const render_types = @import("types.zig");
 const blur_geometry = @import("blur_geometry.zig");
 const dual_kawase = @import("dual_kawase.zig");
+const rect_region = @import("rect_region.zig");
 
 const pixman = @cImport({
     @cInclude("pixman.h");
@@ -429,8 +430,8 @@ fn drawBackdropBlur(
     if (blur.radius != snapshot.marker.radius or
         blur.downsample_level != snapshot.marker.downsample_level or
         !std.meta.eql(blur.finish, snapshot.marker.finish) or
-        !rectContains(snapshot.marker.rect, clipped)) return error.InvalidTarget;
-    _ = damageBounds(damage, clipped) orelse return;
+        !snapshot.marker.rect.contains(clipped)) return error.InvalidTarget;
+    _ = rect_region.damageBounds(damage, clipped) orelse return;
 
     if (damage) |rectangles| {
         for (rectangles) |rectangle| {
@@ -456,13 +457,6 @@ fn drawBackdropBlur(
             snapshot.sample_rect.width,
         );
     }
-}
-
-fn rectContains(outer: render_types.Rect, inner: render_types.Rect) bool {
-    return @as(i64, inner.x) >= outer.x and
-        @as(i64, inner.y) >= outer.y and
-        @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
-        @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
 }
 
 fn compositeBackdropBlur(
@@ -504,32 +498,6 @@ fn compositeBackdropBlur(
             );
         }
     }
-}
-
-fn damageBounds(
-    damage: ?[]const render_types.Rect,
-    visible: render_types.Rect,
-) ?render_types.Rect {
-    const rectangles = damage orelse return visible;
-    var bounds: ?render_types.Rect = null;
-    for (rectangles) |rectangle| {
-        const clipped = visible.intersection(rectangle) orelse continue;
-        bounds = if (bounds) |current| unionRect(current, clipped) else clipped;
-    }
-    return bounds;
-}
-
-fn unionRect(a: render_types.Rect, b: render_types.Rect) render_types.Rect {
-    const left = @min(a.x, b.x);
-    const top = @min(a.y, b.y);
-    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
-    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
-    return .{
-        .x = left,
-        .y = top,
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
 }
 
 fn blendArgb(source: u32, destination: u32, coverage: u8) u32 {

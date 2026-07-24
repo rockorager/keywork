@@ -8670,7 +8670,7 @@ fn surfaceTreeBlurBounds(
                 effect = effect.intersection(frame.visible_rect) orelse continue;
                 if (rounded_clip) |rounded| effect = effect.intersection(rounded.rect) orelse continue;
                 if (clip) |clip_rect| effect = effect.intersection(clip_rect) orelse continue;
-                result = if (result) |old| rectUnion(old, effect) else effect;
+                result = if (result) |old| old.unionWith(effect) else effect;
             }
         },
         .child => |child| {
@@ -8681,18 +8681,10 @@ fn surfaceTreeBlurBounds(
                 y +| child.position.y,
                 rounded_clip,
                 clip,
-            )) |child_rect| result = if (result) |old| rectUnion(old, child_rect) else child_rect;
+            )) |child_rect| result = if (result) |old| old.unionWith(child_rect) else child_rect;
         },
     };
     return result;
-}
-
-fn rectUnion(a: render.Rect, b: render.Rect) render.Rect {
-    const left = @min(a.x, b.x);
-    const top = @min(a.y, b.y);
-    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
-    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
-    return .{ .x = left, .y = top, .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
 fn renderSurfaceBackgroundEffect(
