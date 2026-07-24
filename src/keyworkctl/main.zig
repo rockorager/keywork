@@ -54,9 +54,7 @@ const WindowParameters = struct {
     windows: []const control.Window,
 };
 
-const StatisticsParameters = struct {
-    outputs: []const control.OutputStatistics,
-};
+const StatisticsParameters = control.PerformanceStatistics;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -177,7 +175,7 @@ fn writeWindows(writer: *std.Io.Writer, windows: []const control.Window) !void {
     for (windows) |window| {
         try writer.writeAll(if (window.focused) "* " else "  ");
         try writeDisplayString(writer, window.id);
-        if (window.app_id) |app_id| {
+        if (window.appId) |app_id| {
             try writer.writeByte(' ');
             try writeDisplayString(writer, app_id);
         }
@@ -247,9 +245,9 @@ fn printStatistics(
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     defer stdout.interface.flush() catch {};
     if (json) {
-        try writeStatisticsJson(&stdout.interface, parsed.value.outputs);
+        try writeStatisticsJson(&stdout.interface, parsed.value);
     } else {
-        try writeStatistics(&stdout.interface, parsed.value.outputs);
+        try writeStatistics(&stdout.interface, parsed.value);
     }
 }
 
@@ -265,17 +263,19 @@ fn parseStatisticsParameters(
     );
 }
 
-fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
-    if (outputs.len == 0) return writer.writeAll("No active outputs.\n");
-    for (outputs, 0..) |output, index| {
+fn writeStatistics(writer: *std.Io.Writer, statistics: StatisticsParameters) !void {
+    if (statistics.outputs.len == 0) {
+        try writer.writeAll("No active outputs.\n\n");
+    }
+    for (statistics.outputs, 0..) |output, index| {
         if (index != 0) try writer.writeByte('\n');
         try writer.print("{s} {d}x{d} ({d}.", .{
             output.name,
             output.width,
             output.height,
-            @divTrunc(output.refresh_millihertz, 1000),
+            @divTrunc(output.refreshMillihertz, 1000),
         });
-        const fractional_refresh = @mod(output.refresh_millihertz, 1000);
+        const fractional_refresh = @mod(output.refreshMillihertz, 1000);
         if (fractional_refresh < 10) {
             try writer.print("00{d}", .{fractional_refresh});
         } else if (fractional_refresh < 100) {
@@ -284,67 +284,106 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
             try writer.print("{d}", .{fractional_refresh});
         }
         try writer.writeAll(" Hz)\n");
-        try writeFrameDiagnostics(writer, output.last_frame);
+        try writeFrameDiagnostics(writer, output.lastFrame);
         try writer.print(
             "  frames: requested {d}, started {d}, presented {d}, discarded {d}\n",
             .{
-                output.frames_requested,
-                output.frames_started,
-                output.frames_presented,
-                output.frames_discarded,
+                output.framesRequested,
+                output.framesStarted,
+                output.framesPresented,
+                output.framesDiscarded,
             },
         );
         try writer.print(
             "  paths: composited {d}, direct scanout {d}/{d} candidates, overlay scanout {d}/{d} candidates\n",
             .{
-                output.composited_frames,
-                output.direct_scanout_frames,
-                output.direct_scanout_candidates,
-                output.overlay_scanout_frames,
-                output.overlay_scanout_candidates,
+                output.compositedFrames,
+                output.directScanoutFrames,
+                output.directScanoutCandidates,
+                output.overlayScanoutFrames,
+                output.overlayScanoutCandidates,
             },
         );
-        try writeDirectScanoutRejections(writer, output.direct_scanout_rejections);
-        try writeOverlayScanoutRejections(writer, output.overlay_scanout_rejections);
+        try writeDirectScanoutRejections(writer, output.directScanoutRejections);
+        try writeOverlayScanoutRejections(writer, output.overlayScanoutRejections);
         try writer.print("  buffer operations: CPU uploads {d}, DMA-BUF imports {d}\n", .{
-            output.cpu_uploads,
-            output.dmabuf_imports,
+            output.cpuUploads,
+            output.dmabufImports,
         });
         try writer.print("  acquire retries: {d}, frames over budget: {d}\n", .{
-            output.acquire_retries,
-            output.frames_over_budget,
+            output.acquireRetries,
+            output.framesOverBudget,
         });
-        try writeLatency(writer, "GPU total", output.gpu_execution);
-        try writeLatency(writer, "GPU composition/effects", output.gpu_composition);
-        try writeLatency(writer, "GPU preparation/uploads", output.gpu_preparation);
-        try writeLatency(writer, "GPU solid composition", output.gpu_solid_composition);
-        try writeLatency(writer, "GPU image composition", output.gpu_image_composition);
-        try writeLatency(writer, "GPU shadows", output.gpu_shadow);
-        try writeLatency(writer, "GPU blur downsample", output.gpu_blur_downsample);
-        try writeLatency(writer, "GPU blur upsample", output.gpu_blur_upsample);
-        try writeLatency(writer, "GPU blur composite", output.gpu_blur_composite);
-        try writeLatency(writer, "GPU composition overhead", output.gpu_composition_overhead);
-        try writeLatency(writer, "GPU output encode", output.gpu_output_encode);
-        try writeLatency(writer, "GPU frame finish", output.gpu_frame_finish);
-        try writeLatency(writer, "request -> presentation", output.request_to_presentation);
-        try writeLatency(writer, "request -> render", output.request_to_render);
-        try writeLatency(writer, "render -> commit", output.render_to_commit);
-        try writeLatency(writer, "commit -> presentation", output.commit_to_presentation);
+        try writeLatency(writer, "GPU total", output.gpuExecution);
+        try writeLatency(writer, "GPU composition/effects", output.gpuComposition);
+        try writeLatency(writer, "GPU preparation/uploads", output.gpuPreparation);
+        try writeLatency(writer, "GPU solid composition", output.gpuSolidComposition);
+        try writeLatency(writer, "GPU image composition", output.gpuImageComposition);
+        try writeLatency(writer, "GPU shadows", output.gpuShadow);
+        try writeLatency(writer, "GPU blur downsample", output.gpuBlurDownsample);
+        try writeLatency(writer, "GPU blur upsample", output.gpuBlurUpsample);
+        try writeLatency(writer, "GPU blur composite", output.gpuBlurComposite);
+        try writeLatency(writer, "GPU composition overhead", output.gpuCompositionOverhead);
+        try writeLatency(writer, "GPU output encode", output.gpuOutputEncode);
+        try writeLatency(writer, "GPU frame finish", output.gpuFrameFinish);
+        try writeLatency(writer, "request -> presentation", output.requestToPresentation);
+        try writeLatency(writer, "request -> render", output.requestToRender);
+        try writeLatency(writer, "render -> commit", output.renderToCommit);
+        try writeLatency(writer, "commit -> presentation", output.commitToPresentation);
         try writer.print("  render fences signaled before commit: {d}/{d}\n", .{
-            output.render_fences_signaled_before_commit,
-            output.render_fence_samples,
+            output.renderFencesSignaledBeforeCommit,
+            output.renderFenceSamples,
         });
-        try writeLatency(writer, "render -> GPU completion", output.render_to_gpu_completion);
+        try writeLatency(writer, "render -> GPU completion", output.renderToGpuCompletion);
         try writeLatency(
             writer,
             "GPU completion -> presentation",
-            output.gpu_completion_to_presentation,
+            output.gpuCompletionToPresentation,
         );
+    }
+    if (statistics.outputs.len != 0) try writer.writeByte('\n');
+    if (statistics.resources) |resources| {
+        try writeResourceStatistics(writer, resources);
+    } else {
+        try writer.writeAll("resources: unavailable (compositor does not expose resource telemetry)\n");
     }
 }
 
-fn writeStatisticsJson(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
-    try std.json.Stringify.value(StatisticsParameters{ .outputs = outputs }, .{}, writer);
+fn writeResourceStatistics(writer: *std.Io.Writer, resources: control.ResourceStatistics) !void {
+    try writer.print(
+        "resources:\n" ++
+            "  renderer targets: {d} (pixel {d}, offscreen {d}, DMA-BUF {d})\n" ++
+            "  textures: cached {d} (imported {d}), pending {d}\n" ++
+            "  GPU submissions pending: {d}\n" ++
+            "  effects: calibration textures {d}, video pipelines {d}, blur images {d}, backdrop images {d}\n" ++
+            "  mapped buffer capacity: {d} bytes\n" ++
+            "  Wayland DMA-BUF buffers: {d}\n" ++
+            "  capture: {d} buffers, {d} screencopy frames, {d} image-copy sessions, {d} image-copy frames\n",
+        .{
+            resources.rendererTargets,
+            resources.pixelRendererTargets,
+            resources.offscreenRendererTargets,
+            resources.dmabufRendererTargets,
+            resources.cachedTextures,
+            resources.importedTextures,
+            resources.pendingTextures,
+            resources.pendingGpuSubmissions,
+            resources.calibrationTextures,
+            resources.videoGraphicsPipelines,
+            resources.blurScratchImages,
+            resources.backdropCacheImages,
+            resources.mappedBufferCapacityBytes,
+            resources.linuxDmabufBuffers,
+            resources.captureBuffers,
+            resources.screencopyFrames,
+            resources.imageCopyCaptureSessions,
+            resources.imageCopyCaptureFrames,
+        },
+    );
+}
+
+fn writeStatisticsJson(writer: *std.Io.Writer, statistics: StatisticsParameters) !void {
+    try std.json.Stringify.value(statistics, .{}, writer);
     try writer.writeByte('\n');
 }
 
@@ -356,14 +395,14 @@ fn writeFrameDiagnostics(
         "  last frame: {s}, working {s}, scanout {s}, transform {s}\n",
         .{
             framePathName(diagnostics.path),
-            bufferFormatName(diagnostics.working_format),
-            bufferFormatName(diagnostics.scanout_format),
-            @tagName(diagnostics.output_transform),
+            bufferFormatName(diagnostics.workingFormat),
+            bufferFormatName(diagnostics.scanoutFormat),
+            @tagName(diagnostics.outputTransform),
         },
     );
     try writer.print("  damage: {d} rectangles, {d} pixels\n", .{
-        diagnostics.damage_rectangles,
-        diagnostics.damaged_pixels,
+        diagnostics.damageRectangles,
+        diagnostics.damagedPixels,
     });
 }
 
@@ -397,10 +436,10 @@ fn writeLatency(
         "  {s}: p50 {d}us, p95 {d}us, p99 {d}us, max {d}us ({d} samples)\n",
         .{
             label,
-            latency.p50_microseconds,
-            latency.p95_microseconds,
-            latency.p99_microseconds,
-            latency.maximum_microseconds,
+            latency.p50Microseconds,
+            latency.p95Microseconds,
+            latency.p99Microseconds,
+            latency.maximumMicroseconds,
             latency.samples,
         },
     );
@@ -411,21 +450,21 @@ fn writeDirectScanoutRejections(
     rejections: control.DirectScanoutRejections,
 ) !void {
     var wrote_rejection = false;
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "no fullscreen surface", rejections.no_fullscreen_surface);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "non-opaque surface", rejections.non_opaque_surface);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "surface transform", rejections.surface_transform);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "non-DMA-BUF", rejections.non_dmabuf);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "Y-inverted buffer", rejections.y_inverted);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "missing buffer identity", rejections.missing_buffer_identity);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "color conversion", rejections.color_conversion);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported backend", rejections.unsupported_backend);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "output unavailable", rejections.output_unavailable);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "output busy", rejections.output_busy);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "device inactive", rejections.device_inactive);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported format/modifier", rejections.unsupported_format_or_modifier);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported layout", rejections.unsupported_layout);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "framebuffer import failed", rejections.framebuffer_import_failed);
-    try writeDirectScanoutRejection(writer, &wrote_rejection, "page flip failed", rejections.page_flip_failed);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "no fullscreen surface", rejections.noFullscreenSurface);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "non-opaque surface", rejections.nonOpaqueSurface);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "surface transform", rejections.surfaceTransform);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "non-DMA-BUF", rejections.nonDmabuf);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "Y-inverted buffer", rejections.yInverted);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "missing buffer identity", rejections.missingBufferIdentity);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "color conversion", rejections.colorConversion);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported backend", rejections.unsupportedBackend);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "output unavailable", rejections.outputUnavailable);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "output busy", rejections.outputBusy);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "device inactive", rejections.deviceInactive);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported format/modifier", rejections.unsupportedFormatOrModifier);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "unsupported layout", rejections.unsupportedLayout);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "framebuffer import failed", rejections.framebufferImportFailed);
+    try writeDirectScanoutRejection(writer, &wrote_rejection, "page flip failed", rejections.pageFlipFailed);
     if (!wrote_rejection) try writer.writeAll("  direct scanout rejections: none\n");
 }
 
@@ -449,28 +488,28 @@ fn writeOverlayScanoutRejections(
     rejections: control.OverlayScanoutRejections,
 ) !void {
     var wrote_rejection = false;
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no topmost surface", rejections.no_topmost_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-opaque surface", rejections.non_opaque_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "clipped surface", rejections.clipped_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "transformed surface", rejections.transformed_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "scaled surface", rejections.scaled_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "outside output", rejections.outside_output);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-DMA-BUF", rejections.non_dmabuf);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-RGB surface", rejections.non_rgb_surface);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "Y-inverted buffer", rejections.y_inverted);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "missing buffer identity", rejections.missing_buffer_identity);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "color conversion", rejections.color_conversion);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported backend", rejections.unsupported_backend);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output unavailable", rejections.output_unavailable);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output busy", rejections.output_busy);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "device inactive", rejections.device_inactive);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no overlay plane", rejections.no_overlay_plane);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported format/modifier", rejections.unsupported_format_or_modifier);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported layout", rejections.unsupported_layout);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "synchronization failed", rejections.synchronization_failed);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "framebuffer import failed", rejections.framebuffer_import_failed);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "atomic test failed", rejections.atomic_test_failed);
-    try writeOverlayScanoutRejection(writer, &wrote_rejection, "page flip failed", rejections.page_flip_failed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no topmost surface", rejections.noTopmostSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-opaque surface", rejections.nonOpaqueSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "clipped surface", rejections.clippedSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "transformed surface", rejections.transformedSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "scaled surface", rejections.scaledSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "outside output", rejections.outsideOutput);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-DMA-BUF", rejections.nonDmabuf);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-RGB surface", rejections.nonRgbSurface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "Y-inverted buffer", rejections.yInverted);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "missing buffer identity", rejections.missingBufferIdentity);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "color conversion", rejections.colorConversion);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported backend", rejections.unsupportedBackend);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output unavailable", rejections.outputUnavailable);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output busy", rejections.outputBusy);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "device inactive", rejections.deviceInactive);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no overlay plane", rejections.noOverlayPlane);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported format/modifier", rejections.unsupportedFormatOrModifier);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported layout", rejections.unsupportedLayout);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "synchronization failed", rejections.synchronizationFailed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "framebuffer import failed", rejections.framebufferImportFailed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "atomic test failed", rejections.atomicTestFailed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "page flip failed", rejections.pageFlipFailed);
     if (!wrote_rejection) try writer.writeAll("  overlay scanout rejections: none\n");
 }
 
@@ -733,14 +772,14 @@ test "configuration reload errors expose their message" {
 
 test "performance statistics decode and render human-readable output" {
     var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
-        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"last_frame":{"path":"composited","working_format":"rgba16f_linear","scanout_format":"xrgb8888","output_transform":"normal","damage_rectangles":2,"damaged_pixels":800000},"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"direct_scanout_rejections":{"no_fullscreen_surface":4,"non_opaque_surface":0,"surface_transform":0,"non_dmabuf":0,"y_inverted":0,"missing_buffer_identity":0,"color_conversion":1,"unsupported_backend":0,"output_unavailable":0,"output_busy":0,"device_inactive":0,"unsupported_format_or_modifier":0,"unsupported_layout":0,"framebuffer_import_failed":0,"page_flip_failed":2},"cpu_uploads":4,"dmabuf_imports":6,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_preparation":{"samples":7,"p50_microseconds":100,"p95_microseconds":200,"p99_microseconds":300,"maximum_microseconds":400},"gpu_solid_composition":{"samples":7,"p50_microseconds":110,"p95_microseconds":210,"p99_microseconds":310,"maximum_microseconds":410},"gpu_image_composition":{"samples":7,"p50_microseconds":120,"p95_microseconds":220,"p99_microseconds":320,"maximum_microseconds":420},"gpu_shadow":{"samples":7,"p50_microseconds":130,"p95_microseconds":230,"p99_microseconds":330,"maximum_microseconds":430},"gpu_blur_downsample":{"samples":7,"p50_microseconds":140,"p95_microseconds":240,"p99_microseconds":340,"maximum_microseconds":440},"gpu_blur_upsample":{"samples":7,"p50_microseconds":150,"p95_microseconds":250,"p99_microseconds":350,"maximum_microseconds":450},"gpu_blur_composite":{"samples":7,"p50_microseconds":160,"p95_microseconds":260,"p99_microseconds":360,"maximum_microseconds":460},"gpu_composition_overhead":{"samples":7,"p50_microseconds":170,"p95_microseconds":270,"p99_microseconds":370,"maximum_microseconds":470},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"gpu_frame_finish":{"samples":7,"p50_microseconds":180,"p95_microseconds":280,"p99_microseconds":380,"maximum_microseconds":480},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
+        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refreshMillihertz":120000,"lastFrame":{"path":"composited","workingFormat":"rgba16f_linear","scanoutFormat":"xrgb8888","outputTransform":"normal","damageRectangles":2,"damagedPixels":800000},"framesRequested":10,"framesStarted":9,"framesPresented":8,"framesDiscarded":1,"acquireRetries":2,"compositedFrames":7,"directScanoutCandidates":3,"directScanoutFrames":1,"directScanoutRejections":{"noFullscreenSurface":4,"nonOpaqueSurface":0,"surfaceTransform":0,"nonDmabuf":0,"yInverted":0,"missingBufferIdentity":0,"colorConversion":1,"unsupportedBackend":0,"outputUnavailable":0,"outputBusy":0,"deviceInactive":0,"unsupportedFormatOrModifier":0,"unsupportedLayout":0,"framebufferImportFailed":0,"pageFlipFailed":2},"cpuUploads":4,"dmabufImports":6,"framesOverBudget":2,"gpuExecution":{"samples":7,"p50Microseconds":2100,"p95Microseconds":4400,"p99Microseconds":6100,"maximumMicroseconds":7200},"gpuComposition":{"samples":7,"p50Microseconds":1500,"p95Microseconds":3300,"p99Microseconds":4700,"maximumMicroseconds":5400},"gpuPreparation":{"samples":7,"p50Microseconds":100,"p95Microseconds":200,"p99Microseconds":300,"maximumMicroseconds":400},"gpuSolidComposition":{"samples":7,"p50Microseconds":110,"p95Microseconds":210,"p99Microseconds":310,"maximumMicroseconds":410},"gpuImageComposition":{"samples":7,"p50Microseconds":120,"p95Microseconds":220,"p99Microseconds":320,"maximumMicroseconds":420},"gpuShadow":{"samples":7,"p50Microseconds":130,"p95Microseconds":230,"p99Microseconds":330,"maximumMicroseconds":430},"gpuBlurDownsample":{"samples":7,"p50Microseconds":140,"p95Microseconds":240,"p99Microseconds":340,"maximumMicroseconds":440},"gpuBlurUpsample":{"samples":7,"p50Microseconds":150,"p95Microseconds":250,"p99Microseconds":350,"maximumMicroseconds":450},"gpuBlurComposite":{"samples":7,"p50Microseconds":160,"p95Microseconds":260,"p99Microseconds":360,"maximumMicroseconds":460},"gpuCompositionOverhead":{"samples":7,"p50Microseconds":170,"p95Microseconds":270,"p99Microseconds":370,"maximumMicroseconds":470},"gpuOutputEncode":{"samples":7,"p50Microseconds":400,"p95Microseconds":700,"p99Microseconds":900,"maximumMicroseconds":1100},"gpuFrameFinish":{"samples":7,"p50Microseconds":180,"p95Microseconds":280,"p99Microseconds":380,"maximumMicroseconds":480},"requestToPresentation":{"samples":8,"p50Microseconds":8200,"p95Microseconds":9100,"p99Microseconds":16700,"maximumMicroseconds":25000},"requestToRender":{"samples":8,"p50Microseconds":1000,"p95Microseconds":1200,"p99Microseconds":1400,"maximumMicroseconds":1600},"renderToCommit":{"samples":8,"p50Microseconds":1100,"p95Microseconds":2800,"p99Microseconds":5600,"maximumMicroseconds":7000},"commitToPresentation":{"samples":8,"p50Microseconds":6800,"p95Microseconds":8000,"p99Microseconds":14900,"maximumMicroseconds":18000}}]}}
     , .{});
     defer reply.deinit();
     const parsed = try parseStatisticsParameters(std.testing.allocator, reply.value.parameters);
     defer parsed.deinit();
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
-    try writeStatistics(&writer.writer, parsed.value.outputs);
+    try writeStatistics(&writer.writer, parsed.value);
     try std.testing.expectEqualStrings(
         \\eDP-1 2880x1800 (120.000 Hz)
         \\  last frame: composited, working RGBA16F linear, scanout XRGB8888, transform normal
@@ -774,12 +813,14 @@ test "performance statistics decode and render human-readable output" {
         \\  render -> GPU completion: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
         \\  GPU completion -> presentation: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
         \\
+        \\resources: unavailable (compositor does not expose resource telemetry)
+        \\
     , writer.written());
 }
 
 test "window snapshots decode and render human-readable output" {
     var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
-        \\{"parameters":{"windows":[{"id":"00000001:00000003","protocol":"xdg_shell","title":"Terminal","app_id":"org.example.Terminal","pid":8124,"rect":{"x":16,"y":16,"width":1248,"height":688},"output":"HEADLESS-1","workspace":1,"focused":true,"visible":true,"floating":false,"fullscreen":false,"maximized":false,"minimized":false},{"id":"00000001:00000004","protocol":"xwayland","app_id":"firefox","output":"HEADLESS-1","workspace":2,"focused":false,"visible":false,"floating":true,"fullscreen":false,"maximized":false,"minimized":true}]}}
+        \\{"parameters":{"windows":[{"id":"00000001:00000003","protocol":"xdg_shell","title":"Terminal","appId":"org.example.Terminal","pid":8124,"rect":{"x":16,"y":16,"width":1248,"height":688},"output":"HEADLESS-1","workspace":1,"focused":true,"visible":true,"floating":false,"fullscreen":false,"maximized":false,"minimized":false},{"id":"00000001:00000004","protocol":"xwayland","appId":"firefox","output":"HEADLESS-1","workspace":2,"focused":false,"visible":false,"floating":true,"fullscreen":false,"maximized":false,"minimized":true}]}}
     , .{});
     defer reply.deinit();
     const parsed = try parseWindowParameters(std.testing.allocator, reply.value.parameters);
@@ -803,7 +844,7 @@ test "window snapshots escape terminal control sequences" {
         .id = "00000001:00000003",
         .protocol = .xdg_shell,
         .title = "bad\n\x1b]52;clipboard\x07\"title",
-        .app_id = "org.example\\bad\tapp",
+        .appId = "org.example\\bad\tapp",
         .output = "HEADLESS-1",
         .workspace = 1,
         .focused = true,
@@ -829,7 +870,7 @@ test "window snapshots render machine-readable JSON" {
         .id = "00000001:00000003",
         .protocol = .xdg_shell,
         .title = "Terminal",
-        .app_id = "org.example.Terminal",
+        .appId = "org.example.Terminal",
         .pid = 8124,
         .rect = .{ .x = 16, .y = 16, .width = 1248, .height = 688 },
         .output = "HEADLESS-1",
@@ -844,7 +885,7 @@ test "window snapshots render machine-readable JSON" {
 
     try writeWindowsJson(&writer.writer, &windows);
     try std.testing.expectEqualStrings(
-        "{\"windows\":[{\"id\":\"00000001:00000003\",\"protocol\":\"xdg_shell\",\"title\":\"Terminal\",\"app_id\":\"org.example.Terminal\",\"pid\":8124,\"rect\":{\"x\":16,\"y\":16,\"width\":1248,\"height\":688},\"output\":\"HEADLESS-1\",\"workspace\":1,\"focused\":true,\"visible\":true,\"floating\":false,\"fullscreen\":false,\"maximized\":false,\"minimized\":false}]}\n",
+        "{\"windows\":[{\"id\":\"00000001:00000003\",\"protocol\":\"xdg_shell\",\"title\":\"Terminal\",\"appId\":\"org.example.Terminal\",\"pid\":8124,\"rect\":{\"x\":16,\"y\":16,\"width\":1248,\"height\":688},\"output\":\"HEADLESS-1\",\"workspace\":1,\"focused\":true,\"visible\":true,\"floating\":false,\"fullscreen\":false,\"maximized\":false,\"minimized\":false}]}\n",
         writer.written(),
     );
 }
@@ -854,8 +895,8 @@ test "overlay scanout rejections render nonzero reasons" {
     defer writer.deinit();
 
     try writeOverlayScanoutRejections(&writer.writer, .{
-        .no_topmost_surface = 2,
-        .atomic_test_failed = 1,
+        .noTopmostSurface = 2,
+        .atomicTestFailed = 1,
     });
 
     try std.testing.expectEqualStrings(
@@ -870,6 +911,18 @@ test "performance statistics render machine-readable JSON" {
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
 
-    try writeStatisticsJson(&writer.writer, &.{});
-    try std.testing.expectEqualStrings("{\"outputs\":[]}\n", writer.written());
+    try writeStatisticsJson(&writer.writer, .{
+        .outputs = &.{},
+        .resources = .{ .cachedTextures = 12, .captureBuffers = 2 },
+    });
+    const parsed = try std.json.parseFromSlice(
+        control.PerformanceStatistics,
+        std.testing.allocator,
+        writer.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.outputs.len);
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.resources.?.cachedTextures);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.resources.?.captureBuffers);
 }

@@ -844,6 +844,22 @@ pub const FrameCompletion = struct {
     dmabuf_imports: u32 = 0,
 };
 
+pub const ResourceStatistics = struct {
+    targets: usize = 0,
+    pixel_targets: usize = 0,
+    offscreen_targets: usize = 0,
+    dmabuf_targets: usize = 0,
+    cached_textures: usize = 0,
+    imported_textures: usize = 0,
+    pending_textures: usize = 0,
+    pending_gpu_submissions: usize = 0,
+    calibration_textures: usize = 0,
+    video_graphics_pipelines: usize = 0,
+    blur_scratch_images: usize = 0,
+    backdrop_cache_images: usize = 0,
+    mapped_buffer_capacity_bytes: usize = 0,
+};
+
 pub const OffscreenTarget = struct {
     id: u64,
     size: Size,

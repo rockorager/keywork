@@ -48,7 +48,7 @@ pub const Executor = struct {
     statistics: *const fn (
         *anyopaque,
         std.mem.Allocator,
-    ) anyerror![]control.OutputStatistics,
+    ) anyerror!control.PerformanceStatistics,
     reset_statistics: *const fn (*anyopaque) void,
     set_unfocused_border: *const fn (*anyopaque, control.Border) void,
     set_log_level: *const fn (*anyopaque, control.LogLevel) void,
@@ -559,9 +559,9 @@ fn handleMessage(
         };
         defer parameters.deinit();
         const statistics = try executor.statistics(executor.context, allocator);
-        defer allocator.free(statistics);
+        defer allocator.free(statistics.outputs);
         if (!call.oneway) try writeMessage(allocator, output, .{
-            .parameters = .{ .outputs = statistics },
+            .parameters = statistics,
         });
         if (parameters.value.reset) executor.reset_statistics(executor.context);
         return;
@@ -753,7 +753,7 @@ const Recorder = struct {
             .id = try allocator.dupe(u8, "00000001:00000003"),
             .protocol = .xdg_shell,
             .title = "Terminal",
-            .app_id = "org.example.Terminal",
+            .appId = "org.example.Terminal",
             .pid = 8124,
             .rect = .{ .x = 16, .y = 16, .width = 1248, .height = 688 },
             .output = "HEADLESS-1",
@@ -771,106 +771,109 @@ const Recorder = struct {
     fn statistics(
         context: *anyopaque,
         allocator: std.mem.Allocator,
-    ) ![]control.OutputStatistics {
+    ) !control.PerformanceStatistics {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.statistics_count += 1;
         const result = try allocator.alloc(control.OutputStatistics, 1);
         const latency: control.LatencyStatistics = .{
             .samples = 4,
-            .p50_microseconds = 100,
-            .p95_microseconds = 200,
-            .p99_microseconds = 300,
-            .maximum_microseconds = 400,
+            .p50Microseconds = 100,
+            .p95Microseconds = 200,
+            .p99Microseconds = 300,
+            .maximumMicroseconds = 400,
         };
         result[0] = .{
             .name = "HEADLESS-1",
             .width = 1280,
             .height = 720,
-            .refresh_millihertz = 60_000,
-            .last_frame = .{
+            .refreshMillihertz = 60_000,
+            .lastFrame = .{
                 .path = .composited,
-                .working_format = .rgba16f_linear,
-                .scanout_format = .none,
-                .output_transform = .normal,
-                .damage_rectangles = 2,
-                .damaged_pixels = 20_000,
+                .workingFormat = .rgba16f_linear,
+                .scanoutFormat = .none,
+                .outputTransform = .normal,
+                .damageRectangles = 2,
+                .damagedPixels = 20_000,
             },
-            .frames_requested = 5,
-            .frames_started = 5,
-            .frames_presented = 4,
-            .frames_discarded = 1,
-            .acquire_retries = 0,
-            .composited_frames = 3,
-            .direct_scanout_candidates = 2,
-            .direct_scanout_frames = 1,
-            .direct_scanout_rejections = .{
-                .no_fullscreen_surface = 1,
-                .non_opaque_surface = 0,
-                .surface_transform = 0,
-                .non_dmabuf = 0,
-                .y_inverted = 0,
-                .missing_buffer_identity = 0,
-                .color_conversion = 1,
-                .unsupported_backend = 0,
-                .output_unavailable = 0,
-                .output_busy = 0,
-                .device_inactive = 0,
-                .unsupported_format_or_modifier = 0,
-                .unsupported_layout = 0,
-                .framebuffer_import_failed = 0,
-                .page_flip_failed = 0,
+            .framesRequested = 5,
+            .framesStarted = 5,
+            .framesPresented = 4,
+            .framesDiscarded = 1,
+            .acquireRetries = 0,
+            .compositedFrames = 3,
+            .directScanoutCandidates = 2,
+            .directScanoutFrames = 1,
+            .directScanoutRejections = .{
+                .noFullscreenSurface = 1,
+                .nonOpaqueSurface = 0,
+                .surfaceTransform = 0,
+                .nonDmabuf = 0,
+                .yInverted = 0,
+                .missingBufferIdentity = 0,
+                .colorConversion = 1,
+                .unsupportedBackend = 0,
+                .outputUnavailable = 0,
+                .outputBusy = 0,
+                .deviceInactive = 0,
+                .unsupportedFormatOrModifier = 0,
+                .unsupportedLayout = 0,
+                .framebufferImportFailed = 0,
+                .pageFlipFailed = 0,
             },
-            .overlay_scanout_candidates = 3,
-            .overlay_scanout_frames = 2,
-            .overlay_scanout_rejections = .{
-                .no_topmost_surface = 1,
-                .non_opaque_surface = 0,
-                .clipped_surface = 0,
-                .transformed_surface = 0,
-                .scaled_surface = 0,
-                .outside_output = 0,
-                .non_dmabuf = 0,
-                .non_rgb_surface = 0,
-                .y_inverted = 0,
-                .missing_buffer_identity = 0,
-                .color_conversion = 0,
-                .unsupported_backend = 0,
-                .output_unavailable = 0,
-                .output_busy = 0,
-                .device_inactive = 0,
-                .no_overlay_plane = 0,
-                .unsupported_format_or_modifier = 0,
-                .unsupported_layout = 0,
-                .synchronization_failed = 0,
-                .framebuffer_import_failed = 0,
-                .atomic_test_failed = 0,
-                .page_flip_failed = 0,
+            .overlayScanoutCandidates = 3,
+            .overlayScanoutFrames = 2,
+            .overlayScanoutRejections = .{
+                .noTopmostSurface = 1,
+                .nonOpaqueSurface = 0,
+                .clippedSurface = 0,
+                .transformedSurface = 0,
+                .scaledSurface = 0,
+                .outsideOutput = 0,
+                .nonDmabuf = 0,
+                .nonRgbSurface = 0,
+                .yInverted = 0,
+                .missingBufferIdentity = 0,
+                .colorConversion = 0,
+                .unsupportedBackend = 0,
+                .outputUnavailable = 0,
+                .outputBusy = 0,
+                .deviceInactive = 0,
+                .noOverlayPlane = 0,
+                .unsupportedFormatOrModifier = 0,
+                .unsupportedLayout = 0,
+                .synchronizationFailed = 0,
+                .framebufferImportFailed = 0,
+                .atomicTestFailed = 0,
+                .pageFlipFailed = 0,
             },
-            .cpu_uploads = 4,
-            .dmabuf_imports = 6,
-            .frames_over_budget = 1,
-            .gpu_execution = latency,
-            .gpu_composition = latency,
-            .gpu_preparation = .{ .samples = 4, .p50_microseconds = 101, .p95_microseconds = 201, .p99_microseconds = 301, .maximum_microseconds = 401 },
-            .gpu_solid_composition = .{ .samples = 4, .p50_microseconds = 102, .p95_microseconds = 202, .p99_microseconds = 302, .maximum_microseconds = 402 },
-            .gpu_image_composition = .{ .samples = 4, .p50_microseconds = 103, .p95_microseconds = 203, .p99_microseconds = 303, .maximum_microseconds = 403 },
-            .gpu_shadow = .{ .samples = 4, .p50_microseconds = 104, .p95_microseconds = 204, .p99_microseconds = 304, .maximum_microseconds = 404 },
-            .gpu_blur_downsample = .{ .samples = 4, .p50_microseconds = 105, .p95_microseconds = 205, .p99_microseconds = 305, .maximum_microseconds = 405 },
-            .gpu_blur_upsample = .{ .samples = 4, .p50_microseconds = 106, .p95_microseconds = 206, .p99_microseconds = 306, .maximum_microseconds = 406 },
-            .gpu_blur_composite = .{ .samples = 4, .p50_microseconds = 107, .p95_microseconds = 207, .p99_microseconds = 307, .maximum_microseconds = 407 },
-            .gpu_composition_overhead = .{ .samples = 4, .p50_microseconds = 108, .p95_microseconds = 208, .p99_microseconds = 308, .maximum_microseconds = 408 },
-            .gpu_output_encode = latency,
-            .gpu_frame_finish = .{ .samples = 4, .p50_microseconds = 109, .p95_microseconds = 209, .p99_microseconds = 309, .maximum_microseconds = 409 },
-            .request_to_presentation = latency,
-            .request_to_render = latency,
-            .render_to_commit = latency,
-            .commit_to_presentation = latency,
-            .render_fence_samples = 4,
-            .render_fences_signaled_before_commit = 2,
-            .render_to_gpu_completion = latency,
-            .gpu_completion_to_presentation = latency,
+            .cpuUploads = 4,
+            .dmabufImports = 6,
+            .framesOverBudget = 1,
+            .gpuExecution = latency,
+            .gpuComposition = latency,
+            .gpuPreparation = .{ .samples = 4, .p50Microseconds = 101, .p95Microseconds = 201, .p99Microseconds = 301, .maximumMicroseconds = 401 },
+            .gpuSolidComposition = .{ .samples = 4, .p50Microseconds = 102, .p95Microseconds = 202, .p99Microseconds = 302, .maximumMicroseconds = 402 },
+            .gpuImageComposition = .{ .samples = 4, .p50Microseconds = 103, .p95Microseconds = 203, .p99Microseconds = 303, .maximumMicroseconds = 403 },
+            .gpuShadow = .{ .samples = 4, .p50Microseconds = 104, .p95Microseconds = 204, .p99Microseconds = 304, .maximumMicroseconds = 404 },
+            .gpuBlurDownsample = .{ .samples = 4, .p50Microseconds = 105, .p95Microseconds = 205, .p99Microseconds = 305, .maximumMicroseconds = 405 },
+            .gpuBlurUpsample = .{ .samples = 4, .p50Microseconds = 106, .p95Microseconds = 206, .p99Microseconds = 306, .maximumMicroseconds = 406 },
+            .gpuBlurComposite = .{ .samples = 4, .p50Microseconds = 107, .p95Microseconds = 207, .p99Microseconds = 307, .maximumMicroseconds = 407 },
+            .gpuCompositionOverhead = .{ .samples = 4, .p50Microseconds = 108, .p95Microseconds = 208, .p99Microseconds = 308, .maximumMicroseconds = 408 },
+            .gpuOutputEncode = latency,
+            .gpuFrameFinish = .{ .samples = 4, .p50Microseconds = 109, .p95Microseconds = 209, .p99Microseconds = 309, .maximumMicroseconds = 409 },
+            .requestToPresentation = latency,
+            .requestToRender = latency,
+            .renderToCommit = latency,
+            .commitToPresentation = latency,
+            .renderFenceSamples = 4,
+            .renderFencesSignaledBeforeCommit = 2,
+            .renderToGpuCompletion = latency,
+            .gpuCompletionToPresentation = latency,
         };
-        return result;
+        return .{
+            .outputs = result,
+            .resources = .{ .cachedTextures = 12, .captureBuffers = 2 },
+        };
     }
 
     fn resetStatistics(context: *anyopaque) void {
@@ -1184,7 +1187,7 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(usize, 1), recorder.statistics_count);
     try std.testing.expectEqual(@as(usize, 1), recorder.statistics_reset_count);
     const parsed = try std.json.parseFromSlice(
-        struct { parameters: struct { outputs: []control.OutputStatistics } },
+        struct { parameters: control.PerformanceStatistics },
         std.testing.allocator,
         output.items[0 .. output.items.len - 1],
         .{},
@@ -1193,26 +1196,26 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.parameters.outputs.len);
     const statistics = parsed.value.parameters.outputs[0];
     try std.testing.expectEqualStrings("HEADLESS-1", statistics.name);
-    try std.testing.expectEqual(@as(i64, 4), statistics.frames_presented);
-    try std.testing.expectEqual(control.FramePath.composited, statistics.last_frame.path);
-    try std.testing.expectEqual(@as(i64, 20_000), statistics.last_frame.damaged_pixels);
-    try std.testing.expectEqual(@as(i64, 3), statistics.overlay_scanout_candidates);
-    try std.testing.expectEqual(@as(i64, 2), statistics.overlay_scanout_frames);
-    try std.testing.expectEqual(@as(i64, 1), statistics.overlay_scanout_rejections.no_topmost_surface);
-    try std.testing.expectEqual(@as(i64, 301), statistics.gpu_preparation.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 302), statistics.gpu_solid_composition.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 303), statistics.gpu_image_composition.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 304), statistics.gpu_shadow.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 305), statistics.gpu_blur_downsample.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 306), statistics.gpu_blur_upsample.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 307), statistics.gpu_blur_composite.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 308), statistics.gpu_composition_overhead.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 309), statistics.gpu_frame_finish.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 4), statistics.render_fence_samples);
-    try std.testing.expectEqual(@as(i64, 2), statistics.render_fences_signaled_before_commit);
-    try std.testing.expectEqual(@as(i64, 300), statistics.render_to_gpu_completion.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 300), statistics.gpu_completion_to_presentation.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 4), statistics.framesPresented);
+    try std.testing.expectEqual(control.FramePath.composited, statistics.lastFrame.path);
+    try std.testing.expectEqual(@as(i64, 20_000), statistics.lastFrame.damagedPixels);
+    try std.testing.expectEqual(@as(i64, 3), statistics.overlayScanoutCandidates);
+    try std.testing.expectEqual(@as(i64, 2), statistics.overlayScanoutFrames);
+    try std.testing.expectEqual(@as(i64, 1), statistics.overlayScanoutRejections.noTopmostSurface);
+    try std.testing.expectEqual(@as(i64, 301), statistics.gpuPreparation.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 302), statistics.gpuSolidComposition.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 303), statistics.gpuImageComposition.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 304), statistics.gpuShadow.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 305), statistics.gpuBlurDownsample.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 306), statistics.gpuBlurUpsample.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 307), statistics.gpuBlurComposite.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 308), statistics.gpuCompositionOverhead.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 309), statistics.gpuFrameFinish.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 300), statistics.requestToPresentation.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 4), statistics.renderFenceSamples);
+    try std.testing.expectEqual(@as(i64, 2), statistics.renderFencesSignaledBeforeCommit);
+    try std.testing.expectEqual(@as(i64, 300), statistics.renderToGpuCompletion.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 300), statistics.gpuCompletionToPresentation.p99Microseconds);
 }
 
 test "window query returns typed mapped-window snapshots" {
@@ -1241,7 +1244,7 @@ test "window query returns typed mapped-window snapshots" {
     const window = parsed.value.parameters.windows[0];
     try std.testing.expectEqualStrings("00000001:00000003", window.id);
     try std.testing.expectEqual(control.WindowProtocol.xdg_shell, window.protocol);
-    try std.testing.expectEqualStrings("org.example.Terminal", window.app_id.?);
+    try std.testing.expectEqualStrings("org.example.Terminal", window.appId.?);
     try std.testing.expectEqualStrings("Terminal", window.title.?);
     try std.testing.expectEqual(@as(?i64, 8124), window.pid);
     try std.testing.expectEqual(control.Rectangle{

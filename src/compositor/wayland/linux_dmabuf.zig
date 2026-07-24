@@ -123,6 +123,10 @@ pub fn allocationDevice(self: *const Self) ?Device {
     return if (self.feedback_state) |state| state.device else null;
 }
 
+pub fn bufferCount(self: *const Self) usize {
+    return self.buffer_count;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = zwp.LinuxDmabufV1.create(client, version, id) catch {
         client.postNoMemory();

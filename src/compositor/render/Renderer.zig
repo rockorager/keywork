@@ -31,6 +31,7 @@ pub const WorkingFormat = enum {
 pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
 pub const GpuTiming = gpu_timing.Timing;
 pub const FrameCompletion = render_types.FrameCompletion;
+pub const ResourceStatistics = render_types.ResourceStatistics;
 
 const Backend = union(enum) {
     cpu: CpuRenderer,
@@ -387,6 +388,13 @@ pub fn discardGpuTimings(self: *Renderer) void {
         .cpu => {},
         .vulkan => |*renderer| renderer.discardGpuTimings(),
     }
+}
+
+pub fn resourceStatistics(self: *const Renderer) ResourceStatistics {
+    return switch (self.backend) {
+        .cpu => .{},
+        .vulkan => |*renderer| renderer.resourceStatistics(),
+    };
 }
 
 pub fn directScanoutCandidate(self: *Renderer) render_types.DirectScanoutCandidate {

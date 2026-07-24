@@ -504,6 +504,18 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn frameCount(self: *const Self) usize {
+    return self.frames.items.len;
+}
+
+pub fn destinationBufferCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.frames.items) |frame| {
+        if (frame.destination != null) count += 1;
+    }
+    return count;
+}
+
 pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
     for (self.frames.items) |frame| {
         const target = frame.target orelse continue;

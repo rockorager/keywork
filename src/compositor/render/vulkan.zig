@@ -2723,6 +2723,39 @@ pub fn discardGpuTimings(self: *Self) void {
     self.completed_gpu_timing_count = 0;
 }
 
+pub fn resourceStatistics(self: *const Self) render.ResourceStatistics {
+    var statistics: render.ResourceStatistics = .{
+        .targets = self.outputs.count(),
+        .cached_textures = self.textures.count(),
+        .calibration_textures = self.calibrations.count(),
+        .video_graphics_pipelines = self.video_graphics.count(),
+    };
+    var target_iterator = self.outputs.iterator();
+    while (target_iterator.next()) |entry| {
+        switch (entry.key_ptr.*) {
+            .pixels => statistics.pixel_targets += 1,
+            .offscreen => statistics.offscreen_targets += 1,
+            .dmabuf => statistics.dmabuf_targets += 1,
+        }
+        const output = entry.value_ptr;
+        if (output.submission.fence_pending) statistics.pending_gpu_submissions += 1;
+        statistics.pending_textures +|= output.submission.pending_textures.items.len;
+        statistics.mapped_buffer_capacity_bytes +|= output.submission.work_capacity;
+        statistics.mapped_buffer_capacity_bytes +|= output.submission.instance_capacity;
+        statistics.backdrop_cache_images +|= output.backdrop_cache.items.len;
+        if (output.blur) |blur| {
+            for (blur.levels) |level| {
+                if (level != null) statistics.blur_scratch_images +|= 2;
+            }
+        }
+    }
+    var texture_iterator = self.textures.valueIterator();
+    while (texture_iterator.next()) |texture| {
+        if (texture.imported) statistics.imported_textures += 1;
+    }
+    return statistics;
+}
+
 fn releasePendingResources(self: *Self, submission: *Submission) void {
     for (submission.pending_wait_semaphores.items) |semaphore| {
         self.device_wrapper.destroySemaphore(self.device, semaphore, null);

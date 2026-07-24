@@ -44,7 +44,7 @@ type Window (
     id: string,
     protocol: WindowProtocol,
     title: ?string,
-    app_id: ?string,
+    appId: ?string,
     pid: ?int,
     rect: ?Rectangle,
     output: string,
@@ -60,55 +60,55 @@ type Window (
 # Rolling latency distribution in microseconds.
 type LatencyStatistics (
     samples: int,
-    p50_microseconds: int,
-    p95_microseconds: int,
-    p99_microseconds: int,
-    maximum_microseconds: int
+    p50Microseconds: int,
+    p95Microseconds: int,
+    p99Microseconds: int,
+    maximumMicroseconds: int
 )
 
 # Reasons composited frames could not use direct scanout.
 type DirectScanoutRejections (
-    no_fullscreen_surface: int,
-    non_opaque_surface: int,
-    surface_transform: int,
-    non_dmabuf: int,
-    y_inverted: int,
-    missing_buffer_identity: int,
-    color_conversion: int,
-    unsupported_backend: int,
-    output_unavailable: int,
-    output_busy: int,
-    device_inactive: int,
-    unsupported_format_or_modifier: int,
-    unsupported_layout: int,
-    framebuffer_import_failed: int,
-    page_flip_failed: int
+    noFullscreenSurface: int,
+    nonOpaqueSurface: int,
+    surfaceTransform: int,
+    nonDmabuf: int,
+    yInverted: int,
+    missingBufferIdentity: int,
+    colorConversion: int,
+    unsupportedBackend: int,
+    outputUnavailable: int,
+    outputBusy: int,
+    deviceInactive: int,
+    unsupportedFormatOrModifier: int,
+    unsupportedLayout: int,
+    framebufferImportFailed: int,
+    pageFlipFailed: int
 )
 
 # Reasons composited images could not be promoted to an overlay plane.
 type OverlayScanoutRejections (
-    no_topmost_surface: int,
-    non_opaque_surface: int,
-    clipped_surface: int,
-    transformed_surface: int,
-    scaled_surface: int,
-    outside_output: int,
-    non_dmabuf: int,
-    non_rgb_surface: int,
-    y_inverted: int,
-    missing_buffer_identity: int,
-    color_conversion: int,
-    unsupported_backend: int,
-    output_unavailable: int,
-    output_busy: int,
-    device_inactive: int,
-    no_overlay_plane: int,
-    unsupported_format_or_modifier: int,
-    unsupported_layout: int,
-    synchronization_failed: int,
-    framebuffer_import_failed: int,
-    atomic_test_failed: int,
-    page_flip_failed: int
+    noTopmostSurface: int,
+    nonOpaqueSurface: int,
+    clippedSurface: int,
+    transformedSurface: int,
+    scaledSurface: int,
+    outsideOutput: int,
+    nonDmabuf: int,
+    nonRgbSurface: int,
+    yInverted: int,
+    missingBufferIdentity: int,
+    colorConversion: int,
+    unsupportedBackend: int,
+    outputUnavailable: int,
+    outputBusy: int,
+    deviceInactive: int,
+    noOverlayPlane: int,
+    unsupportedFormatOrModifier: int,
+    unsupportedLayout: int,
+    synchronizationFailed: int,
+    framebufferImportFailed: int,
+    atomicTestFailed: int,
+    pageFlipFailed: int
 )
 
 # The path used for the most recently committed frame.
@@ -123,11 +123,11 @@ type OutputTransform (normal)
 # Diagnostic state for the most recently committed frame.
 type FrameDiagnostics (
     path: FramePath,
-    working_format: BufferFormat,
-    scanout_format: BufferFormat,
-    output_transform: OutputTransform,
-    damage_rectangles: int,
-    damaged_pixels: int
+    workingFormat: BufferFormat,
+    scanoutFormat: BufferFormat,
+    outputTransform: OutputTransform,
+    damageRectangles: int,
+    damagedPixels: int
 )
 
 # Per-output frame processing and presentation statistics.
@@ -135,43 +135,67 @@ type OutputStatistics (
     name: string,
     width: int,
     height: int,
-    refresh_millihertz: int,
-    last_frame: FrameDiagnostics,
-    frames_requested: int,
-    frames_started: int,
-    frames_presented: int,
-    frames_discarded: int,
-    acquire_retries: int,
-    composited_frames: int,
-    direct_scanout_candidates: int,
-    direct_scanout_frames: int,
-    direct_scanout_rejections: DirectScanoutRejections,
-    overlay_scanout_candidates: int,
-    overlay_scanout_frames: int,
-    overlay_scanout_rejections: OverlayScanoutRejections,
-    cpu_uploads: int,
-    dmabuf_imports: int,
-    frames_over_budget: int,
-    gpu_execution: LatencyStatistics,
-    gpu_composition: LatencyStatistics,
-    gpu_preparation: LatencyStatistics,
-    gpu_solid_composition: LatencyStatistics,
-    gpu_image_composition: LatencyStatistics,
-    gpu_shadow: LatencyStatistics,
-    gpu_blur_downsample: LatencyStatistics,
-    gpu_blur_upsample: LatencyStatistics,
-    gpu_blur_composite: LatencyStatistics,
-    gpu_composition_overhead: LatencyStatistics,
-    gpu_output_encode: LatencyStatistics,
-    gpu_frame_finish: LatencyStatistics,
-    request_to_presentation: LatencyStatistics,
-    request_to_render: LatencyStatistics,
-    render_to_commit: LatencyStatistics,
-    commit_to_presentation: LatencyStatistics,
-    render_fence_samples: int,
-    render_fences_signaled_before_commit: int,
-    render_to_gpu_completion: LatencyStatistics,
-    gpu_completion_to_presentation: LatencyStatistics
+    refreshMillihertz: int,
+    lastFrame: FrameDiagnostics,
+    framesRequested: int,
+    framesStarted: int,
+    framesPresented: int,
+    framesDiscarded: int,
+    acquireRetries: int,
+    compositedFrames: int,
+    directScanoutCandidates: int,
+    directScanoutFrames: int,
+    directScanoutRejections: DirectScanoutRejections,
+    overlayScanoutCandidates: int,
+    overlayScanoutFrames: int,
+    overlayScanoutRejections: OverlayScanoutRejections,
+    cpuUploads: int,
+    dmabufImports: int,
+    framesOverBudget: int,
+    gpuExecution: LatencyStatistics,
+    gpuComposition: LatencyStatistics,
+    gpuPreparation: LatencyStatistics,
+    gpuSolidComposition: LatencyStatistics,
+    gpuImageComposition: LatencyStatistics,
+    gpuShadow: LatencyStatistics,
+    gpuBlurDownsample: LatencyStatistics,
+    gpuBlurUpsample: LatencyStatistics,
+    gpuBlurComposite: LatencyStatistics,
+    gpuCompositionOverhead: LatencyStatistics,
+    gpuOutputEncode: LatencyStatistics,
+    gpuFrameFinish: LatencyStatistics,
+    requestToPresentation: LatencyStatistics,
+    requestToRender: LatencyStatistics,
+    renderToCommit: LatencyStatistics,
+    commitToPresentation: LatencyStatistics,
+    renderFenceSamples: int,
+    renderFencesSignaledBeforeCommit: int,
+    renderToGpuCompletion: LatencyStatistics,
+    gpuCompletionToPresentation: LatencyStatistics
+)
+
+# Instantaneous compositor-owned resource state. Mapped buffer capacity is the
+# usable capacity of retained renderer staging and instance buffers; it excludes
+# Vulkan image allocations, client-owned buffers, and process memory.
+type ResourceStatistics (
+    rendererTargets: int,
+    pixelRendererTargets: int,
+    offscreenRendererTargets: int,
+    dmabufRendererTargets: int,
+    cachedTextures: int,
+    importedTextures: int,
+    pendingTextures: int,
+    pendingGpuSubmissions: int,
+    calibrationTextures: int,
+    videoGraphicsPipelines: int,
+    blurScratchImages: int,
+    backdropCacheImages: int,
+    mappedBufferCapacityBytes: int,
+    linuxDmabufBuffers: int,
+    screencopyFrames: int,
+    imageCopyCaptureSessions: int,
+    imageCopyCaptureFrames: int,
+    captureBuffers: int
 )
 
 # Change focus within the active workspace.
@@ -201,8 +225,9 @@ method MoveFocusedToWorkspace (workspace: int) -> ()
 # Return a snapshot of mapped windows and their published logical geometry.
 method GetWindows () -> (windows: []Window)
 
-# Return a snapshot of per-output frame statistics, then optionally reset them.
-method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)
+# Return per-output performance counters and instantaneous resource state, then
+# optionally reset only the performance counters.
+method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics, resources: ?ResourceStatistics)
 
 # Change the border rendered around unfocused windows and window-like layer surfaces.
 method SetUnfocusedBorder (border: Border) -> ()

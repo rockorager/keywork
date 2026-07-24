@@ -716,6 +716,22 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn sessionCount(self: *const Self) usize {
+    return self.sessions.items.len;
+}
+
+pub fn frameCount(self: *const Self) usize {
+    return self.frames.items.len;
+}
+
+pub fn destinationBufferCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.frames.items) |frame| {
+        if (frame.destination.attached()) count += 1;
+    }
+    return count;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = ext.ImageCopyCaptureManagerV1.create(client, version, id) catch {
         client.postNoMemory();

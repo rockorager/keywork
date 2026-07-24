@@ -133,6 +133,7 @@ const output = try writer.toOwnedSlice();
 ## Command Surfaces
 
 - Keep user-facing compositor commands in sync across configuration keybindings, the Varlink interface and server dispatch, and `keyworkctl` parsing, help, and calls. Update tests for each affected surface.
+- Follow https://systemd.io/VARLINK/ for Varlink interfaces: use lower-camel-case field names, string enums, and meaningful interface and declaration documentation.
 
 ## Licensing Boundary
 

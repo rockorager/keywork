@@ -239,91 +239,91 @@ pub fn snapshot(
         .name = name,
         .width = @intCast(size.width),
         .height = @intCast(size.height),
-        .refresh_millihertz = refresh_millihertz,
-        .last_frame = .{
+        .refreshMillihertz = refresh_millihertz,
+        .lastFrame = .{
             .path = controlFramePath(self.last_path),
-            .working_format = controlWorkingFormat(working_format),
-            .scanout_format = controlScanoutFormat(self.last_scanout_format),
-            .output_transform = .normal,
-            .damage_rectangles = wireInteger(self.last_damage_rectangles),
-            .damaged_pixels = wireInteger(self.last_damaged_pixels),
+            .workingFormat = controlWorkingFormat(working_format),
+            .scanoutFormat = controlScanoutFormat(self.last_scanout_format),
+            .outputTransform = .normal,
+            .damageRectangles = wireInteger(self.last_damage_rectangles),
+            .damagedPixels = wireInteger(self.last_damaged_pixels),
         },
-        .frames_requested = wireInteger(self.frames_requested),
-        .frames_started = wireInteger(self.frames_started),
-        .frames_presented = wireInteger(self.frames_presented),
-        .frames_discarded = wireInteger(self.frames_discarded),
-        .acquire_retries = wireInteger(self.acquire_retries),
-        .composited_frames = wireInteger(self.composited_frames),
-        .direct_scanout_candidates = wireInteger(self.direct_scanout_candidates),
-        .direct_scanout_frames = wireInteger(self.direct_scanout_frames),
-        .direct_scanout_rejections = .{
-            .no_fullscreen_surface = self.directScanoutRejection(.no_fullscreen_surface),
-            .non_opaque_surface = self.directScanoutRejection(.non_opaque_surface),
-            .surface_transform = self.directScanoutRejection(.surface_transform),
-            .non_dmabuf = self.directScanoutRejection(.non_dmabuf),
-            .y_inverted = self.directScanoutRejection(.y_inverted),
-            .missing_buffer_identity = self.directScanoutRejection(.missing_buffer_identity),
-            .color_conversion = self.directScanoutRejection(.color_conversion),
-            .unsupported_backend = self.directScanoutRejection(.unsupported_backend),
-            .output_unavailable = self.directScanoutRejection(.output_unavailable),
-            .output_busy = self.directScanoutRejection(.output_busy),
-            .device_inactive = self.directScanoutRejection(.device_inactive),
-            .unsupported_format_or_modifier = self.directScanoutRejection(.unsupported_format_or_modifier),
-            .unsupported_layout = self.directScanoutRejection(.unsupported_layout),
-            .framebuffer_import_failed = self.directScanoutRejection(.framebuffer_import_failed),
-            .page_flip_failed = self.directScanoutRejection(.page_flip_failed),
+        .framesRequested = wireInteger(self.frames_requested),
+        .framesStarted = wireInteger(self.frames_started),
+        .framesPresented = wireInteger(self.frames_presented),
+        .framesDiscarded = wireInteger(self.frames_discarded),
+        .acquireRetries = wireInteger(self.acquire_retries),
+        .compositedFrames = wireInteger(self.composited_frames),
+        .directScanoutCandidates = wireInteger(self.direct_scanout_candidates),
+        .directScanoutFrames = wireInteger(self.direct_scanout_frames),
+        .directScanoutRejections = .{
+            .noFullscreenSurface = self.directScanoutRejection(.no_fullscreen_surface),
+            .nonOpaqueSurface = self.directScanoutRejection(.non_opaque_surface),
+            .surfaceTransform = self.directScanoutRejection(.surface_transform),
+            .nonDmabuf = self.directScanoutRejection(.non_dmabuf),
+            .yInverted = self.directScanoutRejection(.y_inverted),
+            .missingBufferIdentity = self.directScanoutRejection(.missing_buffer_identity),
+            .colorConversion = self.directScanoutRejection(.color_conversion),
+            .unsupportedBackend = self.directScanoutRejection(.unsupported_backend),
+            .outputUnavailable = self.directScanoutRejection(.output_unavailable),
+            .outputBusy = self.directScanoutRejection(.output_busy),
+            .deviceInactive = self.directScanoutRejection(.device_inactive),
+            .unsupportedFormatOrModifier = self.directScanoutRejection(.unsupported_format_or_modifier),
+            .unsupportedLayout = self.directScanoutRejection(.unsupported_layout),
+            .framebufferImportFailed = self.directScanoutRejection(.framebuffer_import_failed),
+            .pageFlipFailed = self.directScanoutRejection(.page_flip_failed),
         },
-        .overlay_scanout_candidates = wireInteger(self.overlay_scanout_candidates),
-        .overlay_scanout_frames = wireInteger(self.overlay_scanout_frames),
-        .overlay_scanout_rejections = .{
-            .no_topmost_surface = self.overlayScanoutRejection(.no_topmost_surface),
-            .non_opaque_surface = self.overlayScanoutRejection(.non_opaque_surface),
-            .clipped_surface = self.overlayScanoutRejection(.clipped_surface),
-            .transformed_surface = self.overlayScanoutRejection(.transformed_surface),
-            .scaled_surface = self.overlayScanoutRejection(.scaled_surface),
-            .outside_output = self.overlayScanoutRejection(.outside_output),
-            .non_dmabuf = self.overlayScanoutRejection(.non_dmabuf),
-            .non_rgb_surface = self.overlayScanoutRejection(.non_rgb_surface),
-            .y_inverted = self.overlayScanoutRejection(.y_inverted),
-            .missing_buffer_identity = self.overlayScanoutRejection(.missing_buffer_identity),
-            .color_conversion = self.overlayScanoutRejection(.color_conversion),
-            .unsupported_backend = self.overlayScanoutRejection(.unsupported_backend),
-            .output_unavailable = self.overlayScanoutRejection(.output_unavailable),
-            .output_busy = self.overlayScanoutRejection(.output_busy),
-            .device_inactive = self.overlayScanoutRejection(.device_inactive),
-            .no_overlay_plane = self.overlayScanoutRejection(.no_overlay_plane),
-            .unsupported_format_or_modifier = self.overlayScanoutRejection(.unsupported_format_or_modifier),
-            .unsupported_layout = self.overlayScanoutRejection(.unsupported_layout),
-            .synchronization_failed = self.overlayScanoutRejection(.synchronization_failed),
-            .framebuffer_import_failed = self.overlayScanoutRejection(.framebuffer_import_failed),
-            .atomic_test_failed = self.overlayScanoutRejection(.atomic_test_failed),
-            .page_flip_failed = self.overlayScanoutRejection(.page_flip_failed),
+        .overlayScanoutCandidates = wireInteger(self.overlay_scanout_candidates),
+        .overlayScanoutFrames = wireInteger(self.overlay_scanout_frames),
+        .overlayScanoutRejections = .{
+            .noTopmostSurface = self.overlayScanoutRejection(.no_topmost_surface),
+            .nonOpaqueSurface = self.overlayScanoutRejection(.non_opaque_surface),
+            .clippedSurface = self.overlayScanoutRejection(.clipped_surface),
+            .transformedSurface = self.overlayScanoutRejection(.transformed_surface),
+            .scaledSurface = self.overlayScanoutRejection(.scaled_surface),
+            .outsideOutput = self.overlayScanoutRejection(.outside_output),
+            .nonDmabuf = self.overlayScanoutRejection(.non_dmabuf),
+            .nonRgbSurface = self.overlayScanoutRejection(.non_rgb_surface),
+            .yInverted = self.overlayScanoutRejection(.y_inverted),
+            .missingBufferIdentity = self.overlayScanoutRejection(.missing_buffer_identity),
+            .colorConversion = self.overlayScanoutRejection(.color_conversion),
+            .unsupportedBackend = self.overlayScanoutRejection(.unsupported_backend),
+            .outputUnavailable = self.overlayScanoutRejection(.output_unavailable),
+            .outputBusy = self.overlayScanoutRejection(.output_busy),
+            .deviceInactive = self.overlayScanoutRejection(.device_inactive),
+            .noOverlayPlane = self.overlayScanoutRejection(.no_overlay_plane),
+            .unsupportedFormatOrModifier = self.overlayScanoutRejection(.unsupported_format_or_modifier),
+            .unsupportedLayout = self.overlayScanoutRejection(.unsupported_layout),
+            .synchronizationFailed = self.overlayScanoutRejection(.synchronization_failed),
+            .framebufferImportFailed = self.overlayScanoutRejection(.framebuffer_import_failed),
+            .atomicTestFailed = self.overlayScanoutRejection(.atomic_test_failed),
+            .pageFlipFailed = self.overlayScanoutRejection(.page_flip_failed),
         },
-        .cpu_uploads = wireInteger(self.cpu_uploads),
-        .dmabuf_imports = wireInteger(self.dmabuf_imports),
-        .frames_over_budget = wireInteger(self.frames_over_budget),
-        .render_fence_samples = wireInteger(self.render_fence_samples),
-        .render_fences_signaled_before_commit = wireInteger(
+        .cpuUploads = wireInteger(self.cpu_uploads),
+        .dmabufImports = wireInteger(self.dmabuf_imports),
+        .framesOverBudget = wireInteger(self.frames_over_budget),
+        .renderFenceSamples = wireInteger(self.render_fence_samples),
+        .renderFencesSignaledBeforeCommit = wireInteger(
             self.render_fences_signaled_before_commit,
         ),
-        .gpu_execution = self.gpuExecutionSummary(.total),
-        .gpu_composition = self.gpuExecutionSummary(.composition),
-        .gpu_preparation = self.gpuExecutionSummary(.preparation),
-        .gpu_solid_composition = self.gpuExecutionSummary(.solid_composition),
-        .gpu_image_composition = self.gpuExecutionSummary(.image_composition),
-        .gpu_shadow = self.gpuExecutionSummary(.shadow),
-        .gpu_blur_downsample = self.gpuExecutionSummary(.blur_downsample),
-        .gpu_blur_upsample = self.gpuExecutionSummary(.blur_upsample),
-        .gpu_blur_composite = self.gpuExecutionSummary(.blur_composite),
-        .gpu_composition_overhead = self.gpuExecutionSummary(.composition_overhead),
-        .gpu_output_encode = self.gpuExecutionSummary(.output_encode),
-        .gpu_frame_finish = self.gpuExecutionSummary(.frame_finish),
-        .request_to_presentation = self.latencySummary(.request_to_presentation),
-        .request_to_render = self.latencySummary(.request_to_render),
-        .render_to_commit = self.latencySummary(.render_to_commit),
-        .commit_to_presentation = self.latencySummary(.commit_to_presentation),
-        .render_to_gpu_completion = self.latencySummary(.render_to_gpu_completion),
-        .gpu_completion_to_presentation = self.latencySummary(
+        .gpuExecution = self.gpuExecutionSummary(.total),
+        .gpuComposition = self.gpuExecutionSummary(.composition),
+        .gpuPreparation = self.gpuExecutionSummary(.preparation),
+        .gpuSolidComposition = self.gpuExecutionSummary(.solid_composition),
+        .gpuImageComposition = self.gpuExecutionSummary(.image_composition),
+        .gpuShadow = self.gpuExecutionSummary(.shadow),
+        .gpuBlurDownsample = self.gpuExecutionSummary(.blur_downsample),
+        .gpuBlurUpsample = self.gpuExecutionSummary(.blur_upsample),
+        .gpuBlurComposite = self.gpuExecutionSummary(.blur_composite),
+        .gpuCompositionOverhead = self.gpuExecutionSummary(.composition_overhead),
+        .gpuOutputEncode = self.gpuExecutionSummary(.output_encode),
+        .gpuFrameFinish = self.gpuExecutionSummary(.frame_finish),
+        .requestToPresentation = self.latencySummary(.request_to_presentation),
+        .requestToRender = self.latencySummary(.request_to_render),
+        .renderToCommit = self.latencySummary(.render_to_commit),
+        .commitToPresentation = self.latencySummary(.commit_to_presentation),
+        .renderToGpuCompletion = self.latencySummary(.render_to_gpu_completion),
+        .gpuCompletionToPresentation = self.latencySummary(
             .gpu_completion_to_presentation,
         ),
     };
@@ -366,10 +366,10 @@ fn latencySummary(
     std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
     return .{
         .samples = @intCast(sorted.len),
-        .p50_microseconds = wireInteger(percentile(sorted, 50)),
-        .p95_microseconds = wireInteger(percentile(sorted, 95)),
-        .p99_microseconds = wireInteger(percentile(sorted, 99)),
-        .maximum_microseconds = wireInteger(sorted[sorted.len - 1]),
+        .p50Microseconds = wireInteger(percentile(sorted, 50)),
+        .p95Microseconds = wireInteger(percentile(sorted, 95)),
+        .p99Microseconds = wireInteger(percentile(sorted, 99)),
+        .maximumMicroseconds = wireInteger(sorted[sorted.len - 1]),
     };
 }
 
@@ -379,10 +379,10 @@ fn gpuExecutionSummary(
 ) ControlProtocol.LatencyStatistics {
     const no_samples: ControlProtocol.LatencyStatistics = .{
         .samples = 0,
-        .p50_microseconds = 0,
-        .p95_microseconds = 0,
-        .p99_microseconds = 0,
-        .maximum_microseconds = 0,
+        .p50Microseconds = 0,
+        .p95Microseconds = 0,
+        .p99Microseconds = 0,
+        .maximumMicroseconds = 0,
     };
     if (self.gpu_execution_count == 0) return no_samples;
     var values: [sample_capacity]u64 = undefined;
@@ -410,10 +410,10 @@ fn gpuExecutionSummary(
     std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
     return .{
         .samples = @intCast(sorted.len),
-        .p50_microseconds = wireInteger(percentile(sorted, 50)),
-        .p95_microseconds = wireInteger(percentile(sorted, 95)),
-        .p99_microseconds = wireInteger(percentile(sorted, 99)),
-        .maximum_microseconds = wireInteger(sorted[sorted.len - 1]),
+        .p50Microseconds = wireInteger(percentile(sorted, 50)),
+        .p95Microseconds = wireInteger(percentile(sorted, 95)),
+        .p99Microseconds = wireInteger(percentile(sorted, 99)),
+        .maximumMicroseconds = wireInteger(sorted[sorted.len - 1]),
     };
 }
 
@@ -500,10 +500,10 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     });
     const summary = statistics.latencySummary(.request_to_presentation);
     try std.testing.expectEqual(@as(i64, 4), summary.samples);
-    try std.testing.expectEqual(@as(i64, 200), summary.p50_microseconds);
-    try std.testing.expectEqual(@as(i64, 400), summary.p95_microseconds);
-    try std.testing.expectEqual(@as(i64, 400), summary.p99_microseconds);
-    try std.testing.expectEqual(@as(i64, 400), summary.maximum_microseconds);
+    try std.testing.expectEqual(@as(i64, 200), summary.p50Microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.p95Microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.p99Microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.maximumMicroseconds);
 
     statistics.rejectDirectScanout(.color_conversion);
     statistics.rejectDirectScanout(.color_conversion);
@@ -572,28 +572,28 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     });
     const gpu_summary = statistics.gpuExecutionSummary(.total);
     try std.testing.expectEqual(@as(i64, 3), gpu_summary.samples);
-    try std.testing.expectEqual(@as(i64, 2_200), gpu_summary.p50_microseconds);
-    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.p95_microseconds);
-    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.maximum_microseconds);
+    try std.testing.expectEqual(@as(i64, 2_200), gpu_summary.p50Microseconds);
+    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.p95Microseconds);
+    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.maximumMicroseconds);
     try std.testing.expectEqual(
         @as(i64, 1_400),
-        statistics.gpuExecutionSummary(.composition).p50_microseconds,
+        statistics.gpuExecutionSummary(.composition).p50Microseconds,
     );
     try std.testing.expectEqual(
         @as(i64, 600),
-        statistics.gpuExecutionSummary(.output_encode).p50_microseconds,
+        statistics.gpuExecutionSummary(.output_encode).p50Microseconds,
     );
     try std.testing.expectEqual(
         @as(i64, 200),
-        statistics.gpuExecutionSummary(.preparation).p50_microseconds,
+        statistics.gpuExecutionSummary(.preparation).p50Microseconds,
     );
     try std.testing.expectEqual(
         @as(i64, 400),
-        statistics.gpuExecutionSummary(.image_composition).p50_microseconds,
+        statistics.gpuExecutionSummary(.image_composition).p50Microseconds,
     );
     try std.testing.expectEqual(
         @as(i64, 200),
-        statistics.gpuExecutionSummary(.frame_finish).p50_microseconds,
+        statistics.gpuExecutionSummary(.frame_finish).p50Microseconds,
     );
     statistics.addGpuExecution(.{
         .tag = 0,
@@ -626,13 +626,13 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         60_000,
         .rgba16f_linear,
     );
-    try std.testing.expectEqual(ControlProtocol.FramePath.composited, output_snapshot.last_frame.path);
-    try std.testing.expectEqual(ControlProtocol.BufferFormat.rgba16f_linear, output_snapshot.last_frame.working_format);
-    try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, output_snapshot.last_frame.scanout_format);
-    try std.testing.expectEqual(@as(i64, 3), output_snapshot.last_frame.damage_rectangles);
-    try std.testing.expectEqual(@as(i64, 225), output_snapshot.last_frame.damaged_pixels);
-    try std.testing.expectEqual(@as(i64, 1), output_snapshot.overlay_scanout_rejections.no_overlay_plane);
-    try std.testing.expectEqual(@as(i64, 2), output_snapshot.overlay_scanout_rejections.atomic_test_failed);
+    try std.testing.expectEqual(ControlProtocol.FramePath.composited, output_snapshot.lastFrame.path);
+    try std.testing.expectEqual(ControlProtocol.BufferFormat.rgba16f_linear, output_snapshot.lastFrame.workingFormat);
+    try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, output_snapshot.lastFrame.scanoutFormat);
+    try std.testing.expectEqual(@as(i64, 3), output_snapshot.lastFrame.damageRectangles);
+    try std.testing.expectEqual(@as(i64, 225), output_snapshot.lastFrame.damagedPixels);
+    try std.testing.expectEqual(@as(i64, 1), output_snapshot.overlayScanoutRejections.noOverlayPlane);
+    try std.testing.expectEqual(@as(i64, 2), output_snapshot.overlayScanoutRejections.atomicTestFailed);
 
     statistics.recordFrame(.overlay_scanout, .xrgb8888, &damage);
     const overlay_snapshot = statistics.snapshot(
@@ -641,7 +641,7 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         60_000,
         .rgba16f_linear,
     );
-    try std.testing.expectEqual(ControlProtocol.FramePath.overlay_scanout, overlay_snapshot.last_frame.path);
+    try std.testing.expectEqual(ControlProtocol.FramePath.overlay_scanout, overlay_snapshot.lastFrame.path);
 
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
@@ -659,11 +659,11 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     }, 30 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
     try std.testing.expectEqual(
         @as(i64, 2_000),
-        statistics.latencySummary(.render_to_gpu_completion).p50_microseconds,
+        statistics.latencySummary(.render_to_gpu_completion).p50Microseconds,
     );
     try std.testing.expectEqual(
         @as(i64, 7_000),
-        statistics.latencySummary(.gpu_completion_to_presentation).p50_microseconds,
+        statistics.latencySummary(.gpu_completion_to_presentation).p50Microseconds,
     );
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fence_samples);
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fences_signaled_before_commit);
@@ -687,5 +687,5 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     });
     const rolling = statistics.latencySummary(.request_to_presentation);
     try std.testing.expectEqual(@as(i64, sample_capacity), rolling.samples);
-    try std.testing.expectEqual(@as(i64, sample_capacity), rolling.maximum_microseconds);
+    try std.testing.expectEqual(@as(i64, sample_capacity), rolling.maximumMicroseconds);
 }
