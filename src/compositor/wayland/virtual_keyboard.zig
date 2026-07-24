@@ -78,7 +78,10 @@ pub fn setInhibited(self: *Self, inhibited: bool) void {
         for (self.devices.items) |device| device.applyDeferredKeymap();
         return;
     }
-    for (self.devices.items) |device| device.releasePressedKeys();
+    for (self.devices.items) |device| {
+        device.releasePressedKeys();
+        device.clearModifiers();
+    }
 }
 
 fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
@@ -193,6 +196,7 @@ const Device = struct {
                 if (!self.requireKeymap(resource)) return;
                 if (self.manager.inhibited) return;
                 self.seat.?.setVirtualModifiers(
+                    self,
                     modifiers.mods_depressed,
                     modifiers.mods_latched,
                     modifiers.mods_locked,
@@ -306,10 +310,16 @@ const Device = struct {
         }
     }
 
+    fn clearModifiers(self: *Device) void {
+        const seat = self.seat orelse return;
+        seat.clearVirtualModifiers(self);
+    }
+
     fn deactivate(self: *Device) void {
         if (!self.active) return;
         const seat = self.seat orelse unreachable;
         self.releasePressedKeys();
+        self.clearModifiers();
         if (self.registered) {
             seat.removeVirtualKeyboard();
             self.registered = false;

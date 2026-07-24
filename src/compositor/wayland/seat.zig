@@ -57,7 +57,7 @@ pointer_grab: ?PointerGrab,
 pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
 pressed_keys: PressedKeyState,
 grabbed_keys: std.ArrayList(GrabbedKey),
-modifiers: Modifiers,
+modifier_state: ModifierState,
 last_user_action: ?UserAction,
 recent_user_actions: [user_action_history_capacity]UserAction,
 recent_user_action_count: usize,
@@ -81,6 +81,30 @@ const Modifiers = struct {
     latched: u32 = 0,
     locked: u32 = 0,
     group: u32 = 0,
+};
+
+const ModifierState = struct {
+    current: Modifiers = .{},
+    physical: Modifiers = .{},
+    virtual_owner: ?*anyopaque = null,
+
+    fn setPhysical(self: *ModifierState, modifiers: Modifiers) void {
+        self.current = modifiers;
+        self.physical = modifiers;
+        self.virtual_owner = null;
+    }
+
+    fn setVirtual(self: *ModifierState, owner: *anyopaque, modifiers: Modifiers) void {
+        self.current = modifiers;
+        self.virtual_owner = owner;
+    }
+
+    fn clearVirtual(self: *ModifierState, owner: *anyopaque) bool {
+        if (self.virtual_owner != owner) return false;
+        self.current = self.physical;
+        self.virtual_owner = null;
+        return true;
+    }
 };
 
 const GrabbedKey = struct {
@@ -431,7 +455,7 @@ pub fn init(
         .pressed_pointer_buttons = .empty,
         .pressed_keys = .{},
         .grabbed_keys = .empty,
-        .modifiers = .{},
+        .modifier_state = .{},
         .last_user_action = null,
         .recent_user_actions = undefined,
         .recent_user_action_count = 0,
@@ -616,10 +640,10 @@ fn installKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
         grab.repeat_info(grab.context, self.repeat_info.rate, self.repeat_info.delay);
         grab.modifiers(
             grab.context,
-            self.modifiers.depressed,
-            self.modifiers.latched,
-            self.modifiers.locked,
-            self.modifiers.group,
+            self.modifier_state.current.depressed,
+            self.modifier_state.current.latched,
+            self.modifier_state.current.locked,
+            self.modifier_state.current.group,
         );
     }
     return true;
@@ -772,7 +796,8 @@ pub fn pointerPosition(self: *const Self) ?struct { x: f64, y: f64 } {
 }
 
 pub fn effectiveModifiers(self: *const Self) u32 {
-    return (self.modifiers.depressed | self.modifiers.latched) & 0xed;
+    const modifiers = self.modifier_state.current;
+    return (modifiers.depressed | modifiers.latched) & 0xed;
 }
 
 /// Set the client allowed to own the cursor while pointer focus is absent.
@@ -1185,33 +1210,39 @@ pub fn setModifiers(
     locked: u32,
     group: u32,
 ) void {
-    self.setModifiersWithGrab(depressed, latched, locked, group, true);
-}
-
-pub fn setVirtualModifiers(
-    self: *Self,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
-) void {
-    self.setModifiersWithGrab(depressed, latched, locked, group, false);
-}
-
-fn setModifiersWithGrab(
-    self: *Self,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
-    allow_grab: bool,
-) void {
-    self.modifiers = .{
+    self.modifier_state.setPhysical(.{
         .depressed = depressed,
         .latched = latched,
         .locked = locked,
         .group = group,
-    };
+    });
+    self.sendCurrentModifiers(true);
+}
+
+pub fn setVirtualModifiers(
+    self: *Self,
+    owner: *anyopaque,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) void {
+    self.modifier_state.setVirtual(owner, .{
+        .depressed = depressed,
+        .latched = latched,
+        .locked = locked,
+        .group = group,
+    });
+    self.sendCurrentModifiers(false);
+}
+
+pub fn clearVirtualModifiers(self: *Self, owner: *anyopaque) void {
+    if (!self.modifier_state.clearVirtual(owner)) return;
+    self.sendCurrentModifiers(false);
+}
+
+fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
+    const modifiers = self.modifier_state.current;
     if (allow_grab) {
         if (self.keyboard_grab) |grab| {
             if (grab.surface) |surface_id| {
@@ -1225,7 +1256,13 @@ fn setModifiersWithGrab(
                 }
                 return;
             }
-            grab.modifiers(grab.context, depressed, latched, locked, group);
+            grab.modifiers(
+                grab.context,
+                modifiers.depressed,
+                modifiers.latched,
+                modifiers.locked,
+                modifiers.group,
+            );
             return;
         }
     }
@@ -2028,12 +2065,13 @@ fn sendLeave(self: *Self) void {
 }
 
 fn sendModifiers(self: *const Self, resource: *wl.Keyboard, serial: u32) void {
+    const modifiers = self.modifier_state.current;
     resource.sendModifiers(
         serial,
-        self.modifiers.depressed,
-        self.modifiers.latched,
-        self.modifiers.locked,
-        self.modifiers.group,
+        modifiers.depressed,
+        modifiers.latched,
+        modifiers.locked,
+        modifiers.group,
     );
 }
 
@@ -2456,6 +2494,33 @@ test "physical key replacement preserves virtual ownership" {
     try std.testing.expectEqualSlices(u32, &.{40}, state.key_codes.items);
     try std.testing.expect(try state.update(std.testing.allocator, 40, .released, .virtual));
     try std.testing.expectEqual(@as(usize, 0), state.key_codes.items.len);
+}
+
+test "virtual modifier teardown restores only the superseded physical state" {
+    const physical: Modifiers = .{ .depressed = 1, .locked = 2 };
+    const virtual_a: Modifiers = .{ .depressed = 4, .latched = 8 };
+    const virtual_b: Modifiers = .{ .depressed = 16, .group = 1 };
+    var owner_a: u8 = 0;
+    var owner_b: u8 = 0;
+    var state: ModifierState = .{};
+
+    state.setPhysical(physical);
+    state.setVirtual(&owner_a, virtual_a);
+    try std.testing.expect(state.clearVirtual(&owner_a));
+    try std.testing.expectEqual(physical, state.current);
+    try std.testing.expect(!state.clearVirtual(&owner_a));
+
+    state.setVirtual(&owner_a, virtual_a);
+    state.setPhysical(physical);
+    try std.testing.expect(!state.clearVirtual(&owner_a));
+    try std.testing.expectEqual(physical, state.current);
+
+    state.setVirtual(&owner_a, virtual_a);
+    state.setVirtual(&owner_b, virtual_b);
+    try std.testing.expect(!state.clearVirtual(&owner_a));
+    try std.testing.expectEqual(virtual_b, state.current);
+    try std.testing.expect(state.clearVirtual(&owner_b));
+    try std.testing.expectEqual(physical, state.current);
 }
 
 test "seat capability generations invalidate existing input resources" {
