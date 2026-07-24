@@ -7,6 +7,7 @@ const cursor_resample = @import("cursor_resample.zig");
 const display_color = @import("display_color.zig");
 const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
+const ScanoutFramebufferCache = @import("ScanoutFramebufferCache.zig");
 const Logging = @import("../logging.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
@@ -104,8 +105,7 @@ overlay_pending: ?ClientScanout,
 overlay_displayed: ?ClientScanout,
 validated_overlay: ?PreparedOverlay,
 pending_page_flip: ?PageFlipMode,
-scanout_framebuffers: std.AutoHashMapUnmanaged(ScanoutFramebufferKey, ScanoutFramebuffer),
-scanout_frame_number: u64,
+scanout_framebuffer_cache: ScanoutFramebufferCache,
 direct_scanout_active: bool,
 enabled: bool,
 powered: bool,
@@ -124,25 +124,9 @@ const Buffer = struct {
     stride_pixels: u32 = 0,
 };
 
-const ScanoutFramebufferKey = struct {
-    cache_id: u64,
-    format: u32,
-};
-
-const ScanoutFramebuffer = struct {
-    framebuffer_id: u32,
-    size: render.Size,
-    format: u32,
-    modifier: u64,
-    plane_count: u8,
-    strides: [render.max_dmabuf_planes]u32,
-    offsets: [render.max_dmabuf_planes]u32,
-    last_used: u64,
-};
-
 const ClientScanout = struct {
     source: render.DmabufSource,
-    framebuffer_key: ScanoutFramebufferKey,
+    framebuffer_key: ScanoutFramebufferCache.Key,
 
     fn release(self: ClientScanout) void {
         self.source.release(self.source.context);
@@ -344,8 +328,6 @@ pub const OverlayScanoutResult = union(enum) {
     rejected: render.OverlayScanoutRejection,
 };
 
-const max_scanout_framebuffers = 8;
-
 pub const Selection = struct {
     modes: []Mode,
     mode_index: usize,
@@ -475,8 +457,7 @@ pub fn init(
         .overlay_displayed = null,
         .validated_overlay = null,
         .pending_page_flip = null,
-        .scanout_framebuffers = .empty,
-        .scanout_frame_number = 0,
+        .scanout_framebuffer_cache = .init(allocator),
         .direct_scanout_active = false,
         .enabled = true,
         .powered = true,
@@ -493,8 +474,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
     std.debug.assert(self.overlay_pending == null and self.overlay_displayed == null);
     std.debug.assert(self.validated_overlay == null);
-    std.debug.assert(self.scanout_framebuffers.count() == 0);
-    self.scanout_framebuffers.deinit(self.allocator);
+    self.scanout_framebuffer_cache.deinit();
     self.clearIdentity();
     if (self.icc_profile) |*profile| profile.deinit(self.allocator);
     if (self.icc_profile_path) |path| self.allocator.free(path);
@@ -1542,7 +1522,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     // A retired output remains callback-owned until its queued flip completes.
     // Keep buffers submitted by that flip retained even after the connector is gone.
     self.releaseClientScanoutsForTeardown();
-    self.destroyScanoutFramebuffers(fd);
+    self.scanout_framebuffer_cache.clear(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
     for (&self.buffer_damage) |*damage| damage.clear();
@@ -1598,7 +1578,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.mode_set = false;
     self.displayed = null;
     self.releaseClientScanouts();
-    self.destroyScanoutFramebuffers(fd);
+    self.scanout_framebuffer_cache.clear(fd);
     self.notifyDeactivated();
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
@@ -1634,7 +1614,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
         self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
         self.releaseClientScanouts();
-        self.destroyScanoutFramebuffers(fd);
+        self.scanout_framebuffer_cache.clear(fd);
         self.mode_set = false;
     }
 
@@ -2194,39 +2174,6 @@ fn planeFormats(
     return formats.toOwnedSlice(allocator);
 }
 
-fn scanoutFramebufferFormat(
-    formats: []const render.DmabufFormatModifier,
-    source_format: u32,
-    modifier: u64,
-) ?u32 {
-    const format = render.DmabufFormat.fromFourcc(source_format) orelse return null;
-    const opaque_format = @intFromEnum(format.opaqueFormat());
-    if (render.DmabufFormatModifier.contains(formats, opaque_format, modifier)) {
-        return opaque_format;
-    }
-    if (render.DmabufFormatModifier.contains(formats, source_format, modifier)) {
-        return source_format;
-    }
-    return null;
-}
-
-test "scanout framebuffer prefers an opaque format with the same memory layout" {
-    const formats = [_]render.DmabufFormatModifier{
-        .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = 7 },
-        .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = 7 },
-        .{ .format = c.DRM_FORMAT_ABGR8888, .modifier = 9 },
-    };
-    try std.testing.expectEqual(
-        c.DRM_FORMAT_XRGB8888,
-        scanoutFramebufferFormat(&formats, c.DRM_FORMAT_ARGB8888, 7).?,
-    );
-    try std.testing.expectEqual(
-        c.DRM_FORMAT_ABGR8888,
-        scanoutFramebufferFormat(&formats, c.DRM_FORMAT_ABGR8888, 9).?,
-    );
-    try std.testing.expect(scanoutFramebufferFormat(&formats, c.DRM_FORMAT_XBGR8888, 9) == null);
-}
-
 test "HDR metadata converts output description to CTA values" {
     const output_description: render.ColorDescription = .{
         .primaries = render.bt2020_chromaticities,
@@ -2418,126 +2365,21 @@ fn scanoutFramebuffer(
     buffer: render.PixelBuffer,
     formats: []const render.DmabufFormatModifier,
     implicit_scanout: bool,
-) !struct { key: ScanoutFramebufferKey, framebuffer_id: u32 } {
-    const source = buffer.dmabuf orelse return error.InvalidBuffer;
-    if (source.plane_count == 0 or source.plane_count > render.max_dmabuf_planes) {
-        return error.InvalidBuffer;
-    }
-    const framebuffer_format = scanoutFramebufferFormat(
-        formats,
-        source.format,
-        source.modifier,
-    ) orelse return error.UnsupportedModifier;
-    const modifier_supported = render.DmabufFormatModifier.contains(
-        formats,
-        framebuffer_format,
-        source.modifier,
-    );
-    if (!modifier_supported and !(implicit_scanout and
-        source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
-    const key: ScanoutFramebufferKey = .{
-        .cache_id = buffer.source_cache.?.id,
-        .format = framebuffer_format,
+) !ScanoutFramebufferCache.Result {
+    const pinned_keys = [_]?ScanoutFramebufferCache.Key{
+        if (self.direct_pending) |scanout| scanout.framebuffer_key else null,
+        if (self.direct_displayed) |scanout| scanout.framebuffer_key else null,
+        if (self.overlay_pending) |scanout| scanout.framebuffer_key else null,
+        if (self.overlay_displayed) |scanout| scanout.framebuffer_key else null,
+        if (self.validated_overlay) |overlay| overlay.scanout.framebuffer_key else null,
     };
-    self.scanout_frame_number +%= 1;
-    if (self.scanout_frame_number == 0) self.scanout_frame_number = 1;
-    if (self.scanout_framebuffers.getPtr(key)) |framebuffer| {
-        if (!scanoutFramebufferLayoutMatches(framebuffer.*, buffer.size, source)) {
-            return error.CacheIdentityMismatch;
-        }
-        framebuffer.last_used = self.scanout_frame_number;
-        return .{ .key = key, .framebuffer_id = framebuffer.framebuffer_id };
-    }
-    try self.makeScanoutFramebufferRoom(fd);
-
-    var handles: [render.max_dmabuf_planes]u32 = @splat(0);
-    defer closeImportedBufferHandles(fd, handles);
-    var pitches: [render.max_dmabuf_planes]u32 = @splat(0);
-    var offsets: [render.max_dmabuf_planes]u32 = @splat(0);
-    for (source.planeSlice(), 0..) |plane, index| {
-        if (c.drmPrimeFDToHandle(fd, plane.fd, &handles[index]) != 0) {
-            return error.ImportHandleFailed;
-        }
-        pitches[index] = plane.stride;
-        offsets[index] = plane.offset;
-    }
-    var framebuffer_id: u32 = 0;
-    var add_result: c_int = -1;
-    if (modifier_supported) {
-        var modifiers: [render.max_dmabuf_planes]u64 = @splat(0);
-        for (modifiers[0..source.plane_count]) |*modifier| modifier.* = source.modifier;
-        add_result = c.drmModeAddFB2WithModifiers(
-            fd,
-            buffer.size.width,
-            buffer.size.height,
-            framebuffer_format,
-            &handles,
-            &pitches,
-            &offsets,
-            &modifiers,
-            &framebuffer_id,
-            c.DRM_MODE_FB_MODIFIERS,
-        );
-    }
-    if (add_result != 0 and source.modifier == drm_format_mod_linear and implicit_scanout) {
-        add_result = c.drmModeAddFB2(
-            fd,
-            buffer.size.width,
-            buffer.size.height,
-            framebuffer_format,
-            &handles,
-            &pitches,
-            &offsets,
-            &framebuffer_id,
-            0,
-        );
-    }
-    if (add_result != 0) return error.AddFramebufferFailed;
-    errdefer _ = c.drmModeRmFB(fd, framebuffer_id);
-
-    try self.scanout_framebuffers.put(self.allocator, key, .{
-        .framebuffer_id = framebuffer_id,
-        .size = buffer.size,
-        .format = source.format,
-        .modifier = source.modifier,
-        .plane_count = source.plane_count,
-        .strides = pitches,
-        .offsets = offsets,
-        .last_used = self.scanout_frame_number,
+    return self.scanout_framebuffer_cache.getOrImport(.{
+        .fd = fd,
+        .buffer = buffer,
+        .formats = formats,
+        .implicit_scanout = implicit_scanout,
+        .pinned_keys = &pinned_keys,
     });
-    return .{ .key = key, .framebuffer_id = framebuffer_id };
-}
-
-fn scanoutFramebufferLayoutMatches(
-    framebuffer: ScanoutFramebuffer,
-    size: render.Size,
-    source: render.DmabufSource,
-) bool {
-    if (!std.meta.eql(framebuffer.size, size) or
-        framebuffer.format != source.format or
-        framebuffer.modifier != source.modifier or
-        framebuffer.plane_count != source.plane_count)
-    {
-        return false;
-    }
-    for (source.planeSlice(), 0..) |plane, index| {
-        if (framebuffer.strides[index] != plane.stride or
-            framebuffer.offsets[index] != plane.offset) return false;
-    }
-    return true;
-}
-
-fn closeImportedBufferHandles(
-    fd: std.posix.fd_t,
-    handles: [render.max_dmabuf_planes]u32,
-) void {
-    handle_loop: for (handles, 0..) |handle, index| {
-        if (handle == 0) continue;
-        for (handles[0..index]) |previous| if (previous == handle) continue :handle_loop;
-        if (c.drmCloseBufferHandle(fd, handle) != 0) {
-            log.err("failed to close imported DRM buffer handle {d}", .{handle});
-        }
-    }
 }
 
 fn dmabufPlanesShareAllocation(planes: []const render.DmabufPlane) bool {
@@ -2582,64 +2424,6 @@ test "overlay synchronization requires one shared DMA-BUF allocation" {
     }));
 }
 
-test "scanout framebuffer cache validates every DMA-BUF plane" {
-    const NoopSource = struct {
-        fn retain(_: *anyopaque) void {}
-        fn release(_: *anyopaque) void {}
-        fn begin(_: *anyopaque) bool {
-            return true;
-        }
-        fn end(_: *anyopaque) bool {
-            return true;
-        }
-        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
-            return null;
-        }
-    };
-
-    var context: u8 = 0;
-    var source: render.DmabufSource = .{
-        .context = &context,
-        .format = @intFromEnum(render.DmabufFormat.nv12),
-        .modifier = 7,
-        .planes = .{
-            .{ .stride = 128, .offset = 0 },
-            .{ .stride = 64, .offset = 8192 },
-            .{},
-            .{},
-        },
-        .plane_count = 2,
-        .y_inverted = false,
-        .force_opaque = true,
-        .retain = NoopSource.retain,
-        .release = NoopSource.release,
-        .begin_cpu_read = NoopSource.begin,
-        .end_cpu_read = NoopSource.end,
-        .export_read_fence = NoopSource.exportFence,
-    };
-    const framebuffer: ScanoutFramebuffer = .{
-        .framebuffer_id = 1,
-        .size = .{ .width = 64, .height = 64 },
-        .format = source.format,
-        .modifier = source.modifier,
-        .plane_count = source.plane_count,
-        .strides = .{ 128, 64, 0, 0 },
-        .offsets = .{ 0, 8192, 0, 0 },
-        .last_used = 1,
-    };
-    try std.testing.expect(scanoutFramebufferLayoutMatches(
-        framebuffer,
-        framebuffer.size,
-        source,
-    ));
-    source.planes[1].offset += 64;
-    try std.testing.expect(!scanoutFramebufferLayoutMatches(
-        framebuffer,
-        framebuffer.size,
-        source,
-    ));
-}
-
 fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
     const source = buffer.dmabuf orelse return false;
     if (source.plane_count != 1) return false;
@@ -2650,13 +2434,11 @@ fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer)
         c.DRM_FORMAT_XRGB8888;
     if (source.format != compositor_format) return false;
     if (self.direct_displayed) |displayed| {
-        const current = self.scanout_framebuffers.get(displayed.framebuffer_key) orelse return false;
-        return current.format == source.format and
-            std.meta.eql(current.size, buffer.size) and
-            current.modifier == source.modifier and
-            current.plane_count == 1 and
-            current.strides[0] == plane.stride and
-            current.offsets[0] == plane.offset;
+        return self.scanout_framebuffer_cache.matchesLayout(
+            displayed.framebuffer_key,
+            buffer.size,
+            source,
+        );
     }
 
     const index = self.displayed orelse return false;
@@ -3579,34 +3361,6 @@ fn boundedU32(value: u64) u32 {
     return @intCast(@min(value, std.math.maxInt(u32)));
 }
 
-fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
-    if (self.scanout_framebuffers.count() < max_scanout_framebuffers) return;
-    var oldest_key: ?ScanoutFramebufferKey = null;
-    var oldest_frame: u64 = std.math.maxInt(u64);
-    var iterator = self.scanout_framebuffers.iterator();
-    while (iterator.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if ((self.direct_pending != null and
-            std.meta.eql(self.direct_pending.?.framebuffer_key, key)) or
-            (self.direct_displayed != null and
-                std.meta.eql(self.direct_displayed.?.framebuffer_key, key)) or
-            (self.overlay_pending != null and
-                std.meta.eql(self.overlay_pending.?.framebuffer_key, key)) or
-            (self.overlay_displayed != null and
-                std.meta.eql(self.overlay_displayed.?.framebuffer_key, key)) or
-            (self.validated_overlay != null and
-                std.meta.eql(self.validated_overlay.?.scanout.framebuffer_key, key)) or
-            entry.value_ptr.last_used >= oldest_frame) continue;
-        oldest_key = key;
-        oldest_frame = entry.value_ptr.last_used;
-    }
-    const key = oldest_key orelse return error.CacheFull;
-    const framebuffer = self.scanout_framebuffers.fetchRemove(key).?.value;
-    if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
-        log.err("failed to remove scanout framebuffer {d}", .{framebuffer.framebuffer_id});
-    }
-}
-
 fn releaseClientScanouts(self: *Self) void {
     self.releasePendingClientScanouts();
     if (self.direct_displayed) |scanout| scanout.release();
@@ -3642,17 +3396,6 @@ fn discardValidatedOverlay(self: *Self) void {
 fn discardFailedValidatedFrame(self: *Self) void {
     self.discardValidatedOverlay();
     self.acquired = null;
-}
-
-fn destroyScanoutFramebuffers(self: *Self, fd: std.posix.fd_t) void {
-    while (self.scanout_framebuffers.count() > 0) {
-        var iterator = self.scanout_framebuffers.iterator();
-        const key = iterator.next().?.key_ptr.*;
-        const framebuffer = self.scanout_framebuffers.fetchRemove(key).?.value;
-        if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
-            log.err("failed to remove scanout framebuffer {d}", .{framebuffer.framebuffer_id});
-        }
-    }
 }
 
 fn setDirectScanoutActive(self: *Self, active: bool) void {
