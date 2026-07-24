@@ -542,6 +542,9 @@ const Frame = struct {
         expected: Constraints,
         timestamp: presentation.Timestamp,
     ) void {
+        std.debug.assert(!self.finished);
+        std.debug.assert(self.scheduled_output == null);
+        std.debug.assert(self.pending == null);
         self.resource.sendTransform(expected.transform);
         self.resource.sendDamage(
             0,
@@ -560,9 +563,10 @@ const Frame = struct {
     }
 
     fn fail(self: *Frame, reason: ext.ImageCopyCaptureFrameV1.FailureReason) void {
-        self.cancelPendingCapture();
         if (self.finished) return;
         self.finished = true;
+        self.scheduled_output = null;
+        self.cancelPendingCapture();
         self.resource.sendFailed(reason);
     }
 
