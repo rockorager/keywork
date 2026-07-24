@@ -518,12 +518,16 @@ fn findXwayland(self: *Self, xwayland_id: Xwm.WindowId) ?WindowId {
 }
 
 fn transientParent(self: *Self, window: *const Window) ?WindowId {
-    const xdg_id = switch (window.backend) {
-        .xdg => |id| id,
-        .xwayland => return null,
+    return switch (window.backend) {
+        .xdg => |id| {
+            const parent = (self.xdg_shell.windowInfo(id) orelse return null).parent orelse return null;
+            return self.findXdg(parent);
+        },
+        .xwayland => |id| {
+            const parent = (self.xwayland.window_info(self.xwayland.context, id) orelse return null).parent orelse return null;
+            return self.findXwayland(parent);
+        },
     };
-    const parent = (self.xdg_shell.windowInfo(xdg_id) orelse return null).parent orelse return null;
-    return self.findXdg(parent);
 }
 
 fn fixedSizeWantsFloating(minimum: XdgShell.SizeHint, maximum: XdgShell.SizeHint) bool {
@@ -2794,7 +2798,11 @@ pub fn xwaylandWindowMetadataChanged(self: *Self, id: Xwm.WindowId) void {
         if (self.findXwayland(id)) |managed| self.removeId(managed);
         return;
     }
-    if (info.mapped and self.findXwayland(id) == null) self.xwaylandWindowMapped(id, true);
+    if (self.findXwayland(id) == null) {
+        if (info.mapped) self.xwaylandWindowMapped(id, true);
+        return;
+    }
+    self.relayout();
 }
 
 pub fn xwaylandWindowFullscreenRequested(self: *Self, id: Xwm.WindowId, fullscreen: bool, output: ?OutputLayout.Id) void {
