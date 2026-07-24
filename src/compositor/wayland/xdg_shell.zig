@@ -942,7 +942,7 @@ pub fn popupGrabOwnsSurface(self: *Self, surface_id: Surface.Id) bool {
 }
 
 pub fn popupKeyboardFocus(self: *Self) ?Surface.Id {
-    const popup_id = self.topGrabbedPopup() orelse return null;
+    const popup_id = self.topMappedGrabbedPopup() orelse return null;
     const popup = self.popups.get(popup_id) orelse return null;
     const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse return null;
     return xdg_surface.surface_id;
@@ -1002,12 +1002,20 @@ pub fn dismissPopupGrab(self: *Self) void {
 }
 
 fn topGrabbedPopup(self: *Self) ?PopupId {
+    return self.findTopGrabbedPopup(false);
+}
+
+fn topMappedGrabbedPopup(self: *Self) ?PopupId {
+    return self.findTopGrabbedPopup(true);
+}
+
+fn findTopGrabbedPopup(self: *Self, require_mapped: bool) ?PopupId {
     var result: ?PopupId = null;
     var order: u64 = 0;
     var iterator = self.popups.iterator();
     while (iterator.next()) |entry| {
         const popup = entry.value;
-        if (!popup.grabbed or !popup.mapped or popup.dismissed) continue;
+        if (!popup.grabbed or popup.dismissed or (require_mapped and !popup.mapped)) continue;
         if (result == null or popup.order > order) {
             result = entry.id;
             order = popup.order;
@@ -2720,6 +2728,44 @@ test "popup configure acknowledgements retain the matched placement" {
         state.last_acked_configure.?.popup.?.placement.position,
     );
     try std.testing.expectEqual(@as(usize, 0), state.configures.items.len);
+}
+
+test "explicit popup grabs precede popup mapping" {
+    const allocator = std.testing.allocator;
+    var shell: Self = undefined;
+    shell.popups = .{};
+    defer shell.popups.deinit(allocator);
+
+    const initial: PopupState = .{
+        .xdg_surface_id = undefined,
+        .parent = .unattached,
+        .scene_id = null,
+        .resource = undefined,
+        .rules = .{},
+        .order = 1,
+    };
+    const parent = try shell.popups.insert(allocator, initial);
+    errdefer _ = shell.popups.remove(parent);
+    var child_state = initial;
+    child_state.order = 2;
+    const child = try shell.popups.insert(allocator, child_state);
+    errdefer _ = shell.popups.remove(child);
+    defer {
+        _ = shell.popups.remove(child);
+        _ = shell.popups.remove(parent);
+    }
+
+    shell.popups.get(parent).?.grabbed = true;
+    try std.testing.expect(std.meta.eql(parent, shell.topGrabbedPopup().?));
+    try std.testing.expect(shell.topMappedGrabbedPopup() == null);
+
+    shell.popups.get(parent).?.mapped = true;
+    shell.popups.get(child).?.grabbed = true;
+    try std.testing.expect(std.meta.eql(child, shell.topGrabbedPopup().?));
+    try std.testing.expect(std.meta.eql(parent, shell.topMappedGrabbedPopup().?));
+
+    shell.popups.get(child).?.mapped = true;
+    try std.testing.expect(std.meta.eql(child, shell.topMappedGrabbedPopup().?));
 }
 
 test "xdg toplevel states are gated by protocol version" {
