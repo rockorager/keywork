@@ -5,7 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
-const SelectionSource = @import("selection_source.zig").Source;
+const SelectionSource = @import("SelectionSource.zig");
 const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;

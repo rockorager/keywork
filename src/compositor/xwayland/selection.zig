@@ -6,7 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const DataDevice = @import("../wayland/data_device.zig");
 const PrimarySelection = @import("../wayland/primary_selection.zig");
-const SelectionSource = @import("../wayland/selection_source.zig").Source;
+const SelectionSource = @import("../wayland/SelectionSource.zig");
 const c = @import("xcb.zig").c;
 
 const wl = wayland.server.wl;

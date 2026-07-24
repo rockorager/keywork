@@ -502,7 +502,7 @@ test {
     _ = @import("wayland/gamma_control.zig");
     _ = @import("wayland/data_device.zig");
     _ = @import("wayland/primary_selection.zig");
-    _ = @import("wayland/selection_source.zig");
+    _ = @import("wayland/SelectionSource.zig");
     _ = @import("wayland/data_control.zig");
     _ = @import("wayland/foreign_toplevel_list.zig");
     _ = @import("wayland/image_capture_source.zig");

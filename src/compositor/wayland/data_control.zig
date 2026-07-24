@@ -8,7 +8,7 @@ const DataDevice = @import("data_device.zig");
 const PrimarySelection = @import("primary_selection.zig");
 const Seat = @import("seat.zig");
 const SecurityContext = @import("security_context.zig");
-const SelectionSource = @import("selection_source.zig").Source;
+const SelectionSource = @import("SelectionSource.zig");
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
