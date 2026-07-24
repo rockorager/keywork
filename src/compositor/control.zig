@@ -48,8 +48,8 @@ pub const Executor = struct {
     statistics: *const fn (
         *anyopaque,
         std.mem.Allocator,
-        bool,
     ) anyerror![]control.OutputStatistics,
+    reset_statistics: *const fn (*anyopaque) void,
     set_unfocused_border: *const fn (*anyopaque, control.Border) void,
     set_log_level: *const fn (*anyopaque, control.LogLevel) void,
     reload: *const fn (*anyopaque) ?[]const u8,
@@ -197,11 +197,39 @@ fn acceptClients(self: *Self) void {
             }
             return;
         }
+        const peer_uid = peerUid(fd) catch |err| {
+            _ = std.c.close(fd);
+            log.warn("failed to authenticate control client: {t}", .{err});
+            continue;
+        };
+        if (!peerAuthorized(std.c.geteuid(), peer_uid)) {
+            _ = std.c.close(fd);
+            log.warn("rejected control client owned by uid {d}", .{peer_uid});
+            continue;
+        }
         Client.create(self, fd) catch |err| {
             _ = std.c.close(fd);
             log.warn("failed to register control client: {t}", .{err});
         };
     }
+}
+
+fn peerUid(fd: std.posix.fd_t) !std.c.uid_t {
+    var credentials: c.struct_ucred = undefined;
+    var size: c.socklen_t = @sizeOf(c.struct_ucred);
+    if (c.getsockopt(
+        fd,
+        c.SOL_SOCKET,
+        c.SO_PEERCRED,
+        &credentials,
+        &size,
+    ) < 0) return error.PeerCredentialsUnavailable;
+    if (size != @sizeOf(c.struct_ucred)) return error.InvalidPeerCredentials;
+    return credentials.uid;
+}
+
+fn peerAuthorized(owner_uid: std.c.uid_t, peer_uid: std.c.uid_t) bool {
+    return owner_uid == peer_uid;
 }
 
 const Client = struct {
@@ -276,6 +304,7 @@ const Client = struct {
                     self.owner.executor.quit(self.owner.executor.context);
                     return false;
                 }
+                if (self.output_offset < self.output.items.len) return self.updateMask();
                 continue;
             }
             if (result == 0) return false;
@@ -288,33 +317,47 @@ const Client = struct {
     }
 
     fn writeAvailable(self: *Client) bool {
-        while (self.output_offset < self.output.items.len) {
-            const pending = self.output.items[self.output_offset..];
-            const result = std.c.send(self.fd, pending.ptr, pending.len, c.MSG_NOSIGNAL);
-            if (result > 0) {
-                self.output_offset += @intCast(result);
-                continue;
+        while (true) {
+            while (self.output_offset < self.output.items.len) {
+                const pending = self.output.items[self.output_offset..];
+                const result = std.c.send(self.fd, pending.ptr, pending.len, c.MSG_NOSIGNAL);
+                if (result > 0) {
+                    self.output_offset += @intCast(result);
+                    continue;
+                }
+                if (result == 0) return false;
+                switch (std.posix.errno(result)) {
+                    .AGAIN => return self.updateMask(),
+                    .INTR => continue,
+                    else => return false,
+                }
             }
-            if (result == 0) return false;
-            switch (std.posix.errno(result)) {
-                .AGAIN => return self.updateMask(),
-                .INTR => continue,
-                else => return false,
+            self.output.clearRetainingCapacity();
+            self.output_offset = 0;
+            if (self.quit_after_write) {
+                self.owner.executor.quit(self.owner.executor.context);
+                return false;
             }
+            processInput(
+                self.owner.allocator,
+                self.owner.executor,
+                &self.input,
+                &self.output,
+                &self.quit_after_write,
+            ) catch return false;
+            if (self.quit_after_write and self.output.items.len == 0) {
+                self.owner.executor.quit(self.owner.executor.context);
+                return false;
+            }
+            if (self.output.items.len == 0) return self.updateMask();
         }
-        self.output.clearRetainingCapacity();
-        self.output_offset = 0;
-        if (self.quit_after_write) {
-            self.owner.executor.quit(self.owner.executor.context);
-            return false;
-        }
-        return self.updateMask();
     }
 
     fn updateMask(self: *Client) bool {
+        const reply_pending = self.output_offset < self.output.items.len;
         self.source.fdUpdate(.{
-            .readable = true,
-            .writable = self.output_offset < self.output.items.len,
+            .readable = !reply_pending,
+            .writable = reply_pending,
             .hangup = true,
             .@"error" = true,
         }) catch return false;
@@ -329,10 +372,11 @@ fn processInput(
     output: *std.ArrayList(u8),
     quit_requested: *bool,
 ) !void {
+    if (output.items.len != 0) return;
     var frames: varlink.FrameIterator = .init(input.items);
     while (try frames.next()) |message| {
         try handleMessage(allocator, executor, message, output, quit_requested);
-        if (quit_requested.*) break;
+        if (quit_requested.* or output.items.len != 0) break;
     }
     const consumed = frames.consumed();
     if (consumed == 0) return;
@@ -403,8 +447,8 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
-        executor.execute(executor.context, focusCommand(parameters.value.direction));
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.execute(executor.context, focusCommand(parameters.value.direction));
         return;
     }
     if (std.mem.eql(u8, call.method, control.move_focused_method)) {
@@ -413,8 +457,8 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
-        executor.execute(executor.context, moveCommand(parameters.value.direction));
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.execute(executor.context, moveCommand(parameters.value.direction));
         return;
     }
     if (std.mem.eql(u8, call.method, control.close_method)) {
@@ -423,10 +467,10 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
+        if (!call.oneway) try writeSuccess(allocator, output);
         executor.execute(executor.context, .{ .close = switch (parameters.value.target) {
             .focused => .focused,
         } });
-        if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
     if (std.mem.eql(u8, call.method, control.toggle_fullscreen_method)) {
@@ -435,10 +479,10 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
+        if (!call.oneway) try writeSuccess(allocator, output);
         executor.execute(executor.context, .{ .toggle_fullscreen = switch (parameters.value.target) {
             .focused => .focused,
         } });
-        if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
     if (std.mem.eql(u8, call.method, control.toggle_floating_method)) {
@@ -447,10 +491,10 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
+        if (!call.oneway) try writeSuccess(allocator, output);
         executor.execute(executor.context, .{ .toggle_floating = switch (parameters.value.target) {
             .focused => .focused,
         } });
-        if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
     if (std.mem.eql(u8, call.method, control.set_layout_method)) {
@@ -459,10 +503,10 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
+        if (!call.oneway) try writeSuccess(allocator, output);
         executor.execute(executor.context, switch (parameters.value.layout) {
             .tiled => .layout_tiled,
         });
-        if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
     if (std.mem.eql(u8, call.method, control.switch_workspace_method)) {
@@ -475,8 +519,8 @@ fn handleMessage(
             if (!call.oneway) try writeInvalidWorkspace(allocator, output, parameters.value.workspace);
             return;
         }
-        executor.execute(executor.context, .{ .switch_workspace = @intCast(parameters.value.workspace) });
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.execute(executor.context, .{ .switch_workspace = @intCast(parameters.value.workspace) });
         return;
     }
     if (std.mem.eql(u8, call.method, control.move_focused_to_workspace_method)) {
@@ -489,8 +533,8 @@ fn handleMessage(
             if (!call.oneway) try writeInvalidWorkspace(allocator, output, parameters.value.workspace);
             return;
         }
-        executor.execute(executor.context, .{ .move_to_workspace = @intCast(parameters.value.workspace) });
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.execute(executor.context, .{ .move_to_workspace = @intCast(parameters.value.workspace) });
         return;
     }
     if (std.mem.eql(u8, call.method, control.get_windows_method)) {
@@ -514,15 +558,12 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
-        const statistics = try executor.statistics(
-            executor.context,
-            allocator,
-            parameters.value.reset,
-        );
+        const statistics = try executor.statistics(executor.context, allocator);
         defer allocator.free(statistics);
         if (!call.oneway) try writeMessage(allocator, output, .{
             .parameters = .{ .outputs = statistics },
         });
+        if (parameters.value.reset) executor.reset_statistics(executor.context);
         return;
     }
     if (std.mem.eql(u8, call.method, control.set_unfocused_border_method)) {
@@ -535,8 +576,8 @@ fn handleMessage(
             if (!call.oneway) try writeInvalidParameter(allocator, output, "border");
             return;
         }
-        executor.set_unfocused_border(executor.context, parameters.value.border);
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.set_unfocused_border(executor.context, parameters.value.border);
         return;
     }
     if (std.mem.eql(u8, call.method, control.set_log_level_method)) {
@@ -545,8 +586,8 @@ fn handleMessage(
             return;
         };
         defer parameters.deinit();
-        executor.set_log_level(executor.context, parameters.value.level);
         if (!call.oneway) try writeSuccess(allocator, output);
+        executor.set_log_level(executor.context, parameters.value.level);
         return;
     }
     if (std.mem.eql(u8, call.method, control.reload_configuration_method)) {
@@ -646,10 +687,16 @@ fn writeConfigurationReloadFailed(
     output: *std.ArrayList(u8),
     message: []const u8,
 ) !void {
-    try writeMessage(allocator, output, .{
+    writeMessage(allocator, output, .{
         .@"error" = control.configuration_reload_failed_error,
         .parameters = .{ .message = message },
-    });
+    }) catch |err| switch (err) {
+        error.OutputTooLarge => try writeMessage(allocator, output, .{
+            .@"error" = control.configuration_reload_failed_error,
+            .parameters = .{ .message = "configuration error exceeds control reply limit" },
+        }),
+        else => return err,
+    };
 }
 
 fn writeMessage(
@@ -664,7 +711,7 @@ const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
     windows_count: usize = 0,
     statistics_count: usize = 0,
-    statistics_reset: bool = false,
+    statistics_reset_count: usize = 0,
     unfocused_border: ?control.Border = null,
     log_level: ?control.LogLevel = null,
     reload_count: usize = 0,
@@ -681,6 +728,7 @@ const Recorder = struct {
             .execute = execute,
             .windows = windows,
             .statistics = statistics,
+            .reset_statistics = resetStatistics,
             .set_unfocused_border = setUnfocusedBorder,
             .set_log_level = setLogLevel,
             .reload = reload,
@@ -723,11 +771,9 @@ const Recorder = struct {
     fn statistics(
         context: *anyopaque,
         allocator: std.mem.Allocator,
-        reset: bool,
     ) ![]control.OutputStatistics {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.statistics_count += 1;
-        self.statistics_reset = reset;
         const result = try allocator.alloc(control.OutputStatistics, 1);
         const latency: control.LatencyStatistics = .{
             .samples = 4,
@@ -827,6 +873,11 @@ const Recorder = struct {
         return result;
     }
 
+    fn resetStatistics(context: *anyopaque) void {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.statistics_reset_count += 1;
+    }
+
     fn setUnfocusedBorder(context: *anyopaque, border: control.Border) void {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.unfocused_border = border;
@@ -849,7 +900,23 @@ const Recorder = struct {
     }
 };
 
-test "fragmented and coalesced calls execute typed commands in order" {
+test "control socket authenticates the peer uid" {
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+
+    const owner_uid = std.c.geteuid();
+    try std.testing.expectEqual(owner_uid, try peerUid(sockets[0]));
+    try std.testing.expect(peerAuthorized(owner_uid, owner_uid));
+    const other_uid = if (owner_uid == std.math.maxInt(std.c.uid_t)) owner_uid - 1 else owner_uid + 1;
+    try std.testing.expect(!peerAuthorized(owner_uid, other_uid));
+}
+
+test "fragmented and coalesced calls execute one reply at a time in order" {
     var recorder: Recorder = .{};
     defer recorder.deinit();
     var input: std.ArrayList(u8) = .empty;
@@ -878,11 +945,22 @@ test "fragmented and coalesced calls execute typed commands in order" {
     try input.append(std.testing.allocator, 0);
     try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
 
-    try std.testing.expectEqual(@as(usize, 3), recorder.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
     try std.testing.expect(std.meta.eql(
         command.Command{ .focus_direction = .left },
         recorder.commands.items[0],
     ));
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+    try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
+    try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
+
+    output.clearRetainingCapacity();
+    try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
+    try std.testing.expectEqual(@as(usize, 2), recorder.commands.items.len);
+    output.clearRetainingCapacity();
+    try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
+
+    try std.testing.expectEqual(@as(usize, 3), recorder.commands.items.len);
     try std.testing.expect(std.meta.eql(
         command.Command{ .switch_workspace = 3 },
         recorder.commands.items[1],
@@ -891,10 +969,57 @@ test "fragmented and coalesced calls execute typed commands in order" {
         command.Command{ .close = .focused },
         recorder.commands.items[2],
     ));
-    try std.testing.expectEqualStrings(
-        "{\"parameters\":{}}\x00{\"parameters\":{}}\x00{\"parameters\":{}}\x00",
-        output.items,
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+}
+
+test "mutations occur only after their replies fit the output bound" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+    try output.resize(std.testing.allocator, maximum_output_size);
+
+    const focus =
+        \\{"method":"dev.rockorager.keywork.compositor.Focus","parameters":{"direction":"left"}}
+    ;
+    try std.testing.expectError(
+        error.OutputTooLarge,
+        handleMessage(
+            std.testing.allocator,
+            recorder.executor(),
+            focus,
+            &output,
+            &quit_requested,
+        ),
     );
+    try std.testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
+
+    const statistics =
+        \\{"method":"dev.rockorager.keywork.compositor.GetPerformanceStatistics","parameters":{"reset":true}}
+    ;
+    try std.testing.expectError(
+        error.OutputTooLarge,
+        handleMessage(
+            std.testing.allocator,
+            recorder.executor(),
+            statistics,
+            &output,
+            &quit_requested,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.statistics_count);
+    try std.testing.expectEqual(@as(usize, 0), recorder.statistics_reset_count);
+
+    output.clearRetainingCapacity();
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        focus,
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
 }
 
 test "oneway calls suppress replies and invalid workspaces return typed errors" {
@@ -1057,7 +1182,7 @@ test "performance statistics return typed output snapshots and forward reset" {
         &quit_requested,
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.statistics_count);
-    try std.testing.expect(recorder.statistics_reset);
+    try std.testing.expectEqual(@as(usize, 1), recorder.statistics_reset_count);
     const parsed = try std.json.parseFromSlice(
         struct { parameters: struct { outputs: []control.OutputStatistics } },
         std.testing.allocator,

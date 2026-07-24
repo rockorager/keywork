@@ -3247,6 +3247,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
             .execute = executeControlCommand,
             .windows = controlWindows,
             .statistics = controlPerformanceStatistics,
+            .reset_statistics = resetControlPerformanceStatistics,
             .set_unfocused_border = setControlUnfocusedBorder,
             .set_log_level = setControlLogLevel,
             .reload = reloadControlConfiguration,
@@ -3312,7 +3313,6 @@ fn controlWindows(
 fn controlPerformanceStatistics(
     context: *anyopaque,
     allocator: std.mem.Allocator,
-    reset: bool,
 ) ![]ControlProtocol.OutputStatistics {
     const self: *Self = @ptrCast(@alignCast(context));
     self.collectGpuTimings();
@@ -3328,10 +3328,15 @@ fn controlPerformanceStatistics(
             render_output.backend.refreshMillihertz(),
             self.renderer.workingFormat(),
         );
-        if (reset) render_output.frame_statistics.reset();
     }
-    if (reset) self.renderer.discardGpuTimings();
     return result;
+}
+
+fn resetControlPerformanceStatistics(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| entry.value.*.frame_statistics.reset();
+    self.renderer.discardGpuTimings();
 }
 
 fn outputStatisticsTag(id: OutputLayout.Id) u64 {
