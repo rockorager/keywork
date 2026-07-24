@@ -163,6 +163,10 @@ const ToplevelDrag = struct {
     grab_x: f64,
     grab_y: f64,
     modifier: bool = false,
+    initial_position: Scene.Position,
+    original_floating_override: ?bool,
+    original_floating_position: ?Scene.Position,
+    original_floating_restore_size: ?types.Size,
 };
 
 const InteractiveResize = union(enum) {
@@ -180,7 +184,9 @@ const FloatingResize = struct {
 };
 
 const TiledResize = struct {
-    workspace: usize,
+    window: WindowId,
+    output: OutputLayout.Id,
+    workspace_number: u8,
     resize: layout_mod.Layout.Resize,
 };
 
@@ -1360,7 +1366,9 @@ fn interactiveResizeForWindow(
         resize_edge_threshold,
     ) orelse return null;
     return .{ .tiled = .{
-        .workspace = window.workspace,
+        .window = id,
+        .output = workspace.output,
+        .workspace_number = workspace.number,
         .resize = resize,
     } };
 }
@@ -1424,8 +1432,8 @@ pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) 
     return switch (resize) {
         .floating => |value| self.updateFloatingResize(value, pointer_x, pointer_y),
         .tiled => |value| update: {
-            if (value.workspace >= self.workspaces.items.len) break :update false;
-            const changed = self.workspaces.items[value.workspace].workspace.layout.updateResize(
+            const layout = self.tiledResizeLayout(value) orelse break :update false;
+            const changed = layout.updateResize(
                 value.resize,
                 pointer_x,
                 pointer_y,
@@ -1441,14 +1449,45 @@ pub fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
     if (self.toplevel_drag) |drag| {
         if (drag.modifier) {
             self.toplevel_drag = null;
+            if (!commit) if (self.windows.get(drag.window)) |window| {
+                window.floating_override = drag.original_floating_override;
+                window.floating_position = drag.original_floating_position;
+                window.floating_restore_size = drag.original_floating_restore_size;
+                self.setWindowPositionImmediate(window, drag.initial_position);
+            };
             self.relayout();
             return true;
         }
     }
-    if (self.interactive_resize == null) return false;
+    const resize = self.interactive_resize orelse return false;
     self.interactive_resize = null;
+    if (!commit) switch (resize) {
+        .floating => |value| if (self.windows.get(value.window)) |window| {
+            if (self.isFloating(window)) {
+                const position: Scene.Position = .{
+                    .x = value.initial_rect.x,
+                    .y = value.initial_rect.y,
+                };
+                window.floating_position = position;
+                window.floating_restore_size = value.initial_rect.size;
+                self.setWindowPositionImmediate(window, position);
+            }
+        },
+        .tiled => |value| if (self.tiledResizeLayout(value)) |layout| {
+            _ = layout.cancelResize(value.resize);
+        },
+    };
     self.relayout();
     return true;
+}
+
+fn tiledResizeLayout(self: *Self, resize: TiledResize) ?*layout_mod.Layout {
+    const window = self.windows.get(resize.window) orelse return null;
+    if (window.workspace >= self.workspaces.items.len) return null;
+    const entry = &self.workspaces.items[window.workspace];
+    if (!std.meta.eql(entry.output, resize.output) or
+        entry.number != resize.workspace_number) return null;
+    return &entry.workspace.layout;
 }
 
 pub fn beginToplevelDrag(
@@ -1498,6 +1537,9 @@ fn beginWindowMove(
     else
         pointer_y - @as(f64, @floatFromInt(current.y));
     const position = toplevelDragPosition(pointer_x, pointer_y, grab_x, grab_y);
+    const original_floating_override = window.floating_override;
+    const original_floating_position = window.floating_position;
+    const original_floating_restore_size = window.floating_restore_size;
     if (!self.isFloating(window)) {
         const dimensions = self.currentDimensions(window);
         window.floating_restore_size = types.Size.init(
@@ -1516,6 +1558,10 @@ fn beginWindowMove(
         .grab_x = grab_x,
         .grab_y = grab_y,
         .modifier = modifier,
+        .initial_position = current,
+        .original_floating_override = original_floating_override,
+        .original_floating_position = original_floating_position,
+        .original_floating_restore_size = original_floating_restore_size,
     };
     self.relayout();
     self.setWindowPositionImmediate(window, position);

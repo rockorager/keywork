@@ -195,6 +195,14 @@ pub const Layout = union(enum) {
         };
     }
 
+    pub fn cancelResize(self: *Layout, resize: Resize) bool {
+        return switch (self.*) {
+            .tiled => |*layout| switch (resize) {
+                .tiled => |value| layout.cancelResize(value),
+            },
+        };
+    }
+
     pub fn arrange(
         self: *Layout,
         allocator: std.mem.Allocator,
@@ -229,6 +237,7 @@ pub const Tiled = struct {
         first: NodeIndex,
         second: NodeIndex,
         axis: Axis,
+        original_split_ratio_percent: u8,
         initial_ratio_percent: u8,
         initial_pointer: f64,
         available_length: u32,
@@ -596,6 +605,7 @@ pub const Tiled = struct {
                         .first = split.first,
                         .second = split.second,
                         .axis = split.axis,
+                        .original_split_ratio_percent = split.ratio_percent,
                         .initial_ratio_percent = splitRatioPercent(first_length, second_length),
                         .initial_pointer = pointer,
                         .available_length = available_length,
@@ -613,17 +623,7 @@ pub const Tiled = struct {
         pointer_x: f64,
         pointer_y: f64,
     ) bool {
-        var node_index = self.findLeaf(resize.window) orelse return false;
-        while (node_index != resize.split_index) {
-            node_index = self.nodes.items[node_index].parent orelse return false;
-        }
-        const node = &self.nodes.items[resize.split_index];
-        const split = switch (node.content) {
-            .leaf => return false,
-            .split => &node.content.split,
-        };
-        if (split.first != resize.first or split.second != resize.second or
-            split.axis != resize.axis) return false;
+        const split = self.resizeSplit(resize) orelse return false;
         const pointer = if (resize.axis == .horizontal) pointer_x else pointer_y;
         const ratio = resizedRatio(
             resize.initial_ratio_percent,
@@ -647,6 +647,28 @@ pub const Tiled = struct {
         if (ratio == split.ratio_percent) return false;
         split.ratio_percent = ratio;
         return true;
+    }
+
+    fn cancelResize(self: *Tiled, resize: Resize) bool {
+        const split = self.resizeSplit(resize) orelse return false;
+        if (split.ratio_percent == resize.original_split_ratio_percent) return false;
+        split.ratio_percent = resize.original_split_ratio_percent;
+        return true;
+    }
+
+    fn resizeSplit(self: *Tiled, resize: Resize) ?*Split {
+        var node_index = self.findLeaf(resize.window) orelse return null;
+        while (node_index != resize.split_index) {
+            node_index = self.nodes.items[node_index].parent orelse return null;
+        }
+        const node = &self.nodes.items[resize.split_index];
+        const split = switch (node.content) {
+            .leaf => return null,
+            .split => &node.content.split,
+        };
+        if (split.first != resize.first or split.second != resize.second or
+            split.axis != resize.axis) return null;
+        return split;
     }
 
     fn arrange(
@@ -1221,9 +1243,12 @@ test "tiled resize uses constrained split geometry" {
     var plans = try layout.arrange(std.testing.allocator, &.{ first, second }, area, first.id);
     plans.deinit(std.testing.allocator);
     const resize = layout.beginResize(first.id, 69, 30, 2).?;
+    try std.testing.expectEqual(@as(u8, 50), resize.tiled.original_split_ratio_percent);
     try std.testing.expectEqual(@as(u8, 70), resize.tiled.initial_ratio_percent);
     try std.testing.expect(!layout.updateResize(resize, 69, 30));
     try std.testing.expect(layout.updateResize(resize, 40, 30));
+    try std.testing.expect(layout.cancelResize(resize));
+    try std.testing.expect(!layout.cancelResize(resize));
     plans = try layout.arrange(std.testing.allocator, &.{ first, second }, area, first.id);
     defer plans.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 70), plans.items[0].rect.size.width);
@@ -1583,6 +1608,7 @@ test "tiled pointer resize rejects a split removed during the grab" {
     const resize = layout.beginResize(first.id, 45, 50, 8).?;
     layout.windowRemoved(second.id);
     try std.testing.expect(!layout.updateResize(resize, 60, 50));
+    try std.testing.expect(!layout.cancelResize(resize));
 }
 
 test "tiled pointer resize accepts a window edge across a wide gap" {
