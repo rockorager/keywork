@@ -1679,12 +1679,11 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     // configuration is infrequent, so reject a busy head and let the client
     // retry rather than complicating the page-flip lifetime.
     if (self.pending != null or self.direct_pending != null) return error.OutputBusy;
-    _ = self.disableCursor(fd);
-    self.acquired = null;
-    self.acquired_damage.clear();
     if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
         return error.DisableFailed;
     }
+    self.acquired = null;
+    self.acquired_damage.clear();
     self.cursor_active = false;
     self.cursor_source = null;
     self.cursor_buffer_index = null;
@@ -1708,15 +1707,14 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     const size = mode.size();
 
     if (self.powered) {
-        _ = self.disableCursor(fd);
         const pair = try self.allocatePair(fd, size);
-        self.acquired = null;
-        self.acquired_damage.clear();
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
             var failed_buffers = pair.buffers;
             self.destroyPair(fd, &failed_buffers, pair.shadow_pixels);
             return error.DisableFailed;
         }
+        self.acquired = null;
+        self.acquired_damage.clear();
         self.cursor_active = false;
         self.cursor_source = null;
         self.cursor_buffer_index = null;
