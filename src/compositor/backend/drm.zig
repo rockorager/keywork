@@ -10,6 +10,7 @@ const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const Icc = @import("../render/icc.zig");
 const render = @import("../render/types.zig");
+const plane_assignment = @import("drm_plane_assignment.zig");
 
 const c = @cImport({
     @cInclude("stdlib.h");
@@ -257,17 +258,10 @@ const AtomicPlaneDisableProperties = struct {
     }
 };
 
-const PlaneZpos = struct {
-    property_id: u32,
-    current: u64,
-    maximum: u64,
-    immutable: bool,
-};
-
 const PlaneSelectionInfo = struct {
     plane_type: ?u64 = null,
     formats_blob_id: ?u32 = null,
-    zpos: ?PlaneZpos = null,
+    zpos: ?plane_assignment.Zpos = null,
 };
 
 const OverlayPlane = struct {
@@ -2180,53 +2174,6 @@ fn planeSelectionInfo(fd: std.posix.fd_t, plane_id: u32) ?PlaneSelectionInfo {
     return result;
 }
 
-const PlaneAssignmentRank = struct {
-    attachment: u8,
-    possible_crtc_count: u8,
-    plane_id: u32,
-
-    fn betterThan(self: PlaneAssignmentRank, other: PlaneAssignmentRank) bool {
-        if (self.attachment != other.attachment) return self.attachment > other.attachment;
-        if (self.possible_crtc_count != other.possible_crtc_count) {
-            return self.possible_crtc_count < other.possible_crtc_count;
-        }
-        return self.plane_id < other.plane_id;
-    }
-};
-
-fn planeAssignmentRank(
-    plane_id: u32,
-    plane_crtc_id: u32,
-    possible_crtcs: u32,
-    crtc_id: u32,
-    preferred_plane_id: ?u32,
-) PlaneAssignmentRank {
-    const attachment: u8 = if (preferred_plane_id == plane_id and
-        (plane_crtc_id == 0 or plane_crtc_id == crtc_id))
-        3
-    else if (plane_crtc_id == crtc_id)
-        2
-    else if (plane_crtc_id == 0)
-        1
-    else
-        0;
-    return .{
-        .attachment = attachment,
-        .possible_crtc_count = @intCast(@popCount(possible_crtcs)),
-        .plane_id = plane_id,
-    };
-}
-
-fn overlayZpos(zpos: PlaneZpos, primary_zpos: u64) ?u64 {
-    if (zpos.current > primary_zpos) return zpos.current;
-    if (zpos.immutable or zpos.maximum <= primary_zpos) return null;
-    return primary_zpos + 1;
-}
-
-fn writableZposProperty(zpos: PlaneZpos) ?u32 {
-    return if (zpos.immutable) null else zpos.property_id;
-}
-
 fn overlayPlane(
     fd: std.posix.fd_t,
     crtc_id: u32,
@@ -2242,7 +2189,7 @@ fn overlayPlane(
     defer c.drmModeFreePlaneResources(resources);
     var selected: ?OverlayPlane = null;
     errdefer if (selected) |plane| plane.deinit(allocator);
-    var selected_rank: ?PlaneAssignmentRank = null;
+    var selected_rank: ?plane_assignment.Rank = null;
     const plane_count: usize = @intCast(resources.*.count_planes);
     for (resources.*.planes[0..plane_count]) |plane_id| {
         const plane = c.drmModeGetPlane(fd, plane_id) orelse continue;
@@ -2252,7 +2199,7 @@ fn overlayPlane(
             (preferred_plane_id != plane_id and
                 std.mem.indexOfScalar(u32, reserved_planes, plane_id) != null)) continue;
 
-        const rank = planeAssignmentRank(
+        const rank = plane_assignment.rank(
             plane_id,
             plane.*.crtc_id,
             plane.*.possible_crtcs,
@@ -2264,7 +2211,7 @@ fn overlayPlane(
         const info = planeSelectionInfo(fd, plane_id) orelse continue;
         if (info.plane_type != c.DRM_PLANE_TYPE_OVERLAY or info.formats_blob_id == null) continue;
         const zpos = info.zpos orelse continue;
-        const selected_zpos = overlayZpos(zpos, required_primary_zpos) orelse continue;
+        const selected_zpos = plane_assignment.overlayZpos(zpos, required_primary_zpos) orelse continue;
         const atomic = loadAtomicPlaneProperties(fd, plane_id) orelse continue;
         const formats = try planeFormats(fd, plane, info.formats_blob_id, allocator);
         if (formats.len == 0) {
@@ -2276,8 +2223,8 @@ fn overlayPlane(
             .id = plane_id,
             .formats = formats,
             .atomic = atomic,
-            .zpos_property = writableZposProperty(zpos),
-            .zpos = selected_zpos,
+            .zpos_property = selected_zpos.property_id,
+            .zpos = selected_zpos.value,
         };
         selected_rank = rank;
     }
@@ -4549,41 +4496,4 @@ test "CRTC selection preserves preferred and never selects claimed" {
     try std.testing.expectEqual(@as(?usize, 1), selectCrtcIndex(&resources, 0b111, 20, 0));
     try std.testing.expectEqual(@as(?usize, 0), selectCrtcIndex(&resources, 0b111, 20, 0b010));
     try std.testing.expectEqual(@as(?usize, null), selectCrtcIndex(&resources, 0b011, null, 0b011));
-}
-
-test "overlay plane ranking preserves assignments and constrained planes" {
-    const preferred = planeAssignmentRank(7, 0, 0b111, 10, 7);
-    const attached = planeAssignmentRank(8, 10, 0b001, 10, 7);
-    const free = planeAssignmentRank(9, 0, 0b001, 10, 7);
-    const flexible = planeAssignmentRank(10, 0, 0b111, 10, 7);
-    const unavailable = planeAssignmentRank(11, 20, 0b001, 10, 7);
-    try std.testing.expect(preferred.betterThan(attached));
-    try std.testing.expect(attached.betterThan(free));
-    try std.testing.expect(free.betterThan(flexible));
-    try std.testing.expectEqual(@as(u8, 0), unavailable.attachment);
-}
-
-test "overlay plane zpos must remain above primary" {
-    const immutable: PlaneZpos = .{
-        .property_id = 1,
-        .current = 2,
-        .maximum = 2,
-        .immutable = true,
-    };
-    const mutable: PlaneZpos = .{
-        .property_id = 1,
-        .current = 0,
-        .maximum = 3,
-        .immutable = false,
-    };
-    try std.testing.expectEqual(@as(?u64, 2), overlayZpos(immutable, 0));
-    try std.testing.expectEqual(@as(?u64, 1), overlayZpos(mutable, 0));
-    try std.testing.expectEqual(@as(?u32, null), writableZposProperty(immutable));
-    try std.testing.expectEqual(@as(?u32, 1), writableZposProperty(mutable));
-    try std.testing.expectEqual(@as(?u64, null), overlayZpos(.{
-        .property_id = 1,
-        .current = 0,
-        .maximum = 0,
-        .immutable = true,
-    }, 0));
 }
