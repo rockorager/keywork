@@ -1216,6 +1216,8 @@ fn addInputDevice(
     else
         null;
     errdefer if (tablet_pad_info) |info| self.deinitTabletPadInfo(info);
+    const retained_device = c.libinput_device_ref(libinput_device).?;
+    errdefer _ = c.libinput_device_unref(retained_device);
     try self.input_devices.append(self.allocator, .{
         .info = .{
             .id = id,
@@ -1225,7 +1227,7 @@ fn addInputDevice(
             .vendor = c.libinput_device_get_id_vendor(libinput_device),
             .product = c.libinput_device_get_id_product(libinput_device),
         },
-        .libinput_device = libinput_device,
+        .libinput_device = retained_device,
         .keyboard = keyboard,
         .tablet_info = tablet_info,
         .tablet_pad_info = tablet_pad_info,
@@ -1400,6 +1402,7 @@ fn deinitInputDevice(self: *Self, device: *InputDevice) void {
     if (device.tablet_info) |info| if (info.path) |path| self.allocator.free(path);
     if (device.tablet_pad_info) |info| self.deinitTabletPadInfo(info);
     self.allocator.free(device.info.name);
+    _ = c.libinput_device_unref(device.libinput_device);
 }
 
 fn promoteKeyboard(self: *Self) void {
