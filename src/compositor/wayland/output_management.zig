@@ -39,6 +39,7 @@ pub const Change = struct {
 
 pub const Listener = struct {
     context: *anyopaque,
+    test_configuration: *const fn (*anyopaque, []const Change) bool,
     apply: *const fn (*anyopaque, []const Change) bool,
 };
 
@@ -829,7 +830,11 @@ fn finish(configuration: *Configuration, apply: bool) void {
         };
     }
     if (!apply) {
-        configuration.resource.sendSucceeded();
+        if (manager.listener.test_configuration(manager.listener.context, changes.items)) {
+            configuration.resource.sendSucceeded();
+        } else {
+            configuration.resource.sendFailed();
+        }
         return;
     }
     if (!manager.listener.apply(manager.listener.context, changes.items)) {
@@ -987,7 +992,7 @@ test "disconnected head storage is reclaimed across reconnects" {
         display,
         &.{&output},
         &security_context,
-        .{ .context = &context, .apply = testApply },
+        .{ .context = &context, .test_configuration = testApply, .apply = testApply },
     );
     defer manager.deinit();
 
@@ -1037,7 +1042,7 @@ test "configuration retains disconnected head storage" {
         display,
         &.{&output},
         &security_context,
-        .{ .context = &context, .apply = testApply },
+        .{ .context = &context, .test_configuration = testApply, .apply = testApply },
     );
     defer manager.deinit();
 

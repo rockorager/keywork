@@ -855,7 +855,11 @@ pub fn createWithVirtualOutput(
             display,
             self.drm_device.outputs(),
             &self.security_context,
-            .{ .context = self, .apply = applyOutputConfiguration },
+            .{
+                .context = self,
+                .test_configuration = testOutputConfiguration,
+                .apply = applyOutputConfiguration,
+            },
         );
         self.output_management_initialized = true;
         errdefer {
@@ -2176,7 +2180,12 @@ fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManageme
     return self.applyOutputChanges(changes);
 }
 
-fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
+fn testOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.outputChangesAvailable(changes);
+}
+
+fn outputChangesAvailable(self: *Self, changes: []const OutputManagement.Change) bool {
     if (self.drm_lease_initialized) for (changes) |change| {
         if (self.drm_lease.outputLeased(change.output)) return false;
     };
@@ -2188,6 +2197,11 @@ fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) boo
             change.scale,
         )) return false;
     }
+    return true;
+}
+
+fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
+    if (!self.outputChangesAvailable(changes)) return false;
     for (changes) |change| {
         if (change.old_mode_index == change.mode_index) continue;
         self.drm_device.setOutputMode(change.output, change.mode_index) catch {
