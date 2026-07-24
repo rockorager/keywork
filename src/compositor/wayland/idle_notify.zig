@@ -56,11 +56,7 @@ pub fn deinit(self: *Self) void {
 pub fn notifyActivity(self: *Self, seat: *Seat) void {
     const timestamp = now(self.io);
     for (self.notifications.items) |notification| {
-        if (notification.seat != seat or
-            (self.inhibited and notification.obey_inhibitors))
-        {
-            continue;
-        }
+        if (notification.seat != seat) continue;
         notification.setIdle(false);
         notification.restart(timestamp);
     }
@@ -70,14 +66,9 @@ pub fn notifyActivity(self: *Self, seat: *Seat) void {
 pub fn setInhibited(self: *Self, inhibited: bool) void {
     if (self.inhibited == inhibited) return;
     self.inhibited = inhibited;
-    const timestamp = now(self.io);
     for (self.notifications.items) |notification| {
         if (!notification.obey_inhibitors) continue;
         notification.setIdle(false);
-        notification.deadline = if (inhibited)
-            null
-        else
-            deadline(timestamp, notification.timeout_ms);
     }
     self.scheduleTimer() catch self.fail();
 }
@@ -140,10 +131,7 @@ fn createNotification(
         .resource = resource,
         .seat = Seat.fromResource(seat_resource),
         .timeout_ms = timeout_ms,
-        .deadline = if (self.inhibited and obey_inhibitors)
-            null
-        else
-            deadline(now(self.io), timeout_ms),
+        .deadline = deadline(now(self.io), timeout_ms),
         .obey_inhibitors = obey_inhibitors,
         .idle = false,
     };
@@ -188,9 +176,10 @@ fn scheduleTimer(self: *Self) std.posix.UnexpectedError!void {
     const timestamp = now(self.io);
     var earliest: ?i96 = null;
     for (self.notifications.items) |notification| {
-        const notification_deadline = notification.deadline orelse continue;
+        // Inhibition suppresses delivery without pausing elapsed inactivity.
+        if (notification.idle or (self.inhibited and notification.obey_inhibitors)) continue;
+        const notification_deadline = notification.deadline;
         if (notification_deadline <= timestamp) {
-            notification.deadline = null;
             notification.setIdle(true);
             continue;
         }
@@ -231,7 +220,7 @@ const Notification = struct {
     resource: *ext.IdleNotificationV1,
     seat: *Seat,
     timeout_ms: u32,
-    deadline: ?i96,
+    deadline: i96,
     obey_inhibitors: bool,
     idle: bool,
 
