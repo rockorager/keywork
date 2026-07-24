@@ -6,6 +6,7 @@ const std = @import("std");
 const vk = @import("vulkan");
 const CpuRenderer = @import("cpu.zig");
 const render = @import("types.zig");
+const color_math = @import("color_math.zig");
 const shaders = @import("vulkan_shaders.zig");
 const sync = @cImport({
     @cInclude("linux/dma-buf.h");
@@ -262,15 +263,6 @@ const FramePush = extern struct {
     transfer_aux: [4]f32 = .{ 0.2, 0.2126, 0.7152, 0.0722 },
 };
 
-const ColorTransform = extern struct {
-    color_matrix_0: [4]f32 = .{ 1, 0, 0, 0 },
-    color_matrix_1: [4]f32 = .{ 0, 1, 0, 0 },
-    color_matrix_2: [4]f32 = .{ 0, 0, 1, 0 },
-    transfer: [4]f32 = .{ 0, 1, 1, 1 },
-    output_transfer: [4]f32 = .{ 1, 0, 80, 80 },
-    transfer_aux: [4]f32 = .{ 0.2, 0.2126, 0.7152, 0.0722 },
-};
-
 const PipelineKind = enum {
     replace,
     blend,
@@ -399,7 +391,7 @@ const DrawRun = struct {
     texture_size: render.Size,
     first_instance: u32,
     instance_count: u32,
-    color_transform: ColorTransform = .{},
+    color_transform: color_math.ColorTransform = .{},
     manual_ycbcr: ?ManualYcbcr = null,
     backdrop_op_index: ?u32 = null,
 };
@@ -3250,7 +3242,7 @@ pub fn copyComposedFrame(
             &.{source.linear.descriptor_set},
             null,
         );
-        var transform = sourceColorTransform(source.color_description, color_description);
+        var transform = color_math.sourceTransform(source.color_description, color_description);
         transform.transfer = @splat(0);
         const conversion_push: FramePush = .{
             .target_size = sizeFloats(size),
@@ -3338,8 +3330,8 @@ pub fn copyComposedFrame(
         .swap_red_blue = @floatFromInt(@intFromBool(output.format == .r8g8b8a8_unorm)),
         .quantization_levels = if (output.format == .a2r10g10b10_unorm_pack32) 1023 else 255,
         .transfer = .{ 1, 80, 80, 0 },
-        .output_transfer = outputColorTransfer(color_description),
-        .transfer_aux = colorTransferAux(color_description),
+        .output_transfer = color_math.outputTransfer(color_description),
+        .transfer_aux = color_math.transferAux(color_description),
     };
     self.device_wrapper.cmdPushConstants(
         output.command_buffer,
@@ -3835,7 +3827,7 @@ fn renderFrameWithCompletion(
                 .color_matrix_2 = .{ 0, 0, 1, 0 },
                 .transfer = .{ 1, 0, 80, 80 },
                 .output_transfer = .{ 1, 0, 80, 80 },
-                .transfer_aux = colorTransferAux(.{}),
+                .transfer_aux = color_math.transferAux(.{}),
             };
             self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &initialize_push);
             self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
@@ -4168,8 +4160,8 @@ fn renderFrameWithCompletion(
             .color_matrix_1 = .{ 0, 1, 0, 0 },
             .color_matrix_2 = .{ 0, 0, 1, 0 },
             .transfer = .{ 1, 80, 80, 0 },
-            .output_transfer = outputColorTransfer(frame.output_color_description),
-            .transfer_aux = colorTransferAux(frame.output_color_description),
+            .output_transfer = color_math.outputTransfer(frame.output_color_description),
+            .transfer_aux = color_math.transferAux(frame.output_color_description),
         };
         self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
         self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
@@ -6489,7 +6481,7 @@ fn compileDrawRuns(
                 .destination = rectFloats(rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(color, output_color_description),
+                .color = color_math.linearColor(color, output_color_description),
                 .rounded = .{ 0, 0, 0, 0 },
                 .parameters = .{ 0, 0, 0, 0 },
             });
@@ -6505,7 +6497,7 @@ fn compileDrawRuns(
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(solid.color, output_color_description),
+                .color = color_math.linearColor(solid.color, output_color_description),
                 .rounded = .{ 0, 0, 0, 0 },
                 .parameters = .{ 0, 0, 0, 0 },
             });
@@ -6569,7 +6561,7 @@ fn compileDrawRuns(
                 prepared.texture.pipeline_layout,
                 prepared.texture.descriptor_set,
                 image.buffer.size,
-                sourceColorTransform(
+                color_math.sourceTransform(
                     image.buffer.color_description,
                     output_color_description,
                 ),
@@ -6634,7 +6626,7 @@ fn compileDrawRuns(
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(shadow.color, output_color_description),
+                .color = color_math.linearColor(shadow.color, output_color_description),
                 .rounded = .{
                     @floatFromInt(shape_x),
                     @floatFromInt(shape_y),
@@ -6958,7 +6950,7 @@ fn emitDamaged(
     pipeline_layout: vk.PipelineLayout,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
-    color_transform: ColorTransform,
+    color_transform: color_math.ColorTransform,
     manual_ycbcr: ?ManualYcbcr,
     backdrop_op_index: ?u32,
     instance: Instance,
@@ -7071,7 +7063,7 @@ fn emitInstance(
     pipeline_layout: vk.PipelineLayout,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
-    color_transform: ColorTransform,
+    color_transform: color_math.ColorTransform,
     manual_ycbcr: ?ManualYcbcr,
     backdrop_op_index: ?u32,
     template: Instance,
@@ -7306,214 +7298,6 @@ fn transitionScratchForWrite(self: *Self, command_buffer: vk.CommandBuffer, imag
 
 fn transitionScratchToRead(self: *Self, command_buffer: vk.CommandBuffer, image: vk.Image, old_layout: vk.ImageLayout, source_access: vk.AccessFlags, source_stage: vk.PipelineStageFlags) void {
     self.transitionImage(command_buffer, image, old_layout, .shader_read_only_optimal, source_access, .{ .shader_read_bit = true }, source_stage, .{ .fragment_shader_bit = true });
-}
-
-const Matrix3 = [3][3]f64;
-
-fn sourceColorTransform(
-    description: render.ColorDescription,
-    output_description: render.ColorDescription,
-) ColorTransform {
-    const matrix = colorConversionMatrix(
-        description.primaries,
-        output_description.primaries,
-    ) orelse identityMatrix3();
-    const target_peak = description.max_cll orelse description.targetMaxLuminance();
-    const transfer: [4]f32 = switch (description.transfer_function) {
-        .gamma22 => .{ 1, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .srgb => .{ 2, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .bt1886 => .{ 3, @as(f32, @floatFromInt(description.min_luminance)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .power => |exponent| .{ 4, @as(f32, @floatFromInt(exponent)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .st2084_pq => .{ 5, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
-        .hlg => .{ 6, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
-    };
-    const output_rgb = rgbToXyz(output_description.primaries) orelse
-        rgbToXyz(render.srgb_chromaticities).?;
-    const compress_gamut = gamutCompressionNeeded(matrix);
-    return .{
-        .color_matrix_0 = .{ @floatCast(matrix[0][0]), @floatCast(matrix[0][1]), @floatCast(matrix[0][2]), @floatCast(if (compress_gamut) output_rgb[1][0] else -output_rgb[1][0]) },
-        .color_matrix_1 = .{ @floatCast(matrix[1][0]), @floatCast(matrix[1][1]), @floatCast(matrix[1][2]), @floatCast(output_rgb[1][1]) },
-        .color_matrix_2 = .{ @floatCast(matrix[2][0]), @floatCast(matrix[2][1]), @floatCast(matrix[2][2]), @floatCast(output_rgb[1][2]) },
-        .transfer = transfer,
-        .output_transfer = outputColorTransfer(output_description),
-        .transfer_aux = colorTransferAux(description),
-    };
-}
-
-fn gamutCompressionNeeded(matrix: Matrix3) bool {
-    const tolerance = 0.001;
-    for (matrix) |row| {
-        for (row) |value| {
-            if (value < -tolerance or value > 1 + tolerance) return true;
-        }
-    }
-    return false;
-}
-
-test "renderer conformance: gamut compression policy distinguishes wider and equivalent primaries" {
-    try std.testing.expect(!gamutCompressionNeeded(identityMatrix3()));
-    try std.testing.expect(gamutCompressionNeeded(colorConversionMatrix(
-        render.display_p3_chromaticities,
-        render.srgb_chromaticities,
-    ).?));
-    try std.testing.expect(!gamutCompressionNeeded(colorConversionMatrix(
-        render.srgb_chromaticities,
-        render.display_p3_chromaticities,
-    ).?));
-
-    var nearly_srgb = render.srgb_chromaticities;
-    nearly_srgb.red_x += 1;
-    try std.testing.expect(!gamutCompressionNeeded(colorConversionMatrix(
-        nearly_srgb,
-        render.srgb_chromaticities,
-    ).?));
-}
-
-fn outputColorTransfer(description: render.ColorDescription) [4]f32 {
-    return switch (description.transfer_function) {
-        .gamma22 => .{ 1, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .srgb => .{ 2, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .bt1886 => .{ 3, @as(f32, @floatFromInt(description.min_luminance)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .power => |exponent| .{ 4, @as(f32, @floatFromInt(exponent)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .st2084_pq => .{ 5, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-        .hlg => .{ 6, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
-    };
-}
-
-fn colorTransferAux(description: render.ColorDescription) [4]f32 {
-    const matrix = rgbToXyz(description.primaries) orelse
-        rgbToXyz(render.srgb_chromaticities).?;
-    return .{
-        @as(f32, @floatFromInt(description.min_luminance)) / 10000.0,
-        @floatCast(matrix[1][0]),
-        @floatCast(matrix[1][1]),
-        @floatCast(matrix[1][2]),
-    };
-}
-
-fn colorConversionMatrix(source: render.Chromaticities, destination: render.Chromaticities) ?Matrix3 {
-    const source_rgb = rgbToXyz(source) orelse return null;
-    const destination_rgb = rgbToXyz(destination) orelse return null;
-    const destination_inverse = inverseMatrix3(destination_rgb) orelse return null;
-    const adaptation = chromaticAdaptation(source, destination) orelse return null;
-    return multiplyMatrix3(destination_inverse, multiplyMatrix3(adaptation, source_rgb));
-}
-
-fn rgbToXyz(chromaticities: render.Chromaticities) ?Matrix3 {
-    const values = chromaticities.values();
-    const red = xyToXyz(values[0], values[1]) orelse return null;
-    const green = xyToXyz(values[2], values[3]) orelse return null;
-    const blue = xyToXyz(values[4], values[5]) orelse return null;
-    const white = xyToXyz(values[6], values[7]) orelse return null;
-    const primaries: Matrix3 = .{
-        .{ red[0], green[0], blue[0] },
-        .{ red[1], green[1], blue[1] },
-        .{ red[2], green[2], blue[2] },
-    };
-    const inverse = inverseMatrix3(primaries) orelse return null;
-    const scale = multiplyMatrixVector(inverse, white);
-    return .{
-        .{ primaries[0][0] * scale[0], primaries[0][1] * scale[1], primaries[0][2] * scale[2] },
-        .{ primaries[1][0] * scale[0], primaries[1][1] * scale[1], primaries[1][2] * scale[2] },
-        .{ primaries[2][0] * scale[0], primaries[2][1] * scale[1], primaries[2][2] * scale[2] },
-    };
-}
-
-fn chromaticAdaptation(source: render.Chromaticities, destination: render.Chromaticities) ?Matrix3 {
-    const source_values = source.values();
-    const destination_values = destination.values();
-    const source_white = xyToXyz(source_values[6], source_values[7]) orelse return null;
-    const destination_white = xyToXyz(destination_values[6], destination_values[7]) orelse return null;
-    const bradford: Matrix3 = .{
-        .{ 0.8951, 0.2664, -0.1614 },
-        .{ -0.7502, 1.7135, 0.0367 },
-        .{ 0.0389, -0.0685, 1.0296 },
-    };
-    const bradford_inverse: Matrix3 = .{
-        .{ 0.9869929, -0.1470543, 0.1599627 },
-        .{ 0.4323053, 0.5183603, 0.0492912 },
-        .{ -0.0085287, 0.0400428, 0.9684867 },
-    };
-    const source_cone = multiplyMatrixVector(bradford, source_white);
-    const destination_cone = multiplyMatrixVector(bradford, destination_white);
-    if (@abs(source_cone[0]) < 1e-12 or @abs(source_cone[1]) < 1e-12 or @abs(source_cone[2]) < 1e-12) return null;
-    const scale: Matrix3 = .{
-        .{ destination_cone[0] / source_cone[0], 0, 0 },
-        .{ 0, destination_cone[1] / source_cone[1], 0 },
-        .{ 0, 0, destination_cone[2] / source_cone[2] },
-    };
-    return multiplyMatrix3(bradford_inverse, multiplyMatrix3(scale, bradford));
-}
-
-fn xyToXyz(x_fixed: i32, y_fixed: i32) ?[3]f64 {
-    const x = @as(f64, @floatFromInt(x_fixed)) / 1_000_000.0;
-    const y = @as(f64, @floatFromInt(y_fixed)) / 1_000_000.0;
-    if (!std.math.isFinite(x) or !std.math.isFinite(y) or y <= 0) return null;
-    return .{ x / y, 1, (1 - x - y) / y };
-}
-
-fn identityMatrix3() Matrix3 {
-    return .{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 0, 1 } };
-}
-
-fn multiplyMatrix3(a: Matrix3, b: Matrix3) Matrix3 {
-    var result: Matrix3 = @splat(@splat(0));
-    for (0..3) |row| for (0..3) |column| for (0..3) |index| {
-        result[row][column] += a[row][index] * b[index][column];
-    };
-    return result;
-}
-
-fn multiplyMatrixVector(matrix: Matrix3, vector: [3]f64) [3]f64 {
-    var result: [3]f64 = @splat(0);
-    for (0..3) |row| {
-        for (0..3) |column| result[row] += matrix[row][column] * vector[column];
-    }
-    return result;
-}
-
-fn inverseMatrix3(matrix: Matrix3) ?Matrix3 {
-    const determinant = matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) -
-        matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0]) +
-        matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]);
-    if (!std.math.isFinite(determinant) or @abs(determinant) < 1e-12) return null;
-    const inverse = 1.0 / determinant;
-    return .{
-        .{ (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) * inverse, (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2]) * inverse, (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1]) * inverse },
-        .{ (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2]) * inverse, (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0]) * inverse, (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2]) * inverse },
-        .{ (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]) * inverse, (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1]) * inverse, (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]) * inverse },
-    };
-}
-
-fn colorFloats(
-    color: render.Color,
-    output_description: render.ColorDescription,
-) [4]f32 {
-    const inverse: f32 = 1.0 / 255.0;
-    const alpha = @as(f32, @floatFromInt(color.alpha)) * inverse;
-    if (alpha == 0) return .{ 0, 0, 0, 0 };
-    const red = @as(f32, @floatFromInt(color.red)) * inverse / alpha;
-    const green = @as(f32, @floatFromInt(color.green)) * inverse / alpha;
-    const blue = @as(f32, @floatFromInt(color.blue)) * inverse / alpha;
-    const sdr: render.ColorDescription = .{};
-    const sdr_black = @as(f32, @floatFromInt(sdr.min_luminance)) / 10000.0;
-    const sdr_white: f32 = @floatFromInt(sdr.max_luminance);
-    const linear: [3]f64 = .{
-        ((sdr_white - sdr_black) * std.math.pow(f32, @max(red, 0), 2.2) + sdr_black) / sdr_white,
-        ((sdr_white - sdr_black) * std.math.pow(f32, @max(green, 0), 2.2) + sdr_black) / sdr_white,
-        ((sdr_white - sdr_black) * std.math.pow(f32, @max(blue, 0), 2.2) + sdr_black) / sdr_white,
-    };
-    const matrix = colorConversionMatrix(
-        render.srgb_chromaticities,
-        output_description.primaries,
-    ) orelse identityMatrix3();
-    const converted = multiplyMatrixVector(matrix, linear);
-    return .{
-        @floatCast(converted[0] * alpha),
-        @floatCast(converted[1] * alpha),
-        @floatCast(converted[2] * alpha),
-        alpha,
-    };
 }
 
 fn copyOutputDamage(
