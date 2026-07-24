@@ -12,6 +12,7 @@ const command_geometry = @import("command_geometry.zig");
 const color_math = @import("color_math.zig");
 const gpu_timing = @import("gpu_timing.zig");
 const shaders = @import("vulkan_shaders.zig");
+const vulkan_format = @import("vulkan_format.zig");
 const sync = @cImport({
     @cInclude("linux/dma-buf.h");
     @cInclude("sys/ioctl.h");
@@ -22,6 +23,8 @@ const GpuTiming = gpu_timing.Timing;
 const GpuTimingCategory = gpu_timing.Category;
 const GpuTimingPlan = gpu_timing.Plan;
 const timestamp_query_count = gpu_timing.query_count;
+const ManualYcbcr = vulkan_format.ManualYcbcr;
+const VideoGraphicsKey = vulkan_format.GraphicsKey;
 
 allocator: std.mem.Allocator,
 loader: std.DynLib,
@@ -1098,84 +1101,6 @@ fn hasExtension(properties: []const vk.ExtensionProperties, name: []const u8) bo
     return false;
 }
 
-fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
-    return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
-        .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
-        .abgr8888, .xbgr8888 => .r8g8b8a8_unorm,
-        .nv12 => .g8_b8r8_2plane_420_unorm,
-        .p010 => .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
-        .xrgb2101010 => null,
-    };
-}
-
-fn videoPlaneViewFormats(format: vk.Format) ?[2]vk.Format {
-    return switch (format) {
-        .g8_b8r8_2plane_420_unorm => .{ .r8_unorm, .r8g8_unorm },
-        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16 => .{
-            .r10x6_unorm_pack16,
-            .r10x6g10x6_unorm_2pack16,
-        },
-        else => null,
-    };
-}
-
-fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
-    return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
-        .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
-        .xrgb2101010 => .a2r10g10b10_unorm_pack32,
-        .abgr8888, .xbgr8888, .nv12, .p010 => null,
-    };
-}
-
-fn dmabufSourceExtentValid(format: render.DmabufFormat, size: render.Size) bool {
-    if (size.width == 0 or size.height == 0) return false;
-    return format.isPackedRgb() or (size.width % 2 == 0 and size.height % 2 == 0);
-}
-
-test "Vulkan source extents respect chroma subsampling" {
-    try std.testing.expect(dmabufSourceExtentValid(.nv12, .{ .width = 1920, .height = 1080 }));
-    try std.testing.expect(!dmabufSourceExtentValid(.nv12, .{ .width = 1919, .height = 1080 }));
-    try std.testing.expect(!dmabufSourceExtentValid(.p010, .{ .width = 1920, .height = 1079 }));
-    try std.testing.expect(dmabufSourceExtentValid(.argb8888, .{ .width = 1919, .height = 1079 }));
-}
-
-test "video plane views preserve native sample precision" {
-    try std.testing.expectEqualSlices(
-        vk.Format,
-        &.{ .r8_unorm, .r8g8_unorm },
-        &videoPlaneViewFormats(.g8_b8r8_2plane_420_unorm).?,
-    );
-    try std.testing.expectEqualSlices(
-        vk.Format,
-        &.{ .r10x6_unorm_pack16, .r10x6g10x6_unorm_2pack16 },
-        &videoPlaneViewFormats(.g10x6_b10x6r10x6_2plane_420_unorm_3pack16).?,
-    );
-    try std.testing.expect(videoPlaneViewFormats(.r8g8b8a8_unorm) == null);
-}
-
-const YcbcrConversion = struct {
-    model: vk.SamplerYcbcrModelConversion,
-    range: vk.SamplerYcbcrRange,
-    x_chroma_offset: vk.ChromaLocation,
-    y_chroma_offset: vk.ChromaLocation,
-};
-
-const ManualYcbcr = struct {
-    quantization_levels: f32,
-    narrow_range: bool,
-    coefficients: [2]f32,
-    chroma_location: render.ChromaLocation,
-};
-
-const VideoGraphicsKey = struct {
-    format: vk.Format,
-    manual: bool = false,
-    model: vk.SamplerYcbcrModelConversion,
-    range: vk.SamplerYcbcrRange,
-    x_chroma_offset: vk.ChromaLocation,
-    y_chroma_offset: vk.ChromaLocation,
-};
-
 const VideoGraphics = struct {
     conversion: ?vk.SamplerYcbcrConversion,
     sampler: vk.Sampler,
@@ -1183,91 +1108,6 @@ const VideoGraphics = struct {
     pipeline_layout: vk.PipelineLayout,
     pipeline: vk.Pipeline,
 };
-
-fn defaultVideoRepresentation() render.ColorRepresentation {
-    return .{
-        .coefficients = .bt709,
-        .range = .limited,
-        .chroma_location = .type_0,
-    };
-}
-
-fn ycbcrConversion(representation: render.ColorRepresentation) ?YcbcrConversion {
-    const model: vk.SamplerYcbcrModelConversion = switch (representation.coefficients) {
-        .identity => return null,
-        .bt601 => .ycbcr_601,
-        .bt709 => .ycbcr_709,
-        .bt2020 => .ycbcr_2020,
-    };
-    const range: vk.SamplerYcbcrRange = switch (representation.range) {
-        .full => .itu_full,
-        .limited => .itu_narrow,
-    };
-    const location = representation.chroma_location orelse return null;
-    const offsets: struct { vk.ChromaLocation, vk.ChromaLocation } = switch (location) {
-        .type_0 => .{ .cosited_even, .midpoint },
-        .type_1 => .{ .midpoint, .midpoint },
-        .type_2 => .{ .cosited_even, .cosited_even },
-        .type_3 => .{ .midpoint, .cosited_even },
-        // Vulkan's basic conversion cannot express a vertical offset of one.
-        .type_4, .type_5 => return null,
-    };
-    return .{
-        .model = model,
-        .range = range,
-        .x_chroma_offset = offsets[0],
-        .y_chroma_offset = offsets[1],
-    };
-}
-
-fn manualYcbcrConversion(
-    format: vk.Format,
-    representation: render.ColorRepresentation,
-) ?ManualYcbcr {
-    const quantization_levels: f32 = switch (format) {
-        .g8_b8r8_2plane_420_unorm => 255,
-        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16 => 1023,
-        else => return null,
-    };
-    const coefficients: [2]f32 = switch (representation.coefficients) {
-        .identity => return null,
-        .bt601 => .{ 0.299, 0.114 },
-        .bt709 => .{ 0.2126, 0.0722 },
-        .bt2020 => .{ 0.2627, 0.0593 },
-    };
-    const chroma_location = representation.chroma_location orelse return null;
-    switch (chroma_location) {
-        .type_0, .type_1, .type_2, .type_3 => return null,
-        .type_4, .type_5 => {},
-    }
-    return .{
-        .quantization_levels = quantization_levels,
-        .narrow_range = representation.range == .limited,
-        .coefficients = coefficients,
-        .chroma_location = chroma_location,
-    };
-}
-
-fn videoGraphicsKey(format: vk.Format, conversion: YcbcrConversion) VideoGraphicsKey {
-    return .{
-        .format = format,
-        .model = conversion.model,
-        .range = conversion.range,
-        .x_chroma_offset = conversion.x_chroma_offset,
-        .y_chroma_offset = conversion.y_chroma_offset,
-    };
-}
-
-fn manualVideoGraphicsKey(format: vk.Format) VideoGraphicsKey {
-    return .{
-        .format = format,
-        .manual = true,
-        .model = .rgb_identity,
-        .range = .itu_full,
-        .x_chroma_offset = .cosited_even,
-        .y_chroma_offset = .cosited_even,
-    };
-}
 
 fn getVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
     if (self.video_graphics.get(key)) |graphics| return graphics;
@@ -1423,86 +1263,6 @@ fn destroyVideoGraphics(self: *Self, graphics: VideoGraphics) void {
     }
 }
 
-test "color representation maps to Vulkan YCbCr conversion" {
-    const conversion = ycbcrConversion(.{
-        .coefficients = .bt2020,
-        .range = .limited,
-        .chroma_location = .type_3,
-    }).?;
-    try std.testing.expectEqual(vk.SamplerYcbcrModelConversion.ycbcr_2020, conversion.model);
-    try std.testing.expectEqual(vk.SamplerYcbcrRange.itu_narrow, conversion.range);
-    try std.testing.expectEqual(vk.ChromaLocation.midpoint, conversion.x_chroma_offset);
-    try std.testing.expectEqual(vk.ChromaLocation.cosited_even, conversion.y_chroma_offset);
-
-    const expected_offsets = [_][2]vk.ChromaLocation{
-        .{ .cosited_even, .midpoint },
-        .{ .midpoint, .midpoint },
-        .{ .cosited_even, .cosited_even },
-        .{ .midpoint, .cosited_even },
-    };
-    for (expected_offsets, 0..) |expected, index| {
-        const location: render.ChromaLocation = @enumFromInt(index);
-        const mapped = ycbcrConversion(.{
-            .coefficients = .bt709,
-            .range = .full,
-            .chroma_location = location,
-        }).?;
-        try std.testing.expectEqual(expected[0], mapped.x_chroma_offset);
-        try std.testing.expectEqual(expected[1], mapped.y_chroma_offset);
-    }
-}
-
-test "unsupported YCbCr conversion metadata is rejected" {
-    try std.testing.expect(ycbcrConversion(.{
-        .coefficients = .identity,
-        .range = .full,
-        .chroma_location = .type_0,
-    }) == null);
-    try std.testing.expect(ycbcrConversion(.{
-        .coefficients = .bt709,
-        .range = .limited,
-        .chroma_location = null,
-    }) == null);
-    inline for (.{ render.ChromaLocation.type_4, render.ChromaLocation.type_5 }) |location| {
-        try std.testing.expect(ycbcrConversion(.{
-            .coefficients = .bt709,
-            .range = .limited,
-            .chroma_location = location,
-        }) == null);
-    }
-}
-
-test "manual YCbCr conversion preserves video precision and metadata" {
-    const nv12 = manualYcbcrConversion(.g8_b8r8_2plane_420_unorm, .{
-        .coefficients = .bt601,
-        .range = .full,
-        .chroma_location = .type_4,
-    }).?;
-    try std.testing.expectEqual(@as(f32, 255), nv12.quantization_levels);
-    try std.testing.expect(!nv12.narrow_range);
-    try std.testing.expectEqual([2]f32{ 0.299, 0.114 }, nv12.coefficients);
-    try std.testing.expectEqual(render.ChromaLocation.type_4, nv12.chroma_location);
-
-    const p010 = manualYcbcrConversion(
-        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
-        .{
-            .coefficients = .bt2020,
-            .range = .limited,
-            .chroma_location = .type_5,
-        },
-    ).?;
-    try std.testing.expectEqual(@as(f32, 1023), p010.quantization_levels);
-    try std.testing.expect(p010.narrow_range);
-    try std.testing.expectEqual([2]f32{ 0.2627, 0.0593 }, p010.coefficients);
-    try std.testing.expectEqual(render.ChromaLocation.type_5, p010.chroma_location);
-
-    try std.testing.expect(manualYcbcrConversion(.g8_b8r8_2plane_420_unorm, .{
-        .coefficients = .bt709,
-        .range = .limited,
-        .chroma_location = .type_3,
-    }) == null);
-}
-
 test "Vulkan caches immutable YCbCr sampler pipelines" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
@@ -1511,8 +1271,8 @@ test "Vulkan caches immutable YCbCr sampler pipelines" {
     defer renderer.deinit();
     if (renderer.dmabuf_nv12_source_modifiers.len == 0) return error.SkipZigTest;
 
-    const parameters = ycbcrConversion(defaultVideoRepresentation()).?;
-    const key = videoGraphicsKey(.g8_b8r8_2plane_420_unorm, parameters);
+    const parameters = vulkan_format.automaticConversion(vulkan_format.defaultRepresentation()).?;
+    const key = vulkan_format.automaticGraphicsKey(.g8_b8r8_2plane_420_unorm, parameters);
     const first = try renderer.getVideoGraphics(key);
     const second = try renderer.getVideoGraphics(key);
     try std.testing.expectEqual(first.conversion, second.conversion);
@@ -1521,7 +1281,7 @@ test "Vulkan caches immutable YCbCr sampler pipelines" {
     try std.testing.expectEqual(first.pipeline_layout, second.pipeline_layout);
     try std.testing.expectEqual(first.pipeline, second.pipeline);
 
-    const manual_key = manualVideoGraphicsKey(.g8_b8r8_2plane_420_unorm);
+    const manual_key = vulkan_format.manualGraphicsKey(.g8_b8r8_2plane_420_unorm);
     const manual_first = try renderer.getVideoGraphics(manual_key);
     const manual_second = try renderer.getVideoGraphics(manual_key);
     try std.testing.expect(manual_first.conversion == null);
@@ -1585,7 +1345,7 @@ fn dmabufSourceModifierImportable(
         .drm_format_modifier = modifier,
         .sharing_mode = .exclusive,
     };
-    var plane_view_formats = videoPlaneViewFormats(format);
+    var plane_view_formats = vulkan_format.planeViewFormats(format);
     var format_list: vk.ImageFormatListCreateInfo = .{ .p_next = &modifier_info };
     if (plane_view_formats) |*formats| {
         format_list.view_format_count = formats.len;
@@ -1626,49 +1386,6 @@ fn dmabufSourceModifierImportable(
         ycbcr_properties.combined_image_sampler_descriptor_count,
         @as(u32, if (plane_view_formats != null) 2 else 1),
     );
-}
-
-test "DMA-BUF source FourCC selects the matching Vulkan format" {
-    try std.testing.expectEqual(
-        vk.Format.b8g8r8a8_unorm,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.argb8888)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.b8g8r8a8_unorm,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xrgb8888)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.r8g8b8a8_unorm,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.abgr8888)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.r8g8b8a8_unorm,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xbgr8888)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.g8_b8r8_2plane_420_unorm,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.nv12)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.p010)).?,
-    );
-    try std.testing.expect(
-        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xrgb2101010)) == null,
-    );
-    try std.testing.expect(dmabufSourceVkFormat(0) == null);
-}
-
-test "DMA-BUF target FourCC selects the matching Vulkan format" {
-    try std.testing.expectEqual(
-        vk.Format.b8g8r8a8_unorm,
-        dmabufTargetVkFormat(@intFromEnum(render.DmabufFormat.xrgb8888)).?,
-    );
-    try std.testing.expectEqual(
-        vk.Format.a2r10g10b10_unorm_pack32,
-        dmabufTargetVkFormat(@intFromEnum(render.DmabufFormat.xrgb2101010)).?,
-    );
-    try std.testing.expect(dmabufTargetVkFormat(0) == null);
 }
 
 const DmabufTargetModifiers = struct {
@@ -2432,7 +2149,7 @@ fn validateSourceCallback(
             .end_cpu_read = Noop.sync,
             .export_read_fence = Noop.exportFence,
         },
-        if (source_format.isPackedRgb()) .{} else defaultVideoRepresentation(),
+        if (source_format.isPackedRgb()) .{} else vulkan_format.defaultRepresentation(),
     );
     self.destroyTexture(texture);
 }
@@ -2488,7 +2205,7 @@ fn releaseTargetCallback(context: *anyopaque, id: u64) void {
 }
 
 fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
-    const target_format = dmabufTargetVkFormat(descriptor.format) orelse
+    const target_format = vulkan_format.targetVkFormat(descriptor.format) orelse
         return error.InvalidTarget;
     if (descriptor.id == 0 or
         descriptor.size.width == 0 or descriptor.size.height == 0 or
@@ -2654,7 +2371,7 @@ fn createSubmission(self: *Self) Error!Submission {
 }
 
 fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u64) bool {
-    const target_format = dmabufTargetVkFormat(format) orelse return false;
+    const target_format = vulkan_format.targetVkFormat(format) orelse return false;
     if (size.width == 0 or size.height == 0 or
         !render.DmabufFormatModifier.contains(self.dmabuf_target_formats, format, modifier) or
         (target_format == .a2r10g10b10_unorm_pack32 and self.output_10bit == null))
@@ -2711,9 +2428,9 @@ fn dmabufTargetUsage(sampleable: bool) vk.ImageUsageFlags {
 
 fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSource) bool {
     const source_format_info = render.DmabufFormat.fromFourcc(source.format) orelse return false;
-    if (!dmabufSourceExtentValid(source_format_info, size) or
+    if (!vulkan_format.sourceExtentValid(source_format_info, size) or
         source.plane_count != source_format_info.planeCount()) return false;
-    const source_format = dmabufSourceVkFormat(source.format) orelse return false;
+    const source_format = vulkan_format.sourceVkFormat(source.format) orelse return false;
     const modifiers = switch (source_format) {
         .b8g8r8a8_unorm => self.dmabuf_source_modifiers,
         .r8g8b8a8_unorm => self.dmabuf_rgba_source_modifiers,
@@ -5471,24 +5188,24 @@ fn createImportedTexture(
     if (!self.supportsDmabufSource(size, source)) return error.InvalidTarget;
     const format_info = render.DmabufFormat.fromFourcc(source.format) orelse
         return error.InvalidTarget;
-    const source_format = dmabufSourceVkFormat(source.format) orelse return error.InvalidTarget;
-    const conversion_parameters: ?YcbcrConversion = if (format_info.isPackedRgb())
+    const source_format = vulkan_format.sourceVkFormat(source.format) orelse return error.InvalidTarget;
+    const conversion_parameters: ?vulkan_format.YcbcrConversion = if (format_info.isPackedRgb())
         null
     else
-        ycbcrConversion(representation);
+        vulkan_format.automaticConversion(representation);
     const manual_parameters: ?ManualYcbcr = if (format_info.isPackedRgb() or
         conversion_parameters != null)
         null
     else
-        manualYcbcrConversion(source_format, representation) orelse
+        vulkan_format.manualConversion(source_format, representation) orelse
             return error.InvalidTarget;
     if (!format_info.isPackedRgb() and !dmabufPlanesShareAllocation(source.planeSlice())) {
         return error.InvalidTarget;
     }
     const video_graphics: ?VideoGraphics = if (conversion_parameters) |parameters|
-        try self.getVideoGraphics(videoGraphicsKey(source_format, parameters))
+        try self.getVideoGraphics(vulkan_format.automaticGraphicsKey(source_format, parameters))
     else if (manual_parameters != null)
-        try self.getVideoGraphics(manualVideoGraphicsKey(source_format))
+        try self.getVideoGraphics(vulkan_format.manualGraphicsKey(source_format))
     else
         null;
     const duplicate_fd = std.c.dup(source.planes[0].fd);
@@ -5513,7 +5230,7 @@ fn createImportedTexture(
         .p_plane_layouts = &plane_layouts,
     };
     var plane_view_formats = if (manual_parameters != null)
-        videoPlaneViewFormats(source_format)
+        vulkan_format.planeViewFormats(source_format)
     else
         null;
     var format_list: vk.ImageFormatListCreateInfo = .{ .p_next = &modifier_info };
