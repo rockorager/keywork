@@ -9,6 +9,7 @@ const PrimarySelection = @import("../wayland/primary_selection.zig");
 const Surface = @import("../wayland/surface.zig");
 const Xdnd = @import("dnd.zig");
 const XSelection = @import("selection.zig");
+const window_policy = @import("window_policy.zig");
 
 const c = @import("xcb.zig").c;
 const wl = wayland.server.wl;
@@ -47,43 +48,8 @@ pub const Geometry = struct {
     height: u16,
 };
 
-pub const Size = struct {
-    width: i32 = 0,
-    height: i32 = 0,
-};
-
-pub const WindowType = enum {
-    desktop,
-    dock,
-    toolbar,
-    menu,
-    utility,
-    splash,
-    dialog,
-    dropdown_menu,
-    popup_menu,
-    tooltip,
-    notification,
-    combo,
-    dnd,
-    normal,
-
-    pub fn participatesInWindowManagement(self: WindowType) bool {
-        return switch (self) {
-            .normal, .dialog, .utility, .toolbar, .menu => true,
-            .desktop,
-            .dock,
-            .splash,
-            .dropdown_menu,
-            .popup_menu,
-            .tooltip,
-            .notification,
-            .combo,
-            .dnd,
-            => false,
-        };
-    }
-};
+pub const Size = window_policy.Size;
+pub const WindowType = window_policy.WindowType;
 
 pub const WindowInfo = struct {
     id: WindowId,
@@ -1377,10 +1343,10 @@ fn refreshWindowType(self: *Self, window_id: WindowId, window: *Window) !bool {
     var override_redirect_wants_focus = true;
     const window_type = for (type_atoms) |type_atom| {
         if (self.windowTypeForAtom(type_atom)) |value| break value;
-    } else defaultWindowType(window.override_redirect, window.parent != null);
+    } else window_policy.defaultWindowType(window.override_redirect, window.parent != null);
     for (type_atoms) |type_atom| {
         const value = self.windowTypeForAtom(type_atom) orelse continue;
-        if (windowTypePreventsOverrideRedirectFocus(value)) {
+        if (window_policy.preventsOverrideRedirectFocus(value)) {
             override_redirect_wants_focus = false;
         }
     }
@@ -1413,26 +1379,6 @@ fn windowTypeForAtom(self: *const Self, atom: c.xcb_atom_t) ?WindowType {
     return null;
 }
 
-fn defaultWindowType(override_redirect: bool, transient: bool) WindowType {
-    return if (!override_redirect and transient) .dialog else .normal;
-}
-
-fn windowTypePreventsOverrideRedirectFocus(window_type: WindowType) bool {
-    return switch (window_type) {
-        .menu,
-        .utility,
-        .splash,
-        .dropdown_menu,
-        .popup_menu,
-        .tooltip,
-        .notification,
-        .combo,
-        .dnd,
-        => true,
-        .desktop, .dock, .toolbar, .dialog, .normal => false,
-    };
-}
-
 fn refreshMotifHints(self: *Self, window_id: WindowId, window: *Window) bool {
     const reply = c.xcb_get_property_reply(
         self.connection,
@@ -1451,20 +1397,11 @@ fn refreshMotifHints(self: *Self, window_id: WindowId, window: *Window) bool {
     if (reply.*.format != 32 or reply.*.value_len < 5) return false;
     const value = c.xcb_get_property_value(reply) orelse return false;
     const hints: [*]const u32 = @ptrCast(@alignCast(value));
-    const prefers_server_decorations = motifPrefersServerDecorations(hints[0..5]) orelse
+    const prefers_server_decorations = window_policy.motifPrefersServerDecorations(hints[0..5]) orelse
         return false;
     if (window.prefers_server_decorations == prefers_server_decorations) return false;
     window.prefers_server_decorations = prefers_server_decorations;
     return true;
-}
-
-fn motifPrefersServerDecorations(hints: []const u32) ?bool {
-    std.debug.assert(hints.len >= 5);
-    const decorations_valid = hints[0] & (1 << 1) != 0;
-    if (!decorations_valid) return null;
-    const decorations = hints[2];
-    if (decorations & (1 << 0) != 0) return true;
-    return decorations & (1 << 1) != 0 and decorations & (1 << 3) != 0;
 }
 
 fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -1478,10 +1415,10 @@ fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
     var min_size: Size = .{};
     var max_size: Size = .{};
     if (found and hints.flags & c.XCB_ICCCM_SIZE_HINT_P_MIN_SIZE != 0) {
-        min_size = validSizeHint(hints.min_width, hints.min_height);
+        min_size = window_policy.validSizeHint(hints.min_width, hints.min_height);
     }
     if (found and hints.flags & c.XCB_ICCCM_SIZE_HINT_P_MAX_SIZE != 0) {
-        max_size = validSizeHint(hints.max_width, hints.max_height);
+        max_size = window_policy.validSizeHint(hints.max_width, hints.max_height);
     }
     if (max_size.width > 0 and min_size.width > max_size.width) {
         max_size.width = min_size.width;
@@ -1495,13 +1432,6 @@ fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
     window.min_size = min_size;
     window.max_size = max_size;
     return true;
-}
-
-fn validSizeHint(width: i32, height: i32) Size {
-    return .{
-        .width = if (width > 0) width else 0,
-        .height = if (height > 0) height else 0,
-    };
 }
 
 fn readTitle(self: *Self, window_id: WindowId) !?[:0]u8 {
@@ -2257,25 +2187,6 @@ test "EWMH state replacement removes duplicates before appending" {
     try std.testing.expectEqualSlices(c.xcb_atom_t, &.{ 1, 3, 4 }, atoms);
 }
 
-test "EWMH window type fallback follows transient and override-redirect rules" {
-    try std.testing.expectEqual(WindowType.normal, defaultWindowType(false, false));
-    try std.testing.expectEqual(WindowType.dialog, defaultWindowType(false, true));
-    try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, false));
-    try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, true));
-}
-
-test "EWMH auxiliary window types bypass toplevel policy" {
-    try std.testing.expect(WindowType.normal.participatesInWindowManagement());
-    try std.testing.expect(WindowType.dialog.participatesInWindowManagement());
-    try std.testing.expect(WindowType.utility.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.desktop.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.dock.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.splash.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.tooltip.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.notification.participatesInWindowManagement());
-    try std.testing.expect(!WindowType.dnd.participatesInWindowManagement());
-}
-
 test "mapped managed windows retain compositor geometry authority" {
     var window: Window = .{
         .geometry = .{ .x = 0, .y = 0, .width = 640, .height = 480 },
@@ -2301,27 +2212,4 @@ test "ConfigureNotify preserves the mapped window management role" {
     try std.testing.expect(!window.overrideRedirectForConfigure(true));
     window.override_redirect = true;
     try std.testing.expect(window.overrideRedirectForConfigure(false));
-}
-
-test "override-redirect input heuristic excludes transient UI types" {
-    try std.testing.expect(!windowTypePreventsOverrideRedirectFocus(.normal));
-    try std.testing.expect(!windowTypePreventsOverrideRedirectFocus(.dialog));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.menu));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.utility));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.splash));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.dropdown_menu));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.popup_menu));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.tooltip));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.notification));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.combo));
-    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.dnd));
-}
-
-test "Motif hints reduce partial decorations to client-side decoration" {
-    try std.testing.expectEqual(null, motifPrefersServerDecorations(&.{ 0, 0, 0, 0, 0 }));
-    try std.testing.expectEqual(true, motifPrefersServerDecorations(&.{ 2, 0, 1, 0, 0 }));
-    try std.testing.expectEqual(true, motifPrefersServerDecorations(&.{ 2, 0, 10, 0, 0 }));
-    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 0, 0, 0 }));
-    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 2, 0, 0 }));
-    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 8, 0, 0 }));
 }

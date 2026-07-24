@@ -522,6 +522,7 @@ test {
     _ = @import("wayland/xwayland_shell.zig");
     _ = @import("xwayland/selection.zig");
     _ = @import("xwayland/server.zig");
+    _ = @import("xwayland/window_policy.zig");
     _ = @import("xwayland/xwm.zig");
     _ = @import("wayland/workspace.zig");
     _ = @import("wayland/text_input.zig");
