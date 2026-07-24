@@ -3913,6 +3913,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
             const route = self.pointerRoute(position.x, position.y);
             self.seat.pointerEnter(position.x, position.y, route.focus);
             self.updateResizeCursor(route.root, position.x, position.y);
+            self.pointer_constraints.syncFocus();
         }
     }
 }
