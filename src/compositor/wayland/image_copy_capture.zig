@@ -88,6 +88,7 @@ const Destination = struct {
         self.resource = resource;
         self.shm = if (shm) |buffer| wl_shm_buffer_ref(buffer) else null;
         self.dmabuf = dmabuf;
+        if (dmabuf) |buffer| buffer.reference();
         self.destroy_listener = wl.Listener(*wl.Resource).init(handleResourceDestroy);
         @as(*wl.Resource, @ptrCast(resource)).addDestroyListener(&self.destroy_listener);
     }
@@ -95,13 +96,14 @@ const Destination = struct {
     fn clear(self: *Destination) void {
         if (self.resource != null) self.destroy_listener.link.remove();
         if (self.shm) |buffer| wl_shm_buffer_unref(buffer);
+        if (self.dmabuf) |buffer| buffer.unreference();
         self.resource = null;
         self.shm = null;
         self.dmabuf = null;
     }
 
     fn attached(self: *const Destination) bool {
-        return self.resource != null or self.shm != null;
+        return self.shm != null or self.dmabuf != null;
     }
 
     fn handleResourceDestroy(
@@ -111,7 +113,6 @@ const Destination = struct {
         const self: *Destination = @fieldParentPtr("destroy_listener", listener);
         listener.link.remove();
         self.resource = null;
-        self.dmabuf = null;
     }
 };
 
