@@ -394,16 +394,11 @@ fn reconcile(self: *Self) !void {
         self.active_outputs.items,
     );
     defer DrmOutput.deinitSelections(self.allocator, selections);
-    var unleased_output_count: usize = 0;
-    for (self.active_outputs.items) |output| if (!self.outputLeased(output)) {
-        unleased_output_count += 1;
-    };
-    var topology_changed = selections.len != unleased_output_count;
+    // Kernel leases survive connector disconnects. Track every output here;
+    // the removal listener revokes any lease before the output is retired.
+    const topology_changed = connectorTopologyChanged(self.active_outputs.items, selections);
     for (selections) |selection| {
-        const output = self.findOutput(selection.connector_id) orelse {
-            topology_changed = true;
-            continue;
-        };
+        const output = self.findOutput(selection.connector_id) orelse continue;
         if (!std.meta.eql(output.size, selection.modes[selection.mode_index].size()) or
             output.crtc_id != selection.crtc_id)
         {
@@ -435,7 +430,6 @@ fn reconcile(self: *Self) !void {
     while (index > 0) {
         index -= 1;
         const output = self.active_outputs.items[index];
-        if (self.outputLeased(output)) continue;
         var found = false;
         for (selections) |selection| if (selection.connector_id == output.connector_id) {
             found = true;
@@ -443,6 +437,19 @@ fn reconcile(self: *Self) !void {
         };
         if (!found) self.removeAt(index, device.fd);
     }
+}
+
+fn connectorTopologyChanged(
+    tracked_outputs: []const *DrmOutput,
+    selections: []const DrmOutput.Selection,
+) bool {
+    if (tracked_outputs.len != selections.len) return true;
+    for (tracked_outputs) |output| {
+        for (selections) |selection| {
+            if (selection.connector_id == output.connector_id) break;
+        } else return true;
+    }
+    return false;
 }
 
 fn refreshLeases(self: *Self) !void {
@@ -641,4 +648,23 @@ fn accessActive(context: *anyopaque) bool {
 fn accessFail(context: *anyopaque, err: anyerror) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.fail(err);
+}
+
+test "connector topology requires every tracked output" {
+    var first: DrmOutput = undefined;
+    first.connector_id = 10;
+    var second: DrmOutput = undefined;
+    second.connector_id = 20;
+    const tracked_outputs = [_]*DrmOutput{ &first, &second };
+
+    var unchanged: [2]DrmOutput.Selection = undefined;
+    unchanged[0].connector_id = 20;
+    unchanged[1].connector_id = 10;
+    try std.testing.expect(!connectorTopologyChanged(&tracked_outputs, &unchanged));
+
+    var replacement: [2]DrmOutput.Selection = undefined;
+    replacement[0].connector_id = 10;
+    replacement[1].connector_id = 30;
+    try std.testing.expect(connectorTopologyChanged(&tracked_outputs, &replacement));
+    try std.testing.expect(connectorTopologyChanged(&tracked_outputs, replacement[0..1]));
 }
