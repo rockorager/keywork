@@ -824,20 +824,21 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
     it = self.windows.iterator();
     while (it.next()) |entry| {
         const source_index = entry.value.workspace;
-        if (!std.meta.eql(self.workspaces.items[source_index].output, output)) continue;
-        const moved = try workspace_mod.Workspace.moveWindow(
-            self.allocator,
-            &self.workspaces.items[source_index].workspace,
-            &self.workspaces.items[replacement_index].workspace,
-            neutral(entry.id),
-        );
-        std.debug.assert(moved);
-        entry.value.workspace = replacement_index;
-        self.reportWorkspaceOccupancy(source_index);
-        self.reportWorkspaceOccupancy(replacement_index);
+        if (std.meta.eql(self.workspaces.items[source_index].output, output)) {
+            const moved = try workspace_mod.Workspace.moveWindow(
+                self.allocator,
+                &self.workspaces.items[source_index].workspace,
+                &self.workspaces.items[replacement_index].workspace,
+                neutral(entry.id),
+            );
+            std.debug.assert(moved);
+            entry.value.workspace = replacement_index;
+            self.reportWorkspaceOccupancy(source_index);
+            self.reportWorkspaceOccupancy(replacement_index);
+        }
         if (entry.value.fullscreen_output) |fullscreen_output| {
             if (std.meta.eql(fullscreen_output, output)) {
-                entry.value.fullscreen_output = replacement_output;
+                entry.value.fullscreen_output = self.workspaces.items[entry.value.workspace].output;
             }
         }
     }
@@ -2221,6 +2222,10 @@ fn relayout(self: *Self) void {
                 },
                 .xdg => |id| configure: {
                     const info = self.xdg_shell.windowInfo(id) orelse break :configure null;
+                    const bounds_output = if (window.fullscreen_output) |fullscreen_output|
+                        self.outputs.get(fullscreen_output) orelse output
+                    else
+                        output;
                     const configure_dimensions = requestedXdgDimensions(
                         info.dimensions,
                         dimensions,
@@ -2240,8 +2245,8 @@ fn relayout(self: *Self) void {
                         else
                             .server_side,
                         .bounds = .{
-                            .width = @intCast(output.logicalSize().width),
-                            .height = @intCast(output.logicalSize().height),
+                            .width = @intCast(bounds_output.logicalSize().width),
+                            .height = @intCast(bounds_output.logicalSize().height),
                         },
                         .suspended = repaint_suspended,
                     };
