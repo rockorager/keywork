@@ -94,6 +94,7 @@ const Control = @import("control.zig");
 const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 const WindowAnimation = @import("window_animation.zig");
+const backdrop_blur_damage = @import("backdrop_blur_damage.zig");
 const capture_geometry = @import("capture_geometry.zig");
 const damage_geometry = @import("damage_geometry.zig");
 const window_geometry = @import("window_geometry.zig");
@@ -7086,39 +7087,6 @@ fn handleScheduledRender(output_context: *RenderOutput) void {
     self.scheduleRepaint(output_context);
 }
 
-const BackdropBlurArea = struct {
-    rect: render.Rect,
-    radius: u32,
-    downsample_level: ?u8,
-};
-
-fn backdropBlurArea(
-    render_output: *const RenderOutput,
-    output: *const Output,
-    logical_rect: render.Rect,
-    radius: u32,
-    downsample_level: ?u8,
-) ?BackdropBlurArea {
-    if (radius == 0) return null;
-    const output_rect = output.logicalRect();
-    const logical = logical_rect.intersection(output_rect) orelse return null;
-    const physical = damage_geometry.scaleRect(.{
-        .x = logical.x -| output_rect.x,
-        .y = logical.y -| output_rect.y,
-        .width = logical.width,
-        .height = logical.height,
-    }, render_output.backend.renderScale(), render_output.backend.modeSize()) orelse return null;
-    const scale = render_output.backend.renderScale();
-    const scaled_radius = (@as(u64, radius) * scale.numerator +
-        render.Scale.denominator / 2) / render.Scale.denominator;
-    if (scaled_radius == 0) return null;
-    return .{
-        .rect = physical,
-        .radius = @intCast(scaled_radius),
-        .downsample_level = downsample_level,
-    };
-}
-
 fn layerSurfaceRect(
     layer_surface: *const Scene.LayerSurface,
     size: render.Size,
@@ -7142,30 +7110,6 @@ fn layerSurfaceEffectsRect(
         layer_surface.surface_id,
     ) orelse return null;
     return layerSurfaceRect(layer_surface, buffer.logical_size);
-}
-
-fn addBackdropBlurDamage(
-    damage: *Region,
-    blur: BackdropBlurArea,
-    output_size: render.Size,
-    footprint: u32,
-) Region.Error!bool {
-    const output_rect: render.Rect = .{ .x = 0, .y = 0, .width = output_size.width, .height = output_size.height };
-    const affected = damage_geometry.expandRect(blur.rect, footprint).intersection(output_rect) orelse return false;
-    var rectangles = damage.rectangleIterator();
-    while (rectangles.next()) |rectangle| {
-        if (affected.intersection(.{
-            .x = rectangle.x,
-            .y = rectangle.y,
-            .width = rectangle.width,
-            .height = rectangle.height,
-        }) != null) break;
-    } else return false;
-    if (damage.coversRectangle(affected.x, affected.y, affected.width, affected.height)) {
-        return false;
-    }
-    try damage.add(affected.x, affected.y, @intCast(affected.width), @intCast(affected.height));
-    return true;
 }
 
 fn expandBackdropBlurDamage(
@@ -7201,68 +7145,25 @@ fn expandBackdropBlurDamage(
             var rectangles = region.rectangleIterator();
             while (rectangles.next()) |rectangle| {
                 const local = surfaceEffectRect(rectangle, buffer.logical_size) orelse continue;
-                const blur = backdropBlurArea(
-                    render_output,
-                    output,
+                const blur = backdrop_blur_damage.areaForOutput(
                     local.translated(
                         root_position.x +| offset.x,
                         root_position.y +| offset.y,
                     ),
+                    output.logicalRect(),
+                    render_output.backend.renderScale(),
+                    render_output.backend.modeSize(),
                     surface_blur.radius,
                     surface_blur.downsample_level,
                 ) orelse continue;
-                const footprint = self.renderer.backdropBlurFootprint(
-                    blur.radius,
-                    blur.downsample_level,
-                );
-                changed = try addBackdropBlurDamage(
+                changed = try backdrop_blur_damage.propagate(
                     damage,
                     blur,
                     render_output.backend.modeSize(),
-                    footprint,
                 ) or changed;
             }
         }
     }
-}
-
-test "backdrop blur damage includes the whole blur and sample area" {
-    var damage = Region.init();
-    defer damage.deinit();
-    damage.setRectangle(10, 10, 2, 2);
-    const blur: BackdropBlurArea = .{
-        .rect = .{ .x = 8, .y = 8, .width = 10, .height = 10 },
-        .radius = 4,
-        .downsample_level = null,
-    };
-
-    try std.testing.expect(try addBackdropBlurDamage(&damage, blur, .{ .width = 20, .height = 20 }, 4));
-    try std.testing.expect(damage.coversRectangle(4, 4, 16, 16));
-    try std.testing.expect(!try addBackdropBlurDamage(&damage, blur, .{ .width = 20, .height = 20 }, 4));
-
-    var distant = Region.init();
-    defer distant.deinit();
-    distant.setRectangle(0, 0, 2, 2);
-    try std.testing.expect(!try addBackdropBlurDamage(&distant, blur, .{ .width = 20, .height = 20 }, 4));
-}
-
-test "backdrop blur damage expands transitively across overlapping effects" {
-    var damage = Region.init();
-    defer damage.deinit();
-    damage.setRectangle(5, 5, 1, 1);
-    const blurs = [_]BackdropBlurArea{
-        .{ .rect = .{ .x = 5, .y = 4, .width = 8, .height = 8 }, .radius = 2, .downsample_level = null },
-        .{ .rect = .{ .x = 14, .y = 4, .width = 8, .height = 8 }, .radius = 2, .downsample_level = null },
-    };
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (blurs) |blur| {
-            changed = try addBackdropBlurDamage(&damage, blur, .{ .width = 30, .height = 20 }, 2) or changed;
-        }
-    }
-    try std.testing.expect(damage.coversRectangle(3, 2, 12, 12));
-    try std.testing.expect(damage.coversRectangle(12, 2, 12, 12));
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {

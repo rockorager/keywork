@@ -467,6 +467,7 @@ test {
     _ = @import("backend/session.zig");
     _ = @import("drm_syncobj.zig");
     _ = @import("presentation.zig");
+    _ = @import("backdrop_blur_damage.zig");
     _ = @import("capture_geometry.zig");
     _ = @import("damage_geometry.zig");
     _ = @import("output_configuration.zig");
