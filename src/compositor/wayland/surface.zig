@@ -677,7 +677,9 @@ pub const RoleIdentity = struct {
     context: *anyopaque,
 };
 
-/// Listener registrations must remain unchanged during commit notifications.
+/// The surface retains this caller-owned object and its context until removal.
+/// Registrations must remain unchanged during commit notifications. On surface
+/// destruction, `surface_destroyed` must unregister this listener before returning.
 pub const CommitListener = struct {
     context: *anyopaque,
     committed: ?*const fn (*anyopaque) void = null,
@@ -686,6 +688,9 @@ pub const CommitListener = struct {
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
+/// The surface retains and mutates this caller-owned object until removal.
+/// The object and its context must remain valid while registered. `presented`
+/// and `discarded` are terminal callbacks and must unregister it before returning.
 pub const CommitFeedback = struct {
     context: *anyopaque,
     sampled: *const fn (*anyopaque, *anyopaque) void,
