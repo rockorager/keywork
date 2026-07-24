@@ -7,6 +7,7 @@ const headless = @import("../backend/headless.zig");
 const Region = @import("../region.zig");
 const render_types = @import("types.zig");
 const blur_geometry = @import("blur_geometry.zig");
+const command_geometry = @import("command_geometry.zig");
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -628,7 +629,7 @@ fn pruneOccludedCommands(
         const command = commands[read];
         if (std.meta.activeTag(command) == .backdrop_capture) {
             coverage.clear();
-        } else if (commandVisibleRect(command, frame_size)) |visible| {
+        } else if (command_geometry.visibleRect(command, frame_size)) |visible| {
             if (commandCanBePruned(command)) {
                 uncovered.setRectangle(visible.x, visible.y, visible.width, visible.height);
                 var covered_rectangles = coverage.rectangleIterator();
@@ -721,40 +722,6 @@ fn clipCommand(command: render_types.Command, clip: render_types.Rect) render_ty
     };
 }
 
-fn commandVisibleRect(
-    command: render_types.Command,
-    frame_size: render_types.Size,
-) ?render_types.Rect {
-    return switch (command) {
-        .clear => .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height },
-        .solid_rect => |solid| clipped: {
-            var rect = solid.rect.clipTo(frame_size) orelse break :clipped null;
-            if (solid.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            break :clipped rect;
-        },
-        .image => |image| clipped: {
-            var rect = (render_types.Rect{
-                .x = image.x,
-                .y = image.y,
-                .width = image.size.width,
-                .height = image.size.height,
-            }).clipTo(frame_size) orelse break :clipped null;
-            if (image.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            if (image.rounded_clip) |clip| {
-                rect = rect.intersection(clip.rect) orelse break :clipped null;
-            }
-            break :clipped rect;
-        },
-        .crossfade => |fade| clipped: {
-            var rect = fade.destination.clipTo(frame_size) orelse break :clipped null;
-            if (fade.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            if (fade.rounded_clip) |clip| rect = rect.intersection(clip.rect) orelse break :clipped null;
-            break :clipped rect;
-        },
-        .shadow, .backdrop_capture, .backdrop_blur => null,
-    };
-}
-
 fn addOpaqueCommandCoverage(
     coverage: *Region,
     command: render_types.Command,
@@ -767,7 +734,7 @@ fn addOpaqueCommandCoverage(
             if (image.alpha_multiplier != std.math.maxInt(u32) or
                 image.rounded_clip != null) return;
             if (!image.is_opaque) {
-                const visible = commandVisibleRect(command, frame_size) orelse return;
+                const visible = command_geometry.visibleRect(command, frame_size) orelse return;
                 for (image.opaque_region.slice()) |rectangle| {
                     const clipped = rectangle.intersection(visible) orelse continue;
                     try addCoverageRectangle(coverage, clipped);
@@ -777,7 +744,7 @@ fn addOpaqueCommandCoverage(
         },
         .crossfade, .shadow, .backdrop_capture, .backdrop_blur => return,
     }
-    if (commandVisibleRect(command, frame_size)) |rectangle| {
+    if (command_geometry.visibleRect(command, frame_size)) |rectangle| {
         try addCoverageRectangle(coverage, rectangle);
     }
 }

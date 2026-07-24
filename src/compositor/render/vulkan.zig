@@ -7,6 +7,7 @@ const vk = @import("vulkan");
 const CpuRenderer = @import("cpu.zig");
 const render = @import("types.zig");
 const blur_geometry = @import("blur_geometry.zig");
+const command_geometry = @import("command_geometry.zig");
 const color_math = @import("color_math.zig");
 const shaders = @import("vulkan_shaders.zig");
 const sync = @cImport({
@@ -6307,73 +6308,10 @@ fn commandsAffectRect(
     frame_size: render.Size,
 ) bool {
     for (commands) |command| {
-        const visible = commandVisibleRect(command, frame_size) orelse continue;
+        const visible = command_geometry.visibleRect(command, frame_size) orelse continue;
         if (visible.intersection(rect) != null) return true;
     }
     return false;
-}
-
-fn commandVisibleRect(command: render.Command, frame_size: render.Size) ?render.Rect {
-    return switch (command) {
-        .clear => .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height },
-        .solid_rect => |solid| clipped: {
-            var rect = solid.rect.clipTo(frame_size) orelse break :clipped null;
-            if (solid.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            break :clipped rect;
-        },
-        .image => |image| clipped: {
-            var rect = (render.Rect{
-                .x = image.x,
-                .y = image.y,
-                .width = image.size.width,
-                .height = image.size.height,
-            }).clipTo(frame_size) orelse break :clipped null;
-            if (image.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            if (image.rounded_clip) |clip| {
-                rect = rect.intersection(clip.rect) orelse break :clipped null;
-            }
-            break :clipped rect;
-        },
-        .crossfade => |fade| clipped: {
-            var rect = fade.destination.clipTo(frame_size) orelse break :clipped null;
-            if (fade.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            if (fade.rounded_clip) |clip| rect = rect.intersection(clip.rect) orelse break :clipped null;
-            break :clipped rect;
-        },
-        .shadow => |shadow| shadowVisibleRect(shadow, frame_size),
-        .backdrop_capture => null,
-        .backdrop_blur => |blur| clipped: {
-            var rect = blur.rect.clipTo(frame_size) orelse break :clipped null;
-            if (blur.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
-            break :clipped rect;
-        },
-    };
-}
-
-fn shadowVisibleRect(shadow: render.Shadow, frame_size: render.Size) ?render.Rect {
-    if (shadow.color.alpha == 0 or shadow.rect.width == 0 or shadow.rect.height == 0) {
-        return null;
-    }
-    const spread: i64 = shadow.spread;
-    const shape_x = @as(i64, shadow.rect.x) - spread;
-    const shape_y = @as(i64, shadow.rect.y) - spread;
-    const shape_width = @as(i64, shadow.rect.width) + 2 * spread;
-    const shape_height = @as(i64, shadow.rect.height) + 2 * spread;
-    if (shape_width <= 0 or shape_height <= 0) return null;
-    const blur_extent: i64 = render.shadowBlurExtent(shadow.blur_radius);
-    const left = @max(shape_x - blur_extent, 0);
-    const top = @max(shape_y - blur_extent, 0);
-    const right = @min(shape_x + shape_width + blur_extent, frame_size.width);
-    const bottom = @min(shape_y + shape_height + blur_extent, frame_size.height);
-    if (left >= right or top >= bottom) return null;
-    var rect: render.Rect = .{
-        .x = @intCast(left),
-        .y = @intCast(top),
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
-    if (shadow.clip) |clip| rect = rect.intersection(clip) orelse return null;
-    return rect;
 }
 
 fn imageCanReplace(image: render.Image) bool {
