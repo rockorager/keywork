@@ -669,9 +669,7 @@ fn prepareClosing(self: *Self, id: WindowId) void {
 fn removeId(self: *Self, id: WindowId) void {
     self.prepareClosing(id);
     const pending = self.windows.get(id).?.serial != null;
-    if (self.toplevel_drag) |drag| {
-        if (std.meta.eql(drag.window, id)) self.toplevel_drag = null;
-    }
+    self.removeWindowPointerInteractions(id);
     var window = self.windows.remove(id).?;
     if (self.geometry_listener) |listener| listener.removed(listener.context, window.scene_id);
     _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
@@ -680,6 +678,23 @@ fn removeId(self: *Self, id: WindowId) void {
     window.tags.deinit(self.allocator);
     if (self.transaction.removed(pending)) self.publish();
     self.relayout();
+}
+
+fn removeWindowPointerInteractions(self: *Self, id: WindowId) void {
+    if (self.tiling_drag) |*drag| {
+        if (std.meta.eql(drag.source, id)) {
+            self.tiling_drag = null;
+        } else if (drag.target) |target| switch (target) {
+            .window => |window_target| if (std.meta.eql(window_target.window, id)) {
+                drag.target = null;
+            },
+            .workspace => {},
+        };
+    }
+    if (self.toplevel_drag) |drag| {
+        if (std.meta.eql(drag.window, id)) self.toplevel_drag = null;
+    }
+    if (self.interactivelyResizing(id)) self.cancelInteractiveResize();
 }
 
 fn removeXdg(self: *Self, xdg_id: XdgShell.WindowId) void {
@@ -814,6 +829,16 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
     }
     var replacement_index = replacement orelse return;
     const replacement_output = self.workspaces.items[replacement_index].output;
+    if (self.tiling_drag) |*drag| if (drag.target) |target| switch (target) {
+        .window => {},
+        .workspace => |workspace_target| if (std.meta.eql(workspace_target.output, output)) {
+            drag.target = null;
+        },
+    };
+    if (self.interactive_resize) |resize| switch (resize) {
+        .floating => {},
+        .tiled => |tiled| if (std.meta.eql(tiled.output, output)) self.cancelInteractiveResize(),
+    };
     var migration_count: usize = 0;
     var it = self.windows.iterator();
     while (it.next()) |entry| {
@@ -1484,6 +1509,17 @@ pub fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
     };
     self.relayout();
     return true;
+}
+
+fn cancelInteractiveResize(self: *Self) void {
+    const resize = self.interactive_resize orelse return;
+    self.interactive_resize = null;
+    switch (resize) {
+        .floating => {},
+        .tiled => |value| if (self.tiledResizeLayout(value)) |layout| {
+            _ = layout.cancelResize(value.resize);
+        },
+    }
 }
 
 fn tiledResizeLayout(self: *Self, resize: TiledResize) ?*layout_mod.Layout {
@@ -3095,6 +3131,47 @@ test "toplevel drag preserves the grab offset and clamps coordinates" {
         Scene.Position{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
         toplevelDragPosition(1.0e20, -1.0e20, 0, 0),
     );
+}
+
+test "removed windows release owned pointer interactions and drop targets" {
+    const removed: WindowId = .{ .index = 1, .generation = 1 };
+    const other: WindowId = .{ .index = 2, .generation = 1 };
+    var manager: Self = undefined;
+    manager.tiling_drag = .{ .source = removed, .initial_x = 0, .initial_y = 0 };
+    manager.toplevel_drag = .{
+        .window = removed,
+        .grab_x = 0,
+        .grab_y = 0,
+        .initial_position = .{},
+        .original_floating_override = null,
+        .original_floating_position = null,
+        .original_floating_restore_size = null,
+    };
+    manager.interactive_resize = .{ .floating = .{
+        .window = removed,
+        .initial_rect = .{ .x = 0, .y = 0, .size = types.Size.init(1, 1) },
+        .initial_pointer_x = 0,
+        .initial_pointer_y = 0,
+        .edges = .{ .right = true },
+        .constraints = .{},
+    } };
+
+    manager.removeWindowPointerInteractions(removed);
+    try std.testing.expect(manager.tiling_drag == null);
+    try std.testing.expect(manager.toplevel_drag == null);
+    try std.testing.expect(manager.interactive_resize == null);
+
+    manager.tiling_drag = .{
+        .source = other,
+        .initial_x = 0,
+        .initial_y = 0,
+        .target = .{ .window = .{ .window = removed, .position = .left } },
+    };
+    manager.toplevel_drag = null;
+    manager.interactive_resize = null;
+    manager.removeWindowPointerInteractions(removed);
+    try std.testing.expect(manager.tiling_drag != null);
+    try std.testing.expect(manager.tiling_drag.?.target == null);
 }
 
 test "floating directional navigation uses signed center distance on its axis" {
