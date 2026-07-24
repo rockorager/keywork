@@ -781,10 +781,7 @@ pub fn setDeviceRepeatInfo(self: *Self, id: DeviceId, rate: i32, delay: i32) voi
     const device = self.findInputDeviceById(id) orelse return;
     if (device.info.device_type != .keyboard) return;
     device.repeat_info = .{ .rate = rate, .delay = delay };
-    if (self.active_keyboard == id and !std.meta.eql(self.active_repeat_info, device.repeat_info)) {
-        self.active_repeat_info = device.repeat_info;
-        self.listener.keyboard_repeat_info(self.listener.context, id, rate, delay);
-    }
+    if (self.active_keyboard == id) self.updateActiveRepeatInfo(device);
 }
 
 pub fn setDeviceScrollFactor(self: *Self, id: DeviceId, factor: f64) void {
@@ -1408,10 +1405,8 @@ fn deinitInputDevice(self: *Self, device: *InputDevice) void {
 fn promoteKeyboard(self: *Self) void {
     if (self.active_keyboard != null) return;
     for (self.input_devices.items) |*device| {
-        const keyboard = if (device.keyboard) |*value| value else continue;
-        self.installKeymap(device.info.id, keyboard.keymap) catch |err| return self.fail(err);
-        self.active_keyboard = device.info.id;
-        self.sendKeyboardModifiers(keyboard, true);
+        if (device.keyboard == null) continue;
+        self.activateKeyboard(device) catch |err| return self.fail(err);
         return;
     }
 }
@@ -1421,21 +1416,14 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     const libinput_device = c.libinput_event_get_device(base_event).?;
     const device = self.findInputDevice(libinput_device, .keyboard) orelse return;
     const keyboard = if (device.keyboard) |*value| value else unreachable;
-    if (!std.meta.eql(self.active_repeat_info, device.repeat_info)) {
-        self.active_repeat_info = device.repeat_info;
-        self.listener.keyboard_repeat_info(
-            self.listener.context,
-            device.info.id,
-            device.repeat_info.rate,
-            device.repeat_info.delay,
-        );
-    }
     const key = c.libinput_event_keyboard_get_key(event);
     const pressed = c.libinput_event_keyboard_get_key_state(event) == c.LIBINPUT_KEY_STATE_PRESSED;
     const seat_key_count = c.libinput_event_keyboard_get_seat_key_count(event);
     const forward = (pressed and seat_key_count == 1) or (!pressed and seat_key_count == 0);
     if (self.active_keyboard != device.info.id) {
         self.activateKeyboard(device) catch |err| return self.fail(err);
+    } else {
+        self.updateActiveRepeatInfo(device);
     }
     const binding_event = keyboardEvent(device, keyboard, key, pressed, forward);
     const emergency_captured = forward and self.handleEmergencyShortcut(key, pressed);
@@ -1504,7 +1492,20 @@ fn activateKeyboard(self: *Self, device: *InputDevice) !void {
     const keyboard = if (device.keyboard) |*value| value else unreachable;
     try self.installKeymap(device.info.id, keyboard.keymap);
     self.active_keyboard = device.info.id;
+    self.updateActiveRepeatInfo(device);
     self.sendKeyboardModifiers(keyboard, true);
+}
+
+fn updateActiveRepeatInfo(self: *Self, device: *const InputDevice) void {
+    std.debug.assert(self.active_keyboard == device.info.id and device.keyboard != null);
+    if (std.meta.eql(self.active_repeat_info, device.repeat_info)) return;
+    self.active_repeat_info = device.repeat_info;
+    self.listener.keyboard_repeat_info(
+        self.listener.context,
+        device.info.id,
+        device.repeat_info.rate,
+        device.repeat_info.delay,
+    );
 }
 
 fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) void {
