@@ -1115,6 +1115,21 @@ pub fn clearForeignParents(self: *Self, owner: *anyopaque) void {
     }
 }
 
+fn reparentChildren(
+    self: *Self,
+    parent_id: WindowId,
+    replacement_parent: ?WindowId,
+) void {
+    var iterator = self.windows.iterator();
+    while (iterator.next()) |entry| {
+        const current_parent = entry.value.parent orelse continue;
+        if (!std.meta.eql(current_parent, parent_id)) continue;
+        entry.value.parent = replacement_parent;
+        if (replacement_parent == null) entry.value.parent_owner = null;
+        _ = self.notifyWindowMetadataChanged(entry.id);
+    }
+}
+
 fn clearParentReferences(self: *Self, parent_id: WindowId) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
@@ -1860,6 +1875,7 @@ const XdgSurfaceResource = struct {
 
         if (info.had_buffer and !info.has_buffer) {
             self.shell.dismissPopupsForParent(self.id);
+            self.shell.reparentChildren(window_id, window.parent);
             self.shell.notifyWindowUnmapped(window_id);
             state.mapped = false;
             state.configured = false;
@@ -2819,4 +2835,72 @@ test "xdg state requests survive initial setup and reset on unmap" {
 
     window.reset(allocator);
     try std.testing.expectEqual(WindowRequestState{}, window.requested_state);
+}
+
+test "unmapping a toplevel reparents only its direct children" {
+    const allocator = std.testing.allocator;
+    var shell: Self = undefined;
+    shell.windows = .{};
+    shell.window_listener = null;
+    shell.window_observers = .empty;
+    defer shell.windows.deinit(allocator);
+    defer shell.window_observers.deinit(allocator);
+
+    const initial: WindowState = .{
+        .xdg_surface_id = undefined,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+    };
+    const grandparent = try shell.windows.insert(allocator, initial);
+    errdefer _ = shell.windows.remove(grandparent);
+    const parent = try shell.windows.insert(allocator, initial);
+    errdefer _ = shell.windows.remove(parent);
+    const child = try shell.windows.insert(allocator, initial);
+    errdefer _ = shell.windows.remove(child);
+    const sibling = try shell.windows.insert(allocator, initial);
+    errdefer _ = shell.windows.remove(sibling);
+    const grandchild = try shell.windows.insert(allocator, initial);
+    errdefer _ = shell.windows.remove(grandchild);
+    defer {
+        _ = shell.windows.remove(grandchild);
+        _ = shell.windows.remove(sibling);
+        _ = shell.windows.remove(child);
+        _ = shell.windows.remove(parent);
+        _ = shell.windows.remove(grandparent);
+    }
+
+    shell.windows.get(parent).?.parent = grandparent;
+    shell.windows.get(child).?.parent = parent;
+    shell.windows.get(sibling).?.parent = parent;
+    shell.windows.get(grandchild).?.parent = child;
+    var parent_owner: u8 = 0;
+    shell.windows.get(child).?.parent_owner = &parent_owner;
+
+    shell.reparentChildren(parent, grandparent);
+    try std.testing.expect(std.meta.eql(
+        grandparent,
+        shell.windows.get(child).?.parent.?,
+    ));
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_owner),
+        shell.windows.get(child).?.parent_owner,
+    );
+    try std.testing.expect(std.meta.eql(
+        grandparent,
+        shell.windows.get(sibling).?.parent.?,
+    ));
+    try std.testing.expect(std.meta.eql(
+        child,
+        shell.windows.get(grandchild).?.parent.?,
+    ));
+
+    shell.reparentChildren(grandparent, null);
+    try std.testing.expect(shell.windows.get(parent).?.parent == null);
+    try std.testing.expect(shell.windows.get(child).?.parent == null);
+    try std.testing.expect(shell.windows.get(child).?.parent_owner == null);
+    try std.testing.expect(shell.windows.get(sibling).?.parent == null);
+    try std.testing.expect(std.meta.eql(
+        child,
+        shell.windows.get(grandchild).?.parent.?,
+    ));
 }
