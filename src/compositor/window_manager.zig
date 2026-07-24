@@ -16,6 +16,7 @@ const Xwm = @import("xwayland/xwm.zig");
 const ConfigureTransaction = @import("window_manager/ConfigureTransaction.zig");
 const XwaylandController = @import("window_manager/XwaylandController.zig");
 const types = @import("window_manager/types.zig");
+const drag_geometry = @import("window_manager/drag_geometry.zig");
 const floating_placement = @import("window_manager/floating_placement.zig");
 const floating_resize = @import("window_manager/floating_resize.zig");
 const layout_mod = @import("window_manager/layout.zig");
@@ -28,7 +29,6 @@ const wl = wayland.server.wl;
 const PointerShape = wayland.server.wp.CursorShapeDeviceV1.Shape;
 const workspace_count = 10;
 const resize_edge_threshold: f64 = 8;
-const tiling_drag_center_radius: f64 = 0.25;
 const tiling_drag_activation_threshold: f64 = 8;
 const tiling_drag_output_edge_threshold: f64 = 32;
 
@@ -1148,7 +1148,7 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
             .y = position.y,
             .size = types.Size.init(size.width, size.height),
         };
-        if (tilingOutputEdgeDropPosition(x, y, bounds, tiling_drag_output_edge_threshold)) |edge| {
+        if (drag_geometry.outputEdgePosition(x, y, bounds, tiling_drag_output_edge_threshold)) |edge| {
             drag.target = .{ .workspace = .{
                 .output = output.id,
                 .position = edge,
@@ -1162,11 +1162,10 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
         const window = self.windows.get(id) orelse continue;
         if (!self.isDraggableTiledWindow(window)) continue;
         const plan = window.placement orelse continue;
-        if (!pointInLayoutPlan(x, y, plan)) continue;
-        const rect = visibleLayoutRect(plan) orelse unreachable;
+        const rect = drag_geometry.hitTest(x, y, plan) orelse continue;
         drag.target = .{ .window = .{
             .window = id,
-            .position = tilingDropPosition(x, y, rect),
+            .position = drag_geometry.dropPosition(x, y, rect),
         } };
         break;
     }
@@ -1183,8 +1182,8 @@ pub fn tilingDragPreview(self: *Self) ?types.Rect {
         .window => |window_target| preview: {
             const target = self.windows.get(window_target.window) orelse return null;
             if (!self.isDraggableTiledWindow(target)) return null;
-            const rect = visibleLayoutRect(target.placement orelse return null) orelse return null;
-            break :preview tilingDropPreview(rect, window_target.position);
+            const rect = drag_geometry.visibleRect(target.placement orelse return null) orelse return null;
+            break :preview drag_geometry.dropPreview(rect, window_target.position);
         },
         .workspace => |workspace_target| preview: {
             const workspace_index = self.workspaceFor(workspace_target.output) orelse return null;
@@ -1198,7 +1197,7 @@ pub fn tilingDragPreview(self: *Self) ?types.Rect {
                 .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
             };
             break :preview if (workspace_target.position) |position|
-                tilingDropPreview(rect, position)
+                drag_geometry.dropPreview(rect, position)
             else
                 rect;
         },
@@ -1530,7 +1529,7 @@ fn beginWindowMove(
         @as(f64, @floatFromInt(y_offset))
     else
         pointer_y - @as(f64, @floatFromInt(current.y));
-    const position = toplevelDragPosition(pointer_x, pointer_y, grab_x, grab_y);
+    const position = drag_geometry.toplevelPosition(pointer_x, pointer_y, grab_x, grab_y);
     const original_floating_override = window.floating_override;
     const original_floating_position = window.floating_position;
     const original_floating_restore_size = window.floating_restore_size;
@@ -1569,7 +1568,7 @@ pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
         self.toplevel_drag = null;
         return;
     };
-    const position = toplevelDragPosition(pointer_x, pointer_y, drag.grab_x, drag.grab_y);
+    const position = drag_geometry.toplevelPosition(pointer_x, pointer_y, drag.grab_x, drag.grab_y);
     window.floating_position = position;
     if (window.placement) |*placement| {
         placement.rect.x = position.x;
@@ -2455,124 +2454,6 @@ fn clampI16(value: i32) i16 {
     return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
 }
 
-fn toplevelDragPosition(x: f64, y: f64, grab_x: f64, grab_y: f64) Scene.Position {
-    return .{
-        .x = dragCoordinate(x - grab_x),
-        .y = dragCoordinate(y - grab_y),
-    };
-}
-
-fn dragCoordinate(value: f64) i32 {
-    return @intFromFloat(@floor(std.math.clamp(
-        value,
-        @as(f64, @floatFromInt(std.math.minInt(i32))),
-        @as(f64, @floatFromInt(std.math.maxInt(i32))),
-    )));
-}
-
-fn pointInLayoutPlan(x: f64, y: f64, plan: types.LayoutPlan) bool {
-    const rect = visibleLayoutRect(plan) orelse return false;
-    return x >= @as(f64, @floatFromInt(rect.x)) and
-        y >= @as(f64, @floatFromInt(rect.y)) and
-        x < @as(f64, @floatFromInt(@as(i64, rect.x) + rect.size.width)) and
-        y < @as(f64, @floatFromInt(@as(i64, rect.y) + rect.size.height));
-}
-
-fn tilingDropPosition(x: f64, y: f64, rect: types.Rect) layout_mod.DropPosition {
-    const relative_x = std.math.clamp(
-        (x - @as(f64, @floatFromInt(rect.x))) /
-            @as(f64, @floatFromInt(rect.size.width)),
-        0,
-        1,
-    );
-    const relative_y = std.math.clamp(
-        (y - @as(f64, @floatFromInt(rect.y))) /
-            @as(f64, @floatFromInt(rect.size.height)),
-        0,
-        1,
-    );
-    const horizontal_distance = @abs(relative_x - 0.5);
-    const vertical_distance = @abs(relative_y - 0.5);
-    if (horizontal_distance <= tiling_drag_center_radius and
-        vertical_distance <= tiling_drag_center_radius) return .center;
-    if (horizontal_distance > vertical_distance)
-        return if (relative_x < 0.5) .left else .right;
-    return if (relative_y < 0.5) .top else .bottom;
-}
-
-fn tilingOutputEdgeDropPosition(
-    x: f64,
-    y: f64,
-    bounds: types.Rect,
-    threshold: f64,
-) ?layout_mod.DropPosition {
-    std.debug.assert(threshold >= 0);
-    const left: f64 = @floatFromInt(bounds.x);
-    const top: f64 = @floatFromInt(bounds.y);
-    const right: f64 = @floatFromInt(@as(i64, bounds.x) + bounds.size.width);
-    const bottom: f64 = @floatFromInt(@as(i64, bounds.y) + bounds.size.height);
-    if (x < left or x >= right or y < top or y >= bottom) return null;
-    const left_distance = x - left;
-    const right_distance = right - x;
-    if (@min(left_distance, right_distance) > threshold) return null;
-    return if (left_distance <= right_distance) .left else .right;
-}
-
-fn tilingDropPreview(rect: types.Rect, position: layout_mod.DropPosition) types.Rect {
-    return switch (position) {
-        .center => rect,
-        .left, .right => if (rect.size.width < 2)
-            rect
-        else preview: {
-            const first_width = rect.size.width / 2;
-            break :preview if (position == .left) .{
-                .x = rect.x,
-                .y = rect.y,
-                .size = types.Size.init(first_width, rect.size.height),
-            } else .{
-                .x = rect.x + @as(i32, @intCast(first_width)),
-                .y = rect.y,
-                .size = types.Size.init(rect.size.width - first_width, rect.size.height),
-            };
-        },
-        .top, .bottom => if (rect.size.height < 2)
-            rect
-        else preview: {
-            const first_height = rect.size.height / 2;
-            break :preview if (position == .top) .{
-                .x = rect.x,
-                .y = rect.y,
-                .size = types.Size.init(rect.size.width, first_height),
-            } else .{
-                .x = rect.x,
-                .y = rect.y + @as(i32, @intCast(first_height)),
-                .size = types.Size.init(rect.size.width, rect.size.height - first_height),
-            };
-        },
-    };
-}
-
-fn visibleLayoutRect(plan: types.LayoutPlan) ?types.Rect {
-    if (!plan.visible) return null;
-    const clip = plan.clip orelse return plan.rect;
-    const left = @max(@as(i64, plan.rect.x), clip.x);
-    const top = @max(@as(i64, plan.rect.y), clip.y);
-    const right = @min(
-        @as(i64, plan.rect.x) + plan.rect.size.width,
-        @as(i64, clip.x) + clip.size.width,
-    );
-    const bottom = @min(
-        @as(i64, plan.rect.y) + plan.rect.size.height,
-        @as(i64, clip.y) + clip.size.height,
-    );
-    if (left >= right or top >= bottom) return null;
-    return .{
-        .x = @intCast(left),
-        .y = @intCast(top),
-        .size = types.Size.init(@intCast(right - left), @intCast(bottom - top)),
-    };
-}
-
 fn directionalDelta(origin: types.Rect, candidate: types.Rect, direction: Direction) i64 {
     const origin_x = doubledCenter(origin.x, origin.size.width);
     const origin_y = doubledCenter(origin.y, origin.size.height);
@@ -2907,91 +2788,6 @@ test "XDG toplevel with one fixed dimension wants floating" {
         .{ .width = 784, .height = 0 },
         .{ .width = 784, .height = 0 },
     ));
-}
-
-test "tiling drag hit testing honors visibility and layout clipping" {
-    const plan: types.LayoutPlan = .{
-        .id = types.id(1),
-        .rect = .{ .x = 10, .y = 20, .size = types.Size.init(100, 80) },
-        .visible = true,
-        .clip = .{ .x = 30, .y = 10, .size = types.Size.init(40, 50) },
-    };
-    try std.testing.expectEqual(
-        types.Rect{ .x = 30, .y = 20, .size = types.Size.init(40, 40) },
-        visibleLayoutRect(plan).?,
-    );
-    try std.testing.expect(pointInLayoutPlan(30, 20, plan));
-    try std.testing.expect(pointInLayoutPlan(69.99, 59.99, plan));
-    try std.testing.expect(!pointInLayoutPlan(29.99, 20, plan));
-    try std.testing.expect(!pointInLayoutPlan(70, 20, plan));
-
-    var hidden = plan;
-    hidden.visible = false;
-    try std.testing.expect(visibleLayoutRect(hidden) == null);
-}
-
-test "tiling drag drop zones select a side and preview its half" {
-    const rect: types.Rect = .{
-        .x = 100,
-        .y = 200,
-        .size = types.Size.init(400, 200),
-    };
-    try std.testing.expectEqual(layout_mod.DropPosition.center, tilingDropPosition(300, 300, rect));
-    try std.testing.expectEqual(layout_mod.DropPosition.left, tilingDropPosition(110, 300, rect));
-    try std.testing.expectEqual(layout_mod.DropPosition.right, tilingDropPosition(490, 300, rect));
-    try std.testing.expectEqual(layout_mod.DropPosition.top, tilingDropPosition(300, 205, rect));
-    try std.testing.expectEqual(layout_mod.DropPosition.bottom, tilingDropPosition(300, 395, rect));
-
-    try std.testing.expectEqual(
-        types.Rect{ .x = 100, .y = 200, .size = types.Size.init(200, 200) },
-        tilingDropPreview(rect, .left),
-    );
-    try std.testing.expectEqual(
-        types.Rect{ .x = 300, .y = 200, .size = types.Size.init(200, 200) },
-        tilingDropPreview(rect, .right),
-    );
-    try std.testing.expectEqual(
-        types.Rect{ .x = 100, .y = 200, .size = types.Size.init(400, 100) },
-        tilingDropPreview(rect, .top),
-    );
-    try std.testing.expectEqual(
-        types.Rect{ .x = 100, .y = 300, .size = types.Size.init(400, 100) },
-        tilingDropPreview(rect, .bottom),
-    );
-}
-
-test "tiling drag detects output left and right edge targets" {
-    const bounds: types.Rect = .{
-        .x = 100,
-        .y = 200,
-        .size = types.Size.init(400, 200),
-    };
-    try std.testing.expectEqual(
-        layout_mod.DropPosition.left,
-        tilingOutputEdgeDropPosition(100, 250, bounds, 32).?,
-    );
-    try std.testing.expectEqual(
-        layout_mod.DropPosition.left,
-        tilingOutputEdgeDropPosition(132, 250, bounds, 32).?,
-    );
-    try std.testing.expectEqual(
-        layout_mod.DropPosition.right,
-        tilingOutputEdgeDropPosition(499.99, 250, bounds, 32).?,
-    );
-    try std.testing.expect(tilingOutputEdgeDropPosition(133, 250, bounds, 32) == null);
-    try std.testing.expect(tilingOutputEdgeDropPosition(300, 199, bounds, 32) == null);
-    try std.testing.expect(tilingOutputEdgeDropPosition(500, 250, bounds, 32) == null);
-}
-
-test "toplevel drag preserves the grab offset and clamps coordinates" {
-    try std.testing.expectEqual(
-        Scene.Position{ .x = 90, .y = 185 },
-        toplevelDragPosition(100.75, 200.25, 10, 15),
-    );
-    try std.testing.expectEqual(
-        Scene.Position{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
-        toplevelDragPosition(1.0e20, -1.0e20, 0, 0),
-    );
 }
 
 test "removed windows release owned pointer interactions and drop targets" {
