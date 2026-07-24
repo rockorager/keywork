@@ -8,6 +8,7 @@ const Region = @import("../region.zig");
 const render_types = @import("types.zig");
 const blur_geometry = @import("blur_geometry.zig");
 const command_geometry = @import("command_geometry.zig");
+const gpu_timing = @import("gpu_timing.zig");
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -28,7 +29,7 @@ pub const Renderer = struct {
     };
 
     pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
-    pub const GpuTiming = VulkanRenderer.GpuTiming;
+    pub const GpuTiming = gpu_timing.Timing;
     pub const FrameCompletion = render_types.FrameCompletion;
 
     const Backend = union(enum) {
