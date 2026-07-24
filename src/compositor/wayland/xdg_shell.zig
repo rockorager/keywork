@@ -1091,6 +1091,8 @@ pub fn toplevelFromResource(self: *Self, resource: *xdg.Toplevel) ?ToplevelInfo 
     };
 }
 
+/// Associates the relation with the opaque `owner` identity so
+/// `clearForeignParents` can remove every relation established by that owner.
 pub fn setForeignParent(
     self: *Self,
     child_surface_id: Surface.Id,

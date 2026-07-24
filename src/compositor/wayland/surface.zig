@@ -657,6 +657,8 @@ pub const CommitAction = enum {
     reject,
 };
 
+/// The surface copies this table but borrows its context until `releaseRole` or
+/// until the `surface_destroyed` callback returns.
 pub const RoleHandler = struct {
     context: *anyopaque,
     before_commit: *const fn (*anyopaque, CommitInfo) CommitAction,

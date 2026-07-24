@@ -21,6 +21,7 @@ active: bool,
 failed: bool,
 notifying: bool,
 
+/// The session retains this caller-owned object and its context until removal.
 /// Listener registrations must remain unchanged during broadcast callbacks.
 pub const Listener = struct {
     context: *anyopaque,

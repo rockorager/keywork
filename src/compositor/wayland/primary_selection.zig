@@ -551,6 +551,7 @@ pub fn hasSelection(self: *const Self) bool {
     return self.selection != null;
 }
 
+/// Returns a slice borrowed from the current source and invalidated by source mutation.
 pub fn selectionMimeTypes(self: *Self) []const [:0]const u8 {
     const selection = self.selection orelse return &.{};
     return switch (selection) {
@@ -575,6 +576,8 @@ pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) 
     }
 }
 
+/// Borrows `source` and its callback-returned MIME slices until replacement or
+/// `externalSourceDestroyed`.
 pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     const selection: ?Selection = if (source) |value| .{ .external = value } else null;
     if (std.meta.eql(self.selection, selection)) return;
