@@ -757,8 +757,8 @@ fn sendMetadata(self: *Self, mapping: *Mapping) void {
     const metadata = self.mappingMetadata(mapping) orelse return;
     for (self.handles.items) |handle| {
         if (handle.mapping != mapping or handle.closed) continue;
-        if (metadata.title) |title| handle.resource.sendTitle(title.ptr);
-        if (metadata.app_id) |app_id| handle.resource.sendAppId(app_id.ptr);
+        handle.resource.sendTitle(if (metadata.title) |title| title.ptr else "");
+        handle.resource.sendAppId(if (metadata.app_id) |app_id| app_id.ptr else "");
         handle.resource.sendDone();
     }
     for (self.wlr_handles.items) |handle| {
