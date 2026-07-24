@@ -151,6 +151,7 @@ type OutputStatistics (
     overlayScanoutRejections: OverlayScanoutRejections,
     cpuUploads: int,
     dmabufImports: int,
+    # Frames whose render-to-presentation latency exceeded one refresh period plus tolerance.
     framesOverBudget: int,
     gpuExecution: LatencyStatistics,
     gpuComposition: LatencyStatistics,

@@ -117,6 +117,10 @@ pub fn recordPresentation(
         timestamps.request_nanoseconds,
         presented_nanoseconds,
     );
+    const render_to_presentation = elapsedNanoseconds(
+        timestamps.render_nanoseconds,
+        presented_nanoseconds,
+    );
     var latency: FrameLatency = .{
         .request_to_presentation_microseconds = nanosecondsToMicroseconds(request_to_presentation),
         .request_to_render_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
@@ -153,7 +157,7 @@ pub fn recordPresentation(
     }
     self.addLatency(latency);
     increment(&self.frames_presented);
-    if (request_to_presentation > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
+    if (render_to_presentation > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
         increment(&self.frames_over_budget);
     }
 }
@@ -643,13 +647,15 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     );
     try std.testing.expectEqual(ControlProtocol.FramePath.overlay_scanout, overlay_snapshot.lastFrame.path);
 
+    // Time queued behind an already-submitted frame is request latency, not
+    // compositor work exceeding the next presentation budget.
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
-        .render_nanoseconds = std.time.ns_per_ms,
-        .commit_nanoseconds = 2 * std.time.ns_per_ms,
+        .render_nanoseconds = 10 * std.time.ns_per_ms,
+        .commit_nanoseconds = 11 * std.time.ns_per_ms,
     }, 20 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u64, 1), statistics.frames_presented);
-    try std.testing.expectEqual(@as(u64, 1), statistics.frames_over_budget);
+    try std.testing.expectEqual(@as(u64, 0), statistics.frames_over_budget);
 
     statistics.recordPresentation(.{
         .request_nanoseconds = 20 * std.time.ns_per_ms,
@@ -657,6 +663,7 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         .commit_nanoseconds = 24 * std.time.ns_per_ms,
         .render_completion_nanoseconds = 23 * std.time.ns_per_ms,
     }, 30 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 0), statistics.frames_over_budget);
     try std.testing.expectEqual(
         @as(i64, 2_000),
         statistics.latencySummary(.render_to_gpu_completion).p50Microseconds,
@@ -667,6 +674,13 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     );
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fence_samples);
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fences_signaled_before_commit);
+
+    statistics.recordPresentation(.{
+        .request_nanoseconds = 30 * std.time.ns_per_ms,
+        .render_nanoseconds = 31 * std.time.ns_per_ms,
+        .commit_nanoseconds = 32 * std.time.ns_per_ms,
+    }, 43 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 1), statistics.frames_over_budget);
 
     statistics.reset();
     try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
