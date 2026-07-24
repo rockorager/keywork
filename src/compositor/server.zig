@@ -4475,6 +4475,17 @@ fn seatButtonHeld(self: *const Self, seat: *Seat, button: u32) bool {
     return false;
 }
 
+fn forgetRoutedButtonsForSeat(self: *Self, seat: *Seat) void {
+    var index: usize = 0;
+    while (index < self.routed_buttons.items.len) {
+        if (self.routed_buttons.items[index].seat != seat) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_buttons.orderedRemove(index);
+    }
+}
+
 fn beginGesture(
     self: *Self,
     device_id: NativeInput.DeviceId,
@@ -4777,6 +4788,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         return;
     }
     self.seat.pointerEnter(point.x, point.y, route.focus);
+    if (self.seat.implicitPointerGrabActive()) return;
     if (!self.xdg_shell.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, point.x, point.y);
@@ -4793,6 +4805,7 @@ fn pointerLeave(context: *anyopaque) void {
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
+    self.forgetRoutedButtonsForSeat(&self.seat);
     self.seat.pointerLeave();
 }
 
@@ -4872,6 +4885,7 @@ fn pointerMotionGlobalForSeat(
         motion.point.y,
         route.focus,
     );
+    if (seat.implicitPointerGrabActive()) return;
     if (!self.xdg_shell.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, motion.point.x, motion.point.y);
@@ -5125,10 +5139,12 @@ fn pointerButtonForSeat(
                 null;
             self.session_lock.pointerPressed(focused);
         }
-        _ = seat.pointerButton(time, button, state) catch {
+        const grab_ended = seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
             self.terminate();
+            return;
         };
+        if (state == .released and grab_ended) self.restoreSeatPointerFocus(seat);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
@@ -5164,7 +5180,12 @@ fn pointerButtonForSeat(
         }
         return;
     }
-    const root = if (seat.pointerPosition()) |position|
+    const root = if (seat.implicitPointerGrabActive())
+        if (seat.pointerFocusedSurface()) |surface_id|
+            self.subcompositor.rootSurface(surface_id)
+        else
+            null
+    else if (seat.pointerPosition()) |position|
         self.pointerRoute(position.x, position.y).root
     else
         null;
@@ -5206,10 +5227,12 @@ fn pointerButtonForSeat(
         self.xdg_shell.dismissPopupGrab();
         return;
     }
-    _ = seat.pointerButton(time, button, state) catch {
+    const grab_ended = seat.pointerButton(time, button, state) catch {
         log.err("failed to store pointer button state", .{});
         self.terminate();
+        return;
     };
+    if (state == .released and grab_ended) self.restoreSeatPointerFocus(seat);
 }
 
 fn dragStarted(context: *anyopaque) void {
@@ -5219,6 +5242,7 @@ fn dragStarted(context: *anyopaque) void {
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     self.reconcileOutputCursors();
+    self.seat.dissolvePointerGrab();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.dragPointerRoute(position.x, position.y);
     if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
@@ -5277,9 +5301,14 @@ fn dragEnded(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) self.xwm.physicalDragEnded();
     self.reconcileOutputCursors();
-    const position = self.seat.pointerPosition() orelse return;
+    self.restoreSeatPointerFocus(&self.seat);
+}
+
+fn restoreSeatPointerFocus(self: *Self, seat: *Seat) void {
+    const position = seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
-    self.seat.pointerEnter(position.x, position.y, route.focus);
+    seat.pointerEnter(position.x, position.y, route.focus);
+    if (seat != &self.seat or self.session_lock.isLocked()) return;
     if (!self.xdg_shell.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, position.x, position.y);

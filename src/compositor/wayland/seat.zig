@@ -53,6 +53,7 @@ default_cursor: ?CursorImage,
 cursor_controller: ?CursorController,
 drag_cursor_client: ?*wl.Client,
 cursor_surface_count: usize,
+pointer_grab: ?PointerGrab,
 pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
 pressed_keys: std.ArrayList(u32),
 grabbed_keys: std.ArrayList(GrabbedKey),
@@ -133,6 +134,11 @@ const PressedPointerButton = struct {
     client: *wl.Client,
     surface_id: Surface.Id,
     serial: u32,
+};
+
+const PointerGrab = struct {
+    surface_id: Surface.Id,
+    suppressed: bool = false,
 };
 
 const SurfaceCursor = struct {
@@ -282,6 +288,7 @@ pub fn init(
         .cursor_controller = null,
         .drag_cursor_client = null,
         .cursor_surface_count = 0,
+        .pointer_grab = null,
         .pressed_pointer_buttons = .empty,
         .pressed_keys = .empty,
         .grabbed_keys = .empty,
@@ -573,6 +580,10 @@ pub fn hasPressedPointerButtons(self: *const Self) bool {
     return self.pressed_pointer_buttons.items.len != 0;
 }
 
+pub fn implicitPointerGrabActive(self: *const Self) bool {
+    return self.pointer_grab != null;
+}
+
 pub fn hasPressedPointerButtonForSurface(
     self: *const Self,
     button: u32,
@@ -588,6 +599,7 @@ pub fn forgetPressedPointerButton(self: *Self, button: u32) void {
     for (self.pressed_pointer_buttons.items, 0..) |press, index| {
         if (press.button != button) continue;
         _ = self.pressed_pointer_buttons.orderedRemove(index);
+        if (self.pressed_pointer_buttons.items.len == 0) self.pointer_grab = null;
         return;
     }
 }
@@ -645,7 +657,14 @@ pub fn setDragCursorController(self: *Self, client: ?*wl.Client) void {
 }
 
 pub fn suppressPointerFocus(self: *Self, suppress: bool) void {
-    if (suppress) self.updatePointerFocus(null, null);
+    if (!suppress) return;
+    if (self.pointer_grab) |*grab| grab.suppressed = true;
+    self.updatePointerFocus(null, null);
+}
+
+/// End implicit pointer routing while preserving button bookkeeping for a drag.
+pub fn dissolvePointerGrab(self: *Self) void {
+    self.pointer_grab = null;
 }
 
 pub fn restoreUnfocusedCursor(self: *Self) void {
@@ -1071,13 +1090,29 @@ fn setModifiersWithGrab(
 }
 
 pub fn pointerEnter(self: *Self, x: f64, y: f64, focus: ?PointerFocus) void {
+    const adjusted_focus = adjustedPointerGrabFocus(
+        self.pointer_grab,
+        self.pointer_focus,
+        self.pointer_position,
+        focus,
+        x,
+        y,
+    );
     self.setPointerPosition(x, y);
-    self.updatePointerFocus(focus, null);
+    self.updatePointerFocus(adjusted_focus, null);
 }
 
 pub fn pointerMotion(self: *Self, time: u32, x: f64, y: f64, focus: ?PointerFocus) void {
+    const adjusted_focus = adjustedPointerGrabFocus(
+        self.pointer_grab,
+        self.pointer_focus,
+        self.pointer_position,
+        focus,
+        x,
+        y,
+    );
     self.setPointerPosition(x, y);
-    self.updatePointerFocus(focus, time);
+    self.updatePointerFocus(adjusted_focus, time);
 }
 
 pub fn warpPointer(
@@ -1107,6 +1142,8 @@ pub fn pointerLeave(self: *Self) void {
     self.pointer_focus = null;
     self.pointer_position = null;
     self.latest_pointer_enter = null;
+    self.pointer_grab = null;
+    self.pressed_pointer_buttons.clearRetainingCapacity();
     if (fallback_visible) self.notifyCursorChanged(old_cursor);
 }
 
@@ -1123,12 +1160,16 @@ pub fn pointerButton(
             }
             const surface = self.pointerSurface() orelse return false;
             const serial = self.display.nextSerial();
+            const starts_grab = self.pressed_pointer_buttons.items.len == 0;
             try self.pressed_pointer_buttons.append(self.allocator, .{
                 .button = button,
                 .client = surface.getClient(),
                 .surface_id = self.pointer_focus.?.surface_id,
                 .serial = serial,
             });
+            if (starts_grab) {
+                self.pointer_grab = .{ .surface_id = self.pointer_focus.?.surface_id };
+            }
             self.recordUserAction(surface.getClient(), serial);
             for (self.pointer_resources.items) |entry| {
                 if (!self.pointerResourceActive(entry)) continue;
@@ -1150,6 +1191,7 @@ pub fn pointerButton(
     }
 
     const grab_ended = self.pressed_pointer_buttons.items.len == 0;
+    if (grab_ended) self.pointer_grab = null;
     const surface = self.pointerSurface() orelse return grab_ended;
     const serial = self.display.nextSerial();
     self.recordSelectionSerial(surface.getClient(), serial);
@@ -2151,6 +2193,29 @@ fn fixed(value: f64) wl.Fixed {
     return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
 }
 
+fn adjustedPointerGrabFocus(
+    grab: ?PointerGrab,
+    current: ?PointerFocus,
+    old_position: ?PointerPosition,
+    candidate: ?PointerFocus,
+    x: f64,
+    y: f64,
+) ?PointerFocus {
+    const active = grab orelse return candidate;
+    if (active.suppressed) return null;
+    if (candidate) |focus| {
+        if (std.meta.eql(focus.surface_id, active.surface_id)) return focus;
+    }
+    const focus = current orelse return null;
+    std.debug.assert(std.meta.eql(focus.surface_id, active.surface_id));
+    const position = old_position orelse return focus;
+    return .{
+        .surface_id = active.surface_id,
+        .x = focus.x + x - position.x,
+        .y = focus.y + y - position.y,
+    };
+}
+
 test "cursor position accounts for hotspot and fractional motion" {
     try std.testing.expectEqual(@as(i32, 8), cursorCoordinate(12.75, 4));
     try std.testing.expectEqual(@as(i32, -5), cursorCoordinate(0.25, 5));
@@ -2186,4 +2251,61 @@ test "seat capability generations invalidate existing input resources" {
 test "touch resources bound after down do not join the contact sequence" {
     try std.testing.expect(touchResourceInSequence(4, 4));
     try std.testing.expect(!touchResourceInSequence(5, 4));
+}
+
+test "implicit pointer grab freezes focus to the pressed surface" {
+    const grabbed_surface: Surface.Id = .{ .index = 1, .generation = 2 };
+    const other_surface: Surface.Id = .{ .index = 3, .generation = 4 };
+    const adjusted = adjustedPointerGrabFocus(
+        .{ .surface_id = grabbed_surface },
+        .{ .surface_id = grabbed_surface, .x = 10, .y = 20 },
+        .{ .x = 100, .y = 200 },
+        .{ .surface_id = other_surface, .x = 1, .y = 2 },
+        103,
+        196,
+    ).?;
+    try std.testing.expect(std.meta.eql(grabbed_surface, adjusted.surface_id));
+    try std.testing.expectEqual(@as(f64, 13), adjusted.x);
+    try std.testing.expectEqual(@as(f64, 16), adjusted.y);
+}
+
+test "implicit pointer grab uses current coordinates for its surface" {
+    const surface_id: Surface.Id = .{ .index = 1, .generation = 2 };
+    const candidate: PointerFocus = .{ .surface_id = surface_id, .x = 4, .y = 5 };
+    try std.testing.expectEqual(
+        candidate,
+        adjustedPointerGrabFocus(
+            .{ .surface_id = surface_id },
+            .{ .surface_id = surface_id, .x = 10, .y = 20 },
+            .{ .x = 100, .y = 200 },
+            candidate,
+            103,
+            196,
+        ).?,
+    );
+}
+
+test "suppressed pointer grab cannot retarget focus" {
+    const grabbed_surface: Surface.Id = .{ .index = 1, .generation = 2 };
+    const other_surface: Surface.Id = .{ .index = 3, .generation = 4 };
+    try std.testing.expectEqual(
+        @as(?PointerFocus, null),
+        adjustedPointerGrabFocus(
+            .{ .surface_id = grabbed_surface, .suppressed = true },
+            null,
+            .{ .x = 100, .y = 200 },
+            .{ .surface_id = other_surface, .x = 1, .y = 2 },
+            103,
+            196,
+        ),
+    );
+}
+
+test "pointer focus passes through without a grab" {
+    const surface_id: Surface.Id = .{ .index = 1, .generation = 2 };
+    const candidate: PointerFocus = .{ .surface_id = surface_id, .x = 4, .y = 5 };
+    try std.testing.expectEqual(
+        candidate,
+        adjustedPointerGrabFocus(null, null, null, candidate, 10, 20).?,
+    );
 }
