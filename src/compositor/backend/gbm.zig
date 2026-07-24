@@ -18,6 +18,8 @@ pub const Plane = struct {
     offset: u32 = 0,
 };
 
+/// Owns the GBM buffer object and every exported plane descriptor.
+/// Call deinit exactly once.
 pub const Buffer = struct {
     bo: *c.gbm_bo,
     fd: std.posix.fd_t,

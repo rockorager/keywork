@@ -1,4 +1,7 @@
 //! Compositor-owned window placement and visual effect state.
+//!
+//! Iterators traverse live scene storage and return borrowed entry pointers.
+//! Do not mutate the scene while iterating or retain pointers across insertions.
 
 const Self = @This();
 

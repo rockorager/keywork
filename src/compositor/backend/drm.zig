@@ -507,6 +507,8 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Retains the listener context until detach or deinit. Renderer callbacks are
+/// retained until the next attachment replaces them or this output is deinitialized.
 pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRenderer) !void {
     std.debug.assert(self.listener == null);
     std.debug.assert(dmabuf_renderer != null or self.buffers[0].render_target_id == null);
@@ -525,6 +527,7 @@ pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRe
     self.listener = listener;
 }
 
+/// Returns output-owned storage, invalidated by the next activation or deinit.
 pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
     return self.scanout_formats;
 }
@@ -546,22 +549,27 @@ pub fn releaseClientBuffers(self: *Self) void {
     self.releaseClientScanouts();
 }
 
+/// Returns output-owned storage, invalidated by the next activation or deinit.
 pub fn name(self: *const Self) []const u8 {
     return self.connector_name[0..self.connector_name_length];
 }
 
+/// Returns output-owned storage, invalidated by identity refresh or deinit.
 pub fn make(self: *const Self) ?[]const u8 {
     return if (self.make_value == null) null else std.mem.span(self.make_value);
 }
 
+/// Returns output-owned storage, invalidated by identity refresh or deinit.
 pub fn model(self: *const Self) ?[]const u8 {
     return if (self.model_value == null) null else std.mem.span(self.model_value);
 }
 
+/// Returns output-owned storage, invalidated by identity refresh or deinit.
 pub fn serial(self: *const Self) ?[]const u8 {
     return if (self.serial_value == null) null else std.mem.span(self.serial_value);
 }
 
+/// Returns output-owned storage, invalidated by the next activation or deinit.
 pub fn description(self: *const Self) []const u8 {
     return self.description_value[0..self.description_length];
 }
@@ -574,11 +582,13 @@ pub fn nativeColorDescription(self: *const Self) render.ColorDescription {
     return self.native_color_description;
 }
 
+/// A returned calibration aliases the current ICC profile until replacement or deinit.
 pub fn outputCalibration(self: *const Self) ?render.OutputCalibration {
     if (self.output_color_mode != .sdr) return null;
     return if (self.icc_profile) |profile| profile.rendererCalibration() else null;
 }
 
+/// Returns output-owned storage, invalidated by ICC profile replacement or deinit.
 pub fn iccProfilePath(self: *const Self) ?[]const u8 {
     return self.icc_profile_path;
 }
@@ -596,6 +606,8 @@ pub fn colorDescriptionForIccProfile(
         self.native_color_description;
 }
 
+/// Takes ownership of both values; owned_path must use this output's allocator.
+/// Replaces and deinitializes the current pair.
 pub fn replaceIccProfile(
     self: *Self,
     profile: ?Icc.OutputProfile,
@@ -675,6 +687,7 @@ pub fn refreshMillihertz(self: *const Self) i32 {
     ));
 }
 
+/// Returns output-owned storage, invalidated by the next activation or deinit.
 pub fn availableModes(self: *const Self) []const Mode {
     return self.modes;
 }

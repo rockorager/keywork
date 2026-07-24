@@ -27,6 +27,7 @@ pub fn init(allocator: std.mem.Allocator, size: render.Size) Error!Self {
     };
 }
 
+/// Retains the renderer callbacks and created target until deinit.
 pub fn initForRenderer(
     allocator: std.mem.Allocator,
     size: render.Size,

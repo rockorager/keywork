@@ -122,6 +122,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Returns a borrowed view invalidated by output hotplug or device teardown.
 pub fn outputs(self: *Self) []const *DrmOutput {
     return self.active_outputs.items;
 }

@@ -118,6 +118,7 @@ const Buffer = struct {
     }
 };
 
+/// Copies the listener and retains its context until deinit.
 pub fn init(
     self: *Self,
     io: std.Io,

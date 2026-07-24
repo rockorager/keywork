@@ -22,6 +22,7 @@ pub fn SlotMap(comptime Value: type, comptime Tag: type) type {
         free_head: ?u32 = null,
         count: usize = 0,
 
+        /// Requires all values to have been removed; this does not deinitialize them.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             std.debug.assert(self.count == 0);
             self.slots.deinit(allocator);

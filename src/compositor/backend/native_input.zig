@@ -235,6 +235,7 @@ pub const DeviceType = enum {
     tablet_pad,
 };
 
+/// A borrowed device description. The name remains valid until device removal.
 pub const DeviceInfo = struct {
     id: DeviceId,
     physical_id: PhysicalDeviceId,
@@ -252,6 +253,7 @@ pub const DeviceCapabilities = struct {
     tablet_pad: bool,
 };
 
+/// A borrowed tablet description, valid until device removal.
 pub const TabletInfo = struct {
     vendor: u32,
     product: u32,
@@ -259,6 +261,7 @@ pub const TabletInfo = struct {
     path: ?[:0]const u8,
 };
 
+/// A borrowed tablet-pad group description, valid until device removal.
 pub const TabletPadGroupInfo = struct {
     buttons: []const u32,
     rings: []const u32,
@@ -268,6 +271,7 @@ pub const TabletPadGroupInfo = struct {
     current_mode: u32,
 };
 
+/// A borrowed tablet-pad description, valid until device removal.
 pub const TabletPadInfo = struct {
     path: ?[:0]const u8,
     button_count: u32,
@@ -358,6 +362,7 @@ pub const RepeatInfo = struct {
     delay: i32 = 600,
 };
 
+/// Iterates live device storage and is invalidated by device addition or removal.
 pub const DeviceIterator = struct {
     devices: []const InputDevice,
     index: usize = 0,
