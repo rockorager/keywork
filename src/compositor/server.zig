@@ -2620,7 +2620,7 @@ fn controlWindows(
                 .xwayland => .xwayland,
             },
             .title = snapshot.title,
-            .app_id = snapshot.app_id,
+            .appId = snapshot.app_id,
             .pid = if (snapshot.pid) |pid| pid else null,
             .rect = if (snapshot.rect) |rect| .{
                 .x = rect.x,
