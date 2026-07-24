@@ -451,6 +451,7 @@ test {
     _ = @import("render/blur_geometry.zig");
     _ = @import("render/color_math.zig");
     _ = @import("render/command_geometry.zig");
+    _ = @import("render/dual_kawase.zig");
     _ = @import("render/icc.zig");
     _ = @import("render/Renderer.zig");
     _ = @import("render/cpu.zig");
