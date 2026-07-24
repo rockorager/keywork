@@ -503,6 +503,7 @@ test {
     _ = @import("wayland/subcompositor.zig");
     _ = @import("wayland/seat.zig");
     _ = @import("wayland/PressedKeyState.zig");
+    _ = @import("wayland/UserActionSerials.zig");
     _ = @import("wayland/transient_seat.zig");
     _ = @import("wayland/output.zig");
     _ = @import("wayland/output_layout.zig");

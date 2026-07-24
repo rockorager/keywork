@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const render = @import("../render/types.zig");
 const PressedKeyState = @import("PressedKeyState.zig");
 const Surface = @import("surface.zig");
+const UserActionSerials = @import("UserActionSerials.zig");
 
 const wl = wayland.server.wl;
 
@@ -59,12 +60,7 @@ pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
 pressed_keys: PressedKeyState,
 grabbed_keys: std.ArrayList(GrabbedKey),
 modifier_state: ModifierState,
-last_user_action: ?UserAction,
-recent_user_actions: [user_action_history_capacity]UserAction,
-recent_user_action_count: usize,
-next_user_action: usize,
-
-const user_action_history_capacity = 32;
+user_action_serials: UserActionSerials,
 
 const Keymap = struct {
     format: wl.Keyboard.KeymapFormat,
@@ -323,10 +319,7 @@ pub fn init(
         .pressed_keys = .init(allocator),
         .grabbed_keys = .empty,
         .modifier_state = .{},
-        .last_user_action = null,
-        .recent_user_actions = undefined,
-        .recent_user_action_count = 0,
-        .next_user_action = 0,
+        .user_action_serials = .{},
     };
     errdefer self.seat_resources.deinit(allocator);
     errdefer self.keyboard_resources.deinit(allocator);
@@ -551,10 +544,7 @@ pub fn acceptsUserActionSerial(
 }
 
 pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool {
-    for (self.recent_user_actions[0..self.recent_user_action_count]) |action| {
-        if (action.client == client and action.serial == serial) return true;
-    }
-    return false;
+    return self.user_action_serials.acceptsSelection(client, serial);
 }
 
 pub fn acceptsActivationSerial(
@@ -584,8 +574,7 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
 }
 
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
-    const action = self.last_user_action orelse return false;
-    return action.client == client and action.serial == serial;
+    return self.user_action_serials.acceptsAction(client, serial);
 }
 
 pub fn acceptsPointerGrabSerial(
@@ -1029,9 +1018,9 @@ fn keyWithGrab(
             const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
             const serial = self.display.nextSerial();
             if (state == .pressed)
-                self.recordUserAction(surface.getClient(), serial)
+                self.user_action_serials.recordAction(surface.getClient(), serial)
             else
-                self.recordSelectionSerial(surface.getClient(), serial);
+                self.user_action_serials.recordSelection(surface.getClient(), serial);
             for (self.keyboard_resources.items) |entry| {
                 if (!self.keyboardResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -1048,9 +1037,9 @@ fn keyWithGrab(
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
     if (state == .pressed)
-        self.recordUserAction(surface.getClient(), serial)
+        self.user_action_serials.recordAction(surface.getClient(), serial)
     else
-        self.recordSelectionSerial(surface.getClient(), serial);
+        self.user_action_serials.recordSelection(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1226,7 +1215,7 @@ pub fn pointerButton(
             if (starts_grab) {
                 self.pointer_grab = .{ .surface_id = self.pointer_focus.?.surface_id };
             }
-            self.recordUserAction(surface.getClient(), serial);
+            self.user_action_serials.recordAction(surface.getClient(), serial);
             for (self.pointer_resources.items) |entry| {
                 if (!self.pointerResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -1250,7 +1239,7 @@ pub fn pointerButton(
     if (grab_ended) self.pointer_grab = null;
     const surface = self.pointerSurface() orelse return grab_ended;
     const serial = self.display.nextSerial();
-    self.recordSelectionSerial(surface.getClient(), serial);
+    self.user_action_serials.recordSelection(surface.getClient(), serial);
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1383,7 +1372,7 @@ pub fn touchDown(
     const destination = target orelse return;
     const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
     const serial = self.display.nextSerial();
-    self.recordUserAction(destination.client, serial);
+    self.user_action_serials.recordAction(destination.client, serial);
     for (self.touch_resources.items) |entry| {
         if (!self.touchResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1409,7 +1398,7 @@ pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
     const point = self.touch_points.items[index];
     if (point.target) |target| {
         const serial = self.display.nextSerial();
-        self.recordSelectionSerial(target.client, serial);
+        self.user_action_serials.recordSelection(target.client, serial);
         for (self.touch_resources.items) |entry| {
             if (!self.touchResourceActive(entry)) continue;
             const resource = entry.resource;
@@ -1616,7 +1605,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     const surface = self.keyboardDeliverySurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
-        self.recordSelectionSerial(surface.getClient(), serial);
+        self.user_action_serials.recordSelection(surface.getClient(), serial);
         self.sendEnterTo(resource, surface, serial);
     }
 }
@@ -1906,7 +1895,7 @@ fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
     const surface = self.keyboardDeliverySurface() orelse return;
     const serial = self.display.nextSerial();
-    self.recordSelectionSerial(surface.getClient(), serial);
+    self.user_action_serials.recordSelection(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -2205,22 +2194,6 @@ fn requestRepaint(self: *Self) void {
 fn notifyCursorChanged(self: *Self, old_cursor: ?CursorInfo) void {
     const listener = self.repaint_listener orelse return;
     listener.cursor_changed(listener.context, old_cursor, self.cursorInfo());
-}
-
-fn recordUserAction(self: *Self, client: *wl.Client, serial: u32) void {
-    const action: UserAction = .{ .client = client, .serial = serial };
-    self.last_user_action = action;
-    self.recordSelectionSerial(client, serial);
-}
-
-fn recordSelectionSerial(self: *Self, client: *wl.Client, serial: u32) void {
-    const action: UserAction = .{ .client = client, .serial = serial };
-    self.recent_user_actions[self.next_user_action] = action;
-    self.next_user_action = (self.next_user_action + 1) % user_action_history_capacity;
-    self.recent_user_action_count = @min(
-        self.recent_user_action_count + 1,
-        user_action_history_capacity,
-    );
 }
 
 fn notifyKeyboardFocus(self: *Self) void {
