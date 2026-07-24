@@ -458,10 +458,12 @@ test {
     _ = @import("backend/native_input.zig");
     _ = @import("backend/output.zig");
     _ = @import("backend/session.zig");
+    _ = @import("drm_syncobj.zig");
     _ = @import("presentation.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
+    _ = @import("systemd.zig");
     _ = @import("window_manager.zig");
     _ = @import("window_animation.zig");
     _ = @import("builtin_keybindings.zig");
