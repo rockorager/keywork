@@ -2045,6 +2045,7 @@ fn setDrmOutputConfiguration(
         },
     );
     self.xdg_output.refresh(protocol_output);
+    protocol_output.sendDone();
     self.window_manager.outputStateChanged(
         render_output.output.protocol_id,
         position_changed,

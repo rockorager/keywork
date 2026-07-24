@@ -174,8 +174,8 @@ pub fn logicalPosition(self: *const Self) Position {
     return self.position;
 }
 
-/// Atomically replaces output geometry and mode state, then advertises one
-/// coherent update to each bound wl_output resource.
+/// Replaces output geometry and mode state and advertises changed properties.
+/// The caller must finish related extension updates with sendDone().
 pub fn configure(
     self: *Self,
     position: Position,
@@ -209,7 +209,6 @@ pub fn configure(
         if (client_scale_changed and resource.getVersion() >= wl.Output.scale_since_version) {
             resource.sendScale(self.scale);
         }
-        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
     }
     return mode_changed;
 }

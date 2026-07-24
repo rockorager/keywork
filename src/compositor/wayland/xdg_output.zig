@@ -40,7 +40,7 @@ pub fn deinit(self: *Self) void {
 pub fn refresh(self: *Self, output: *Output) void {
     for (self.resources.items) |managed| {
         if (managed.output != output) continue;
-        managed.sendState();
+        managed.sendUpdate();
     }
 }
 
@@ -115,7 +115,7 @@ fn createOutput(
         return;
     };
     resource.setHandler(*OutputResource, outputRequest, outputDestroyed, managed);
-    managed.sendState();
+    managed.sendInitialState();
 }
 
 const OutputResource = struct {
@@ -124,7 +124,14 @@ const OutputResource = struct {
     wl_output: ?*wl.Output,
     output: ?*Output,
 
-    fn sendState(self: *OutputResource) void {
+    fn sendInitialState(self: *OutputResource) void {
+        self.sendUpdate();
+        if (self.resource.getVersion() < 3) return;
+        const wl_output = self.wl_output orelse return;
+        if (wl_output.getVersion() >= wl.Output.done_since_version) wl_output.sendDone();
+    }
+
+    fn sendUpdate(self: *OutputResource) void {
         const output = self.output orelse return;
         const position = output.logicalPosition();
         const size = output.logicalSize();
@@ -134,11 +141,7 @@ const OutputResource = struct {
             self.resource.sendName(output.name());
             self.resource.sendDescription(output.description());
         }
-        if (self.resource.getVersion() < 3) {
-            self.resource.sendDone();
-        } else if (self.wl_output) |wl_output| {
-            if (wl_output.getVersion() >= wl.Output.done_since_version) wl_output.sendDone();
-        }
+        if (self.resource.getVersion() < 3) self.resource.sendDone();
     }
 };
 
