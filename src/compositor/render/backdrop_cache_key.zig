@@ -49,6 +49,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
         },
         .backdrop_capture => |capture| {
             hashScalar(hasher, @as(u8, 3));
+            hashScalar(hasher, capture.id);
             hashRect(hasher, capture.rect);
             hashScalar(hasher, capture.radius);
             hashOptionalScalar(hasher, capture.downsample_level);
@@ -57,6 +58,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
         },
         .backdrop_blur => |blur| {
             hashScalar(hasher, @as(u8, 4));
+            hashScalar(hasher, blur.capture_id);
             hashRect(hasher, blur.rect);
             hashScalar(hasher, blur.corner_radius);
             hashScalar(hasher, blur.radius);
@@ -268,4 +270,38 @@ test "keys ignore later owner changes and track sampled content" {
     try std.testing.expect(original != key(commands[0..3]).?);
     commands[1].image.buffer.source_cache = null;
     try std.testing.expectEqual(@as(?u64, null), key(commands[0..3]));
+}
+
+test "keys track backdrop capture topology" {
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .backdrop_capture = .{
+            .id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 8, .height = 8 },
+            .radius = 4,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 8, .height = 8 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .id = 2,
+            .rect = .{ .x = 0, .y = 0, .width = 8, .height = 8 },
+            .radius = 4,
+        } },
+        .{ .backdrop_blur = .{
+            .capture_id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 8, .height = 8 },
+            .corner_radius = 0,
+            .radius = 4,
+        } },
+    };
+    const original = key(&commands).?;
+
+    commands[4].backdrop_blur.capture_id = 2;
+    try std.testing.expect(original != key(&commands).?);
+    commands[4].backdrop_blur.capture_id = 1;
+
+    commands[1].backdrop_capture.id = 3;
+    try std.testing.expect(original != key(&commands).?);
 }
