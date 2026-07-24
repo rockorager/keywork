@@ -546,7 +546,7 @@ const Popup = struct {
     const CreateError = error{ OutOfMemory, ResourceCreateFailed, Role };
 
     fn create(method: *Method, surface: *Surface, id: u32) CreateError!void {
-        if (surface.assignedRole()) |role| if (role != .input_popup) return error.Role;
+        if (surface.assignedRole() != null) return error.Role;
         const resource = try zwp.InputPopupSurfaceV2.create(
             method.resource.getClient(),
             method.resource.getVersion(),
