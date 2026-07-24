@@ -4667,7 +4667,15 @@ fn routeTouchMotion(
 }
 
 fn cancelDeviceTouches(self: *Self, device_id: NativeInput.DeviceId) void {
-    while (self.touchSeatForDevice(device_id)) |seat| self.cancelSeatTouches(seat);
+    var index: usize = 0;
+    while (index < self.routed_touches.items.len) {
+        if (self.routed_touches.items[index].device_id == device_id) {
+            const touch = self.routed_touches.orderedRemove(index);
+            touch.seat.touchCancelPoint(touch.protocol_id);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn cancelSeatTouches(self: *Self, seat: *Seat) void {

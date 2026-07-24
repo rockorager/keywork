@@ -111,6 +111,11 @@ const TouchPoint = struct {
     };
 };
 
+const TouchCancellation = struct {
+    client: *wl.Client,
+    max_resource_generation: u64,
+};
+
 const TouchResource = struct {
     resource: *wl.Touch,
     generation: u64,
@@ -1415,6 +1420,27 @@ pub fn touchCancel(self: *Self) void {
     self.touch_frame_resources.clearRetainingCapacity();
 }
 
+/// Cancels the client-visible stream containing `id` and forgets that point.
+/// Other points in the stream remain tracked without a target until their
+/// physical device reports up or cancel.
+pub fn touchCancelPoint(self: *Self, id: i32) void {
+    const cancellation = cancelTouchPointState(&self.touch_points, id) orelse return;
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry) or
+            entry.generation > cancellation.max_resource_generation or
+            entry.resource.getClient() != cancellation.client) continue;
+        entry.resource.sendCancel();
+    }
+    var index: usize = 0;
+    while (index < self.touch_frame_resources.items.len) {
+        if (self.touch_frame_resources.items[index].getClient() == cancellation.client) {
+            _ = self.touch_frame_resources.orderedRemove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) error{OutOfMemory}!void {
     if (!self.touch_available) return;
     const point = self.touchPoint(id) orelse return;
@@ -1743,6 +1769,28 @@ fn findTouchPoint(self: *const Self, id: i32) ?usize {
 
 fn touchPoint(self: *const Self, id: i32) ?*const TouchPoint {
     return &self.touch_points.items[self.findTouchPoint(id) orelse return null];
+}
+
+fn cancelTouchPointState(
+    points: *std.ArrayList(TouchPoint),
+    id: i32,
+) ?TouchCancellation {
+    const cancelled_index = for (points.items, 0..) |point, index| {
+        if (point.id == id) break index;
+    } else return null;
+    const cancelled = points.orderedRemove(cancelled_index);
+    const client = if (cancelled.target) |target| target.client else return null;
+    var max_resource_generation = cancelled.target.?.max_resource_generation;
+    for (points.items) |*point| {
+        const target = point.target orelse continue;
+        if (target.client != client) continue;
+        max_resource_generation = @max(max_resource_generation, target.max_resource_generation);
+        point.target = null;
+    }
+    return .{
+        .client = client,
+        .max_resource_generation = max_resource_generation,
+    };
 }
 
 fn latestTouchResourceGeneration(self: *const Self, client: *wl.Client) ?u64 {
@@ -2251,6 +2299,33 @@ test "seat capability generations invalidate existing input resources" {
 test "touch resources bound after down do not join the contact sequence" {
     try std.testing.expect(touchResourceInSequence(4, 4));
     try std.testing.expect(!touchResourceInSequence(5, 4));
+}
+
+test "touch point cancellation preserves unrelated client streams" {
+    const client_a: *wl.Client = @ptrFromInt(0x1000);
+    const client_b: *wl.Client = @ptrFromInt(0x2000);
+    var points: std.ArrayList(TouchPoint) = .empty;
+    defer points.deinit(std.testing.allocator);
+    try points.appendSlice(std.testing.allocator, &.{
+        .{ .id = 1, .target = .{ .surface_id = .{ .index = 1, .generation = 1 }, .client = client_a, .offset_x = 0, .offset_y = 0, .max_resource_generation = 2 } },
+        .{ .id = 2, .target = .{ .surface_id = .{ .index = 2, .generation = 1 }, .client = client_a, .offset_x = 0, .offset_y = 0, .max_resource_generation = 4 } },
+        .{ .id = 3, .target = .{ .surface_id = .{ .index = 3, .generation = 1 }, .client = client_b, .offset_x = 0, .offset_y = 0, .max_resource_generation = 3 } },
+        .{ .id = 4, .target = null },
+    });
+
+    const cancellation = cancelTouchPointState(&points, 1).?;
+    try std.testing.expectEqual(client_a, cancellation.client);
+    try std.testing.expectEqual(@as(u64, 4), cancellation.max_resource_generation);
+    try std.testing.expectEqual(@as(usize, 3), points.items.len);
+    try std.testing.expectEqual(@as(i32, 2), points.items[0].id);
+    try std.testing.expect(points.items[0].target == null);
+    try std.testing.expectEqual(client_b, points.items[1].target.?.client);
+    try std.testing.expect(points.items[2].target == null);
+
+    try std.testing.expect(cancelTouchPointState(&points, 4) == null);
+    try std.testing.expectEqual(@as(usize, 2), points.items.len);
+    try std.testing.expect(cancelTouchPointState(&points, 99) == null);
+    try std.testing.expectEqual(@as(usize, 2), points.items.len);
 }
 
 test "implicit pointer grab freezes focus to the pressed surface" {
