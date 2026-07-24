@@ -486,6 +486,7 @@ test {
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/surface.zig");
+    _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");
     _ = @import("wayland/subcompositor.zig");
     _ = @import("wayland/seat.zig");

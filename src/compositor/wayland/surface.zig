@@ -9,6 +9,7 @@ const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
+const surface_geometry = @import("surface_geometry.zig");
 const WaylandRegion = @import("region.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
 const SinglePixelBuffer = @import("single_pixel_buffer.zig");
@@ -255,17 +256,8 @@ pub const RoleError = error{
     NotReserved,
 };
 
-pub const ViewportSource = struct {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-};
-
-pub const ViewportState = struct {
-    source: ?ViewportSource = null,
-    destination: ?render_types.Size = null,
-};
+pub const ViewportSource = surface_geometry.ViewportSource;
+pub const ViewportState = surface_geometry.ViewportState;
 
 pub const ContentType = wp.ContentTypeV1.Type;
 
@@ -1180,7 +1172,7 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
         },
         .commit => commit(self),
         .set_buffer_transform => |set| {
-            if (!validTransform(set.transform)) {
+            if (!surface_geometry.validTransform(set.transform)) {
                 resource.postError(.invalid_transform, "invalid buffer transform");
                 return;
             }
@@ -1464,7 +1456,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
     } else {
         const buffer = latestEffectiveBuffer(surface_state);
         if (buffer) |existing| {
-            _ = viewportGeometry(
+            _ = surface_geometry.calculate(
                 existing.buffer_size,
                 surface_state.pending_scale,
                 surface_state.pending_transform,
@@ -1924,100 +1916,6 @@ fn fifoCommitReady(wait_barrier: bool, wait_ignored: bool, barrier: bool) bool {
     return !wait_barrier or wait_ignored or !barrier;
 }
 
-fn validTransform(transform: wl.Output.Transform) bool {
-    return switch (transform) {
-        .normal,
-        .@"90",
-        .@"180",
-        .@"270",
-        .flipped,
-        .flipped_90,
-        .flipped_180,
-        .flipped_270,
-        => true,
-        else => false,
-    };
-}
-
-fn swapsAxes(transform: wl.Output.Transform) bool {
-    return switch (transform) {
-        .@"90", .@"270", .flipped_90, .flipped_270 => true,
-        else => false,
-    };
-}
-
-fn logicalSize(
-    buffer_size: render_types.Size,
-    scale: i32,
-    transform: wl.Output.Transform,
-) error{InvalidSize}!render_types.Size {
-    if (scale <= 0 or !validTransform(transform)) return error.InvalidSize;
-
-    const transformed: render_types.Size = if (swapsAxes(transform))
-        .{ .width = buffer_size.height, .height = buffer_size.width }
-    else
-        buffer_size;
-    const unsigned_scale: u32 = @intCast(scale);
-    if (transformed.width % unsigned_scale != 0 or
-        transformed.height % unsigned_scale != 0) return error.InvalidSize;
-
-    return .{
-        .width = transformed.width / unsigned_scale,
-        .height = transformed.height / unsigned_scale,
-    };
-}
-
-const ViewportGeometry = struct {
-    logical_size: render_types.Size,
-    source: ?render_types.SourceRect,
-};
-
-fn viewportGeometry(
-    buffer_size: render_types.Size,
-    scale: i32,
-    transform: wl.Output.Transform,
-    viewport: ViewportState,
-) BufferSnapshot.Error!ViewportGeometry {
-    const base_size = logicalSize(buffer_size, scale, transform) catch
-        return error.InvalidSize;
-    const source = viewport.source orelse return .{
-        .logical_size = viewport.destination orelse base_size,
-        .source = null,
-    };
-
-    const right = @as(i64, source.x) + source.width;
-    const bottom = @as(i64, source.y) + source.height;
-    if (source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
-        right > @as(i64, base_size.width) * 256 or
-        bottom > @as(i64, base_size.height) * 256)
-    {
-        return error.ViewportOutOfBuffer;
-    }
-
-    const logical_size = viewport.destination orelse size: {
-        if (@mod(source.width, 256) != 0 or @mod(source.height, 256) != 0) {
-            return error.BadViewportSize;
-        }
-        const source_size: render_types.Size = .{
-            .width = @as(u32, @intCast(@divExact(source.width, 256))),
-            .height = @as(u32, @intCast(@divExact(source.height, 256))),
-        };
-        break :size source_size;
-    };
-    // Viewport source coordinates are post-transform, so preserve that coordinate
-    // space for the renderer to map back to buffer pixels.
-    const buffer_scale: f64 = @floatFromInt(scale);
-    return .{
-        .logical_size = logical_size,
-        .source = .{
-            .x = @as(f64, @floatFromInt(source.x)) / 256.0 * buffer_scale,
-            .y = @as(f64, @floatFromInt(source.y)) / 256.0 * buffer_scale,
-            .width = @as(f64, @floatFromInt(source.width)) / 256.0 * buffer_scale,
-            .height = @as(f64, @floatFromInt(source.height)) / 256.0 * buffer_scale,
-        },
-    };
-}
-
 const InputRegion = struct {
     infinite: bool,
     value: Region,
@@ -2441,7 +2339,7 @@ pub const BufferSnapshot = struct {
             .width = @intCast(width),
             .height = @intCast(height),
         };
-        const geometry = viewportGeometry(buffer_size, scale, transform, viewport) catch |err|
+        const geometry = surface_geometry.calculate(buffer_size, scale, transform, viewport) catch |err|
             return err;
         const row_bytes = std.math.mul(usize, buffer_size.width, @sizeOf(u32)) catch
             return error.InvalidBuffer;
@@ -2513,7 +2411,7 @@ pub const BufferSnapshot = struct {
         var owned_synchronization = synchronization;
         errdefer if (owned_synchronization) |*sync| sync.deinit();
         const buffer_size = buffer.size();
-        const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(buffer_size, scale, transform, viewport);
         const dmabuf = try DmabufUse.create(buffer, owned_synchronization);
         owned_synchronization = null;
 
@@ -2542,7 +2440,7 @@ pub const BufferSnapshot = struct {
         source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const buffer_size: render_types.Size = .{ .width = 1, .height = 1 };
-        const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(buffer_size, scale, transform, viewport);
         const pixels = if (reusable) |snapshot|
             snapshot.takePixels(1) orelse
                 allocator.alloc(u32, 1) catch return error.OutOfMemory
@@ -2570,7 +2468,7 @@ pub const BufferSnapshot = struct {
         transform: wl.Output.Transform,
         viewport: ViewportState,
     ) Error!void {
-        const geometry = try viewportGeometry(self.buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(self.buffer_size, scale, transform, viewport);
         self.logical_size = geometry.logical_size;
         self.scale = scale;
         self.transform = transform;
@@ -2827,35 +2725,6 @@ fn removeBufferReleaseCallback(
 extern fn wl_shm_buffer_ref(buffer: *wl.shm.Buffer) *wl.shm.Buffer;
 extern fn wl_shm_buffer_unref(buffer: *wl.shm.Buffer) void;
 
-test "logical surface size accounts for scale and transform" {
-    try std.testing.expectEqual(
-        render_types.Size{ .width = 100, .height = 50 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .normal),
-    );
-    try std.testing.expectEqual(
-        render_types.Size{ .width = 50, .height = 100 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .@"90"),
-    );
-    try std.testing.expectError(
-        error.InvalidSize,
-        logicalSize(.{ .width = 201, .height = 100 }, 2, .normal),
-    );
-}
-
-test "viewport destination defines logical surface size" {
-    const geometry = try viewportGeometry(
-        .{ .width = 1200, .height = 900 },
-        1,
-        .normal,
-        .{ .destination = .{ .width = 800, .height = 600 } },
-    );
-    try std.testing.expectEqual(
-        render_types.Size{ .width = 800, .height = 600 },
-        geometry.logical_size,
-    );
-    try std.testing.expectEqual(@as(?render_types.SourceRect, null), geometry.source);
-}
-
 test "single pixel snapshots use viewporter destination without changing color" {
     var snapshot = try BufferSnapshot.copySinglePixel(
         std.testing.allocator,
@@ -2978,44 +2847,6 @@ test "SHM snapshot copying updates only damaged rows" {
             untouched, 0xffdd_eeff, untouched,
         },
         &destination,
-    );
-}
-
-test "viewport source is validated and converted to buffer coordinates" {
-    const geometry = try viewportGeometry(
-        .{ .width = 8, .height = 8 },
-        2,
-        .normal,
-        .{
-            .source = .{ .x = 256, .y = 512, .width = 512, .height = 256 },
-            .destination = .{ .width = 4, .height = 2 },
-        },
-    );
-    try std.testing.expectEqual(
-        render_types.Size{ .width = 4, .height = 2 },
-        geometry.logical_size,
-    );
-    try std.testing.expectEqual(@as(f64, 2), geometry.source.?.x);
-    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.y);
-    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.width);
-    try std.testing.expectEqual(@as(f64, 2), geometry.source.?.height);
-    try std.testing.expectError(
-        error.ViewportOutOfBuffer,
-        viewportGeometry(
-            .{ .width = 8, .height = 8 },
-            2,
-            .normal,
-            .{ .source = .{ .x = 768, .y = 0, .width = 512, .height = 256 } },
-        ),
-    );
-    try std.testing.expectError(
-        error.BadViewportSize,
-        viewportGeometry(
-            .{ .width = 8, .height = 8 },
-            2,
-            .normal,
-            .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
-        ),
     );
 }
 
