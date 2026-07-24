@@ -695,7 +695,6 @@ const SubsurfaceResource = struct {
             .surface_destroyed = surfaceDestroyed,
         }) catch return error.BadSurface;
         errdefer surface.releaseRole(self);
-        surface.assignReservedRole(.subsurface, self) catch return error.BadSurface;
 
         const parent = try shell.getParent(parent_surface);
         var child_added = false;
@@ -714,6 +713,7 @@ const SubsurfaceResource = struct {
         errdefer _ = shell.by_surface.remove(surface.handle());
         shell.adapters.put(shell.allocator, id, self) catch return error.OutOfMemory;
 
+        surface.assignReservedRole(.subsurface, self) catch unreachable;
         resource.setHandler(
             *SubsurfaceResource,
             SubsurfaceResource.handleRequest,
