@@ -198,15 +198,13 @@ pub const Renderer = struct {
 
     pub fn finishFrame(self: *Renderer) Error!void {
         const active = self.active_frame orelse unreachable;
-        self.active_frame = null;
-        defer self.commands.clearRetainingCapacity();
+        errdefer self.cancelFrame();
         const commands = try pruneOccludedCommands(
             self.allocator,
             &self.visible_commands,
             self.commands.items,
             active.target.size(),
         );
-        self.rememberSampledCommands(commands);
         try self.renderDirect(.{
             .size = active.target.size(),
             .commands = commands,
@@ -214,6 +212,9 @@ pub const Renderer = struct {
             .output_color_description = active.color_description,
             .output_calibration = active.output_calibration,
         }, active.target);
+        self.rememberSampledCommands(commands);
+        self.active_frame = null;
+        self.commands.clearRetainingCapacity();
     }
 
     /// Finish a frame whose CPU pixel target may be populated asynchronously.
@@ -223,33 +224,35 @@ pub const Renderer = struct {
     /// descriptor means the target was populated before this function returned.
     pub fn finishFrameReadback(self: *Renderer) Error!FrameCompletion {
         const active = self.active_frame orelse unreachable;
+        errdefer self.cancelFrame();
         const target = switch (active.target) {
             .pixels => |pixels| pixels,
             .offscreen, .dmabuf => return error.InvalidTarget,
         };
         if (active.damage != null) return error.InvalidTarget;
-        self.active_frame = null;
-        defer self.commands.clearRetainingCapacity();
         const commands = try pruneOccludedCommands(
             self.allocator,
             &self.visible_commands,
             self.commands.items,
             target.size,
         );
-        self.rememberSampledCommands(commands);
         const frame: render_types.Frame = .{
             .size = target.size,
             .commands = commands,
             .output_color_description = active.color_description,
             .output_calibration = active.output_calibration,
         };
-        return switch (self.backend) {
+        const completion: FrameCompletion = switch (self.backend) {
             .cpu => |*renderer| completed: {
                 try renderer.render(frame, target);
                 break :completed .{};
             },
-            .vulkan => |*renderer| renderer.renderFrameReadback(frame, target),
+            .vulkan => |*renderer| try renderer.renderFrameReadback(frame, target),
         };
+        self.rememberSampledCommands(commands);
+        self.active_frame = null;
+        self.commands.clearRetainingCapacity();
+        return completion;
     }
 
     /// Wait for a readback submitted with source and optionally copy it into
@@ -319,8 +322,7 @@ pub const Renderer = struct {
         exclude_topmost: bool,
     ) Error!FrameCompletion {
         const active = self.active_frame orelse unreachable;
-        self.active_frame = null;
-        defer self.commands.clearRetainingCapacity();
+        errdefer self.cancelFrame();
         const unpruned_commands = if (exclude_topmost) commands: {
             const last_command = self.commands.getLastOrNull() orelse unreachable;
             switch (last_command) {
@@ -337,10 +339,6 @@ pub const Renderer = struct {
             unpruned_commands,
             active.target.size(),
         );
-        self.rememberSampledCommands(commands);
-        if (exclude_topmost) {
-            self.rememberSampledCommand(self.commands.getLast());
-        }
         const frame: render_types.Frame = .{
             .size = active.target.size(),
             .commands = commands,
@@ -348,20 +346,27 @@ pub const Renderer = struct {
             .output_color_description = active.color_description,
             .output_calibration = active.output_calibration,
         };
-        return switch (self.backend) {
+        const completion: FrameCompletion = switch (self.backend) {
             .cpu => |*renderer| switch (active.target) {
                 .pixels => |pixels| blk: {
                     try renderer.render(frame, pixels);
                     break :blk .{};
                 },
-                .offscreen, .dmabuf => error.InvalidTarget,
+                .offscreen, .dmabuf => return error.InvalidTarget,
             },
-            .vulkan => |*renderer| renderer.renderFrameScanout(
+            .vulkan => |*renderer| try renderer.renderFrameScanout(
                 frame,
                 active.target,
                 gpu_sample_tag,
             ),
         };
+        self.rememberSampledCommands(commands);
+        if (exclude_topmost) {
+            self.rememberSampledCommand(self.commands.getLast());
+        }
+        self.active_frame = null;
+        self.commands.clearRetainingCapacity();
+        return completion;
     }
 
     pub fn takeGpuTiming(self: *Renderer) ?GpuTiming {
@@ -1349,6 +1354,51 @@ test "cancelled renderer frame does not leak commands" {
         output.target(),
     );
 
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
+}
+
+test "failed renderer finishes cancel frame state" {
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    var source_pixel = [_]u32{0xffffffff};
+    const image: render_types.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &source_pixel,
+        },
+        .sample_tag = 42,
+        .is_opaque = true,
+    } };
+    const unsupported_target: render_types.Target = .{
+        .offscreen = .{ .id = 1, .size = size },
+    };
+
+    try renderer.beginFrame(unsupported_target, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    try std.testing.expectError(error.InvalidTarget, renderer.finishFrame());
+    try std.testing.expect(!renderer.wasSampled(42));
+
+    try renderer.beginFrame(unsupported_target, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    try std.testing.expectError(error.InvalidTarget, renderer.finishFrameReadback());
+    try std.testing.expect(!renderer.wasSampled(42));
+
+    try renderer.beginFrame(unsupported_target, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    try std.testing.expectError(error.InvalidTarget, renderer.finishFrameScanout(null));
+    try std.testing.expect(!renderer.wasSampled(42));
+
+    try renderer.render(
+        .{ .size = size, .commands = &.{.{ .clear = render_types.Color.rgba(0, 0, 255, 255) }} },
+        output.target(),
+    );
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
 }
 
