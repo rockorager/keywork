@@ -159,6 +159,11 @@ const Window = struct {
     skip_taskbar: bool = false,
     prefers_server_decorations: bool = true,
 
+    fn clientControlsGeometry(self: Window) bool {
+        return !self.mapped or self.override_redirect or
+            !self.window_type.participatesInWindowManagement();
+    }
+
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
         if (self.app_id) |value| allocator.free(value);
@@ -1944,6 +1949,10 @@ fn handleConfigureRequest(
     event: *const c.xcb_configure_request_event_t,
 ) void {
     const window = self.windows.getPtr(event.window) orelse return;
+    if (!window.clientControlsGeometry()) {
+        self.sendConfigureNotify(event.window, window.*);
+        return;
+    }
     var requested = window.geometry;
     if (event.value_mask & c.XCB_CONFIG_WINDOW_X != 0) requested.x = event.x;
     if (event.value_mask & c.XCB_CONFIG_WINDOW_Y != 0) requested.y = event.y;
@@ -2329,6 +2338,21 @@ test "EWMH auxiliary window types bypass toplevel policy" {
     try std.testing.expect(!WindowType.tooltip.participatesInWindowManagement());
     try std.testing.expect(!WindowType.notification.participatesInWindowManagement());
     try std.testing.expect(!WindowType.dnd.participatesInWindowManagement());
+}
+
+test "mapped managed windows retain compositor geometry authority" {
+    var window: Window = .{
+        .geometry = .{ .x = 0, .y = 0, .width = 640, .height = 480 },
+        .override_redirect = false,
+    };
+    try std.testing.expect(window.clientControlsGeometry());
+    window.mapped = true;
+    try std.testing.expect(!window.clientControlsGeometry());
+    window.window_type = .dock;
+    try std.testing.expect(window.clientControlsGeometry());
+    window.window_type = .normal;
+    window.override_redirect = true;
+    try std.testing.expect(window.clientControlsGeometry());
 }
 
 test "override-redirect input heuristic excludes transient UI types" {
