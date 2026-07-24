@@ -485,7 +485,7 @@ test {
     _ = @import("command.zig");
     _ = @import("input_manager.zig");
     _ = @import("window_manager/types.zig");
-    _ = @import("window_manager/backend.zig");
+    _ = @import("window_manager/XwaylandController.zig");
     _ = @import("window_manager/layout.zig");
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
