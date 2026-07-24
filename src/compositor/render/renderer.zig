@@ -179,16 +179,17 @@ pub const Renderer = struct {
             commands.len,
         ) catch return error.OutOfMemory;
         try self.sampled_tags.ensureTotalCapacity(self.allocator, command_count);
+        try self.commands.ensureTotalCapacity(self.allocator, command_count);
         const translated = active.origin.x != 0 or active.origin.y != 0;
         const scaled = active.scale.numerator != render_types.Scale.denominator;
         if (!translated and !scaled) {
-            try self.commands.appendSlice(self.allocator, commands);
+            self.commands.appendSliceAssumeCapacity(commands);
             return;
         }
 
         for (commands) |command| {
             const local_command = translateCommand(command, active.origin);
-            try self.commands.append(self.allocator, if (scaled)
+            self.commands.appendAssumeCapacity(if (scaled)
                 scaleCommand(local_command, active.scale)
             else
                 local_command);
