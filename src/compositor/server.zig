@@ -1493,7 +1493,8 @@ pub fn createWithVirtualOutput(
             drm_output.logical_y = 0;
             const id = try self.addRenderOutput(io, .{ .kind = .drm, .size = drm_output.size, .position = .{ .x = x }, .name = "DRM", .description = "Keywork DRM output", .model = "drm-kms", .drm_output = drm_output });
             if (index == 0) render_output_id = id;
-            x += @intCast(drm_output.logicalSize().width);
+            x = std.math.add(i32, x, @intCast(drm_output.logicalSize().width)) catch
+                return error.InvalidOutputGeometry;
         }
     } else render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
@@ -2542,7 +2543,12 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
         const output = entry.value.*;
         const protocol_output = self.outputs.get(output.protocol_id).?;
         const position = protocol_output.logicalPosition();
-        right = @max(right, position.x + @as(i32, @intCast(protocol_output.logicalSize().width)));
+        const output_right = std.math.add(
+            i32,
+            position.x,
+            @intCast(protocol_output.logicalSize().width),
+        ) catch return self.terminate();
+        right = @max(right, output_right);
     }
     drm_output.logical_x = right;
     drm_output.logical_y = 0;
@@ -2656,6 +2662,12 @@ fn setDrmOutputConfiguration(
     position: Output.Position,
     scale: render.Scale,
 ) void {
+    std.debug.assert(drmOutputGeometryValid(
+        drm_output,
+        drm_output.currentModeIndex(),
+        position,
+        scale,
+    ));
     const position_changed = drm_output.logical_x != position.x or drm_output.logical_y != position.y;
     const scale_changed = drm_output.scale.numerator != scale.numerator;
     drm_output.logical_x = position.x;
@@ -2664,15 +2676,12 @@ fn setDrmOutputConfiguration(
     const render_output = self.findDrmRenderOutput(drm_output) orelse return;
     const protocol_output = self.outputs.get(render_output.output.protocol_id).?;
     const old_logical_size = protocol_output.logicalSize();
-    protocol_output.setPosition(position);
-    const mode_changed = protocol_output.setMode(
+    const mode_changed = protocol_output.configure(
+        position,
         render_output.output.backend.size(),
         render_output.output.backend.modeSize(),
         drm_output.refreshMillihertz(),
         render_output.output.backend.modePreferred(),
-    );
-    protocol_output.setScale(
-        render_output.output.backend.size(),
         render_output.output.backend.clientScale(),
         render_output.output.backend.renderScale(),
     );
@@ -2711,6 +2720,12 @@ fn setDrmOutputConfiguration(
 }
 
 fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
+    if (!drmOutputGeometryValid(
+        drm_output,
+        drm_output.currentModeIndex(),
+        position,
+        drm_output.scale,
+    )) return error.InvalidOutputGeometry;
     if (drm_output.enabled) {
         self.setDrmOutputConfiguration(drm_output, position, drm_output.scale);
         return;
@@ -2779,7 +2794,17 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
             self.enableDrmOutput(replacement, .{
                 .x = replacement.logical_x,
                 .y = replacement.logical_y,
-            }) catch return self.terminate();
+            }) catch |err| switch (err) {
+                error.InvalidOutputGeometry => {
+                    log.warn(
+                        "resetting unusable geometry while enabling fallback output {s}",
+                        .{replacement.name()},
+                    );
+                    replacement.scale = .{};
+                    self.enableDrmOutput(replacement, .{}) catch return self.terminate();
+                },
+                else => return self.terminate(),
+            };
             if (self.output_management_initialized) self.output_management.syncHead(replacement);
         } else {
             if (self.native_input_initialized) {
@@ -2809,6 +2834,14 @@ fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) boo
     if (self.drm_lease_initialized) for (changes) |change| {
         if (self.drm_lease.outputLeased(change.output)) return false;
     };
+    for (changes) |change| {
+        if (change.enabled and !drmOutputGeometryValid(
+            change.output,
+            change.mode_index,
+            .{ .x = change.x, .y = change.y },
+            change.scale,
+        )) return false;
+    }
     for (changes) |change| {
         if (change.old_mode_index == change.mode_index) continue;
         self.drm_device.setOutputMode(change.output, change.mode_index) catch {
@@ -2914,7 +2947,12 @@ fn configuredOutputChange(output: *DrmOutput, rules: []const Config.OutputRule) 
     if (effective.requested_mode) |mode| {
         effective.mode_index = try resolveOutputMode(output.availableModes(), mode);
     }
-    _ = try effective.scale.logicalSize(output.availableModes()[effective.mode_index].size());
+    if (effective.enabled and !drmOutputGeometryValid(
+        output,
+        effective.mode_index,
+        .{ .x = effective.x, .y = effective.y },
+        effective.scale,
+    )) return error.InvalidOutputGeometry;
     if (effective.enabled == output.enabled and effective.mode_index == output.currentModeIndex() and
         effective.x == output.logical_x and effective.y == output.logical_y and
         effective.scale.numerator == output.scale.numerator) return null;
@@ -2931,6 +2969,18 @@ fn configuredOutputChange(output: *DrmOutput, rules: []const Config.OutputRule) 
         .scale = effective.scale,
         .mode_index = effective.mode_index,
     };
+}
+
+fn drmOutputGeometryValid(
+    output: *const DrmOutput,
+    mode_index: usize,
+    position: Output.Position,
+    scale: render.Scale,
+) bool {
+    const modes = output.availableModes();
+    if (mode_index >= modes.len) return false;
+    const logical_size = scale.logicalSize(modes[mode_index].size()) catch return false;
+    return Output.logicalGeometryValid(position, logical_size);
 }
 
 fn configuredOutputIccProfile(

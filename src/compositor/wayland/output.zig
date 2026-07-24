@@ -37,6 +37,15 @@ pub const Position = struct {
     y: i32 = 0,
 };
 
+/// Returns whether the positive-area logical bounds, including their
+/// exclusive right and bottom edges, are representable as i32 coordinates.
+pub fn logicalGeometryValid(position: Position, size: render.Size) bool {
+    return size.width > 0 and size.height > 0 and
+        size.width <= std.math.maxInt(i32) and size.height <= std.math.maxInt(i32) and
+        @as(i64, position.x) + size.width <= std.math.maxInt(i32) and
+        @as(i64, position.y) + size.height <= std.math.maxInt(i32);
+}
+
 pub const Config = struct {
     position: Position = .{},
     size: render.Size,
@@ -78,8 +87,7 @@ pub fn init(
     surfaces: *Surface.Store,
 ) Error!void {
     const mode_size = config.mode_size orelse config.size;
-    if (config.size.width == 0 or config.size.height == 0 or
-        config.size.width > std.math.maxInt(i32) or config.size.height > std.math.maxInt(i32) or
+    if (!logicalGeometryValid(config.position, config.size) or
         mode_size.width == 0 or mode_size.height == 0 or
         mode_size.width > std.math.maxInt(i32) or mode_size.height > std.math.maxInt(i32) or
         config.scale == 0 or config.scale > std.math.maxInt(i32) or
@@ -166,33 +174,44 @@ pub fn logicalPosition(self: *const Self) Position {
     return self.position;
 }
 
-pub fn setPosition(self: *Self, position: Position) void {
-    if (std.meta.eql(self.position, position)) return;
-    self.position = position;
-    for (self.resources.items) |resource| {
-        self.sendGeometry(resource);
-        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
-    }
-}
-
-pub fn setScale(
+/// Atomically replaces output geometry and mode state, then advertises one
+/// coherent update to each bound wl_output resource.
+pub fn configure(
     self: *Self,
+    position: Position,
     size: render.Size,
+    mode_size: render.Size,
+    refresh_millihertz: i32,
+    preferred: bool,
     scale: u32,
     preferred_scale: render.Scale,
-) void {
-    std.debug.assert(size.width > 0 and size.height > 0);
+) bool {
+    std.debug.assert(logicalGeometryValid(position, size));
+    std.debug.assert(mode_size.width > 0 and mode_size.height > 0);
     std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
     std.debug.assert(preferred_scale.numerator > 0);
+    const position_changed = !std.meta.eql(self.position, position);
+    const mode_changed = !std.meta.eql(self.mode_size, mode_size) or
+        self.refresh_millihertz != refresh_millihertz or
+        self.mode_preferred != preferred;
     const client_scale_changed = self.scale != scale;
+    self.position = position;
     self.size = size;
+    self.mode_size = mode_size;
+    self.refresh_millihertz = refresh_millihertz;
+    self.mode_preferred = preferred;
     self.scale = @intCast(scale);
     self.preferred_scale = preferred_scale;
-    if (!client_scale_changed) return;
+    if (!position_changed and !mode_changed and !client_scale_changed) return false;
     for (self.resources.items) |resource| {
-        if (resource.getVersion() >= wl.Output.scale_since_version) resource.sendScale(self.scale);
+        if (position_changed) self.sendGeometry(resource);
+        if (mode_changed) self.sendMode(resource);
+        if (client_scale_changed and resource.getVersion() >= wl.Output.scale_since_version) {
+            resource.sendScale(self.scale);
+        }
         if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
     }
+    return mode_changed;
 }
 
 pub fn preferredScale(self: *const Self) render.Scale {
@@ -228,30 +247,6 @@ pub fn sendDone(self: *Self) void {
 
 pub fn clientScale(self: *const Self) u32 {
     return @intCast(self.scale);
-}
-
-pub fn setMode(
-    self: *Self,
-    size: render.Size,
-    mode_size: render.Size,
-    refresh_millihertz: i32,
-    preferred: bool,
-) bool {
-    std.debug.assert(size.width > 0 and size.height > 0);
-    std.debug.assert(mode_size.width > 0 and mode_size.height > 0);
-    const mode_changed = !std.meta.eql(self.mode_size, mode_size) or
-        self.refresh_millihertz != refresh_millihertz or
-        self.mode_preferred != preferred;
-    self.size = size;
-    self.mode_size = mode_size;
-    self.refresh_millihertz = refresh_millihertz;
-    self.mode_preferred = preferred;
-    if (!mode_changed) return false;
-    for (self.resources.items) |resource| {
-        self.sendMode(resource);
-        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
-    }
-    return true;
 }
 
 pub fn logicalRect(self: *const Self) render.Rect {
@@ -449,6 +444,22 @@ fn inertRequest(resource: *wl.Output, request: wl.Output.Request, _: ?*anyopaque
     switch (request) {
         .release => resource.destroy(),
     }
+}
+
+test "logical output geometry requires representable exclusive edges" {
+    try std.testing.expect(logicalGeometryValid(
+        .{ .x = std.math.maxInt(i32) - 1, .y = std.math.minInt(i32) },
+        .{ .width = 1, .height = std.math.maxInt(i32) },
+    ));
+    try std.testing.expect(!logicalGeometryValid(
+        .{ .x = std.math.maxInt(i32) },
+        .{ .width = 1, .height = 1 },
+    ));
+    try std.testing.expect(!logicalGeometryValid(
+        .{ .y = std.math.maxInt(i32) - 10 },
+        .{ .width = 1, .height = 11 },
+    ));
+    try std.testing.expect(!logicalGeometryValid(.{}, .{ .width = 0, .height = 1 }));
 }
 
 test "retiring an output leaves client-owned resources alive" {

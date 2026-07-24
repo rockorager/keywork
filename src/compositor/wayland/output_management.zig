@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("../backend/drm.zig");
 const render = @import("../render/types.zig");
+const Output = @import("output.zig");
 const SecurityContext = @import("security_context.zig");
 
 const wl = wayland.server.wl;
@@ -733,7 +734,9 @@ fn finish(configuration: *Configuration, apply: bool) void {
             scaleFromFixed(value) catch unreachable
         else
             configured.head.scale;
-        if (!modeScaleValid(configured.head.modes[mode_index], scale)) {
+        const x = if (configured.position) |position| position.x else configured.head.x;
+        const y = if (configured.position) |position| position.y else configured.head.y;
+        if (!modeGeometryValid(configured.head.modes[mode_index], scale, x, y)) {
             configuration.resource.sendFailed();
             return;
         }
@@ -840,9 +843,9 @@ fn scaleToFixed(scale: render.Scale) wl.Fixed {
     return @enumFromInt(@as(i32, @intCast(raw)));
 }
 
-fn modeScaleValid(mode: DrmOutput.Mode, scale: render.Scale) bool {
-    _ = scale.logicalSize(mode.size()) catch return false;
-    return true;
+fn modeGeometryValid(mode: DrmOutput.Mode, scale: render.Scale, x: i32, y: i32) bool {
+    const size = scale.logicalSize(mode.size()) catch return false;
+    return Output.logicalGeometryValid(.{ .x = x, .y = y }, size);
 }
 
 fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
@@ -872,7 +875,7 @@ test "output scales round-trip between fixed and v120 units" {
     try std.testing.expectError(error.InvalidScale, scaleFromFixed(wl.Fixed.fromInt(0)));
 }
 
-test "output scale validation uses the selected mode" {
+test "output geometry validation uses the selected mode and scale" {
     var current = std.mem.zeroes(DrmOutput.Mode);
     current.value.hdisplay = 3840;
     current.value.vdisplay = 2160;
@@ -881,8 +884,14 @@ test "output scale validation uses the selected mode" {
     selected.value.vdisplay = 480;
     const scale: render.Scale = .{ .numerator = 120_000 };
 
-    try std.testing.expect(modeScaleValid(current, scale));
-    try std.testing.expect(!modeScaleValid(selected, scale));
+    try std.testing.expect(modeGeometryValid(current, scale, 0, 0));
+    try std.testing.expect(!modeGeometryValid(selected, scale, 0, 0));
+    try std.testing.expect(!modeGeometryValid(
+        current,
+        .{},
+        std.math.maxInt(i32) - 3839,
+        0,
+    ));
 }
 
 test "connected head storage survives disable and reconnect lifetimes" {
