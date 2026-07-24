@@ -113,7 +113,7 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
         .shortcuts_inhibited
     else if (matchBinding(self.bindings, event.modifiers, event.keysyms)) |binding| blk: {
         self.executeAction(binding.action);
-        self.armRepeat(event, binding.keysym);
+        if (actionRepeats(binding.action)) self.armRepeat(event, binding.keysym);
         break :blk .captured;
     } else .forwarded;
     self.held_keys.append(self.allocator, .{ .device_id = event.device_id, .key_code = event.key_code, .disposition = disposition }) catch {
@@ -185,6 +185,10 @@ fn repeatTimer(self: *Self) c_int {
         self.cancelRepeat();
         return 0;
     };
+    if (!actionRepeats(binding.action)) {
+        self.cancelRepeat();
+        return 0;
+    }
     self.executeAction(binding.action);
     self.updateRepeatTimer(interval);
     return 0;
@@ -213,6 +217,13 @@ fn repeatInterval(rate: i32) ?i32 {
 fn repeatMatchesKey(repeat: ?RepeatIdentity, device_id: NativeInput.DeviceId, key_code: u32) bool {
     const identity = repeat orelse return false;
     return identity.device_id == device_id and identity.key_code == key_code;
+}
+
+fn actionRepeats(action: Config.Action) bool {
+    return switch (action) {
+        .command => |command| command.repeats(),
+        .run => false,
+    };
 }
 
 fn matchBinding(bindings: []const Config.Binding, modifiers: u32, keysyms: []const u32) ?Config.Binding {
@@ -259,6 +270,12 @@ test "repeat interval rounds up and rate zero disables repeat" {
     try std.testing.expectEqual(@as(?i32, null), repeatInterval(0));
     try std.testing.expectEqual(@as(?i32, 34), repeatInterval(30));
     try std.testing.expectEqual(@as(?i32, 1), repeatInterval(2000));
+}
+
+test "run actions do not repeat" {
+    try std.testing.expect(!actionRepeats(.{ .run = &.{"example"} }));
+    try std.testing.expect(actionRepeats(.{ .command = .focus_next }));
+    try std.testing.expect(!actionRepeats(.{ .command = .{ .close = .focused } }));
 }
 
 test "repeat identity only matches its physical key" {
