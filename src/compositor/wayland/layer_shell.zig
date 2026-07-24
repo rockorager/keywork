@@ -214,7 +214,12 @@ pub fn keyboardFocus(self: *Self, popup_focus: ?Surface.Id) ?Surface.Id {
         }
         return exclusive;
     }
-    return popup_focus orelse self.regularKeyboardFocus();
+    if (popup_focus) |popup| {
+        const root = self.xdg_shell.popupRootLayerSurface(popup) orelse return popup;
+        const state = self.findScene(root) orelse return self.regularKeyboardFocus();
+        if (state.current.keyboard != .none) return popup;
+    }
+    return self.regularKeyboardFocus();
 }
 
 pub fn pointerPressed(self: *Self, id: ?Surface.Id) void {
