@@ -515,12 +515,16 @@ pub const Command = union(enum) {
 pub const output_calibration_edge_length = 33;
 pub const max_dmabuf_planes = 4;
 
+/// The LUT values are borrowed and must remain alive and unchanged for every
+/// render operation that uses this calibration.
 pub const OutputCalibration = struct {
     identity: u64,
     edge_length: u32,
     values: []const [4]f16,
 };
 
+/// A one-shot render description. All slices and nested PixelBuffer storage
+/// are borrowed for the duration of the render operation.
 pub const Frame = struct {
     size: Size,
     commands: []const Command,
@@ -669,6 +673,7 @@ pub const DmabufFormatModifier = struct {
 /// A CPU-addressable ARGB8888 target or a retained DMA-BUF image source.
 /// Render targets are always CPU-addressable. Image sources may instead set
 /// `dmabuf` and leave `pixels` empty so GPU renderers can sample them directly.
+/// Pixel and source-damage slices are borrowed for the render operation.
 pub const PixelBuffer = struct {
     size: Size,
     stride_pixels: u32,
@@ -749,6 +754,9 @@ pub const DmabufPlane = struct {
     required_bytes: usize = 0,
 };
 
+/// An externally owned DMA-BUF image. The context and plane descriptors,
+/// including their file descriptors, are borrowed. A consumer that stores the
+/// source beyond the current call must retain it and later release it.
 pub const DmabufSource = struct {
     context: *anyopaque,
     format: u32,
@@ -759,8 +767,10 @@ pub const DmabufSource = struct {
     force_opaque: bool,
     retain: *const fn (*anyopaque) void,
     release: *const fn (*anyopaque) void,
+    /// A successful begin must be paired with end_cpu_read.
     begin_cpu_read: *const fn (*anyopaque) bool,
     end_cpu_read: *const fn (*anyopaque) bool,
+    /// Returns a caller-owned sync-file descriptor when synchronization is needed.
     export_read_fence: *const fn (*anyopaque, u8) ?std.posix.fd_t,
 
     pub fn planeSlice(self: *const DmabufSource) []const DmabufPlane {
@@ -778,6 +788,8 @@ pub const DmabufSourceDescriptor = struct {
     force_opaque: bool,
 };
 
+/// A validator borrowed from its renderer. The context and callback become
+/// invalid when that renderer is deinitialized.
 pub const DmabufSourceValidator = struct {
     context: *anyopaque,
     validate: *const fn (*anyopaque, DmabufSourceDescriptor) anyerror!void,
@@ -833,6 +845,8 @@ pub const DrmDeviceId = struct {
 
 /// Renderer operations borrowed by a DRM output for the lifetime of the
 /// renderer. Import duplicates the descriptor's borrowed file descriptor.
+/// Every successful import owns the descriptor ID until exactly one matching
+/// release_target call.
 pub const DmabufRenderer = struct {
     context: *anyopaque,
     target_formats: []const DmabufFormatModifier,
@@ -842,8 +856,9 @@ pub const DmabufRenderer = struct {
 };
 
 /// Renderer-owned storage for outputs which have no display backend. The
-/// target remains GPU-resident unless a separate capture operation requests
-/// CPU-addressable pixels.
+/// context and callbacks remain valid only for the renderer's lifetime. Every
+/// successful create_target call requires exactly one matching release_target
+/// call before that renderer is deinitialized.
 pub const OffscreenRenderer = struct {
     context: *anyopaque,
     create_target: *const fn (*anyopaque, Size) anyerror!OffscreenTarget,

@@ -107,6 +107,9 @@ pub fn workingFormat(self: *const Renderer) WorkingFormat {
     };
 }
 
+/// Begins a stateful frame. The target and damage storage, plus backing storage
+/// referenced by appended commands, remain borrowed until finishFrame or
+/// cancelFrame returns.
 pub fn beginFrame(
     self: *Renderer,
     target: render_types.Target,
@@ -115,7 +118,6 @@ pub fn beginFrame(
     damage: ?[]const render_types.Rect,
     color_description: render_types.ColorDescription,
 ) Error!void {
-    // Damage and buffers referenced by appended commands must remain valid through finishFrame.
     std.debug.assert(self.active_frame == null);
     std.debug.assert(self.commands.items.len == 0);
     self.sampled_tags.clearRetainingCapacity();
@@ -146,6 +148,7 @@ pub fn dmabufDeviceId(self: *const Renderer) ?render_types.DrmDeviceId {
     };
 }
 
+/// Returns renderer-owned format storage, valid until deinit.
 pub fn dmabufSourceFormats(self: *const Renderer) []const render_types.DmabufFormatModifier {
     return switch (self.backend) {
         .cpu => &.{
@@ -172,6 +175,8 @@ pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
     };
 }
 
+/// Copies the command records into the active frame. Storage referenced by
+/// those commands remains borrowed as described by beginFrame.
 pub fn append(self: *Renderer, commands: []const render_types.Command) Error!void {
     const active = self.active_frame orelse unreachable;
     const command_count = std.math.add(
@@ -502,6 +507,7 @@ pub fn setOutputColorDescription(
     active.color_description = description;
 }
 
+/// Borrows calibration.values until the active frame is finished or canceled.
 pub fn setOutputCalibration(
     self: *Renderer,
     calibration: ?render_types.OutputCalibration,

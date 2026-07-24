@@ -40,6 +40,7 @@ pub const CalibrationLut = struct {
         return self.values[lutIndex(red, green, blue)];
     }
 
+    /// The returned values alias this LUT and become invalid when it is deinitialized.
     pub fn rendererCalibration(self: CalibrationLut) render.OutputCalibration {
         return .{
             .identity = self.identity,
@@ -68,6 +69,7 @@ pub const OutputProfile = union(enum) {
         };
     }
 
+    /// A returned calibration aliases this profile's LUT storage.
     pub fn rendererCalibration(self: OutputProfile) ?render.OutputCalibration {
         return switch (self) {
             .matrix => null,
