@@ -18,6 +18,7 @@ const usage =
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: tiled
+    \\workspaces: 1..10
     \\log levels: error, warning, info, debug
     \\colors: '#RRGGBB' or '#RRGGBBAA'
     \\
