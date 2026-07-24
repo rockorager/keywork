@@ -1346,6 +1346,7 @@ pub fn createWithVirtualOutput(
         .context = self,
         .request = requestRepaint,
         .surface_changed = surfaceChanged,
+        .window_changed = sceneWindowChanged,
     });
     self.seat.setRepaintListener(.{
         .context = self,
@@ -3215,6 +3216,17 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
         else
             global, root);
     }
+}
+
+fn sceneWindowChanged(context: *anyopaque, scene_id: Scene.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (transitionIndex(self, scene_id)) |index| {
+        const transition = &self.window_transitions.items[index];
+        if (transition.phase == .animating and transition.kind != .disappearance) {
+            transition.target_dirty = true;
+        }
+    }
+    requestRepaint(self);
 }
 
 fn transitionIndex(self: *Self, scene_id: Scene.Id) ?usize {

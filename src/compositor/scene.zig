@@ -176,6 +176,7 @@ pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
     surface_changed: *const fn (*anyopaque, Surface.Id) void,
+    window_changed: *const fn (*anyopaque, Id) void,
 };
 
 pub const Iterator = struct {
@@ -655,7 +656,7 @@ pub fn addDecoration(
 pub fn removeDecoration(self: *Self, id: DecorationId) void {
     const decoration = self.decorations.remove(id) orelse return;
     const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped and decoration.mapped) self.requestRepaint();
+    if (window.mapped and decoration.mapped) self.requestWindowChanged(decoration.window_id);
 }
 
 pub fn setDecorationOffset(self: *Self, id: DecorationId, offset: Position) void {
@@ -663,7 +664,7 @@ pub fn setDecorationOffset(self: *Self, id: DecorationId, offset: Position) void
     if (std.meta.eql(decoration.offset, offset)) return;
     decoration.offset = offset;
     const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped and decoration.mapped) self.requestRepaint();
+    if (window.mapped and decoration.mapped) self.requestWindowChanged(decoration.window_id);
 }
 
 pub fn setDecorationMapped(self: *Self, id: DecorationId, mapped: bool) void {
@@ -671,13 +672,13 @@ pub fn setDecorationMapped(self: *Self, id: DecorationId, mapped: bool) void {
     if (decoration.mapped == mapped) return;
     decoration.mapped = mapped;
     const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped) self.requestRepaint();
+    if (window.mapped) self.requestWindowChanged(decoration.window_id);
 }
 
 pub fn decorationCommitted(self: *Self, id: DecorationId) void {
     const decoration = self.decorations.get(id) orelse return;
     const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped and decoration.mapped) self.requestRepaint();
+    if (window.mapped and decoration.mapped) self.requestWindowChanged(decoration.window_id);
 }
 
 pub fn setMapped(self: *Self, id: Id, mapped: bool) void {
@@ -1043,6 +1044,10 @@ fn requestSurfaceChanged(self: *Self, surface_id: Surface.Id) void {
     }
 }
 
+fn requestWindowChanged(self: *Self, id: Id) void {
+    if (self.repaint_listener) |listener| listener.window_changed(listener.context, id);
+}
+
 fn layerIndex(layer: Layer) usize {
     return @intFromEnum(layer);
 }
@@ -1343,12 +1348,14 @@ test "scene reorders windows through handles" {
 
 const RepaintCounter = struct {
     count: usize = 0,
+    last_window: ?Id = null,
 
     fn listener(self: *RepaintCounter) RepaintListener {
         return .{
             .context = self,
             .request = request,
             .surface_changed = surfaceChanged,
+            .window_changed = windowChanged,
         };
     }
 
@@ -1358,6 +1365,12 @@ const RepaintCounter = struct {
     }
 
     fn surfaceChanged(_: *anyopaque, _: Surface.Id) void {}
+
+    fn windowChanged(context: *anyopaque, id: Id) void {
+        const self: *RepaintCounter = @ptrCast(@alignCast(context));
+        self.count += 1;
+        self.last_window = id;
+    }
 };
 
 test "scene stack updates only repaint for a different final order" {
@@ -1518,6 +1531,34 @@ test "scene attaches decoration handles to windows" {
     scene.removeDecoration(below);
     scene.removeWindow(window);
     try std.testing.expectEqual(@as(?Decoration, null), scene.decorations.remove(above));
+}
+
+test "scene reports visible decoration changes with their owning window" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const window = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const decoration = try scene.addDecoration(
+        window,
+        .{ .index = 2, .generation = 1 },
+        .above,
+    );
+    scene.setMapped(window, true);
+    var repaint: RepaintCounter = .{};
+    scene.setRepaintListener(repaint.listener());
+    defer scene.clearRepaintListener();
+
+    scene.setDecorationOffset(decoration, .{ .x = 4 });
+    try std.testing.expectEqual(@as(usize, 0), repaint.count);
+    scene.setDecorationMapped(decoration, true);
+    scene.setDecorationOffset(decoration, .{ .x = 8 });
+    scene.decorationCommitted(decoration);
+    scene.removeDecoration(decoration);
+    try std.testing.expectEqual(@as(usize, 4), repaint.count);
+    try std.testing.expect(std.meta.eql(window, repaint.last_window.?));
+
+    scene.removeWindow(window);
 }
 
 test "scene keeps nested popups relative to their root window" {
