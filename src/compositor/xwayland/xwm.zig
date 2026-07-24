@@ -52,19 +52,6 @@ pub const Size = struct {
     height: i32 = 0,
 };
 
-pub const MoveResizeRequest = union(enum) {
-    move,
-    resize: Edges,
-    cancel,
-
-    pub const Edges = packed struct(u4) {
-        top: bool = false,
-        bottom: bool = false,
-        left: bool = false,
-        right: bool = false,
-    };
-};
-
 pub const WindowType = enum {
     desktop,
     dock,
@@ -187,7 +174,6 @@ const Atom = enum {
     net_wm_name,
     net_active_window,
     net_close_window,
-    net_wm_moveresize,
     net_wm_state,
     net_wm_state_modal,
     net_wm_state_fullscreen,
@@ -251,7 +237,6 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_NAME",
     "_NET_ACTIVE_WINDOW",
     "_NET_CLOSE_WINDOW",
-    "_NET_WM_MOVERESIZE",
     "_NET_WM_STATE",
     "_NET_WM_STATE_MODAL",
     "_NET_WM_STATE_FULLSCREEN",
@@ -319,7 +304,6 @@ pub const Listener = struct {
     minimize_requested: *const fn (*anyopaque, WindowId, bool) void,
     activation_requested: *const fn (*anyopaque, WindowId) void,
     activation_changed: *const fn (*anyopaque, WindowId) void,
-    move_resize_requested: *const fn (*anyopaque, WindowId, MoveResizeRequest, u32) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -1066,7 +1050,6 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_wm_name),
         self.atomValue(.net_active_window),
         self.atomValue(.net_close_window),
-        self.atomValue(.net_wm_moveresize),
         self.atomValue(.net_wm_state),
         self.atomValue(.net_wm_state_modal),
         self.atomValue(.net_wm_state_fullscreen),
@@ -2056,10 +2039,6 @@ fn handleClientMessage(
         self.handleNetCloseWindowMessage(event);
         return;
     }
-    if (event.type == self.atomValue(.net_wm_moveresize)) {
-        self.handleNetWmMoveResizeMessage(event);
-        return;
-    }
     if (event.type != self.atomValue(.wl_surface_serial)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     const serial = @as(u64, event.data.data32[1]) << 32 | event.data.data32[0];
@@ -2184,18 +2163,6 @@ fn handleNetCloseWindowMessage(self: *Self, event: *const c.xcb_client_message_e
     self.closeWindow(event.window);
 }
 
-fn handleNetWmMoveResizeMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
-    const window = self.windows.get(event.window) orelse return;
-    if (!window.mapped or window.override_redirect) return;
-    const request = moveResizeRequest(event.data.data32[2]) orelse return;
-    self.listener.move_resize_requested(
-        self.listener.context,
-        event.window,
-        request,
-        event.data.data32[3],
-    );
-}
-
 fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
     return .{
         .id = window_id,
@@ -2228,22 +2195,6 @@ fn applyStateAction(current: bool, action: u32) ?bool {
         0 => false,
         1 => true,
         2 => !current,
-        else => null,
-    };
-}
-
-fn moveResizeRequest(direction: u32) ?MoveResizeRequest {
-    return switch (direction) {
-        0 => .{ .resize = .{ .top = true, .left = true } },
-        1 => .{ .resize = .{ .top = true } },
-        2 => .{ .resize = .{ .top = true, .right = true } },
-        3 => .{ .resize = .{ .right = true } },
-        4 => .{ .resize = .{ .bottom = true, .right = true } },
-        5 => .{ .resize = .{ .bottom = true } },
-        6 => .{ .resize = .{ .bottom = true, .left = true } },
-        7 => .{ .resize = .{ .left = true } },
-        8 => .move,
-        11 => .cancel,
         else => null,
     };
 }
@@ -2304,22 +2255,6 @@ test "EWMH state replacement removes duplicates before appending" {
     );
     defer std.testing.allocator.free(atoms);
     try std.testing.expectEqualSlices(c.xcb_atom_t, &.{ 1, 3, 4 }, atoms);
-}
-
-test "EWMH moveresize directions map to compositor requests" {
-    try std.testing.expectEqual(MoveResizeRequest.move, moveResizeRequest(8).?);
-    try std.testing.expectEqual(MoveResizeRequest.cancel, moveResizeRequest(11).?);
-    try std.testing.expectEqual(
-        MoveResizeRequest{ .resize = .{ .top = true, .left = true } },
-        moveResizeRequest(0).?,
-    );
-    try std.testing.expectEqual(
-        MoveResizeRequest{ .resize = .{ .bottom = true, .right = true } },
-        moveResizeRequest(4).?,
-    );
-    try std.testing.expectEqual(null, moveResizeRequest(9));
-    try std.testing.expectEqual(null, moveResizeRequest(10));
-    try std.testing.expectEqual(null, moveResizeRequest(12));
 }
 
 test "EWMH window type fallback follows transient and override-redirect rules" {

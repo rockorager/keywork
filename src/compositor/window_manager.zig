@@ -2833,8 +2833,6 @@ pub fn xwaylandWindowActivationRequested(self: *Self, id: Xwm.WindowId, _: *Seat
     self.relayout();
 }
 
-pub fn xwaylandWindowMoveResizeRequested(_: *Self, _: Xwm.WindowId, _: Xwm.MoveResizeRequest) void {}
-
 pub fn xwaylandWindowDisplayed(self: *Self, id: Xwm.WindowId) bool {
     const window = self.windows.get(self.findXwayland(id) orelse return true) orelse return true;
     return displayed(window.mapped, window.minimized, self.workspaces.items[window.workspace].active, window.placement);
