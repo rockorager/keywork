@@ -445,11 +445,21 @@ const KeyboardGrab = struct {
         self.method.manager.seat.setKeyboardGrab(.{
             .context = self,
             .token = self.token,
+            .cancel = cancel,
             .keymap = sendKeymap,
             .key = sendKey,
             .modifiers = sendModifiers,
             .repeat_info = sendRepeatInfo,
         });
+    }
+
+    fn cancel(context: *anyopaque) void {
+        const self: *KeyboardGrab = @ptrCast(@alignCast(context));
+        std.debug.assert(self.active);
+        std.debug.assert(self.method.active_grab == self);
+        self.active = false;
+        self.method.active_grab = null;
+        self.method.manager.seat.clearKeyboardGrab(self, false);
     }
 
     fn sendKeymap(

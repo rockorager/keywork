@@ -392,7 +392,7 @@ pub const KeyboardGrab = struct {
     context: *anyopaque,
     token: u64,
     surface: ?Surface.Id = null,
-    cancel: ?*const fn (*anyopaque) void = null,
+    cancel: *const fn (*anyopaque) void,
     keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
     key: *const fn (*anyopaque, u32, u32, u32, wl.Keyboard.KeyState) void,
     modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
@@ -612,8 +612,7 @@ pub fn removeKeyboardFocusListener(self: *Self, context: *anyopaque) void {
 
 pub fn setKeyboardGrab(self: *Self, grab: KeyboardGrab) void {
     if (self.keyboard_grab) |active| {
-        const cancel = active.cancel orelse unreachable;
-        cancel(active.context);
+        active.cancel(active.context);
     }
     std.debug.assert(self.installKeyboardGrab(grab));
 }
