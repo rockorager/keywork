@@ -255,7 +255,8 @@ fn waitOutputIdle(self: *Self, output: *DrmOutput) !void {
         {
             return error.DeviceDisconnected;
         }
-        try output.dispatchEvent(fd);
+        try DrmOutput.dispatchEvents(fd);
+        self.collectRetiredOutputs();
     }
 }
 
@@ -350,7 +351,7 @@ fn activate(self: *Self) !void {
             found = true;
             break;
         };
-        if (!found) self.removeAt(index, device.fd);
+        if (!found) try self.removeAt(index, device.fd);
     }
     self.event_source = try self.event_loop.addFd(*Self, device.fd, .{ .readable = true }, handleDrmEvent, self);
     if (self.initialized) if (self.listener) |listener| listener.activated(listener.context);
@@ -374,13 +375,18 @@ fn deactivate(self: *Self) void {
     self.destroyList(&self.retired_outputs);
 }
 
-fn removeAt(self: *Self, index: usize, fd: std.posix.fd_t) void {
+fn removeAt(self: *Self, index: usize, fd: std.posix.fd_t) !void {
+    try self.retired_outputs.ensureUnusedCapacity(self.allocator, 1);
     const output = self.active_outputs.items[index];
     if (self.listener) |listener| listener.removing(listener.context, output);
     output.retire();
     output.disconnect(fd);
-    self.retired_outputs.append(self.allocator, output) catch return self.fail(error.OutOfMemory);
     _ = self.active_outputs.orderedRemove(index);
+    if (output.retirementComplete()) {
+        self.destroyOutput(output);
+    } else {
+        self.retired_outputs.appendAssumeCapacity(output);
+    }
 }
 
 fn reconcile(self: *Self) !void {
@@ -435,7 +441,7 @@ fn reconcile(self: *Self) !void {
             found = true;
             break;
         };
-        if (!found) self.removeAt(index, device.fd);
+        if (!found) try self.removeAt(index, device.fd);
     }
 }
 
@@ -474,11 +480,24 @@ fn findOutput(self: *Self, connector_id: u32) ?*DrmOutput {
     return null;
 }
 
-fn destroyList(self: *Self, list: *std.ArrayList(*DrmOutput)) void {
-    for (list.items) |output| {
-        output.deinit();
-        self.allocator.destroy(output);
+fn collectRetiredOutputs(self: *Self) void {
+    var index = self.retired_outputs.items.len;
+    while (index > 0) {
+        index -= 1;
+        const output = self.retired_outputs.items[index];
+        if (!output.retirementComplete()) continue;
+        _ = self.retired_outputs.orderedRemove(index);
+        self.destroyOutput(output);
     }
+}
+
+fn destroyOutput(self: *Self, output: *DrmOutput) void {
+    output.deinit();
+    self.allocator.destroy(output);
+}
+
+fn destroyList(self: *Self, list: *std.ArrayList(*DrmOutput)) void {
+    for (list.items) |output| self.destroyOutput(output);
     list.clearRetainingCapacity();
 }
 
@@ -578,7 +597,8 @@ fn handleSessionFailed(context: *anyopaque) void {
 
 fn handleDrmEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
     if (mask.hangup or mask.@"error") self.fail(error.DeviceDisconnected) else if (mask.readable) if (self.device) |device| {
-        if (self.active_outputs.items.len > 0) self.active_outputs.items[0].dispatchEvent(device.fd) catch |err| self.fail(err);
+        DrmOutput.dispatchEvents(device.fd) catch |err| self.fail(err);
+        self.collectRetiredOutputs();
     };
     return 0;
 }

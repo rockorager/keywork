@@ -1628,7 +1628,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.acquired_damage.clear();
     self.pending = null;
     self.displayed = null;
-    self.pending_page_flip = null;
+    if (!self.retired) self.pending_page_flip = null;
     self.releaseClientScanouts();
     self.destroyScanoutFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
@@ -1835,12 +1835,18 @@ pub fn notifyDeactivated(self: *Self) void {
 }
 
 pub fn retire(self: *Self) void {
+    std.debug.assert(!self.retired);
     self.retired = true;
     self.pending = null;
-    self.pending_page_flip = null;
 }
 
-pub fn dispatchEvent(_: *Self, fd: std.posix.fd_t) !void {
+/// True when no queued DRM callback can still reference this retired output.
+pub fn retirementComplete(self: *const Self) bool {
+    std.debug.assert(self.retired);
+    return self.pending_page_flip == null;
+}
+
+pub fn dispatchEvents(fd: std.posix.fd_t) !void {
     var context = event_context;
     if (c.drmHandleEvent(fd, &context) != 0) return error.EventDispatchFailed;
 }
@@ -1853,8 +1859,12 @@ fn handlePageFlip(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(data.?));
+    if (self.retired) {
+        std.debug.assert(self.pending_page_flip != null);
+        self.pending_page_flip = null;
+        return;
+    }
     if (self.pending == null and self.direct_pending == null) {
-        if (self.retired) return;
         self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
     }
@@ -4486,6 +4496,27 @@ test "asynchronous page flips retain completion events" {
         @as(u32, c.DRM_MODE_PAGE_FLIP_EVENT | c.DRM_MODE_PAGE_FLIP_ASYNC),
         pageFlipFlags(.async),
     );
+}
+
+test "retired DRM outputs wait for queued page flip callbacks" {
+    var context: u8 = 0;
+    var output: Self = undefined;
+    output.init(std.testing.allocator, std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .gbm = testDeviceGbm,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+    output.pending = 0;
+    output.pending_page_flip = .vsync;
+
+    output.retire();
+    try std.testing.expect(!output.retirementComplete());
+
+    handlePageFlip(0, 0, 0, 0, &output);
+    try std.testing.expect(output.retirementComplete());
 }
 
 test "CRTC selection preserves preferred and never selects claimed" {
