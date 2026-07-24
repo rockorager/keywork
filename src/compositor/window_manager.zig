@@ -1622,14 +1622,14 @@ fn windowSizeConstraints(self: *Self, window: *const Window) types.SizeConstrain
             break :constraints .{
                 .min_width = min_width,
                 .min_height = min_height,
-                .max_width = @intCast(@max(
-                    @as(i32, @intCast(min_width)),
-                    if (info.max_size.width > 0) info.max_size.width else std.math.maxInt(i32),
-                )),
-                .max_height = @intCast(@max(
-                    @as(i32, @intCast(min_height)),
-                    if (info.max_size.height > 0) info.max_size.height else std.math.maxInt(i32),
-                )),
+                .max_width = if (info.max_size.width > 0)
+                    @intCast(@max(@as(i32, @intCast(min_width)), info.max_size.width))
+                else
+                    null,
+                .max_height = if (info.max_size.height > 0)
+                    @intCast(@max(@as(i32, @intCast(min_height)), info.max_size.height))
+                else
+                    null,
             };
         },
         .xwayland => |id| constraints: {
@@ -1646,20 +1646,20 @@ fn windowSizeConstraints(self: *Self, window: *const Window) types.SizeConstrain
             break :constraints .{
                 .min_width = min_width,
                 .min_height = min_height,
-                .max_width = @intCast(@min(
-                    @max(
-                        @as(i32, @intCast(min_width)),
-                        if (info.max_size.width > 0) info.max_size.width else std.math.maxInt(i32),
-                    ),
-                    std.math.maxInt(u16),
-                )),
-                .max_height = @intCast(@min(
-                    @max(
-                        @as(i32, @intCast(min_height)),
-                        if (info.max_size.height > 0) info.max_size.height else std.math.maxInt(i32),
-                    ),
-                    std.math.maxInt(u16),
-                )),
+                .max_width = if (info.max_size.width > 0)
+                    @intCast(@min(
+                        @max(@as(i32, @intCast(min_width)), info.max_size.width),
+                        std.math.maxInt(u16),
+                    ))
+                else
+                    null,
+                .max_height = if (info.max_size.height > 0)
+                    @intCast(@min(
+                        @max(@as(i32, @intCast(min_height)), info.max_size.height),
+                        std.math.maxInt(u16),
+                    ))
+                else
+                    null,
             };
         },
     };
@@ -2011,7 +2011,14 @@ fn relayout(self: *Self) void {
             if (window.minimized or window.fullscreen_output != null or
                 self.isFloating(window)) continue;
             const current = self.currentDimensions(window);
-            inputs.append(self.allocator, .{ .id = member, .current = types.Size.init(@intCast(@max(1, current.width)), @intCast(@max(1, current.height))) }) catch return;
+            inputs.append(self.allocator, .{
+                .id = member,
+                .constraints = self.windowSizeConstraints(window),
+                .current = types.Size.init(
+                    @intCast(@max(1, current.width)),
+                    @intCast(@max(1, current.height)),
+                ),
+            }) catch return;
         }
         var plans = entry.workspace.layout.arrange(self.allocator, inputs.items, .{ .x = area.x, .y = area.y, .size = types.Size.init(@intCast(area.width), @intCast(area.height)) }, entry.workspace.focused) catch return;
         defer plans.deinit(self.allocator);

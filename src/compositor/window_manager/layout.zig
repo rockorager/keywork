@@ -16,6 +16,11 @@ pub const DropPosition = enum {
     left,
 };
 
+const Division = struct {
+    first: types.Rect,
+    second: types.Rect,
+};
+
 pub const Layout = union(enum) {
     tiled: Tiled,
 
@@ -241,6 +246,19 @@ pub const Tiled = struct {
             leaf: types.WindowId,
             split: Split,
         },
+    };
+    const SpanConstraints = struct {
+        // Subtrees may sum multiple client-controlled u32 size hints.
+        minimum: u64,
+        maximum: ?u64,
+    };
+    const NodeConstraints = struct {
+        horizontal: SpanConstraints,
+        vertical: SpanConstraints,
+
+        fn forAxis(self: NodeConstraints, axis: Axis) SpanConstraints {
+            return if (axis == .horizontal) self.horizontal else self.vertical;
+        }
     };
 
     pub fn deinit(self: *Tiled, allocator: std.mem.Allocator) void {
@@ -510,23 +528,22 @@ pub const Tiled = struct {
                 .leaf => unreachable,
                 .split => |value| value,
             };
-            const division = divide(
-                parent.rect orelse break,
-                split.axis,
-                split.ratio_percent,
-                self.inner_gap,
-            ) orelse {
+            const first_rect = self.nodes.items[split.first].rect orelse {
+                child_index = parent_index;
+                continue;
+            };
+            const second_rect = self.nodes.items[split.second].rect orelse {
                 child_index = parent_index;
                 continue;
             };
             const first_end = if (split.axis == .horizontal)
-                @as(i64, division.first.x) + division.first.size.width
+                @as(i64, first_rect.x) + first_rect.size.width
             else
-                @as(i64, division.first.y) + division.first.size.height;
+                @as(i64, first_rect.y) + first_rect.size.height;
             const second_start = if (split.axis == .horizontal)
-                @as(i64, division.second.x)
+                @as(i64, second_rect.x)
             else
-                @as(i64, division.second.y);
+                @as(i64, second_rect.y);
             const leaf_start = if (split.axis == .horizontal)
                 @as(i64, leaf_rect.x)
             else
@@ -563,6 +580,15 @@ pub const Tiled = struct {
                 else
                     0;
                 if (distance < best_distance) {
+                    const first_length = if (split.axis == .horizontal)
+                        first_rect.size.width
+                    else
+                        first_rect.size.height;
+                    const second_length = if (split.axis == .horizontal)
+                        second_rect.size.width
+                    else
+                        second_rect.size.height;
+                    const available_length = first_length + second_length;
                     best_distance = distance;
                     best = .{
                         .window = id,
@@ -570,12 +596,9 @@ pub const Tiled = struct {
                         .first = split.first,
                         .second = split.second,
                         .axis = split.axis,
-                        .initial_ratio_percent = split.ratio_percent,
+                        .initial_ratio_percent = splitRatioPercent(first_length, second_length),
                         .initial_pointer = pointer,
-                        .available_length = if (split.axis == .horizontal)
-                            division.first.size.width + division.second.size.width
-                        else
-                            division.first.size.height + division.second.size.height,
+                        .available_length = available_length,
                     };
                 }
             }
@@ -608,9 +631,21 @@ pub const Tiled = struct {
             pointer,
             resize.available_length,
         );
+        const first_rect = self.nodes.items[split.first].rect;
+        const second_rect = self.nodes.items[split.second].rect;
+        if (first_rect != null and second_rect != null) {
+            const first_length = if (resize.axis == .horizontal)
+                first_rect.?.size.width
+            else
+                first_rect.?.size.height;
+            const second_length = if (resize.axis == .horizontal)
+                second_rect.?.size.width
+            else
+                second_rect.?.size.height;
+            if (ratio == splitRatioPercent(first_length, second_length)) return false;
+        }
         if (ratio == split.ratio_percent) return false;
         split.ratio_percent = ratio;
-        self.refreshRects();
         return true;
     }
 
@@ -625,10 +660,14 @@ pub const Tiled = struct {
         try plans.ensureTotalCapacity(allocator, windows.len);
         const area = inset(usable, self.outer_gap);
         self.last_usable = area;
-        self.refreshRects();
+        const measured = try allocator.alloc(?NodeConstraints, self.nodes.items.len);
+        defer allocator.free(measured);
+        @memset(measured, null);
+        for (self.nodes.items) |*node| node.rect = null;
         if (self.root) |root| {
-            if (self.nodeVisible(root, windows))
-                self.arrangeNode(root, windows, area, &plans);
+            if (self.measureNode(root, windows, measured) != null) {
+                self.arrangeNode(root, measured, area, &plans);
+            }
         }
         std.debug.assert(plans.items.len == windows.len);
         return plans;
@@ -664,7 +703,7 @@ pub const Tiled = struct {
     fn arrangeNode(
         self: *Tiled,
         node_index: NodeIndex,
-        windows: []const types.WindowInput,
+        measured: []const ?NodeConstraints,
         area: types.Rect,
         plans: *std.ArrayList(types.LayoutPlan),
     ) void {
@@ -672,7 +711,7 @@ pub const Tiled = struct {
         node.rect = area;
         switch (node.content) {
             .leaf => |id| {
-                std.debug.assert(inputFor(windows, id) != null);
+                std.debug.assert(measured[node_index] != null);
                 plans.appendAssumeCapacity(.{
                     .id = id,
                     .rect = area,
@@ -681,35 +720,58 @@ pub const Tiled = struct {
                 });
             },
             .split => |split| {
-                const first_visible = self.nodeVisible(split.first, windows);
-                const second_visible = self.nodeVisible(split.second, windows);
-                if (first_visible and second_visible) {
-                    if (divide(area, split.axis, split.ratio_percent, self.inner_gap)) |division| {
-                        self.arrangeNode(split.first, windows, division.first, plans);
-                        self.arrangeNode(split.second, windows, division.second, plans);
+                const first_constraints = measured[split.first];
+                const second_constraints = measured[split.second];
+                if (first_constraints != null and second_constraints != null) {
+                    if (divideConstrained(
+                        area,
+                        split.axis,
+                        split.ratio_percent,
+                        self.inner_gap,
+                        first_constraints.?.forAxis(split.axis),
+                        second_constraints.?.forAxis(split.axis),
+                    )) |division| {
+                        self.arrangeNode(split.first, measured, division.first, plans);
+                        self.arrangeNode(split.second, measured, division.second, plans);
                     } else {
-                        self.arrangeNode(split.first, windows, area, plans);
-                        self.arrangeNode(split.second, windows, area, plans);
+                        self.arrangeNode(split.first, measured, area, plans);
+                        self.arrangeNode(split.second, measured, area, plans);
                     }
-                } else if (first_visible) {
-                    self.arrangeNode(split.first, windows, area, plans);
-                } else if (second_visible) {
-                    self.arrangeNode(split.second, windows, area, plans);
+                } else if (first_constraints != null) {
+                    self.arrangeNode(split.first, measured, area, plans);
+                } else if (second_constraints != null) {
+                    self.arrangeNode(split.second, measured, area, plans);
                 } else unreachable;
             },
         }
     }
 
-    fn nodeVisible(
+    fn measureNode(
         self: *const Tiled,
         node_index: NodeIndex,
         windows: []const types.WindowInput,
-    ) bool {
-        return switch (self.nodes.items[node_index].content) {
-            .leaf => |id| inputFor(windows, id) != null,
-            .split => |split| self.nodeVisible(split.first, windows) or
-                self.nodeVisible(split.second, windows),
+        measured: []?NodeConstraints,
+    ) ?NodeConstraints {
+        const constraints: ?NodeConstraints = switch (self.nodes.items[node_index].content) {
+            .leaf => |id| if (inputFor(windows, id)) |window_input|
+                nodeConstraints(window_input.constraints)
+            else
+                null,
+            .split => |split| constraints: {
+                const first = self.measureNode(split.first, windows, measured);
+                const second = self.measureNode(split.second, windows, measured);
+                if (first == null) break :constraints second;
+                if (second == null) break :constraints first;
+                break :constraints combineNodeConstraints(
+                    first.?,
+                    second.?,
+                    split.axis,
+                    self.inner_gap,
+                );
+            },
         };
+        measured[node_index] = constraints;
+        return constraints;
     }
 
     fn findLeaf(self: *const Tiled, id: types.WindowId) ?NodeIndex {
@@ -780,19 +842,165 @@ fn containsId(ids: []const types.WindowId, id: types.WindowId) bool {
     return false;
 }
 
+fn nodeConstraints(constraints: types.SizeConstraints) Tiled.NodeConstraints {
+    std.debug.assert(constraints.min_width > 0 and constraints.min_height > 0);
+    return .{
+        .horizontal = spanConstraints(constraints.min_width, constraints.max_width),
+        .vertical = spanConstraints(constraints.min_height, constraints.max_height),
+    };
+}
+
+fn spanConstraints(minimum: u32, maximum: ?u32) Tiled.SpanConstraints {
+    return .{
+        .minimum = minimum,
+        .maximum = if (maximum) |value| @max(value, minimum) else null,
+    };
+}
+
+fn combineNodeConstraints(
+    first: Tiled.NodeConstraints,
+    second: Tiled.NodeConstraints,
+    split_axis: Tiled.Axis,
+    preferred_gap: u32,
+) Tiled.NodeConstraints {
+    return .{
+        .horizontal = combineSpanConstraints(
+            first.horizontal,
+            second.horizontal,
+            split_axis == .horizontal,
+            preferred_gap,
+        ),
+        .vertical = combineSpanConstraints(
+            first.vertical,
+            second.vertical,
+            split_axis == .vertical,
+            preferred_gap,
+        ),
+    };
+}
+
+fn combineSpanConstraints(
+    first: Tiled.SpanConstraints,
+    second: Tiled.SpanConstraints,
+    divided: bool,
+    preferred_gap: u32,
+) Tiled.SpanConstraints {
+    const minimum = if (divided)
+        first.minimum +| second.minimum
+    else
+        @max(first.minimum, second.minimum);
+    const maximum = if (divided)
+        addMaximum(first.maximum, second.maximum, preferred_gap)
+    else
+        intersectMaximum(first.maximum, second.maximum);
+    return .{
+        .minimum = minimum,
+        // When sibling intervals do not intersect, honoring minima avoids
+        // configuring a client below the size it needs to display content.
+        .maximum = if (maximum) |value| @max(value, minimum) else null,
+    };
+}
+
+fn addMaximum(first: ?u64, second: ?u64, gap: u32) ?u64 {
+    const first_value = first orelse return null;
+    const second_value = second orelse return null;
+    const children = std.math.add(u64, first_value, second_value) catch return null;
+    return std.math.add(u64, children, gap) catch null;
+}
+
+fn intersectMaximum(first: ?u64, second: ?u64) ?u64 {
+    if (first) |first_value| {
+        return if (second) |second_value| @min(first_value, second_value) else first_value;
+    }
+    return second;
+}
+
 fn divide(
     rect: types.Rect,
     axis: Tiled.Axis,
     ratio_percent: u8,
     requested_gap: u32,
-) ?struct { first: types.Rect, second: types.Rect } {
+) ?Division {
     const length = if (axis == .horizontal) rect.size.width else rect.size.height;
     if (length < 2) return null;
     const gap = @min(requested_gap, length - 2);
     const available = length - gap;
     var first_length: u32 = @intCast((@as(u64, available) * ratio_percent) / 100);
     first_length = std.math.clamp(first_length, 1, available - 1);
-    const second_length = available - first_length;
+    return splitRect(rect, axis, first_length, gap);
+}
+
+fn divideConstrained(
+    rect: types.Rect,
+    axis: Tiled.Axis,
+    ratio_percent: u8,
+    requested_gap: u32,
+    first_constraints: Tiled.SpanConstraints,
+    second_constraints: Tiled.SpanConstraints,
+) ?Division {
+    const length = if (axis == .horizontal) rect.size.width else rect.size.height;
+    if (length < 2) return null;
+    const length_u64: u64 = length;
+    const minimum_sum = first_constraints.minimum +| second_constraints.minimum;
+    // Decorative gaps yield before client minima. If the remaining span still
+    // cannot satisfy both children, divide it in proportion to their minima.
+    const maximum_gap: u64 = @min(requested_gap, length - 2);
+    const gap: u32 = @intCast(if (minimum_sum >= length_u64)
+        0
+    else
+        @min(maximum_gap, length_u64 - minimum_sum));
+    const available = length - gap;
+    const available_u64: u64 = available;
+    const desired = std.math.clamp(
+        (@as(u64, available) * ratio_percent) / 100,
+        1,
+        available_u64 - 1,
+    );
+    const first_length: u32 = if (available_u64 < minimum_sum) overflow: {
+        const proportional = (@as(u128, available) * first_constraints.minimum +
+            minimum_sum / 2) / minimum_sum;
+        break :overflow @intCast(std.math.clamp(
+            proportional,
+            1,
+            @as(u128, available - 1),
+        ));
+    } else constrained: {
+        var lower = first_constraints.minimum;
+        var upper = available_u64 - second_constraints.minimum;
+        const maximum_sum = addMaximum(
+            first_constraints.maximum,
+            second_constraints.maximum,
+            0,
+        );
+        // Enforce finite maxima only when the subtrees can consume the whole
+        // span; otherwise preserve the requested ratio and honor minima.
+        if (maximum_sum == null or available_u64 <= maximum_sum.?) {
+            if (second_constraints.maximum) |second_maximum| {
+                lower = @max(lower, available_u64 -| second_maximum);
+            }
+            if (first_constraints.maximum) |first_maximum| {
+                upper = @min(upper, first_maximum);
+            }
+        }
+        std.debug.assert(lower <= upper);
+        break :constrained @intCast(std.math.clamp(desired, lower, upper));
+    };
+    return splitRect(rect, axis, first_length, gap);
+}
+
+fn splitRect(
+    rect: types.Rect,
+    axis: Tiled.Axis,
+    first_length: u32,
+    gap: u32,
+) Division {
+    const length = if (axis == .horizontal) rect.size.width else rect.size.height;
+    std.debug.assert(first_length > 0 and first_length + gap < length);
+    const second_length = length - first_length - gap;
+    const origin = if (axis == .horizontal) rect.x else rect.y;
+    const second_origin = @as(i64, origin) + first_length + gap;
+    std.debug.assert(second_origin >= std.math.minInt(i32) and
+        second_origin <= std.math.maxInt(i32));
     return if (axis == .horizontal) .{
         .first = .{
             .x = rect.x,
@@ -800,7 +1008,7 @@ fn divide(
             .size = types.Size.init(first_length, rect.size.height),
         },
         .second = .{
-            .x = rect.x + @as(i32, @intCast(first_length + gap)),
+            .x = @intCast(second_origin),
             .y = rect.y,
             .size = types.Size.init(second_length, rect.size.height),
         },
@@ -812,10 +1020,20 @@ fn divide(
         },
         .second = .{
             .x = rect.x,
-            .y = rect.y + @as(i32, @intCast(first_length + gap)),
+            .y = @intCast(second_origin),
             .size = types.Size.init(rect.size.width, second_length),
         },
     };
+}
+
+fn splitRatioPercent(first_length: u32, second_length: u32) u8 {
+    std.debug.assert(first_length > 0 and second_length > 0);
+    const available = @as(u64, first_length) + second_length;
+    return @intCast(std.math.clamp(
+        (@as(u64, first_length) * 100 + available / 2) / available,
+        1,
+        99,
+    ));
 }
 
 fn resizedRatio(initial: u8, initial_pointer: f64, pointer: f64, available: u32) u8 {
@@ -834,12 +1052,182 @@ fn input(index: u32, width: u32) types.WindowInput {
     return .{ .id = types.id(index), .current = types.Size.init(width, 40) };
 }
 
+fn constrainedInput(index: u32, constraints: types.SizeConstraints) types.WindowInput {
+    return .{
+        .id = types.id(index),
+        .constraints = constraints,
+        .current = types.Size.init(40, 40),
+    };
+}
+
 test "gap configuration applies to tiled layout" {
     var layout: Layout = .init(.tiled);
     defer layout.deinit(std.testing.allocator);
     layout.setGaps(20, 24);
     try std.testing.expectEqual(@as(u32, 20), layout.tiled.inner_gap);
     try std.testing.expectEqual(@as(u32, 24), layout.tiled.outer_gap);
+}
+
+test "constrained division honors feasible bounds and degrades deterministically" {
+    const rect: types.Rect = .{ .x = 0, .y = 0, .size = types.Size.init(100, 10) };
+
+    const no_gap = divideConstrained(
+        rect,
+        .horizontal,
+        50,
+        10,
+        spanConstraints(50, null),
+        spanConstraints(50, null),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 50), no_gap.first.size.width);
+    try std.testing.expectEqual(@as(i32, 50), no_gap.second.x);
+
+    const partial_gap = divideConstrained(
+        rect,
+        .horizontal,
+        50,
+        10,
+        spanConstraints(48, null),
+        spanConstraints(48, null),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 48), partial_gap.first.size.width);
+    try std.testing.expectEqual(@as(i32, 52), partial_gap.second.x);
+    try std.testing.expectEqual(@as(u32, 48), partial_gap.second.size.width);
+
+    const minimum_clamped = divideConstrained(
+        rect,
+        .horizontal,
+        10,
+        0,
+        spanConstraints(30, null),
+        spanConstraints(1, null),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 30), minimum_clamped.first.size.width);
+    try std.testing.expectEqual(@as(u32, 70), minimum_clamped.second.size.width);
+
+    const sibling_maximum = divideConstrained(
+        rect,
+        .horizontal,
+        50,
+        0,
+        spanConstraints(1, null),
+        spanConstraints(1, 40),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 60), sibling_maximum.first.size.width);
+    try std.testing.expectEqual(@as(u32, 40), sibling_maximum.second.size.width);
+
+    const overflow = divideConstrained(
+        .{ .x = 0, .y = 0, .size = types.Size.init(60, 10) },
+        .horizontal,
+        10,
+        10,
+        spanConstraints(80, null),
+        spanConstraints(40, null),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 40), overflow.first.size.width);
+    try std.testing.expectEqual(@as(u32, 20), overflow.second.size.width);
+
+    const maximum_overflow = divideConstrained(
+        rect,
+        .horizontal,
+        50,
+        0,
+        spanConstraints(1, 30),
+        spanConstraints(1, 30),
+    ).?;
+    try std.testing.expectEqual(@as(u32, 50), maximum_overflow.first.size.width);
+    try std.testing.expectEqual(@as(u32, 50), maximum_overflow.second.size.width);
+}
+
+test "subtree constraints compose without overflow and prioritize minima" {
+    const maximum = std.math.maxInt(u32);
+    const wide = combineSpanConstraints(
+        spanConstraints(maximum, null),
+        spanConstraints(maximum, 200),
+        true,
+        16,
+    );
+    try std.testing.expectEqual(@as(u64, maximum) * 2, wide.minimum);
+    try std.testing.expectEqual(@as(?u64, null), wide.maximum);
+
+    const cross_axis = combineSpanConstraints(
+        spanConstraints(1, 50),
+        spanConstraints(80, 100),
+        false,
+        16,
+    );
+    try std.testing.expectEqual(@as(u64, 80), cross_axis.minimum);
+    try std.testing.expectEqual(@as(?u64, 80), cross_axis.maximum);
+
+    const finite_cross_axis = combineSpanConstraints(
+        spanConstraints(1, null),
+        spanConstraints(1, 200),
+        false,
+        16,
+    );
+    try std.testing.expectEqual(@as(?u64, 200), finite_cross_axis.maximum);
+}
+
+test "nested tiled constraints preserve coverage and visible pass-through" {
+    const first = constrainedInput(0, .{ .min_width = 70 });
+    const second = constrainedInput(1, .{ .min_height = 80 });
+    const third = constrainedInput(2, .{ .min_height = 40 });
+    const area: types.Rect = .{ .x = 0, .y = 0, .size = types.Size.init(100, 60) };
+    var layout: Layout = .{ .tiled = .{ .outer_gap = 0, .inner_gap = 0 } };
+    defer layout.deinit(std.testing.allocator);
+
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    var plans = try layout.arrange(std.testing.allocator, &.{first}, area, first.id);
+    plans.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    plans = try layout.arrange(std.testing.allocator, &.{ first, second }, area, second.id);
+    plans.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, third.id, second.id);
+    plans = try layout.arrange(
+        std.testing.allocator,
+        &.{ first, second, third },
+        area,
+        third.id,
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 0, .y = 0, .size = types.Size.init(70, 60) },
+        plans.items[0].rect,
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 70, .y = 0, .size = types.Size.init(30, 40) },
+        plans.items[1].rect,
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 70, .y = 40, .size = types.Size.init(30, 20) },
+        plans.items[2].rect,
+    );
+    plans.deinit(std.testing.allocator);
+
+    plans = try layout.arrange(std.testing.allocator, &.{third}, area, third.id);
+    defer plans.deinit(std.testing.allocator);
+    try std.testing.expectEqual(area, plans.items[0].rect);
+    try std.testing.expect(layout.beginResize(third.id, 50, 30, 100) == null);
+}
+
+test "tiled resize uses constrained split geometry" {
+    const first = constrainedInput(0, .{ .min_width = 70 });
+    const second = constrainedInput(1, .{});
+    const area: types.Rect = .{ .x = 0, .y = 0, .size = types.Size.init(100, 60) };
+    var layout: Layout = .{ .tiled = .{ .outer_gap = 0, .inner_gap = 0 } };
+    defer layout.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+
+    var plans = try layout.arrange(std.testing.allocator, &.{ first, second }, area, first.id);
+    plans.deinit(std.testing.allocator);
+    const resize = layout.beginResize(first.id, 69, 30, 2).?;
+    try std.testing.expectEqual(@as(u8, 70), resize.tiled.initial_ratio_percent);
+    try std.testing.expect(!layout.updateResize(resize, 69, 30));
+    try std.testing.expect(layout.updateResize(resize, 40, 30));
+    plans = try layout.arrange(std.testing.allocator, &.{ first, second }, area, first.id);
+    defer plans.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 70), plans.items[0].rect.size.width);
+    try std.testing.expectEqual(@as(u32, 30), plans.items[1].rect.size.width);
 }
 
 test "tiled shadows share the usable area without neighbor clipping" {
