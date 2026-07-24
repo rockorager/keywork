@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const headless = @import("../backend/headless.zig");
 const render_types = @import("types.zig");
+const blur_geometry = @import("blur_geometry.zig");
 
 const pixman = @cImport({
     @cInclude("pixman.h");
@@ -396,10 +397,10 @@ fn captureBackdrop(
     marker: render_types.BackdropCapture,
 ) Error!?BackdropSnapshot {
     const clipped = marker.rect.clipTo(target.size) orelse return null;
-    const level = configuredBlurLevel(marker.radius, marker.downsample_level);
-    const sample_rect = blurSampleRect(
+    const level = blur_geometry.configuredLevel(marker.radius, marker.downsample_level);
+    const sample_rect = blur_geometry.sampleRect(
         clipped,
-        backdropBlurFootprint(marker.radius, marker.downsample_level),
+        blur_geometry.footprint(marker.radius, marker.downsample_level),
         level,
         target.size,
     );
@@ -530,7 +531,6 @@ fn unionRect(a: render_types.Rect, b: render_types.Rect) render_types.Rect {
     };
 }
 
-const kawase_level_count = render_types.maximum_blur_downsample_level + 1;
 const KawaseColor = [4]f32;
 
 const KawaseImage = struct {
@@ -574,17 +574,6 @@ const KawaseImage = struct {
     }
 };
 
-comptime {
-    std.debug.assert(kawase_level_count == 6);
-}
-
-pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
-    if (radius == 0) return 0;
-    const level = configuredBlurLevel(radius, downsample_level);
-    const scale: u32 = @as(u32, 1) << @intCast(level);
-    return (ceilDiv(radius, scale) +| 3) *| scale;
-}
-
 fn dualKawaseArgb(
     allocator: std.mem.Allocator,
     target: render_types.PixelBuffer,
@@ -593,8 +582,8 @@ fn dualKawaseArgb(
     downsample_level: ?u8,
     finish: render_types.BackdropBlurFinish,
 ) Error![]u32 {
-    const level = configuredBlurLevel(radius, downsample_level);
-    const offset = kawaseOffset(radius, level);
+    const level = blur_geometry.configuredLevel(radius, downsample_level);
+    const offset = blur_geometry.sampleOffset(radius, level);
     const sample_size: render_types.Size = .{
         .width = sample_rect.width,
         .height = sample_rect.height,
@@ -607,7 +596,7 @@ fn dualKawaseArgb(
         const destination_level: u8 = if (level == 0) 0 else @intCast(index + 1);
         const destination = try KawaseImage.init(
             allocator,
-            kawaseLevelSize(sample_size, destination_level),
+            blur_geometry.levelSize(sample_size, destination_level),
         );
         kawaseDownsample(current, destination, offset);
         current.deinit(allocator);
@@ -623,7 +612,7 @@ fn dualKawaseArgb(
             @intCast(source_level - 1);
         const destination = try KawaseImage.init(
             allocator,
-            kawaseLevelSize(sample_size, destination_level),
+            blur_geometry.levelSize(sample_size, destination_level),
         );
         kawaseUpsample(current, destination, offset, level == 0);
         current.deinit(allocator);
@@ -632,65 +621,6 @@ fn dualKawaseArgb(
     }
     applyBackdropBlurFinish(current, sample_rect, finish);
     return packKawaseImage(allocator, current);
-}
-
-fn blurLevel(radius: u32) u8 {
-    var level: u8 = 0;
-    while (level < kawase_level_count - 1 and
-        ceilDiv(radius, @as(u32, 1) << @intCast(level)) > 2) level += 1;
-    return level;
-}
-
-fn configuredBlurLevel(radius: u32, configured: ?u8) u8 {
-    std.debug.assert(configured == null or configured.? < kawase_level_count);
-    return configured orelse blurLevel(radius);
-}
-
-fn ceilDiv(value: u32, divisor: u32) u32 {
-    return value / divisor + @intFromBool(value % divisor != 0);
-}
-
-fn kawaseLevelSize(size: render_types.Size, level: u8) render_types.Size {
-    const scale: u32 = @as(u32, 1) << @intCast(level);
-    return .{
-        .width = ceilDiv(size.width, scale),
-        .height = ceilDiv(size.height, scale),
-    };
-}
-
-fn kawaseOffset(radius: u32, level: u8) f32 {
-    const kernel_extent: u32 = if (level == 0) 2 else blk: {
-        const scale: u32 = @as(u32, 1) << @intCast(level);
-        break :blk 3 * scale - 3;
-    };
-    return @as(f32, @floatFromInt(radius)) / @as(f32, @floatFromInt(kernel_extent));
-}
-
-fn blurSampleRect(
-    rect: render_types.Rect,
-    radius: u32,
-    level: u8,
-    frame_size: render_types.Size,
-) render_types.Rect {
-    const alignment: i64 = @as(i64, 1) << @intCast(level);
-    const left = @max(@divFloor(@as(i64, rect.x) - radius, alignment) * alignment, 0);
-    const top = @max(@divFloor(@as(i64, rect.y) - radius, alignment) * alignment, 0);
-    const raw_right = @as(i64, rect.x) + rect.width + radius;
-    const raw_bottom = @as(i64, rect.y) + rect.height + radius;
-    const right = @min(
-        @divFloor(raw_right + alignment - 1, alignment) * alignment,
-        frame_size.width,
-    );
-    const bottom = @min(
-        @divFloor(raw_bottom + alignment - 1, alignment) * alignment,
-        frame_size.height,
-    );
-    return .{
-        .x = @intCast(left),
-        .y = @intCast(top),
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
 }
 
 fn kawaseDownsample(source: KawaseImage, destination: KawaseImage, offset: f32) void {
@@ -1844,21 +1774,6 @@ test "CPU backdrop blur snapshots disjoint damage before compositing" {
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
 }
 
-test "CPU dual Kawase blur derives levels and footprints from radius" {
-    try std.testing.expectEqual(@as(u8, 0), blurLevel(2));
-    try std.testing.expectEqual(@as(u8, 1), blurLevel(3));
-    try std.testing.expectEqual(@as(u8, 3), blurLevel(16));
-    try std.testing.expectEqual(@as(u8, 5), blurLevel(65));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), kawaseOffset(1, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
-    try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16, null));
-    try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
-    try std.testing.expectEqual(
-        std.math.maxInt(u32),
-        backdropBlurFootprint(std.math.maxInt(u32), null),
-    );
-}
-
 test "CPU dual Kawase pyramid preserves a uniform odd-sized image" {
     const size: render_types.Size = .{ .width = 5, .height = 3 };
     var source = [_]u32{0x80402010} ** (size.width * size.height);
@@ -1900,10 +1815,10 @@ test "CPU dual Kawase scoped pyramid matches full-frame results" {
         .height = size.height,
     };
     const output_rect: render_types.Rect = .{ .x = 28, .y = 14, .width = 4, .height = 4 };
-    const level = configuredBlurLevel(3, null);
-    const sample_rect = blurSampleRect(
+    const level = blur_geometry.configuredLevel(3, null);
+    const sample_rect = blur_geometry.sampleRect(
         output_rect,
-        backdropBlurFootprint(3, null),
+        blur_geometry.footprint(3, null),
         level,
         size,
     );

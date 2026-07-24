@@ -6,6 +6,7 @@ const VulkanRenderer = @import("vulkan.zig");
 const headless = @import("../backend/headless.zig");
 const Region = @import("../region.zig");
 const render_types = @import("types.zig");
+const blur_geometry = @import("blur_geometry.zig");
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -105,14 +106,11 @@ pub const Renderer = struct {
     }
 
     pub fn backdropBlurFootprint(
-        self: *const Renderer,
+        _: *const Renderer,
         radius: u32,
         downsample_level: ?u8,
     ) u32 {
-        return switch (self.backend) {
-            .cpu => CpuRenderer.backdropBlurFootprint(radius, downsample_level),
-            .vulkan => VulkanRenderer.backdropBlurFootprint(radius, downsample_level),
-        };
+        return blur_geometry.footprint(radius, downsample_level);
     }
 
     pub fn beginFrame(

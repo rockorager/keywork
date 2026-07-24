@@ -447,6 +447,7 @@ test "cursor size defaults when missing or empty" {
 
 test {
     _ = @import("render/types.zig");
+    _ = @import("render/blur_geometry.zig");
     _ = @import("render/color_math.zig");
     _ = @import("render/icc.zig");
     _ = @import("render/renderer.zig");

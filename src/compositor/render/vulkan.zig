@@ -6,6 +6,7 @@ const std = @import("std");
 const vk = @import("vulkan");
 const CpuRenderer = @import("cpu.zig");
 const render = @import("types.zig");
+const blur_geometry = @import("blur_geometry.zig");
 const color_math = @import("color_math.zig");
 const shaders = @import("vulkan_shaders.zig");
 const sync = @cImport({
@@ -192,11 +193,7 @@ const BackdropCache = struct {
     }
 };
 
-const blur_level_count = 6;
-
-comptime {
-    std.debug.assert(blur_level_count - 1 == render.maximum_blur_downsample_level);
-}
+const blur_level_count = blur_geometry.level_count;
 
 const Texture = struct {
     image: vk.Image,
@@ -4836,7 +4833,7 @@ fn destroyImageDescriptor(self: *Self, descriptor_set: vk.DescriptorSet) void {
 fn ensureBlurLevel(self: *Self, scratch: *BlurScratch, output_size: render.Size, index: usize) Error!void {
     std.debug.assert(index < blur_level_count);
     if (scratch.levels[index] != null) return;
-    const level_size = blurLevelSize(output_size, @intCast(index));
+    const level_size = blur_geometry.levelSize(output_size, @intCast(index));
     const a = try self.createBlurImage(level_size, .{ .color_attachment_bit = true, .sampled_bit = true });
     errdefer self.destroyBlurImage(a);
     const b = try self.createBlurImage(level_size, .{ .color_attachment_bit = true, .sampled_bit = true });
@@ -6660,9 +6657,9 @@ fn compileDrawRuns(
             if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
             const capture = compiledBackdropCapture(captures.items, blur.capture_id) orelse
                 return error.InvalidTarget;
-            const level = configuredBlurLevel(blur.radius, blur.downsample_level);
-            const sample_radius = backdropBlurFootprint(blur.radius, blur.downsample_level);
-            const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
+            const level = blur_geometry.configuredLevel(blur.radius, blur.downsample_level);
+            const sample_radius = blur_geometry.footprint(blur.radius, blur.downsample_level);
+            const sample_rect = blur_geometry.sampleRect(clipped, sample_radius, level, frame.size);
             if (capture.radius != blur.radius or
                 capture.downsample_level != blur.downsample_level or
                 !std.meta.eql(capture.finish, blur.finish) or
@@ -6779,9 +6776,9 @@ fn compileBackdropCapture(
         return error.InvalidTarget;
     }
     const clipped = capture.rect.clipTo(frame.size) orelse return error.InvalidTarget;
-    const level = configuredBlurLevel(capture.radius, capture.downsample_level);
-    const sample_radius = backdropBlurFootprint(capture.radius, capture.downsample_level);
-    const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
+    const level = blur_geometry.configuredLevel(capture.radius, capture.downsample_level);
+    const sample_radius = blur_geometry.footprint(capture.radius, capture.downsample_level);
+    const sample_rect = blur_geometry.sampleRect(clipped, sample_radius, level, frame.size);
     const own_cache_key = backdropCacheKey(frame.commands[0 .. command_index + 1]);
     const geometry_key = backdropGeometryKey(capture);
     const reuse_op_index = if (!capture.base) reuse: {
@@ -6800,14 +6797,16 @@ fn compileBackdropCapture(
     const cache_key = if (reuse_op_index != null) base_capture.?.key else own_cache_key;
 
     var level_rects: [blur_level_count]render.Rect = undefined;
-    for (&level_rects, 0..) |*rect, index| rect.* = scaleRect(sample_rect, @intCast(index));
-    const kawase_offset = kawaseOffset(capture.radius, level);
-    const source_expansion = kawaseSourceExpansion(capture.radius, level);
+    for (&level_rects, 0..) |*rect, index| {
+        rect.* = blur_geometry.scaledRect(sample_rect, @intCast(index));
+    }
+    const kawase_offset = blur_geometry.sampleOffset(capture.radius, level);
+    const source_expansion = blur_geometry.sourceExpansion(capture.radius, level);
     var upsample_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 });
     upsample_rects[0] = clipped;
     for (1..@as(usize, level) + 1) |index| {
-        upsample_rects[index] = expandRectWithin(
-            scaleRect(upsample_rects[index - 1], 1),
+        upsample_rects[index] = blur_geometry.expandWithin(
+            blur_geometry.scaledRect(upsample_rects[index - 1], 1),
             source_expansion,
             level_rects[index],
         );
@@ -7132,70 +7131,6 @@ fn gpuTimingCategory(kind: PipelineKind) GpuTimingCategory {
     };
 }
 
-fn blurLevel(radius: u32) u8 {
-    var level: u8 = 0;
-    while (level < blur_level_count - 1 and ceilDiv(radius, @as(u32, 1) << @intCast(level)) > 2) level += 1;
-    return level;
-}
-
-fn configuredBlurLevel(radius: u32, configured: ?u8) u8 {
-    std.debug.assert(configured == null or configured.? < blur_level_count);
-    return configured orelse blurLevel(radius);
-}
-
-pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
-    if (radius == 0) return 0;
-    const level = configuredBlurLevel(radius, downsample_level);
-    const scale: u32 = @as(u32, 1) << @intCast(level);
-    return (ceilDiv(radius, scale) +| 3) *| scale;
-}
-
-fn ceilDiv(value: u32, divisor: u32) u32 {
-    return value / divisor + @intFromBool(value % divisor != 0);
-}
-
-fn blurLevelSize(size: render.Size, level: u8) render.Size {
-    const scale: u32 = @as(u32, 1) << @intCast(level);
-    return .{ .width = ceilDiv(size.width, scale), .height = ceilDiv(size.height, scale) };
-}
-
-fn kawaseOffset(radius: u32, level: u8) f32 {
-    const kernel_extent: u32 = if (level == 0) 2 else blk: {
-        const scale: u32 = @as(u32, 1) << @intCast(level);
-        break :blk 3 * scale - 3;
-    };
-    return @as(f32, @floatFromInt(radius)) / @as(f32, @floatFromInt(kernel_extent));
-}
-
-fn kawaseSourceExpansion(radius: u32, level: u8) u32 {
-    const kernel_extent: u32 = if (level == 0) 2 else blk: {
-        const scale: u32 = @as(u32, 1) << @intCast(level);
-        break :blk 3 * scale - 3;
-    };
-    // Include one texel for the linear sampler's footprint around each tap.
-    return ceilDiv(radius, kernel_extent) + 1;
-}
-
-fn scaleRect(rect: render.Rect, level: u8) render.Rect {
-    const scale: i64 = @as(i64, 1) << @intCast(level);
-    const left = @divFloor(@as(i64, rect.x), scale);
-    const top = @divFloor(@as(i64, rect.y), scale);
-    const right = @divFloor(@as(i64, rect.x) + rect.width + scale - 1, scale);
-    const bottom = @divFloor(@as(i64, rect.y) + rect.height + scale - 1, scale);
-    return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
-}
-
-fn blurSampleRect(rect: render.Rect, radius: u32, level: u8, frame_size: render.Size) render.Rect {
-    const alignment: i64 = @as(i64, 1) << @intCast(level);
-    const left = @max(@divFloor(@as(i64, rect.x) - radius, alignment) * alignment, 0);
-    const top = @max(@divFloor(@as(i64, rect.y) - radius, alignment) * alignment, 0);
-    const raw_right = @as(i64, rect.x) + rect.width + radius;
-    const raw_bottom = @as(i64, rect.y) + rect.height + radius;
-    const right = @min(@divFloor(raw_right + alignment - 1, alignment) * alignment, frame_size.width);
-    const bottom = @min(@divFloor(raw_bottom + alignment - 1, alignment) * alignment, frame_size.height);
-    return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
-}
-
 fn imageInstance(destination: render.Rect, source: render.Rect) Instance {
     return .{ .destination = rectFloats(destination), .source = rectFloats(source), .clip = rectFloats(destination), .color = .{ 1, 1, 1, 1 }, .rounded = .{ 0, 0, 0, 0 }, .parameters = .{ 0, 0, 0, 1 } };
 }
@@ -7238,15 +7173,6 @@ fn kawaseUpsampleInstance(
             finish_parameters.noise,
         },
     };
-}
-
-fn expandRectWithin(rect: render.Rect, amount: u32, bounds: render.Rect) render.Rect {
-    const left = @max(@as(i64, rect.x) - amount, bounds.x);
-    const top = @max(@as(i64, rect.y) - amount, bounds.y);
-    const right = @min(@as(i64, rect.x) + rect.width + amount, @as(i64, bounds.x) + bounds.width);
-    const bottom = @min(@as(i64, rect.y) + rect.height + amount, @as(i64, bounds.y) + bounds.height);
-    std.debug.assert(left < right and top < bottom);
-    return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
 fn buildGpuTimingPlan(draw_runs: []const DrawRun, blur_ops: []const BlurOp) GpuTimingPlan {
@@ -7839,60 +7765,6 @@ test "Vulkan graphics path supports images, alpha blending, and backdrop blur" {
     } }}));
 }
 
-test "backdrop blur level keeps low resolution radius bounded" {
-    const cases = [_]struct { radius: u32, level: u8 }{
-        .{ .radius = 1, .level = 0 },
-        .{ .radius = 2, .level = 0 },
-        .{ .radius = 3, .level = 1 },
-        .{ .radius = 4, .level = 1 },
-        .{ .radius = 5, .level = 2 },
-        .{ .radius = 8, .level = 2 },
-        .{ .radius = 9, .level = 3 },
-        .{ .radius = 16, .level = 3 },
-        .{ .radius = 17, .level = 4 },
-        .{ .radius = 32, .level = 4 },
-        .{ .radius = 64, .level = 5 },
-        .{ .radius = 128, .level = 5 },
-        .{ .radius = 256, .level = 5 },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.level, blurLevel(case.radius));
-        try std.testing.expect(ceilDiv(case.radius, @as(u32, 1) << @intCast(case.level)) <= 2 or case.level == blur_level_count - 1);
-    }
-
-    try std.testing.expectEqual(@as(u8, 3), configuredBlurLevel(16, null));
-    try std.testing.expectEqual(@as(u8, 0), configuredBlurLevel(16, 0));
-    try std.testing.expectEqual(@as(u8, 5), configuredBlurLevel(16, 5));
-
-    try std.testing.expectEqual(@as(u32, 0), backdropBlurFootprint(0, null));
-    try std.testing.expectEqual(@as(u32, 4), backdropBlurFootprint(1, null));
-    try std.testing.expectEqual(@as(u32, 10), backdropBlurFootprint(3, null));
-    try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16, null));
-    try std.testing.expectEqual(@as(u32, 192), backdropBlurFootprint(65, null));
-    try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
-    try std.testing.expectEqual(@as(u32, 128), backdropBlurFootprint(16, 5));
-    try std.testing.expectEqual(
-        std.math.maxInt(u32),
-        backdropBlurFootprint(std.math.maxInt(u32), null),
-    );
-
-    for (0..blur_level_count) |level_index| {
-        const level: u8 = @intCast(level_index);
-        const scale: u32 = @as(u32, 1) << @intCast(level);
-        for (1..257) |radius_index| {
-            const radius: u32 = @intCast(radius_index);
-            const sample_radius = (ceilDiv(radius, scale) + 3) * scale;
-            try std.testing.expectEqual(backdropBlurFootprint(radius, level), sample_radius);
-        }
-    }
-
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), kawaseOffset(1, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), kawaseOffset(3, 1), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
-    try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(1, 0));
-    try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(16, 3));
-}
-
 test "Vulkan work reservation rejects overflow without changing the offset" {
     var work_size: usize = std.math.maxInt(usize) - 3;
     try std.testing.expectError(error.InvalidTarget, reserveWork(&work_size, 4));
@@ -7913,14 +7785,6 @@ test "backdrop blur finish is attached only to the final upsample" {
     });
     try std.testing.expectEqualSlices(f32, &.{ 0.95, 1, 0, 0 }, &final.color);
     try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.92, 1.08, 0.01 }, &final.parameters);
-}
-
-test "backdrop blur geometry scales odd rectangles and clips aligned edges" {
-    try std.testing.expectEqual(render.Size{ .width = 5, .height = 4 }, blurLevelSize(.{ .width = 17, .height = 13 }, 2));
-    try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 5, .height = 4 }, scaleRect(.{ .x = 1, .y = 3, .width = 16, .height = 10 }, 2));
-    try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 17, .height = 13 }, blurSampleRect(.{ .x = 1, .y = 3, .width = 15, .height = 9 }, 9, 1, .{ .width = 17, .height = 13 }));
-    try std.testing.expectEqual(render.Rect{ .x = 8, .y = 4, .width = 16, .height = 16 }, blurSampleRect(.{ .x = 13, .y = 9, .width = 5, .height = 5 }, 3, 2, .{ .width = 31, .height = 23 }));
-    try std.testing.expectEqual(render.Rect{ .x = 4, .y = 0, .width = 27, .height = 23 }, blurSampleRect(.{ .x = 17, .y = 9, .width = 1, .height = 1 }, 12, 2, .{ .width = 31, .height = 23 }));
 }
 
 test "damage coverage combines disjoint rectangles without accepting holes" {
