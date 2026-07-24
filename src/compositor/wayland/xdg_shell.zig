@@ -2009,6 +2009,7 @@ const XdgSurfaceResource = struct {
         state.mapped = false;
         if (state.role) |role| switch (role) {
             .toplevel => |window_id| {
+                self.shell.dismissPopupsForParent(self.id);
                 if (self.shell.windows.get(window_id)) |window| {
                     if (window.ready) {
                         self.shell.notifyWindowUnmapped(window_id);
