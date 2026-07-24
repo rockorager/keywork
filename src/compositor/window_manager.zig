@@ -210,6 +210,7 @@ const Window = struct {
     serial: ?u32 = null,
     placement: ?types.LayoutPlan = null,
     published_rect: ?types.Rect = null,
+    published_fullscreen: bool = false,
     published_once: bool = false,
     transition_prepared: bool = false,
     closing_prepared: bool = false,
@@ -2176,8 +2177,12 @@ fn relayout(self: *Self) void {
             window.transition_prepared = false;
             if (self.geometry_listener) |listener| if (plan) |placement| {
                 if (window.published_rect) |old_rect| {
+                    const entering_fullscreen = window.fullscreen_output != null and
+                        !window.published_fullscreen and
+                        std.meta.eql(window.fullscreen_output.?, entry.output);
                     const eligible = window.mapped and entry.active and placement.visible and
-                        !window.minimized and window.fullscreen_output == null and
+                        !window.minimized and
+                        (window.fullscreen_output == null or entering_fullscreen) and
                         !floating and self.transientParent(window) == null and
                         self.interactive_resize == null and self.tiling_drag == null and
                         self.toplevel_drag == null and !std.meta.eql(old_rect, placement.rect);
@@ -2318,6 +2323,7 @@ fn publish(self: *Self) void {
             .xwayland => |id| _ = self.xwayland.move(self.xwayland.context, id, clampI16(placement.rect.x), clampI16(placement.rect.y)),
         };
         if (plan) |placement| window.published_rect = placement.rect else window.published_rect = null;
+        window.published_fullscreen = window.fullscreen_output != null;
         const focused = !window.minimized and
             self.workspaces.items[window.workspace].workspace.focused != null and
             neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
