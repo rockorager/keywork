@@ -1889,6 +1889,20 @@ fn setCursor(
     hotspot_x: i32,
     hotspot_y: i32,
 ) void {
+    const manager_controller = self.isUnfocusedCursorController(pointer.getClient());
+    const drag_controller = if (self.drag_cursor_client) |client|
+        client == pointer.getClient()
+    else
+        false;
+    const controller = manager_controller or drag_controller;
+    const enter = self.latest_pointer_enter;
+    if (!controller and (enter == null or enter.?.client != pointer.getClient() or enter.?.serial != serial)) return;
+    const focused_client = if (self.pointerSurface()) |surface|
+        surface.getClient() == pointer.getClient()
+    else
+        false;
+    if (!controller and !focused_client and !self.activeCursorOwnedBy(pointer.getClient())) return;
+
     const cursor_surface = if (surface_resource) |resource| cursor: {
         const surface = Surface.fromResource(resource);
         if (surface.assignedRole()) |role| {
@@ -1910,20 +1924,6 @@ fn setCursor(
         }
         break :cursor surface;
     } else null;
-
-    const manager_controller = self.isUnfocusedCursorController(pointer.getClient());
-    const drag_controller = if (self.drag_cursor_client) |client|
-        client == pointer.getClient()
-    else
-        false;
-    const controller = manager_controller or drag_controller;
-    const enter = self.latest_pointer_enter;
-    if (!controller and (enter == null or enter.?.client != pointer.getClient() or enter.?.serial != serial)) return;
-    const focused_client = if (self.pointerSurface()) |surface|
-        surface.getClient() == pointer.getClient()
-    else
-        false;
-    if (!controller and !focused_client and !self.activeCursorOwnedBy(pointer.getClient())) return;
 
     const requested: ?ActiveCursor = if (cursor_surface) |surface| .{ .surface = .{
         .surface_id = surface.handle(),

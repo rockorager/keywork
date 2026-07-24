@@ -1100,7 +1100,7 @@ fn setToolCursor(
     hotspot_x: i32,
     hotspot_y: i32,
 ) void {
-    const tool = adapter.tool orelse return;
+    const tool = activeToolResource(adapter, serial, adapter.binding.client) orelse return;
     const cursor_surface = if (surface_resource) |resource| cursor: {
         const surface = Surface.fromResource(resource);
         if (surface.assignedRole()) |role| {
@@ -1123,7 +1123,6 @@ fn setToolCursor(
         break :cursor surface;
     } else null;
 
-    if (activeToolResource(adapter, serial, adapter.binding.client) == null) return;
     tool.cursor = if (cursor_surface) |surface| .{ .surface = .{
         .surface_id = surface.handle(),
         .hotspot_x = hotspot_x,
