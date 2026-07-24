@@ -164,6 +164,10 @@ const Window = struct {
             !self.window_type.participatesInWindowManagement();
     }
 
+    fn overrideRedirectForConfigure(self: Window, reported: bool) bool {
+        return if (self.mapped) self.override_redirect else reported;
+    }
+
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
         if (self.app_id) |value| allocator.free(value);
@@ -1990,15 +1994,12 @@ fn handleConfigureNotify(
         .width = event.width,
         .height = event.height,
     };
-    const override_redirect = event.override_redirect != 0;
+    const override_redirect = window.overrideRedirectForConfigure(event.override_redirect != 0);
     if (std.meta.eql(window.geometry, geometry) and
         window.override_redirect == override_redirect) return;
     window.geometry = geometry;
     const override_redirect_changed = window.override_redirect != override_redirect;
     window.override_redirect = override_redirect;
-    if (override_redirect_changed and window.mapped) {
-        try self.updateClientListMembership(event.window, !override_redirect);
-    }
     if (override_redirect and self.focused_window == event.window) {
         self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
     }
@@ -2353,6 +2354,18 @@ test "mapped managed windows retain compositor geometry authority" {
     window.window_type = .normal;
     window.override_redirect = true;
     try std.testing.expect(window.clientControlsGeometry());
+}
+
+test "ConfigureNotify preserves the mapped window management role" {
+    var window: Window = .{
+        .geometry = .{ .x = 0, .y = 0, .width = 640, .height = 480 },
+        .override_redirect = false,
+    };
+    try std.testing.expect(window.overrideRedirectForConfigure(true));
+    window.mapped = true;
+    try std.testing.expect(!window.overrideRedirectForConfigure(true));
+    window.override_redirect = true;
+    try std.testing.expect(window.overrideRedirectForConfigure(false));
 }
 
 test "override-redirect input heuristic excludes transient UI types" {
