@@ -157,6 +157,26 @@ pub fn identityForDescription(self: *Self, description: Description) !u64 {
     return identity;
 }
 
+test "known color descriptions need no further allocation" {
+    var manager: Self = undefined;
+    manager.allocator = std.testing.allocator;
+    manager.next_identity = sdr_identity + 1;
+    manager.description_records = .empty;
+    defer manager.description_records.deinit(std.testing.allocator);
+
+    var description = sdr;
+    description.primaries = render.display_p3_chromaticities;
+    description.named_primaries = .display_p3;
+    const identity = try manager.identityForDescription(description);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    manager.allocator = failing.allocator();
+    try std.testing.expectEqual(identity, try manager.identityForDescription(description));
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
 const ParametricCreator = struct {
     manager: *Self,
     description: Description = .{},

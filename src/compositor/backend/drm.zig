@@ -600,18 +600,34 @@ pub fn iccProfilePath(self: *const Self) ?[]const u8 {
     return self.icc_profile_path;
 }
 
+/// Returns the color description that `replaceIccProfile` will publish without
+/// taking ownership of the prospective profile.
+pub fn colorDescriptionForIccProfile(
+    self: *const Self,
+    profile: ?Icc.OutputProfile,
+) render.ColorDescription {
+    if (self.output_color_mode != .sdr) return self.color_description;
+    return if (profile) |value|
+        value.applyTo(self.native_color_description)
+    else
+        self.native_color_description;
+}
+
 pub fn replaceIccProfile(
     self: *Self,
     profile: ?Icc.OutputProfile,
     owned_path: ?[]u8,
 ) void {
     std.debug.assert((profile == null) == (owned_path == null));
+    const color_description = self.colorDescriptionForIccProfile(profile);
     if (self.icc_profile) |*old| old.deinit(self.allocator);
     if (self.icc_profile_path) |path| self.allocator.free(path);
     self.icc_profile = profile;
     self.icc_profile_path = owned_path;
     self.refreshSdrColorDescription();
-    if (self.output_color_mode == .sdr) self.color_description = self.sdr_color_description;
+    std.debug.assert(self.output_color_mode != .sdr or
+        std.meta.eql(color_description, self.sdr_color_description));
+    self.color_description = color_description;
 }
 
 pub fn selectOutputTransfer(self: *Self, transfer: ?render.TransferFunction) bool {
@@ -4447,12 +4463,15 @@ test "ICC profiles override SDR colorimetry without replacing native display dat
     output.refreshSdrColorDescription();
     output.color_description = output.sdr_color_description;
     const path = try std.testing.allocator.dupe(u8, "/profiles/display.icc");
-    output.replaceIccProfile(.{ .matrix = .{
+    const matrix_profile: Icc.OutputProfile = .{ .matrix = .{
         .primaries = render.srgb_chromaticities,
         .transfer_function = .{ .power = 24000 },
-    } }, path);
+    } };
+    const matrix_description = output.colorDescriptionForIccProfile(matrix_profile);
+    output.replaceIccProfile(matrix_profile, path);
 
     try std.testing.expectEqualStrings("/profiles/display.icc", output.iccProfilePath().?);
+    try std.testing.expectEqual(matrix_description, output.colorDescription());
     try std.testing.expectEqual(render.srgb_chromaticities, output.color_description.primaries);
     try std.testing.expectEqual(
         render.TransferFunction{ .power = 24000 },
@@ -4471,16 +4490,36 @@ test "ICC profiles override SDR colorimetry without replacing native display dat
     );
     @memset(values, .{ 0, 0, 0, 1 });
     const calibration_path = try std.testing.allocator.dupe(u8, "/profiles/calibration.icc");
-    output.replaceIccProfile(.{ .calibration = .{
+    const calibration_profile: Icc.OutputProfile = .{ .calibration = .{
         .values = values,
         .identity = 42,
-    } }, calibration_path);
+    } };
+    const calibration_description = output.colorDescriptionForIccProfile(calibration_profile);
+    output.replaceIccProfile(calibration_profile, calibration_path);
+    try std.testing.expectEqual(calibration_description, output.colorDescription());
     try std.testing.expectEqual(
         render.display_p3_chromaticities,
         output.color_description.primaries,
     );
     try std.testing.expectEqual(@as(u64, 42), output.outputCalibration().?.identity);
+
+    const replacement_values = try std.testing.allocator.dupe([4]f16, values);
+    const replacement_path = try std.testing.allocator.dupe(u8, "/profiles/calibration.icc");
+    output.replaceIccProfile(.{ .calibration = .{
+        .values = replacement_values,
+        .identity = 42,
+    } }, replacement_path);
+    const replacement_calibration = output.outputCalibration().?;
+    try std.testing.expectEqual(@as(u64, 42), replacement_calibration.identity);
+    try std.testing.expect(replacement_calibration.values.ptr == replacement_values.ptr);
+
+    output.output_color_mode = .pq;
+    var hdr_description = output.color_description;
+    hdr_description.transfer_function = .st2084_pq;
+    output.color_description = hdr_description;
+    const predicted_hdr_description = output.colorDescriptionForIccProfile(null);
     output.replaceIccProfile(null, null);
+    try std.testing.expectEqual(predicted_hdr_description, output.colorDescription());
     try std.testing.expect(output.outputCalibration() == null);
 }
 

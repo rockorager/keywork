@@ -1218,6 +1218,8 @@ const PreparedIccProfile = struct {
     output: *DrmOutput,
     profile: ?Icc.OutputProfile,
     owned_path: ?[]u8,
+    color_description: render.ColorDescription,
+    color_identity: u64 = 0,
 };
 
 pub const VirtualOutputConfig = struct {
@@ -3045,9 +3047,17 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
             .output = output,
             .profile = profile,
             .owned_path = owned_path,
+            .color_description = output.colorDescriptionForIccProfile(profile),
         });
         profile = null;
         owned_path = null;
+    }
+    if (self.renderer.supportsColorManagement()) {
+        for (profiles.items) |*prepared| {
+            prepared.color_identity = try self.color_management.identityForDescription(
+                prepared.color_description,
+            );
+        }
     }
     if (changes.items.len != 0) {
         if (!self.applyOutputChanges(changes.items)) return error.OutputConfigurationFailed;
@@ -3061,7 +3071,14 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
         prepared.output.replaceIccProfile(prepared.profile, path);
         prepared.profile = null;
         if (self.findDrmRenderOutput(prepared.output)) |render_output| {
-            try self.refreshRenderOutputColorDescription(render_output.output);
+            if (self.renderer.supportsColorManagement()) {
+                std.debug.assert(prepared.color_identity != 0);
+                self.updateRenderOutputColorDescription(
+                    render_output.output,
+                    prepared.color_description,
+                    prepared.color_identity,
+                );
+            }
         }
     }
 }
@@ -3175,6 +3192,19 @@ fn refreshRenderOutputColorDescription(
 ) !void {
     if (!self.renderer.supportsColorManagement()) return;
     const description = render_output.backend.colorDescription();
+    const identity = try self.color_management.identityForDescription(description);
+    self.updateRenderOutputColorDescription(render_output, description, identity);
+}
+
+fn updateRenderOutputColorDescription(
+    self: *Self,
+    render_output: *RenderOutput,
+    description: render.ColorDescription,
+    identity: u64,
+) void {
+    std.debug.assert(self.renderer.supportsColorManagement());
+    std.debug.assert(identity != 0);
+    std.debug.assert(std.meta.eql(description, render_output.backend.colorDescription()));
     const calibration = render_output.backend.outputCalibration();
     const description_changed = !std.meta.eql(description, render_output.color_description);
     const calibration_changed = calibrationIdentity(calibration) !=
@@ -3184,7 +3214,6 @@ fn refreshRenderOutputColorDescription(
     render_output.output_calibration = calibration;
     if (!description_changed and !calibration_changed) return;
     if (description_changed) {
-        const identity = try self.color_management.identityForDescription(description);
         const output = self.outputs.get(render_output.protocol_id) orelse unreachable;
         self.color_management.updateOutputColorDescription(output, description, identity);
     }
