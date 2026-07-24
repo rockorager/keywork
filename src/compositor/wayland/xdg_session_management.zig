@@ -376,6 +376,24 @@ fn createStoredToplevel(
     return stored;
 }
 
+fn removeStoredSession(self: *Self, stored: *StoredSession) void {
+    std.debug.assert(stored.active == null);
+    std.debug.assert(self.sessions.remove(stored.id));
+    stored.deinit(self.allocator);
+}
+
+fn removeStoredToplevel(
+    self: *Self,
+    session: *StoredSession,
+    stored: *StoredToplevel,
+) void {
+    for (self.associations.items) |association| {
+        std.debug.assert(association.session != session or association.toplevel != stored);
+    }
+    std.debug.assert(session.toplevels.remove(stored.name));
+    stored.deinit(self.allocator);
+}
+
 fn generateSession(self: *Self) !*StoredSession {
     while (true) {
         var bytes: [16]u8 = undefined;
@@ -423,28 +441,38 @@ fn getSession(
         manager_resource.postError(.invalid_session_id, "session identifier is not valid UTF-8");
         return;
     };
-    var restored = false;
+    var created: ?*StoredSession = null;
+    defer if (created) |stored| self.removeStoredSession(stored);
     const stored = if (requested_id) |value|
-        if (self.sessions.get(value)) |existing| existing else self.generateSession() catch {
-            manager_resource.postNoMemory();
-            return;
+        self.sessions.get(value) orelse new_session: {
+            const new = self.generateSession() catch {
+                manager_resource.postNoMemory();
+                return;
+            };
+            created = new;
+            break :new_session new;
         }
-    else
-        self.generateSession() catch {
+    else new_session: {
+        const new = self.generateSession() catch {
             manager_resource.postNoMemory();
             return;
         };
-    if (requested_id != null and self.sessions.get(requested_id.?) == stored) restored = true;
+        created = new;
+        break :new_session new;
+    };
     if (stored.active) |active| {
         if (active.resource.getClient() == manager_resource.getClient()) {
             manager_resource.postError(.in_use, "session is already in use by this client");
             return;
         }
-        active.replace();
     }
-    SessionResource.create(self, manager_resource, id, stored, restored) catch |err| switch (err) {
-        error.OutOfMemory, error.ResourceCreateFailed => manager_resource.postNoMemory(),
+    SessionResource.create(self, manager_resource, id, stored, created == null) catch |err| {
+        switch (err) {
+            error.OutOfMemory, error.ResourceCreateFailed => manager_resource.postNoMemory(),
+        }
+        return;
     };
+    created = null;
 }
 
 const SessionResource = struct {
@@ -470,6 +498,7 @@ const SessionResource = struct {
         errdefer manager.allocator.destroy(self);
         self.* = .{ .manager = manager, .resource = resource, .stored = stored };
         try manager.session_resources.append(manager.allocator, self);
+        if (stored.active) |active| active.replace();
         stored.active = self;
         resource.setHandler(*SessionResource, handleRequest, handleDestroy, self);
         if (restored) resource.sendRestored() else resource.sendCreated(stored.id.ptr);
@@ -569,6 +598,11 @@ const SessionResource = struct {
                 return;
             }
         }
+        var created: ?*StoredToplevel = null;
+        defer if (created) |stored| self.manager.removeStoredToplevel(
+            stored_session,
+            stored,
+        );
         var known = stored_session.toplevels.get(name);
         if (!restore and known != null) {
             self.resource.postError(.name_in_use, "toplevel name is already in use");
@@ -586,6 +620,7 @@ const SessionResource = struct {
                 self.resource.postNoMemory();
                 return;
             };
+            created = known;
         }
         const stored_toplevel = known.?;
         if (restore) if (stored_toplevel.state) |*state| {
@@ -622,6 +657,7 @@ const SessionResource = struct {
             self.resource.postNoMemory();
             return;
         };
+        created = null;
         self.manager.captureWindow(toplevel.window_id);
         self.manager.save() catch |err| log.warn("failed to save XDG sessions: {t}", .{err});
     }
@@ -770,10 +806,7 @@ fn endSession(self: *Self, resource: *SessionResource, remove: bool) void {
     }
     if (stored.active == resource) stored.active = null;
     resource.stored = null;
-    if (remove) {
-        std.debug.assert(self.sessions.remove(stored.id));
-        stored.deinit(self.allocator);
-    }
+    if (remove) self.removeStoredSession(stored);
     self.save() catch |err| log.warn("failed to save XDG sessions: {t}", .{err});
 }
 
@@ -796,8 +829,7 @@ fn removeToplevel(
             self.removeAssociation(index);
         }
     }
-    std.debug.assert(session.toplevels.remove(toplevel.name));
-    toplevel.deinit(self.allocator);
+    self.removeStoredToplevel(session, toplevel);
     self.save() catch |err| log.warn("failed to save XDG sessions: {t}", .{err});
 }
 
@@ -889,4 +921,31 @@ test "owned session state detects window management changes" {
     changed.workspace = 5;
     try std.testing.expect(!state.eql(changed));
     try std.testing.expectEqualStrings("HEADLESS-1", state.borrowed().output_name);
+}
+
+fn exerciseStoredRecordRollback(allocator: std.mem.Allocator) !void {
+    var manager: Self = undefined;
+    manager.allocator = allocator;
+    manager.sessions = .empty;
+    manager.associations = .empty;
+    defer {
+        manager.clearStoredSessions();
+        manager.sessions.deinit(allocator);
+        manager.associations.deinit(allocator);
+    }
+
+    const session = try manager.createStoredSession("session");
+    const toplevel = try manager.createStoredToplevel(session, "window");
+    manager.removeStoredToplevel(session, toplevel);
+    try std.testing.expectEqual(@as(usize, 0), session.toplevels.count());
+    manager.removeStoredSession(session);
+    try std.testing.expectEqual(@as(usize, 0), manager.sessions.count());
+}
+
+test "stored record rollback releases all ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseStoredRecordRollback,
+        .{},
+    );
 }
