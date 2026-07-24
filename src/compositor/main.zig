@@ -462,6 +462,7 @@ test {
     _ = @import("backend/headless.zig");
     _ = @import("backend/nested_wayland.zig");
     _ = @import("backend/drm.zig");
+    _ = @import("backend/BufferDamageTracker.zig");
     _ = @import("backend/ScanoutFramebufferCache.zig");
     _ = @import("backend/cursor_resample.zig");
     _ = @import("backend/display_color.zig");

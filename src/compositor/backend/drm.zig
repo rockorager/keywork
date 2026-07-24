@@ -3,12 +3,12 @@
 const Self = @This();
 
 const std = @import("std");
+const BufferDamageTracker = @import("BufferDamageTracker.zig");
 const cursor_resample = @import("cursor_resample.zig");
 const display_color = @import("display_color.zig");
 const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const ScanoutFramebufferCache = @import("ScanoutFramebufferCache.zig");
-const Logging = @import("../logging.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const Icc = @import("../render/icc.zig");
@@ -27,7 +27,7 @@ const c = @cImport({
     @cInclude("xf86drmMode.h");
 });
 const log = std.log.scoped(.drm);
-const buffer_count = 2;
+const buffer_count = BufferDamageTracker.buffer_count;
 const description_capacity = 512;
 const drm_format_mod_linear: u64 = 0;
 const default_target_dpi: f64 = 110.0;
@@ -45,8 +45,7 @@ dmabuf_renderer: ?render.DmabufRenderer,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
 shadow_pixels: []u32,
-buffer_damage: [buffer_count]Region,
-acquired_damage: Region,
+damage_tracker: BufferDamageTracker,
 cursor_buffers: [2]Buffer,
 cursor_width: u32,
 cursor_height: u32,
@@ -397,8 +396,7 @@ pub fn init(
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
         .shadow_pixels = &.{},
-        .buffer_damage = .{ Region.init(), Region.init() },
-        .acquired_damage = Region.init(),
+        .damage_tracker = .init(),
         .cursor_buffers = .{ .{}, .{} },
         .cursor_width = 0,
         .cursor_height = 0,
@@ -482,8 +480,7 @@ pub fn deinit(self: *Self) void {
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_formats);
     if (self.overlay_plane) |plane| plane.deinit(self.allocator);
-    for (&self.buffer_damage) |*damage| damage.deinit();
-    self.acquired_damage.deinit();
+    self.damage_tracker.deinit();
     self.* = undefined;
 }
 
@@ -502,7 +499,7 @@ pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRe
         const pair = try self.allocatePair(fd, self.size);
         self.buffers = pair.buffers;
         self.shadow_pixels = pair.shadow_pixels;
-        self.resetBufferDamage(self.size);
+        self.damage_tracker.reset(self.size);
     }
     self.listener = listener;
 }
@@ -782,7 +779,7 @@ pub fn shapeCursorActive(self: *const Self) bool {
 
 pub fn acquire(self: *Self) ?render.Target {
     std.debug.assert(self.acquired == null);
-    std.debug.assert(self.acquired_damage.isEmpty());
+    std.debug.assert(self.damage_tracker.isIdle());
     if (!self.ready()) return null;
     const index = self.availableBuffer().?;
     self.acquired = index;
@@ -801,30 +798,15 @@ pub fn acquire(self: *Self) ?render.Target {
 
 pub fn repairDamage(self: *Self, damage: *Region) !void {
     const index = self.acquired orelse unreachable;
-    std.debug.assert(self.acquired_damage.isEmpty());
-    try self.acquired_damage.copyFrom(damage);
+    try self.damage_tracker.beginFrame(index, damage);
     if (self.buffers[index].render_target_id != null) {
-        if (Logging.enabled(.debug)) {
-            const full_damage = damage.coversRectangle(0, 0, self.size.width, self.size.height);
-            const full_repair = self.buffer_damage[index].coversRectangle(
-                0,
-                0,
-                self.size.width,
-                self.size.height,
-            );
-            if (full_damage) {
-                log.debug("new scene damage is full-output before buffer {d} repair", .{index});
-            } else if (full_repair) {
-                log.debug("buffer {d} repair adds a full-output backlog", .{index});
-            }
-        }
-        try damage.unionWith(&self.buffer_damage[index]);
+        try self.damage_tracker.addBacklog(damage, self.size);
     }
 }
 
 pub fn cancel(self: *Self) void {
     self.acquired = null;
-    self.acquired_damage.clear();
+    self.damage_tracker.cancel();
     self.discardValidatedOverlay();
 }
 
@@ -966,20 +948,16 @@ fn prepareAcquiredFrame(
         }
     }
     if (buffer.render_target_id == null) {
-        try self.buffer_damage[index].unionWith(&self.acquired_damage);
+        const damage = try self.damage_tracker.shadowCopyDamage();
         copyShadowDamage(
             buffer.pixels,
             buffer.stride_pixels,
             self.shadow_pixels,
             self.size,
-            &self.buffer_damage[index],
+            damage,
         );
     }
-    try finishBufferDamageRepair(
-        &self.buffer_damage,
-        &self.acquired_damage,
-        index,
-    );
+    try self.damage_tracker.finishFrame();
     return .{
         .fd = fd,
         .index = index,
@@ -1210,8 +1188,8 @@ pub fn tryDirectScanout(
     };
     self.pending_page_flip = page_flip;
     self.acquired = null;
-    self.acquired_damage.clear();
-    self.resetBufferDamage(self.size);
+    self.damage_tracker.cancel();
+    self.damage_tracker.reset(self.size);
     return .accepted;
 }
 
@@ -1352,7 +1330,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         const pair = try self.allocatePair(fd, self.size);
         self.buffers = pair.buffers;
         self.shadow_pixels = pair.shadow_pixels;
-        self.resetBufferDamage(self.size);
+        self.damage_tracker.reset(self.size);
     }
     self.clearInheritedCursor(fd);
     log.info(
@@ -1515,7 +1493,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.atomic_color = null;
     self.async_page_flip_supported = false;
     self.acquired = null;
-    self.acquired_damage.clear();
+    self.damage_tracker.cancel();
     self.pending = null;
     self.displayed = null;
     if (!self.retired) self.pending_page_flip = null;
@@ -1525,7 +1503,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.scanout_framebuffer_cache.clear(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
-    for (&self.buffer_damage) |*damage| damage.clear();
+    self.damage_tracker.clear();
     if (self.old_crtc) |old_crtc| {
         c.drmModeFreeCrtc(old_crtc);
         self.old_crtc = null;
@@ -1554,7 +1532,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
         const pair = try self.allocatePair(fd, self.size);
         self.buffers = pair.buffers;
         self.shadow_pixels = pair.shadow_pixels;
-        self.resetBufferDamage(self.size);
+        self.damage_tracker.reset(self.size);
         self.powered = true;
         self.mode_set = false;
         self.cursor_failed = self.cursor_width == 0 or self.cursor_height == 0;
@@ -1569,7 +1547,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
         return error.DisableFailed;
     }
     self.acquired = null;
-    self.acquired_damage.clear();
+    self.damage_tracker.cancel();
     self.cursor_active = false;
     self.cursor_source = null;
     self.cursor_buffer_index = null;
@@ -1582,7 +1560,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.notifyDeactivated();
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
-    for (&self.buffer_damage) |*damage| damage.clear();
+    self.damage_tracker.clear();
 }
 
 pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
@@ -1600,7 +1578,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
             return error.DisableFailed;
         }
         self.acquired = null;
-        self.acquired_damage.clear();
+        self.damage_tracker.cancel();
         self.cursor_active = false;
         self.cursor_source = null;
         self.cursor_buffer_index = null;
@@ -1610,7 +1588,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
         const old_shadow_pixels = self.shadow_pixels;
         self.buffers = pair.buffers;
         self.shadow_pixels = pair.shadow_pixels;
-        self.resetBufferDamage(size);
+        self.damage_tracker.reset(size);
         self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
         self.releaseClientScanouts();
@@ -2287,26 +2265,6 @@ fn defaultScale(pixel_size: render.Size, physical_size: render.Size) render.Scal
 fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
     if (mode.vrefresh == 0) return presentation.nominal_refresh_nanoseconds;
     return @intCast(std.time.ns_per_s / mode.vrefresh);
-}
-
-noinline fn resetBufferDamage(self: *Self, size: render.Size) void {
-    log.debug("resetting full buffer damage from 0x{x}", .{@returnAddress()});
-    for (&self.buffer_damage) |*damage| {
-        damage.setRectangle(0, 0, size.width, size.height);
-    }
-}
-
-fn finishBufferDamageRepair(
-    buffer_damage: *[buffer_count]Region,
-    acquired_damage: *Region,
-    acquired_index: usize,
-) Region.Error!void {
-    std.debug.assert(acquired_index < buffer_damage.len);
-    for (buffer_damage, 0..) |*damage, index| {
-        if (index != acquired_index) try damage.unionWith(acquired_damage);
-    }
-    buffer_damage[acquired_index].clear();
-    acquired_damage.clear();
 }
 
 fn createShadowBuffer(
@@ -3683,53 +3641,6 @@ fn testDeviceActive(_: *anyopaque) bool {
 
 fn testDeviceFail(_: *anyopaque, _: anyerror) void {
     unreachable;
-}
-
-test "DRM buffer repair does not propagate an acquired buffer's backlog" {
-    var context: u8 = 0;
-    var output: Self = undefined;
-    output.init(std.testing.allocator, std.testing.io, .{
-        .context = &context,
-        .fd = testDeviceFd,
-        .gbm = testDeviceGbm,
-        .active = testDeviceActive,
-        .fail = testDeviceFail,
-    });
-    defer output.deinit();
-    output.buffers[0].render_target_id = 1;
-    output.buffers[1].render_target_id = 2;
-    output.resetBufferDamage(.{ .width = 100, .height = 100 });
-
-    var first_damage = Region.init();
-    defer first_damage.deinit();
-    first_damage.setRectangle(10, 10, 2, 2);
-    output.acquired = 0;
-    try output.repairDamage(&first_damage);
-    try std.testing.expect(first_damage.coversRectangle(0, 0, 100, 100));
-    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 0);
-    try std.testing.expect(output.buffer_damage[0].isEmpty());
-    try std.testing.expect(output.buffer_damage[1].coversRectangle(0, 0, 100, 100));
-
-    var second_damage = Region.init();
-    defer second_damage.deinit();
-    second_damage.setRectangle(20, 20, 2, 2);
-    output.acquired = 1;
-    try output.repairDamage(&second_damage);
-    try std.testing.expect(second_damage.coversRectangle(0, 0, 100, 100));
-    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 1);
-    try std.testing.expect(output.buffer_damage[0].coversRectangle(20, 20, 2, 2));
-    try std.testing.expect(output.buffer_damage[1].isEmpty());
-
-    var third_damage = Region.init();
-    defer third_damage.deinit();
-    third_damage.setRectangle(30, 30, 2, 2);
-    output.acquired = 0;
-    try output.repairDamage(&third_damage);
-    try std.testing.expect(!third_damage.coversRectangle(0, 0, 100, 100));
-    try std.testing.expect(third_damage.coversRectangle(20, 20, 2, 2));
-    try std.testing.expect(third_damage.coversRectangle(30, 30, 2, 2));
-    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 0);
-    output.acquired = null;
 }
 
 test "cursor coordinates preserve signed fractional output-local positions" {
