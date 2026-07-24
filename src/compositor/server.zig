@@ -6793,7 +6793,6 @@ fn xwmWindowCreated(_: *anyopaque, _: Xwm.WindowInfo) void {}
 fn xwmWindowDestroyed(context: *anyopaque, window_id: Xwm.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.window_manager_initialized) self.window_manager.xwaylandWindowClosing(window_id);
-    removeXwaylandWindow(self, window_id);
 }
 
 fn xwmWindowMapped(context: *anyopaque, window_id: Xwm.WindowId, mapped: bool) void {

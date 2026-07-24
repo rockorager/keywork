@@ -299,6 +299,8 @@ pub const Listener = struct {
     context: *anyopaque,
     failed: *const fn (*anyopaque) void,
     created: *const fn (*anyopaque, WindowInfo) void,
+    /// Runs before `dissociated` on window destruction so consumers can
+    /// inspect association-owned presentation state before removing it.
     destroyed: *const fn (*anyopaque, WindowId) void,
     mapped: *const fn (*anyopaque, WindowId, bool) void,
     configured: *const fn (*anyopaque, WindowId, Geometry, bool) void,
@@ -1777,9 +1779,9 @@ fn removeWindow(self: *Self, window_id: WindowId) void {
     self.updateClientListMembership(window_id, false) catch unreachable;
     if (removed.value.serial) |serial|
         std.debug.assert(self.serial_windows.remove(serial));
+    self.listener.destroyed(self.listener.context, window_id);
     if (removed.value.surface_id) |surface_id|
         self.listener.dissociated(self.listener.context, window_id, surface_id);
-    self.listener.destroyed(self.listener.context, window_id);
     var children = self.windows.iterator();
     while (children.next()) |entry| {
         if (entry.value_ptr.parent != window_id) continue;
