@@ -112,7 +112,7 @@ pub const WaylandSelection = union(enum) {
         return switch (self) {
             .clipboard => |selection| selection.externalSelectionIs(source),
             .primary => |selection| selection.externalSelectionIs(source),
-            .drag => false,
+            .drag => |selection| selection.dragIsExternal(),
         };
     }
 
