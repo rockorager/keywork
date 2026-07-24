@@ -19,7 +19,9 @@ listeners: std.ArrayList(*Listener),
 device_count: usize,
 active: bool,
 failed: bool,
+notifying: bool,
 
+/// Listener registrations must remain unchanged during broadcast callbacks.
 pub const Listener = struct {
     context: *anyopaque,
     activated: *const fn (*anyopaque) void,
@@ -50,6 +52,7 @@ pub fn init(
         .device_count = 0,
         .active = false,
         .failed = false,
+        .notifying = false,
     };
     errdefer self.listeners.deinit(allocator);
 
@@ -84,6 +87,7 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn addListener(self: *Self, listener: *Listener) error{OutOfMemory}!void {
+    std.debug.assert(!self.notifying);
     for (self.listeners.items) |candidate| std.debug.assert(candidate != listener);
     try self.listeners.append(self.allocator, listener);
     if (self.failed) {
@@ -94,6 +98,7 @@ pub fn addListener(self: *Self, listener: *Listener) error{OutOfMemory}!void {
 }
 
 pub fn removeListener(self: *Self, listener: *Listener) void {
+    std.debug.assert(!self.notifying);
     for (self.listeners.items, 0..) |candidate, index| {
         if (candidate != listener) continue;
         _ = self.listeners.orderedRemove(index);
@@ -149,7 +154,7 @@ fn handleEnable(_: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void {
     if (self.failed or self.active) return;
     self.active = true;
     log.info("seat activated", .{});
-    for (self.listeners.items) |listener| listener.activated(listener.context);
+    self.notify(.activated);
 }
 
 fn handleDisable(seat: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void {
@@ -157,7 +162,7 @@ fn handleDisable(seat: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void 
     if (self.active) {
         self.active = false;
         log.info("seat deactivated", .{});
-        for (self.listeners.items) |listener| listener.deactivated(listener.context);
+        self.notify(.deactivated);
     }
     if (c.libseat_disable_seat(seat) < 0) self.fail();
 }
@@ -167,7 +172,20 @@ fn fail(self: *Self) void {
     self.failed = true;
     self.active = false;
     log.err("libseat session failed", .{});
-    for (self.listeners.items) |listener| listener.failed(listener.context);
+    self.notify(.failed);
+}
+
+const Notification = enum { activated, deactivated, failed };
+
+fn notify(self: *Self, notification: Notification) void {
+    std.debug.assert(!self.notifying);
+    self.notifying = true;
+    defer self.notifying = false;
+    for (self.listeners.items) |listener| switch (notification) {
+        .activated => listener.activated(listener.context),
+        .deactivated => listener.deactivated(listener.context),
+        .failed => listener.failed(listener.context),
+    };
 }
 
 test "active sessions immediately notify new listeners" {
@@ -190,6 +208,7 @@ test "active sessions immediately notify new listeners" {
         .device_count = 0,
         .active = true,
         .failed = false,
+        .notifying = false,
     };
     defer session.listeners.deinit(std.testing.allocator);
     var tracker: Tracker = .{};
