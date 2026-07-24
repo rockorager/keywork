@@ -92,6 +92,7 @@ const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 const WindowAnimation = @import("window_animation.zig");
 const capture_geometry = @import("capture_geometry.zig");
+const damage_geometry = @import("damage_geometry.zig");
 
 const c = @cImport({
     @cInclude("linux/sync_file.h");
@@ -3814,7 +3815,7 @@ fn addOutputCursorDamage(self: *Self, output: *RenderOutput, info: ?Seat.CursorI
     };
     const output_rect = self.outputs.get(output.protocol_id).?.logicalRect();
     const intersection = bounds.intersection(output_rect) orelse return false;
-    const physical = scaleDamageRect(.{
+    const physical = damage_geometry.scaleRect(.{
         .x = intersection.x -| output_rect.x,
         .y = intersection.y -| output_rect.y,
         .width = intersection.width,
@@ -4025,7 +4026,7 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
             );
         }
         self.damageGlobalRect(if (layer_effects)
-            effectsDamageRect(global, self.layer_shell_effects)
+            damage_geometry.effectsRect(global, self.layer_shell_effects)
         else
             global, root);
     }
@@ -4528,7 +4529,7 @@ fn damageGlobalRect(
         const output = self.outputs.get(render_output.protocol_id).?;
         const output_rect = output.logicalRect();
         const intersection = rectangle.intersection(output_rect) orelse continue;
-        const physical = scaleDamageRect(
+        const physical = damage_geometry.scaleRect(
             .{
                 .x = intersection.x -| output_rect.x,
                 .y = intersection.y -| output_rect.y,
@@ -4600,40 +4601,6 @@ fn damageGlobalRect(
         render_output.requestFrame();
         self.scheduleRepaint(render_output);
     }
-}
-
-fn scaleDamageRect(
-    logical: render.Rect,
-    scale: render.Scale,
-    target_size: render.Size,
-) ?render.Rect {
-    std.debug.assert(logical.x >= 0 and logical.y >= 0);
-    const denominator: i128 = render.Scale.denominator;
-    const left_product = @as(i128, logical.x) * scale.numerator;
-    const top_product = @as(i128, logical.y) * scale.numerator;
-    const right_product = (@as(i128, logical.x) + logical.width) * scale.numerator;
-    const bottom_product = (@as(i128, logical.y) + logical.height) * scale.numerator;
-    var left: i64 = @intCast(@divTrunc(left_product, denominator));
-    var top: i64 = @intCast(@divTrunc(top_product, denominator));
-    var right: i64 = @intCast(@divTrunc(right_product + denominator - 1, denominator));
-    var bottom: i64 = @intCast(@divTrunc(bottom_product + denominator - 1, denominator));
-    if (scale.numerator % render.Scale.denominator != 0) {
-        left -= 1;
-        top -= 1;
-        right += 1;
-        bottom += 1;
-    }
-    left = std.math.clamp(left, 0, target_size.width);
-    top = std.math.clamp(top, 0, target_size.height);
-    right = std.math.clamp(right, 0, target_size.width);
-    bottom = std.math.clamp(bottom, 0, target_size.height);
-    if (right <= left or bottom <= top) return null;
-    return .{
-        .x = @intCast(left),
-        .y = @intCast(top),
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
 }
 
 noinline fn damageFullOutput(self: *Self, output: *RenderOutput) void {
@@ -7662,25 +7629,6 @@ test "output capture uses pixel dimensions at fractional scale" {
     for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff18181b), pixel);
 }
 
-test "damage scaling covers fractional sampling edges" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = 0, .y = 0, .width = 4, .height = 4 },
-        scaleDamageRect(
-            .{ .x = 1, .y = 1, .width = 1, .height = 1 },
-            .{ .numerator = 180 },
-            .{ .width = 10, .height = 10 },
-        ).?,
-    );
-    try std.testing.expectEqual(
-        render.Rect{ .x = 2, .y = 2, .width = 2, .height = 2 },
-        scaleDamageRect(
-            .{ .x = 1, .y = 1, .width = 1, .height = 1 },
-            .{ .numerator = 240 },
-            .{ .width = 10, .height = 10 },
-        ).?,
-    );
-}
-
 test "promoted overlay damage remains stale for the next frame" {
     var damage = Region.init();
     defer damage.deinit();
@@ -8007,7 +7955,7 @@ fn backdropBlurArea(
     if (radius == 0) return null;
     const output_rect = output.logicalRect();
     const logical = logical_rect.intersection(output_rect) orelse return null;
-    const physical = scaleDamageRect(.{
+    const physical = damage_geometry.scaleRect(.{
         .x = logical.x -| output_rect.x,
         .y = logical.y -| output_rect.y,
         .width = logical.width,
@@ -8056,7 +8004,7 @@ fn addBackdropBlurDamage(
     footprint: u32,
 ) Region.Error!bool {
     const output_rect: render.Rect = .{ .x = 0, .y = 0, .width = output_size.width, .height = output_size.height };
-    const affected = expandDamageRect(blur.rect, footprint).intersection(output_rect) orelse return false;
+    const affected = damage_geometry.expandRect(blur.rect, footprint).intersection(output_rect) orelse return false;
     var rectangles = damage.rectangleIterator();
     while (rectangles.next()) |rectangle| {
         if (affected.intersection(.{
@@ -8071,84 +8019,6 @@ fn addBackdropBlurDamage(
     }
     try damage.add(affected.x, affected.y, @intCast(affected.width), @intCast(affected.height));
     return true;
-}
-
-fn expandDamageRect(rectangle: anytype, amount: u32) render.Rect {
-    const left = @as(i64, rectangle.x) - amount;
-    const top = @as(i64, rectangle.y) - amount;
-    const right = @as(i64, rectangle.x) + rectangle.width + amount;
-    const bottom = @as(i64, rectangle.y) + rectangle.height + amount;
-    return .{
-        .x = @intCast(std.math.clamp(left, std.math.minInt(i32), std.math.maxInt(i32))),
-        .y = @intCast(std.math.clamp(top, std.math.minInt(i32), std.math.maxInt(i32))),
-        .width = @intCast(@min(right - left, std.math.maxInt(u32))),
-        .height = @intCast(@min(bottom - top, std.math.maxInt(u32))),
-    };
-}
-
-fn shadowDamageRect(rectangle: render.Rect, shadow: Scene.Shadow) render.Rect {
-    return expandDamageRect(rectangle, shadowDamageExtent(shadow));
-}
-
-fn shadowDamageExtent(shadow: Scene.Shadow) u32 {
-    const spread: u32 = if (shadow.spread > 0) @intCast(shadow.spread) else 0;
-    const offset_x: u32 = if (shadow.offset.x < 0)
-        @intCast(-@as(i64, shadow.offset.x))
-    else
-        @intCast(shadow.offset.x);
-    const offset_y: u32 = if (shadow.offset.y < 0)
-        @intCast(-@as(i64, shadow.offset.y))
-    else
-        @intCast(shadow.offset.y);
-    return render.shadowBlurExtent(shadow.blur_radius) +|
-        spread +| @max(offset_x, offset_y);
-}
-
-fn effectsDamageRect(rectangle: render.Rect, effects: Scene.Effects) render.Rect {
-    var amount: u32 = 0;
-    if (effects.shadow) |shadow| {
-        amount = @max(amount, shadowDamageExtent(shadow));
-    }
-    if (effects.contact_shadow) |shadow| {
-        amount = @max(amount, shadowDamageExtent(shadow));
-    }
-    return expandDamageRect(rectangle, amount);
-}
-
-test "shadow damage includes blur spread and offset" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = -14, .y = -4, .width = 78, .height = 88 },
-        shadowDamageRect(
-            .{ .x = 10, .y = 20, .width = 30, .height = 40 },
-            .{
-                .offset = .{ .x = 3, .y = -2 },
-                .blur_radius = 12,
-                .spread = 3,
-                .color = render.Color.rgba(0, 0, 0, 128),
-            },
-        ),
-    );
-}
-
-test "effect damage includes every shadow layer" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = -8, .y = 2, .width = 66, .height = 76 },
-        effectsDamageRect(
-            .{ .x = 10, .y = 20, .width = 30, .height = 40 },
-            .{
-                .shadow = .{
-                    .offset = .{ .y = 1 },
-                    .blur_radius = 2,
-                    .color = render.Color.rgba(0, 0, 0, 128),
-                },
-                .contact_shadow = .{
-                    .offset = .{ .y = 3 },
-                    .blur_radius = 10,
-                    .color = render.Color.rgba(0, 0, 0, 128),
-                },
-            },
-        ),
-    );
 }
 
 fn expandBackdropBlurDamage(
@@ -10025,7 +9895,7 @@ fn pointInBorderCommand(x: f64, y: f64, command: render.Command) bool {
                 if (!pointInRect(x, y, clip)) break :contains false;
             }
             const spread: u32 = @intCast(shadow.spread);
-            const outer = expandDamageRect(shadow.rect, spread);
+            const outer = damage_geometry.expandRect(shadow.rect, spread);
             if (!pointInRoundedRect(
                 x,
                 y,
