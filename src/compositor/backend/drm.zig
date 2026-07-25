@@ -178,6 +178,7 @@ const AtomicPlaneProperties = struct {
     crtc_w: u32 = 0,
     crtc_h: u32 = 0,
     in_fence_fd: u32 = 0,
+    fb_damage_clips: u32 = 0,
     color: AtomicPlaneColorProperties = .{},
 
     fn complete(self: AtomicPlaneProperties) bool {
@@ -812,7 +813,7 @@ pub fn cancel(self: *Self) void {
 
 pub fn present(
     self: *Self,
-    _: *const Region,
+    damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
@@ -858,6 +859,7 @@ pub fn present(
         frame.buffer.framebuffer_id,
         self.size,
         null,
+        presentationDamage(frame.buffer, damage),
         null,
         .commit,
         allow_tearing,
@@ -883,7 +885,7 @@ pub fn present(
 /// the incomplete primary buffer by itself.
 pub fn presentValidatedOverlay(
     self: *Self,
-    _: *const Region,
+    damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
@@ -895,6 +897,7 @@ pub fn presentValidatedOverlay(
         frame.buffer.framebuffer_id,
         self.size,
         null,
+        presentationDamage(frame.buffer, damage),
         validated.atomic,
         .commit,
         allow_tearing,
@@ -963,6 +966,14 @@ fn prepareAcquiredFrame(
         .index = index,
         .buffer = buffer,
     };
+}
+
+/// FB_DAMAGE_CLIPS damage for a composited primary framebuffer. The CPU
+/// shadow-copy path repairs the acquired dumb buffer's backlog in addition
+/// to the frame damage, so the frame damage alone would understate the
+/// buffer's changed pixels; only GBM render targets receive the hint.
+fn presentationDamage(buffer: *const Buffer, damage: *const Region) ?*const Region {
+    return if (buffer.render_target_id != null) damage else null;
 }
 
 fn importSyncFile(dmabuf_fd: std.posix.fd_t, sync_file_fd: std.posix.fd_t) bool {
@@ -1107,6 +1118,7 @@ pub fn validateOverlayScanout(
         self.buffers[index].framebuffer_id,
         self.size,
         null,
+        null,
         prepared.atomic,
         .test_only,
         false,
@@ -1164,11 +1176,14 @@ pub fn tryDirectScanout(
     };
 
     source.retain(source.context);
+    // Direct scanout damage describes the composited output, not the client
+    // buffer, so it cannot safely populate FB_DAMAGE_CLIPS here.
     const page_flip = self.queuePageFlip(
         fd,
         framebuffer.framebuffer_id,
         buffer.size,
         source,
+        null,
         null,
         .commit,
         allow_tearing,
@@ -2415,6 +2430,7 @@ fn queuePageFlip(
     framebuffer_id: u32,
     source_size: render.Size,
     source: ?render.DmabufSource,
+    damage: ?*const Region,
     overlay: ?AtomicOverlay,
     action: PageFlipAction,
     allow_tearing: bool,
@@ -2589,24 +2605,75 @@ fn queuePageFlip(
             }
         }
     }
+    // FB_DAMAGE_CLIPS is an optional hint appended after all mandatory
+    // state: any failure below, including kernel rejection of the finished
+    // request, falls back to the kernel's full-plane damage default by
+    // rewinding the request cursor instead of failing the frame. The kernel
+    // references the blob from the committed plane state, so the blob can be
+    // destroyed once the commit ioctls have returned.
+    var damage_blob_id: u32 = 0;
+    defer if (damage_blob_id != 0) {
+        _ = c.drmModeDestroyPropertyBlob(fd, damage_blob_id);
+    };
+    var damage_property_added = false;
+    const damage_cursor = c.drmModeAtomicGetCursor(request);
+    if (action == .commit and properties.fb_damage_clips != 0) damage_clips: {
+        const region = damage orelse break :damage_clips;
+        var clips: [max_damage_clips]c.drm_mode_rect = undefined;
+        const slice = damageClips(region, source_size, &clips) orelse
+            break :damage_clips;
+        if (c.drmModeCreatePropertyBlob(
+            fd,
+            slice.ptr,
+            slice.len * @sizeOf(c.drm_mode_rect),
+            &damage_blob_id,
+        ) != 0) {
+            damage_blob_id = 0;
+            break :damage_clips;
+        }
+        if (damage_blob_id == 0) break :damage_clips;
+        damage_property_added = addAtomicProperty(
+            request,
+            plane_id,
+            properties.fb_damage_clips,
+            damage_blob_id,
+        );
+    }
     const atomic_flags: c_uint = if (color_dirty)
         @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET)
     else
         @intCast(c.DRM_MODE_ATOMIC_NONBLOCK);
     if (overlay != null and !testAtomicRequest(fd, request, color_dirty)) {
-        return error.AtomicTestFailed;
+        if (!damage_property_added) return error.AtomicTestFailed;
+        c.drmModeAtomicSetCursor(request, damage_cursor);
+        damage_property_added = false;
+        if (!testAtomicRequest(fd, request, color_dirty)) {
+            return error.AtomicTestFailed;
+        }
     }
     if (action == .test_only) {
         std.debug.assert(overlay != null);
         return .vsync;
     }
     const preferred_flags = atomic_flags | pageFlipFlags(preferred_mode);
-    const preferred_result = c.drmModeAtomicCommit(
+    var preferred_result = c.drmModeAtomicCommit(
         fd,
         request,
         preferred_flags,
         self,
     );
+    if (preferred_result != 0 and damage_property_added and
+        drmModeError(preferred_result) != .BUSY)
+    {
+        c.drmModeAtomicSetCursor(request, damage_cursor);
+        damage_property_added = false;
+        preferred_result = c.drmModeAtomicCommit(
+            fd,
+            request,
+            preferred_flags,
+            self,
+        );
+    }
     if (preferred_result == 0) {
         self.output_color_dirty = false;
         return preferred_mode;
@@ -2614,12 +2681,24 @@ fn queuePageFlip(
     const preferred_errno = drmModeError(preferred_result);
     if (preferred_mode == .async) {
         const fallback_flags = atomic_flags | pageFlipFlags(.vsync);
-        const fallback_result = c.drmModeAtomicCommit(
+        var fallback_result = c.drmModeAtomicCommit(
             fd,
             request,
             fallback_flags,
             self,
         );
+        if (fallback_result != 0 and damage_property_added and
+            drmModeError(fallback_result) != .BUSY)
+        {
+            c.drmModeAtomicSetCursor(request, damage_cursor);
+            damage_property_added = false;
+            fallback_result = c.drmModeAtomicCommit(
+                fd,
+                request,
+                fallback_flags,
+                self,
+            );
+        }
         if (fallback_result == 0) {
             self.output_color_dirty = false;
             return .vsync;
@@ -2863,6 +2942,142 @@ fn addAtomicProperty(
     value: u64,
 ) bool {
     return c.drmModeAtomicAddProperty(request, object_id, property_id, value) >= 0;
+}
+
+/// FB_DAMAGE_CLIPS rectangle capacity before damage collapses to its
+/// bounding rectangle to bound blob size and kernel clip processing.
+const max_damage_clips = 64;
+
+/// Convert framebuffer-local damage into FB_DAMAGE_CLIPS rectangles clipped
+/// to the framebuffer bounds. Returns null when the clipped damage is empty
+/// or covers the full framebuffer, where omitting the optional property is
+/// equivalent to the kernel's full-damage default.
+fn damageClips(
+    damage: *const Region,
+    size: render.Size,
+    clips: *[max_damage_clips]c.drm_mode_rect,
+) ?[]const c.drm_mode_rect {
+    const width: i64 = size.width;
+    const height: i64 = size.height;
+    var count: usize = 0;
+    var bounds: ?c.drm_mode_rect = null;
+    var overflowed = false;
+    var iterator = damage.rectangleIterator();
+    while (iterator.next()) |rectangle| {
+        const x1 = @max(@as(i64, rectangle.x), 0);
+        const y1 = @max(@as(i64, rectangle.y), 0);
+        const x2 = @min(@as(i64, rectangle.x) + rectangle.width, width);
+        const y2 = @min(@as(i64, rectangle.y) + rectangle.height, height);
+        if (x2 <= x1 or y2 <= y1) continue;
+        const clip: c.drm_mode_rect = .{
+            .x1 = @intCast(x1),
+            .y1 = @intCast(y1),
+            .x2 = @intCast(x2),
+            .y2 = @intCast(y2),
+        };
+        bounds = if (bounds) |value| .{
+            .x1 = @min(value.x1, clip.x1),
+            .y1 = @min(value.y1, clip.y1),
+            .x2 = @max(value.x2, clip.x2),
+            .y2 = @max(value.y2, clip.y2),
+        } else clip;
+        if (count < max_damage_clips) {
+            clips[count] = clip;
+            count += 1;
+        } else {
+            overflowed = true;
+        }
+    }
+    const merged = bounds orelse return null;
+    if (overflowed) {
+        clips[0] = merged;
+        count = 1;
+    }
+    if (count == 1 and clips[0].x1 == 0 and clips[0].y1 == 0 and
+        clips[0].x2 == width and clips[0].y2 == height)
+    {
+        return null;
+    }
+    return clips[0..count];
+}
+
+test "damage clips convert rectangles to exclusive framebuffer coordinates" {
+    var damage = Region.init();
+    defer damage.deinit();
+    try damage.add(10, 20, 30, 40);
+    try damage.add(100, 200, 50, 60);
+    var clips: [max_damage_clips]c.drm_mode_rect = undefined;
+    const slice = damageClips(&damage, .{ .width = 640, .height = 480 }, &clips).?;
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+    try std.testing.expectEqual(@as(i32, 10), slice[0].x1);
+    try std.testing.expectEqual(@as(i32, 20), slice[0].y1);
+    try std.testing.expectEqual(@as(i32, 40), slice[0].x2);
+    try std.testing.expectEqual(@as(i32, 60), slice[0].y2);
+    try std.testing.expectEqual(@as(i32, 100), slice[1].x1);
+    try std.testing.expectEqual(@as(i32, 200), slice[1].y1);
+    try std.testing.expectEqual(@as(i32, 150), slice[1].x2);
+    try std.testing.expectEqual(@as(i32, 260), slice[1].y2);
+}
+
+test "damage clips clip to framebuffer bounds and drop exterior damage" {
+    var damage = Region.init();
+    defer damage.deinit();
+    try damage.add(-10, -10, 30, 30);
+    try damage.add(630, 470, 100, 100);
+    try damage.add(1000, 1000, 5, 5);
+    var clips: [max_damage_clips]c.drm_mode_rect = undefined;
+    const slice = damageClips(&damage, .{ .width = 640, .height = 480 }, &clips).?;
+    try std.testing.expectEqual(@as(usize, 2), slice.len);
+    try std.testing.expectEqual(@as(i32, 0), slice[0].x1);
+    try std.testing.expectEqual(@as(i32, 0), slice[0].y1);
+    try std.testing.expectEqual(@as(i32, 20), slice[0].x2);
+    try std.testing.expectEqual(@as(i32, 20), slice[0].y2);
+    try std.testing.expectEqual(@as(i32, 630), slice[1].x1);
+    try std.testing.expectEqual(@as(i32, 470), slice[1].y1);
+    try std.testing.expectEqual(@as(i32, 640), slice[1].x2);
+    try std.testing.expectEqual(@as(i32, 480), slice[1].y2);
+}
+
+test "damage clips omit empty and full-framebuffer damage" {
+    var damage = Region.init();
+    defer damage.deinit();
+    var clips: [max_damage_clips]c.drm_mode_rect = undefined;
+    const size: render.Size = .{ .width = 640, .height = 480 };
+    try std.testing.expectEqual(
+        @as(?[]const c.drm_mode_rect, null),
+        damageClips(&damage, size, &clips),
+    );
+    damage.setRectangle(0, 0, 640, 480);
+    try std.testing.expectEqual(
+        @as(?[]const c.drm_mode_rect, null),
+        damageClips(&damage, size, &clips),
+    );
+    damage.setRectangle(-5, -5, 650, 490);
+    try std.testing.expectEqual(
+        @as(?[]const c.drm_mode_rect, null),
+        damageClips(&damage, size, &clips),
+    );
+    damage.setRectangle(700, 0, 10, 10);
+    try std.testing.expectEqual(
+        @as(?[]const c.drm_mode_rect, null),
+        damageClips(&damage, size, &clips),
+    );
+}
+
+test "damage clips collapse overflowing damage to its bounds" {
+    var damage = Region.init();
+    defer damage.deinit();
+    var index: i32 = 0;
+    while (index < max_damage_clips + 8) : (index += 1) {
+        try damage.add(index * 4, index * 4, 2, 2);
+    }
+    var clips: [max_damage_clips]c.drm_mode_rect = undefined;
+    const slice = damageClips(&damage, .{ .width = 4096, .height = 4096 }, &clips).?;
+    try std.testing.expectEqual(@as(usize, 1), slice.len);
+    try std.testing.expectEqual(@as(i32, 0), slice[0].x1);
+    try std.testing.expectEqual(@as(i32, 0), slice[0].y1);
+    try std.testing.expectEqual(@as(i32, (max_damage_clips + 7) * 4 + 2), slice[0].x2);
+    try std.testing.expectEqual(@as(i32, (max_damage_clips + 7) * 4 + 2), slice[0].y2);
 }
 
 fn addAtomicPlaneState(
@@ -3179,6 +3394,7 @@ fn loadAtomicPlaneProperties(fd: std.posix.fd_t, plane_id: u32) ?AtomicPlaneProp
             .{ "CRTC_W", "crtc_w" },
             .{ "CRTC_H", "crtc_h" },
             .{ "IN_FENCE_FD", "in_fence_fd" },
+            .{ "FB_DAMAGE_CLIPS", "fb_damage_clips" },
         }) |mapping| {
             if (std.mem.eql(u8, property_name, mapping[0])) {
                 @field(result, mapping[1]) = property_id;
