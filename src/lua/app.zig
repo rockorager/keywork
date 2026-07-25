@@ -3824,19 +3824,19 @@ test "lua default theme exposes opaque Radix component tokens" {
         \\assert(theme.components.separator.thickness == 1)
         \\for _, scheme in ipairs({ "light", "dark" }) do
         \\  local resolved = kw.resolve_theme(kw.theme_data(), scheme)
-        \\  assert(resolved.colors.surface == resolved.colors.slate2)
+        \\  assert(resolved.colors.surface == resolved.colors.neutral2)
         \\  assert(resolved.colors.backdrop_surface == (scheme == "light" and 0x59ffffff or resolved.colors.black_a6))
-        \\  assert(resolved.colors.text_secondary == resolved.colors.slate11)
-        \\  assert(resolved.colors.text_tertiary == resolved.colors.slate10)
-        \\  assert(resolved.colors.border == resolved.colors.slate7)
-        \\  assert(resolved.colors.fill == resolved.colors.slate4)
+        \\  assert(resolved.colors.text_secondary == resolved.colors.neutral11)
+        \\  assert(resolved.colors.text_tertiary == resolved.colors.neutral10)
+        \\  assert(resolved.colors.border == resolved.colors.neutral7)
+        \\  assert(resolved.colors.fill == resolved.colors.neutral4)
         \\  assert(resolved.components.chip.background == resolved.colors.blue3)
         \\  assert(resolved.components.menu.item.selected_background == resolved.colors.blue4)
         \\  assert(resolved.components.menu.border == resolved.colors.panel_border)
         \\  assert(resolved.components.menu.border_width == 1)
-        \\  assert(resolved.components.separator.color == resolved.colors.slate6)
-        \\  assert(resolved.components.scrollbar.track == resolved.colors.slate3)
-        \\  assert(resolved.components.scrollbar.thumb == resolved.colors.slate8)
+        \\  assert(resolved.components.separator.color == resolved.colors.neutral6)
+        \\  assert(resolved.components.scrollbar.track == resolved.colors.neutral3)
+        \\  assert(resolved.components.scrollbar.thumb == resolved.colors.neutral8)
         \\end
         \\return kw.app({
         \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),

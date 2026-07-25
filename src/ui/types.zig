@@ -136,39 +136,39 @@ pub const colors = struct {
     pub const surface_light: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
     pub const surface_dark: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
 
-    pub const slate1: Color = Color.argb(0xff, 0xfc, 0xfc, 0xfd);
-    pub const slate2: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
-    pub const slate3: Color = Color.argb(0xff, 0xf0, 0xf0, 0xf3);
-    pub const slate4: Color = Color.argb(0xff, 0xe8, 0xe8, 0xec);
-    pub const slate6: Color = Color.argb(0xff, 0xd9, 0xd9, 0xe0);
-    pub const slate7: Color = Color.argb(0xff, 0xcd, 0xce, 0xd6);
-    pub const slate8: Color = Color.argb(0xff, 0xb9, 0xbb, 0xc6);
-    pub const slate10: Color = Color.argb(0xff, 0x80, 0x83, 0x8d);
-    pub const slate11: Color = Color.argb(0xff, 0x60, 0x64, 0x6c);
-    pub const slate12: Color = Color.argb(0xff, 0x1c, 0x20, 0x24);
-    pub const slate_a3: Color = Color.argb(0x0f, 0x00, 0x00, 0x33);
-    pub const slate_a6: Color = Color.argb(0x26, 0x00, 0x00, 0x2f);
-    pub const slate_a7: Color = Color.argb(0x32, 0x00, 0x06, 0x2e);
-    pub const slate_a8: Color = Color.argb(0x46, 0x00, 0x08, 0x30);
-    pub const slate_a10: Color = Color.argb(0x7f, 0x00, 0x07, 0x1b);
-    pub const slate_a11: Color = Color.argb(0x9f, 0x00, 0x07, 0x14);
+    pub const neutral1: Color = Color.argb(0xff, 0xfc, 0xfc, 0xfd);
+    pub const neutral2: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
+    pub const neutral3: Color = Color.argb(0xff, 0xf0, 0xf0, 0xf3);
+    pub const neutral4: Color = Color.argb(0xff, 0xe8, 0xe8, 0xec);
+    pub const neutral6: Color = Color.argb(0xff, 0xd9, 0xd9, 0xe0);
+    pub const neutral7: Color = Color.argb(0xff, 0xcd, 0xce, 0xd6);
+    pub const neutral8: Color = Color.argb(0xff, 0xb9, 0xbb, 0xc6);
+    pub const neutral10: Color = Color.argb(0xff, 0x80, 0x83, 0x8d);
+    pub const neutral11: Color = Color.argb(0xff, 0x60, 0x64, 0x6c);
+    pub const neutral12: Color = Color.argb(0xff, 0x1c, 0x20, 0x24);
+    pub const neutral_a3: Color = Color.argb(0x0f, 0x00, 0x00, 0x33);
+    pub const neutral_a6: Color = Color.argb(0x26, 0x00, 0x00, 0x2f);
+    pub const neutral_a7: Color = Color.argb(0x32, 0x00, 0x06, 0x2e);
+    pub const neutral_a8: Color = Color.argb(0x46, 0x00, 0x08, 0x30);
+    pub const neutral_a10: Color = Color.argb(0x7f, 0x00, 0x07, 0x1b);
+    pub const neutral_a11: Color = Color.argb(0x9f, 0x00, 0x07, 0x14);
 
-    pub const slate_dark1: Color = Color.argb(0xff, 0x11, 0x11, 0x13);
-    pub const slate_dark2: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
-    pub const slate_dark3: Color = Color.argb(0xff, 0x21, 0x22, 0x25);
-    pub const slate_dark4: Color = Color.argb(0xff, 0x27, 0x2a, 0x2d);
-    pub const slate_dark6: Color = Color.argb(0xff, 0x36, 0x3a, 0x3f);
-    pub const slate_dark7: Color = Color.argb(0xff, 0x43, 0x48, 0x4e);
-    pub const slate_dark8: Color = Color.argb(0xff, 0x5a, 0x61, 0x69);
-    pub const slate_dark10: Color = Color.argb(0xff, 0x77, 0x7b, 0x84);
-    pub const slate_dark11: Color = Color.argb(0xff, 0xb0, 0xb4, 0xba);
-    pub const slate_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
-    pub const slate_dark_a3: Color = Color.argb(0x14, 0xdd, 0xea, 0xf8);
-    pub const slate_dark_a6: Color = Color.argb(0x30, 0xd6, 0xeb, 0xfd);
-    pub const slate_dark_a7: Color = Color.argb(0x40, 0xd9, 0xed, 0xff);
-    pub const slate_dark_a8: Color = Color.argb(0x5d, 0xd9, 0xed, 0xff);
-    pub const slate_dark_a10: Color = Color.argb(0x7b, 0xe5, 0xed, 0xfd);
-    pub const slate_dark_a11: Color = Color.argb(0xb5, 0xf1, 0xf7, 0xfe);
+    pub const neutral_dark1: Color = Color.argb(0xff, 0x11, 0x11, 0x13);
+    pub const neutral_dark2: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
+    pub const neutral_dark3: Color = Color.argb(0xff, 0x21, 0x22, 0x25);
+    pub const neutral_dark4: Color = Color.argb(0xff, 0x27, 0x2a, 0x2d);
+    pub const neutral_dark6: Color = Color.argb(0xff, 0x36, 0x3a, 0x3f);
+    pub const neutral_dark7: Color = Color.argb(0xff, 0x43, 0x48, 0x4e);
+    pub const neutral_dark8: Color = Color.argb(0xff, 0x5a, 0x61, 0x69);
+    pub const neutral_dark10: Color = Color.argb(0xff, 0x77, 0x7b, 0x84);
+    pub const neutral_dark11: Color = Color.argb(0xff, 0xb0, 0xb4, 0xba);
+    pub const neutral_dark12: Color = Color.argb(0xff, 0xed, 0xee, 0xf0);
+    pub const neutral_dark_a3: Color = Color.argb(0x14, 0xdd, 0xea, 0xf8);
+    pub const neutral_dark_a6: Color = Color.argb(0x30, 0xd6, 0xeb, 0xfd);
+    pub const neutral_dark_a7: Color = Color.argb(0x40, 0xd9, 0xed, 0xff);
+    pub const neutral_dark_a8: Color = Color.argb(0x5d, 0xd9, 0xed, 0xff);
+    pub const neutral_dark_a10: Color = Color.argb(0x7b, 0xe5, 0xed, 0xfd);
+    pub const neutral_dark_a11: Color = Color.argb(0xb5, 0xf1, 0xf7, 0xfe);
 
     pub const blue3: Color = Color.argb(0xff, 0xe6, 0xf4, 0xfe);
     pub const blue4: Color = Color.argb(0xff, 0xd5, 0xef, 0xff);
@@ -193,8 +193,8 @@ pub const colors = struct {
     pub const blue_dark_a11: Color = Color.argb(0xff, 0x70, 0xb8, 0xff);
     pub const red9: Color = Color.argb(0xff, 0xe5, 0x48, 0x4d);
 
-    pub const ink: Color = slate12;
-    pub const panel: Color = slate2;
+    pub const ink: Color = neutral12;
+    pub const panel: Color = neutral2;
     pub const accent: Color = blue9;
 };
 
@@ -251,24 +251,24 @@ pub const ColorScheme = struct {
         .on_primary = colors.white,
         .surface = colors.surface_light,
         .surface_high = colors.white,
-        .surface_low = colors.slate2,
-        .border = colors.slate7,
-        .muted = colors.slate11,
+        .surface_low = colors.neutral2,
+        .border = colors.neutral7,
+        .muted = colors.neutral11,
         .error_color = colors.red9,
         .on_error = colors.white,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
-        .background = colors.slate_dark1,
-        .foreground = colors.slate_dark12,
+        .background = colors.neutral_dark1,
+        .foreground = colors.neutral_dark12,
         .primary = colors.blue9,
         .on_primary = colors.white,
         .surface = colors.surface_dark,
-        .surface_high = colors.slate_dark2,
-        .surface_low = colors.slate_dark2,
-        .border = colors.slate_dark7,
-        .muted = colors.slate_dark11,
+        .surface_high = colors.neutral_dark2,
+        .surface_low = colors.neutral_dark2,
+        .border = colors.neutral_dark7,
+        .muted = colors.neutral_dark11,
         .error_color = colors.red9,
         .on_error = colors.white,
     };
@@ -357,18 +357,18 @@ pub const Theme = struct {
             .hover_foreground = colors.white,
             .focused_border = colors.blue8,
             .pressed_background = colors.blue10,
-            .disabled_background = colors.slate3,
-            .disabled_foreground = colors.slate8,
+            .disabled_background = colors.neutral3,
+            .disabled_foreground = colors.neutral8,
         },
         .input_theme = .{
             .background = colors.surface_light,
-            .foreground = colors.slate12,
-            .placeholder = colors.slate10,
-            .border = colors.slate7,
+            .foreground = colors.neutral12,
+            .placeholder = colors.neutral10,
+            .border = colors.neutral7,
             .focused_border = colors.blue8,
         },
-        .separator_theme = .{ .color = colors.slate6 },
-        .scrollbar_theme = .{ .track = colors.slate3, .thumb = colors.slate8 },
+        .separator_theme = .{ .color = colors.neutral6 },
+        .scrollbar_theme = .{ .track = colors.neutral3, .thumb = colors.neutral8 },
     };
     pub const dark: Theme = .{
         .color_scheme = .dark,
@@ -379,18 +379,18 @@ pub const Theme = struct {
             .hover_foreground = colors.white,
             .focused_border = colors.blue_dark8,
             .pressed_background = colors.blue_dark10,
-            .disabled_background = colors.slate_dark3,
-            .disabled_foreground = colors.slate_dark8,
+            .disabled_background = colors.neutral_dark3,
+            .disabled_foreground = colors.neutral_dark8,
         },
         .input_theme = .{
             .background = colors.surface_dark,
-            .foreground = colors.slate_dark12,
-            .placeholder = colors.slate_dark10,
-            .border = colors.slate_dark7,
+            .foreground = colors.neutral_dark12,
+            .placeholder = colors.neutral_dark10,
+            .border = colors.neutral_dark7,
             .focused_border = colors.blue_dark8,
         },
-        .separator_theme = .{ .color = colors.slate_dark6 },
-        .scrollbar_theme = .{ .track = colors.slate_dark3, .thumb = colors.slate_dark8 },
+        .separator_theme = .{ .color = colors.neutral_dark6 },
+        .scrollbar_theme = .{ .track = colors.neutral_dark3, .thumb = colors.neutral_dark8 },
     };
     pub const default: Theme = light;
 
