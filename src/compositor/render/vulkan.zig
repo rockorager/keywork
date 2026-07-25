@@ -119,10 +119,17 @@ const TargetKey = union(enum) {
     dmabuf: u64,
 };
 
+/// Ring depth per output. Two slots let the CPU prepare and submit frame
+/// N+1 while the GPU still executes frame N; the drain moves to the slot
+/// being reused, which is usually already signaled.
+const submission_ring_size = 2;
+
 const Submission = struct {
     fence: vk.Fence,
     scanout_semaphore: vk.Semaphore,
     timestamp_query_pool: vk.QueryPool,
+    command_buffer: vk.CommandBuffer,
+    recorded_frame: RecordedFrame = .{},
     fence_pending: bool = false,
     pending_gpu_sample_tag: ?u64 = null,
     pending_gpu_timing_plan: GpuTimingPlan = .{},
@@ -158,13 +165,31 @@ const Output = struct {
     initialized: bool = false,
     linear_initialized: bool = false,
     last_used: u64,
-    command_buffer: vk.CommandBuffer = .null_handle,
-    recorded_frame: RecordedFrame = .{},
     blur: ?BlurScratch = null,
     blur_initialized: u16 = 0,
     backdrop_cache: std.ArrayList(BackdropCache) = .empty,
     linear: WorkingImage,
-    submission: Submission,
+    submissions: [submission_ring_size]Submission,
+    // Index of the slot used by the most recently prepared frame. Frame
+    // preparation advances to the next slot before draining it, so older
+    // GPU work can stay in flight while the CPU records the new frame.
+    submission_index: u8 = 0,
+
+    fn currentSubmission(self: *Output) *Submission {
+        return &self.submissions[self.submission_index];
+    }
+
+    fn advanceSubmission(self: *Output) *Submission {
+        self.submission_index = (self.submission_index + 1) % submission_ring_size;
+        return &self.submissions[self.submission_index];
+    }
+
+    // Recorded commands bake in output image layouts and initialization
+    // state, so any out-of-band change to the output must invalidate every
+    // slot's recording, not only the current one.
+    fn invalidateRecordedFrames(self: *Output) void {
+        for (&self.submissions) |*submission| submission.recorded_frame.valid = false;
+    }
 };
 
 const WorkingImage = struct {
@@ -2450,14 +2475,8 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
     errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
     const linear = try self.createWorkingTarget(descriptor.size);
     errdefer self.destroyWorkingTarget(linear);
-    const command_buffer = try self.allocateCommandBuffer();
-    errdefer self.device_wrapper.freeCommandBuffers(
-        self.device,
-        self.command_pool,
-        &.{command_buffer},
-    );
-    const submission = try self.createSubmission();
-    errdefer self.destroySubmission(submission);
+    const submissions = try self.createSubmissionRing();
+    errdefer for (submissions) |submission| self.destroySubmission(submission);
     self.outputs.put(self.allocator, .{ .dmabuf = descriptor.id }, .{
         .image = image,
         .memory = memory,
@@ -2468,9 +2487,8 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         .size = descriptor.size,
         .kind = .dmabuf,
         .last_used = self.frame_number,
-        .command_buffer = command_buffer,
         .linear = linear,
-        .submission = submission,
+        .submissions = submissions,
     }) catch return error.OutOfMemory;
 }
 
@@ -2484,7 +2502,23 @@ fn allocateCommandBuffer(self: *Self) Error!vk.CommandBuffer {
     return command_buffer;
 }
 
+fn createSubmissionRing(self: *Self) Error![submission_ring_size]Submission {
+    var submissions: [submission_ring_size]Submission = undefined;
+    var created: usize = 0;
+    errdefer for (submissions[0..created]) |submission| self.destroySubmission(submission);
+    while (created < submission_ring_size) : (created += 1) {
+        submissions[created] = try self.createSubmission();
+    }
+    return submissions;
+}
+
 fn createSubmission(self: *Self) Error!Submission {
+    const command_buffer = try self.allocateCommandBuffer();
+    errdefer self.device_wrapper.freeCommandBuffers(
+        self.device,
+        self.command_pool,
+        &.{command_buffer},
+    );
     const fence = self.device_wrapper.createFence(self.device, &.{}, null) catch
         return error.VulkanFailure;
     errdefer self.device_wrapper.destroyFence(self.device, fence, null);
@@ -2516,6 +2550,7 @@ fn createSubmission(self: *Self) Error!Submission {
         .fence = fence,
         .scanout_semaphore = scanout_semaphore,
         .timestamp_query_pool = timestamp_query_pool,
+        .command_buffer = command_buffer,
     };
 }
 
@@ -2706,7 +2741,20 @@ fn drainSubmission(self: *Self, submission: *Submission) Error!void {
 
 fn drainAllPending(self: *Self) Error!void {
     var iterator = self.outputs.valueIterator();
-    while (iterator.next()) |output| try self.drainSubmission(&output.submission);
+    while (iterator.next()) |output| try self.drainOutputSubmissions(output);
+}
+
+fn drainOutputSubmissions(self: *Self, output: *Output) Error!void {
+    // A failed drain idles the device and cleans up only its own slot. Keep
+    // draining the remaining slots so callers such as destroyOutput can rely
+    // on every slot being settled even after a device failure.
+    var failed: ?Error = null;
+    for (&output.submissions) |*submission| {
+        self.drainSubmission(submission) catch |err| {
+            failed = err;
+        };
+    }
+    if (failed) |err| return err;
 }
 
 fn writeGpuTimestamp(
@@ -2778,7 +2826,9 @@ pub fn takeGpuTiming(self: *Self) ?GpuTiming {
 
 pub fn discardGpuTimings(self: *Self) void {
     var iterator = self.outputs.valueIterator();
-    while (iterator.next()) |output| output.submission.pending_gpu_sample_tag = null;
+    while (iterator.next()) |output| {
+        for (&output.submissions) |*submission| submission.pending_gpu_sample_tag = null;
+    }
     self.completed_gpu_timing_count = 0;
 }
 
@@ -2797,10 +2847,12 @@ pub fn resourceStatistics(self: *const Self) render.ResourceStatistics {
             .dmabuf => statistics.dmabuf_targets += 1,
         }
         const output = entry.value_ptr;
-        if (output.submission.fence_pending) statistics.pending_gpu_submissions += 1;
-        statistics.pending_textures +|= output.submission.pending_textures.items.len;
-        statistics.mapped_buffer_capacity_bytes +|= output.submission.work_capacity;
-        statistics.mapped_buffer_capacity_bytes +|= output.submission.instance_capacity;
+        for (&output.submissions) |*submission| {
+            if (submission.fence_pending) statistics.pending_gpu_submissions += 1;
+            statistics.pending_textures +|= submission.pending_textures.items.len;
+            statistics.mapped_buffer_capacity_bytes +|= submission.work_capacity;
+            statistics.mapped_buffer_capacity_bytes +|= submission.instance_capacity;
+        }
         statistics.backdrop_cache_images +|= output.backdrop_cache.items.len;
         if (output.blur) |blur| {
             for (blur.levels) |level| {
@@ -2828,23 +2880,27 @@ fn disableScanoutSynchronization(self: *Self) void {
     self.scanout_sync_enabled = false;
     var iterator = self.outputs.valueIterator();
     while (iterator.next()) |output| {
-        std.debug.assert(!output.submission.fence_pending);
-        if (output.submission.scanout_semaphore == .null_handle) continue;
-        self.device_wrapper.destroySemaphore(
-            self.device,
-            output.submission.scanout_semaphore,
-            null,
-        );
-        output.submission.scanout_semaphore = .null_handle;
+        for (&output.submissions) |*submission| {
+            std.debug.assert(!submission.fence_pending);
+            if (submission.scanout_semaphore == .null_handle) continue;
+            self.device_wrapper.destroySemaphore(
+                self.device,
+                submission.scanout_semaphore,
+                null,
+            );
+            submission.scanout_semaphore = .null_handle;
+        }
     }
 }
 
 fn releaseAllPendingAfterDeviceIdle(self: *Self) void {
     var iterator = self.outputs.valueIterator();
     while (iterator.next()) |output| {
-        output.submission.fence_pending = false;
-        output.submission.pending_gpu_sample_tag = null;
-        self.releasePendingResources(&output.submission);
+        for (&output.submissions) |*submission| {
+            submission.fence_pending = false;
+            submission.pending_gpu_sample_tag = null;
+            self.releasePendingResources(submission);
+        }
     }
 }
 
@@ -2854,6 +2910,14 @@ fn destroySubmission(self: *Self, value: Submission) void {
     self.releasePendingResources(&submission);
     submission.pending_wait_semaphores.deinit(self.allocator);
     submission.pending_textures.deinit(self.allocator);
+    submission.recorded_frame.deinit(self.allocator);
+    if (submission.command_buffer != .null_handle) {
+        self.device_wrapper.freeCommandBuffers(
+            self.device,
+            self.command_pool,
+            &.{submission.command_buffer},
+        );
+    }
     self.destroyInstanceBuffer(&submission);
     self.destroyWorkBuffer(&submission);
     if (submission.scanout_semaphore != .null_handle) {
@@ -2879,6 +2943,10 @@ pub fn renderFrameReadback(
     return self.renderFrameWithCompletion(frame, .{ .pixels = target }, .readback, null);
 }
 
+/// Completes the most recent renderFrameReadback for `source`. At most one
+/// readback per pixel target may be outstanding: rendering to the same
+/// target again advances its submission ring and orphans the earlier
+/// readback's slot.
 pub fn completeFrameReadback(
     self: *Self,
     source: render.PixelBuffer,
@@ -2887,12 +2955,13 @@ pub fn completeFrameReadback(
     const key = targetKey(.{ .pixels = source });
     const output = self.outputs.getPtr(key) orelse return error.InvalidTarget;
     if (output.kind != .pixels) return error.InvalidTarget;
-    try self.drainSubmission(&output.submission);
+    const submission = output.currentSubmission();
+    try self.drainSubmission(submission);
     const target = destination orelse return;
     if (!std.meta.eql(source.size, target.size) or
         source.stride_pixels != target.stride_pixels) return error.InvalidTarget;
     _ = try requiredBufferPixels(target);
-    const mapped = output.submission.work_mapped orelse return error.InvalidTarget;
+    const mapped = submission.work_mapped orelse return error.InvalidTarget;
     copyMappedRect(target, mapped, .{
         .x = 0,
         .y = 0,
@@ -2950,12 +3019,18 @@ pub fn copyComposedFrame(
         return null;
     }
 
-    const submission = &output.submission;
+    const submission = output.advanceSubmission();
     try self.drainSubmission(submission);
+    // The source's previous frame may still be in flight on another ring
+    // slot; settle it conservatively before sampling its retained image.
+    try self.drainOutputSubmissions(source);
     if (!std.meta.eql(output.size, size)) return error.InvalidTarget;
     source.last_used = self.frame_number;
     output.last_used = self.frame_number;
-    output.recorded_frame.valid = false;
+    // The composed copy changes the output images outside recorded frames,
+    // so every slot's recording is stale, not only this one.
+    output.invalidateRecordedFrames();
+    const command_buffer = submission.command_buffer;
 
     const pixel_target: ?render.PixelBuffer = switch (target) {
         .pixels => |pixels| pixels,
@@ -2991,18 +3066,18 @@ pub fn copyComposedFrame(
         self.invalidateOutput(target_key);
     };
 
-    std.debug.assert(output.command_buffer != .null_handle);
-    self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch
+    std.debug.assert(command_buffer != .null_handle);
+    self.device_wrapper.resetCommandBuffer(command_buffer, .{}) catch
         return error.VulkanFailure;
     self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
-    self.device_wrapper.beginCommandBuffer(output.command_buffer, &.{
+    self.device_wrapper.beginCommandBuffer(command_buffer, &.{
         .flags = .{ .one_time_submit_bit = true },
     }) catch return error.VulkanFailure;
 
     const encode_descriptor = if (prepare_linear) descriptor: {
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.linear.image,
             if (output.linear_initialized) .shader_read_only_optimal else .undefined,
             .color_attachment_optimal,
@@ -3020,24 +3095,24 @@ pub fn copyComposedFrame(
             .render_area = rect2D(full_output),
         };
         self.device_wrapper.cmdBeginRenderPass(
-            output.command_buffer,
+            command_buffer,
             &conversion_pass,
             .@"inline",
         );
-        self.setViewportAndScissor(output.command_buffer, size);
+        self.setViewportAndScissor(command_buffer, size);
         self.device_wrapper.cmdBindVertexBuffers(
-            output.command_buffer,
+            command_buffer,
             0,
             &.{submission.instance_buffer},
             &.{0},
         );
         self.device_wrapper.cmdBindPipeline(
-            output.command_buffer,
+            command_buffer,
             .graphics,
             self.opaque_image_pipeline,
         );
         self.device_wrapper.cmdBindDescriptorSets(
-            output.command_buffer,
+            command_buffer,
             .graphics,
             self.pipeline_layout,
             0,
@@ -3058,17 +3133,17 @@ pub fn copyComposedFrame(
             .transfer_aux = transform.transfer_aux,
         };
         self.device_wrapper.cmdPushConstants(
-            output.command_buffer,
+            command_buffer,
             self.pipeline_layout,
             .{ .vertex_bit = true, .fragment_bit = true },
             0,
             @sizeOf(FramePush),
             &conversion_push,
         );
-        self.device_wrapper.cmdDraw(output.command_buffer, 4, 1, 0, 0);
-        self.device_wrapper.cmdEndRenderPass(output.command_buffer);
+        self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, 0);
+        self.device_wrapper.cmdEndRenderPass(command_buffer);
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.linear.image,
             .color_attachment_optimal,
             .shader_read_only_optimal,
@@ -3081,11 +3156,11 @@ pub fn copyComposedFrame(
     } else source.linear.descriptor_set;
 
     if (output.kind == .dmabuf) {
-        self.transitionExternalToRender(output.command_buffer, output.*);
+        self.transitionExternalToRender(command_buffer, output.*);
     } else {
         std.debug.assert(output.kind == .pixels);
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.image,
             if (output.initialized) .color_attachment_optimal else .undefined,
             .color_attachment_optimal,
@@ -3105,21 +3180,21 @@ pub fn copyComposedFrame(
         .framebuffer = output.framebuffer,
         .render_area = rect2D(full_output),
     };
-    self.device_wrapper.cmdBeginRenderPass(output.command_buffer, &pass_info, .@"inline");
-    self.setViewportAndScissor(output.command_buffer, size);
+    self.device_wrapper.cmdBeginRenderPass(command_buffer, &pass_info, .@"inline");
+    self.setViewportAndScissor(command_buffer, size);
     self.device_wrapper.cmdBindVertexBuffers(
-        output.command_buffer,
+        command_buffer,
         0,
         &.{submission.instance_buffer},
         &.{0},
     );
     self.device_wrapper.cmdBindPipeline(
-        output.command_buffer,
+        command_buffer,
         .graphics,
         output_graphics.encode_pipeline,
     );
     self.device_wrapper.cmdBindDescriptorSets(
-        output.command_buffer,
+        command_buffer,
         .graphics,
         self.pipeline_layout,
         0,
@@ -3136,7 +3211,7 @@ pub fn copyComposedFrame(
         .transfer_aux = color_math.transferAux(color_description),
     };
     self.device_wrapper.cmdPushConstants(
-        output.command_buffer,
+        command_buffer,
         self.pipeline_layout,
         .{ .vertex_bit = true, .fragment_bit = true },
         0,
@@ -3144,19 +3219,19 @@ pub fn copyComposedFrame(
         &output_push,
     );
     self.device_wrapper.cmdDraw(
-        output.command_buffer,
+        command_buffer,
         4,
         1,
         0,
         @intFromBool(prepare_linear),
     );
-    self.device_wrapper.cmdEndRenderPass(output.command_buffer);
+    self.device_wrapper.cmdEndRenderPass(command_buffer);
 
     if (output.kind == .dmabuf) {
-        self.transitionRenderToExternal(output.command_buffer, output.image);
+        self.transitionRenderToExternal(command_buffer, output.image);
     } else {
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.image,
             .color_attachment_optimal,
             .transfer_src_optimal,
@@ -3168,13 +3243,13 @@ pub fn copyComposedFrame(
         const copy_frame: render.Frame = .{ .size = size, .commands = &.{} };
         self.copyOutputDamage(
             submission.work_buffer,
-            output.command_buffer,
+            command_buffer,
             copy_frame,
             pixel_target.?,
             output.image,
         );
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.image,
             .transfer_src_optimal,
             .color_attachment_optimal,
@@ -3183,15 +3258,15 @@ pub fn copyComposedFrame(
             .{ .transfer_bit = true },
             .{ .color_attachment_output_bit = true },
         );
-        self.transferToHostBarrier(output.command_buffer);
+        self.transferToHostBarrier(command_buffer);
     }
-    self.device_wrapper.endCommandBuffer(output.command_buffer) catch
+    self.device_wrapper.endCommandBuffer(command_buffer) catch
         return error.VulkanFailure;
 
     const export_completion = submission.scanout_semaphore != .null_handle;
     const submit_info: vk.SubmitInfo = .{
         .command_buffer_count = 1,
-        .p_command_buffers = @ptrCast(&output.command_buffer),
+        .p_command_buffers = @ptrCast(&command_buffer),
         .signal_semaphore_count = @intFromBool(export_completion),
         .p_signal_semaphores = if (export_completion)
             @ptrCast(&submission.scanout_semaphore)
@@ -3268,7 +3343,7 @@ fn renderFrameWithCompletion(
         switch (target) {
             .pixels => |pixels| {
                 if (self.outputs.getPtr(target_key)) |output| {
-                    try self.drainSubmission(&output.submission);
+                    try self.drainOutputSubmissions(output);
                 }
                 self.invalidateOutput(target_key);
                 try self.fallback.render(frame, pixels);
@@ -3287,7 +3362,7 @@ fn renderFrameWithCompletion(
         log.err("Vulkan output target lookup failed: {t}", .{err});
         return err;
     };
-    const submission = &output.submission;
+    const submission = output.advanceSubmission();
     try self.drainSubmission(submission);
     if (!std.meta.eql(output.size, frame.size)) {
         log.err(
@@ -3311,10 +3386,10 @@ fn renderFrameWithCompletion(
                 if (source_output.kind != .offscreen or
                     !std.meta.eql(source_output.size, retained.size) or
                     !source_output.linear_initialized) return error.InvalidTarget;
-                try self.drainSubmission(&source_output.submission);
+                try self.drainOutputSubmissions(source_output);
                 source_output.last_used = self.frame_number;
             }
-            output.recorded_frame.valid = false;
+            output.invalidateRecordedFrames();
         },
         else => {},
     };
@@ -3424,7 +3499,11 @@ fn renderFrameWithCompletion(
         // Reusing any of it after the output description changes would mix
         // incompatible primaries and reference luminances in one frame.
         compiled_frame.damage = null;
-        output.recorded_frame.valid = false;
+        output.invalidateRecordedFrames();
+        // The previous ring slot may still be executing commands recorded
+        // for the old description; settle it before this frame records
+        // conflicting initial layouts for the same backdrop images.
+        try self.drainOutputSubmissions(output);
         for (output.backdrop_cache.items) |*cache| {
             cache.key = null;
             cache.initialized = false;
@@ -3519,7 +3598,7 @@ fn renderFrameWithCompletion(
     const reusable = output.kind != .pixels;
     const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
     std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
-    const cache_hit = reusable and output.recorded_frame.matches(.{
+    const cache_hit = reusable and submission.recorded_frame.matches(.{
         .resource_epoch = self.resource_epoch,
         .submission = submission,
         .output_initialized = output.initialized,
@@ -3529,8 +3608,8 @@ fn renderFrameWithCompletion(
         .draw_runs = self.draw_runs.items,
         .blur_ops = self.blur_ops.items,
     });
-    std.debug.assert(!reusable or output.command_buffer != .null_handle);
-    const command_buffer = output.command_buffer;
+    std.debug.assert(!reusable or submission.command_buffer != .null_handle);
+    const command_buffer = submission.command_buffer;
     if (!cache_hit) {
         var gpu_timing_recorder: GpuTimingRecorder = .{ .plan = gpu_timing_plan };
         self.device_wrapper.beginCommandBuffer(command_buffer, &.{
@@ -4068,8 +4147,8 @@ fn renderFrameWithCompletion(
                 // replayed safely after the mapped work buffer is reused. A
                 // direct composed-frame copy can also initialize only the
                 // encoded image, making this frame's initial layouts unique.
-                output.recorded_frame.valid = false;
-            } else try output.recorded_frame.replace(
+                submission.recorded_frame.valid = false;
+            } else try submission.recorded_frame.replace(
                 self.allocator,
                 .{
                     .resource_epoch = self.resource_epoch,
@@ -4328,8 +4407,9 @@ fn supports(commands: []const render.Command) bool {
 fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!void {
     const output = self.outputs.getPtr(key) orelse return error.InvalidTarget;
     if (output.kind == .pixels or !std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
-    const submission = &output.submission;
+    const submission = output.advanceSubmission();
     try self.drainSubmission(submission);
+    const command_buffer = submission.command_buffer;
     const pixel_count = frame.size.pixelCount() catch return error.InvalidTarget;
     const byte_count = std.math.mul(usize, pixel_count, @sizeOf(u32)) catch
         return error.InvalidTarget;
@@ -4342,18 +4422,18 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
     };
     try self.fallback.render(frame, cpu_target);
 
-    std.debug.assert(output.command_buffer != .null_handle);
-    output.recorded_frame.valid = false;
-    self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch
+    std.debug.assert(command_buffer != .null_handle);
+    output.invalidateRecordedFrames();
+    self.device_wrapper.resetCommandBuffer(command_buffer, .{}) catch
         return error.VulkanFailure;
     self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
-    self.device_wrapper.beginCommandBuffer(output.command_buffer, &.{
+    self.device_wrapper.beginCommandBuffer(command_buffer, &.{
         .flags = .{ .one_time_submit_bit = true },
     }) catch return error.VulkanFailure;
     if (output.kind == .dmabuf) {
         self.transitionExternal(
-            output.command_buffer,
+            command_buffer,
             output.*,
             if (output.initialized) .general else .undefined,
             .transfer_dst_optimal,
@@ -4367,7 +4447,7 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
     } else {
         std.debug.assert(output.kind == .offscreen);
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.image,
             if (output.initialized) .color_attachment_optimal else .undefined,
             .transfer_dst_optimal,
@@ -4382,14 +4462,14 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
             const clipped = rect.clipTo(frame.size) orelse continue;
             self.copyTextureRect(
                 submission.work_buffer,
-                output.command_buffer,
+                command_buffer,
                 output.image,
                 cpu_target,
                 0,
                 clipped,
             );
         }
-    } else self.copyTextureRect(submission.work_buffer, output.command_buffer, output.image, cpu_target, 0, .{
+    } else self.copyTextureRect(submission.work_buffer, command_buffer, output.image, cpu_target, 0, .{
         .x = 0,
         .y = 0,
         .width = frame.size.width,
@@ -4397,7 +4477,7 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
     });
     if (output.kind == .dmabuf) {
         self.transitionExternal(
-            output.command_buffer,
+            command_buffer,
             output.*,
             .transfer_dst_optimal,
             .general,
@@ -4410,7 +4490,7 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
         );
     } else {
         self.transitionImage(
-            output.command_buffer,
+            command_buffer,
             output.image,
             .transfer_dst_optimal,
             .color_attachment_optimal,
@@ -4420,10 +4500,10 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
             .{ .color_attachment_output_bit = true },
         );
     }
-    self.device_wrapper.endCommandBuffer(output.command_buffer) catch return error.VulkanFailure;
+    self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
     const submit: vk.SubmitInfo = .{
         .command_buffer_count = 1,
-        .p_command_buffers = @ptrCast(&output.command_buffer),
+        .p_command_buffers = @ptrCast(&command_buffer),
     };
     self.device_wrapper.queueSubmit(self.queue, &.{submit}, submission.fence) catch
         return error.VulkanFailure;
@@ -4571,14 +4651,8 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
     errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
     const linear = try self.createWorkingTarget(size);
     errdefer self.destroyWorkingTarget(linear);
-    const command_buffer = try self.allocateCommandBuffer();
-    errdefer self.device_wrapper.freeCommandBuffers(
-        self.device,
-        self.command_pool,
-        &.{command_buffer},
-    );
-    const submission = try self.createSubmission();
-    errdefer self.destroySubmission(submission);
+    const submissions = try self.createSubmissionRing();
+    errdefer for (submissions) |submission| self.destroySubmission(submission);
     return .{
         .image = allocation.image,
         .memory = allocation.memory,
@@ -4588,9 +4662,8 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
         .format = self.format,
         .size = size,
         .last_used = self.frame_number,
-        .command_buffer = command_buffer,
         .linear = linear,
-        .submission = submission,
+        .submissions = submissions,
     };
 }
 
@@ -4604,7 +4677,7 @@ fn invalidateOutput(self: *Self, key: TargetKey) void {
                 cache.key = null;
                 cache.initialized = false;
             }
-            output.recorded_frame.valid = false;
+            output.invalidateRecordedFrames();
             return;
         }
     }
@@ -4613,8 +4686,11 @@ fn invalidateOutput(self: *Self, key: TargetKey) void {
 
 fn resetCommandBufferForTarget(self: *Self, key: TargetKey) void {
     if (self.outputs.getPtr(key)) |output| {
-        self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch {};
-        output.recorded_frame.valid = false;
+        self.device_wrapper.resetCommandBuffer(
+            output.currentSubmission().command_buffer,
+            .{},
+        ) catch {};
+        output.invalidateRecordedFrames();
         return;
     }
     self.device_wrapper.resetCommandBuffer(self.command_buffer, .{}) catch {};
@@ -4622,19 +4698,11 @@ fn resetCommandBufferForTarget(self: *Self, key: TargetKey) void {
 
 fn destroyOutput(self: *Self, value: Output) void {
     var output = value;
-    self.drainSubmission(&output.submission) catch {};
-    self.destroySubmission(output.submission);
+    self.drainOutputSubmissions(&output) catch {};
+    for (output.submissions) |submission| self.destroySubmission(submission);
     if (output.blur) |blur| self.destroyBlurScratch(blur);
     for (output.backdrop_cache.items) |cache| self.destroyBackdropCache(cache);
     output.backdrop_cache.deinit(self.allocator);
-    output.recorded_frame.deinit(self.allocator);
-    if (output.command_buffer != .null_handle) {
-        self.device_wrapper.freeCommandBuffers(
-            self.device,
-            self.command_pool,
-            &.{output.command_buffer},
-        );
-    }
     self.device_wrapper.destroyFramebuffer(self.device, output.framebuffer, null);
     if (output.descriptor_set != .null_handle) self.destroyImageDescriptor(output.descriptor_set);
     self.destroyWorkingTarget(output.linear);
@@ -4760,11 +4828,15 @@ fn prepareBackdropCaches(
         }
     }
 
+    if (output.backdrop_cache.items.len > next_cache_index) {
+        // The previous ring slot may still sample the surplus caches.
+        try self.drainOutputSubmissions(output);
+    }
     while (output.backdrop_cache.items.len > next_cache_index) {
         self.destroyBackdropCache(output.backdrop_cache.pop().?);
         cache_changed = true;
     }
-    if (cache_changed) output.recorded_frame.valid = false;
+    if (cache_changed) output.invalidateRecordedFrames();
     return incomplete_capture_damage;
 }
 
@@ -4780,14 +4852,19 @@ fn ensureBackdropCache(
             self.destroyBackdropCache(cache);
             return err;
         };
-        output.recorded_frame.valid = false;
+        output.invalidateRecordedFrames();
     }
     const cache = &output.backdrop_cache.items[index];
     if (std.meta.eql(cache.size, size)) return cache;
     const replacement = try self.createBackdropCache(size);
+    // The previous ring slot may still sample the cache being replaced.
+    self.drainOutputSubmissions(output) catch |err| {
+        self.destroyBackdropCache(replacement);
+        return err;
+    };
     self.destroyBackdropCache(cache.*);
     cache.* = replacement;
-    output.recorded_frame.valid = false;
+    output.invalidateRecordedFrames();
     return cache;
 }
 
@@ -6812,7 +6889,7 @@ fn transitionRenderToExternal(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
-        .submission = undefined,
+        .submissions = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -6843,7 +6920,7 @@ fn transitionExternalSourceToSample(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
-        .submission = undefined,
+        .submissions = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -6874,7 +6951,7 @@ fn transitionSampleToExternal(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
-        .submission = undefined,
+        .submissions = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -8784,11 +8861,11 @@ test "Vulkan renderer keeps offscreen frames GPU-resident" {
     const output = renderer.outputs.getPtr(.{ .offscreen = offscreen.id }).?;
     try std.testing.expectEqual(OutputKind.offscreen, output.kind);
     try std.testing.expect(output.initialized);
-    try std.testing.expect(output.recorded_frame.valid);
+    try std.testing.expect(output.currentSubmission().recorded_frame.valid);
 
     command.clear = render.Color.rgba(78, 90, 123, 255);
     try renderer.renderFrame(frame, .{ .offscreen = offscreen });
-    try std.testing.expect(output.recorded_frame.valid);
+    try std.testing.expect(output.currentSubmission().recorded_frame.valid);
 }
 
 test "Vulkan renderer copies a retained composed frame without replaying commands" {
@@ -9624,16 +9701,22 @@ test "Vulkan renderer reuses frame resources per target" {
         .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
     }, .{ .pixels = small });
     const small_key = targetKey(.{ .pixels = small });
-    const initial_buffer = renderer.outputs.getPtr(small_key).?.submission.work_buffer;
+    const initial_buffer = renderer.outputs.getPtr(small_key).?.currentSubmission().work_buffer;
+    try renderer.renderFrame(.{
+        .size = small.size,
+        .commands = &.{.{ .clear = render.Color.rgba(4, 5, 6, 255) }},
+    }, .{ .pixels = small });
+    try std.testing.expectEqual(@as(u32, 0xff040506), small_pixels[0]);
+    // The third frame wraps back to the first ring slot; the same-size
+    // render must reuse that slot's work buffer instead of reallocating.
     try renderer.renderFrame(.{
         .size = small.size,
         .commands = &.{.{ .clear = render.Color.rgba(4, 5, 6, 255) }},
     }, .{ .pixels = small });
     try std.testing.expectEqual(
         initial_buffer,
-        renderer.outputs.getPtr(small_key).?.submission.work_buffer,
+        renderer.outputs.getPtr(small_key).?.currentSubmission().work_buffer,
     );
-    try std.testing.expectEqual(@as(u32, 0xff040506), small_pixels[0]);
 
     var large_pixels = [_]u32{0} ** 4;
     const large: render.PixelBuffer = .{
@@ -9648,7 +9731,7 @@ test "Vulkan renderer reuses frame resources per target" {
     const large_key = targetKey(.{ .pixels = large });
     try std.testing.expectEqual(
         @as(usize, 4 * @sizeOf(u32)),
-        renderer.outputs.getPtr(large_key).?.submission.work_capacity,
+        renderer.outputs.getPtr(large_key).?.currentSubmission().work_capacity,
     );
     try std.testing.expectEqualSlices(u32, &([_]u32{0xff070809} ** 4), &large_pixels);
 
@@ -9658,7 +9741,7 @@ test "Vulkan renderer reuses frame resources per target" {
     }, .{ .pixels = small });
     try std.testing.expectEqual(
         @as(usize, @sizeOf(u32)),
-        renderer.outputs.getPtr(small_key).?.submission.work_capacity,
+        renderer.outputs.getPtr(small_key).?.currentSubmission().work_capacity,
     );
     try std.testing.expectEqual(@as(u32, 0xff0a0b0c), small_pixels[0]);
 }
@@ -9672,22 +9755,32 @@ test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
 
     const target = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
     defer renderer.releaseOutput(.{ .offscreen = target.id });
-    if (renderer.outputs.getPtr(.{ .offscreen = target.id }).?.submission.timestamp_query_pool == .null_handle) {
+    if (renderer.outputs.getPtr(.{ .offscreen = target.id }).?.submissions[0].timestamp_query_pool == .null_handle) {
         return error.SkipZigTest;
     }
     const frame: render.Frame = .{
         .size = target.size,
         .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
     };
+    // A frame's timing is collected when its ring slot is drained for
+    // reuse, so results lag by the ring depth instead of one frame.
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 17);
     try std.testing.expect(renderer.takeGpuTiming() == null);
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 18);
+    try std.testing.expect(renderer.takeGpuTiming() == null);
+    // The third frame reuses frame 17's slot: it collects that timing and
+    // replays the cached command buffer recorded for the identical frame.
+    _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 19);
     const first_timing = renderer.takeGpuTiming().?;
     try std.testing.expectEqual(@as(u64, 17), first_timing.tag);
     try std.testing.expect(first_timing.pass_timings_available);
-    try renderer.renderFrame(frame, .{ .offscreen = target });
+    try std.testing.expect(renderer.takeGpuTiming() == null);
+    try renderer.drainAllPending();
+    const second_timing = renderer.takeGpuTiming().?;
+    try std.testing.expectEqual(@as(u64, 18), second_timing.tag);
+    try std.testing.expect(second_timing.pass_timings_available);
     const cached_timing = renderer.takeGpuTiming().?;
-    try std.testing.expectEqual(@as(u64, 18), cached_timing.tag);
+    try std.testing.expectEqual(@as(u64, 19), cached_timing.tag);
     try std.testing.expect(cached_timing.pass_timings_available);
     try std.testing.expect(renderer.takeGpuTiming() == null);
 }
@@ -9709,19 +9802,59 @@ test "Vulkan renderer keeps independent output submissions in flight" {
     };
 
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = first }, null);
-    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.currentSubmission().fence_pending);
 
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = second }, null);
-    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
-    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.fence_pending);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.currentSubmission().fence_pending);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = second.id }).?.currentSubmission().fence_pending);
     try std.testing.expect(
-        renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.instance_buffer !=
-            renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.instance_buffer,
+        renderer.outputs.getPtr(.{ .offscreen = first.id }).?.currentSubmission().instance_buffer !=
+            renderer.outputs.getPtr(.{ .offscreen = second.id }).?.currentSubmission().instance_buffer,
     );
 
     try renderer.drainAllPending();
-    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
-    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.fence_pending);
+    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = first.id }).?.currentSubmission().fence_pending);
+    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = second.id }).?.currentSubmission().fence_pending);
+}
+
+test "Vulkan settles in-flight frames before destroying backdrop caches" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const target = try renderer.createOffscreenTarget(.{ .width = 4, .height = 1 });
+    defer renderer.releaseOutput(.{ .offscreen = target.id });
+    const blur_commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 1, .y = 0, .width = 2, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+    // The scanout submission for an offscreen target stays in flight, so the
+    // next frame must settle it before destroying the now-surplus backdrop
+    // caches its commands may still sample.
+    _ = try renderer.renderFrameScanout(.{
+        .size = target.size,
+        .commands = &blur_commands,
+    }, .{ .offscreen = target }, null);
+    const plain_commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(9, 9, 9, 255) },
+    };
+    _ = try renderer.renderFrameScanout(.{
+        .size = target.size,
+        .commands = &plain_commands,
+    }, .{ .offscreen = target }, null);
+    const output = renderer.outputs.getPtr(.{ .offscreen = target.id }).?;
+    try std.testing.expectEqual(@as(usize, 0), output.backdrop_cache.items.len);
+    try renderer.drainAllPending();
 }
 
 test "GPU timing plan includes only executed backdrop blur passes" {
