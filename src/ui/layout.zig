@@ -821,11 +821,16 @@ fn layoutElementInto(
             var height = @min(available_height, content_height);
             state.viewport_height = height;
 
+            const follow_end_pending = state.follow_end_pending;
+            state.follow_end_pending = false;
+
             // Follow the controlled selection: when it changes (or first
             // appears), scroll the minimum distance to bring the item
             // fully into view. Free scrolling in between is left alone.
+            var selection_changed = false;
             if (list_widget.selected) |selected| {
                 if (state.last_selected != selected and selected < list_widget.item_count) {
+                    selection_changed = true;
                     const top = state.itemStart(list_widget, selected);
                     const bottom = top + state.itemExtent(list_widget, selected);
                     state.follow_alignment = null;
@@ -840,21 +845,26 @@ fn layoutElementInto(
                 state.last_selected = selected;
             } else {
                 state.last_selected = null;
-                state.follow_alignment = null;
+                if (state.follow_alignment != .end) state.follow_alignment = null;
             }
+            if (follow_end_pending and !selection_changed) state.follow_alignment = .end;
 
-            // Keep the selected edge anchored while estimates converge. The
-            // anchor is cleared as soon as the measured window stabilizes,
-            // after which an unchanged selection never fights free scrolling.
+            // Keep the selected edge or followed list end anchored while
+            // estimates converge. The anchor clears once the measured window
+            // stabilizes, so an unchanged selection never fights free scrolling.
             if (state.follow_alignment) |alignment| {
-                if (list_widget.selected) |selected| {
-                    if (selected < list_widget.item_count) {
-                        const top = state.itemStart(list_widget, selected);
-                        state.offset = switch (alignment) {
-                            .top => top,
-                            .bottom => top + state.itemExtent(list_widget, selected) - height,
-                        };
-                    }
+                switch (alignment) {
+                    .end => state.offset = content_height - height,
+                    .top, .bottom => if (list_widget.selected) |selected| {
+                        if (selected < list_widget.item_count) {
+                            const top = state.itemStart(list_widget, selected);
+                            state.offset = switch (alignment) {
+                                .top => top,
+                                .bottom => top + state.itemExtent(list_widget, selected) - height,
+                                .end => unreachable,
+                            };
+                        }
+                    },
                 }
             }
 
@@ -885,14 +895,18 @@ fn layoutElementInto(
                 height = @min(measured_available, content_height);
                 state.viewport_height = height;
                 if (state.follow_alignment) |alignment| {
-                    if (list_widget.selected) |selected| {
-                        if (selected < list_widget.item_count) {
-                            const top = state.itemStart(list_widget, selected);
-                            state.offset = switch (alignment) {
-                                .top => top,
-                                .bottom => top + state.itemExtent(list_widget, selected) - height,
-                            };
-                        }
+                    switch (alignment) {
+                        .end => state.offset = content_height - height,
+                        .top, .bottom => if (list_widget.selected) |selected| {
+                            if (selected < list_widget.item_count) {
+                                const top = state.itemStart(list_widget, selected);
+                                state.offset = switch (alignment) {
+                                    .top => top,
+                                    .bottom => top + state.itemExtent(list_widget, selected) - height,
+                                    .end => unreachable,
+                                };
+                            }
+                        },
                     }
                 } else if (scroll_anchor) |anchor| {
                     state.restoreScrollAnchor(list_widget, anchor);
@@ -908,11 +922,13 @@ fn layoutElementInto(
                 }
             }
 
-            // A drifted window is rebuilt by the next dirty-state pass.
+            // Rebuild a drifted window or keep converging a followed edge.
             const ideal = listVisibleRange(list_widget, state, state.offset, height);
             const window_stale = ideal.first != state.first or ideal.count != state.built;
-            state.range_stale = window_stale;
-            if (!window_stale) state.follow_alignment = null;
+            const follow_stale = geometry_changed and state.follow_alignment != null;
+            state.range_stale = window_stale or follow_stale;
+            if (!state.range_stale) state.follow_alignment = null;
+            state.content_extent = content_height;
 
             const width = if (std.math.isFinite(constraints.max_width)) constraints.max_width else content_width;
             const viewport = constraints.clamp(.{ .width = width, .height = height });

@@ -652,6 +652,7 @@
 ---@field count?       integer                             Defaults to zero.
 ---@field item_height? number                              Fixed item height. Omit to lazily measure variable-height items.
 ---@field selected?    integer                             One-based; nil or zero means no selection.
+---@field follow_end?  boolean                             Follow appends while already scrolled to the end.
 ---@field build_item   fun(index: integer): keywork.Widget
 
 ---@class keywork.LinearOptions

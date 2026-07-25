@@ -1077,6 +1077,7 @@ function ui.list(options)
         count = options.count,
         item_height = options.item_height,
         selected = options.selected,
+        follow_end = options.follow_end,
         build_item = options.build_item,
     }
 end

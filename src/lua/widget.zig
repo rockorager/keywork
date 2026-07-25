@@ -936,6 +936,7 @@ pub fn parse(
             count: usize = 0,
             item_height: ?f32 = null,
             selected: ?usize = null,
+            follow_end: bool = false,
         };
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const options = try lua_codec.decode(ListOptions, lua_state, table, allocator);
@@ -957,6 +958,7 @@ pub fn parse(
         if (options.selected) |selected| {
             if (selected >= 1) list_widget.list.selected = selected - 1;
         }
+        list_widget.list.follow_end = options.follow_end;
         return list_widget;
     }
     if (std.mem.eql(u8, kind, "spacer")) {

@@ -314,6 +314,10 @@ pub const Widget = union(enum) {
         /// layout, the list scrolls the minimum distance to bring the
         /// item fully into view. Selection state itself lives in the app.
         selected: ?usize = null,
+        /// Follow appended items while the viewport is already at the end.
+        /// Scrolling away from the end suspends following until the user
+        /// returns there.
+        follow_end: bool = false,
         scrollbar_track_color: ?Color = null,
         scrollbar_color: ?Color = null,
     };
@@ -1329,7 +1333,7 @@ pub fn scrollState(element: *Element) *ScrollState {
 /// matches the offset/viewport; the runtime schedules another dirty-state
 /// pass to rebuild it.
 pub const ListState = struct {
-    const FollowAlignment = enum { top, bottom };
+    const FollowAlignment = enum { top, bottom, end };
 
     pub const ScrollAnchor = struct {
         index: usize,
@@ -1345,6 +1349,8 @@ pub const ListState = struct {
     /// triggers the follow scroll, so free scrolling in between is left
     /// alone.
     last_selected: ?usize = null,
+    content_extent: f32 = 0,
+    follow_end_pending: bool = false,
     /// Variable-height lists retain measured extents by absolute item index.
     /// Values from an old width remain useful estimates after reflow, while
     /// measured marks values authoritative at measured_width.
@@ -1370,6 +1376,14 @@ pub const ListState = struct {
     /// tree walks pass null because flex layout may narrow their constraints.
     /// Fixed-height lists never allocate this cache.
     pub fn prepare(self: *ListState, allocator: std.mem.Allocator, list_widget: Widget.List, width: ?f32) !void {
+        const at_end = self.content_extent == 0 or self.offset + self.viewport_height >= self.content_extent - 0.5;
+        if (!list_widget.follow_end) {
+            self.follow_end_pending = false;
+            if (self.follow_alignment == .end) self.follow_alignment = null;
+        } else if (at_end) {
+            self.follow_end_pending = true;
+        }
+
         if (list_widget.item_extent != null) {
             if (self.heights.capacity != 0 or self.prefix.capacity != 0 or self.measured.bit_length != 0 or self.ever_measured.bit_length != 0) {
                 self.heights.deinit(allocator);
@@ -2843,7 +2857,8 @@ fn widgetLayoutEqual(a: Widget, b: Widget) bool {
         .scroll => |scroll| scroll.axes == b.scroll.axes,
         .list => |list| list.item_count == b.list.item_count and
             list.item_extent == b.list.item_extent and
-            list.selected == b.list.selected,
+            list.selected == b.list.selected and
+            list.follow_end == b.list.follow_end,
         .text_input => |a_input| blk: {
             const b_input = b.text_input;
             break :blk std.mem.eql(u8, a_input.placeholder, b_input.placeholder) and
@@ -3208,6 +3223,7 @@ fn cloneWidgetForElement(allocator: std.mem.Allocator, widget: Widget) !Widget {
                 .item_extent = list_widget.item_extent,
                 .build_item = builder,
                 .selected = list_widget.selected,
+                .follow_end = list_widget.follow_end,
                 .scrollbar_track_color = list_widget.scrollbar_track_color,
                 .scrollbar_color = list_widget.scrollbar_color,
             } };
@@ -3771,14 +3787,15 @@ test "list follows controlled selection and leaves free scrolling alone" {
     const items: TestListItems = .{};
     var list_widget = widgets.list("select-list", 100, 16, items.builder());
     list_widget.list.selected = 10;
+    list_widget.list.follow_end = true;
     const constraints: Constraints = .{ .max_width = 100, .max_height = 48 };
 
     var scope: BuildScope = .{ .allocator = build_arena.allocator() };
     var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
     defer destroyElementTree(retained_allocator, &element);
 
-    // The initial selection scrolls into view on the first layout: item
-    // 10's bottom lands at the viewport bottom.
+    // The initial selection takes precedence over end following: item 10's
+    // bottom lands at the viewport bottom.
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
     const state = listState(&element);
     try std.testing.expectEqual(@as(f32, 11 * 16 - 48), state.offset);
@@ -3923,6 +3940,48 @@ test "variable-height list follows appends then preserves free scrolling" {
     _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
     const appended_bottom = state.itemStart(element.widget.list, heights.len - 1) + state.itemExtent(element.widget.list, heights.len - 1);
     try std.testing.expectApproxEqAbs(appended_bottom, state.offset + constraints.max_height, 0.01);
+}
+
+test "variable-height list follows appends only while pinned to the end" {
+    const retained_allocator = std.testing.allocator;
+    var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
+    defer build_arena.deinit();
+
+    const heights = [_]f32{ 12, 24, 18, 36, 20, 28, 16, 40, 22, 30, 26, 44, 32, 20 };
+    const items: VariableListItems = .{ .heights = &heights };
+    var list_widget = widgets.list("follow-end", 11, null, items.builder());
+    list_widget.list.follow_end = true;
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 50 };
+
+    var scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    var element = try buildElementTreeScoped(retained_allocator, &scope, &list_widget, constraints);
+    defer destroyElementTree(retained_allocator, &element);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+
+    const state = listState(&element);
+    try std.testing.expectApproxEqAbs(state.contentExtent(element.widget.list), state.offset + constraints.max_height, 0.01);
+
+    // Appending while the user is reading history preserves their anchor.
+    state.offset = 20;
+    _ = dirtyScrollElement(&element, "follow-end");
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    var appended_widget = widgets.list("follow-end", 12, null, items.builder());
+    appended_widget.list.follow_end = true;
+    var update_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try updateElementTreeScoped(retained_allocator, &update_scope, &element, &appended_widget, constraints);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), state.offset, 0.01);
+
+    // Once the user returns to the end, the next append remains pinned.
+    state.offset = state.contentExtent(element.widget.list) - constraints.max_height;
+    _ = dirtyScrollElement(&element, "follow-end");
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    var pinned_widget = widgets.list("follow-end", heights.len, null, items.builder());
+    pinned_widget.list.follow_end = true;
+    var pinned_scope: BuildScope = .{ .allocator = build_arena.allocator() };
+    try updateElementTreeScoped(retained_allocator, &pinned_scope, &element, &pinned_widget, constraints);
+    _ = try convergeTestList(retained_allocator, build_arena.allocator(), &element, constraints);
+    try std.testing.expectApproxEqAbs(state.contentExtent(element.widget.list), state.offset + constraints.max_height, 0.01);
 }
 
 test "variable-height cache resizes through empty lists" {
