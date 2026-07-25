@@ -98,6 +98,11 @@ dmabuf_source_formats: []render.DmabufFormatModifier,
 dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
+// Semaphores previously imported from DMA-BUF sync files, ready for reuse.
+// A semaphore enters the pool only after its owning submission's fence has
+// signaled, so its temporary payload has been consumed and a new sync file
+// may be imported over the restored permanent state.
+wait_semaphore_pool: std.ArrayList(vk.Semaphore) = .empty,
 calibrations: std.AutoHashMapUnmanaged(u64, CalibrationTexture) = .empty,
 video_graphics: std.AutoHashMapUnmanaged(VideoGraphicsKey, VideoGraphics) = .empty,
 frame_number: u64,
@@ -2190,6 +2195,10 @@ pub fn deinit(self: *Self) void {
     self.releaseAllPendingAfterDeviceIdle();
     self.fallback.deinit();
     self.destroyCachedResources();
+    for (self.wait_semaphore_pool.items) |semaphore| {
+        self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+    }
+    self.wait_semaphore_pool.deinit(self.allocator);
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
     if (self.dmabuf_sampled_modifiers.len != 0) self.allocator.free(self.dmabuf_sampled_modifiers);
     if (self.dmabuf_10bit_modifiers.len != 0) self.allocator.free(self.dmabuf_10bit_modifiers);
@@ -2736,6 +2745,9 @@ fn drainSubmission(self: *Self, submission: *Submission) Error!void {
     }
     submission.fence_pending = false;
     self.finishPendingGpuTiming(submission);
+    // The fence has signaled, so the imported temporary payloads have been
+    // consumed and the semaphores can be reused for later imports.
+    self.recyclePendingWaitSemaphores(submission);
     self.releasePendingResources(submission);
 }
 
@@ -2874,6 +2886,28 @@ fn releasePendingResources(self: *Self, submission: *Submission) void {
     submission.pending_wait_semaphores.clearRetainingCapacity();
     for (submission.pending_textures.items) |texture| self.destroyTexture(texture);
     submission.pending_textures.clearRetainingCapacity();
+}
+
+/// Acquires a semaphore suitable for importing a DMA-BUF sync file,
+/// reusing a pooled one when available.
+fn acquireWaitSemaphore(self: *Self) !vk.Semaphore {
+    if (self.wait_semaphore_pool.pop()) |semaphore| return semaphore;
+    return self.device_wrapper.createSemaphore(self.device, &.{}, null);
+}
+
+/// Returns an imported wait semaphore to the pool. Only call this once the
+/// semaphore's temporary payload has been waited on (or was never set).
+fn recycleWaitSemaphore(self: *Self, semaphore: vk.Semaphore) void {
+    self.wait_semaphore_pool.append(self.allocator, semaphore) catch {
+        self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+    };
+}
+
+fn recyclePendingWaitSemaphores(self: *Self, submission: *Submission) void {
+    for (submission.pending_wait_semaphores.items) |semaphore| {
+        self.recycleWaitSemaphore(semaphore);
+    }
+    submission.pending_wait_semaphores.clearRetainingCapacity();
 }
 
 fn disableScanoutSynchronization(self: *Self) void {
@@ -4193,7 +4227,7 @@ fn renderFrameWithCompletion(
                 if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
                 break :plane_waits;
             };
-            const semaphore = self.device_wrapper.createSemaphore(self.device, &.{}, null) catch {
+            const semaphore = self.acquireWaitSemaphore() catch {
                 _ = std.c.close(sync_fd);
                 if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
                 if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
@@ -4206,7 +4240,9 @@ fn renderFrameWithCompletion(
                 .fd = sync_fd,
             }) catch {
                 _ = std.c.close(sync_fd);
-                self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+                // The import failed, so no payload was attached and the
+                // semaphore can safely return to the pool.
+                self.recycleWaitSemaphore(semaphore);
                 if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
                 if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
                 break :plane_waits;
@@ -9815,6 +9851,22 @@ test "Vulkan renderer keeps independent output submissions in flight" {
     try renderer.drainAllPending();
     try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = first.id }).?.currentSubmission().fence_pending);
     try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = second.id }).?.currentSubmission().fence_pending);
+}
+
+test "Vulkan reuses recycled DMA-BUF wait semaphores" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const first = try renderer.acquireWaitSemaphore();
+    renderer.recycleWaitSemaphore(first);
+    try std.testing.expectEqual(@as(usize, 1), renderer.wait_semaphore_pool.items.len);
+    const second = try renderer.acquireWaitSemaphore();
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(usize, 0), renderer.wait_semaphore_pool.items.len);
+    renderer.recycleWaitSemaphore(second);
 }
 
 test "Vulkan settles in-flight frames before destroying backdrop caches" {
