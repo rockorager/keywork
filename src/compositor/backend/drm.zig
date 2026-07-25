@@ -95,6 +95,10 @@ logical_x: i32,
 logical_y: i32,
 refresh_nanoseconds: u32,
 presentation_clock_id: u32,
+// Monotonic timestamp of the most recent vsync page flip, used to predict
+// the next vblank. Null until a vsync flip completes on a monotonic DRM
+// presentation clock, and reset whenever the mode timing changes.
+last_vblank_nanoseconds: ?i96,
 acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
@@ -447,6 +451,7 @@ pub fn init(
         .logical_y = 0,
         .refresh_nanoseconds = presentation.nominal_refresh_nanoseconds,
         .presentation_clock_id = presentation.monotonic_clock_id,
+        .last_vblank_nanoseconds = null,
         .acquired = null,
         .pending = null,
         .displayed = null,
@@ -662,6 +667,76 @@ pub fn refreshMillihertz(self: *const Self) i32 {
     return @intCast(@min(
         @as(u64, self.mode.vrefresh) * 1000,
         std.math.maxInt(i32),
+    ));
+}
+
+/// Predicts the monotonic timestamp of the next vblank strictly after
+/// `now_nanoseconds`. Returns null when no trustworthy anchor exists: no
+/// vsync flip observed yet, a non-monotonic DRM presentation clock, or an
+/// anchor stale enough that nominal-refresh extrapolation would drift.
+pub fn nextVblankNanoseconds(self: *const Self, now_nanoseconds: i96) ?i96 {
+    if (self.presentation_clock_id != presentation.monotonic_clock_id) return null;
+    const last = self.last_vblank_nanoseconds orelse return null;
+    return predictNextVblank(last, now_nanoseconds, self.refresh_nanoseconds);
+}
+
+/// The prediction extrapolates the nominal refresh period, so its error
+/// grows with every period since the anchor; beyond this age the actual
+/// mode clock may have drifted several milliseconds from nominal.
+const vblank_anchor_stale_nanoseconds = std.time.ns_per_s;
+
+fn predictNextVblank(
+    last_vblank_nanoseconds: i96,
+    now_nanoseconds: i96,
+    refresh_nanoseconds: u32,
+) ?i96 {
+    if (refresh_nanoseconds == 0) return null;
+    if (now_nanoseconds < last_vblank_nanoseconds) return null;
+    const elapsed = now_nanoseconds - last_vblank_nanoseconds;
+    if (elapsed > vblank_anchor_stale_nanoseconds) return null;
+    const interval: i96 = refresh_nanoseconds;
+    const periods = @divTrunc(elapsed, interval) + 1;
+    return last_vblank_nanoseconds + periods * interval;
+}
+
+test "next vblank prediction advances whole refresh periods" {
+    try std.testing.expectEqual(@as(?i96, 1_016_666_666), predictNextVblank(
+        1_000_000_000,
+        1_005_000_000,
+        16_666_666,
+    ));
+    // An elapsed time of several periods still lands on the cadence.
+    try std.testing.expectEqual(@as(?i96, 1_066_666_664), predictNextVblank(
+        1_000_000_000,
+        1_055_000_000,
+        16_666_666,
+    ));
+    // A query at the anchor instant predicts the following vblank.
+    try std.testing.expectEqual(@as(?i96, 1_016_666_666), predictNextVblank(
+        1_000_000_000,
+        1_000_000_000,
+        16_666_666,
+    ));
+}
+
+test "next vblank prediction rejects stale or invalid anchors" {
+    // Anchor older than the staleness cutoff.
+    try std.testing.expectEqual(@as(?i96, null), predictNextVblank(
+        1_000_000_000,
+        2_100_000_000,
+        16_666_666,
+    ));
+    // Clock inversion.
+    try std.testing.expectEqual(@as(?i96, null), predictNextVblank(
+        1_000_000_000,
+        999_999_999,
+        16_666_666,
+    ));
+    // Unknown refresh period.
+    try std.testing.expectEqual(@as(?i96, null), predictNextVblank(
+        1_000_000_000,
+        1_005_000_000,
+        0,
     ));
 }
 
@@ -1308,6 +1383,9 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     } else {
         self.presentation_clock_id = @intCast(@intFromEnum(std.posix.CLOCK.REALTIME));
     }
+    // Reactivation restarts the CRTC, so a pre-release flip timestamp no
+    // longer describes the new scanout phase even if it is recent.
+    self.last_vblank_nanoseconds = null;
 
     self.old_crtc = c.drmModeGetCrtc(fd, self.crtc_id);
     if (self.old_crtc == null) return error.GetCrtcFailed;
@@ -1570,6 +1648,8 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.powered = false;
     self.mode_set = false;
     self.displayed = null;
+    // Powering back on restarts scanout with a new vblank phase.
+    self.last_vblank_nanoseconds = null;
     self.releaseClientScanouts();
     self.scanout_framebuffer_cache.clear(fd);
     self.notifyDeactivated();
@@ -1615,6 +1695,9 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     self.mode = mode.value;
     self.size = size;
     self.refresh_nanoseconds = refreshNanoseconds(self.mode);
+    // Flip timestamps from the previous mode no longer predict this
+    // mode's vblank cadence.
+    self.last_vblank_nanoseconds = null;
 }
 
 pub fn gammaSize(self: *const Self) ?u32 {
@@ -1774,6 +1857,18 @@ fn handlePageFlip(
     if (self.overlay_displayed) |displayed| displayed.release();
     self.overlay_displayed = self.overlay_pending;
     self.overlay_pending = null;
+    if (page_flip == .vsync and
+        self.presentation_clock_id == presentation.monotonic_clock_id)
+    {
+        self.last_vblank_nanoseconds = @as(i96, seconds) * std.time.ns_per_s +
+            @as(i96, microseconds) * std.time.ns_per_us;
+    } else {
+        // A tearing flip signals that the client wants minimal latency, so
+        // stop delaying repaints toward vblank while tearing is active. Its
+        // timestamp also completes off the vblank cadence, and a
+        // non-monotonic timestamp cannot anchor a monotonic prediction.
+        self.last_vblank_nanoseconds = null;
+    }
     const listener = self.listener orelse return;
     listener.presented(listener.context, .{
         .timestamp = .{

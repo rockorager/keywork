@@ -282,6 +282,22 @@ pub fn repaintIntervalNanoseconds(self: *const Self) ?u32 {
     };
 }
 
+/// Whether the backend can predict vblanks so repaints may be delayed
+/// toward the presentation deadline instead of starting immediately.
+pub fn supportsRepaintDelay(self: *const Self) bool {
+    return self.backend == .drm;
+}
+
+/// Predicted monotonic timestamp of the next vblank strictly after
+/// `now_nanoseconds`, or null when the backend cannot make a trustworthy
+/// prediction and the caller must repaint immediately.
+pub fn nextVblankNanoseconds(self: *const Self, now_nanoseconds: i96) ?i96 {
+    return switch (self.backend) {
+        .drm => |output| output.nextVblankNanoseconds(now_nanoseconds),
+        .headless, .nested => null,
+    };
+}
+
 pub fn presentationClockId(self: *const Self) u32 {
     return switch (self.backend) {
         .drm => |output| output.presentation_clock_id,

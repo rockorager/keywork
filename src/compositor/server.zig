@@ -262,6 +262,7 @@ const RenderOutput = struct {
     lock_frame_pending: bool,
     consecutive_output_busy_retries: u8,
     frame_statistics: FrameStatistics,
+    render_budget: RenderBudget,
     request_started_nanoseconds: ?i96,
     frame_callback_deadline_nanoseconds: ?i96,
     repaint_deadline_nanoseconds: ?i96,
@@ -278,12 +279,16 @@ const RenderOutput = struct {
         self.repaint_needed = true;
     }
 
-    fn beginFrame(self: *RenderOutput) void {
+    /// `render_start_nanoseconds` must be captured when frame production
+    /// begins, before transition processing and cursor preparation, so the
+    /// repaint-delay budget covers everything between the repaint timer
+    /// firing and the frame being ready for the vblank.
+    fn beginFrame(self: *RenderOutput, render_start_nanoseconds: i96) void {
         std.debug.assert(self.pending_frame == null);
-        const now = nowNanoseconds(self.server.io);
         self.pending_frame = .{
-            .request_nanoseconds = self.request_started_nanoseconds orelse now,
-            .render_nanoseconds = now,
+            .request_nanoseconds = self.request_started_nanoseconds orelse
+                render_start_nanoseconds,
+            .render_nanoseconds = render_start_nanoseconds,
         };
         self.request_started_nanoseconds = null;
         increment(&self.frame_statistics.frames_started);
@@ -301,6 +306,7 @@ const RenderOutput = struct {
         std.debug.assert(path == .composited or scanout_format != null);
         pending.commit_nanoseconds = nowNanoseconds(self.server.io);
         pending.trackRenderFence(render_fence_fd);
+        pending.path = path;
         self.consecutive_output_busy_retries = 0;
         self.frame_statistics.recordFrame(path, scanout_format, damage);
         if (self.cursor_state == .activating or self.cursor_state == .deactivating) {
@@ -338,6 +344,11 @@ const RenderOutput = struct {
         if (pending.render_fence_fd) |fd| {
             pending.render_completion_nanoseconds = syncFileSignalNanoseconds(fd);
         }
+        const refresh_nanoseconds = presentationRefreshNanoseconds(
+            info,
+            self.backend.refreshMillihertz(),
+        );
+        self.recordRenderBudget(&pending, presented_nanoseconds, refresh_nanoseconds);
         self.frame_statistics.recordPresentation(
             .{
                 .request_nanoseconds = pending.request_nanoseconds,
@@ -346,8 +357,30 @@ const RenderOutput = struct {
                 .render_completion_nanoseconds = pending.render_completion_nanoseconds,
             },
             presented_nanoseconds,
-            presentationRefreshNanoseconds(info, self.backend.refreshMillihertz()),
+            refresh_nanoseconds,
         );
+    }
+
+    /// Feeds the repaint-delay budget from a presented frame.
+    fn recordRenderBudget(
+        self: *RenderOutput,
+        pending: *const PendingFrame,
+        presented_nanoseconds: i96,
+        refresh_nanoseconds: u64,
+    ) void {
+        const completion = pending.render_completion_nanoseconds;
+        const commit = pending.commit_nanoseconds orelse unreachable;
+        switch (renderBudgetUpdate(
+            pending.path orelse unreachable,
+            pending.render_nanoseconds,
+            if (completion) |signal| @max(signal, commit) else null,
+            presented_nanoseconds,
+            refresh_nanoseconds,
+        )) {
+            .ignore => {},
+            .reset => self.render_budget.reset(),
+            .sample => |duration| self.render_budget.record(duration),
+        }
     }
 
     fn discardFrame(self: *RenderOutput) void {
@@ -379,6 +412,7 @@ const PendingFrame = struct {
     commit_nanoseconds: ?i96 = null,
     render_fence_fd: ?std.posix.fd_t = null,
     render_completion_nanoseconds: ?i96 = null,
+    path: ?FramePath = null,
 
     fn trackRenderFence(self: *PendingFrame, render_fence_fd: ?std.posix.fd_t) void {
         const fd = render_fence_fd orelse return;
@@ -446,6 +480,99 @@ fn outputRefreshNanoseconds(refresh_millihertz: i32) u64 {
     return (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
 }
 
+/// Rolling worst case of recent composited render durations, from render
+/// start to GPU completion. Determines how long a repaint may be delayed
+/// toward the next vblank without risking a missed deadline.
+const RenderBudget = struct {
+    samples: [sample_capacity]u64 = undefined,
+    count: usize = 0,
+    next: usize = 0,
+
+    const sample_capacity = 32;
+
+    fn record(self: *RenderBudget, duration_nanoseconds: u64) void {
+        self.samples[self.next] = duration_nanoseconds;
+        self.next = (self.next + 1) % sample_capacity;
+        self.count = @min(self.count + 1, sample_capacity);
+    }
+
+    fn reset(self: *RenderBudget) void {
+        self.count = 0;
+        self.next = 0;
+    }
+
+    /// Worst duration in the window, or null until the window is full so
+    /// a few fast frames cannot understate the budget.
+    fn budgetNanoseconds(self: *const RenderBudget) ?u64 {
+        if (self.count < sample_capacity) return null;
+        var maximum: u64 = 0;
+        for (self.samples[0..self.count]) |sample| maximum = @max(maximum, sample);
+        return maximum;
+    }
+};
+
+/// Deadline misses beyond the refresh period by more than this clear the
+/// repaint-delay budget. Matches the frame statistics over-budget tolerance.
+const repaint_miss_tolerance_nanoseconds = std.time.ns_per_ms;
+
+const RenderBudgetUpdate = union(enum) {
+    ignore,
+    reset,
+    sample: u64,
+};
+
+/// Decides how a presented frame updates the repaint-delay budget. Any
+/// frame that missed its deadline resets the budget so a stale estimate
+/// cannot keep causing misses. Frames that render the primary plane
+/// contribute a sample from render start until the frame is ready for the
+/// vblank: the later of GPU completion and DRM commit. Direct scanout
+/// performs no rendering and cannot sample, and a frame without a ready
+/// timestamp inside the render-to-presentation interval resets the budget
+/// because delays would be flying blind.
+fn renderBudgetUpdate(
+    path: FramePath,
+    render_nanoseconds: i96,
+    ready_nanoseconds: ?i96,
+    presented_nanoseconds: i96,
+    refresh_nanoseconds: u64,
+) RenderBudgetUpdate {
+    const render_to_presentation = presented_nanoseconds - render_nanoseconds;
+    if (render_to_presentation >
+        @as(i96, refresh_nanoseconds +| repaint_miss_tolerance_nanoseconds))
+    {
+        return .reset;
+    }
+    if (path == .direct_scanout) return .ignore;
+    const ready = ready_nanoseconds orelse return .reset;
+    if (ready < render_nanoseconds or ready > presented_nanoseconds) return .reset;
+    return .{ .sample = @intCast(ready - render_nanoseconds) };
+}
+
+/// Subtracted from the predicted vblank deadline to absorb timer
+/// granularity, scheduler wakeup latency, and budget estimation error.
+const repaint_delay_margin_nanoseconds = 2 * std.time.ns_per_ms;
+
+/// Delays shorter than this are not worth a timer round-trip; rendering
+/// starts immediately as before.
+const minimum_repaint_delay_milliseconds = 2;
+
+/// Milliseconds to wait before starting a repaint so that rendering
+/// completes just ahead of the predicted vblank, or null when the frame
+/// should start immediately.
+fn repaintDelayFromDeadline(
+    now_nanoseconds: i96,
+    next_vblank_nanoseconds: i96,
+    render_budget_nanoseconds: u64,
+) ?i32 {
+    const start_deadline = next_vblank_nanoseconds -
+        @as(i96, render_budget_nanoseconds) - repaint_delay_margin_nanoseconds;
+    if (start_deadline <= now_nanoseconds) return null;
+    // Round down so rendering starts early rather than past the deadline.
+    const delay = @divTrunc(start_deadline - now_nanoseconds, std.time.ns_per_ms);
+    if (delay < minimum_repaint_delay_milliseconds) return null;
+    return @intCast(@min(delay, std.math.maxInt(i32)));
+}
+
 const PeriodicTimerSchedule = struct {
     deadline_nanoseconds: i96,
     delay_milliseconds: i32,
@@ -490,6 +617,103 @@ test "periodic output timer preserves fractional refresh phase" {
     const third = periodicTimerSchedule(17 * std.time.ns_per_ms, second.deadline_nanoseconds, interval);
     try std.testing.expectEqual(@as(i96, 24_999_999), third.deadline_nanoseconds);
     try std.testing.expectEqual(@as(i32, 8), third.delay_milliseconds);
+}
+
+test "repaint delay leaves the render budget and margin before vblank" {
+    // 16.7ms until vblank with a 4ms budget: start 2ms margin plus budget
+    // early, rounded down to whole milliseconds.
+    try std.testing.expectEqual(@as(?i32, 10), repaintDelayFromDeadline(
+        0,
+        16_700_000,
+        4 * std.time.ns_per_ms,
+    ));
+    // The budget consumes the whole period: render immediately.
+    try std.testing.expectEqual(@as(?i32, null), repaintDelayFromDeadline(
+        0,
+        16_700_000,
+        15 * std.time.ns_per_ms,
+    ));
+    // A sub-threshold delay is not worth the timer round-trip.
+    try std.testing.expectEqual(@as(?i32, null), repaintDelayFromDeadline(
+        0,
+        16_700_000,
+        13 * std.time.ns_per_ms,
+    ));
+    // A deadline already in the past renders immediately.
+    try std.testing.expectEqual(@as(?i32, null), repaintDelayFromDeadline(
+        20_000_000,
+        16_700_000,
+        std.time.ns_per_ms,
+    ));
+}
+
+test "render budget samples the later of GPU completion and commit" {
+    const refresh: u64 = 16_666_666;
+    // GPU completion after commit: the fence signal bounds the sample.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate{ .sample = 5 * std.time.ns_per_ms },
+        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, refresh, refresh),
+    );
+    // Overlay scanout still renders the primary plane and samples too.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate{ .sample = 4 * std.time.ns_per_ms },
+        renderBudgetUpdate(.overlay_scanout, 0, 4 * std.time.ns_per_ms, refresh, refresh),
+    );
+    // Direct scanout renders nothing and contributes no sample.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.ignore,
+        renderBudgetUpdate(.direct_scanout, 0, null, refresh, refresh),
+    );
+    // Unknown GPU completion disables delays rather than guessing.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.reset,
+        renderBudgetUpdate(.composited, 0, null, refresh, refresh),
+    );
+    // A ready timestamp outside render-to-presentation is untrustworthy.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.reset,
+        renderBudgetUpdate(.composited, 0, @as(i96, refresh) + 1, refresh, refresh),
+    );
+}
+
+test "render budget resets on a missed deadline regardless of frame path" {
+    const refresh: u64 = 16_666_666;
+    const late: i96 = @as(i96, refresh) + 2 * std.time.ns_per_ms;
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.reset,
+        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, late, refresh),
+    );
+    // Overlay and direct scanout misses must also invalidate a stale
+    // budget so delayed frames cannot keep missing the same vblank.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.reset,
+        renderBudgetUpdate(.overlay_scanout, 0, 5 * std.time.ns_per_ms, late, refresh),
+    );
+    try std.testing.expectEqual(
+        RenderBudgetUpdate.reset,
+        renderBudgetUpdate(.direct_scanout, 0, null, late, refresh),
+    );
+}
+
+test "render budget requires a full window and tracks the worst frame" {
+    var budget: RenderBudget = .{};
+    try std.testing.expectEqual(@as(?u64, null), budget.budgetNanoseconds());
+    for (0..RenderBudget.sample_capacity - 1) |_| budget.record(std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?u64, null), budget.budgetNanoseconds());
+    budget.record(3 * std.time.ns_per_ms);
+    try std.testing.expectEqual(
+        @as(?u64, 3 * std.time.ns_per_ms),
+        budget.budgetNanoseconds(),
+    );
+    // The worst sample eventually rolls out of the window.
+    for (0..RenderBudget.sample_capacity) |_| budget.record(2 * std.time.ns_per_ms);
+    try std.testing.expectEqual(
+        @as(?u64, 2 * std.time.ns_per_ms),
+        budget.budgetNanoseconds(),
+    );
+    // A reset disables delays until the window refills.
+    budget.reset();
+    try std.testing.expectEqual(@as(?u64, null), budget.budgetNanoseconds());
 }
 
 const RoutedKey = struct {
@@ -1610,6 +1834,7 @@ fn addRenderOutput(
         .lock_frame_pending = false,
         .consecutive_output_busy_retries = 0,
         .frame_statistics = .{},
+        .render_budget = .{},
         .request_started_nanoseconds = null,
         .frame_callback_deadline_nanoseconds = null,
         .repaint_deadline_nanoseconds = null,
@@ -1658,7 +1883,9 @@ fn addRenderOutput(
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
     errdefer stopRenderOutput(render_output);
-    if (render_output.backend.repaintIntervalNanoseconds() != null) {
+    if (render_output.backend.repaintIntervalNanoseconds() != null or
+        render_output.backend.supportsRepaintDelay())
+    {
         render_output.timer = try self.display.getEventLoop().addTimer(
             *RenderOutput,
             handleRenderTimer,
@@ -4207,8 +4434,17 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
             self.terminate();
             return;
         };
+    } else if (self.repaintDelayMilliseconds(output)) |delay_milliseconds| {
+        // Deferring the render toward the predicted vblank shortens the
+        // damage-to-presentation latency without missing the deadline.
+        const timer = output.timer orelse unreachable;
+        timer.timerUpdate(delay_milliseconds) catch |err| {
+            log.err("failed to schedule repaint: {t}", .{err});
+            self.terminate();
+            return;
+        };
     } else {
-        std.debug.assert(output.timer == null and output.repaint_idle == null);
+        std.debug.assert(output.repaint_idle == null);
         output.repaint_idle = self.display.getEventLoop().addIdle(
             *RenderOutput,
             handleRenderIdle,
@@ -4220,6 +4456,18 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
         };
     }
     output.render_scheduled = true;
+}
+
+/// Milliseconds to delay the pending repaint toward the next vblank, or
+/// null when the output must render immediately: the backend cannot predict
+/// vblanks, the render-cost window is not full, or the deadline is already
+/// too close.
+fn repaintDelayMilliseconds(self: *Self, output: *RenderOutput) ?i32 {
+    if (!output.backend.supportsRepaintDelay()) return null;
+    const budget = output.render_budget.budgetNanoseconds() orelse return null;
+    const now = nowNanoseconds(self.io);
+    const next_vblank = output.backend.nextVblankNanoseconds(now) orelse return null;
+    return repaintDelayFromDeadline(now, next_vblank, budget);
 }
 
 fn scheduleFrameCallback(self: *Self, output: *RenderOutput) void {
@@ -7463,7 +7711,10 @@ fn expandBackdropBlurDamage(
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
-    self.animation_now = nowNanoseconds(self.io);
+    // Frame production starts here: transition processing below may render
+    // window snapshots, so the repaint-delay budget must include it.
+    const render_start_nanoseconds = nowNanoseconds(self.io);
+    self.animation_now = render_start_nanoseconds;
     if (self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) {
         finishAllWindowTransitions(self);
     } else {
@@ -7531,7 +7782,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
         return;
     };
     errdefer render_output.backend.cancel();
-    render_output.beginFrame();
+    render_output.beginFrame(render_start_nanoseconds);
     errdefer render_output.clearPendingFrame();
     const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
