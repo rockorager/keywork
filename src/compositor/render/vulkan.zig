@@ -78,11 +78,13 @@ blur_composite_pipeline: vk.Pipeline,
 encode_pipeline: vk.Pipeline,
 encode_calibrated_pipeline: vk.Pipeline,
 sampler: vk.Sampler,
+memory_properties: vk.PhysicalDeviceMemoryProperties,
 instances: std.ArrayList(Instance) = .empty,
 draw_runs: std.ArrayList(DrawRun) = .empty,
 blur_ops: std.ArrayList(BlurOp) = .empty,
 frame_rects: std.ArrayList(render.Rect) = .empty,
 prepared_images: std.ArrayList(PreparedImage) = .empty,
+dmabuf_capabilities: std.AutoHashMapUnmanaged(DmabufCapabilityKey, DmabufCapability) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
 dmabuf_10bit_modifiers: []u64,
@@ -2085,6 +2087,9 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .device_wrapper = device_wrapper,
         .instance = instance,
         .physical_device = physical_device,
+        // Physical-device memory types are immutable; query them once instead
+        // of on every allocation.
+        .memory_properties = instance_wrapper.getPhysicalDeviceMemoryProperties(physical_device),
         .device = device,
         .queue = device_wrapper.getDeviceQueue(device, queue_family_index, 0),
         .queue_family_index = queue_family_index,
@@ -2183,6 +2188,7 @@ pub fn deinit(self: *Self) void {
     self.blur_ops.deinit(self.allocator);
     self.frame_rects.deinit(self.allocator);
     self.prepared_images.deinit(self.allocator);
+    self.dmabuf_capabilities.deinit(self.allocator);
     destroyGraphics(self.device_wrapper, self.device, .{
         .render_pass = self.render_pass,
         .scratch_render_pass = self.scratch_render_pass,
@@ -2520,6 +2526,46 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u
         (target_format == .a2r10g10b10_unorm_pack32 and self.output_10bit == null))
         return false;
 
+    const sampleable = self.dmabufTargetSampleable(format, modifier);
+    const capability = self.dmabufImportCapability(
+        target_format,
+        modifier,
+        dmabufTargetUsage(sampleable),
+    );
+    return capability.importable and
+        size.width <= capability.max_extent.width and
+        size.height <= capability.max_extent.height;
+}
+
+const DmabufCapabilityKey = struct {
+    format: vk.Format,
+    modifier: u64,
+    usage: vk.Flags,
+};
+
+const DmabufCapability = struct {
+    importable: bool,
+    max_extent: vk.Extent2D,
+};
+
+/// Returns whether a DMA-BUF image with this format, modifier, and usage can
+/// be imported and the maximum importable extent. Physical-device
+/// capabilities are immutable, so query results are cached for the
+/// renderer's lifetime; transient out-of-memory failures are not cached and
+/// report the image as not importable.
+fn dmabufImportCapability(
+    self: *Self,
+    format: vk.Format,
+    modifier: u64,
+    usage: vk.ImageUsageFlags,
+) DmabufCapability {
+    const key: DmabufCapabilityKey = .{
+        .format = format,
+        .modifier = modifier,
+        .usage = @bitCast(usage),
+    };
+    if (self.dmabuf_capabilities.get(key)) |capability| return capability;
+
     const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .drm_format_modifier = modifier,
         .sharing_mode = .exclusive,
@@ -2528,13 +2574,12 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u
         .p_next = &modifier_info,
         .handle_type = .{ .dma_buf_bit_ext = true },
     };
-    const sampleable = self.dmabufTargetSampleable(format, modifier);
     const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
         .p_next = &external_info,
-        .format = target_format,
+        .format = format,
         .type = .@"2d",
         .tiling = .drm_format_modifier_ext,
-        .usage = dmabufTargetUsage(sampleable),
+        .usage = usage,
     };
     var external_properties: vk.ExternalImageFormatProperties = .{
         .external_memory_properties = undefined,
@@ -2543,14 +2588,36 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u
         .p_next = &external_properties,
         .image_format_properties = undefined,
     };
+    const unsupported: DmabufCapability = .{
+        .importable = false,
+        .max_extent = .{ .width = 0, .height = 0 },
+    };
     self.instance_wrapper.getPhysicalDeviceImageFormatProperties2KHR(
         self.physical_device,
         &format_info,
         &format_properties,
-    ) catch return false;
+    ) catch |err| switch (err) {
+        error.OutOfHostMemory, error.OutOfDeviceMemory => return unsupported,
+        else => {
+            // A deterministic rejection such as FormatNotSupported.
+            self.cacheDmabufCapability(key, unsupported);
+            return unsupported;
+        },
+    };
     const maximum = format_properties.image_format_properties.max_extent;
-    return external_properties.external_memory_properties.external_memory_features.importable_bit and
-        size.width <= maximum.width and size.height <= maximum.height;
+    const capability: DmabufCapability = .{
+        .importable = external_properties.external_memory_properties
+            .external_memory_features.importable_bit,
+        .max_extent = .{ .width = maximum.width, .height = maximum.height },
+    };
+    self.cacheDmabufCapability(key, capability);
+    return capability;
+}
+
+fn cacheDmabufCapability(self: *Self, key: DmabufCapabilityKey, capability: DmabufCapability) void {
+    // Caching is an optimization; on allocation failure the capability is
+    // simply re-queried next time.
+    self.dmabuf_capabilities.put(self.allocator, key, capability) catch {};
 }
 
 fn dmabufTargetSampleable(self: *const Self, format: u32, modifier: u64) bool {
@@ -2583,36 +2650,14 @@ fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSou
     };
     if (std.mem.indexOfScalar(u64, modifiers, source.modifier) == null) return false;
 
-    const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
-        .drm_format_modifier = source.modifier,
-        .sharing_mode = .exclusive,
-    };
-    const external_info: vk.PhysicalDeviceExternalImageFormatInfo = .{
-        .p_next = &modifier_info,
-        .handle_type = .{ .dma_buf_bit_ext = true },
-    };
-    const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
-        .p_next = &external_info,
-        .format = source_format,
-        .type = .@"2d",
-        .tiling = .drm_format_modifier_ext,
-        .usage = .{ .sampled_bit = true },
-    };
-    var external_properties: vk.ExternalImageFormatProperties = .{
-        .external_memory_properties = undefined,
-    };
-    var format_properties: vk.ImageFormatProperties2 = .{
-        .p_next = &external_properties,
-        .image_format_properties = undefined,
-    };
-    self.instance_wrapper.getPhysicalDeviceImageFormatProperties2KHR(
-        self.physical_device,
-        &format_info,
-        &format_properties,
-    ) catch return false;
-    const maximum = format_properties.image_format_properties.max_extent;
-    return external_properties.external_memory_properties.external_memory_features.importable_bit and
-        size.width <= maximum.width and size.height <= maximum.height;
+    const capability = self.dmabufImportCapability(
+        source_format,
+        source.modifier,
+        .{ .sampled_bit = true },
+    );
+    return capability.importable and
+        size.width <= capability.max_extent.width and
+        size.height <= capability.max_extent.height;
 }
 
 fn releaseTarget(self: *Self, id: u64) void {
@@ -5583,8 +5628,8 @@ fn invalidatePreparedTextures(self: *Self, prepared_images: []const PreparedImag
     }
 }
 
-fn deviceMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
-    const properties = self.instance_wrapper.getPhysicalDeviceMemoryProperties(self.physical_device);
+fn deviceMemoryType(self: *const Self, memory_type_bits: u32) ?u32 {
+    const properties = self.memory_properties;
     var compatible: ?u32 = null;
     for (0..properties.memory_type_count) |index| {
         const index_u5: u5 = @intCast(index);
@@ -5713,8 +5758,8 @@ fn destroyInstanceBuffer(self: *Self, submission: *Submission) void {
     submission.instance_capacity = 0;
 }
 
-fn hostMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
-    const properties = self.instance_wrapper.getPhysicalDeviceMemoryProperties(self.physical_device);
+fn hostMemoryType(self: *const Self, memory_type_bits: u32) ?u32 {
+    const properties = self.memory_properties;
     var coherent: ?u32 = null;
     for (0..properties.memory_type_count) |index| {
         const index_u5: u5 = @intCast(index);
