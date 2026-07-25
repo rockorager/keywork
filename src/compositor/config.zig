@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const command = @import("command.zig");
+const theme = @import("theme.zig");
 const Command = command.Command;
 const Direction = command.Direction;
 const WindowTarget = command.WindowTarget;
@@ -178,12 +179,7 @@ pub const OutputRule = struct {
     settings: OutputSettings = .{},
 };
 
-pub const Color = struct {
-    red: u8,
-    green: u8,
-    blue: u8,
-    alpha: u8,
-};
+pub const Color = theme.Color;
 
 pub const GeneralSettings = struct {
     focus_follows_mouse: bool = true,
@@ -194,9 +190,9 @@ pub const GeneralSettings = struct {
     shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0x70 },
     focused_shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0xa0 },
     unfocused_border_width: u32 = 1,
-    unfocused_border_color: Color = .{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff },
+    unfocused_border_color: ?Color = null,
     focused_border_width: u32 = 1,
-    focused_border_color: Color = .{ .red = 0x28, .green = 0x70, .blue = 0xbd, .alpha = 0xff },
+    focused_border_color: ?Color = null,
 };
 
 pub const Snapshot = struct {
@@ -1346,9 +1342,9 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
     try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color);
     try std.testing.expectEqual(@as(u32, 2), snapshot.general.unfocused_border_width);
-    try std.testing.expectEqual(Color{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff }, snapshot.general.unfocused_border_color);
+    try std.testing.expectEqual(Color{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff }, snapshot.general.unfocused_border_color.?);
     try std.testing.expectEqual(@as(u32, 3), snapshot.general.focused_border_width);
-    try std.testing.expectEqual(Color{ .red = 0x7a, .green = 0xa2, .blue = 0xf7, .alpha = 0x80 }, snapshot.general.focused_border_color);
+    try std.testing.expectEqual(Color{ .red = 0x7a, .green = 0xa2, .blue = 0xf7, .alpha = 0x80 }, snapshot.general.focused_border_color.?);
 
     const invalid = try parse(std.testing.allocator, "[general]\nfocus-follows-mouse=sometimes\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid.diagnostic.problem);

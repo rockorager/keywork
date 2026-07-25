@@ -122,6 +122,9 @@ pub fn main(init: std.process.Init) !void {
         options.config_path,
     );
     server.setConfiguration(&configuration);
+    server.watchAppearance(
+        init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
+    );
 
     const interrupt = try server.eventLoop().addSignal(
         *Server,
@@ -492,7 +495,9 @@ test {
     _ = @import("window_manager/floating_placement.zig");
     _ = @import("window_manager/floating_resize.zig");
     _ = @import("builtin_keybindings.zig");
+    _ = @import("AppearanceClient.zig");
     _ = @import("config.zig");
+    _ = @import("theme.zig");
     _ = @import("launcher.zig");
     _ = @import("command.zig");
     _ = @import("input_manager.zig");

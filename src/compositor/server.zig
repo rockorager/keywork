@@ -86,6 +86,8 @@ const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
 const Command = @import("command.zig").Command;
 const Config = @import("config.zig");
+const AppearanceClient = @import("AppearanceClient.zig");
+const theme = @import("theme.zig");
 const input_configuration = @import("input_configuration.zig");
 const output_configuration = @import("output_configuration.zig");
 const Launcher = @import("launcher.zig");
@@ -112,7 +114,10 @@ io: std.Io,
 display: *wl.Server,
 control: Control,
 control_initialized: bool,
+appearance_client: AppearanceClient,
+appearance_client_initialized: bool,
 configuration: ?Config.Store,
+palette: theme.Palette,
 layer_shell_effects: Scene.Effects,
 layer_shell_border: ?Scene.Borders,
 session: Session,
@@ -633,7 +638,10 @@ pub fn createWithVirtualOutput(
         .display = display,
         .control = undefined,
         .control_initialized = false,
+        .appearance_client = undefined,
+        .appearance_client_initialized = false,
         .configuration = null,
+        .palette = theme.default_palette,
         .layer_shell_effects = Scene.default_effects,
         .layer_shell_border = null,
         .session = undefined,
@@ -1426,6 +1434,10 @@ pub fn configureXdgSessionStorage(
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    if (self.appearance_client_initialized) {
+        self.appearance_client.deinit();
+        self.appearance_client_initialized = false;
+    }
     if (self.control_initialized) {
         self.control.deinit();
         self.control_initialized = false;
@@ -2590,6 +2602,32 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
     self.control_initialized = true;
 }
 
+pub fn watchAppearance(self: *Self, runtime_directory: []const u8) void {
+    std.debug.assert(!self.appearance_client_initialized);
+    self.appearance_client.init(
+        self.allocator,
+        self.io,
+        self.eventLoop(),
+        .{ .context = self, .changed = appearanceChanged },
+        runtime_directory,
+    ) catch |err| {
+        log.info("Prefer appearance service unavailable; using built-in palette: {t}", .{err});
+        return;
+    };
+    self.appearance_client_initialized = true;
+}
+
+fn appearanceChanged(context: *anyopaque, scheme: theme.Scheme) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const palette = theme.builtIn(scheme);
+    if (std.meta.eql(self.palette, palette)) return;
+    self.palette = palette;
+    if (self.configuration) |*configuration| {
+        self.applyGeneralConfiguration(configuration.snapshot.general);
+    }
+    requestRepaint(self);
+}
+
 fn executeControlCommand(context: *anyopaque, command: Command) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.window_manager.execute(command);
@@ -2841,8 +2879,14 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
 }
 
 fn applyWindowBorders(self: *Self, general: Config.GeneralSettings) void {
-    const unfocused = windowBorder(general.unfocused_border_width, general.unfocused_border_color);
-    const focused = windowBorder(general.focused_border_width, general.focused_border_color);
+    const unfocused = windowBorder(
+        general.unfocused_border_width,
+        general.unfocused_border_color orelse self.palette.unfocused_border,
+    );
+    const focused = windowBorder(
+        general.focused_border_width,
+        general.focused_border_color orelse self.palette.focused_border,
+    );
     self.window_manager.setWindowBorders(unfocused, focused);
     if (std.meta.eql(self.layer_shell_border, unfocused)) return;
     self.layer_shell_border = unfocused;
@@ -2854,8 +2898,12 @@ fn windowBorder(width: u32, color: Config.Color) ?Scene.Borders {
     return .{
         .edges = .{ .top = true, .bottom = true, .left = true, .right = true },
         .width = width,
-        .color = render.Color.rgba(color.red, color.green, color.blue, color.alpha),
+        .color = renderColor(color),
     };
+}
+
+fn renderColor(color: Config.Color) render.Color {
+    return render.Color.rgba(color.red, color.green, color.blue, color.alpha);
 }
 
 fn applyInputConfiguration(self: *Self, rules: []const Config.InputRule) void {
@@ -6849,7 +6897,8 @@ test "output capture uses pixel dimensions at fractional scale" {
         .stride_pixels = 6,
         .pixels = &pixels,
     });
-    for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff18181b), pixel);
+    const background = renderColor(server.palette.desktop_background).argb8888();
+    for (pixels) |pixel| try std.testing.expectEqual(background, pixel);
 }
 
 test "promoted overlay damage remains stale for the next frame" {
@@ -6959,10 +7008,9 @@ fn captureOutputTarget(
         .track_visibility = false,
         .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
-    const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
-        render.Color.rgba(0, 0, 0, 255)
-    else
-        render.Color.rgba(24, 24, 27, 255) }};
+    const clear_command = [_]render.Command{.{
+        .clear = outputClearColor(self.palette, self.session_lock.isLocked()),
+    }};
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, paint_cursors, paint_cursors);
@@ -7359,10 +7407,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
         .presentation_damage = &frame_damage,
         .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
-    const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
-        render.Color.rgba(0, 0, 0, 255)
-    else
-        render.Color.rgba(24, 24, 27, 255) }};
+    const clear_command = [_]render.Command{.{
+        .clear = outputClearColor(self.palette, self.session_lock.isLocked()),
+    }};
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, paint_primary_cursor, true);
@@ -8046,19 +8093,24 @@ fn renderTilingDragPreview(
         .y = preview.y,
         .width = preview.size.width,
         .height = preview.size.height,
-    })};
+    }, self.palette.tiling_drag_preview)};
     try self.renderCommands(frame, &command);
 }
 
-fn tilingDragPreviewCommand(rect: render.Rect) render.Command {
+fn tilingDragPreviewCommand(rect: render.Rect, color: Config.Color) render.Command {
     std.debug.assert(rect.width > 0 and rect.height > 0);
     return .{ .shadow = .{
         .rect = rect,
         .corner_radius = 12,
         .blur_radius = 20,
         .spread = 0,
-        .color = render.Color.rgba(0x28, 0x70, 0xbd, 0x70),
+        .color = renderColor(color),
     } };
+}
+
+fn outputClearColor(palette: theme.Palette, locked: bool) render.Color {
+    if (locked) return render.Color.rgba(0, 0, 0, 0xff);
+    return renderColor(palette.desktop_background);
 }
 
 fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
@@ -8984,20 +9036,29 @@ test "general configuration maps window shadows" {
 
 test "general configuration maps window borders" {
     const defaults: Config.GeneralSettings = .{};
-    const default_unfocused = windowBorder(defaults.unfocused_border_width, defaults.unfocused_border_color).?;
+    const default_unfocused = windowBorder(
+        defaults.unfocused_border_width,
+        defaults.unfocused_border_color orelse theme.default_palette.unfocused_border,
+    ).?;
     try std.testing.expectEqual(@as(u32, 1), default_unfocused.width);
     try std.testing.expectEqual(
-        render.Color.rgba(0x3a, 0x3a, 0x40, 0xff),
+        renderColor(theme.default_palette.unfocused_border),
         default_unfocused.color,
     );
-    const default_focused = windowBorder(defaults.focused_border_width, defaults.focused_border_color).?;
+    const default_focused = windowBorder(
+        defaults.focused_border_width,
+        defaults.focused_border_color orelse theme.default_palette.focused_border,
+    ).?;
     try std.testing.expectEqual(@as(u32, 1), default_focused.width);
     try std.testing.expectEqual(
-        render.Color.rgba(0x28, 0x70, 0xbd, 0xff),
+        renderColor(theme.default_palette.focused_border),
         default_focused.color,
     );
 
-    try std.testing.expect(windowBorder(0, defaults.focused_border_color) == null);
+    try std.testing.expect(windowBorder(
+        0,
+        defaults.focused_border_color orelse theme.default_palette.focused_border,
+    ) == null);
 
     const configured_color: Config.Color = .{
         .red = 0x7a,
