@@ -180,6 +180,21 @@ pub const RepaintListener = struct {
     request: *const fn (*anyopaque) void,
     surface_changed: *const fn (*anyopaque, Surface.Id) void,
     window_changed: *const fn (*anyopaque, Id) void,
+    node_damage: *const fn (*anyopaque, DamageNode) void,
+    /// Called after a node's mapped state or existence changed, once the new
+    /// state is observable through scene queries. Receivers refresh state
+    /// derived from surface visibility.
+    visibility_changed: *const fn (*anyopaque) void,
+};
+
+/// Identifies a scene node whose rendered extent must be repainted. Receivers
+/// damage the node's conservative visual bounds; windows include their
+/// decorations and popups, layer surfaces include their popups.
+pub const DamageNode = union(enum) {
+    window: Id,
+    shell_surface: ShellSurfaceId,
+    layer_surface: LayerSurfaceId,
+    popup: PopupId,
 };
 
 pub const Iterator = struct {
@@ -469,8 +484,14 @@ pub fn addWindow(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!Id {
 }
 
 pub fn removeWindow(self: *Self, id: Id) void {
-    const window = self.windows.remove(id) orelse return;
+    const was_mapped = (self.windows.get(id) orelse return).mapped;
+    // The stack snapshot cannot damage nodes that disappear mid-batch.
+    if (self.stack_update_active) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
+    // Remove popups while the window is still stored so their damage
+    // callbacks can resolve global positions through the parent chain.
     while (self.firstWindowPopup(id)) |popup_id| self.removePopup(popup_id);
+    _ = self.windows.remove(id) orelse return;
     var decorations = self.decorations.iterator();
     while (decorations.next()) |entry| {
         if (std.meta.eql(entry.value.window_id, id)) {
@@ -483,7 +504,7 @@ pub fn removeWindow(self: *Self, id: Id) void {
             break;
         }
     }
-    if (window.mapped) self.requestRepaint();
+    if (was_mapped) self.requestVisibilityChanged();
 }
 
 pub fn addShellSurface(
@@ -497,28 +518,35 @@ pub fn addShellSurface(
 }
 
 pub fn removeShellSurface(self: *Self, id: ShellSurfaceId) void {
-    const shell_surface = self.shell_surfaces.remove(id) orelse return;
+    const was_mapped = (self.shell_surfaces.get(id) orelse return).mapped;
+    // The stack snapshot cannot damage nodes that disappear mid-batch.
+    if (self.stack_update_active) self.requestRepaint();
+    self.requestNodeDamage(.{ .shell_surface = id });
+    _ = self.shell_surfaces.remove(id) orelse return;
     for (self.stack.items, 0..) |candidate, index| {
         if (std.meta.eql(candidate, NodeId{ .shell_surface = id })) {
             _ = self.stack.orderedRemove(index);
             break;
         }
     }
-    if (shell_surface.mapped) self.requestRepaint();
+    if (was_mapped) self.requestVisibilityChanged();
 }
 
 pub fn setShellSurfaceMapped(self: *Self, id: ShellSurfaceId, mapped: bool) void {
     const shell_surface = self.shell_surfaces.get(id) orelse return;
     if (shell_surface.mapped == mapped) return;
+    self.requestNodeDamage(.{ .shell_surface = id });
     shell_surface.mapped = mapped;
-    self.requestRepaint();
+    self.requestNodeDamage(.{ .shell_surface = id });
+    self.requestVisibilityChanged();
 }
 
 pub fn setShellSurfacePosition(self: *Self, id: ShellSurfaceId, position: Position) void {
     const shell_surface = self.shell_surfaces.get(id) orelse return;
     if (std.meta.eql(shell_surface.position, position)) return;
+    self.requestNodeDamage(.{ .shell_surface = id });
     shell_surface.position = position;
-    if (shell_surface.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .shell_surface = id });
 }
 
 pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
@@ -541,17 +569,25 @@ pub fn addLayerSurface(
 }
 
 pub fn removeLayerSurface(self: *Self, id: LayerSurfaceId) void {
-    const layer_surface = self.layer_surfaces.remove(id) orelse return;
+    const layer_surface = self.layer_surfaces.get(id) orelse return;
+    const layer = layer_surface.layer;
+    const was_mapped = layer_surface.mapped;
+    self.requestNodeDamage(.{ .layer_surface = id });
+    // Remove popups while the layer surface is still stored so their damage
+    // callbacks can resolve global positions through the parent chain.
     while (self.firstLayerSurfacePopup(id)) |popup_id| self.removePopup(popup_id);
-    removeLayerSurfaceFromStack(self, id, layer_surface.layer);
-    if (layer_surface.mapped) self.requestRepaint();
+    _ = self.layer_surfaces.remove(id) orelse return;
+    removeLayerSurfaceFromStack(self, id, layer);
+    if (was_mapped) self.requestVisibilityChanged();
 }
 
 pub fn setLayerSurfaceMapped(self: *Self, id: LayerSurfaceId, mapped: bool) void {
     const layer_surface = self.layer_surfaces.get(id) orelse return;
     if (layer_surface.mapped == mapped) return;
+    self.requestNodeDamage(.{ .layer_surface = id });
     layer_surface.mapped = mapped;
-    self.requestRepaint();
+    self.requestNodeDamage(.{ .layer_surface = id });
+    self.requestVisibilityChanged();
 }
 
 pub fn setLayerSurfacePosition(
@@ -561,8 +597,9 @@ pub fn setLayerSurfacePosition(
 ) void {
     const layer_surface = self.layer_surfaces.get(id) orelse return;
     if (std.meta.eql(layer_surface.position, position)) return;
+    self.requestNodeDamage(.{ .layer_surface = id });
     layer_surface.position = position;
-    if (layer_surface.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .layer_surface = id });
 }
 
 pub fn setLayerSurfaceLayer(
@@ -573,9 +610,12 @@ pub fn setLayerSurfaceLayer(
     const layer_surface = self.layer_surfaces.get(id) orelse return;
     if (layer_surface.layer == layer) return;
     try self.layer_stacks[layerIndex(layer)].append(self.allocator, id);
+    // Damage under the old layer as well: backdrop blur stacked between the
+    // two layers samples this surface's extent and must repaint too.
+    self.requestNodeDamage(.{ .layer_surface = id });
     removeLayerSurfaceFromStack(self, id, layer_surface.layer);
     layer_surface.layer = layer;
-    if (layer_surface.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .layer_surface = id });
 }
 
 pub fn layerSurfaceCommitted(self: *Self, id: LayerSurfaceId) void {
@@ -604,27 +644,32 @@ pub fn addPopup(
 
 pub fn removePopup(self: *Self, id: PopupId) void {
     while (self.firstChildPopup(id)) |child_id| self.removePopup(child_id);
-    const popup = self.popups.remove(id) orelse return;
+    const was_mapped = (self.popups.get(id) orelse return).mapped;
+    self.requestNodeDamage(.{ .popup = id });
+    _ = self.popups.remove(id) orelse return;
     for (self.popup_stack.items, 0..) |candidate, index| {
         if (!std.meta.eql(candidate, id)) continue;
         _ = self.popup_stack.orderedRemove(index);
         break;
     }
-    if (popup.mapped) self.requestRepaint();
+    if (was_mapped) self.requestVisibilityChanged();
 }
 
 pub fn setPopupMapped(self: *Self, id: PopupId, mapped: bool) void {
     const popup = self.popups.get(id) orelse return;
     if (popup.mapped == mapped) return;
+    self.requestNodeDamage(.{ .popup = id });
     popup.mapped = mapped;
-    self.requestRepaint();
+    self.requestNodeDamage(.{ .popup = id });
+    self.requestVisibilityChanged();
 }
 
 pub fn setPopupPosition(self: *Self, id: PopupId, position: Position) void {
     const popup = self.popups.get(id) orelse return;
     if (std.meta.eql(popup.position, position)) return;
+    self.requestPopupDamage(id);
     popup.position = position;
-    if (popup.mapped) self.requestRepaint();
+    self.requestPopupDamage(id);
 }
 
 pub fn setPopupContentGeometry(
@@ -634,8 +679,9 @@ pub fn setPopupContentGeometry(
 ) void {
     const popup = self.popups.get(id) orelse return;
     if (std.meta.eql(popup.content_geometry, geometry)) return;
+    self.requestNodeDamage(.{ .popup = id });
     popup.content_geometry = geometry;
-    if (popup.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .popup = id });
 }
 
 pub fn popupCommitted(self: *Self, id: PopupId) void {
@@ -658,25 +704,30 @@ pub fn addDecoration(
 }
 
 pub fn removeDecoration(self: *Self, id: DecorationId) void {
-    const decoration = self.decorations.remove(id) orelse return;
-    const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped and decoration.mapped) self.requestWindowChanged(decoration.window_id);
+    const decoration = self.decorations.get(id) orelse return;
+    const was_mapped = decoration.mapped;
+    // Report the change while the decoration still exists so receivers can
+    // include its extent in the window's damaged bounds.
+    if (was_mapped) self.requestDecorationChanged(decoration.window_id);
+    _ = self.decorations.remove(id);
+    if (was_mapped) self.requestVisibilityChanged();
 }
 
 pub fn setDecorationOffset(self: *Self, id: DecorationId, offset: Position) void {
     const decoration = self.decorations.get(id) orelse return;
     if (std.meta.eql(decoration.offset, offset)) return;
+    if (decoration.mapped) self.requestDecorationChanged(decoration.window_id);
     decoration.offset = offset;
-    const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped and decoration.mapped) self.requestWindowChanged(decoration.window_id);
+    if (decoration.mapped) self.requestDecorationChanged(decoration.window_id);
 }
 
 pub fn setDecorationMapped(self: *Self, id: DecorationId, mapped: bool) void {
     const decoration = self.decorations.get(id) orelse return;
     if (decoration.mapped == mapped) return;
+    if (decoration.mapped) self.requestDecorationChanged(decoration.window_id);
     decoration.mapped = mapped;
-    const window = self.windows.get(decoration.window_id) orelse return;
-    if (window.mapped) self.requestWindowChanged(decoration.window_id);
+    if (decoration.mapped) self.requestDecorationChanged(decoration.window_id);
+    self.requestVisibilityChanged();
 }
 
 pub fn decorationCommitted(self: *Self, id: DecorationId) void {
@@ -688,8 +739,10 @@ pub fn decorationCommitted(self: *Self, id: DecorationId) void {
 pub fn setMapped(self: *Self, id: Id, mapped: bool) void {
     const window = self.windows.get(id) orelse return;
     if (window.mapped == mapped) return;
+    self.requestNodeDamage(.{ .window = id });
     window.mapped = mapped;
-    self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
+    self.requestVisibilityChanged();
 }
 
 pub fn surfaceCommitted(self: *Self, id: Id) void {
@@ -700,8 +753,9 @@ pub fn surfaceCommitted(self: *Self, id: Id) void {
 pub fn setPosition(self: *Self, id: Id, position: Position) void {
     const window = self.windows.get(id) orelse return;
     if (std.meta.eql(window.position, position)) return;
+    self.requestNodeDamage(.{ .window = id });
     window.position = position;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 pub fn placeTop(self: *Self, id: Id) void {
@@ -723,6 +777,9 @@ pub fn placeBelow(self: *Self, id: Id, other: Id) void {
 pub fn placeNodeTop(self: *Self, id: NodeId) void {
     const index = self.nodeIndex(id) orelse return;
     if (index == self.stack.items.len - 1) return;
+    // Damage under the old order as well: backdrop blur above this node in
+    // the old stacking samples its extent and must repaint too.
+    self.requestStackRepaint(id);
     const moved = self.stack.orderedRemove(index);
     self.stack.appendAssumeCapacity(moved);
     self.requestStackRepaint(id);
@@ -731,6 +788,7 @@ pub fn placeNodeTop(self: *Self, id: NodeId) void {
 pub fn placeNodeBottom(self: *Self, id: NodeId) void {
     const index = self.nodeIndex(id) orelse return;
     if (index == 0) return;
+    self.requestStackRepaint(id);
     const moved = self.stack.orderedRemove(index);
     self.stack.insertAssumeCapacity(0, moved);
     self.requestStackRepaint(id);
@@ -741,6 +799,7 @@ pub fn placeNodeAbove(self: *Self, id: NodeId, other: NodeId) void {
     const index = self.nodeIndex(id) orelse return;
     const other_index_before = self.nodeIndex(other) orelse return;
     if (index == other_index_before + 1) return;
+    self.requestStackRepaint(id);
     const moved = self.stack.orderedRemove(index);
     const other_index = self.nodeIndex(other) orelse unreachable;
     self.stack.insertAssumeCapacity(other_index + 1, moved);
@@ -752,6 +811,7 @@ pub fn placeNodeBelow(self: *Self, id: NodeId, other: NodeId) void {
     const index = self.nodeIndex(id) orelse return;
     const other_index_before = self.nodeIndex(other) orelse return;
     if (index + 1 == other_index_before) return;
+    self.requestStackRepaint(id);
     const moved = self.stack.orderedRemove(index);
     const other_index = self.nodeIndex(other) orelse unreachable;
     self.stack.insertAssumeCapacity(other_index, moved);
@@ -771,25 +831,49 @@ pub fn beginStackUpdate(self: *Self) error{OutOfMemory}!void {
 
 pub fn endStackUpdate(self: *Self) void {
     std.debug.assert(self.stack_update_active);
-    const changed = !nodeStacksEqual(self.stack_snapshot.items, self.stack.items);
     const repaint = self.stack_update_repaint;
-    self.stack_snapshot.clearRetainingCapacity();
     self.stack_update_active = false;
     self.stack_update_repaint = false;
-    if (changed and repaint) self.requestRepaint();
+    defer self.stack_snapshot.clearRetainingCapacity();
+    if (!repaint) return;
+    // Only nodes whose stacking order relative to another node changed can
+    // look different; damage those instead of repainting every output.
+    for (self.stack.items) |id| {
+        if (self.nodeOrderChanged(id)) self.requestNodeDamage(damageNodeFor(id));
+    }
+}
+
+fn nodeOrderChanged(self: *Self, id: NodeId) bool {
+    const new_index = nodeStackIndex(self.stack.items, id) orelse return false;
+    const old_index = nodeStackIndex(self.stack_snapshot.items, id) orelse return true;
+    for (self.stack.items, 0..) |other, other_new_index| {
+        if (other_new_index == new_index) continue;
+        const other_old_index = nodeStackIndex(self.stack_snapshot.items, other) orelse continue;
+        if ((other_new_index > new_index) != (other_old_index > old_index)) return true;
+    }
+    return false;
+}
+
+fn nodeStackIndex(stack: []const NodeId, id: NodeId) ?usize {
+    for (stack, 0..) |candidate, index| {
+        if (std.meta.eql(candidate, id)) return index;
+    }
+    return null;
 }
 
 pub fn setFocused(self: *Self, id: Id, focused: bool) void {
     const window = self.windows.get(id) orelse return;
     if (window.focused == focused) return;
     window.focused = focused;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 pub fn setFullscreen(self: *Self, id: Id, fullscreen: bool) void {
     const window = self.windows.get(id) orelse return;
     if (window.fullscreen == fullscreen) return;
     window.fullscreen = fullscreen;
+    // Fullscreen changes which layers and nodes are rendered at all, so the
+    // whole output must repaint rather than just this window's bounds.
     if (window.mapped) self.requestRepaint();
 }
 
@@ -801,8 +885,9 @@ pub fn setBorders(self: *Self, id: Id, borders: ?Borders) void {
     }
     const window = self.windows.get(id) orelse return;
     if (std.meta.eql(window.borders, borders)) return;
+    self.requestNodeDamage(.{ .window = id });
     window.borders = borders;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 pub fn setClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
@@ -826,15 +911,17 @@ pub fn setContentGeometry(self: *Self, id: Id, geometry: ?ContentGeometry) void 
     }
     const window = self.windows.get(id) orelse return;
     if (std.meta.eql(window.content_geometry, geometry)) return;
+    self.requestNodeDamage(.{ .window = id });
     window.content_geometry = geometry;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 pub fn setEffects(self: *Self, id: Id, effects: Effects) void {
     const window = self.windows.get(id) orelse return;
     if (std.meta.eql(window.effects, effects)) return;
+    self.requestNodeDamage(.{ .window = id });
     window.effects = effects;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 pub fn iterator(self: *Self) Iterator {
@@ -914,6 +1001,14 @@ pub fn layerSurface(self: *Self, id: LayerSurfaceId) ?*LayerSurface {
     return self.layer_surfaces.get(id);
 }
 
+pub fn shellSurface(self: *Self, id: ShellSurfaceId) ?*ShellSurface {
+    return self.shell_surfaces.get(id);
+}
+
+pub fn popupFor(self: *Self, id: PopupId) ?*Popup {
+    return self.popups.get(id);
+}
+
 pub fn popupPosition(self: *Self, id: PopupId) ?Position {
     return self.popupGlobalPosition(id);
 }
@@ -946,6 +1041,15 @@ pub fn surfacePosition(self: *Self, surface_id: Surface.Id) ?Position {
         }
         return position;
     }
+    var decorations = self.decorations.iterator();
+    while (decorations.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        const window = self.windows.get(entry.value.window_id) orelse return null;
+        return .{
+            .x = window.position.x +| entry.value.offset.x,
+            .y = window.position.y +| entry.value.offset.y,
+        };
+    }
     return null;
 }
 
@@ -971,6 +1075,33 @@ pub fn surfaceMapped(self: *Self, surface_id: Surface.Id) bool {
         if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
         const window = self.windows.get(entry.value.window_id) orelse return false;
         return entry.value.mapped and window.mapped;
+    }
+    return false;
+}
+
+/// Returns whether the surface is the root surface of any scene node or
+/// decoration. Surfaces rendered outside the scene (input method popups,
+/// drag icons, session lock surfaces, cursors) are not tracked.
+pub fn surfaceTracked(self: *Self, surface_id: Surface.Id) bool {
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
+    }
+    var shell_surfaces = self.shell_surfaces.iterator();
+    while (shell_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
+    }
+    var layer_surfaces = self.layer_surfaces.iterator();
+    while (layer_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
+    }
+    var popups = self.popups.iterator();
+    while (popups.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
+    }
+    var decorations = self.decorations.iterator();
+    while (decorations.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
     }
     return false;
 }
@@ -1033,12 +1164,47 @@ fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }
 
+/// Reports a node's visual bounds as damaged. Skips unmapped nodes because
+/// they render nothing before and after the change being reported.
+fn requestNodeDamage(self: *Self, node: DamageNode) void {
+    const mapped = switch (node) {
+        .window => |id| if (self.windows.get(id)) |window| window.mapped else false,
+        .shell_surface => |id| if (self.shell_surfaces.get(id)) |shell| shell.mapped else false,
+        .layer_surface => |id| if (self.layer_surfaces.get(id)) |layer| layer.mapped else false,
+        .popup => |id| if (self.popups.get(id)) |popup| popup.mapped else false,
+    };
+    if (!mapped) return;
+    if (self.repaint_listener) |listener| listener.node_damage(listener.context, node);
+}
+
+/// Damages a popup and every descendant popup. Descendants derive their
+/// global position from this popup, so geometry changes move them as well.
+fn requestPopupDamage(self: *Self, id: PopupId) void {
+    self.requestNodeDamage(.{ .popup = id });
+    for (self.popup_stack.items) |candidate| {
+        const popup = self.popups.get(candidate) orelse continue;
+        switch (popup.parent) {
+            .popup => |parent_id| if (std.meta.eql(parent_id, id)) {
+                self.requestPopupDamage(candidate);
+            },
+            .window, .layer_surface => {},
+        }
+    }
+}
+
+fn damageNodeFor(id: NodeId) DamageNode {
+    return switch (id) {
+        .window => |window_id| .{ .window = window_id },
+        .shell_surface => |shell_id| .{ .shell_surface = shell_id },
+    };
+}
+
 fn requestStackRepaint(self: *Self, id: NodeId) void {
     if (!self.nodeMapped(id)) return;
     if (self.stack_update_active) {
         self.stack_update_repaint = true;
     } else {
-        self.requestRepaint();
+        self.requestNodeDamage(damageNodeFor(id));
     }
 }
 
@@ -1050,6 +1216,18 @@ fn requestSurfaceChanged(self: *Self, surface_id: Surface.Id) void {
 
 fn requestWindowChanged(self: *Self, id: Id) void {
     if (self.repaint_listener) |listener| listener.window_changed(listener.context, id);
+}
+
+/// Reports a decoration change through the owning window when that window is
+/// currently visible.
+fn requestDecorationChanged(self: *Self, window_id: Id) void {
+    const window = self.windows.get(window_id) orelse return;
+    if (!window.mapped) return;
+    self.requestWindowChanged(window_id);
+}
+
+fn requestVisibilityChanged(self: *Self) void {
+    if (self.repaint_listener) |listener| listener.visibility_changed(listener.context);
 }
 
 fn layerIndex(layer: Layer) usize {
@@ -1179,8 +1357,9 @@ fn setWindowClipBox(
         .content => &window.content_clip_box,
     };
     if (std.meta.eql(destination.*, clip_box)) return;
+    self.requestNodeDamage(.{ .window = id });
     destination.* = clip_box;
-    if (window.mapped) self.requestRepaint();
+    self.requestNodeDamage(.{ .window = id });
 }
 
 fn nodeIndex(self: *Self, id: NodeId) ?usize {
@@ -1189,14 +1368,6 @@ fn nodeIndex(self: *Self, id: NodeId) ?usize {
         if (std.meta.eql(candidate, id)) return index;
     }
     unreachable;
-}
-
-fn nodeStacksEqual(first: []const NodeId, second: []const NodeId) bool {
-    if (first.len != second.len) return false;
-    for (first, second) |first_node, second_node| {
-        if (!std.meta.eql(first_node, second_node)) return false;
-    }
-    return true;
 }
 
 fn surfaceNodeIndex(self: *Self, surface_id: Surface.Id) ?usize {
@@ -1353,6 +1524,7 @@ test "scene reorders windows through handles" {
 const RepaintCounter = struct {
     count: usize = 0,
     last_window: ?Id = null,
+    last_node: ?DamageNode = null,
 
     fn listener(self: *RepaintCounter) RepaintListener {
         return .{
@@ -1360,6 +1532,8 @@ const RepaintCounter = struct {
             .request = request,
             .surface_changed = surfaceChanged,
             .window_changed = windowChanged,
+            .node_damage = nodeDamage,
+            .visibility_changed = visibilityChanged,
         };
     }
 
@@ -1375,6 +1549,14 @@ const RepaintCounter = struct {
         self.count += 1;
         self.last_window = id;
     }
+
+    fn nodeDamage(context: *anyopaque, node: DamageNode) void {
+        const self: *RepaintCounter = @ptrCast(@alignCast(context));
+        self.count += 1;
+        self.last_node = node;
+    }
+
+    fn visibilityChanged(_: *anyopaque) void {}
 };
 
 test "scene stack updates only repaint for a different final order" {
@@ -1399,14 +1581,16 @@ test "scene stack updates only repaint for a different final order" {
     scene.endStackUpdate();
     try std.testing.expectEqual(@as(usize, 0), repaint.count);
 
+    // Raising the bottom window changes its order relative to both others,
+    // so all three nodes report damage.
     try scene.beginStackUpdate();
     scene.placeTop(first);
     scene.endStackUpdate();
-    try std.testing.expectEqual(@as(usize, 1), repaint.count);
+    try std.testing.expectEqual(@as(usize, 3), repaint.count);
 
     scene.placeAbove(first, third);
     scene.placeBelow(third, first);
-    try std.testing.expectEqual(@as(usize, 1), repaint.count);
+    try std.testing.expectEqual(@as(usize, 3), repaint.count);
 
     scene.removeWindow(first);
     scene.removeWindow(second);
@@ -1556,10 +1740,13 @@ test "scene reports visible decoration changes with their owning window" {
     scene.setDecorationOffset(decoration, .{ .x = 4 });
     try std.testing.expectEqual(@as(usize, 0), repaint.count);
     scene.setDecorationMapped(decoration, true);
+    try std.testing.expectEqual(@as(usize, 1), repaint.count);
+    // Moving a visible decoration reports both the old and new extents.
     scene.setDecorationOffset(decoration, .{ .x = 8 });
+    try std.testing.expectEqual(@as(usize, 3), repaint.count);
     scene.decorationCommitted(decoration);
     scene.removeDecoration(decoration);
-    try std.testing.expectEqual(@as(usize, 4), repaint.count);
+    try std.testing.expectEqual(@as(usize, 5), repaint.count);
     try std.testing.expect(std.meta.eql(window, repaint.last_window.?));
 
     scene.removeWindow(window);

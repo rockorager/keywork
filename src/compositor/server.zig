@@ -1359,6 +1359,8 @@ pub fn createWithVirtualOutput(
         .request = requestRepaint,
         .surface_changed = surfaceChanged,
         .window_changed = sceneWindowChanged,
+        .node_damage = sceneNodeDamage,
+        .visibility_changed = sceneVisibilityChanged,
     });
     self.seat.setRepaintListener(.{
         .context = self,
@@ -3319,7 +3321,171 @@ fn sceneWindowChanged(context: *anyopaque, scene_id: Scene.Id) void {
             transition.target_dirty = true;
         }
     }
-    requestRepaint(self);
+    sceneNodeDamage(context, .{ .window = scene_id });
+}
+
+fn sceneVisibilityChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.refreshIdleInhibition();
+    if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+}
+
+fn sceneNodeDamage(context: *anyopaque, node: Scene.DamageNode) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    switch (node) {
+        .window => |id| {
+            // Transition rendering paints snapshots outside the window's
+            // current bounds, so targeted damage cannot cover it.
+            if (transitionIndex(self, id) != null) return requestRepaint(self);
+            // The selected fullscreen window suppresses lower layers and
+            // other nodes across the whole output, so any change to a
+            // fullscreen window can alter pixels far outside its bounds.
+            const window = self.sceneWindow(id) orelse return requestRepaint(self);
+            if (window.fullscreen) return requestRepaint(self);
+        },
+        .shell_surface, .layer_surface, .popup => {},
+    }
+    // Unresolvable bounds usually mean the node's buffer was already dropped
+    // by the commit that triggered this change; its previously rendered
+    // pixels still need repair, so repaint everything.
+    const bounds = self.sceneNodeBounds(node) orelse return requestRepaint(self);
+    const root: ?Surface.Id = switch (node) {
+        .window => |id| self.scene.windowSurface(id),
+        .shell_surface => |id| if (self.scene.shellSurface(id)) |shell| shell.surface_id else null,
+        .layer_surface => |id| if (self.scene.layerSurface(id)) |layer| layer.surface_id else null,
+        .popup => |id| if (self.scene.popupFor(id)) |popup| popup.surface_id else null,
+    };
+    self.damageGlobalRect(bounds, root);
+}
+
+/// Conservative global bounds of everything a scene node currently paints:
+/// surface trees, decorations, borders, shadows, and popups. Null means the
+/// node renders nothing, so no damage is required for its current state.
+fn sceneNodeBounds(self: *Self, node: Scene.DamageNode) ?render.Rect {
+    return switch (node) {
+        .window => |id| self.windowNodeBounds(id),
+        .shell_surface => |id| self.shellSurfaceNodeBounds(id),
+        .layer_surface => |id| self.layerSurfaceNodeBounds(id),
+        .popup => |id| self.popupNodeBounds(id),
+    };
+}
+
+fn windowNodeBounds(self: *Self, id: Scene.Id) ?render.Rect {
+    const window = self.sceneWindow(id) orelse return null;
+    var bounds: ?render.Rect = null;
+    // Prefer the configured content geometry so bounds survive commits that
+    // drop the buffer just before an unmap reaches the scene.
+    const content_size: ?render.Size = if (window.content_geometry) |geometry|
+        geometry.size
+    else if (Surface.currentBuffer(self.compositor.surfaceStore(), window.surface_id)) |buffer|
+        buffer.logical_size
+    else
+        null;
+    const content_offset = if (window.content_geometry) |geometry|
+        geometry.offset
+    else
+        Scene.Position{};
+    if (content_size) |size| {
+        if (window_geometry.windowContentRect(window, size)) |content_rect| {
+            var decorated = damage_geometry.effectsRect(content_rect, window.effects);
+            if (window.borders) |borders| {
+                decorated = decorated.unionWith(
+                    damage_geometry.expandRect(content_rect, borders.width),
+                );
+            }
+            bounds = decorated;
+        }
+    }
+    if (self.subcompositor.treeBounds(window.surface_id)) |tree| {
+        const rect = treeBoundsRect(tree).translated(
+            window.position.x -| content_offset.x,
+            window.position.y -| content_offset.y,
+        );
+        bounds = if (bounds) |current| current.unionWith(rect) else rect;
+    }
+    inline for (.{ Scene.DecorationLayer.below, Scene.DecorationLayer.above }) |layer| {
+        var decorations = self.scene.decorationIterator(id, layer);
+        while (decorations.next()) |entry| {
+            if (!entry.decoration.mapped) continue;
+            const tree = self.subcompositor.treeBounds(entry.decoration.surface_id) orelse continue;
+            const rect = treeBoundsRect(tree).translated(
+                window.position.x +| entry.decoration.offset.x,
+                window.position.y +| entry.decoration.offset.y,
+            );
+            bounds = if (bounds) |current| current.unionWith(rect) else rect;
+        }
+    }
+    var popups = self.scene.popupIterator(id);
+    while (popups.next()) |entry| {
+        const rect = self.popupTreeBounds(entry.popup, entry.position) orelse continue;
+        bounds = if (bounds) |current| current.unionWith(rect) else rect;
+    }
+    return bounds;
+}
+
+fn shellSurfaceNodeBounds(self: *Self, id: Scene.ShellSurfaceId) ?render.Rect {
+    const shell_surface = self.scene.shellSurface(id) orelse return null;
+    const tree = self.subcompositor.treeBounds(shell_surface.surface_id) orelse return null;
+    return treeBoundsRect(tree).translated(
+        shell_surface.position.x,
+        shell_surface.position.y,
+    );
+}
+
+fn layerSurfaceNodeBounds(self: *Self, id: Scene.LayerSurfaceId) ?render.Rect {
+    const layer_surface = self.scene.layerSurface(id) orelse return null;
+    // Unlike windows, layer surfaces retain no geometry once their buffer is
+    // gone, so an unresolvable tree must escalate to a full repaint.
+    const tree = self.subcompositor.treeBounds(layer_surface.surface_id) orelse return null;
+    var bounds: ?render.Rect = treeBoundsRect(tree).translated(
+        layer_surface.position.x,
+        layer_surface.position.y,
+    );
+    if (self.layerSurfaceEffectsRect(layer_surface)) |rect| {
+        var effects = damage_geometry.effectsRect(rect, self.layer_shell_effects);
+        if (self.layer_shell_border) |border| {
+            effects = effects.unionWith(damage_geometry.expandRect(rect, border.width));
+        }
+        bounds = if (bounds) |current| current.unionWith(effects) else effects;
+    }
+    var popups = self.scene.layerPopupIterator(id);
+    while (popups.next()) |entry| {
+        const rect = self.popupTreeBounds(entry.popup, entry.position) orelse continue;
+        bounds = if (bounds) |current| current.unionWith(rect) else rect;
+    }
+    return bounds;
+}
+
+fn popupNodeBounds(self: *Self, id: Scene.PopupId) ?render.Rect {
+    const popup = self.scene.popupFor(id) orelse return null;
+    const position = self.scene.popupPosition(id) orelse return null;
+    return self.popupTreeBounds(popup, position);
+}
+
+fn popupTreeBounds(
+    self: *Self,
+    popup: *const Scene.Popup,
+    position: Scene.Position,
+) ?render.Rect {
+    if (!popup.mapped) return null;
+    const offset = if (popup.content_geometry) |geometry|
+        geometry.offset
+    else
+        Scene.Position{};
+    const tree = self.subcompositor.treeBounds(popup.surface_id) orelse return null;
+    return treeBoundsRect(tree).translated(
+        position.x -| offset.x,
+        position.y -| offset.y,
+    );
+}
+
+fn treeBoundsRect(bounds: Subcompositor.TreeBounds) render.Rect {
+    return .{
+        .x = bounds.x,
+        .y = bounds.y,
+        .width = bounds.width,
+        .height = bounds.height,
+    };
 }
 
 fn transitionIndex(self: *Self, scene_id: Scene.Id) ?usize {
@@ -7241,7 +7407,7 @@ fn expandBackdropBlurDamage(
     output: *const Output,
     damage: *Region,
     source_root: ?Surface.Id,
-) Region.Error!void {
+) (Region.Error || error{UnresolvedBlurSource})!void {
     const surface_blur = Scene.background_blur;
     var changed = true;
     while (changed) {
@@ -7262,8 +7428,15 @@ fn expandBackdropBlurDamage(
                     if (!above) continue;
                 }
             }
-            if (!self.scene.surfaceMapped(root)) continue;
-            const root_position = self.scene.surfacePosition(root) orelse continue;
+            if (!self.scene.surfaceMapped(root)) {
+                // Blur roots rendered outside the scene (input method popups,
+                // drag icons, session lock surfaces) cannot be resolved here,
+                // so callers must repaint the whole output.
+                if (!self.scene.surfaceTracked(root)) return error.UnresolvedBlurSource;
+                continue;
+            }
+            const root_position = self.scene.surfacePosition(root) orelse
+                return error.UnresolvedBlurSource;
             const offset = self.subcompositor.surfaceOffset(surface_entry.id);
             var rectangles = region.rectangleIterator();
             while (rectangles.next()) |rectangle| {
@@ -7371,7 +7544,13 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     // CPU captures read the live persistent target, so every dependency must
     // be repainted. Vulkan reuses captures keyed by preceding scene content.
     if (!self.renderer.supportsBackdropCaptureReuse()) {
-        try self.expandBackdropBlurDamage(render_output, output, &frame_damage, null);
+        self.expandBackdropBlurDamage(render_output, output, &frame_damage, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnresolvedBlurSource => {
+                const size = render_output.backend.modeSize();
+                frame_damage.setRectangle(0, 0, size.width, size.height);
+            },
+        };
     }
     // Buffer-age repair must retain the post-effect damage as this frame's new
     // damage while adding only the acquired buffer's backlog to the redraw.
