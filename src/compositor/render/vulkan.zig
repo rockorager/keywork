@@ -24,6 +24,10 @@ const GpuTiming = gpu_timing.Timing;
 const GpuTimingCategory = gpu_timing.Category;
 const GpuTimingPlan = gpu_timing.Plan;
 const timestamp_query_count = gpu_timing.query_count;
+/// Sparse-damage frames replay every composition draw run once per damage
+/// rectangle. Beyond this many rectangles the recording and vertex overhead
+/// outweighs the skipped fill, so damage collapses to its bounding rectangle.
+const max_frame_damage_rects = 16;
 const ManualYcbcr = vulkan_format.ManualYcbcr;
 const VideoGraphicsKey = vulkan_format.GraphicsKey;
 
@@ -77,6 +81,7 @@ sampler: vk.Sampler,
 instances: std.ArrayList(Instance) = .empty,
 draw_runs: std.ArrayList(DrawRun) = .empty,
 blur_ops: std.ArrayList(BlurOp) = .empty,
+frame_rects: std.ArrayList(render.Rect) = .empty,
 prepared_images: std.ArrayList(PreparedImage) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
@@ -390,7 +395,6 @@ const RecordedFrame = struct {
     resource_epoch: u64 = 0,
     output_initialized: bool = false,
     blur_initialized: u16 = 0,
-    render_area: render.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     work_buffer: vk.Buffer = .null_handle,
     instance_buffer: vk.Buffer = .null_handle,
     timestamp_query_pool: vk.QueryPool = .null_handle,
@@ -398,13 +402,17 @@ const RecordedFrame = struct {
     upload_rectangles: std.ArrayList(render.Rect) = .empty,
     draw_runs: std.ArrayList(DrawRun) = .empty,
     blur_ops: std.ArrayList(BlurOp) = .empty,
+    // The recorded command buffer bakes in per-rectangle scissors for the
+    // composition and encode draws, so replay is only valid for an identical
+    // damage rectangle list.
+    frame_rects: std.ArrayList(render.Rect) = .empty,
 
     const Input = struct {
         resource_epoch: u64,
         submission: *const Submission,
         output_initialized: bool,
         blur_initialized: u16,
-        render_area: render.Rect,
+        frame_rects: []const render.Rect,
         prepared_images: []const PreparedImage,
         draw_runs: []const DrawRun,
         blur_ops: []const BlurOp,
@@ -415,6 +423,7 @@ const RecordedFrame = struct {
         self.upload_rectangles.deinit(allocator);
         self.draw_runs.deinit(allocator);
         self.blur_ops.deinit(allocator);
+        self.frame_rects.deinit(allocator);
         self.* = undefined;
     }
 
@@ -426,14 +435,17 @@ const RecordedFrame = struct {
             self.resource_epoch != input.resource_epoch or
             self.output_initialized != input.output_initialized or
             self.blur_initialized != input.blur_initialized or
-            !std.meta.eql(self.render_area, input.render_area) or
             self.work_buffer != input.submission.work_buffer or
             self.instance_buffer != input.submission.instance_buffer or
             self.timestamp_query_pool != input.submission.timestamp_query_pool or
+            self.frame_rects.items.len != input.frame_rects.len or
             self.draw_runs.items.len != input.draw_runs.len or
             self.blur_ops.items.len != input.blur_ops.len)
         {
             return false;
+        }
+        for (self.frame_rects.items, input.frame_rects) |recorded_rect, rect| {
+            if (!std.meta.eql(recorded_rect, rect)) return false;
         }
         for (self.draw_runs.items, input.draw_runs) |recorded_run, run| {
             if (!std.meta.eql(recorded_run, run)) return false;
@@ -486,6 +498,7 @@ const RecordedFrame = struct {
         self.upload_rectangles.clearRetainingCapacity();
         self.draw_runs.clearRetainingCapacity();
         self.blur_ops.clearRetainingCapacity();
+        self.frame_rects.clearRetainingCapacity();
 
         for (input.prepared_images) |prepared| {
             const offset = prepared.upload_offset orelse continue;
@@ -506,10 +519,10 @@ const RecordedFrame = struct {
         }
         try self.draw_runs.appendSlice(allocator, input.draw_runs);
         try self.blur_ops.appendSlice(allocator, input.blur_ops);
+        try self.frame_rects.appendSlice(allocator, input.frame_rects);
         self.resource_epoch = input.resource_epoch;
         self.output_initialized = input.output_initialized;
         self.blur_initialized = input.blur_initialized;
-        self.render_area = input.render_area;
         self.work_buffer = input.submission.work_buffer;
         self.instance_buffer = input.submission.instance_buffer;
         self.timestamp_query_pool = input.submission.timestamp_query_pool;
@@ -2168,6 +2181,7 @@ pub fn deinit(self: *Self) void {
     self.instances.deinit(self.allocator);
     self.draw_runs.deinit(self.allocator);
     self.blur_ops.deinit(self.allocator);
+    self.frame_rects.deinit(self.allocator);
     self.prepared_images.deinit(self.allocator);
     destroyGraphics(self.device_wrapper, self.device, .{
         .render_pass = self.render_pass,
@@ -3397,9 +3411,26 @@ fn renderFrameWithCompletion(
         );
         _ = try self.prepareBackdropCaches(output, compiled_frame.damage);
     }
+    const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
+    const frame_render_area =
+        rect_region.damageBounds(compiled_frame.damage, full_output) orelse full_output;
+    self.frame_rects.clearRetainingCapacity();
+    if (compiled_frame.damage) |damage| {
+        if (damage.len <= max_frame_damage_rects) {
+            try self.frame_rects.ensureUnusedCapacity(self.allocator, damage.len);
+            for (damage) |rect| {
+                const clipped = rect.clipTo(frame.size) orelse continue;
+                self.frame_rects.appendAssumeCapacity(clipped);
+            }
+        }
+    }
+    // Damage that is absent, empty, or too fragmented for per-rectangle draws
+    // degenerates to the single bounding rectangle, matching the render area.
+    if (self.frame_rects.items.len == 0) {
+        try self.frame_rects.append(self.allocator, frame_render_area);
+    }
     if (self.instances.items.len >= std.math.maxInt(u32)) return error.InvalidTarget;
     const encode_instance: u32 = @intCast(self.instances.items.len);
-    const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
     try self.instances.append(self.allocator, imageInstance(full_output, full_output));
     const instance_bytes = std.mem.sliceAsBytes(self.instances.items);
     try self.ensureInstanceBuffer(submission, instance_bytes.len);
@@ -3441,7 +3472,6 @@ fn renderFrameWithCompletion(
     self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
-    const frame_render_area = rect_region.damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
     std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
     const cache_hit = reusable and output.recorded_frame.matches(.{
@@ -3449,7 +3479,7 @@ fn renderFrameWithCompletion(
         .submission = submission,
         .output_initialized = output.initialized,
         .blur_initialized = output.blur_initialized,
-        .render_area = frame_render_area,
+        .frame_rects = self.frame_rects.items,
         .prepared_images = self.prepared_images.items,
         .draw_runs = self.draw_runs.items,
         .blur_ops = self.blur_ops.items,
@@ -3654,10 +3684,10 @@ fn renderFrameWithCompletion(
             .min_depth = 0,
             .max_depth = 1,
         }});
-        self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{.{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = .{ .width = frame.size.width, .height = frame.size.height },
-        }});
+        // Rendering outside the render pass render area is invalid, and every
+        // frame rectangle lies inside it; single-rectangle frames keep this
+        // scissor for all composition draws.
+        self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
         if (self.instances.items.len > 0) {
             self.device_wrapper.cmdBindVertexBuffers(
                 command_buffer,
@@ -3735,7 +3765,15 @@ fn renderFrameWithCompletion(
                     gpu_timing_recorder.switchTo(self, submission, command_buffer, gpuTimingCategory(run.pipeline));
                     self.transitionImage(command_buffer, output.linear.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
                     self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
-                    self.setViewportAndScissor(command_buffer, frame.size);
+                    self.device_wrapper.cmdSetViewport(command_buffer, 0, &.{.{
+                        .x = 0,
+                        .y = 0,
+                        .width = @floatFromInt(frame.size.width),
+                        .height = @floatFromInt(frame.size.height),
+                        .min_depth = 0,
+                        .max_depth = 1,
+                    }});
+                    self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
                     bound_pipeline = .null_handle;
                     bound_pipeline_layout = .null_handle;
                     bound_descriptors = @splat(null);
@@ -3837,13 +3875,30 @@ fn renderFrameWithCompletion(
                 @sizeOf(FramePush),
                 &push,
             );
-            self.device_wrapper.cmdDraw(
-                command_buffer,
-                4,
-                run.instance_count,
-                0,
-                run.first_instance,
-            );
+            if (self.frame_rects.items.len == 1) {
+                self.device_wrapper.cmdDraw(
+                    command_buffer,
+                    4,
+                    run.instance_count,
+                    0,
+                    run.first_instance,
+                );
+            } else {
+                // Sparse damage: replay the run once per damage rectangle so
+                // fragments in undamaged gaps inside the damage bounds are
+                // never shaded. Rectangles are disjoint, so blended content
+                // still composites exactly once per pixel.
+                for (self.frame_rects.items) |rect| {
+                    self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(rect)});
+                    self.device_wrapper.cmdDraw(
+                        command_buffer,
+                        4,
+                        run.instance_count,
+                        0,
+                        run.first_instance,
+                    );
+                }
+            }
         }
         gpu_timing_recorder.switchTo(self, submission, command_buffer, .composition_overhead);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
@@ -3867,7 +3922,6 @@ fn renderFrameWithCompletion(
         };
         self.device_wrapper.cmdBeginRenderPass(command_buffer, &output_pass_info, .@"inline");
         self.setViewportAndScissor(command_buffer, frame.size);
-        self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
         const output_graphics = self.outputGraphics(output.format);
         self.device_wrapper.cmdBindPipeline(
             command_buffer,
@@ -3909,7 +3963,15 @@ fn renderFrameWithCompletion(
             .transfer_aux = color_math.transferAux(frame.output_color_description),
         };
         self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
-        self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
+        // Encoding the full-output quad once per damage rectangle under a
+        // per-rectangle scissor skips undamaged gaps inside the damage bounds
+        // while keeping the exact full-output texel mapping; rectangle-sized
+        // quads would interpolate fractional coordinates at rectangle edges
+        // and bleed neighboring undamaged texels into the output.
+        for (self.frame_rects.items) |rect| {
+            self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(rect)});
+            self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
+        }
         self.device_wrapper.cmdEndRenderPass(command_buffer);
         self.writeGpuTimestamp(submission, command_buffer, gpu_timing_plan.outputEncodeEndQuery());
 
@@ -3969,7 +4031,7 @@ fn renderFrameWithCompletion(
                     .submission = submission,
                     .output_initialized = output.initialized,
                     .blur_initialized = output.blur_initialized,
-                    .render_area = frame_render_area,
+                    .frame_rects = self.frame_rects.items,
                     .prepared_images = self.prepared_images.items,
                     .draw_runs = self.draw_runs.items,
                     .blur_ops = self.blur_ops.items,
@@ -7138,14 +7200,19 @@ test "recorded Vulkan frames match only identical command topology" {
     submission.work_buffer = .null_handle;
     submission.instance_buffer = .null_handle;
     submission.timestamp_query_pool = .null_handle;
-    const render_area: render.Rect = .{ .x = 0, .y = 0, .width = 2, .height = 1 };
+    const frame_rects = [_]render.Rect{.{ .x = 0, .y = 0, .width = 2, .height = 1 }};
+    const changed_rects = [_]render.Rect{.{ .x = 1, .y = 0, .width = 1, .height = 1 }};
+    const split_rects = [_]render.Rect{
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+    };
 
     var input: RecordedFrame.Input = .{
         .resource_epoch = renderer.resource_epoch,
         .submission = &submission,
         .output_initialized = true,
         .blur_initialized = 0,
-        .render_area = render_area,
+        .frame_rects = &frame_rects,
         .prepared_images = &prepared,
         .draw_runs = renderer.draw_runs.items,
         .blur_ops = renderer.blur_ops.items,
@@ -7155,9 +7222,11 @@ test "recorded Vulkan frames match only identical command topology" {
     input.blur_initialized = 1;
     try std.testing.expect(!recorded.matches(input));
     input.blur_initialized = 0;
-    input.render_area = .{ .x = 1, .y = 0, .width = 1, .height = 1 };
+    input.frame_rects = &changed_rects;
     try std.testing.expect(!recorded.matches(input));
-    input.render_area = render_area;
+    input.frame_rects = &split_rects;
+    try std.testing.expect(!recorded.matches(input));
+    input.frame_rects = &frame_rects;
 
     try renderer.blur_ops.append(std.testing.allocator, .{
         .run_index = 0,
@@ -7738,6 +7807,105 @@ test "reproducible scene: Vulkan preserves pixels outside frame damage" {
         &.{ untouched, 0xff010203, 0xff010203, untouched },
         &pixels,
     );
+}
+
+test "reproducible scene: Vulkan updates disjoint damage without touching gaps" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var reference_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer reference_renderer.deinit();
+
+    const untouched = 0xfeedbeef;
+    var pixels = [_]u32{untouched} ** 6;
+    var reference_pixels = [_]u32{untouched} ** 6;
+    const size: render.Size = .{ .width = 6, .height = 1 };
+    const commands = [_]render.Command{.{ .clear = render.Color.rgba(1, 2, 3, 255) }};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &.{
+            .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .{ .x = 4, .y = 0, .width = 1, .height = 1 },
+        },
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 6,
+        .pixels = &pixels,
+    } });
+    try reference_renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 6,
+        .pixels = &reference_pixels,
+    } });
+
+    // Output encoding dithers by pixel position, so damaged pixels must match
+    // a full redraw exactly while gap pixels stay byte-identical.
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{
+            untouched,
+            reference_pixels[1],
+            untouched,
+            untouched,
+            reference_pixels[4],
+            untouched,
+        },
+        &pixels,
+    );
+}
+
+test "reproducible scene: Vulkan sparse damage matches a full redraw" {
+    var partial_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer partial_renderer.deinit();
+    var full_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer full_renderer.deinit();
+
+    const size: render.Size = .{ .width = 32, .height = 8 };
+    var partial_pixels = [_]u32{0} ** (size.width * size.height);
+    var full_pixels = [_]u32{0} ** (size.width * size.height);
+    // The translucent overlay makes double composition visible: replaying a
+    // blended draw twice for the same pixel would darken it.
+    const initial = [_]render.Command{
+        .{ .clear = render.Color.rgba(16, 32, 48, 255) },
+        .{ .solid_rect = .{ .rect = .{ .x = 4, .y = 4, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .solid_rect = .{ .rect = .{ .x = 24, .y = 4, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .solid_rect = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .color = render.Color.rgba(0, 0, 255, 128) } },
+    };
+    try partial_renderer.renderFrame(.{ .size = size, .commands = &initial }, .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &partial_pixels } });
+    try full_renderer.renderFrame(.{ .size = size, .commands = &initial }, .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &full_pixels } });
+
+    const updated = [_]render.Command{
+        .{ .clear = render.Color.rgba(16, 32, 48, 255) },
+        .{ .solid_rect = .{ .rect = .{ .x = 5, .y = 4, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .solid_rect = .{ .rect = .{ .x = 25, .y = 4, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .solid_rect = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .color = render.Color.rgba(0, 0, 255, 128) } },
+    };
+    try partial_renderer.renderFrame(.{
+        .size = size,
+        .commands = &updated,
+        .damage = &.{
+            .{ .x = 4, .y = 4, .width = 2, .height = 1 },
+            .{ .x = 24, .y = 4, .width = 2, .height = 1 },
+        },
+    }, .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &partial_pixels } });
+    try full_renderer.renderFrame(.{ .size = size, .commands = &updated }, .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &full_pixels } });
+
+    try std.testing.expectEqualSlices(u32, &full_pixels, &partial_pixels);
 }
 
 test "Vulkan output color changes redraw retained pixels outside frame damage" {

@@ -555,6 +555,8 @@ pub const Frame = struct {
     size: Size,
     commands: []const Command,
     /// Target-local physical pixels to update. Null updates the full target.
+    /// Rectangles must not overlap; renderers may composite each rectangle
+    /// independently, so overlaps would blend translucent content twice.
     damage: ?[]const Rect = null,
     scale: Scale = .{},
     /// Global logical coordinate rendered at the target's top-left corner.
