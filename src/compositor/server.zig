@@ -378,7 +378,17 @@ const RenderOutput = struct {
             refresh_nanoseconds,
         )) {
             .ignore => {},
-            .reset => self.render_budget.reset(),
+            .reset => |cause| {
+                self.render_budget.reset();
+                switch (cause) {
+                    .missed_deadline => increment(
+                        &self.frame_statistics.render_budget_resets_missed,
+                    ),
+                    .no_timing => increment(
+                        &self.frame_statistics.render_budget_resets_no_timing,
+                    ),
+                }
+            },
             .sample => |duration| self.render_budget.record(duration),
         }
     }
@@ -515,9 +525,11 @@ const RenderBudget = struct {
 /// repaint-delay budget. Matches the frame statistics over-budget tolerance.
 const repaint_miss_tolerance_nanoseconds = std.time.ns_per_ms;
 
+const RenderBudgetResetCause = enum { missed_deadline, no_timing };
+
 const RenderBudgetUpdate = union(enum) {
     ignore,
-    reset,
+    reset: RenderBudgetResetCause,
     sample: u64,
 };
 
@@ -540,11 +552,13 @@ fn renderBudgetUpdate(
     if (render_to_presentation >
         @as(i96, refresh_nanoseconds +| repaint_miss_tolerance_nanoseconds))
     {
-        return .reset;
+        return .{ .reset = .missed_deadline };
     }
     if (path == .direct_scanout) return .ignore;
-    const ready = ready_nanoseconds orelse return .reset;
-    if (ready < render_nanoseconds or ready > presented_nanoseconds) return .reset;
+    const ready = ready_nanoseconds orelse return .{ .reset = .no_timing };
+    if (ready < render_nanoseconds or ready > presented_nanoseconds) {
+        return .{ .reset = .no_timing };
+    }
     return .{ .sample = @intCast(ready - render_nanoseconds) };
 }
 
@@ -666,12 +680,12 @@ test "render budget samples the later of GPU completion and commit" {
     );
     // Unknown GPU completion disables delays rather than guessing.
     try std.testing.expectEqual(
-        RenderBudgetUpdate.reset,
+        RenderBudgetUpdate{ .reset = .no_timing },
         renderBudgetUpdate(.composited, 0, null, refresh, refresh),
     );
     // A ready timestamp outside render-to-presentation is untrustworthy.
     try std.testing.expectEqual(
-        RenderBudgetUpdate.reset,
+        RenderBudgetUpdate{ .reset = .no_timing },
         renderBudgetUpdate(.composited, 0, @as(i96, refresh) + 1, refresh, refresh),
     );
 }
@@ -680,17 +694,17 @@ test "render budget resets on a missed deadline regardless of frame path" {
     const refresh: u64 = 16_666_666;
     const late: i96 = @as(i96, refresh) + 2 * std.time.ns_per_ms;
     try std.testing.expectEqual(
-        RenderBudgetUpdate.reset,
+        RenderBudgetUpdate{ .reset = .missed_deadline },
         renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, late, refresh),
     );
     // Overlay and direct scanout misses must also invalidate a stale
     // budget so delayed frames cannot keep missing the same vblank.
     try std.testing.expectEqual(
-        RenderBudgetUpdate.reset,
+        RenderBudgetUpdate{ .reset = .missed_deadline },
         renderBudgetUpdate(.overlay_scanout, 0, 5 * std.time.ns_per_ms, late, refresh),
     );
     try std.testing.expectEqual(
-        RenderBudgetUpdate.reset,
+        RenderBudgetUpdate{ .reset = .missed_deadline },
         renderBudgetUpdate(.direct_scanout, 0, null, late, refresh),
     );
 }
@@ -2930,6 +2944,7 @@ fn controlPerformanceStatistics(
             render_output.backend.modeSize(),
             render_output.backend.refreshMillihertz(),
             self.renderer.workingFormat(),
+            render_output.render_budget.budgetNanoseconds(),
         );
     }
     const renderer_statistics = self.renderer.resourceStatistics();
@@ -2956,6 +2971,15 @@ fn controlPerformanceStatistics(
             .imageCopyCaptureSessions = wireInteger(@intCast(self.image_copy_capture.sessionCount())),
             .imageCopyCaptureFrames = wireInteger(@intCast(self.image_copy_capture.frameCount())),
             .captureBuffers = wireInteger(@intCast(screencopy_buffers +| image_copy_buffers)),
+            .gpuSubmissionOverlapFrames = wireInteger(
+                @intCast(renderer_statistics.submission_overlap_frames),
+            ),
+            .gpuSubmissionSlotWaits = wireInteger(
+                @intCast(renderer_statistics.submission_slot_waits),
+            ),
+            .gpuSubmissionSlotWaitMicroseconds = wireInteger(@intCast(
+                renderer_statistics.submission_slot_wait_nanoseconds / std.time.ns_per_us,
+            )),
         },
     };
 }
@@ -2965,6 +2989,7 @@ fn resetControlPerformanceStatistics(context: *anyopaque) void {
     var outputs = self.render_outputs.iterator();
     while (outputs.next()) |entry| entry.value.*.frame_statistics.reset();
     self.renderer.discardGpuTimings();
+    self.renderer.resetStatistics();
 }
 
 fn outputStatisticsTag(id: OutputLayout.Id) u64 {
@@ -4437,6 +4462,7 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     } else if (self.repaintDelayMilliseconds(output)) |delay_milliseconds| {
         // Deferring the render toward the predicted vblank shortens the
         // damage-to-presentation latency without missing the deadline.
+        increment(&output.frame_statistics.repaints_delayed);
         const timer = output.timer orelse unreachable;
         timer.timerUpdate(delay_milliseconds) catch |err| {
             log.err("failed to schedule repaint: {t}", .{err});
@@ -4445,6 +4471,7 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
         };
     } else {
         std.debug.assert(output.repaint_idle == null);
+        increment(&output.frame_statistics.repaints_immediate);
         output.repaint_idle = self.display.getEventLoop().addIdle(
             *RenderOutput,
             handleRenderIdle,

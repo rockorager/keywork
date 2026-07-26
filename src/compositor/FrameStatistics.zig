@@ -94,6 +94,10 @@ overlay_scanout_rejections: [overlay_scanout_rejection_count]u64 = @splat(0),
 cpu_uploads: u64 = 0,
 dmabuf_imports: u64 = 0,
 frames_over_budget: u64 = 0,
+repaints_delayed: u64 = 0,
+repaints_immediate: u64 = 0,
+render_budget_resets_missed: u64 = 0,
+render_budget_resets_no_timing: u64 = 0,
 render_fence_samples: u64 = 0,
 render_fences_signaled_before_commit: u64 = 0,
 latency_samples: [sample_capacity]FrameLatency = undefined,
@@ -232,12 +236,16 @@ pub fn recordFrame(
     self.last_damaged_pixels = pixels;
 }
 
+/// `render_budget_nanoseconds` is the repaint scheduler's current warmed
+/// worst-case render cost, or null while the sample window is not full and
+/// repaint delays are disabled.
 pub fn snapshot(
     self: *const FrameStatistics,
     name: []const u8,
     size: render.Size,
     refresh_millihertz: i32,
     working_format: Renderer.WorkingFormat,
+    render_budget_nanoseconds: ?u64,
 ) ControlProtocol.OutputStatistics {
     return .{
         .name = name,
@@ -306,6 +314,13 @@ pub fn snapshot(
         .cpuUploads = wireInteger(self.cpu_uploads),
         .dmabufImports = wireInteger(self.dmabuf_imports),
         .framesOverBudget = wireInteger(self.frames_over_budget),
+        .repaintsDelayed = wireInteger(self.repaints_delayed),
+        .repaintsImmediate = wireInteger(self.repaints_immediate),
+        .renderBudgetResetsMissedDeadline = wireInteger(self.render_budget_resets_missed),
+        .renderBudgetResetsNoTiming = wireInteger(self.render_budget_resets_no_timing),
+        .renderBudgetMicroseconds = wireInteger(
+            nanosecondsToMicroseconds(render_budget_nanoseconds orelse 0),
+        ),
         .renderFenceSamples = wireInteger(self.render_fence_samples),
         .renderFencesSignaledBeforeCommit = wireInteger(
             self.render_fences_signaled_before_commit,
@@ -629,8 +644,11 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         .{ .width = 100, .height = 100 },
         60_000,
         .rgba16f_linear,
+        null,
     );
     try std.testing.expectEqual(ControlProtocol.FramePath.composited, output_snapshot.lastFrame.path);
+    // A cold repaint-delay budget reports zero microseconds.
+    try std.testing.expectEqual(@as(i64, 0), output_snapshot.renderBudgetMicroseconds);
     try std.testing.expectEqual(ControlProtocol.BufferFormat.rgba16f_linear, output_snapshot.lastFrame.workingFormat);
     try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, output_snapshot.lastFrame.scanoutFormat);
     try std.testing.expectEqual(@as(i64, 3), output_snapshot.lastFrame.damageRectangles);
@@ -644,8 +662,10 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         .{ .width = 100, .height = 100 },
         60_000,
         .rgba16f_linear,
+        1_500 * std.time.ns_per_us,
     );
     try std.testing.expectEqual(ControlProtocol.FramePath.overlay_scanout, overlay_snapshot.lastFrame.path);
+    try std.testing.expectEqual(@as(i64, 1_500), overlay_snapshot.renderBudgetMicroseconds);
 
     // Time queued behind an already-submitted frame is request latency, not
     // compositor work exceeding the next presentation budget.

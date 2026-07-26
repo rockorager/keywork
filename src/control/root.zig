@@ -140,6 +140,16 @@ pub const OutputStatistics = struct {
     cpuUploads: i64,
     dmabufImports: i64,
     framesOverBudget: i64,
+    /// Repaints deferred toward a predicted vblank versus started
+    /// immediately. Defaults preserve decoding of replies from compositors
+    /// predating repaint-delay telemetry.
+    repaintsDelayed: i64 = 0,
+    repaintsImmediate: i64 = 0,
+    renderBudgetResetsMissedDeadline: i64 = 0,
+    renderBudgetResetsNoTiming: i64 = 0,
+    /// Current warmed worst-case render cost, or 0 while the sample window
+    /// is not full and repaint delays are disabled.
+    renderBudgetMicroseconds: i64 = 0,
     gpuExecution: LatencyStatistics,
     gpuComposition: LatencyStatistics,
     gpuPreparation: LatencyStatistics,
@@ -181,6 +191,11 @@ pub const ResourceStatistics = struct {
     imageCopyCaptureSessions: i64 = 0,
     imageCopyCaptureFrames: i64 = 0,
     captureBuffers: i64 = 0,
+    /// Cumulative GPU submission-ring telemetry since start or the last
+    /// statistics reset, unlike the point-in-time gauges above.
+    gpuSubmissionOverlapFrames: i64 = 0,
+    gpuSubmissionSlotWaits: i64 = 0,
+    gpuSubmissionSlotWaitMicroseconds: i64 = 0,
 };
 
 pub const PerformanceStatistics = struct {

@@ -153,6 +153,16 @@ type OutputStatistics (
     dmabufImports: int,
     # Frames whose render-to-presentation latency exceeded one refresh period plus tolerance.
     framesOverBudget: int,
+    # Repaints deferred toward a predicted vblank versus started immediately.
+    repaintsDelayed: int,
+    repaintsImmediate: int,
+    # Repaint-delay budget invalidations: presented frames that missed their
+    # deadline, and frames without trustworthy GPU completion timing.
+    renderBudgetResetsMissedDeadline: int,
+    renderBudgetResetsNoTiming: int,
+    # Current warmed worst-case render cost driving repaint delays, or 0 while
+    # the sample window is not full and delays are disabled.
+    renderBudgetMicroseconds: int,
     gpuExecution: LatencyStatistics,
     gpuComposition: LatencyStatistics,
     gpuPreparation: LatencyStatistics,
@@ -196,7 +206,13 @@ type ResourceStatistics (
     screencopyFrames: int,
     imageCopyCaptureSessions: int,
     imageCopyCaptureFrames: int,
-    captureBuffers: int
+    captureBuffers: int,
+    # Cumulative GPU submission-ring telemetry since start or the last
+    # statistics reset: frames prepared while the previous frame was still
+    # executing on the GPU, and frames that blocked on an exhausted ring.
+    gpuSubmissionOverlapFrames: int,
+    gpuSubmissionSlotWaits: int,
+    gpuSubmissionSlotWaitMicroseconds: int
 )
 
 # Change focus within the active workspace.

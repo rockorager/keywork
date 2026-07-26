@@ -108,6 +108,13 @@ video_graphics: std.AutoHashMapUnmanaged(VideoGraphicsKey, VideoGraphics) = .emp
 frame_number: u64,
 resource_epoch: u64,
 fallback: CpuRenderer,
+// Cumulative submission-ring telemetry, cleared by resetStatistics. Overlap
+// frames prove frame preparation ran while the previous frame's GPU work
+// was still in flight; slot waits count frames that exhausted the ring and
+// had to block, with the total time spent blocked.
+submission_overlap_frames: u64 = 0,
+submission_slot_waits: u64 = 0,
+submission_slot_wait_nanoseconds: u64 = 0,
 
 const max_cached_textures = 4096;
 const descriptor_set_capacity = max_cached_textures + 512;
@@ -2844,12 +2851,32 @@ pub fn discardGpuTimings(self: *Self) void {
     self.completed_gpu_timing_count = 0;
 }
 
+/// Monotonic clock read for measuring in-process wait durations. Returns 0
+/// on failure, which safely collapses the measured duration to 0.
+fn monotonicNanoseconds() u64 {
+    var timestamp: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &timestamp) != 0) return 0;
+    return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(timestamp.nsec));
+}
+
+/// Clears cumulative telemetry counters. Point-in-time resource gauges are
+/// unaffected.
+pub fn resetStatistics(self: *Self) void {
+    self.submission_overlap_frames = 0;
+    self.submission_slot_waits = 0;
+    self.submission_slot_wait_nanoseconds = 0;
+}
+
 pub fn resourceStatistics(self: *const Self) render.ResourceStatistics {
     var statistics: render.ResourceStatistics = .{
         .targets = self.outputs.count(),
         .cached_textures = self.textures.count(),
         .calibration_textures = self.calibrations.count(),
         .video_graphics_pipelines = self.video_graphics.count(),
+        .submission_overlap_frames = self.submission_overlap_frames,
+        .submission_slot_waits = self.submission_slot_waits,
+        .submission_slot_wait_nanoseconds = self.submission_slot_wait_nanoseconds,
     };
     var target_iterator = self.outputs.iterator();
     while (target_iterator.next()) |entry| {
@@ -3396,8 +3423,19 @@ fn renderFrameWithCompletion(
         log.err("Vulkan output target lookup failed: {t}", .{err});
         return err;
     };
+    // The slot being left is the frame submitted last; if its fence has not
+    // signaled yet, this frame's preparation overlaps that GPU work.
+    if (output.currentSubmission().fence_pending) self.submission_overlap_frames += 1;
     const submission = output.advanceSubmission();
-    try self.drainSubmission(submission);
+    if (submission.fence_pending) {
+        self.submission_slot_waits += 1;
+        const wait_start = monotonicNanoseconds();
+        try self.drainSubmission(submission);
+        self.submission_slot_wait_nanoseconds +|=
+            monotonicNanoseconds() -| wait_start;
+    } else {
+        try self.drainSubmission(submission);
+    }
     if (!std.meta.eql(output.size, frame.size)) {
         log.err(
             "Vulkan output target size changed: frame={d}x{d} output={d}x{d}",

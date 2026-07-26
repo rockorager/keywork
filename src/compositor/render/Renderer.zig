@@ -397,6 +397,14 @@ pub fn resourceStatistics(self: *const Renderer) ResourceStatistics {
     };
 }
 
+/// Clears cumulative renderer telemetry counters.
+pub fn resetStatistics(self: *Renderer) void {
+    switch (self.backend) {
+        .cpu => {},
+        .vulkan => |*renderer| renderer.resetStatistics(),
+    }
+}
+
 pub fn directScanoutCandidate(self: *Renderer) render_types.DirectScanoutCandidate {
     const active = self.active_frame orelse return .{ .rejected = .no_fullscreen_surface };
     const last_command = self.commands.getLastOrNull() orelse

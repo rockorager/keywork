@@ -860,6 +860,13 @@ pub const ResourceStatistics = struct {
     blur_scratch_images: usize = 0,
     backdrop_cache_images: usize = 0,
     mapped_buffer_capacity_bytes: usize = 0,
+    /// Cumulative frames whose preparation began while the same output's
+    /// previous submission was still executing on the GPU.
+    submission_overlap_frames: u64 = 0,
+    /// Cumulative frames that blocked because every submission ring slot
+    /// was still in flight, and the total time spent blocked.
+    submission_slot_waits: u64 = 0,
+    submission_slot_wait_nanoseconds: u64 = 0,
 };
 
 pub const OffscreenTarget = struct {
