@@ -1,476 +1,8 @@
 local ui = {}
 
--- Radix Themes scales at 100% scaling and medium radius, mirroring `scale`
--- in src/ui/types.zig. Lua's 1-based arrays match Radix token names:
--- space_scale[3] is Radix --space-3.
-local space_scale = { 4, 8, 12, 16, 24, 32, 40, 48, 64 }
-local font_size_scale = { 12, 14, 16, 18, 20, 24, 28, 35, 60 }
-local line_height_scale = { 16, 20, 24, 26, 28, 30, 36, 40, 60 }
-local radius_scale = { 3, 4, 6, 8, 12, 16 }
-local control_padding_y = (space_scale[6] - line_height_scale[2]) / 2
-local badge_gap = space_scale[1] * 1.5
-
-local default_theme = {
-    schemes = {
-        light = {
-            colors = {
-                black = 0xff000000,
-                white = 0xffffffff,
-                white_a6 = 0x59ffffff,
-                black_a1 = 0x0d000000,
-                black_a2 = 0x1a000000,
-                black_a3 = 0x26000000,
-                black_a4 = 0x33000000,
-                black_a5 = 0x4d000000,
-                black_a6 = 0x59000000,
-                black_a7 = 0x70000000,
-                black_a11 = 0xb8000000,
-
-                neutral1 = 0xfffcfcfd,
-                neutral2 = 0xfff9f9fb,
-                neutral3 = 0xfff0f0f3,
-                neutral4 = 0xffe8e8ec,
-                neutral5 = 0xffe0e1e6,
-                neutral6 = 0xffd9d9e0,
-                neutral7 = 0xffcdced6,
-                neutral8 = 0xffb9bbc6,
-                neutral9 = 0xff8b8d98,
-                neutral10 = 0xff80838d,
-                neutral11 = 0xff60646c,
-                neutral12 = 0xff1c2024,
-                neutral_a1 = 0x03000055,
-                neutral_a2 = 0x06000055,
-                neutral_a3 = 0x0f000033,
-                neutral_a4 = 0x1700002d,
-                neutral_a5 = 0x1f000038,
-                neutral_a6 = 0x2600002f,
-                neutral_a7 = 0x3200062e,
-                neutral_a8 = 0x46000830,
-                neutral_a9 = 0x7400051d,
-                neutral_a10 = 0x7f00071b,
-                neutral_a11 = 0x9f000714,
-
-                blue1 = 0xfffbfdff,
-                blue2 = 0xfff4faff,
-                blue3 = 0xffe6f4fe,
-                blue4 = 0xffd5efff,
-                blue5 = 0xffc2e5ff,
-                blue6 = 0xffacd8fc,
-                blue7 = 0xff8ec8f6,
-                blue8 = 0xff5eb1ef,
-                blue9 = 0xff0090ff,
-                blue10 = 0xff0588f0,
-                blue11 = 0xff0d74ce,
-                blue12 = 0xff113264,
-                blue_a3 = 0x19008ff5,
-                blue_a4 = 0x2a009eff,
-                blue_a5 = 0x3d0093ff,
-                blue_a6 = 0x530088f6,
-                blue_a11 = 0xf2006dcb,
-
-                red = 0xffe5484d,
-                orange = 0xfff76b15,
-                yellow = 0xffffe629,
-                green = 0xff30a46c,
-                mint = 0xff86ead4,
-                teal = 0xff12a594,
-                cyan = 0xff00a2c7,
-                blue = "blue9",
-                indigo = 0xff3e63dd,
-                purple = 0xff8e4ec6,
-                pink = 0xffd6409f,
-                brown = 0xffad7f58,
-                gray = "neutral9",
-                gray2 = "neutral8",
-                gray3 = "neutral7",
-                gray4 = "neutral6",
-                gray5 = "neutral4",
-                gray6 = "neutral3",
-
-                label = "neutral12",
-                secondary_label = "neutral11",
-                tertiary_label = "neutral10",
-                quaternary_label = "neutral9",
-                system_background = "white",
-                secondary_system_background = "neutral2",
-                tertiary_system_background = "white",
-                system_fill = "neutral4",
-                secondary_system_fill = "neutral3",
-                tertiary_system_fill = "neutral2",
-                quaternary_system_fill = "neutral1",
-                separator = "neutral6",
-                opaque_separator = "neutral6",
-                panel_border = "neutral3",
-
-                background = "system_background",
-                surface = "secondary_system_background",
-                surface_high = "tertiary_system_background",
-                surface_low = "neutral2",
-                backdrop_surface = "white_a6",
-                text = "label",
-                text_secondary = "secondary_label",
-                text_tertiary = "tertiary_label",
-                placeholder = "neutral10",
-                border = "neutral7",
-                fill = "system_fill",
-                fill_secondary = "secondary_system_fill",
-
-                accent3 = "blue3",
-                accent4 = "blue4",
-                accent5 = "blue5",
-                accent6 = "blue6",
-                accent8 = "blue8",
-                accent9 = "blue9",
-                accent10 = "blue10",
-                accent11 = "blue11",
-                accent_a3 = "blue_a3",
-                accent_a4 = "blue_a4",
-                accent_a5 = "blue_a5",
-                accent_a6 = "blue_a6",
-                accent_a11 = "blue_a11",
-                accent = "accent9",
-                focus8 = "accent8",
-                on_accent = "white",
-                success = "green",
-                on_success = "white",
-                warning = "yellow",
-                on_warning = "black",
-                danger = "red",
-                on_danger = "white",
-                info = "cyan",
-                on_info = "white",
-
-                foreground = "text",
-                muted = "text_secondary",
-                primary = "accent",
-                on_primary = "on_accent",
-                error = "danger",
-                on_error = "on_danger",
-            },
-            -- Public Radix outer shadow layers. Shadow-1 is inset-only and remains
-      -- unavailable until Keywork supports inner shadows.
-            shadow = {
-                [2] = {
-                    { spread = 1, color = "neutral_a3" },
-                    { spread = 0.5, color = "black_a1" },
-                    { offset_y = 1, blur = 1, color = "neutral_a2" },
-                    { offset_y = 2, blur = 1, spread = -1, color = "black_a1" },
-                    { offset_y = 1, blur = 3, color = "black_a1" },
-                },
-                [3] = {
-                    { spread = 1, color = "neutral_a3" },
-                    { offset_y = 2, blur = 3, spread = -2, color = "neutral_a3" },
-                    { offset_y = 3, blur = 12, spread = -4, color = "black_a2" },
-                    { offset_y = 4, blur = 16, spread = -8, color = "black_a2" },
-                },
-                [4] = {
-                    { spread = 1, color = "neutral_a3" },
-                    { offset_y = 8, blur = 40, color = "black_a1" },
-                    { offset_y = 12, blur = 32, spread = -16, color = "neutral_a3" },
-                },
-                [5] = {
-                    { spread = 1, color = "neutral_a3" },
-                    { offset_y = 12, blur = 60, color = "black_a3" },
-                    { offset_y = 12, blur = 32, spread = -16, color = "neutral_a5" },
-                },
-                [6] = {
-                    { spread = 1, color = "neutral_a3" },
-                    { offset_y = 12, blur = 60, color = "black_a3" },
-                    { offset_y = 16, blur = 64, color = "neutral_a2" },
-                    { offset_y = 16, blur = 36, spread = -20, color = "neutral_a7" },
-                },
-            },
-        },
-        dark = {
-            colors = {
-                black = 0xff000000,
-                white = 0xffffffff,
-                white_a6 = 0x59ffffff,
-                black_a1 = 0x0d000000,
-                black_a2 = 0x1a000000,
-                black_a3 = 0x26000000,
-                black_a4 = 0x33000000,
-                black_a5 = 0x4d000000,
-                black_a6 = 0x59000000,
-                black_a7 = 0x70000000,
-                black_a11 = 0xb8000000,
-
-                neutral1 = 0xff111113,
-                neutral2 = 0xff18191b,
-                neutral3 = 0xff212225,
-                neutral4 = 0xff272a2d,
-                neutral5 = 0xff2e3135,
-                neutral6 = 0xff363a3f,
-                neutral7 = 0xff43484e,
-                neutral8 = 0xff5a6169,
-                neutral9 = 0xff696e77,
-                neutral10 = 0xff777b84,
-                neutral11 = 0xffb0b4ba,
-                neutral12 = 0xffedeef0,
-                neutral_a2 = 0x09d8f4f6,
-                neutral_a3 = 0x14ddeaf8,
-                neutral_a4 = 0x1dd3edf8,
-                neutral_a5 = 0x25d9edff,
-                neutral_a6 = 0x30d6ebfd,
-                neutral_a7 = 0x40d9edff,
-                neutral_a8 = 0x5dd9edff,
-                neutral_a9 = 0x6ddfebfd,
-                neutral_a10 = 0x7be5edfd,
-                neutral_a11 = 0xb5f1f7fe,
-
-                blue1 = 0xff0d1520,
-                blue2 = 0xff111927,
-                blue3 = 0xff0d2847,
-                blue4 = 0xff003362,
-                blue5 = 0xff004074,
-                blue6 = 0xff104d87,
-                blue7 = 0xff205d9e,
-                blue8 = 0xff2870bd,
-                blue9 = 0xff0090ff,
-                blue10 = 0xff3b9eff,
-                blue11 = 0xff70b8ff,
-                blue12 = 0xffc2e6ff,
-                blue_a3 = 0x3a0077ff,
-                blue_a4 = 0x570075ff,
-                blue_a5 = 0x6b0081fd,
-                blue_a6 = 0x7f0f89fd,
-                blue_a11 = 0xff70b8ff,
-
-                red = 0xffe5484d,
-                orange = 0xfff76b15,
-                yellow = 0xffffe629,
-                green = 0xff30a46c,
-                mint = 0xff86ead4,
-                teal = 0xff12a594,
-                cyan = 0xff00a2c7,
-                blue = "blue9",
-                indigo = 0xff3e63dd,
-                purple = 0xff8e4ec6,
-                pink = 0xffd6409f,
-                brown = 0xffad7f58,
-                gray = "neutral9",
-                gray2 = "neutral8",
-                gray3 = "neutral7",
-                gray4 = "neutral6",
-                gray5 = "neutral5",
-                gray6 = "neutral3",
-
-                label = "neutral12",
-                secondary_label = "neutral11",
-                tertiary_label = "neutral10",
-                quaternary_label = "neutral9",
-                system_background = "neutral1",
-                secondary_system_background = "neutral2",
-                tertiary_system_background = "neutral2",
-                system_fill = "neutral4",
-                secondary_system_fill = "neutral3",
-                tertiary_system_fill = "neutral2",
-                quaternary_system_fill = "neutral1",
-                separator = "neutral6",
-                opaque_separator = "neutral6",
-                panel_border = "neutral6",
-
-                background = "system_background",
-                surface = "secondary_system_background",
-                surface_high = "tertiary_system_background",
-                surface_low = "neutral2",
-                backdrop_surface = "black_a6",
-                text = "label",
-                text_secondary = "secondary_label",
-                text_tertiary = "tertiary_label",
-                placeholder = "neutral10",
-                border = "neutral7",
-                fill = "system_fill",
-                fill_secondary = "secondary_system_fill",
-
-                accent3 = "blue3",
-                accent4 = "blue4",
-                accent5 = "blue5",
-                accent6 = "blue6",
-                accent8 = "blue8",
-                accent9 = "blue9",
-                accent10 = "blue10",
-                accent11 = "blue11",
-                accent_a3 = "blue_a3",
-                accent_a4 = "blue_a4",
-                accent_a5 = "blue_a5",
-                accent_a6 = "blue_a6",
-                accent_a11 = "blue_a11",
-                accent = "accent9",
-                focus8 = "accent8",
-                on_accent = "white",
-                success = "green",
-                on_success = "white",
-                warning = "yellow",
-                on_warning = "black",
-                danger = "red",
-                on_danger = "white",
-                info = "cyan",
-                on_info = "white",
-
-                foreground = "text",
-                muted = "text_secondary",
-                primary = "accent",
-                on_primary = "on_accent",
-                error = "danger",
-                on_error = "on_danger",
-            },
-            shadow = {
-                [2] = {
-                    { spread = 1, color = "neutral_a6" },
-                    { spread = 0.5, color = "black_a3" },
-                    { offset_y = 1, blur = 1, color = "black_a6" },
-                    { offset_y = 2, blur = 1, spread = -1, color = "black_a6" },
-                    { offset_y = 1, blur = 3, color = "black_a5" },
-                },
-                [3] = {
-                    { spread = 1, color = "neutral_a6" },
-                    { offset_y = 2, blur = 3, spread = -2, color = "black_a3" },
-                    { offset_y = 3, blur = 8, spread = -2, color = "black_a6" },
-                    { offset_y = 4, blur = 12, spread = -4, color = "black_a7" },
-                },
-                [4] = {
-                    { spread = 1, color = "neutral_a6" },
-                    { offset_y = 8, blur = 40, color = "black_a3" },
-                    { offset_y = 12, blur = 32, spread = -16, color = "black_a5" },
-                },
-                [5] = {
-                    { spread = 1, color = "neutral_a6" },
-                    { offset_y = 12, blur = 60, color = "black_a5" },
-                    { offset_y = 12, blur = 32, spread = -16, color = "black_a7" },
-                },
-                [6] = {
-                    { spread = 1, color = "neutral_a6" },
-                    { offset_y = 12, blur = 60, color = "black_a4" },
-                    { offset_y = 16, blur = 64, color = "black_a6" },
-                    { offset_y = 16, blur = 36, spread = -20, color = "black_a11" },
-                },
-            },
-        },
-    },
-
-    text = {
-        body = { size = font_size_scale[3], line_height = line_height_scale[3] },
-        label = { size = font_size_scale[2], line_height = line_height_scale[2] },
-        title = { size = font_size_scale[5], line_height = line_height_scale[5] },
-    },
-
-    space = space_scale,
-    font_size = font_size_scale,
-    line_height = line_height_scale,
-    radius = radius_scale,
-
-    components = {
-        button = {
-            -- Radix size-2 button: 20px label line plus 6px vertical padding,
-      -- space-3 horizontal padding, and radius-2.
-            padding_x = space_scale[3],
-            padding_y = control_padding_y,
-            radius = radius_scale[2],
-            default = {
-                background = "accent",
-                foreground = "on_accent",
-            },
-            hover = {
-                background = "accent10",
-                foreground = "on_accent",
-            },
-            pressed = {
-                background = "accent10",
-                foreground = "on_accent",
-            },
-            disabled = {
-                background = "neutral3",
-                foreground = "neutral8",
-            },
-            focused = {
-                border = "focus8",
-                border_width = 2,
-            },
-        },
-
-        input = {
-            -- Radix size-2 text field: 32px tall, space-2 horizontal padding,
-      -- radius-2, font-size-2.
-            padding_x = space_scale[2],
-            padding_y = control_padding_y,
-            radius = radius_scale[2],
-            font_size = font_size_scale[2],
-            line_height = line_height_scale[2],
-            background = "surface",
-            foreground = "text",
-            placeholder = "neutral10",
-            border = "neutral7",
-            focused_border = "focus8",
-        },
-
-        chip = {
-            -- Radix size-2 Badge geometry and soft colors.
-            padding_x = space_scale[2],
-            padding_y = space_scale[1],
-            radius = radius_scale[2],
-            min_height = space_scale[5],
-            font_size = font_size_scale[1],
-            line_height = line_height_scale[1],
-            icon_size = space_scale[3],
-            gap = badge_gap,
-            background = "accent3",
-            foreground = "accent11",
-            hover_background = "accent4",
-            pressed_background = "accent5",
-            focused_border = "focus8",
-            focused_border_width = 2,
-            selected_background = "accent9",
-            selected_foreground = "on_accent",
-            selected_hover_background = "accent10",
-            selected_pressed_background = "accent10",
-        },
-
-        menu = {
-            -- Radix size-2 menu content and the soft highlighted-item variant.
-            background = "surface_high",
-            border = "panel_border",
-            border_width = 1,
-            radius = radius_scale[4],
-            padding = space_scale[2],
-            item = {
-                padding_x = space_scale[3],
-                padding_y = control_padding_y,
-                min_height = space_scale[6],
-                radius = radius_scale[2],
-                font_size = font_size_scale[2],
-                line_height = line_height_scale[2],
-                hover_background = "accent4",
-                selected_background = "accent4",
-                selected_hover_background = "accent4",
-            },
-            label = {
-                padding_x = space_scale[3],
-                padding_y = control_padding_y,
-                min_height = space_scale[6],
-                font_size = font_size_scale[2],
-                line_height = line_height_scale[2],
-                foreground = "neutral10",
-            },
-            separator = {
-                color = "neutral6",
-                thickness = 1,
-                margin = space_scale[2],
-                inset = space_scale[1],
-            },
-        },
-
-        separator = {
-            color = "neutral6",
-            thickness = 1,
-        },
-
-        scrollbar = {
-            track = "neutral3",
-            thumb = "neutral8",
-        },
-    },
-}
+-- The authoritative built-in profile lives separately from generic theme and
+-- widget mechanics so additional design profiles do not duplicate this API.
+local default_theme = require("keywork.design.fluent")
 
 local function copy_table(value)
     local result = {}
@@ -500,7 +32,7 @@ function ui.theme_data(options)
     options = options or {}
     local result = merge_table(default_theme, options)
     -- A custom font size without a matching line height keeps the historical
-    -- font-metrics fallback instead of inheriting an unrelated Radix pair.
+    -- font-metrics fallback instead of inheriting an unrelated default pair.
     for role, style in pairs(options.text or {}) do
         if type(style) == "table" and (style.size ~= nil or style.font_size ~= nil) and style.line_height == nil then
             result.text[role].line_height = nil
@@ -665,8 +197,10 @@ local function resolve_menu(menu, colors, space, radius, shadow)
             font_size = item.font_size,
             line_height = item.line_height,
             hover_background = resolve_color(item.hover_background, colors),
+            pressed_background = resolve_color(item.pressed_background, colors),
             selected_background = resolve_color(item.selected_background, colors),
             selected_hover_background = resolve_color(item.selected_hover_background, colors),
+            selected_pressed_background = resolve_color(item.selected_pressed_background, colors),
         },
         label = {
             padding_x = resolve_space(label.padding_x, space),
@@ -1208,7 +742,7 @@ end
 function ui.icon_label(icon_name, text, options)
     options = options or {}
     -- No size default here: a nil size falls through to the enclosing
-    -- icon_theme context or the bridge's Radix space-4 default.
+    -- icon_theme context or the bridge's default.
     local children = {
         ui.icon({
             name = icon_name,
@@ -1232,7 +766,7 @@ function ui.icon_label(icon_name, text, options)
     -- "cap_center" centers the icon on the text's cap-height midline (like
     -- macOS symbol alignment) instead of the text box's geometric center.
     return ui.row({
-        spacing = options.spacing or space_scale[2],
+        spacing = options.spacing or default_theme.space[2],
         align = options.align or "cap_center",
         children = children,
     })
@@ -1258,7 +792,10 @@ local function build_chip(options, theme)
 
     local padding = options.padding
     if not padding then
-        padding = { x = chip_theme.padding_x or space_scale[2], y = chip_theme.padding_y or space_scale[1] }
+        padding = {
+            x = chip_theme.padding_x or default_theme.components.chip.padding_x,
+            y = chip_theme.padding_y or default_theme.components.chip.padding_y,
+        }
     end
 
     local child = options.child
@@ -1354,11 +891,14 @@ local function build_menu_item(options, theme)
     local selected = options.selected or false
     local background = options.background
     local hover_background
+    local pressed_background = options.pressed_background or item_theme.pressed_background
     if options.hover_background ~= false then
         hover_background = options.hover_background or item_theme.hover_background
     end
     if selected then
         background = options.selected_background or item_theme.selected_background or background
+        pressed_background = options.selected_pressed_background or item_theme.selected_pressed_background
+            or pressed_background
         if options.hover_background ~= false then
             if options.selected_hover_background == false then
                 hover_background = nil
@@ -1370,16 +910,20 @@ local function build_menu_item(options, theme)
     end
     local padding = options.padding
     if not padding then
-        padding = { x = item_theme.padding_x or space_scale[3], y = item_theme.padding_y or control_padding_y }
+        padding = {
+            x = item_theme.padding_x or default_theme.components.menu.item.padding_x,
+            y = item_theme.padding_y or default_theme.components.menu.item.padding_y,
+        }
     end
     local child = ui.default_text_style({
-        font_size = item_theme.font_size or font_size_scale[2],
-        line_height = item_theme.line_height or line_height_scale[2],
+        font_size = item_theme.font_size or default_theme.components.menu.item.font_size,
+        line_height = item_theme.line_height or default_theme.components.menu.item.line_height,
         child = options.child,
     })
     return ui.pressable({
         id = options.id,
         hover_background = hover_background,
+        pressed_background = pressed_background,
         cursor = options.cursor,
         activation = options.activation,
         on_tap = options.on_tap,
@@ -1411,20 +955,23 @@ local function build_menu_label(options, theme)
     local child = options.child
         or ui.label(options.text or "", {
             color = options.color or label_theme.foreground,
-            font_size = label_theme.font_size or font_size_scale[2],
-            line_height = label_theme.line_height or line_height_scale[2],
+            font_size = label_theme.font_size or default_theme.components.menu.label.font_size,
+            line_height = label_theme.line_height or default_theme.components.menu.label.line_height,
         })
     if options.child then
         child = ui.default_text_style({
             color = options.color or label_theme.foreground,
-            font_size = label_theme.font_size or font_size_scale[2],
-            line_height = label_theme.line_height or line_height_scale[2],
+            font_size = label_theme.font_size or default_theme.components.menu.label.font_size,
+            line_height = label_theme.line_height or default_theme.components.menu.label.line_height,
             child = child,
         })
     end
     local padding = options.padding
     if not padding then
-        padding = { x = label_theme.padding_x or space_scale[3], y = label_theme.padding_y or control_padding_y }
+        padding = {
+            x = label_theme.padding_x or default_theme.components.menu.label.padding_x,
+            y = label_theme.padding_y or default_theme.components.menu.label.padding_y,
+        }
     end
     return ui.container({
         min_height = options.min_height or label_theme.min_height,
@@ -1448,11 +995,11 @@ local function build_menu_separator(options, theme)
     local menu_theme = theme and theme.components and theme.components.menu or {}
     local separator_theme = menu_theme.separator or {}
     return ui.padding({
-        x = options.inset or separator_theme.inset or space_scale[1],
+        x = options.inset or separator_theme.inset or default_theme.components.menu.separator.inset,
         child = ui.separator({
             color = options.color or separator_theme.color,
             thickness = options.thickness or separator_theme.thickness or 1,
-            margin = options.margin or separator_theme.margin or space_scale[2],
+            margin = options.margin or separator_theme.margin or default_theme.components.menu.separator.margin,
             axis = options.axis,
         }),
     })
@@ -1474,7 +1021,7 @@ function ui.icon_button(options)
         id = options.id,
         theme = options.theme,
         icon = options.icon,
-        icon_size = options.size or space_scale[4],
+        icon_size = options.size or default_theme.space[4],
         color = options.color,
         background = options.background,
         border = options.border,
@@ -1487,7 +1034,7 @@ function ui.icon_button(options)
         selected_color = options.selected_color,
         selected_hover_background = options.selected_hover_background,
         selected_pressed_background = options.selected_pressed_background,
-        padding = options.padding or { all = space_scale[2] },
+        padding = options.padding or { all = default_theme.space[2] },
         radius = options.radius,
         on_tap = options.on_tap,
         on_tap_down = options.on_tap_down,

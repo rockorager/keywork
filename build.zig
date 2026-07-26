@@ -179,6 +179,11 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/keywork/emmylua",
         .include_extensions = &.{".lua"},
     });
+    b.installDirectory(.{
+        .source_dir = b.path("resources/icons"),
+        .install_dir = .prefix,
+        .install_subdir = "share/icons",
+    });
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {

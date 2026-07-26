@@ -178,8 +178,10 @@
 ---@field font_size?                 number
 ---@field line_height?               number
 ---@field hover_background?          keywork.ColorRef
+---@field pressed_background?        keywork.ColorRef
 ---@field selected_background?       keywork.ColorRef
 ---@field selected_hover_background? keywork.ColorRef
+---@field selected_pressed_background? keywork.ColorRef
 
 ---@class keywork.ThemeMenuLabelSource
 ---@field padding_x?   keywork.ThemeMetricRef
@@ -300,8 +302,10 @@
 ---@field font_size?                 number
 ---@field line_height?               number
 ---@field hover_background?          keywork.Color
+---@field pressed_background?        keywork.Color
 ---@field selected_background?       keywork.Color
 ---@field selected_hover_background? keywork.Color
+---@field selected_pressed_background? keywork.Color
 
 ---@class keywork.ThemeWidgetMenuLabel
 ---@field padding_x?   number
@@ -402,8 +406,10 @@
 ---@field font_size                 number
 ---@field line_height               number
 ---@field hover_background          keywork.Color
+---@field pressed_background        keywork.Color
 ---@field selected_background       keywork.Color
 ---@field selected_hover_background keywork.Color
+---@field selected_pressed_background keywork.Color
 
 ---@class keywork.ThemeMenuLabel
 ---@field padding_x   number
@@ -782,8 +788,10 @@
 ---@field selected?                  boolean
 ---@field background?                keywork.Color
 ---@field hover_background?          keywork.Color | false
+---@field pressed_background?        keywork.Color
 ---@field selected_background?       keywork.Color
 ---@field selected_hover_background? keywork.Color | false
+---@field selected_pressed_background? keywork.Color
 ---@field radius?                    number
 ---@field min_height?                number
 ---@field padding?                   number | keywork.EdgeInsets

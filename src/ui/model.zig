@@ -1157,8 +1157,8 @@ pub const RenderNode = struct {
     scroll_id: ?[]const u8 = null,
     scroll_content: Size = .{ .width = 0, .height = 0 },
     scroll_offset: Point = .{ .x = 0, .y = 0 },
-    scrollbar_track_color: Color = colors.neutral3,
-    scrollbar_color: Color = colors.neutral8,
+    scrollbar_track_color: Color = colors.transparent,
+    scrollbar_color: Color = colors.scrollbar_light,
     autofocus: bool = false,
     skip_traversal: bool = false,
     can_request_focus: bool = true,
@@ -3577,7 +3577,7 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     defer build_arena.deinit();
     const build_allocator = build_arena.allocator();
 
-    // Ten Radix body rows at 24px: 240px of content in a 40px viewport.
+    // Ten Fluent body rows at 20px: 200px of content in a 40px viewport.
     var rows: [10]Widget = undefined;
     for (&rows, 0..) |*row, index| {
         row.* = if (index == 9)
@@ -3607,8 +3607,8 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     scrollState(&element).offset_y = 1000;
     _ = dirtyScrollElement(&element, "list");
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 200), scrollState(&element).offset_y);
-    try std.testing.expectEqual(@as(f32, -200), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_y);
+    try std.testing.expectEqual(@as(f32, -160), root.children[0].rect.y);
 
     // Scrolled to the bottom, the last row is inside the viewport and
     // clickable again.
@@ -3634,13 +3634,13 @@ test "scroll viewport clips content, clamps offset, and blocks hits outside" {
     try std.testing.expect(saw_viewport_clip);
 }
 
-test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
+test "horizontal scroll clamps its axis and paints an overlay scrollbar thumb" {
     const retained_allocator = std.testing.allocator;
     var build_arena = std.heap.ArenaAllocator.init(retained_allocator);
     defer build_arena.deinit();
     const build_allocator = build_arena.allocator();
 
-    // Ten 24px-wide cells: 240px of content in an 80px viewport.
+    // Ten 21px-wide cells: 210px of content in an 80px viewport.
     var cells: [10]Widget = undefined;
     for (&cells) |*cell| cell.* = widgets.text("row");
     const row = try widgets.row(build_allocator, &cells, 0);
@@ -3654,17 +3654,17 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
     const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 80), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 240), root.children[0].rect.width);
+    try std.testing.expectEqual(@as(f32, 210), root.children[0].rect.width);
 
     scrollState(&element).offset_x = 1000;
     revealScrollbar(&element, 0);
     _ = dirtyScrollElement(&element, "strip");
     _ = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
-    try std.testing.expectEqual(@as(f32, 160), scrollState(&element).offset_x);
-    try std.testing.expectEqual(@as(f32, -160), root.children[0].rect.x);
+    try std.testing.expectEqual(@as(f32, 130), scrollState(&element).offset_x);
+    try std.testing.expectEqual(@as(f32, -130), root.children[0].rect.x);
 
     // The horizontal thumb shows along the bottom edge as a rounded pill
-    // (an alpha mask tinted with the scrollbar color).
+    // without painting Fluent's transparent overlay track.
     var display_list: DisplayList = .{};
     defer display_list.deinit(retained_allocator);
     var raster_cache: RasterCache = .{};
@@ -3683,7 +3683,7 @@ test "horizontal scroll clamps its axis and paints a scrollbar thumb" {
             else => {},
         }
     }
-    try std.testing.expect(saw_track);
+    try std.testing.expect(!saw_track);
     try std.testing.expect(saw_thumb);
 }
 
@@ -4128,8 +4128,8 @@ test "text input uses intrinsic width when unconstrained" {
     defer destroyElementTree(retained_allocator, &element);
     const root = try layoutElement(retained_allocator, &element, constraints, .{ .x = 0, .y = 0 }, .fixed);
 
-    // Four 14px fixed-measurer glyphs plus 8px on each side.
-    try std.testing.expectEqual(@as(f32, 44), root.rect.width);
+    // Four 7px fixed-measurer glyphs plus 12px on each side.
+    try std.testing.expectEqual(@as(f32, 52), root.rect.width);
     try std.testing.expectEqual(@as(f32, 32), root.rect.height);
 }
 
@@ -4153,8 +4153,8 @@ test "layout, paint, and hit test a padded column" {
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 200, .max_height = 120 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .padding), root.kind);
-    try std.testing.expectEqual(@as(f32, 60), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 88), root.rect.height);
+    try std.testing.expectEqual(@as(f32, 55), root.rect.width);
+    try std.testing.expectEqual(@as(f32, 80), root.rect.height);
 
     var display_list: DisplayList = .{};
     defer display_list.deinit(allocator);
@@ -4184,7 +4184,7 @@ test "button widget composes styled clickable content" {
     try std.testing.expectEqual(@as(RenderNode.Kind, .clickable), root.children[0].kind);
     try std.testing.expectEqualStrings("confirm", root.children[0].clickable_id.?);
     try std.testing.expectEqual(@as(RenderNode.Kind, .box), root.children[0].children[0].kind);
-    try std.testing.expectEqual(colors.blue10, root.children[0].children[0].background);
+    try std.testing.expectEqual(colors.brand_background_pressed, root.children[0].children[0].background);
     try std.testing.expectEqual(@as(f32, 32), root.rect.height);
     try std.testing.expectEqual(@as(RenderNode.Kind, .text), root.children[0].children[0].children[0].children[0].kind);
     try std.testing.expectEqualStrings("Confirm", root.children[0].children[0].children[0].children[0].text.?);
@@ -4210,8 +4210,8 @@ test "row spacer takes remaining main-axis space" {
 
     try std.testing.expectEqual(@as(RenderNode.Kind, .row), root.kind);
     try std.testing.expectEqual(@as(f32, 100), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 84), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 92), root.children[2].rect.x);
+    try std.testing.expectEqual(@as(f32, 86), root.children[1].rect.width);
+    try std.testing.expectEqual(@as(f32, 93), root.children[2].rect.x);
 }
 
 test "expanded children split the spare main axis by flex factor" {
@@ -4232,14 +4232,14 @@ test "expanded children split the spare main axis by flex factor" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 98, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // Text A is 8 wide; the 90 spare pixels split 30/60.
+    // Text A is 7px wide; the 91 spare pixels split by a 1:2 flex ratio.
     try std.testing.expectEqual(@as(f32, 98), root.rect.width);
-    try std.testing.expectEqual(@as(f32, 30), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 60), root.children[2].rect.width);
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
-    try std.testing.expectEqual(@as(f32, 38), root.children[2].rect.x);
+    try std.testing.expectApproxEqAbs(@as(f32, 91.0 / 3.0), root.children[1].rect.width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 182.0 / 3.0), root.children[2].rect.width, 0.001);
+    try std.testing.expectEqual(@as(f32, 7), root.children[1].rect.x);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0 + 91.0 / 3.0), root.children[2].rect.x, 0.001);
     // Tight fit forces the wrapped child to fill the share too.
-    try std.testing.expectEqual(@as(f32, 30), root.children[1].children[0].rect.width);
+    try std.testing.expectApproxEqAbs(@as(f32, 91.0 / 3.0), root.children[1].children[0].rect.width, 0.001);
 }
 
 test "tight flexible box centers its child within the whole share" {
@@ -4260,12 +4260,12 @@ test "tight flexible box centers its child within the whole share" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // The 24px Radix body line and box divide the 48px axis evenly.
+    // The 20px Fluent body line leaves a 28px expanded share.
     const flexible_node = root.children[1];
     const box_node = flexible_node.children[0];
-    try std.testing.expectEqual(@as(f32, 24), flexible_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 24), box_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 24), box_node.rect.y);
+    try std.testing.expectEqual(@as(f32, 28), flexible_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 28), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 20), box_node.rect.y);
     try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
 }
 
@@ -4286,11 +4286,11 @@ test "stretch lays out children with tight cross constraints" {
 
     // Stretch is a tight cross constraint, not a post-layout inflation:
     // children fill the row's whole 40px cross axis, and the box centers
-    // its 24px child in the slack it knew about at alignment time.
+    // its 20px child in the slack it knew about at alignment time.
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
     try std.testing.expectEqual(@as(f32, 40), root.children[0].rect.height);
     try std.testing.expectEqual(@as(f32, 40), root.children[1].rect.height);
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 10), root.children[1].children[0].rect.y);
 }
 
 test "sized passes parent min constraints through unspecified axes" {
@@ -4313,13 +4313,13 @@ test "sized passes parent min constraints through unspecified axes" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 48 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // The sized wrapper only pins its width; the expanded 24px height min
+    // The sized wrapper only pins its width; the expanded 28px height min
     // passes through it so the box still aligns against the whole share.
     const sized_node = root.children[1].children[0];
     const box_node = sized_node.children[0];
     try std.testing.expectEqual(@as(f32, 50), sized_node.rect.width);
-    try std.testing.expectEqual(@as(f32, 24), sized_node.rect.height);
-    try std.testing.expectEqual(@as(f32, 24), box_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 28), sized_node.rect.height);
+    try std.testing.expectEqual(@as(f32, 28), box_node.rect.height);
     try std.testing.expectEqual(@as(f32, 24), box_node.children[0].rect.y);
 }
 
@@ -4337,9 +4337,9 @@ test "linear intrinsic children get an unbounded main axis" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 10, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // The 48px text keeps its intrinsic size and overflows the 10px row
+    // The 42px text keeps its intrinsic size and overflows the 10px row
     // instead of being clamped by the row's own max constraint.
-    try std.testing.expectEqual(@as(f32, 48), root.children[0].rect.width);
+    try std.testing.expectEqual(@as(f32, 42), root.children[0].rect.width);
     try std.testing.expectEqual(@as(f32, 10), root.rect.width);
 }
 
@@ -4359,9 +4359,9 @@ test "loose flexible keeps its intrinsic size" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 20 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    // The loose child may use up to its 92px share but stays 8 wide.
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.width);
-    try std.testing.expectEqual(@as(f32, 8), root.children[1].rect.x);
+    // The loose child may use up to its 93px share but stays 7px wide.
+    try std.testing.expectEqual(@as(f32, 7), root.children[1].rect.width);
+    try std.testing.expectEqual(@as(f32, 7), root.children[1].rect.x);
     try std.testing.expectEqual(@as(f32, 100), root.rect.width);
 }
 
@@ -4371,10 +4371,10 @@ test "main axis alignment distributes leftover space" {
     const children = [_]Widget{ widgets.text("A"), widgets.text("B") };
 
     inline for (.{
-        .{ .main_align = Widget.MainAxisAlignment.space_between, .first = 0, .second = 92 },
-        .{ .main_align = Widget.MainAxisAlignment.center, .first = 42, .second = 50 },
-        .{ .main_align = Widget.MainAxisAlignment.end, .first = 84, .second = 92 },
-        .{ .main_align = Widget.MainAxisAlignment.space_evenly, .first = 28, .second = 64 },
+        .{ .main_align = Widget.MainAxisAlignment.space_between, .first = 0, .second = 93 },
+        .{ .main_align = Widget.MainAxisAlignment.center, .first = 43, .second = 50 },
+        .{ .main_align = Widget.MainAxisAlignment.end, .first = 86, .second = 93 },
+        .{ .main_align = Widget.MainAxisAlignment.space_evenly, .first = 86.0 / 3.0, .second = 193.0 / 3.0 },
     }) |case| {
         const row = try widgets.rowWithOptions(allocator, &children, .{ .main_align = case.main_align });
         defer allocator.free(row.row.children);
@@ -4388,8 +4388,8 @@ test "main axis alignment distributes leftover space" {
 
         // A non-start alignment claims the full 100px main axis.
         try std.testing.expectEqual(@as(f32, 100), root.rect.width);
-        try std.testing.expectEqual(@as(f32, case.first), root.children[0].rect.x);
-        try std.testing.expectEqual(@as(f32, case.second), root.children[1].rect.x);
+        try std.testing.expectApproxEqAbs(@as(f32, case.first), root.children[0].rect.x, 0.001);
+        try std.testing.expectApproxEqAbs(@as(f32, case.second), root.children[1].rect.x, 0.001);
     }
 }
 
@@ -4410,7 +4410,7 @@ test "row centers children on the cross axis" {
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 8), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 10), root.children[0].rect.y);
     try std.testing.expectEqual(@as(f32, 0), root.children[1].rect.y);
 }
 
@@ -4488,7 +4488,7 @@ test "text role resolves themed font size for layout and paint" {
     try std.testing.expectEqual(colors.accent, display_list.commands.items[0].text.style.color);
 }
 
-test "default Radix label resolves size 2 font and line height" {
+test "default Fluent label resolves 14px font and 20px line height" {
     const allocator = std.testing.allocator;
     const label: Widget = .{ .text = .{ .value = "Label", .role = .label } };
 
@@ -4621,8 +4621,8 @@ test "box aligns child inside its minimum size" {
 
     try std.testing.expectEqual(@as(f32, 40), root.rect.width);
     try std.testing.expectEqual(@as(f32, 40), root.rect.height);
-    try std.testing.expectEqual(@as(f32, 16), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 8), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 16.5), root.children[0].rect.x);
+    try std.testing.expectEqual(@as(f32, 10), root.children[0].rect.y);
 }
 
 test "separator fills its cross axis and reserves main-axis margins" {
@@ -4919,8 +4919,8 @@ test "center moves descendants" {
     defer destroyElementTree(allocator, &built_element);
     const root = try layoutElement(allocator, &built_element, .{ .max_width = 100, .max_height = 80 }, .{ .x = 0, .y = 0 }, .fixed);
 
-    try std.testing.expectEqual(@as(f32, 38), root.children[0].rect.x);
-    try std.testing.expectEqual(@as(f32, 28), root.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 39.5), root.children[0].rect.x);
+    try std.testing.expectEqual(@as(f32, 30), root.children[0].rect.y);
     try std.testing.expectEqualStrings("centered", hitTestButton(root, .{ .x = 40, .y = 35 }).?);
 }
 

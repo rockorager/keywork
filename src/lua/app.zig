@@ -1264,6 +1264,7 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
 }
 
 const embedded_ui_source = @embedFile("ui.lua");
+const embedded_fluent_source = @embedFile("design/fluent.lua");
 const embedded_audio_source = @embedFile("audio.lua");
 const embedded_storybook_source = @embedFile("storybook.lua");
 const embedded_storybook_browser_source = @embedFile("storybook_browser.lua");
@@ -1288,6 +1289,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         test_only: bool = false,
     }{
         .{ .name = "keywork", .loader = keyworkModuleLoader, .uses_app = true },
+        .{ .name = "keywork.design.fluent", .loader = fluentModuleLoader },
         .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
         .{ .name = "keywork.loop", .loader = loopModuleLoader, .uses_app = true },
         .{ .name = "keywork.net", .loader = netModuleLoader, .uses_app = true },
@@ -1316,6 +1318,10 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
 
 fn storybookModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_storybook_source, "@keywork/storybook.lua");
+}
+
+fn fluentModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return loadEmbeddedModule(lua_state_optional.?, embedded_fluent_source, "@keywork/design/fluent.lua");
 }
 
 fn audioModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -3799,51 +3805,55 @@ test "lua resolves theme families and component tokens" {
     defer runtime.deinit();
 
     try runtime.repaint();
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=40 color=#ff111113") != null);
-    // Input geometry follows the default input theme: a 20px line plus 6px
-    // vertical and 8px horizontal padding (Radix size-2 text field).
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=40 color=#ff1f1f1f") != null);
+    // Input geometry follows the Fluent medium input: a 20px line plus 6px
+    // vertical and 12px horizontal padding.
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "fill_rect x=0 y=0 w=240 h=32 color=#ff223344") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=8 y=6 value=\"Name\" color=#ff445566") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "text x=12 y=6 value=\"Name\" color=#ff445566") != null);
 }
 
-test "lua default theme exposes opaque Radix component tokens" {
+test "lua default theme exposes Fluent component tokens" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script =
         \\local kw = require("keywork")
+        \\local fluent = require("keywork.design.fluent")
         \\local theme = kw.resolve_theme(kw.theme_data(), "light")
-        \\assert(theme.text.body.size == 16 and theme.text.body.line_height == 24)
+        \\assert(fluent.text.body.size == 14 and fluent.text.body.line_height == 20)
+        \\assert(theme.text.body.size == 14 and theme.text.body.line_height == 20)
         \\assert(theme.components.button.padding_x == 12 and theme.components.button.padding_y == 6 and theme.components.button.radius == 4)
-        \\assert(theme.components.input.padding_x == 8 and theme.components.input.padding_y == 6 and theme.components.input.line_height == 20)
+        \\assert(theme.components.input.padding_x == 12 and theme.components.input.padding_y == 6 and theme.components.input.line_height == 20)
         \\assert(theme.components.chip.min_height == 24 and theme.components.chip.font_size == 12 and theme.components.chip.line_height == 16)
-        \\assert(theme.components.menu.padding == 8 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
-        \\assert(theme.components.menu.separator.margin == 8 and theme.components.menu.separator.inset == 4)
-        \\assert(theme.shadow[1] == nil and #theme.shadow[2] == 5 and #theme.shadow[5] == 3 and #theme.shadow[6] == 4)
+        \\assert(theme.components.menu.padding == 4 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
+        \\assert(theme.components.menu.separator.margin == 12 and theme.components.menu.separator.inset == 4)
+        \\assert(theme.shadow[1] == nil and #theme.shadow[2] == 2 and #theme.shadow[5] == 2 and #theme.shadow[6] == 2)
+        \\assert(#theme.components.menu.shadow == 2)
         \\assert(theme.components.separator.thickness == 1)
         \\for _, scheme in ipairs({ "light", "dark" }) do
         \\  local resolved = kw.resolve_theme(kw.theme_data(), scheme)
-        \\  assert(resolved.colors.surface == resolved.colors.neutral2)
-        \\  assert(resolved.colors.backdrop_surface == (scheme == "light" and 0x59ffffff or resolved.colors.black_a6))
-        \\  assert(resolved.colors.text_secondary == resolved.colors.neutral11)
-        \\  assert(resolved.colors.text_tertiary == resolved.colors.neutral10)
-        \\  assert(resolved.colors.border == resolved.colors.neutral7)
-        \\  assert(resolved.colors.fill == resolved.colors.neutral4)
-        \\  assert(resolved.components.chip.background == resolved.colors.blue3)
-        \\  assert(resolved.components.menu.item.selected_background == resolved.colors.blue4)
-        \\  assert(resolved.components.menu.border == resolved.colors.panel_border)
+        \\  assert(resolved.colors.surface == resolved.colors.neutral_background1)
+        \\  assert(resolved.colors.backdrop_surface == (scheme == "light" and 0x99ffffff or 0x99000000))
+        \\  assert(resolved.colors.text_secondary == resolved.colors.neutral_foreground2)
+        \\  assert(resolved.colors.text_tertiary == resolved.colors.neutral_foreground3)
+        \\  assert(resolved.colors.border == resolved.colors.neutral_stroke1)
+        \\  assert(resolved.colors.fill == resolved.colors.neutral_background4)
+        \\  assert(resolved.components.chip.background == resolved.colors.brand_background2)
+        \\  assert(resolved.components.menu.item.selected_background == resolved.colors.subtle_background_selected)
+        \\  assert(resolved.components.menu.item.pressed_background == resolved.colors.subtle_background_pressed)
+        \\  assert(resolved.components.menu.border == resolved.colors.neutral_stroke2)
         \\  assert(resolved.components.menu.border_width == 1)
-        \\  assert(resolved.components.separator.color == resolved.colors.neutral6)
-        \\  assert(resolved.components.scrollbar.track == resolved.colors.neutral3)
-        \\  assert(resolved.components.scrollbar.thumb == resolved.colors.neutral8)
+        \\  assert(resolved.components.separator.color == resolved.colors.neutral_stroke2)
+        \\  assert(resolved.components.scrollbar.track == resolved.colors.subtle_background)
+        \\  assert(resolved.components.scrollbar.thumb == resolved.colors.scrollbar_overlay)
         \\end
         \\return kw.app({
         \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),
         \\})
         \\
     ;
-    var app = try initTestApp(allocator, &tmp, "radix-typography.lua", script);
+    var app = try initTestApp(allocator, &tmp, "fluent-theme.lua", script);
     defer app.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -3955,10 +3965,10 @@ test "lua flexible and main_align lay out through the parser" {
     defer runtime.deinit();
 
     try runtime.repaint();
-    // space_between pushes R (8px wide) to the 100px right edge.
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=92 y=0 value=\"R\"") != null);
+    // space_between pushes R (7px wide) to the 100px right edge.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=93 y=0 value=\"R\"") != null);
     // The expanded text starts right after A regardless of its own width.
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=8 y=24 value=\"B\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "x=7 y=20 value=\"B\"") != null);
 }
 
 test "lua loop fs_event observes file changes" {

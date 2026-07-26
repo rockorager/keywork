@@ -136,6 +136,38 @@ pub const colors = struct {
     pub const surface_light: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
     pub const surface_dark: Color = Color.argb(0xff, 0x18, 0x19, 0x1b);
 
+    pub const neutral_background1_light: Color = white;
+    pub const neutral_background2_light: Color = Color.argb(0xff, 0xfa, 0xfa, 0xfa);
+    pub const neutral_background3_light: Color = Color.argb(0xff, 0xf5, 0xf5, 0xf5);
+    pub const neutral_background4_light: Color = Color.argb(0xff, 0xf0, 0xf0, 0xf0);
+    pub const neutral_foreground1_light: Color = Color.argb(0xff, 0x24, 0x24, 0x24);
+    pub const neutral_foreground2_light: Color = Color.argb(0xff, 0x42, 0x42, 0x42);
+    pub const neutral_foreground4_light: Color = Color.argb(0xff, 0x70, 0x70, 0x70);
+    pub const neutral_foreground_disabled_light: Color = Color.argb(0xff, 0xbd, 0xbd, 0xbd);
+    pub const neutral_stroke1_light: Color = Color.argb(0xff, 0xd1, 0xd1, 0xd1);
+    pub const neutral_stroke2_light: Color = Color.argb(0xff, 0xe0, 0xe0, 0xe0);
+    pub const brand_background_light: Color = Color.argb(0xff, 0x0f, 0x6c, 0xbd);
+    pub const brand_background_hover_light: Color = Color.argb(0xff, 0x11, 0x5e, 0xa3);
+    pub const brand_background_pressed: Color = Color.argb(0xff, 0x0c, 0x3b, 0x5e);
+
+    pub const neutral_background1_dark: Color = Color.argb(0xff, 0x29, 0x29, 0x29);
+    pub const neutral_background2_dark: Color = Color.argb(0xff, 0x1f, 0x1f, 0x1f);
+    pub const neutral_background3_dark: Color = Color.argb(0xff, 0x14, 0x14, 0x14);
+    pub const neutral_background6_dark: Color = Color.argb(0xff, 0x33, 0x33, 0x33);
+    pub const neutral_foreground1_dark: Color = white;
+    pub const neutral_foreground2_dark: Color = Color.argb(0xff, 0xd6, 0xd6, 0xd6);
+    pub const neutral_foreground4_dark: Color = Color.argb(0xff, 0x99, 0x99, 0x99);
+    pub const neutral_foreground_disabled_dark: Color = Color.argb(0xff, 0x5c, 0x5c, 0x5c);
+    pub const neutral_stroke1_dark: Color = Color.argb(0xff, 0x66, 0x66, 0x66);
+    pub const neutral_stroke2_dark: Color = Color.argb(0xff, 0x52, 0x52, 0x52);
+    pub const brand_background_dark: Color = Color.argb(0xff, 0x11, 0x5e, 0xa3);
+    pub const brand_background_hover_dark: Color = Color.argb(0xff, 0x0f, 0x6c, 0xbd);
+    pub const brand_stroke_dark: Color = Color.argb(0xff, 0x47, 0x9e, 0xf5);
+    pub const danger_light: Color = Color.argb(0xff, 0xb1, 0x0e, 0x1c);
+    pub const danger_dark: Color = Color.argb(0xff, 0xdc, 0x62, 0x6d);
+    pub const scrollbar_light: Color = Color.argb(0x80, 0x00, 0x00, 0x00);
+    pub const scrollbar_dark: Color = Color.argb(0x99, 0xff, 0xff, 0xff);
+
     pub const neutral1: Color = Color.argb(0xff, 0xfc, 0xfc, 0xfd);
     pub const neutral2: Color = Color.argb(0xff, 0xf9, 0xf9, 0xfb);
     pub const neutral3: Color = Color.argb(0xff, 0xf0, 0xf0, 0xf3);
@@ -198,14 +230,12 @@ pub const colors = struct {
     pub const accent: Color = blue9;
 };
 
-/// Radix Themes design scales at 100% scaling and medium radius
-/// (https://www.radix-ui.com/themes/docs/theme/spacing). Steps are 1-based
-/// to match Radix token names: `space(3)` is Radix `--space-3`.
+/// Fluent-derived design scales. Steps remain 1-based for the public API.
 pub const scale = struct {
-    pub const space_steps = [9]f32{ 4, 8, 12, 16, 24, 32, 40, 48, 64 };
-    pub const font_size_steps = [9]f32{ 12, 14, 16, 18, 20, 24, 28, 35, 60 };
-    pub const line_height_steps = [9]f32{ 16, 20, 24, 26, 28, 30, 36, 40, 60 };
-    pub const radius_steps = [6]f32{ 3, 4, 6, 8, 12, 16 };
+    pub const space_steps = [9]f32{ 4, 8, 12, 16, 20, 24, 32, 40, 48 };
+    pub const font_size_steps = [9]f32{ 12, 14, 16, 20, 24, 28, 32, 40, 68 };
+    pub const line_height_steps = [9]f32{ 16, 20, 22, 28, 32, 36, 40, 52, 92 };
+    pub const radius_steps = [6]f32{ 2, 4, 6, 8, 12, 16 };
 
     pub fn space(step: usize) f32 {
         return space_steps[step - 1];
@@ -245,31 +275,31 @@ pub const ColorScheme = struct {
 
     pub const light: ColorScheme = .{
         .brightness = .light,
-        .background = colors.white,
-        .foreground = colors.ink,
-        .primary = colors.accent,
+        .background = colors.neutral_background2_light,
+        .foreground = colors.neutral_foreground1_light,
+        .primary = colors.brand_background_light,
         .on_primary = colors.white,
-        .surface = colors.surface_light,
-        .surface_high = colors.white,
-        .surface_low = colors.neutral2,
-        .border = colors.neutral7,
-        .muted = colors.neutral11,
-        .error_color = colors.red9,
+        .surface = colors.neutral_background1_light,
+        .surface_high = colors.neutral_background1_light,
+        .surface_low = colors.neutral_background3_light,
+        .border = colors.neutral_stroke1_light,
+        .muted = colors.neutral_foreground2_light,
+        .error_color = colors.danger_light,
         .on_error = colors.white,
     };
 
     pub const dark: ColorScheme = .{
         .brightness = .dark,
-        .background = colors.neutral_dark1,
-        .foreground = colors.neutral_dark12,
-        .primary = colors.blue9,
+        .background = colors.neutral_background2_dark,
+        .foreground = colors.neutral_foreground1_dark,
+        .primary = colors.brand_background_dark,
         .on_primary = colors.white,
-        .surface = colors.surface_dark,
-        .surface_high = colors.neutral_dark2,
-        .surface_low = colors.neutral_dark2,
-        .border = colors.neutral_dark7,
-        .muted = colors.neutral_dark11,
-        .error_color = colors.red9,
+        .surface = colors.neutral_background1_dark,
+        .surface_high = colors.neutral_background6_dark,
+        .surface_low = colors.neutral_background3_dark,
+        .border = colors.neutral_stroke1_dark,
+        .muted = colors.neutral_foreground2_dark,
+        .error_color = colors.danger_dark,
         .on_error = colors.white,
     };
 };
@@ -294,9 +324,9 @@ pub const TextRole = enum {
 };
 
 pub const TextTheme = struct {
-    body: TextStyle = .{ .font_size = scale.fontSize(3), .line_height = scale.lineHeight(3) },
+    body: TextStyle = .{ .font_size = scale.fontSize(2), .line_height = scale.lineHeight(2) },
     label: TextStyle = .{ .font_size = scale.fontSize(2), .line_height = scale.lineHeight(2) },
-    title: TextStyle = .{ .font_size = scale.fontSize(5), .line_height = scale.lineHeight(5) },
+    title: TextStyle = .{ .font_size = scale.fontSize(4), .line_height = scale.lineHeight(4) },
 };
 
 pub const ButtonTheme = struct {
@@ -309,10 +339,9 @@ pub const ButtonTheme = struct {
     disabled_background: ?Color = null,
     disabled_foreground: ?Color = null,
     focused_border_width: f32 = 2,
-    // Radix size-2 button: 20px label line plus 6px vertical padding,
-    // space-3 horizontal padding, and radius-2.
+    // Fluent medium button: 20px label line plus 6px vertical padding.
     padding_x: f32 = scale.space(3),
-    padding_y: f32 = (scale.space(6) - scale.lineHeight(2)) / 2,
+    padding_y: f32 = 6,
     radius: f32 = scale.radius(2),
 };
 
@@ -322,10 +351,9 @@ pub const InputTheme = struct {
     placeholder: ?Color = null,
     border: ?Color = null,
     focused_border: ?Color = null,
-    // Radix size-2 text field: 32px tall, space-2 horizontal padding,
-    // radius-2, font-size-2.
-    padding_x: f32 = scale.space(2),
-    padding_y: f32 = (scale.space(6) - scale.lineHeight(2)) / 2,
+    // Fluent medium input: 32px tall with 12px horizontal padding.
+    padding_x: f32 = scale.space(3),
+    padding_y: f32 = 6,
     radius: f32 = scale.radius(2),
     font_size: f32 = scale.fontSize(2),
     line_height: f32 = scale.lineHeight(2),
@@ -351,46 +379,46 @@ pub const Theme = struct {
     pub const light: Theme = .{
         .color_scheme = .light,
         .button_theme = .{
-            .background = colors.blue9,
+            .background = colors.brand_background_light,
             .foreground = colors.white,
-            .hover_background = colors.blue10,
+            .hover_background = colors.brand_background_hover_light,
             .hover_foreground = colors.white,
-            .focused_border = colors.blue8,
-            .pressed_background = colors.blue10,
-            .disabled_background = colors.neutral3,
-            .disabled_foreground = colors.neutral8,
+            .focused_border = colors.brand_background_light,
+            .pressed_background = colors.brand_background_pressed,
+            .disabled_background = colors.neutral_background4_light,
+            .disabled_foreground = colors.neutral_foreground_disabled_light,
         },
         .input_theme = .{
-            .background = colors.surface_light,
-            .foreground = colors.neutral12,
-            .placeholder = colors.neutral10,
-            .border = colors.neutral7,
-            .focused_border = colors.blue8,
+            .background = colors.neutral_background1_light,
+            .foreground = colors.neutral_foreground1_light,
+            .placeholder = colors.neutral_foreground4_light,
+            .border = colors.neutral_stroke1_light,
+            .focused_border = colors.brand_background_light,
         },
-        .separator_theme = .{ .color = colors.neutral6 },
-        .scrollbar_theme = .{ .track = colors.neutral3, .thumb = colors.neutral8 },
+        .separator_theme = .{ .color = colors.neutral_stroke2_light },
+        .scrollbar_theme = .{ .track = colors.transparent, .thumb = colors.scrollbar_light },
     };
     pub const dark: Theme = .{
         .color_scheme = .dark,
         .button_theme = .{
-            .background = colors.blue9,
+            .background = colors.brand_background_dark,
             .foreground = colors.white,
-            .hover_background = colors.blue_dark10,
+            .hover_background = colors.brand_background_hover_dark,
             .hover_foreground = colors.white,
-            .focused_border = colors.blue_dark8,
-            .pressed_background = colors.blue_dark10,
-            .disabled_background = colors.neutral_dark3,
-            .disabled_foreground = colors.neutral_dark8,
+            .focused_border = colors.brand_stroke_dark,
+            .pressed_background = colors.brand_background_pressed,
+            .disabled_background = colors.neutral_background3_dark,
+            .disabled_foreground = colors.neutral_foreground_disabled_dark,
         },
         .input_theme = .{
-            .background = colors.surface_dark,
-            .foreground = colors.neutral_dark12,
-            .placeholder = colors.neutral_dark10,
-            .border = colors.neutral_dark7,
-            .focused_border = colors.blue_dark8,
+            .background = colors.neutral_background1_dark,
+            .foreground = colors.neutral_foreground1_dark,
+            .placeholder = colors.neutral_foreground4_dark,
+            .border = colors.neutral_stroke1_dark,
+            .focused_border = colors.brand_stroke_dark,
         },
-        .separator_theme = .{ .color = colors.neutral_dark6 },
-        .scrollbar_theme = .{ .track = colors.neutral_dark3, .thumb = colors.neutral_dark8 },
+        .separator_theme = .{ .color = colors.neutral_stroke2_dark },
+        .scrollbar_theme = .{ .track = colors.transparent, .thumb = colors.scrollbar_dark },
     };
     pub const default: Theme = light;
 
@@ -400,7 +428,7 @@ pub const Theme = struct {
     }
 };
 
-test "default themes use opaque colors" {
+test "default themes use opaque surfaces and translucent overlay scrollbars" {
     for ([_]Theme{ Theme.light, Theme.dark }) |theme| {
         const scheme = theme.color_scheme;
         const theme_colors = [_]Color{
@@ -429,10 +457,11 @@ test "default themes use opaque colors" {
             theme.input_theme.border.?,
             theme.input_theme.focused_border.?,
             theme.separator_theme.color.?,
-            theme.scrollbar_theme.track.?,
-            theme.scrollbar_theme.thumb.?,
         };
         for (theme_colors) |color| try std.testing.expectEqual(@as(u8, 0xff), color.a);
+        try std.testing.expectEqual(@as(u8, 0), theme.scrollbar_theme.track.?.a);
+        try std.testing.expect(theme.scrollbar_theme.thumb.?.a > 0);
+        try std.testing.expect(theme.scrollbar_theme.thumb.?.a < 0xff);
     }
 }
 

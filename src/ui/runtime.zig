@@ -850,7 +850,7 @@ test "wheel scroll moves viewport content without rebuilding" {
     var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
     try std.testing.expectEqual(@as(usize, 1), app.builds);
-    // 20 Radix body rows at 24px in a 120px viewport: 360px of scroll range.
+    // 20 Fluent body rows at 20px in a 120px viewport: 280px of scroll range.
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 30 });
@@ -859,7 +859,7 @@ test "wheel scroll moves viewport content without rebuilding" {
 
     // Scrolling past the edges clamps.
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = 10_000 });
-    try std.testing.expectEqual(@as(f32, -360), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, -280), runtime.root.?.children[0].rect.y);
     try runtime.scrollBy(.{ .position = .{ .x = 5, .y = 5 }, .dx = 0, .dy = -10_000 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
     try std.testing.expectEqual(@as(usize, 1), app.builds);
@@ -888,11 +888,10 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
     var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
     defer runtime.deinit();
 
-    // 20 Radix body rows at 24px in a 120px viewport: content 480, scroll
-    // range 360.
-    // Radix size-1 thumb: track 112 (120 minus a 4px margin each end),
-    // length max(16, 112*120/480) = 28, travel 84.
-    const drag_scale: f32 = 360.0 / 84.0;
+    // 20 Fluent body rows at 20px in a 120px viewport: content 400, scroll
+    // range 280. The thumb track is 112px (a 4px margin at each end),
+    // giving a 33.6px thumb and 78.4px of travel.
+    const drag_scale: f32 = 280.0 / 78.4;
     // The viewport shrink-wraps its child's width; the thumb hugs its
     // right edge.
     const viewport = runtime.root.?.rect;
@@ -913,7 +912,7 @@ test "dragging the scrollbar thumb scrolls and captures the pointer" {
 
     // The drag stays captured when the pointer leaves the viewport.
     try runtime.pointerMove(.{ .x = 500, .y = 1000 });
-    try std.testing.expectEqual(@as(f32, -360), runtime.root.?.children[0].rect.y);
+    try std.testing.expectEqual(@as(f32, -280), runtime.root.?.children[0].rect.y);
     try runtime.pointerMove(.{ .x = 500, .y = -1000 });
     try std.testing.expectEqual(@as(f32, 0), runtime.root.?.children[0].rect.y);
 

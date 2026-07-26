@@ -177,6 +177,11 @@ fn lookupIconSizedWithFormats(allocator: std.mem.Allocator, name: []const u8, lo
 
     const theme = preferredTheme();
     if (try lookupInTheme(allocator, name, size, theme, formats, &visited, 0)) |path| return path;
+    // Keep the previous desktop fallback when the packaged Keywork theme is
+    // not visible from a development or non-standard install prefix.
+    if (!visitedContains(visited.items, "Adwaita")) {
+        if (try lookupInTheme(allocator, name, size, "Adwaita", formats, &visited, 0)) |path| return path;
+    }
     if (!visitedContains(visited.items, "hicolor")) {
         if (try lookupInTheme(allocator, name, size, "hicolor", formats, &visited, 0)) |path| return path;
     }
@@ -480,7 +485,11 @@ fn exists(path: [:0]const u8) bool {
 }
 
 fn preferredTheme() []const u8 {
-    return env("KEYWORK_ICON_THEME") orelse env("GTK_ICON_THEME") orelse "Adwaita";
+    return preferredThemeFrom(env("KEYWORK_ICON_THEME"), env("GTK_ICON_THEME"));
+}
+
+fn preferredThemeFrom(keywork_theme: ?[]const u8, gtk_theme: ?[]const u8) []const u8 {
+    return keywork_theme orelse gtk_theme orelse "Keywork";
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {
@@ -533,6 +542,12 @@ fn trim(value: []const u8) []const u8 {
 
 test "lookup returns null for a missing icon" {
     try std.testing.expect(try lookupIconSized(std.testing.allocator, "keywork-definitely-missing-icon", 16) == null);
+}
+
+test "icon theme preference uses overrides before Keywork default" {
+    try std.testing.expectEqualStrings("explicit", preferredThemeFrom("explicit", "gtk"));
+    try std.testing.expectEqualStrings("gtk", preferredThemeFrom(null, "gtk"));
+    try std.testing.expectEqualStrings("Keywork", preferredThemeFrom(null, null));
 }
 
 test "lookup rejects relative slash names as direct paths" {
