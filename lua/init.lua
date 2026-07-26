@@ -11,7 +11,7 @@ local osd = require("shell.osd")
 local session = require("shell.session")
 
 -- App-level state shared by the window set. Anything that decides which
--- windows exist lives here and flips via kw.app.invalidate(); widget
+-- windows exist lives here and flips via kw.app.reconcile(); widget
 -- state (kw.stateful) is per-window runtime.
 ---@type { audio_settings_open: boolean, launcher_open: boolean }
 local shell = {
@@ -24,7 +24,7 @@ local function set_audio_settings_open(open)
         return
     end
     shell.audio_settings_open = open
-    kw.app.invalidate()
+    kw.app.reconcile()
 end
 
 local function set_launcher_open(open)
@@ -32,11 +32,11 @@ local function set_launcher_open(open)
         return
     end
     shell.launcher_open = open
-    kw.app.invalidate()
+    kw.app.reconcile()
 end
 
 local osd_controller = osd.new(function()
-    kw.app.invalidate()
+    kw.app.reconcile()
 end)
 
 local session_controller = session.start()
@@ -166,9 +166,7 @@ return kw.app({
                 },
                 child = osd.Level({
                     key = "osd-level",
-                    kind = level.kind,
-                    value = level.value,
-                    muted = level.muted,
+                    controller = osd_controller,
                 }),
             })
         end

@@ -63,10 +63,23 @@ local function level_bar(theme, value, muted)
 end
 
 local Level = kw.stateful({
+    init = function(self)
+        local controller = self.props.controller
+        if not controller then
+            return
+        end
+        self.level = controller:visible()
+        self.scope:on_cancel(controller:subscribe(function(level)
+            self.level = level
+            self:set_state()
+        end))
+    end,
+
     build = function(self, context)
         local theme = context.theme
-        local value = clamp(tonumber(self.props.value) or 0, 0, 1)
-        local muted = self.props.muted == true
+        local level = self.level or self.props
+        local value = clamp(tonumber(level.value) or 0, 0, 1)
+        local muted = level.muted == true
 
         return kw.container({
             background = theme.colors.surface,
@@ -79,7 +92,7 @@ local Level = kw.stateful({
                 spacing = theme.space[3],
                 children = {
                     kw.icon({
-                        name = icon_for(self.props.kind, value, muted),
+                        name = icon_for(level.kind, value, muted),
                         size = theme.space[5],
                         color = muted and theme.colors.text_tertiary or theme.colors.text,
                     }),
@@ -111,17 +124,34 @@ function Controller:changed()
     end
 end
 
+function Controller:subscribe(callback)
+    self.subscribers[callback] = true
+    return function()
+        self.subscribers[callback] = nil
+    end
+end
+
+function Controller:updated()
+    for callback in pairs(self.subscribers) do
+        callback(self.current)
+    end
+end
+
 function Controller:visible()
     return self.current
 end
 
 function Controller:show(kind, value, muted)
+    local was_visible = self.current ~= nil
     self.current = {
         kind = kind,
         value = clamp(value, 0, 1),
         muted = muted == true,
     }
-    self:changed()
+    self:updated()
+    if not was_visible then
+        self:changed()
+    end
 
     local previous = self.hide_timer
     local timer = loop.timer({ delay = DISPLAY_MS / 1000 })
@@ -304,6 +334,7 @@ function M.new(on_change)
     ---@type OsdController
     local controller = setmetatable({
         on_change = on_change,
+        subscribers = {},
         jobs = {},
         running = false,
     }, Controller)

@@ -13,6 +13,12 @@ Fix these in `../keywork`, then simplify here.
 
 ## Resolved
 
+- **Window-set changes rebuilt every existing window.** `kw.app.invalidate()`
+  was the only way to add or remove a managed window, so showing the OSD also
+  rebuilt and repainted both full-resolution background surfaces. Keywork now
+  provides `kw.app.reconcile()` for changes limited to window existence; the
+  OSD uses scoped widget invalidation for level updates and only reconciles
+  when its surface appears or disappears.
 - **Large Vulkan backgrounds could fail on higher-resolution outputs.** Atlas
   growth and staging-buffer growth shared an eight-retry budget, so a 4K
   wallpaper exhausted it even though both resources could still grow. Keywork
