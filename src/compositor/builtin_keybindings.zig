@@ -114,7 +114,7 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
         .shortcuts_inhibited
     else if (matchBinding(self.bindings, event.modifiers, event.keysyms)) |binding| blk: {
         self.executeAction(binding.action);
-        if (actionRepeats(binding.action)) self.armRepeat(event, binding.keysym);
+        if (bindingRepeats(binding)) self.armRepeat(event, binding.keysym);
         break :blk .captured;
     } else .forwarded;
     self.held_keys.append(self.allocator, .{ .device_id = event.device_id, .key_code = event.key_code, .disposition = disposition }) catch {
@@ -186,7 +186,7 @@ fn repeatTimer(self: *Self) c_int {
         self.cancelRepeat();
         return 0;
     };
-    if (!actionRepeats(binding.action)) {
+    if (!bindingRepeats(binding)) {
         self.cancelRepeat();
         return 0;
     }
@@ -220,8 +220,9 @@ fn repeatMatchesKey(repeat: ?RepeatIdentity, device_id: NativeInput.DeviceId, ke
     return identity.device_id == device_id and identity.key_code == key_code;
 }
 
-fn actionRepeats(action: Config.Action) bool {
-    return switch (action) {
+fn bindingRepeats(binding: Config.Binding) bool {
+    if (binding.repeat) return true;
+    return switch (binding.action) {
         .command => |command| command.repeats(),
         .run => false,
     };
@@ -273,10 +274,11 @@ test "repeat interval rounds up and rate zero disables repeat" {
     try std.testing.expectEqual(@as(?i32, 1), repeatInterval(2000));
 }
 
-test "run actions do not repeat" {
-    try std.testing.expect(!actionRepeats(.{ .run = &.{"example"} }));
-    try std.testing.expect(actionRepeats(.{ .command = .focus_next }));
-    try std.testing.expect(!actionRepeats(.{ .command = .{ .close = .focused } }));
+test "bindings repeat by command policy or explicit configuration" {
+    try std.testing.expect(!bindingRepeats(.{ .modifiers = 0, .keysym = 'x', .action = .{ .run = &.{"example"} } }));
+    try std.testing.expect(bindingRepeats(.{ .modifiers = 0, .keysym = 'x', .action = .{ .run = &.{"example"} }, .repeat = true }));
+    try std.testing.expect(bindingRepeats(.{ .modifiers = 0, .keysym = 'j', .action = .{ .command = .focus_next } }));
+    try std.testing.expect(!bindingRepeats(.{ .modifiers = 0, .keysym = 'q', .action = .{ .command = .{ .close = .focused } } }));
 }
 
 test "repeat identity only matches its physical key" {

@@ -30,6 +30,7 @@ pub const Binding = struct {
     modifiers: u32,
     keysym: u32,
     action: Action,
+    repeat: bool = false,
 };
 
 pub fn InputValue(comptime T: type) type {
@@ -511,11 +512,15 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                 } };
             },
             .bindings => {
-                if (!std.mem.eql(u8, name, "bind")) {
+                const repeat = if (std.mem.eql(u8, name, "bind"))
+                    false
+                else if (std.mem.eql(u8, name, "bind-repeat"))
+                    true
+                else {
                     arena.deinit();
                     return .{ .diagnostic = .{ .line = line_number, .problem = .unknown_directive } };
-                }
-                const binding = parseBinding(arena_allocator, value) catch |err| {
+                };
+                var binding = parseBinding(arena_allocator, value) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     arena.deinit();
                     return .{ .diagnostic = .{
@@ -523,6 +528,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                         .problem = problemForError(err),
                     } };
                 };
+                binding.repeat = repeat;
                 for (bindings.items) |existing| {
                     if (existing.modifiers == binding.modifiers and
                         existing.keysym == binding.keysym)
@@ -1208,6 +1214,7 @@ test "configuration parses typed commands and explicit run argv" {
         \\bind=super+1 switch-workspace 1
         \\bind=super+shift+0 move-focused-to-workspace 10
         \\bind=super+return run foot --title "Keywork Terminal" 'empty='
+        \\bind-repeat=XF86AudioRaiseVolume run keywork-shell volume up
     ;
     const result = try parse(std.testing.allocator, source);
     var snapshot = switch (result) {
@@ -1216,7 +1223,7 @@ test "configuration parses typed commands and explicit run argv" {
     };
     defer snapshot.deinit();
     try std.testing.expect(snapshot.general.focus_follows_mouse);
-    try std.testing.expectEqual(@as(usize, 9), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 10), snapshot.bindings.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(Direction.down, snapshot.bindings[1].action.command.move_focused_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[2].action.command.close);
@@ -1227,6 +1234,9 @@ test "configuration parses typed commands and explicit run argv" {
     try std.testing.expectEqualStrings("foot", snapshot.bindings[8].action.run[0]);
     try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[8].action.run[2]);
     try std.testing.expectEqualStrings("empty=", snapshot.bindings[8].action.run[3]);
+    try std.testing.expect(!snapshot.bindings[8].repeat);
+    try std.testing.expect(snapshot.bindings[9].repeat);
+    try std.testing.expectEqualStrings("keywork-shell", snapshot.bindings[9].action.run[0]);
 }
 
 test "valid empty configuration disables configured bindings" {
