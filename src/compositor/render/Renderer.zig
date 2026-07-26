@@ -9,6 +9,7 @@ const headless = @import("../backend/headless.zig");
 const Region = @import("../region.zig");
 const render_types = @import("types.zig");
 const command_geometry = @import("command_geometry.zig");
+const rect_region = @import("rect_region.zig");
 const gpu_timing = @import("gpu_timing.zig");
 
 allocator: std.mem.Allocator,
@@ -717,7 +718,10 @@ fn commandCanBePruned(command: render_types.Command) bool {
 fn commandCanBeClipped(command: render_types.Command) bool {
     return switch (command) {
         .solid_rect, .image, .crossfade => true,
-        .clear, .shadow, .backdrop_capture, .backdrop_blur => false,
+        // A translucent clear replaces the target rather than blending
+        // into it, which no solid rectangle reproduces.
+        .clear => |color| color.alpha == std.math.maxInt(u8),
+        .shadow, .backdrop_capture, .backdrop_blur => false,
     };
 }
 
@@ -738,7 +742,11 @@ fn clipCommand(command: render_types.Command, clip: render_types.Rect) render_ty
             result.clip = clip;
             break :clipped .{ .crossfade = result };
         },
-        .clear, .shadow, .backdrop_capture, .backdrop_blur => unreachable,
+        // An opaque clear fills its rectangle without reading the target,
+        // exactly as an opaque solid rectangle does, so the surviving
+        // fragment becomes that rectangle.
+        .clear => |color| .{ .solid_rect = .{ .rect = clip, .color = color } },
+        .shadow, .backdrop_capture, .backdrop_blur => unreachable,
     };
 }
 
@@ -751,8 +759,24 @@ fn addOpaqueCommandCoverage(
         .clear => |color| if (color.alpha != std.math.maxInt(u8)) return,
         .solid_rect => |solid| if (solid.color.alpha != std.math.maxInt(u8)) return,
         .image => |image| {
-            if (image.alpha_multiplier != std.math.maxInt(u32) or
-                image.rounded_clip != null) return;
+            if (image.alpha_multiplier != std.math.maxInt(u32)) return;
+            if (image.rounded_clip) |rounded| {
+                // Only the corner bands are transparent. An opaque image
+                // still occludes everything under its rounded interior,
+                // and the renderers draw that interior opaquely.
+                if (!image.is_opaque) return;
+                const visible = command_geometry.visibleRect(command, frame_size) orelse return;
+                const radius = @min(
+                    rounded.radius,
+                    @min(rounded.rect.width, rounded.rect.height) / 2,
+                );
+                const interior = rect_region.roundedRectInterior(rounded.rect, radius) orelse return;
+                try addCoverageRectangle(
+                    coverage,
+                    interior.intersection(visible) orelse return,
+                );
+                return;
+            }
             if (!image.is_opaque) {
                 const visible = command_geometry.visibleRect(command, frame_size) orelse return;
                 for (image.opaque_region.slice()) |rectangle| {
@@ -778,6 +802,70 @@ fn addCoverageRectangle(coverage: *Region, rectangle: render_types.Rect) Rendere
         @intCast(rectangle.width),
         @intCast(rectangle.height),
     );
+}
+
+test "renderer clips a background clear around a rounded opaque image" {
+    const size: render_types.Size = .{ .width = 40, .height = 40 };
+    var result: std.ArrayList(render_types.Command) = .empty;
+    defer result.deinit(std.testing.allocator);
+    var pixels = [_]u32{0xffffffff} ** (40 * 40);
+    const image: render_types.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &pixels,
+        },
+        .is_opaque = true,
+        .rounded_clip = .{
+            .rect = .{ .x = 0, .y = 0, .width = 40, .height = 40 },
+            .radius = 8,
+        },
+    } };
+
+    // The rounded interior is {8,8,24,24}, so the clear survives only as
+    // the four strips around it rather than as a full-output fill.
+    var commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        image,
+    };
+    const pruned = try pruneOccludedCommands(
+        std.testing.allocator,
+        &result,
+        &commands,
+        size,
+    );
+    try std.testing.expectEqual(@as(usize, 5), pruned.len);
+    for (pruned[0..4]) |fragment| {
+        try std.testing.expectEqual(.solid_rect, std.meta.activeTag(fragment));
+        try std.testing.expectEqual(
+            @as(?render_types.Rect, null),
+            fragment.solid_rect.rect.intersection(.{
+                .x = 8,
+                .y = 8,
+                .width = 24,
+                .height = 24,
+            }),
+        );
+    }
+    try std.testing.expectEqual(.image, std.meta.activeTag(pruned[4]));
+
+    // A translucent clear replaces rather than blends, so it has no solid
+    // equivalent and must survive whole.
+    var translucent = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 128) },
+        image,
+    };
+    const kept = try pruneOccludedCommands(
+        std.testing.allocator,
+        &result,
+        &translucent,
+        size,
+    );
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqual(.clear, std.meta.activeTag(kept[0]));
 }
 
 test "renderer prunes commands completely hidden by an opaque image" {
@@ -838,6 +926,8 @@ test "renderer prunes commands completely hidden by an opaque image" {
         )).len,
     );
 
+    // Rounding this tall consumes the whole height, leaving no opaque
+    // interior to contribute coverage.
     var rounded = [_]render_types.Command{ commands[0], image };
     rounded[1].image.rounded_clip = .{
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
