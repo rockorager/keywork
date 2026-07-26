@@ -28,7 +28,12 @@ listener: Listener,
 
 pub const Listener = struct {
     context: *anyopaque,
-    changed: *const fn (*anyopaque, theme.Scheme) void,
+    changed: *const fn (*anyopaque, Preferences) void,
+};
+
+pub const Preferences = struct {
+    scheme: theme.Scheme,
+    reduced_motion: bool,
 };
 
 const ColorScheme = enum {
@@ -37,8 +42,14 @@ const ColorScheme = enum {
     light,
 };
 
+const ReducedMotion = enum {
+    no_preference,
+    reduced,
+};
+
 const Appearance = struct {
     colorScheme: ColorScheme,
+    reducedMotion: ReducedMotion,
 };
 
 const Parameters = struct {
@@ -225,8 +236,14 @@ fn processMessage(
         .dark => .dark,
         .light => .light,
     };
-    listener.changed(listener.context, scheme);
-    log.info("applied Prefer color scheme: {t}", .{scheme});
+    listener.changed(listener.context, .{
+        .scheme = scheme,
+        .reduced_motion = parameters.value.appearance.reducedMotion == .reduced,
+    });
+    log.info("applied Prefer appearance: scheme={t} reduced_motion={any}", .{
+        scheme,
+        parameters.value.appearance.reducedMotion == .reduced,
+    });
 }
 
 fn setNonblocking(fd: std.posix.fd_t) !void {
@@ -243,21 +260,23 @@ fn setNonblocking(fd: std.posix.fd_t) !void {
 
 test "appearance replies select built-in color schemes" {
     const Capture = struct {
-        scheme: ?theme.Scheme = null,
+        preferences: ?Preferences = null,
 
-        fn changed(context: *anyopaque, scheme: theme.Scheme) void {
+        fn changed(context: *anyopaque, preferences: Preferences) void {
             const capture: *@This() = @ptrCast(@alignCast(context));
-            capture.scheme = scheme;
+            capture.preferences = preferences;
         }
     };
     var capture: Capture = .{};
     try processMessage(std.testing.allocator, .{ .context = &capture, .changed = Capture.changed },
         \\{"parameters":{"appearance":{"colorScheme":"light","accentColor":"#010203","contrast":"no_preference","reducedMotion":"no_preference"}},"continues":true}
     );
-    try std.testing.expectEqual(theme.Scheme.light, capture.scheme.?);
+    try std.testing.expectEqual(theme.Scheme.light, capture.preferences.?.scheme);
+    try std.testing.expect(!capture.preferences.?.reduced_motion);
 
     try processMessage(std.testing.allocator, .{ .context = &capture, .changed = Capture.changed },
-        \\{"parameters":{"appearance":{"colorScheme":"no_preference","accentColor":null,"contrast":"no_preference","reducedMotion":"no_preference"}},"continues":true}
+        \\{"parameters":{"appearance":{"colorScheme":"no_preference","accentColor":null,"contrast":"no_preference","reducedMotion":"reduced"}},"continues":true}
     );
-    try std.testing.expectEqual(theme.default_scheme, capture.scheme.?);
+    try std.testing.expectEqual(theme.default_scheme, capture.preferences.?.scheme);
+    try std.testing.expect(capture.preferences.?.reduced_motion);
 }

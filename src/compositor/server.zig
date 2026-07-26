@@ -118,6 +118,7 @@ appearance_client: AppearanceClient,
 appearance_client_initialized: bool,
 configuration: ?Config.Store,
 palette: theme.Palette,
+reduced_motion: bool,
 layer_shell_effects: Scene.Effects,
 layer_shell_border: ?Scene.Borders,
 session: Session,
@@ -226,6 +227,7 @@ viewporter: Viewporter,
 window_manager: WindowManager,
 window_manager_initialized: bool,
 window_transitions: std.ArrayList(WindowTransition),
+workspace_transitions: std.ArrayList(WorkspaceTransition),
 animation_now: i96,
 renderer: Renderer,
 socket_buffer: [11]u8,
@@ -846,17 +848,30 @@ const WindowTransition = struct {
     old_rect: WindowAnimation.Rect,
     target_rect: WindowAnimation.Rect,
     old_source_cache: render.SourceCache,
+    buffer_update_required: bool,
     old: WindowAnimation.Snapshot,
     target: ?WindowAnimation.Snapshot = null,
     target_dirty: bool = false,
+    coordinated: bool = false,
     detached: bool = false,
     effects: ?Scene.Effects = null,
     borders: ?Scene.Borders = null,
     phase: enum { waiting, target_pending, animating } = .waiting,
     start: i96 = 0,
+    duration: u64,
+    easing: WindowAnimation.Easing,
 };
 
 const maximum_window_transitions = 64;
+
+const WorkspaceTransition = struct {
+    output_id: OutputLayout.Id,
+    rect: WindowAnimation.Rect,
+    old: WindowAnimation.Snapshot,
+    transparent: WindowAnimation.Snapshot,
+    phase: enum { pending, animating } = .pending,
+    start: i96 = 0,
+};
 
 fn allocateBackdropCaptureId(frame: *const OutputFrame) Renderer.Error!u32 {
     const id = frame.next_backdrop_capture_id.*;
@@ -907,6 +922,7 @@ pub fn createWithVirtualOutput(
         .appearance_client_initialized = false,
         .configuration = null,
         .palette = theme.default_palette,
+        .reduced_motion = false,
         .layer_shell_effects = Scene.default_effects,
         .layer_shell_border = null,
         .session = undefined,
@@ -1019,6 +1035,7 @@ pub fn createWithVirtualOutput(
         .window_manager = undefined,
         .window_manager_initialized = false,
         .window_transitions = .empty,
+        .workspace_transitions = .empty,
         .animation_now = 0,
         .renderer = undefined,
         .socket_buffer = undefined,
@@ -1033,6 +1050,7 @@ pub fn createWithVirtualOutput(
     errdefer self.xwayland_windows.deinit(allocator);
     errdefer self.xwayland_client_stack.deinit(allocator);
     errdefer self.window_transitions.deinit(allocator);
+    errdefer self.workspace_transitions.deinit(allocator);
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
         self.session_initialized = true;
@@ -1454,6 +1472,8 @@ pub fn createWithVirtualOutput(
         .appeared = geometryTransitionAppeared,
         .closing = geometryTransitionClosing,
         .removed = geometryTransitionRemoved,
+        .workspace_switching = workspaceTransitionPrepare,
+        .workspace_published = workspaceTransitionPublished,
     });
     errdefer {
         self.window_manager.clearGeometryTransitionListener();
@@ -1724,6 +1744,7 @@ pub fn destroy(self: *Self) void {
     self.subcompositor.clearRepaintListener();
     self.window_manager.clearGeometryTransitionListener();
     finishAllWindowTransitions(self);
+    finishAllWorkspaceTransitions(self);
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
@@ -1838,6 +1859,7 @@ pub fn destroy(self: *Self) void {
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
     self.window_transitions.deinit(allocator);
+    self.workspace_transitions.deinit(allocator);
     self.routed_touches.deinit(allocator);
     self.routed_gestures.deinit(allocator);
     self.routed_buttons.deinit(allocator);
@@ -2128,6 +2150,7 @@ fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void 
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = (self.render_outputs.get(id) orelse return false).*;
     finishWindowTransitionsForOutput(self, render_output.protocol_id);
+    finishWorkspaceTransitionsForOutput(self, render_output.protocol_id);
     if (self.gamma_control_initialized) self.gamma_control.removeOutput(render_output.protocol_id);
     const removed = self.render_outputs.remove(id) orelse unreachable;
     std.debug.assert(removed == render_output);
@@ -2888,15 +2911,24 @@ pub fn watchAppearance(self: *Self, runtime_directory: []const u8) void {
     self.appearance_client_initialized = true;
 }
 
-fn appearanceChanged(context: *anyopaque, scheme: theme.Scheme) void {
+fn appearanceChanged(context: *anyopaque, preferences: AppearanceClient.Preferences) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const palette = theme.builtIn(scheme);
-    if (std.meta.eql(self.palette, palette)) return;
-    self.palette = palette;
-    if (self.configuration) |*configuration| {
-        self.applyGeneralConfiguration(configuration.snapshot.general);
+    if (self.reduced_motion != preferences.reduced_motion) {
+        self.reduced_motion = preferences.reduced_motion;
+        if (self.reduced_motion) {
+            finishAllWindowTransitions(self);
+            finishAllWorkspaceTransitions(self);
+        }
+        requestRepaint(self);
     }
-    requestRepaint(self);
+    const palette = theme.builtIn(preferences.scheme);
+    if (!std.meta.eql(self.palette, palette)) {
+        self.palette = palette;
+        if (self.configuration) |*configuration| {
+            self.applyGeneralConfiguration(configuration.snapshot.general);
+        }
+        requestRepaint(self);
+    }
 }
 
 fn executeControlCommand(context: *anyopaque, command: Command) void {
@@ -3608,6 +3640,7 @@ fn sceneVisibilityChanged(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+    self.refreshKeyboardFocus();
 }
 
 fn sceneNodeDamage(context: *anyopaque, node: Scene.DamageNode) void {
@@ -3825,6 +3858,32 @@ fn finishWindowTransitionsForOutput(self: *Self, output_id: OutputLayout.Id) voi
     }
 }
 
+fn workspaceTransitionIndex(self: *const Self, output_id: OutputLayout.Id) ?usize {
+    for (self.workspace_transitions.items, 0..) |transition, index| {
+        if (std.meta.eql(transition.output_id, output_id)) return index;
+    }
+    return null;
+}
+
+fn destroyWorkspaceTransition(self: *Self, index: usize) void {
+    var transition = self.workspace_transitions.orderedRemove(index);
+    const offscreen = self.renderer.offscreenAccess();
+    transition.old.deinit(self.allocator, offscreen);
+    transition.transparent.deinit(self.allocator, offscreen);
+}
+
+fn finishAllWorkspaceTransitions(self: *Self) void {
+    while (self.workspace_transitions.items.len != 0) {
+        destroyWorkspaceTransition(self, self.workspace_transitions.items.len - 1);
+    }
+}
+
+fn finishWorkspaceTransitionsForOutput(self: *Self, output_id: OutputLayout.Id) void {
+    if (workspaceTransitionIndex(self, output_id)) |index| {
+        destroyWorkspaceTransition(self, index);
+    }
+}
+
 fn sceneWindow(self: *Self, id: Scene.Id) ?*const Scene.Window {
     var nodes = self.scene.nodeIterator();
     while (nodes.next()) |node| switch (node) {
@@ -3840,6 +3899,23 @@ fn animationRect(rect: @TypeOf(@as(WindowManager.GeometryTransition, undefined).
 
 fn renderAnimationRect(rect: WindowAnimation.Rect) render.Rect {
     return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
+}
+
+fn currentWindowTransitionRect(transition: *const WindowTransition, now: i96) WindowAnimation.Rect {
+    const factor = if (transition.phase == .waiting)
+        0
+    else
+        WindowAnimation.progress(
+            transition.start,
+            now,
+            transition.duration,
+            transition.easing,
+        );
+    return WindowAnimation.constrainSplitOuterEdge(
+        WindowAnimation.interpolate(transition.old_rect, transition.target_rect, factor),
+        transition.old_rect,
+        transition.target_rect,
+    );
 }
 
 fn allocateWindowSnapshot(self: *Self, physical_size: render.Size) !WindowAnimation.Snapshot {
@@ -3951,29 +4027,206 @@ fn captureWindowSnapshot(
     return snapshot;
 }
 
+fn captureWindowTransitionSnapshot(
+    self: *Self,
+    transition: *const WindowTransition,
+    now: i96,
+    rect: WindowAnimation.Rect,
+) !WindowAnimation.Snapshot {
+    const render_output = self.findProtocolRenderOutput(transition.output_id) orelse
+        return error.InvalidTarget;
+    const output = self.outputs.get(transition.output_id) orelse return error.InvalidTarget;
+    const scale = render_output.backend.renderScale();
+    const physical_size = try scale.apply(.{ .width = rect.width, .height = rect.height });
+    if (physical_size.width == 0 or physical_size.height == 0) return error.InvalidTarget;
+    var snapshot = try self.allocateWindowSnapshot(physical_size);
+    errdefer snapshot.deinit(self.allocator, self.renderer.offscreenAccess());
+    try self.renderer.beginFrame(
+        switch (snapshot.source) {
+            .pixels => |pixels| .{ .pixels = pixels },
+            .offscreen => |target| .{ .offscreen = target },
+        },
+        scale,
+        .{ .x = rect.x, .y = rect.y },
+        null,
+        render_output.color_description,
+    );
+    var active = true;
+    errdefer if (active) self.renderer.cancelFrame();
+    var capture_id: u32 = 1;
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .visible_rect = renderAnimationRect(rect),
+        .track_visibility = false,
+        .next_backdrop_capture_id = &capture_id,
+    };
+    try self.renderCommands(&frame, &.{.{ .clear = render.Color.rgba(0, 0, 0, 0) }});
+    const previous_animation_now = self.animation_now;
+    self.animation_now = now;
+    defer self.animation_now = previous_animation_now;
+    try self.renderWindowTransition(&frame, transition, .{}, null, false);
+    active = false;
+    try self.renderer.finishFrame();
+    return snapshot;
+}
+
+fn captureDesktopSnapshot(
+    self: *Self,
+    output_id: OutputLayout.Id,
+) !WindowAnimation.Snapshot {
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return error.InvalidTarget;
+    const output = self.outputs.get(output_id) orelse return error.InvalidTarget;
+    const rect = output.logicalRect();
+    const scale = render_output.backend.renderScale();
+    var snapshot = try self.allocateWindowSnapshot(render_output.backend.modeSize());
+    errdefer snapshot.deinit(self.allocator, self.renderer.offscreenAccess());
+    try self.renderer.beginFrame(
+        switch (snapshot.source) {
+            .pixels => |pixels| .{ .pixels = pixels },
+            .offscreen => |target| .{ .offscreen = target },
+        },
+        scale,
+        .{ .x = rect.x, .y = rect.y },
+        null,
+        render_output.color_description,
+    );
+    var active = true;
+    errdefer if (active) self.renderer.cancelFrame();
+    var capture_id: u32 = 1;
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .visible_rect = rect,
+        .track_visibility = false,
+        .next_backdrop_capture_id = &capture_id,
+    };
+    try self.renderCommands(&frame, &.{.{
+        .clear = outputClearColor(self.palette, false),
+    }});
+    const previous_animation_now = self.animation_now;
+    self.animation_now = nowNanoseconds(self.io);
+    defer self.animation_now = previous_animation_now;
+    _ = try self.renderDesktopContents(&frame, false, false);
+    active = false;
+    try self.renderer.finishFrame();
+    return snapshot;
+}
+
+fn workspaceTransitionPrepare(context: *anyopaque, output_id: OutputLayout.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.reduced_motion or self.session_lock.isLocked() or
+        self.window_manager.directManipulationActive() or self.hasMappedClientPopup())
+    {
+        finishWorkspaceTransitionsForOutput(self, output_id);
+        return;
+    }
+    const output = self.outputs.get(output_id) orelse return;
+    const logical = output.logicalRect();
+    const rect: WindowAnimation.Rect = .{
+        .x = logical.x,
+        .y = logical.y,
+        .width = logical.width,
+        .height = logical.height,
+    };
+    var old = self.captureDesktopSnapshot(output_id) catch |err| {
+        log.warn("failed to capture old workspace: {t}", .{err});
+        finishWorkspaceTransitionsForOutput(self, output_id);
+        return;
+    };
+    finishWorkspaceTransitionsForOutput(self, output_id);
+    finishWindowTransitionsForOutput(self, output_id);
+    var transparent = self.captureTransparentSnapshot(output_id, rect) catch |err| {
+        log.warn("failed to create transparent workspace snapshot: {t}", .{err});
+        old.deinit(self.allocator, self.renderer.offscreenAccess());
+        return;
+    };
+    self.workspace_transitions.append(self.allocator, .{
+        .output_id = output_id,
+        .rect = rect,
+        .old = old,
+        .transparent = transparent,
+    }) catch {
+        old.deinit(self.allocator, self.renderer.offscreenAccess());
+        transparent.deinit(self.allocator, self.renderer.offscreenAccess());
+        return;
+    };
+}
+
+fn workspaceTransitionPublished(context: *anyopaque, output_id: OutputLayout.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const index = workspaceTransitionIndex(self, output_id) orelse return;
+    const transition = &self.workspace_transitions.items[index];
+    transition.phase = .animating;
+    transition.start = nowNanoseconds(self.io);
+    requestRepaint(self);
+}
+
 fn geometryTransitionPrepare(context: *anyopaque, transition: WindowManager.GeometryTransition) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.xdg_shell.hasPopupGrab()) return;
-    if (transitionIndex(self, transition.scene_id)) |index| destroyWindowTransition(self, index);
-    if (self.window_transitions.items.len == maximum_window_transitions) return;
+    if (self.reduced_motion or self.xdg_shell.hasPopupGrab()) return;
+    if (self.window_transitions.items.len == maximum_window_transitions and
+        transitionIndex(self, transition.scene_id) == null) return;
     const current_buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         transition.surface_id,
     ) orelse return;
-    const old_rect = animationRect(transition.old_rect);
-    const snapshot = self.captureWindowSnapshot(transition.scene_id, transition.output, old_rect) catch |err| {
+    var old_rect = animationRect(transition.old_rect);
+    var materialized: ?WindowAnimation.Snapshot = null;
+    if (transitionIndex(self, transition.scene_id)) |index| {
+        const active = &self.window_transitions.items[index];
+        if (active.phase != .waiting) {
+            const now = nowNanoseconds(self.io);
+            const displayed_rect = currentWindowTransitionRect(active, now);
+            materialized = self.captureWindowTransitionSnapshot(
+                active,
+                now,
+                displayed_rect,
+            ) catch |err| capture: {
+                log.warn("failed to materialize interrupted window transition: {t}", .{err});
+                break :capture null;
+            };
+            if (materialized == null) {
+                destroyWindowTransition(self, index);
+                requestRepaint(self);
+                return;
+            }
+            old_rect = displayed_rect;
+        }
+        destroyWindowTransition(self, index);
+    }
+    const snapshot = materialized orelse self.captureWindowSnapshot(
+        transition.scene_id,
+        transition.output,
+        old_rect,
+    ) catch |err| {
         log.warn("failed to capture old tiling snapshot: {t}", .{err});
         return;
     };
+    const target_rect = animationRect(transition.target_rect);
+    var duration = WindowAnimation.reflowDuration(old_rect, target_rect);
+    for (self.window_transitions.items) |*existing| {
+        if (existing.kind != .reflow or existing.phase != .waiting or
+            !std.meta.eql(existing.output_id, transition.output)) continue;
+        duration = @max(duration, existing.duration);
+    }
+    for (self.window_transitions.items) |*existing| {
+        if (existing.kind == .reflow and existing.phase == .waiting and
+            std.meta.eql(existing.output_id, transition.output)) existing.duration = duration;
+    }
     self.window_transitions.append(self.allocator, .{
         .kind = .reflow,
         .scene_id = transition.scene_id,
         .root_id = transition.surface_id,
         .output_id = transition.output,
         .old_rect = old_rect,
-        .target_rect = animationRect(transition.target_rect),
+        .target_rect = target_rect,
         .old_source_cache = current_buffer.source_cache,
+        .buffer_update_required = transition.old_rect.size.width != transition.target_rect.size.width or
+            transition.old_rect.size.height != transition.target_rect.size.height,
         .old = snapshot,
+        .duration = duration,
+        .easing = .existing,
     }) catch {
         var owned = snapshot;
         owned.deinit(self.allocator, self.renderer.offscreenAccess());
@@ -3988,8 +4241,7 @@ fn transitionTargetReady(self: *Self, entry: *const WindowTransition) bool {
     const buffer = Surface.currentBuffer(self.compositor.surfaceStore(), entry.root_id) orelse
         return false;
     return WindowAnimation.targetReady(
-        entry.old_rect,
-        entry.target_rect,
+        entry.buffer_update_required,
         entry.old_source_cache,
         buffer.source_cache,
     );
@@ -4044,6 +4296,12 @@ fn refreshWindowTransitionTarget(self: *Self, index: usize) bool {
 
 const WindowReflowMatch = enum { vacated, absorbed };
 
+const WindowMotion = struct {
+    rect: WindowAnimation.Rect,
+    duration: u64,
+    easing: WindowAnimation.Easing,
+};
+
 fn windowReflowIndex(
     self: *const Self,
     output_id: OutputLayout.Id,
@@ -4067,30 +4325,46 @@ fn windowReflowIndex(
     return result;
 }
 
-fn windowAppearanceStart(
+fn windowAppearanceMotion(
     self: *const Self,
     output_id: OutputLayout.Id,
     target_rect: WindowAnimation.Rect,
-) WindowAnimation.Rect {
-    const index = self.windowReflowIndex(output_id, target_rect, .vacated) orelse
-        return WindowAnimation.appearanceStart(target_rect);
-    return WindowAnimation.splitCollapsedRect(
-        self.window_transitions.items[index].target_rect,
-        target_rect,
-    );
+    coordinated: bool,
+) WindowMotion {
+    if (coordinated) if (self.windowReflowIndex(output_id, target_rect, .vacated)) |index| {
+        const reflow = self.window_transitions.items[index];
+        return .{
+            .rect = WindowAnimation.splitCollapsedRect(reflow.target_rect, target_rect),
+            .duration = reflow.duration,
+            .easing = reflow.easing,
+        };
+    };
+    return .{
+        .rect = WindowAnimation.appearanceStart(target_rect),
+        .duration = WindowAnimation.fast_duration_nanoseconds,
+        .easing = .entrance,
+    };
 }
 
-fn windowDisappearanceTarget(
+fn windowDisappearanceMotion(
     self: *const Self,
     output_id: OutputLayout.Id,
     closing_rect: WindowAnimation.Rect,
-) WindowAnimation.Rect {
-    const index = self.windowReflowIndex(output_id, closing_rect, .absorbed) orelse
-        return WindowAnimation.appearanceStart(closing_rect);
-    return WindowAnimation.splitCollapsedRect(
-        self.window_transitions.items[index].old_rect,
-        closing_rect,
-    );
+    coordinated: bool,
+) WindowMotion {
+    if (coordinated) if (self.windowReflowIndex(output_id, closing_rect, .absorbed)) |index| {
+        const reflow = self.window_transitions.items[index];
+        return .{
+            .rect = WindowAnimation.splitCollapsedRect(reflow.old_rect, closing_rect),
+            .duration = reflow.duration,
+            .easing = reflow.easing,
+        };
+    };
+    return .{
+        .rect = WindowAnimation.appearanceStart(closing_rect),
+        .duration = WindowAnimation.fast_duration_nanoseconds,
+        .easing = .exit,
+    };
 }
 
 fn refreshWindowDisappearanceTargets(self: *Self, output_id: OutputLayout.Id) void {
@@ -4099,10 +4373,14 @@ fn refreshWindowDisappearanceTargets(self: *Self, output_id: OutputLayout.Id) vo
         if (transition.kind != .disappearance or
             transition.phase != .waiting or
             !std.meta.eql(transition.output_id, output_id)) continue;
-        self.window_transitions.items[index].target_rect = self.windowDisappearanceTarget(
+        const motion = self.windowDisappearanceMotion(
             output_id,
             transition.old_rect,
+            transition.coordinated,
         );
+        self.window_transitions.items[index].target_rect = motion.rect;
+        self.window_transitions.items[index].duration = motion.duration;
+        self.window_transitions.items[index].easing = motion.easing;
     }
 }
 
@@ -4111,10 +4389,15 @@ fn geometryTransitionAppeared(
     appearance: WindowManager.GeometryAppearance,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) return;
+    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) return;
     if (transitionIndex(self, appearance.scene_id)) |index| destroyWindowTransition(self, index);
     if (self.window_transitions.items.len == maximum_window_transitions) return;
     const target_rect = animationRect(appearance.target_rect);
+    const motion = self.windowAppearanceMotion(
+        appearance.output,
+        target_rect,
+        appearance.coordinated,
+    );
     var old = self.captureTransparentSnapshot(appearance.output, target_rect) catch |err| {
         log.warn("failed to create empty window appearance snapshot: {t}", .{err});
         return;
@@ -4131,12 +4414,16 @@ fn geometryTransitionAppeared(
         .scene_id = appearance.scene_id,
         .root_id = appearance.surface_id,
         .output_id = appearance.output,
-        .old_rect = self.windowAppearanceStart(appearance.output, target_rect),
+        .old_rect = motion.rect,
         .target_rect = target_rect,
         .old_source_cache = buffer.source_cache,
+        .buffer_update_required = false,
         .old = old,
+        .coordinated = appearance.coordinated,
         .phase = .target_pending,
         .start = nowNanoseconds(self.io),
+        .duration = motion.duration,
+        .easing = motion.easing,
     }) catch {
         old.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
@@ -4149,7 +4436,8 @@ fn geometryTransitionClosing(
     closure: WindowManager.GeometryAppearance,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.session_lock.isLocked()) return;
+    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) return;
+    if (windowTransitionHasPopup(self, closure.scene_id)) return;
     const window = self.sceneWindow(closure.scene_id) orelse return;
     if (transitionIndex(self, closure.scene_id)) |index| destroyWindowTransition(self, index);
     if (self.window_transitions.items.len == maximum_window_transitions) return;
@@ -4165,20 +4453,36 @@ fn geometryTransitionClosing(
         old.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
     };
+    var transparent = self.captureTransparentSnapshot(closure.output, rect) catch |err| {
+        log.warn("failed to create empty closing window snapshot: {t}", .{err});
+        old.deinit(self.allocator, self.renderer.offscreenAccess());
+        return;
+    };
+    const motion = self.windowDisappearanceMotion(
+        closure.output,
+        rect,
+        closure.coordinated,
+    );
     self.window_transitions.append(self.allocator, .{
         .kind = .disappearance,
         .scene_id = closure.scene_id,
         .root_id = closure.surface_id,
         .output_id = closure.output,
         .old_rect = rect,
-        .target_rect = self.windowDisappearanceTarget(closure.output, rect),
+        .target_rect = motion.rect,
         .old_source_cache = buffer.source_cache,
+        .buffer_update_required = false,
         .old = old,
+        .target = transparent,
+        .coordinated = closure.coordinated,
         .detached = true,
         .effects = window.effects,
         .borders = window.borders,
+        .duration = motion.duration,
+        .easing = motion.easing,
     }) catch {
         old.deinit(self.allocator, self.renderer.offscreenAccess());
+        transparent.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
     };
     requestRepaint(self);
@@ -4190,6 +4494,32 @@ fn windowTransitionHasPopup(self: *Self, scene_id: Scene.Id) bool {
     }
     var popups = self.scene.popupIterator(scene_id);
     while (popups.next()) |entry| if (entry.popup.mapped) return true;
+    return false;
+}
+
+fn hasMappedClientPopup(self: *Self) bool {
+    var nodes = self.scene.nodeIterator();
+    while (nodes.next()) |node| switch (node) {
+        .window => |entry| {
+            if (!entry.window.mapped) continue;
+            var popups = self.scene.popupIterator(entry.id);
+            while (popups.next()) |popup| if (popup.popup.mapped) return true;
+        },
+        .shell_surface => {},
+    };
+    inline for (.{
+        Scene.Layer.background,
+        Scene.Layer.bottom,
+        Scene.Layer.top,
+        Scene.Layer.overlay,
+    }) |layer| {
+        var roots = self.scene.layerSurfaceIterator(layer);
+        while (roots.next()) |root| {
+            if (!root.layer_surface.mapped) continue;
+            var popups = self.scene.layerPopupIterator(root.id);
+            while (popups.next()) |popup| if (popup.popup.mapped) return true;
+        }
+    }
     return false;
 }
 
@@ -4427,6 +4757,10 @@ fn xdgActivationRequested(
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.window_manager_initialized) self.window_manager.setSessionLocked(locked);
+    if (locked) {
+        finishAllWindowTransitions(self);
+        finishAllWorkspaceTransitions(self);
+    }
     self.refreshIdleInhibition();
     self.reconcileOutputCursors();
     if (locked) self.xwayland_keyboard_grab.cancelAll();
@@ -7782,8 +8116,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     // window snapshots, so the repaint-delay budget must include it.
     const render_start_nanoseconds = nowNanoseconds(self.io);
     self.animation_now = render_start_nanoseconds;
-    if (self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) {
+    if (self.reduced_motion or self.session_lock.isLocked() or
+        self.xdg_shell.hasPopupGrab() or self.window_manager.directManipulationActive())
+    {
         finishAllWindowTransitions(self);
+        finishAllWorkspaceTransitions(self);
     } else {
         var transition_index: usize = 0;
         while (transition_index < self.window_transitions.items.len) {
@@ -7822,10 +8159,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
                     },
                 },
                 .animating => {
-                    if (WindowAnimation.progress(
+                    if (WindowAnimation.linearProgress(
                         transition.start,
                         self.animation_now,
-                        WindowAnimation.duration_nanoseconds,
+                        transition.duration,
                     ) == std.math.maxInt(u32)) {
                         destroyWindowTransition(self, transition_index);
                     } else if (transition.target_dirty) {
@@ -7836,6 +8173,21 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
                         transition_index += 1;
                     }
                 },
+            }
+        }
+        var workspace_index: usize = 0;
+        while (workspace_index < self.workspace_transitions.items.len) {
+            const transition = self.workspace_transitions.items[workspace_index];
+            if (hasMappedClientPopup(self) or
+                (transition.phase == .animating and WindowAnimation.linearProgress(
+                    transition.start,
+                    self.animation_now,
+                    WindowAnimation.fade_duration_nanoseconds,
+                ) == std.math.maxInt(u32)))
+            {
+                destroyWorkspaceTransition(self, workspace_index);
+            } else {
+                workspace_index += 1;
             }
         }
     }
@@ -8161,6 +8513,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
             break;
         }
     }
+    if (workspaceTransitionIndex(self, render_output.protocol_id) != null) {
+        self.damageFullOutput(render_output);
+    }
     self.refreshKeyboardFocus();
 }
 
@@ -8292,6 +8647,7 @@ fn renderDesktopContents(
         );
     }
 
+    try self.renderWorkspaceTransition(frame);
     if (paint_primary_cursor) try self.renderSeatCursor(frame, &self.seat, false);
     if (paint_tablet_cursors) try self.renderTabletCursors(frame, false);
     return .{
@@ -8677,6 +9033,50 @@ fn renderCommands(
     try self.renderer.append(commands);
 }
 
+fn scalePremultipliedColor(color: render.Color, opacity: u32) render.Color {
+    const maximum: u64 = std.math.maxInt(u32);
+    return .{
+        .red = @intCast((@as(u64, color.red) * opacity + maximum / 2) / maximum),
+        .green = @intCast((@as(u64, color.green) * opacity + maximum / 2) / maximum),
+        .blue = @intCast((@as(u64, color.blue) * opacity + maximum / 2) / maximum),
+        .alpha = @intCast((@as(u64, color.alpha) * opacity + maximum / 2) / maximum),
+    };
+}
+
+fn effectsWithOpacity(effects: Scene.Effects, opacity: u32) Scene.Effects {
+    var result = effects;
+    if (result.shadow) |*shadow| {
+        shadow.color = scalePremultipliedColor(shadow.color, opacity);
+    }
+    if (result.contact_shadow) |*shadow| {
+        shadow.color = scalePremultipliedColor(shadow.color, opacity);
+    }
+    return result;
+}
+
+fn bordersWithOpacity(borders: ?Scene.Borders, opacity: u32) ?Scene.Borders {
+    var result = borders orelse return null;
+    result.color = scalePremultipliedColor(result.color, opacity);
+    return result;
+}
+
+test "transition opacity scales every premultiplied color component" {
+    const color = render.Color.rgba(180, 90, 45, 128);
+    try std.testing.expectEqual(
+        render.Color.rgba(0, 0, 0, 0),
+        scalePremultipliedColor(color, 0),
+    );
+    try std.testing.expectEqual(
+        color,
+        scalePremultipliedColor(color, std.math.maxInt(u32)),
+    );
+    const half = scalePremultipliedColor(color, std.math.maxInt(u32) / 2);
+    try std.testing.expect(half.red <= half.alpha);
+    try std.testing.expect(half.green <= half.alpha);
+    try std.testing.expect(half.blue <= half.alpha);
+    try std.testing.expect(half.alpha >= 63 and half.alpha <= 64);
+}
+
 fn renderShadow(
     self: *Self,
     frame: *const OutputFrame,
@@ -8735,6 +9135,24 @@ fn renderRetainedSnapshot(
         .factor = 0,
         .clip = clip,
         .rounded_clip = rounded_clip,
+    } }});
+}
+
+fn renderWorkspaceTransition(self: *Self, frame: *const OutputFrame) Renderer.Error!void {
+    const index = workspaceTransitionIndex(self, frame.render_output.protocol_id) orelse return;
+    const transition = &self.workspace_transitions.items[index];
+    try self.renderCommands(frame, &.{.{ .crossfade = .{
+        .destination = renderAnimationRect(transition.rect),
+        .old = transition.old.source,
+        .new = transition.transparent.source,
+        .factor = if (transition.phase == .animating)
+            WindowAnimation.linearProgress(
+                transition.start,
+                self.animation_now,
+                WindowAnimation.fade_duration_nanoseconds,
+            )
+        else
+            0,
     } }});
 }
 
@@ -8838,10 +9256,33 @@ fn renderWindowTransition(
         WindowAnimation.progress(
             transition.start,
             self.animation_now,
-            WindowAnimation.duration_nanoseconds,
+            transition.duration,
+            transition.easing,
         )
     else
         0;
+    const content_factor = if (transition.phase != .waiting)
+        WindowAnimation.contentProgress(
+            transition.start,
+            self.animation_now,
+            transition.duration,
+        )
+    else
+        0;
+    const opacity = switch (transition.kind) {
+        .reflow => std.math.maxInt(u32),
+        .appearance => WindowAnimation.appearanceProgress(
+            transition.start,
+            self.animation_now,
+        ),
+        .disappearance => std.math.maxInt(u32) - WindowAnimation.disappearanceProgress(
+            transition.start,
+            self.animation_now,
+            transition.duration,
+        ),
+    };
+    const effects = effectsWithOpacity(configured_effects, opacity);
+    const borders = bordersWithOpacity(configured_borders, opacity);
     const animated_rect = WindowAnimation.constrainSplitOuterEdge(
         WindowAnimation.interpolate(transition.old_rect, transition.target_rect, factor),
         transition.old_rect,
@@ -8849,11 +9290,11 @@ fn renderWindowTransition(
     );
     const animated_destination = renderAnimationRect(animated_rect);
     if (animated_destination.width == 0 or animated_destination.height == 0) return;
-    try self.renderShadows(frame, animated_destination, configured_effects, null);
-    const rounded_clip: ?render.RoundedClip = if (configured_effects.corner_radius == 0)
+    try self.renderShadows(frame, animated_destination, effects, null);
+    const rounded_clip: ?render.RoundedClip = if (effects.corner_radius == 0)
         null
     else
-        .{ .rect = animated_destination, .radius = configured_effects.corner_radius };
+        .{ .rect = animated_destination, .radius = effects.corner_radius };
     const target = if (transition.target) |snapshot| snapshot.source else transition.old.source;
     if (transition.kind == .reflow) {
         const old_area = @as(u64, transition.old_rect.width) * transition.old_rect.height;
@@ -8878,7 +9319,7 @@ fn renderWindowTransition(
                 const reveal_rect = WindowAnimation.targetReveal(
                     transition.old_rect,
                     transition.target_rect,
-                    WindowAnimation.midpointProgress(factor),
+                    content_factor,
                 );
                 const reveal = renderAnimationRect(reveal_rect);
                 if (animated_destination.intersection(reveal)) |target_clip| {
@@ -8902,7 +9343,7 @@ fn renderWindowTransition(
                 animated_destination,
                 rounded_clip,
             );
-            const crossfade_factor = WindowAnimation.lateCrossfade(factor);
+            const crossfade_factor = content_factor;
             if (crossfade_factor != 0) {
                 if (transition.target) |target_snapshot| {
                     if (animated_destination.intersection(target_destination)) |target_clip| {
@@ -8923,31 +9364,34 @@ fn renderWindowTransition(
                 .destination = animated_destination,
                 .old = transition.old.source,
                 .new = target,
-                .factor = WindowAnimation.midpointProgress(factor),
+                .factor = content_factor,
                 .rounded_clip = rounded_clip,
             } }});
         }
     } else {
-        const source = if (transition.kind == .appearance) target else transition.old.source;
         const content_rect = if (transition.kind == .appearance)
             transition.target_rect
         else
             transition.old_rect;
         const content_destination = renderAnimationRect(content_rect);
-        try self.renderRetainedSnapshot(
-            frame,
-            source,
-            content_destination,
-            null,
-            animated_destination,
-            rounded_clip,
-        );
+        const fade_factor = if (transition.kind == .appearance)
+            opacity
+        else
+            std.math.maxInt(u32) - opacity;
+        try self.renderCommands(frame, &.{.{ .crossfade = .{
+            .destination = content_destination,
+            .old = transition.old.source,
+            .new = target,
+            .factor = fade_factor,
+            .clip = animated_destination,
+            .rounded_clip = rounded_clip,
+        } }});
     }
     try self.renderBorders(
         frame,
         animated_destination,
-        configured_borders,
-        configured_effects.corner_radius,
+        borders,
+        effects.corner_radius,
         null,
     );
     if (mark_surfaces and frame.track_visibility) {

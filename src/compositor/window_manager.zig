@@ -113,7 +113,9 @@ pub const SessionListener = struct {
 /// `prepare` runs before any configure for the transaction; `published` runs
 /// after scene positions have reached their final geometry. `appeared` reports
 /// the first mapped publication, which has no old presentation to capture;
-/// `closing` runs while the last presentation can still be captured.
+/// `closing` runs while the last presentation can still be captured. Workspace
+/// switching similarly brackets the policy change and the transaction that
+/// publishes the selected workspace.
 pub const GeometryTransitionListener = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, GeometryTransition) void,
@@ -121,6 +123,8 @@ pub const GeometryTransitionListener = struct {
     appeared: *const fn (*anyopaque, GeometryAppearance) void,
     closing: *const fn (*anyopaque, GeometryAppearance) void,
     removed: *const fn (*anyopaque, Scene.Id) void,
+    workspace_switching: *const fn (*anyopaque, OutputLayout.Id) void,
+    workspace_published: *const fn (*anyopaque, OutputLayout.Id) void,
 };
 
 pub const GeometryTransition = struct {
@@ -136,6 +140,8 @@ pub const GeometryAppearance = struct {
     surface_id: Surface.Id,
     output: OutputLayout.Id,
     target_rect: types.Rect,
+    /// True when this appearance or closure is part of a tiled reflow.
+    coordinated: bool,
 };
 
 const TilingDrag = struct {
@@ -231,6 +237,8 @@ const OutputWorkspace = struct {
     output: OutputLayout.Id,
     number: u8,
     active: bool,
+    transition_pending: bool = false,
+    transition_inflight: bool = false,
     workspace: workspace_mod.Workspace = .{},
 };
 
@@ -606,8 +614,7 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
 fn prepareClosing(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
     if (window.closing_prepared or !window.mapped or window.minimized or
-        window.fullscreen_output != null or self.isFloating(window) or
-        self.transientParent(window) != null) return;
+        window.fullscreen_output != null or self.transientParent(window) != null) return;
     const workspace = self.workspaces.items[window.workspace];
     if (!workspace.active) return;
     const rect = window.published_rect orelse return;
@@ -616,6 +623,7 @@ fn prepareClosing(self: *Self, id: WindowId) void {
         .surface_id = window.surface_id,
         .output = workspace.output,
         .target_rect = rect,
+        .coordinated = !self.isFloating(window),
     });
     window.closing_prepared = true;
 }
@@ -1361,6 +1369,10 @@ pub fn compositorPointerGrabActive(self: *const Self) bool {
         if (self.toplevel_drag) |drag| drag.modifier else false;
 }
 
+pub fn directManipulationActive(self: *const Self) bool {
+    return self.pointerInteractionActive();
+}
+
 pub fn interactiveResizeCursorShape(self: *const Self) ?PointerShape {
     const resize = self.interactive_resize orelse return null;
     return cursorShapeForInteractiveResize(resize);
@@ -1850,11 +1862,41 @@ fn activateWorkspace(self: *Self, output: OutputLayout.Id, number: u8, notify_pr
         if (output_changed) self.relayout();
         return true;
     }
+    if (self.geometry_listener) |listener| {
+        listener.workspace_switching(listener.context, output);
+        queueWorkspaceTransition(self.workspaces.items, output, target);
+    }
     self.workspaces.items[current].active = false;
     self.workspaces.items[target].active = true;
     if (notify_protocol) self.workspace_protocol.setActive(output, number);
     self.relayout();
     return true;
+}
+
+fn queueWorkspaceTransition(
+    workspaces: []OutputWorkspace,
+    output: OutputLayout.Id,
+    target: usize,
+) void {
+    const target_inflight = workspaces[target].transition_inflight;
+    for (workspaces) |*workspace| {
+        if (std.meta.eql(workspace.output, output)) workspace.transition_pending = false;
+    }
+    workspaces[target].transition_pending = !target_inflight;
+}
+
+fn beginPendingWorkspaceTransitions(workspaces: []OutputWorkspace) void {
+    for (workspaces) |*workspace| {
+        if (!workspace.active or !workspace.transition_pending) continue;
+        workspace.transition_pending = false;
+        workspace.transition_inflight = true;
+    }
+}
+
+fn publishWorkspaceTransition(workspace: *OutputWorkspace) bool {
+    const animate = workspace.active and workspace.transition_inflight;
+    workspace.transition_inflight = false;
+    return animate;
 }
 
 pub fn moveFocusedToWorkspace(self: *Self, number: u8) void {
@@ -2266,6 +2308,7 @@ fn relayout(self: *Self) void {
             if (window.serial != null) pending += 1;
         }
     }
+    beginPendingWorkspaceTransitions(self.workspaces.items);
     self.transaction.begin(pending);
     if (pending == 0) {
         self.publish();
@@ -2387,8 +2430,7 @@ fn publish(self: *Self) void {
             if (self.geometry_listener) |listener| listener.published(listener.context, window.scene_id);
             window.transition_prepared = false;
         } else if (!window.published_once and visible and
-            window.fullscreen_output == null and !self.isFloating(window) and
-            self.transientParent(window) == null)
+            window.fullscreen_output == null and self.transientParent(window) == null)
         {
             if (self.geometry_listener) |listener| if (plan) |placement| listener.appeared(
                 listener.context,
@@ -2397,6 +2439,7 @@ fn publish(self: *Self) void {
                     .surface_id = window.surface_id,
                     .output = self.workspaces.items[window.workspace].output,
                     .target_rect = placement.rect,
+                    .coordinated = !self.isFloating(window),
                 },
             );
         }
@@ -2404,6 +2447,12 @@ fn publish(self: *Self) void {
     }
     self.publishStacking();
     self.xwayland.stacking_changed(self.xwayland.context);
+    for (self.workspaces.items) |*workspace| {
+        if (!publishWorkspaceTransition(workspace)) continue;
+        if (self.geometry_listener) |listener| {
+            listener.workspace_published(listener.context, workspace.output);
+        }
+    }
     if (self.session_listener) |listener| {
         var windows = self.windows.iterator();
         while (windows.next()) |entry| switch (entry.value.backend) {
@@ -2698,6 +2747,49 @@ test "each output owns ten numbered workspaces" {
     try std.testing.expectEqual(@as(usize, 10), manager.workspaceFor(second).?);
     try std.testing.expectEqual(@as(usize, 9), manager.workspaceNumber(first, 10).?);
     try std.testing.expectEqual(@as(usize, 19), manager.workspaceNumber(second, 10).?);
+}
+
+test "workspace transition waits for the transaction containing the latest switch" {
+    const output: OutputLayout.Id = .{ .index = 1, .generation = 1 };
+    var workspaces = [_]OutputWorkspace{
+        .{ .output = output, .number = 1, .active = true },
+        .{ .output = output, .number = 2, .active = false },
+    };
+
+    queueWorkspaceTransition(&workspaces, output, 0);
+    beginPendingWorkspaceTransitions(&workspaces);
+    try std.testing.expect(workspaces[0].transition_inflight);
+
+    workspaces[0].active = false;
+    workspaces[1].active = true;
+    queueWorkspaceTransition(&workspaces, output, 1);
+    try std.testing.expect(!publishWorkspaceTransition(&workspaces[0]));
+    try std.testing.expect(workspaces[1].transition_pending);
+
+    beginPendingWorkspaceTransitions(&workspaces);
+    try std.testing.expect(!workspaces[1].transition_pending);
+    try std.testing.expect(workspaces[1].transition_inflight);
+    try std.testing.expect(publishWorkspaceTransition(&workspaces[1]));
+}
+
+test "switching back to an inflight workspace does not queue a second fade" {
+    const output: OutputLayout.Id = .{ .index = 1, .generation = 1 };
+    var workspaces = [_]OutputWorkspace{
+        .{ .output = output, .number = 1, .active = false },
+        .{ .output = output, .number = 2, .active = true },
+    };
+
+    queueWorkspaceTransition(&workspaces, output, 1);
+    beginPendingWorkspaceTransitions(&workspaces);
+    workspaces[0].active = true;
+    workspaces[1].active = false;
+    queueWorkspaceTransition(&workspaces, output, 0);
+    workspaces[0].active = false;
+    workspaces[1].active = true;
+    queueWorkspaceTransition(&workspaces, output, 1);
+
+    try std.testing.expect(!workspaces[1].transition_pending);
+    try std.testing.expect(publishWorkspaceTransition(&workspaces[1]));
 }
 
 test "hidden windows are suspended and not displayed" {

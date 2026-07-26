@@ -22,20 +22,20 @@ pub const Palette = struct {
 pub const Scheme = enum { light, dark };
 pub const default_scheme: Scheme = .dark;
 
-// Radix Colors v3 Slate 1 and 6 provide the neutral roles. Blue 9 gives the
-// light focus indicator enough contrast; dark mode uses the less intense Blue 8.
+// Fluent neutralStroke2 keeps unfocused window edges quiet, while
+// brandStroke1 gives the focused window and tiling preview clear emphasis.
 pub const light: Palette = .{
-    .desktop_background = rgb(0xfc, 0xfc, 0xfd),
-    .unfocused_border = rgb(0xd9, 0xd9, 0xe0),
-    .focused_border = rgb(0x00, 0x90, 0xff),
-    .tiling_drag_preview = rgba(0x00, 0x90, 0xff, 0x70),
+    .desktop_background = rgb(0xfa, 0xfa, 0xfa),
+    .unfocused_border = rgb(0xe0, 0xe0, 0xe0),
+    .focused_border = rgb(0x0f, 0x6c, 0xbd),
+    .tiling_drag_preview = rgba(0x0f, 0x6c, 0xbd, 0x70),
 };
 
 pub const dark: Palette = .{
-    .desktop_background = rgb(0x11, 0x11, 0x13),
-    .unfocused_border = rgb(0x36, 0x3a, 0x3f),
-    .focused_border = rgb(0x28, 0x70, 0xbd),
-    .tiling_drag_preview = rgba(0x28, 0x70, 0xbd, 0x70),
+    .desktop_background = rgb(0x1f, 0x1f, 0x1f),
+    .unfocused_border = rgb(0x52, 0x52, 0x52),
+    .focused_border = rgb(0x47, 0x9e, 0xf5),
+    .tiling_drag_preview = rgba(0x47, 0x9e, 0xf5, 0x70),
 };
 
 /// The compositor remains dark until a preference service selects a scheme.
@@ -57,13 +57,13 @@ fn rgba(red: u8, green: u8, blue: u8, alpha: u8) Color {
 }
 
 test "built-in palettes resolve Keywork semantic colors" {
-    try std.testing.expectEqual(Color{ .red = 0xfc, .green = 0xfc, .blue = 0xfd }, light.desktop_background);
-    try std.testing.expectEqual(Color{ .red = 0xd9, .green = 0xd9, .blue = 0xe0 }, light.unfocused_border);
-    try std.testing.expectEqual(Color{ .red = 0x00, .green = 0x90, .blue = 0xff }, light.focused_border);
+    try std.testing.expectEqual(Color{ .red = 0xfa, .green = 0xfa, .blue = 0xfa }, light.desktop_background);
+    try std.testing.expectEqual(Color{ .red = 0xe0, .green = 0xe0, .blue = 0xe0 }, light.unfocused_border);
+    try std.testing.expectEqual(Color{ .red = 0x0f, .green = 0x6c, .blue = 0xbd }, light.focused_border);
 
-    try std.testing.expectEqual(Color{ .red = 0x11, .green = 0x11, .blue = 0x13 }, dark.desktop_background);
-    try std.testing.expectEqual(Color{ .red = 0x36, .green = 0x3a, .blue = 0x3f }, dark.unfocused_border);
-    try std.testing.expectEqual(Color{ .red = 0x28, .green = 0x70, .blue = 0xbd }, dark.focused_border);
+    try std.testing.expectEqual(Color{ .red = 0x1f, .green = 0x1f, .blue = 0x1f }, dark.desktop_background);
+    try std.testing.expectEqual(Color{ .red = 0x52, .green = 0x52, .blue = 0x52 }, dark.unfocused_border);
+    try std.testing.expectEqual(Color{ .red = 0x47, .green = 0x9e, .blue = 0xf5 }, dark.focused_border);
     try std.testing.expectEqual(light, builtIn(.light));
     try std.testing.expectEqual(dark, builtIn(.dark));
     try std.testing.expectEqual(Scheme.dark, default_scheme);

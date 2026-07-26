@@ -5,8 +5,17 @@ const WindowAnimation = @This();
 const std = @import("std");
 const render = @import("render/types.zig");
 
-pub const duration_nanoseconds: u64 = 140 * std.time.ns_per_ms;
+// Fluent UI React durationUltraFast, durationFaster, and durationFast.
+pub const fade_duration_nanoseconds: u64 = 50 * std.time.ns_per_ms;
+pub const fast_duration_nanoseconds: u64 = 100 * std.time.ns_per_ms;
+pub const normal_duration_nanoseconds: u64 = 150 * std.time.ns_per_ms;
 pub const target_wait_nanoseconds: u64 = 100 * std.time.ns_per_ms;
+
+pub const Easing = enum {
+    entrance,
+    existing,
+    exit,
+};
 
 pub const Rect = struct {
     x: i32,
@@ -15,40 +24,75 @@ pub const Rect = struct {
     height: u32,
 };
 
-pub fn progress(start: i96, now: i96, duration: u64) u32 {
+pub fn linearProgress(start: i96, now: i96, duration: u64) u32 {
     if (now <= start) return 0;
     const elapsed: u128 = @intCast(now - start);
     if (elapsed >= duration) return std.math.maxInt(u32);
-    const linear: u32 = @intCast((elapsed * std.math.maxInt(u32)) / duration);
-    return easeOutCubic(linear);
+    return @intCast((elapsed * std.math.maxInt(u32)) / duration);
 }
 
-pub fn midpointProgress(progress_factor: u32) u32 {
-    const maximum: u64 = std.math.maxInt(u32);
-    const start = maximum * 2 / 5;
-    const end = maximum * 3 / 5;
-    if (progress_factor <= start) return 0;
-    if (progress_factor >= end) return std.math.maxInt(u32);
-    return @intCast(
-        (@as(u64, progress_factor) - start) * maximum / (end - start),
+pub fn progress(start: i96, now: i96, duration: u64, easing: Easing) u32 {
+    return ease(linearProgress(start, now, duration), easing);
+}
+
+pub fn contentProgress(start: i96, now: i96, duration: u64) u32 {
+    const fade_duration = @min(duration, fade_duration_nanoseconds);
+    const offset = (duration - fade_duration) / 2;
+    return linearProgress(start + @as(i96, @intCast(offset)), now, fade_duration);
+}
+
+pub fn appearanceProgress(start: i96, now: i96) u32 {
+    return linearProgress(start, now, fade_duration_nanoseconds);
+}
+
+pub fn disappearanceProgress(start: i96, now: i96, duration: u64) u32 {
+    const fade_duration = @min(duration, fade_duration_nanoseconds);
+    return linearProgress(
+        start + @as(i96, @intCast(duration - fade_duration)),
+        now,
+        fade_duration,
     );
 }
 
-pub fn lateCrossfade(progress_factor: u32) u32 {
-    const maximum: u64 = std.math.maxInt(u32);
-    const start = maximum * 4 / 5;
-    if (progress_factor <= start) return 0;
-    return @intCast(
-        (@as(u64, progress_factor) - start) * maximum / (maximum - start),
+pub fn reflowDuration(old: Rect, target: Rect) u64 {
+    const delta = @max(
+        @abs(@as(i64, target.x) - old.x),
+        @abs(@as(i64, target.y) - old.y),
+        @abs(@as(i64, target.width) - old.width),
+        @abs(@as(i64, target.height) - old.height),
     );
+    return if (delta >= 96) normal_duration_nanoseconds else fast_duration_nanoseconds;
 }
 
-fn easeOutCubic(linear: u32) u32 {
-    const maximum: u128 = std.math.maxInt(u32);
-    const remaining: u128 = maximum - linear;
-    const denominator = maximum * maximum;
-    const eased_remaining = (remaining * remaining * remaining + denominator / 2) / denominator;
-    return @intCast(maximum - eased_remaining);
+pub fn ease(linear: u32, easing: Easing) u32 {
+    return switch (easing) {
+        .entrance => cubicBezier(linear, 0, 0, 0, 1),
+        .existing => cubicBezier(linear, 0.55, 0.55, 0, 1),
+        .exit => cubicBezier(linear, 1, 0, 1, 1),
+    };
+}
+
+fn cubicBezier(linear: u32, x1: f64, y1: f64, x2: f64, y2: f64) u32 {
+    if (linear == 0 or linear == std.math.maxInt(u32)) return linear;
+    const maximum: f64 = @floatFromInt(std.math.maxInt(u32));
+    const target_x = @as(f64, @floatFromInt(linear)) / maximum;
+    var lower: f64 = 0;
+    var upper: f64 = 1;
+    var parameter: f64 = target_x;
+    for (0..24) |_| {
+        const x = bezierCoordinate(parameter, x1, x2);
+        if (x < target_x) lower = parameter else upper = parameter;
+        parameter = (lower + upper) / 2;
+    }
+    const value = std.math.clamp(bezierCoordinate(parameter, y1, y2), 0, 1);
+    return @intFromFloat(@round(value * maximum));
+}
+
+fn bezierCoordinate(parameter: f64, first: f64, second: f64) f64 {
+    const remaining = 1 - parameter;
+    return 3 * remaining * remaining * parameter * first +
+        3 * remaining * parameter * parameter * second +
+        parameter * parameter * parameter;
 }
 
 pub fn interpolate(old: Rect, target: Rect, factor: u32) Rect {
@@ -61,13 +105,11 @@ pub fn interpolate(old: Rect, target: Rect, factor: u32) Rect {
 }
 
 pub fn targetReady(
-    old: Rect,
-    target: Rect,
+    buffer_update_required: bool,
     old_source: render.SourceCache,
     current_source: render.SourceCache,
 ) bool {
-    if (old.width == target.width and old.height == target.height) return true;
-    return !std.meta.eql(old_source, current_source);
+    return !buffer_update_required or !std.meta.eql(old_source, current_source);
 }
 
 pub fn appearanceStart(target: Rect) Rect {
@@ -398,23 +440,50 @@ test "interpolation has exact endpoints" {
     try std.testing.expectEqual(target, interpolate(old, target, std.math.maxInt(u32)));
 }
 
-test "progress is monotonic and clamps" {
-    var previous: u32 = 0;
-    for (0..201) |millisecond| {
-        const current = progress(100, 100 + @as(i96, @intCast(millisecond * std.time.ns_per_ms)), duration_nanoseconds);
-        try std.testing.expect(current >= previous);
-        previous = current;
+test "Fluent easing curves are monotonic and clamp" {
+    for (std.enums.values(Easing)) |easing| {
+        var previous: u32 = 0;
+        for (0..252) |millisecond| {
+            const current = progress(
+                100,
+                100 + @as(i96, @intCast(millisecond * std.time.ns_per_ms)),
+                normal_duration_nanoseconds,
+                easing,
+            );
+            try std.testing.expect(current >= previous);
+            previous = current;
+        }
+        try std.testing.expectEqual(std.math.maxInt(u32), previous);
     }
-    try std.testing.expectEqual(std.math.maxInt(u32), previous);
 }
 
-test "progress eases out with exact endpoints" {
-    try std.testing.expectEqual(@as(u32, 0), progress(0, 0, duration_nanoseconds));
-    const midpoint = progress(0, duration_nanoseconds / 2, duration_nanoseconds);
-    try std.testing.expect(midpoint > std.math.maxInt(u32) / 2);
+test "entrance decelerates and exit accelerates with exact endpoints" {
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        progress(0, 0, fast_duration_nanoseconds, .entrance),
+    );
+    const entrance_midpoint = progress(
+        0,
+        fast_duration_nanoseconds / 2,
+        fast_duration_nanoseconds,
+        .entrance,
+    );
+    const exit_midpoint = progress(
+        0,
+        fast_duration_nanoseconds / 2,
+        fast_duration_nanoseconds,
+        .exit,
+    );
+    try std.testing.expect(entrance_midpoint > std.math.maxInt(u32) / 2);
+    try std.testing.expect(exit_midpoint < std.math.maxInt(u32) / 2);
     try std.testing.expectEqual(
         std.math.maxInt(u32),
-        progress(0, duration_nanoseconds, duration_nanoseconds),
+        progress(
+            0,
+            fast_duration_nanoseconds,
+            fast_duration_nanoseconds,
+            .entrance,
+        ),
     );
 }
 
@@ -538,21 +607,41 @@ test "elastic growth keeps the stable core and moving edge native-sized" {
     );
 }
 
-test "midpoint transition progress uses the middle fifth" {
-    const maximum: u32 = std.math.maxInt(u32);
-    const start: u32 = @intCast(@as(u64, maximum) * 2 / 5);
-    const end: u32 = @intCast(@as(u64, maximum) * 3 / 5);
-    try std.testing.expectEqual(@as(u32, 0), midpointProgress(start));
-    try std.testing.expectEqual(maximum, midpointProgress(end));
-    const midpoint = midpointProgress(maximum / 2);
-    try std.testing.expect(midpoint >= maximum / 2 - 2 and midpoint <= maximum / 2 + 2);
+test "content and opacity transitions use explicit 50 millisecond windows" {
+    const centered_start = (normal_duration_nanoseconds - fade_duration_nanoseconds) / 2;
+    try std.testing.expectEqual(@as(u32, 0), contentProgress(0, centered_start, normal_duration_nanoseconds));
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        contentProgress(0, centered_start + fade_duration_nanoseconds, normal_duration_nanoseconds),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        appearanceProgress(0, fade_duration_nanoseconds),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        disappearanceProgress(
+            0,
+            normal_duration_nanoseconds - fade_duration_nanoseconds,
+            normal_duration_nanoseconds,
+        ),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        disappearanceProgress(0, normal_duration_nanoseconds, normal_duration_nanoseconds),
+    );
 }
 
-test "shrinking content crossfades only near the endpoint" {
-    const maximum: u32 = std.math.maxInt(u32);
-    const start: u32 = @intCast(@as(u64, maximum) * 4 / 5);
-    try std.testing.expectEqual(@as(u32, 0), lateCrossfade(start));
-    try std.testing.expectEqual(maximum, lateCrossfade(maximum));
+test "large reflows use the normal duration" {
+    const old: Rect = .{ .x = 0, .y = 0, .width = 500, .height = 400 };
+    try std.testing.expectEqual(
+        fast_duration_nanoseconds,
+        reflowDuration(old, .{ .x = 20, .y = 0, .width = 480, .height = 400 }),
+    );
+    try std.testing.expectEqual(
+        normal_duration_nanoseconds,
+        reflowDuration(old, .{ .x = 200, .y = 0, .width = 300, .height = 400 }),
+    );
 }
 
 test "target content reveal and source crop preserve stable edges" {
@@ -578,21 +667,21 @@ test "target content reveal and source crop preserve stable edges" {
 }
 
 test "retarget starts at currently displayed position" {
-    const first = interpolate(.{ .x = 0, .y = 0, .width = 100, .height = 100 }, .{ .x = 200, .y = 80, .width = 300, .height = 200 }, progress(0, 50 * std.time.ns_per_ms, duration_nanoseconds));
+    const first = interpolate(
+        .{ .x = 0, .y = 0, .width = 100, .height = 100 },
+        .{ .x = 200, .y = 80, .width = 300, .height = 200 },
+        progress(0, 50 * std.time.ns_per_ms, normal_duration_nanoseconds, .existing),
+    );
     const retargeted = interpolate(first, .{ .x = -100, .y = 20, .width = 500, .height = 400 }, 0);
     try std.testing.expectEqual(first, retargeted);
 }
 
 test "a resize waits for a new buffer generation" {
-    const old: Rect = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
-    const moved: Rect = .{ .x = 20, .y = 10, .width = 100, .height = 80 };
-    const resized: Rect = .{ .x = 0, .y = 0, .width = 200, .height = 160 };
     const generation: render.SourceCache = .{ .id = 1, .version = 1 };
-    try std.testing.expect(targetReady(old, moved, generation, generation));
-    try std.testing.expect(!targetReady(old, resized, generation, generation));
+    try std.testing.expect(targetReady(false, generation, generation));
+    try std.testing.expect(!targetReady(true, generation, generation));
     try std.testing.expect(targetReady(
-        old,
-        resized,
+        true,
         generation,
         .{ .id = 1, .version = 2 },
     ));
