@@ -3149,45 +3149,89 @@ pub fn reloadConfiguration(self: *Self) !void {
 fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void {
     self.window_manager.setFocusFollowsMouse(general.focus_follows_mouse);
     self.window_manager.setGaps(general.inner_gap, general.outer_gap);
-    const normal_effects = windowEffects(general, general.shadow_color);
-    self.window_manager.setWindowEffects(
-        normal_effects,
-        windowEffects(general, general.focused_shadow_color),
-    );
+    const effects = configuredWindowEffects(general, self.palette);
+    self.window_manager.setWindowEffects(effects);
     self.applyWindowBorders(general);
-    if (!std.meta.eql(self.layer_shell_effects, normal_effects)) {
-        self.layer_shell_effects = normal_effects;
+    if (!std.meta.eql(self.layer_shell_effects, effects.floating)) {
+        self.layer_shell_effects = effects.floating;
         requestRepaint(self);
     }
 }
 
-fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Scene.Effects {
-    const defaults = Scene.default_effects;
-    // Preserve the default 0x70:0x50 ambient-to-contact balance for configured colors.
-    const contact_alpha: u8 = @intCast((@as(u16, shadow_color.alpha) * 5 + 3) / 7);
+const Elevation = enum {
+    shadow4,
+    shadow8,
+    shadow16,
+    shadow28,
+};
+
+const ElevationMetrics = struct {
+    ambient_blur_radius: u32,
+    key_offset_y: i32,
+    key_blur_radius: u32,
+};
+
+const ShadowColors = struct {
+    ambient: Config.Color,
+    key: Config.Color,
+};
+
+fn configuredWindowEffects(
+    general: Config.GeneralSettings,
+    palette: theme.Palette,
+) WindowManager.WindowEffects {
+    const normal_colors = configuredShadowColors(palette, general.shadow_color);
+    const focused_colors = configuredShadowColors(
+        palette,
+        general.focused_shadow_color orelse general.shadow_color,
+    );
+    return .{
+        .tiled = windowEffects(general, .shadow4, normal_colors),
+        .tiled_focused = windowEffects(general, .shadow8, focused_colors),
+        .floating = windowEffects(general, .shadow16, normal_colors),
+        .floating_focused = windowEffects(general, .shadow28, focused_colors),
+    };
+}
+
+fn configuredShadowColors(
+    palette: theme.Palette,
+    key_override: ?Config.Color,
+) ShadowColors {
+    const key = key_override orelse palette.shadow_key;
+    if (key_override == null) return .{
+        .ambient = palette.shadow_ambient,
+        .key = key,
+    };
+    var ambient = key;
+    ambient.alpha = @intCast((@as(u16, key.alpha) * 6 + 3) / 7);
+    return .{ .ambient = ambient, .key = key };
+}
+
+fn elevationMetrics(elevation: Elevation) ElevationMetrics {
+    return switch (elevation) {
+        .shadow4 => .{ .ambient_blur_radius = 2, .key_offset_y = 2, .key_blur_radius = 4 },
+        .shadow8 => .{ .ambient_blur_radius = 2, .key_offset_y = 4, .key_blur_radius = 8 },
+        .shadow16 => .{ .ambient_blur_radius = 2, .key_offset_y = 8, .key_blur_radius = 16 },
+        .shadow28 => .{ .ambient_blur_radius = 8, .key_offset_y = 14, .key_blur_radius = 28 },
+    };
+}
+
+fn windowEffects(
+    general: Config.GeneralSettings,
+    elevation: Elevation,
+    colors: ShadowColors,
+) Scene.Effects {
+    const metrics = elevationMetrics(elevation);
     return .{
         .corner_radius = general.corner_radius,
-        .shadow = if (general.shadow_enabled) .{
-            .offset = defaults.shadow.?.offset,
-            .blur_radius = general.shadow_blur_radius,
-            .spread = defaults.shadow.?.spread,
-            .color = render.Color.rgba(
-                shadow_color.red,
-                shadow_color.green,
-                shadow_color.blue,
-                shadow_color.alpha,
-            ),
+        .ambient_shadow = if (general.shadow_enabled) .{
+            .blur_radius = metrics.ambient_blur_radius,
+            .color = renderColor(colors.ambient),
         } else null,
-        .contact_shadow = if (general.shadow_enabled) .{
-            .offset = defaults.contact_shadow.?.offset,
-            .blur_radius = defaults.contact_shadow.?.blur_radius,
-            .spread = defaults.contact_shadow.?.spread,
-            .color = render.Color.rgba(
-                shadow_color.red,
-                shadow_color.green,
-                shadow_color.blue,
-                contact_alpha,
-            ),
+        .key_shadow = if (general.shadow_enabled) .{
+            .offset = .{ .y = metrics.key_offset_y },
+            .blur_radius = general.shadow_blur_radius orelse metrics.key_blur_radius,
+            .color = renderColor(colors.key),
         } else null,
     };
 }
@@ -3618,10 +3662,15 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
                 },
             );
         }
-        self.damageGlobalRect(if (layer_effects)
-            damage_geometry.effectsRect(global, self.layer_shell_effects)
-        else
-            global, root);
+        const global_effects = if (layer_effects) effects: {
+            const caster = window_geometry.shadowCaster(
+                global,
+                self.layer_shell_border,
+                self.layer_shell_effects.corner_radius,
+            );
+            break :effects damage_geometry.effectsRect(caster.rect, self.layer_shell_effects);
+        } else global;
+        self.damageGlobalRect(global_effects, root);
     }
 }
 
@@ -3700,7 +3749,12 @@ fn windowNodeBounds(self: *Self, id: Scene.Id) ?render.Rect {
         Scene.Position{};
     if (content_size) |size| {
         if (window_geometry.windowContentRect(window, size)) |content_rect| {
-            var decorated = damage_geometry.effectsRect(content_rect, window.effects);
+            const caster = window_geometry.shadowCaster(
+                content_rect,
+                window.borders,
+                window.effects.corner_radius,
+            );
+            var decorated = damage_geometry.effectsRect(caster.rect, window.effects);
             if (window.borders) |borders| {
                 decorated = decorated.unionWith(
                     damage_geometry.expandRect(content_rect, borders.width),
@@ -3755,7 +3809,12 @@ fn layerSurfaceNodeBounds(self: *Self, id: Scene.LayerSurfaceId) ?render.Rect {
         layer_surface.position.y,
     );
     if (self.layerSurfaceEffectsRect(layer_surface)) |rect| {
-        var effects = damage_geometry.effectsRect(rect, self.layer_shell_effects);
+        const caster = window_geometry.shadowCaster(
+            rect,
+            self.layer_shell_border,
+            self.layer_shell_effects.corner_radius,
+        );
+        var effects = damage_geometry.effectsRect(caster.rect, self.layer_shell_effects);
         if (self.layer_shell_border) |border| {
             effects = effects.unionWith(damage_geometry.expandRect(rect, border.width));
         }
@@ -8912,6 +8971,7 @@ fn renderLayerSurfaces(
                 frame,
                 rect,
                 self.layer_shell_effects,
+                self.layer_shell_border,
                 null,
             );
         }
@@ -9045,10 +9105,10 @@ fn scalePremultipliedColor(color: render.Color, opacity: u32) render.Color {
 
 fn effectsWithOpacity(effects: Scene.Effects, opacity: u32) Scene.Effects {
     var result = effects;
-    if (result.shadow) |*shadow| {
+    if (result.ambient_shadow) |*shadow| {
         shadow.color = scalePremultipliedColor(shadow.color, opacity);
     }
-    if (result.contact_shadow) |*shadow| {
+    if (result.key_shadow) |*shadow| {
         shadow.color = scalePremultipliedColor(shadow.color, opacity);
     }
     return result;
@@ -9107,13 +9167,15 @@ fn renderShadows(
     frame: *const OutputFrame,
     rect: render.Rect,
     effects: Scene.Effects,
+    borders: ?Scene.Borders,
     clip: ?render.Rect,
 ) Renderer.Error!void {
-    if (effects.shadow) |shadow| {
-        try self.renderShadow(frame, rect, effects.corner_radius, shadow, clip);
+    const caster = window_geometry.shadowCaster(rect, borders, effects.corner_radius);
+    if (effects.ambient_shadow) |shadow| {
+        try self.renderShadow(frame, caster.rect, caster.corner_radius, shadow, clip);
     }
-    if (effects.contact_shadow) |shadow| {
-        try self.renderShadow(frame, rect, effects.corner_radius, shadow, clip);
+    if (effects.key_shadow) |shadow| {
+        try self.renderShadow(frame, caster.rect, caster.corner_radius, shadow, clip);
     }
 }
 
@@ -9290,7 +9352,7 @@ fn renderWindowTransition(
     );
     const animated_destination = renderAnimationRect(animated_rect);
     if (animated_destination.width == 0 or animated_destination.height == 0) return;
-    try self.renderShadows(frame, animated_destination, effects, null);
+    try self.renderShadows(frame, animated_destination, effects, borders, null);
     const rounded_clip: ?render.RoundedClip = if (effects.corner_radius == 0)
         null
     else
@@ -9484,7 +9546,7 @@ fn renderWindow(
             content_clip,
         );
     }
-    try self.renderShadows(frame, content_rect, window.effects, shadow_clip);
+    try self.renderShadows(frame, content_rect, window.effects, window.borders, shadow_clip);
     try self.renderWindowDecorations(frame, id, window, .below, window_clip);
     if (content_visible) {
         try self.renderSurfaceTreeContents(
@@ -9943,36 +10005,53 @@ test "server creates and destroys protocol globals" {
 
 test "general configuration maps window shadows" {
     const defaults: Config.GeneralSettings = .{};
-    try std.testing.expect(std.meta.eql(
-        Scene.default_effects,
-        windowEffects(defaults, defaults.shadow_color),
-    ));
+    const dark = configuredWindowEffects(defaults, theme.dark);
+    try std.testing.expectEqual(Scene.default_effects, dark.tiled);
+    try std.testing.expectEqual(Scene.Position{ .y = 4 }, dark.tiled_focused.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 8), dark.tiled_focused.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 8 }, dark.floating.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 16), dark.floating.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 14 }, dark.floating_focused.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 28), dark.floating_focused.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(renderColor(theme.dark.shadow_ambient), dark.tiled.ambient_shadow.?.color);
+    try std.testing.expectEqual(renderColor(theme.dark.shadow_key), dark.tiled.key_shadow.?.color);
 
-    const focused_color: Config.Color = .{
+    const light = configuredWindowEffects(defaults, theme.light);
+    try std.testing.expectEqual(renderColor(theme.light.shadow_ambient), light.tiled.ambient_shadow.?.color);
+    try std.testing.expectEqual(renderColor(theme.light.shadow_key), light.tiled.key_shadow.?.color);
+
+    var configured = defaults;
+    configured.shadow_blur_radius = 20;
+    configured.shadow_color = .{
+        .red = 0x10,
+        .green = 0x20,
+        .blue = 0x30,
+        .alpha = 0x70,
+    };
+    configured.focused_shadow_color = .{
         .red = 0x7a,
         .green = 0xa2,
         .blue = 0xf7,
         .alpha = 0x80,
     };
-    const focused = windowEffects(defaults, focused_color);
+    const overridden = configuredWindowEffects(configured, theme.light);
     try std.testing.expectEqual(
         render.Color.rgba(0x7a, 0xa2, 0xf7, 0x80),
-        focused.shadow.?.color,
+        overridden.tiled_focused.key_shadow.?.color,
     );
-    try std.testing.expectEqual(Scene.Position{ .y = 10 }, focused.shadow.?.offset);
-    try std.testing.expectEqual(@as(u32, 44), focused.shadow.?.blur_radius);
-    try std.testing.expectEqual(Scene.Position{ .y = 2 }, focused.contact_shadow.?.offset);
-    try std.testing.expectEqual(@as(u32, 12), focused.contact_shadow.?.blur_radius);
     try std.testing.expectEqual(
-        render.Color.rgba(0x7a, 0xa2, 0xf7, 0x5b),
-        focused.contact_shadow.?.color,
+        render.Color.rgba(0x7a, 0xa2, 0xf7, 0x6e),
+        overridden.tiled_focused.ambient_shadow.?.color,
     );
+    try std.testing.expectEqual(@as(u32, 20), overridden.tiled.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(render.Color.rgba(0x10, 0x20, 0x30, 0x70), overridden.floating.key_shadow.?.color);
 
     var disabled = defaults;
     disabled.shadow_enabled = false;
-    const effects = windowEffects(disabled, disabled.shadow_color);
-    try std.testing.expect(effects.shadow == null);
-    try std.testing.expect(effects.contact_shadow == null);
+    const effects = configuredWindowEffects(disabled, theme.dark);
+    try std.testing.expect(effects.tiled.ambient_shadow == null);
+    try std.testing.expect(effects.tiled.key_shadow == null);
+    try std.testing.expectEqual(@as(u32, 12), effects.tiled.corner_radius);
 }
 
 test "general configuration maps window borders" {

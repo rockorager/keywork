@@ -83,8 +83,8 @@ pub const Shadow = struct {
 
 pub const Effects = struct {
     corner_radius: u32 = 0,
-    shadow: ?Shadow = null,
-    contact_shadow: ?Shadow = null,
+    ambient_shadow: ?Shadow = null,
+    key_shadow: ?Shadow = null,
 };
 
 pub const background_blur: Blur = .{
@@ -100,17 +100,14 @@ pub const background_blur: Blur = .{
 
 pub const default_effects: Effects = .{
     .corner_radius = 12,
-    .shadow = .{
-        .offset = .{ .y = 10 },
-        .blur_radius = 44,
-        .spread = 0,
-        .color = render.Color.rgba(0, 0, 0, 0x70),
+    .ambient_shadow = .{
+        .blur_radius = 2,
+        .color = render.Color.rgba(0, 0, 0, 0x3d),
     },
-    .contact_shadow = .{
+    .key_shadow = .{
         .offset = .{ .y = 2 },
-        .blur_radius = 12,
-        .spread = 0,
-        .color = render.Color.rgba(0, 0, 0, 0x50),
+        .blur_radius = 4,
+        .color = render.Color.rgba(0, 0, 0, 0x47),
     },
 };
 
@@ -772,6 +769,12 @@ pub fn placeAbove(self: *Self, id: Id, other: Id) void {
 
 pub fn placeBelow(self: *Self, id: Id, other: Id) void {
     self.placeNodeBelow(.{ .window = id }, .{ .window = other });
+}
+
+pub fn windowAbove(self: *Self, id: Id, other: Id) bool {
+    const index = self.nodeIndex(.{ .window = id }) orelse return false;
+    const other_index = self.nodeIndex(.{ .window = other }) orelse return false;
+    return index > other_index;
 }
 
 pub fn placeNodeTop(self: *Self, id: NodeId) void {
@@ -1491,6 +1494,8 @@ test "scene reorders windows through handles" {
         .{ .window = third },
         .{ .window = first },
     }, scene.stack.items);
+    try std.testing.expect(scene.windowAbove(first, second));
+    try std.testing.expect(!scene.windowAbove(second, first));
     try std.testing.expectEqual(first, scene.topFullscreen().?);
     scene.placeBelow(first, third);
     try std.testing.expectEqualSlices(NodeId, &.{

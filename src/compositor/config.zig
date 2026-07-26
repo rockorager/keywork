@@ -187,9 +187,9 @@ pub const GeneralSettings = struct {
     outer_gap: u32 = 12,
     corner_radius: u32 = 12,
     shadow_enabled: bool = true,
-    shadow_blur_radius: u32 = 44,
-    shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0x70 },
-    focused_shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0xa0 },
+    shadow_blur_radius: ?u32 = null,
+    shadow_color: ?Color = null,
+    focused_shadow_color: ?Color = null,
     unfocused_border_width: u32 = 1,
     unfocused_border_color: ?Color = null,
     focused_border_width: u32 = 2,
@@ -1343,9 +1343,9 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(@as(u32, 16), snapshot.general.outer_gap);
     try std.testing.expectEqual(@as(u32, 8), snapshot.general.corner_radius);
     try std.testing.expect(!snapshot.general.shadow_enabled);
-    try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
-    try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
-    try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color);
+    try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius.?);
+    try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color.?);
+    try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color.?);
     try std.testing.expectEqual(@as(u32, 2), snapshot.general.unfocused_border_width);
     try std.testing.expectEqual(Color{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff }, snapshot.general.unfocused_border_color.?);
     try std.testing.expectEqual(@as(u32, 3), snapshot.general.focused_border_width);

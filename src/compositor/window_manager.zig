@@ -52,8 +52,7 @@ session_locked: bool = false,
 focus_follows_mouse: bool = true,
 inner_gap: u32 = 12,
 outer_gap: u32 = 12,
-window_effects: Scene.Effects = Scene.default_effects,
-focused_window_effects: Scene.Effects = Scene.default_effects,
+window_effects: WindowEffects = .{},
 unfocused_window_border: ?Scene.Borders = null,
 focused_window_border: ?Scene.Borders = null,
 tiling_drag: ?TilingDrag = null,
@@ -66,6 +65,13 @@ const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
 
 pub const WindowProtocol = enum { xdg_shell, xwayland };
+
+pub const WindowEffects = struct {
+    tiled: Scene.Effects = Scene.default_effects,
+    tiled_focused: Scene.Effects = Scene.default_effects,
+    floating: Scene.Effects = Scene.default_effects,
+    floating_focused: Scene.Effects = Scene.default_effects,
+};
 
 pub const WindowRect = struct {
     x: i32,
@@ -875,28 +881,15 @@ pub fn setGaps(self: *Self, inner_gap: u32, outer_gap: u32) void {
     self.relayout();
 }
 
-pub fn setWindowEffects(
-    self: *Self,
-    effects: Scene.Effects,
-    focused_effects: Scene.Effects,
-) void {
-    if (std.meta.eql(self.window_effects, effects) and
-        std.meta.eql(self.focused_window_effects, focused_effects)) return;
+pub fn setWindowEffects(self: *Self, effects: WindowEffects) void {
+    if (std.meta.eql(self.window_effects, effects)) return;
     self.window_effects = effects;
-    self.focused_window_effects = focused_effects;
     var it = self.windows.iterator();
     while (it.next()) |entry| {
         const window = entry.value;
-        const focused = self.workspaces.items[window.workspace].workspace.focused != null and
-            neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
         self.scene.setEffects(
             window.scene_id,
-            if (window.fullscreen_output != null)
-                .{}
-            else if (focused)
-                focused_effects
-            else
-                effects,
+            self.effectsForWindow(window, self.windowFocused(entry.id, window)),
         );
     }
 }
@@ -913,10 +906,36 @@ pub fn setWindowBorders(
     var it = self.windows.iterator();
     while (it.next()) |entry| {
         const window = entry.value;
-        const focused = self.workspaces.items[window.workspace].workspace.focused != null and
-            neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
-        self.scene.setBorders(window.scene_id, self.borderForWindow(window, focused));
+        self.scene.setBorders(
+            window.scene_id,
+            self.borderForWindow(window, self.windowFocused(entry.id, window)),
+        );
     }
+}
+
+fn windowFocused(self: *Self, id: WindowId, window: *const Window) bool {
+    const focused = self.workspaces.items[window.workspace].workspace.focused orelse return false;
+    return !window.minimized and neutral(id).eql(focused);
+}
+
+fn effectsForWindow(self: *Self, window: *const Window, focused: bool) Scene.Effects {
+    return effectsForWindowState(
+        self.window_effects,
+        self.isFloating(window),
+        focused,
+        window.fullscreen_output != null,
+    );
+}
+
+fn effectsForWindowState(
+    effects: WindowEffects,
+    floating: bool,
+    focused: bool,
+    fullscreen: bool,
+) Scene.Effects {
+    if (fullscreen) return .{};
+    if (floating) return if (focused) effects.floating_focused else effects.floating;
+    return if (focused) effects.tiled_focused else effects.tiled;
 }
 
 fn borderForWindow(self: *Self, window: *const Window, focused: bool) ?Scene.Borders {
@@ -2367,9 +2386,7 @@ fn publish(self: *Self) void {
         };
         if (plan) |placement| window.published_rect = placement.rect else window.published_rect = null;
         window.published_fullscreen = window.fullscreen_output != null;
-        const focused = !window.minimized and
-            self.workspaces.items[window.workspace].workspace.focused != null and
-            neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
+        const focused = self.windowFocused(entry.id, window);
         self.scene.setFocused(window.scene_id, focused);
         self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
         self.scene.setBorders(window.scene_id, self.borderForWindow(window, focused));
@@ -2384,15 +2401,7 @@ fn publish(self: *Self) void {
                 self.xwayland.set_minimized(self.xwayland.context, id, window.minimized);
             },
         }
-        self.scene.setEffects(
-            window.scene_id,
-            if (window.fullscreen_output != null)
-                .{}
-            else if (focused)
-                self.focused_window_effects
-            else
-                self.window_effects,
-        );
+        self.scene.setEffects(window.scene_id, self.effectsForWindow(window, focused));
         const clip_box: ?Scene.ClipBox = if (plan) |placement|
             if (placement.clip) |clip| .{
                 .x = clip.x -| placement.rect.x,
@@ -2472,21 +2481,13 @@ fn publishStacking(self: *Self) void {
 
     for (self.workspaces.items) |workspace| {
         if (!workspace.active) continue;
-        for (workspace.workspace.members.items) |member| {
-            const window = self.windows.get(internal(member)) orelse continue;
-            if (window.placement != null) self.scene.placeTop(window.scene_id);
-        }
-        for (workspace.workspace.members.items) |member| {
-            const window = self.windows.get(internal(member)) orelse continue;
-            if (window.placement != null and window.fullscreen_output == null and
-                self.isFloating(window)) self.scene.placeTop(window.scene_id);
-        }
-        for (workspace.workspace.members.items) |member| {
-            const window = self.windows.get(internal(member)) orelse continue;
-            if (window.placement != null and window.fullscreen_output != null) {
-                self.scene.placeTop(window.scene_id);
-            }
-        }
+        inline for (.{
+            StackTier.tiled,
+            StackTier.tiled_focused,
+            StackTier.floating,
+            StackTier.floating_focused,
+            StackTier.fullscreen,
+        }) |tier| self.placeWorkspaceStackTier(&workspace, tier);
     }
     var depth: usize = 1;
     while (depth <= self.windows.len()) : (depth += 1) {
@@ -2499,10 +2500,68 @@ fn publishStacking(self: *Self) void {
                 if (window.placement == null or window.fullscreen_output != null or
                     self.transientDepth(window) != depth) continue;
                 const parent = self.windows.get(self.transientParent(window) orelse continue) orelse continue;
-                if (parent.placement != null) self.scene.placeAbove(window.scene_id, parent.scene_id);
+                if (parent.placement != null and
+                    !self.scene.windowAbove(window.scene_id, parent.scene_id))
+                {
+                    self.scene.placeAbove(window.scene_id, parent.scene_id);
+                }
             }
         }
     }
+}
+
+const StackTier = enum {
+    tiled,
+    tiled_focused,
+    floating,
+    floating_focused,
+    fullscreen,
+};
+
+fn placeWorkspaceStackTier(
+    self: *Self,
+    workspace: *const OutputWorkspace,
+    tier: StackTier,
+) void {
+    for (workspace.workspace.members.items) |member| {
+        const id = internal(member);
+        const window = self.windows.get(id) orelse continue;
+        if (window.placement == null) continue;
+        const window_tier = stackTier(
+            self.isFloating(window),
+            self.windowFocused(id, window),
+            window.fullscreen_output != null,
+        );
+        if (window_tier == tier) self.scene.placeTop(window.scene_id);
+    }
+}
+
+fn stackTier(floating: bool, focused: bool, fullscreen: bool) StackTier {
+    if (fullscreen) return .fullscreen;
+    if (floating) return if (focused) .floating_focused else .floating;
+    return if (focused) .tiled_focused else .tiled;
+}
+
+test "window effects follow elevation and suppress fullscreen effects" {
+    const effects: WindowEffects = .{
+        .tiled = .{ .corner_radius = 1 },
+        .tiled_focused = .{ .corner_radius = 2 },
+        .floating = .{ .corner_radius = 3 },
+        .floating_focused = .{ .corner_radius = 4 },
+    };
+    try std.testing.expectEqual(@as(u32, 1), effectsForWindowState(effects, false, false, false).corner_radius);
+    try std.testing.expectEqual(@as(u32, 2), effectsForWindowState(effects, false, true, false).corner_radius);
+    try std.testing.expectEqual(@as(u32, 3), effectsForWindowState(effects, true, false, false).corner_radius);
+    try std.testing.expectEqual(@as(u32, 4), effectsForWindowState(effects, true, true, false).corner_radius);
+    try std.testing.expectEqual(Scene.Effects{}, effectsForWindowState(effects, true, true, true));
+}
+
+test "stack tiers raise focus without crossing floating or fullscreen tiers" {
+    try std.testing.expectEqual(StackTier.tiled, stackTier(false, false, false));
+    try std.testing.expectEqual(StackTier.tiled_focused, stackTier(false, true, false));
+    try std.testing.expectEqual(StackTier.floating, stackTier(true, false, false));
+    try std.testing.expectEqual(StackTier.floating_focused, stackTier(true, true, false));
+    try std.testing.expectEqual(StackTier.fullscreen, stackTier(false, true, true));
 }
 
 fn clampI16(value: i32) i16 {

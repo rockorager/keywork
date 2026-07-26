@@ -52,6 +52,38 @@ pub fn fullscreenRootOccludesOutput(
     });
 }
 
+pub const ShadowCaster = struct {
+    rect: render.Rect,
+    corner_radius: u32,
+};
+
+/// Returns the visible surface frame that casts a window shadow. A complete
+/// exterior border participates in the silhouette; partial borders remain
+/// decorative and do not change the apparent surface size.
+pub fn shadowCaster(
+    content_rect: render.Rect,
+    borders: ?Scene.Borders,
+    corner_radius: u32,
+) ShadowCaster {
+    const border = borders orelse return .{
+        .rect = content_rect,
+        .corner_radius = corner_radius,
+    };
+    if (!fullBorder(border)) return .{
+        .rect = content_rect,
+        .corner_radius = corner_radius,
+    };
+    return .{
+        .rect = damage_geometry.expandRect(content_rect, border.width),
+        .corner_radius = corner_radius +| border.width,
+    };
+}
+
+fn fullBorder(borders: Scene.Borders) bool {
+    return borders.edges.top and borders.edges.bottom and
+        borders.edges.left and borders.edges.right;
+}
+
 /// Emits the draw commands for one window border into `commands`.
 ///
 /// A border enclosing all four edges becomes a single rounded-rect frame whose
@@ -72,9 +104,7 @@ pub fn makeBorderCommands(
     commands: *[4]render.Command,
 ) []const render.Command {
     const width = borders.width;
-    if (width > 0 and borders.edges.top and borders.edges.bottom and
-        borders.edges.left and borders.edges.right)
-    {
+    if (width > 0 and fullBorder(borders)) {
         commands[0] = .{ .shadow = .{
             .rect = content_rect,
             .corner_radius = corner_radius,
@@ -314,6 +344,30 @@ test "window border follows rounded content corners" {
     try std.testing.expect(pointInBorderCommand(12, 22, result[0]));
     try std.testing.expect(!pointInBorderCommand(7, 17, result[0]));
     try std.testing.expect(!pointInBorderCommand(50, 21, result[0]));
+}
+
+test "complete border expands the shadow caster silhouette" {
+    const content: render.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 50 };
+    const full: Scene.Borders = .{
+        .edges = .{ .top = true, .bottom = true, .left = true, .right = true },
+        .width = 2,
+        .color = render.Color.rgba(0, 0, 0, 0xff),
+    };
+    try std.testing.expectEqual(ShadowCaster{
+        .rect = .{ .x = 8, .y = 18, .width = 104, .height = 54 },
+        .corner_radius = 14,
+    }, shadowCaster(content, full, 12));
+
+    var partial = full;
+    partial.edges.bottom = false;
+    try std.testing.expectEqual(ShadowCaster{
+        .rect = content,
+        .corner_radius = 12,
+    }, shadowCaster(content, partial, 12));
+    try std.testing.expectEqual(ShadowCaster{
+        .rect = content,
+        .corner_radius = 12,
+    }, shadowCaster(content, null, 12));
 }
 
 test "square window borders keep a uniform thickness under fractional scale" {

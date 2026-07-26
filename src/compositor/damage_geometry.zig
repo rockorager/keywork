@@ -71,10 +71,10 @@ fn shadowExtent(shadow: Scene.Shadow) u32 {
 
 pub fn effectsRect(rectangle: render.Rect, effects: Scene.Effects) render.Rect {
     var amount: u32 = 0;
-    if (effects.shadow) |shadow| {
+    if (effects.ambient_shadow) |shadow| {
         amount = @max(amount, shadowExtent(shadow));
     }
-    if (effects.contact_shadow) |shadow| {
+    if (effects.key_shadow) |shadow| {
         amount = @max(amount, shadowExtent(shadow));
     }
     return expandRect(rectangle, amount);
@@ -120,12 +120,12 @@ test "effect damage includes every shadow layer" {
         effectsRect(
             .{ .x = 10, .y = 20, .width = 30, .height = 40 },
             .{
-                .shadow = .{
+                .ambient_shadow = .{
                     .offset = .{ .y = 1 },
                     .blur_radius = 2,
                     .color = render.Color.rgba(0, 0, 0, 128),
                 },
-                .contact_shadow = .{
+                .key_shadow = .{
                     .offset = .{ .y = 3 },
                     .blur_radius = 10,
                     .color = render.Color.rgba(0, 0, 0, 128),
