@@ -52,6 +52,18 @@ pub fn fullscreenRootOccludesOutput(
     });
 }
 
+/// Emits the draw commands for one window border into `commands`.
+///
+/// A border enclosing all four edges becomes a single rounded-rect frame whose
+/// thickness comes from `spread`. That keeps the thickness uniform under
+/// fractional output scaling: `spread` is rounded to device pixels exactly
+/// once, whereas four independent rects round each edge on its own and differ
+/// by a pixel depending on where the window sits on the pixel grid. The frame's
+/// outer corners are `corner_radius + width`, so a square window still gets
+/// slightly rounded outer corners.
+///
+/// Partial borders fall back to one solid rect per edge and inherit that
+/// per-edge rounding. Every returned command is clipped to `clip`.
 pub fn makeBorderCommands(
     content_rect: render.Rect,
     borders: Scene.Borders,
@@ -60,7 +72,7 @@ pub fn makeBorderCommands(
     commands: *[4]render.Command,
 ) []const render.Command {
     const width = borders.width;
-    if (corner_radius > 0 and borders.edges.top and borders.edges.bottom and
+    if (width > 0 and borders.edges.top and borders.edges.bottom and
         borders.edges.left and borders.edges.right)
     {
         commands[0] = .{ .shadow = .{
@@ -302,6 +314,60 @@ test "window border follows rounded content corners" {
     try std.testing.expect(pointInBorderCommand(12, 22, result[0]));
     try std.testing.expect(!pointInBorderCommand(7, 17, result[0]));
     try std.testing.expect(!pointInBorderCommand(50, 21, result[0]));
+}
+
+test "square window borders keep a uniform thickness under fractional scale" {
+    const command_geometry = @import("render/command_geometry.zig");
+    var commands: [4]render.Command = undefined;
+    const color = render.Color.rgba(0x80, 0x40, 0x20, 0xff);
+    const edges: Scene.BorderEdges = .{
+        .top = true,
+        .bottom = true,
+        .left = true,
+        .right = true,
+    };
+
+    // Every horizontal placement must scale to the same three device pixels.
+    // Four independent edge rects would alternate between two and three here.
+    for (100..104) |origin| {
+        const content: render.Rect = .{
+            .x = @intCast(origin),
+            .y = 20,
+            .width = 100,
+            .height = 50,
+        };
+        const result = makeBorderCommands(
+            content,
+            .{ .edges = edges, .width = 2, .color = color },
+            0,
+            null,
+            &commands,
+        );
+        try std.testing.expectEqual(@as(usize, 1), result.len);
+        const border = result[0].shadow;
+        try std.testing.expectEqual(content, border.rect);
+        try std.testing.expectEqual(@as(u32, 0), border.corner_radius);
+        try std.testing.expectEqual(@as(i32, 2), border.spread);
+        try std.testing.expectEqual(content, border.cutout.?.rect);
+        try std.testing.expectEqual(@as(u32, 0), border.cutout.?.radius);
+
+        const scaled = command_geometry.scale(result[0], .{ .numerator = 150 }).shadow;
+        try std.testing.expectEqual(@as(i32, 3), scaled.spread);
+    }
+
+    // A zero width still yields no frame to hit-test or draw.
+    const empty = makeBorderCommands(
+        .{ .x = 10, .y = 20, .width = 100, .height = 50 },
+        .{ .edges = edges, .width = 0, .color = color },
+        0,
+        null,
+        &commands,
+    );
+    try std.testing.expectEqual(@as(usize, 4), empty.len);
+    for (empty) |command| {
+        try std.testing.expect(command.solid_rect.rect.width == 0 or
+            command.solid_rect.rect.height == 0);
+    }
 }
 
 test "content clip boxes intersect window dimensions in global coordinates" {
