@@ -56,7 +56,7 @@ local Browser = kw.stateful({
                 id = "storybook-story:" .. story.id,
                 hover_background = menu.item.hover_background,
                 cursor = "pointer",
-                on_tap = function()
+                on_activate = function()
                     self:set_state(function(state)
                         state.selected = index
                     end)
@@ -112,8 +112,8 @@ local Browser = kw.stateful({
                         }),
                     }),
                     kw.separator({}),
-                    kw.expanded(
-                        kw.scroll({
+                    kw.expanded({
+                        child = kw.scroll_view({
                             id = "storybook-stories",
                             child = kw.padding({
                                 left = space[2],
@@ -124,8 +124,8 @@ local Browser = kw.stateful({
                                     children = story_items,
                                 }),
                             }),
-                        })
-                    ),
+                        }),
+                    }),
                 },
             }),
         })
@@ -157,7 +157,7 @@ local Browser = kw.stateful({
                 data = preview_theme,
                 child = kw.container(preview_container),
             })
-            local preview = kw.sized(preview_options)
+            local preview = kw.sized_box(preview_options)
 
             content = kw.column({
                 align = "stretch",
@@ -169,8 +169,8 @@ local Browser = kw.stateful({
                         child = kw.row({
                             align = "center",
                             children = {
-                                kw.expanded(
-                                    kw.column({
+                                kw.expanded({
+                                    child = kw.column({
                                         spacing = space[1],
                                         children = {
                                             kw.text(selected.name, {
@@ -186,8 +186,8 @@ local Browser = kw.stateful({
                                                 max_lines = 1,
                                             }),
                                         },
-                                    })
-                                ),
+                                    }),
+                                }),
                                 kw.text(string.format(
                                     "%g × %s  ·  %gx  ·  %s",
                                     viewport.width,
@@ -203,21 +203,21 @@ local Browser = kw.stateful({
                             },
                         }),
                     }),
-                    kw.expanded(
-                        kw.container({
+                    kw.expanded({
+                        child = kw.container({
                             background = colors.surface_low,
                             padding = { all = space[5] },
                             align = "center",
                             child = preview,
-                        })
-                    ),
+                        }),
+                    }),
                 },
             })
         else
-            content = kw.center(kw.text("Add a story to begin", { color = colors.muted }))
+            content = kw.center({ child = kw.text("Add a story to begin", { color = colors.muted }) })
         end
 
-        return kw.sized({
+        return kw.sized_box({
             width = context.window_width,
             height = context.window_height,
             child = kw.container({
@@ -225,8 +225,8 @@ local Browser = kw.stateful({
                 child = kw.row({
                     align = "stretch",
                     children = {
-                        kw.sized({ width = 260, child = sidebar }),
-                        kw.expanded(content),
+                        kw.sized_box({ width = 260, child = sidebar }),
+                        kw.expanded({ child = content }),
                     },
                 }),
             }),

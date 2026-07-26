@@ -145,7 +145,6 @@ fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: 
 
 fn elementIsFocused(element: *const Element, focused_id: []const u8) bool {
     return switch (element.widget) {
-        .button => |button_widget| std.mem.eql(u8, button_widget.id, focused_id),
         .clickable => |clickable_widget| std.mem.eql(u8, clickable_widget.id, focused_id),
         .focus => |focus_widget| std.mem.eql(u8, focus_widget.node.id, focused_id),
         .text_input => |input_widget| std.mem.eql(u8, input_widget.focus_node.id, focused_id),

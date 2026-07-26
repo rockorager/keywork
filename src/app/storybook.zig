@@ -329,7 +329,7 @@ test "content-height Storybook snapshot uses exact measured pixel height" {
         \\    name = "Default",
         \\    viewport = { width = 380, height = "content", scale = 2 },
         \\    render = function()
-        \\      return kw.sized({ width = 380, height = 37, child = kw.spacer() })
+        \\      return kw.sized_box({ width = 380, height = 37, child = kw.spacer() })
         \\    end,
         \\  }),
         \\} })

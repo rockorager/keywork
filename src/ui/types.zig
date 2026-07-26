@@ -329,36 +329,6 @@ pub const TextTheme = struct {
     title: TextStyle = .{ .font_size = scale.fontSize(4), .line_height = scale.lineHeight(4) },
 };
 
-pub const ButtonTheme = struct {
-    background: ?Color = null,
-    foreground: ?Color = null,
-    hover_background: ?Color = null,
-    hover_foreground: ?Color = null,
-    focused_border: ?Color = null,
-    pressed_background: ?Color = null,
-    disabled_background: ?Color = null,
-    disabled_foreground: ?Color = null,
-    focused_border_width: f32 = 2,
-    // Fluent medium button: 20px label line plus 6px vertical padding.
-    padding_x: f32 = scale.space(3),
-    padding_y: f32 = 6,
-    radius: f32 = scale.radius(2),
-};
-
-pub const InputTheme = struct {
-    background: ?Color = null,
-    foreground: ?Color = null,
-    placeholder: ?Color = null,
-    border: ?Color = null,
-    focused_border: ?Color = null,
-    // Fluent medium input: 32px tall with 12px horizontal padding.
-    padding_x: f32 = scale.space(3),
-    padding_y: f32 = 6,
-    radius: f32 = scale.radius(2),
-    font_size: f32 = scale.fontSize(2),
-    line_height: f32 = scale.lineHeight(2),
-};
-
 pub const SeparatorTheme = struct {
     color: ?Color = null,
 };
@@ -371,52 +341,16 @@ pub const ScrollbarTheme = struct {
 pub const Theme = struct {
     color_scheme: ColorScheme,
     text_theme: TextTheme = .{},
-    button_theme: ButtonTheme = .{},
-    input_theme: InputTheme = .{},
     separator_theme: SeparatorTheme = .{},
     scrollbar_theme: ScrollbarTheme = .{},
 
     pub const light: Theme = .{
         .color_scheme = .light,
-        .button_theme = .{
-            .background = colors.brand_background_light,
-            .foreground = colors.white,
-            .hover_background = colors.brand_background_hover_light,
-            .hover_foreground = colors.white,
-            .focused_border = colors.brand_background_light,
-            .pressed_background = colors.brand_background_pressed,
-            .disabled_background = colors.neutral_background4_light,
-            .disabled_foreground = colors.neutral_foreground_disabled_light,
-        },
-        .input_theme = .{
-            .background = colors.neutral_background1_light,
-            .foreground = colors.neutral_foreground1_light,
-            .placeholder = colors.neutral_foreground4_light,
-            .border = colors.neutral_stroke1_light,
-            .focused_border = colors.brand_background_light,
-        },
         .separator_theme = .{ .color = colors.neutral_stroke2_light },
         .scrollbar_theme = .{ .track = colors.transparent, .thumb = colors.scrollbar_light },
     };
     pub const dark: Theme = .{
         .color_scheme = .dark,
-        .button_theme = .{
-            .background = colors.brand_background_dark,
-            .foreground = colors.white,
-            .hover_background = colors.brand_background_hover_dark,
-            .hover_foreground = colors.white,
-            .focused_border = colors.brand_stroke_dark,
-            .pressed_background = colors.brand_background_pressed,
-            .disabled_background = colors.neutral_background3_dark,
-            .disabled_foreground = colors.neutral_foreground_disabled_dark,
-        },
-        .input_theme = .{
-            .background = colors.neutral_background1_dark,
-            .foreground = colors.neutral_foreground1_dark,
-            .placeholder = colors.neutral_foreground4_dark,
-            .border = colors.neutral_stroke1_dark,
-            .focused_border = colors.brand_stroke_dark,
-        },
         .separator_theme = .{ .color = colors.neutral_stroke2_dark },
         .scrollbar_theme = .{ .track = colors.transparent, .thumb = colors.scrollbar_dark },
     };
@@ -443,19 +377,6 @@ test "default themes use opaque surfaces and translucent overlay scrollbars" {
             scheme.muted,
             scheme.error_color,
             scheme.on_error,
-            theme.button_theme.background.?,
-            theme.button_theme.foreground.?,
-            theme.button_theme.hover_background.?,
-            theme.button_theme.hover_foreground.?,
-            theme.button_theme.focused_border.?,
-            theme.button_theme.pressed_background.?,
-            theme.button_theme.disabled_background.?,
-            theme.button_theme.disabled_foreground.?,
-            theme.input_theme.background.?,
-            theme.input_theme.foreground.?,
-            theme.input_theme.placeholder.?,
-            theme.input_theme.border.?,
-            theme.input_theme.focused_border.?,
             theme.separator_theme.color.?,
         };
         for (theme_colors) |color| try std.testing.expectEqual(@as(u8, 0xff), color.a);

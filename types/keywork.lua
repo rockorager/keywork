@@ -10,6 +10,7 @@
 ---@alias keywork.MainAxisAlignment keywork.Alignment|'space_between'|'space_around'|'space_evenly'
 ---@alias keywork.CursorShape 'default'|'pointer'|'text'
 ---@alias keywork.PointerButton 'left'|'right'|'middle'|'back'|'forward'
+---@alias keywork.ActivationMode 'release'|'press'
 ---@alias keywork.TextRole 'body'|'label'|'title'
 ---@alias keywork.TextOverflow 'ellipsis'|'clip'
 ---@alias keywork.LineBreakStrategy 'greedy'|'knuth_plass'
@@ -120,25 +121,37 @@
 ---@field colors table<string, keywork.ColorRef>
 ---@field shadow table<integer, keywork.ThemeShadowLayer[]>
 
----@class keywork.ThemeButtonStateSource
+---@class keywork.ButtonAppearanceRecipeSource
 ---@field background? keywork.ColorRef
 ---@field foreground? keywork.ColorRef
+---@field hover_background? keywork.ColorRef
+---@field pressed_background? keywork.ColorRef
 
----@class keywork.ThemeButtonFocusSource
----@field border?       keywork.ColorRef
----@field border_width? number
+---@class keywork.ButtonSizeRecipeSource
+---@field target?      keywork.ThemeMetricRef
+---@field icon_size?   keywork.ThemeMetricRef
+---@field font_size?   number
+---@field line_height? number
+---@field gap?         keywork.ThemeMetricRef
+---@field padding_x?   keywork.ThemeMetricRef
 
----@class keywork.ThemeButtonSource
----@field padding_x? keywork.ThemeMetricRef
----@field padding_y? keywork.ThemeMetricRef
----@field radius?    keywork.ThemeMetricRef
----@field default?   keywork.ThemeButtonStateSource
----@field hover?     keywork.ThemeButtonStateSource
----@field pressed?   keywork.ThemeButtonStateSource
----@field disabled?  keywork.ThemeButtonStateSource
----@field focused?   keywork.ThemeButtonFocusSource
+---@class keywork.ButtonRecipeSource
+---@field radius?         keywork.ThemeMetricRef
+---@field focused_border? keywork.ColorRef
+---@field sizes?          table<string, keywork.ButtonSizeRecipeSource>
+---@field appearances?    table<string, keywork.ButtonAppearanceRecipeSource>
+---@field selected?       keywork.ButtonAppearanceRecipeSource
+---@field disabled?       keywork.ButtonAppearanceRecipeSource
+---@field tones?          table<string, keywork.ButtonToneRecipeSource>
 
----@class keywork.ThemeInputSource
+---@class keywork.ButtonToneRecipeSource
+---@field foreground?         keywork.ColorRef
+---@field background?         keywork.ColorRef
+---@field hover_background?   keywork.ColorRef
+---@field pressed_background? keywork.ColorRef
+---@field on_background?      keywork.ColorRef
+
+---@class keywork.TextFieldRecipeSource
 ---@field padding_x?      keywork.ThemeMetricRef
 ---@field padding_y?      keywork.ThemeMetricRef
 ---@field radius?         keywork.ThemeMetricRef
@@ -150,25 +163,17 @@
 ---@field border?         keywork.ColorRef
 ---@field focused_border? keywork.ColorRef
 
----@class keywork.ThemeChipSource
----@field padding_x?                   keywork.ThemeMetricRef
----@field padding_y?                   keywork.ThemeMetricRef
----@field radius?                      keywork.ThemeMetricRef
----@field min_height?                  keywork.ThemeMetricRef
----@field font_size?                   number
----@field line_height?                 number
----@field icon_size?                   keywork.ThemeMetricRef
----@field gap?                         keywork.ThemeMetricRef
----@field background?                  keywork.ColorRef
----@field foreground?                  keywork.ColorRef
----@field hover_background?            keywork.ColorRef
----@field pressed_background?          keywork.ColorRef
----@field focused_border?              keywork.ColorRef
----@field focused_border_width?        number
----@field selected_background?         keywork.ColorRef
----@field selected_foreground?         keywork.ColorRef
----@field selected_hover_background?   keywork.ColorRef
----@field selected_pressed_background? keywork.ColorRef
+---@class keywork.TokenRecipeSource
+---@field padding_x?   keywork.ThemeMetricRef
+---@field padding_y?   keywork.ThemeMetricRef
+---@field radius?      keywork.ThemeMetricRef
+---@field target?      keywork.ThemeMetricRef
+---@field font_size?   number
+---@field line_height? number
+---@field icon_size?   keywork.ThemeMetricRef
+---@field gap?         keywork.ThemeMetricRef
+---@field background?  keywork.ColorRef
+---@field foreground?  keywork.ColorRef
 
 ---@class keywork.ThemeMenuItemSource
 ---@field padding_x?                 keywork.ThemeMetricRef
@@ -217,12 +222,13 @@
 ---@field thumb? keywork.ColorRef
 
 ---@class keywork.ThemeComponentsSource
----@field button?    keywork.ThemeButtonSource
----@field input?     keywork.ThemeInputSource
----@field chip?      keywork.ThemeChipSource
----@field menu?      keywork.ThemeMenuSource
----@field separator? keywork.ThemeSeparatorSource
----@field scrollbar? keywork.ThemeScrollbarSource
+---@field button?     keywork.ButtonRecipeSource
+---@field text_field? keywork.TextFieldRecipeSource
+---@field tag?        keywork.TokenRecipeSource
+---@field badge?      keywork.TokenRecipeSource
+---@field menu?       keywork.ThemeMenuSource
+---@field separator?  keywork.ThemeSeparatorSource
+---@field scrollbar?  keywork.ThemeScrollbarSource
 
 ---@class keywork.ThemeOverrides
 ---@field schemes?     table<string, keywork.ThemeSchemeOverride>
@@ -243,56 +249,6 @@
 ---@field radius      keywork.ThemeScale
 ---@field shadow?     table<integer, keywork.ThemeShadowLayer[]>
 ---@field components  keywork.ThemeComponentsSource
-
----@class keywork.ThemeWidgetButtonState
----@field background? keywork.Color
----@field foreground? keywork.Color
-
----@class keywork.ThemeWidgetButtonFocus
----@field border?       keywork.Color
----@field border_width? number
-
----@class keywork.ThemeWidgetButton
----@field padding_x? number
----@field padding_y? number
----@field radius?    number
----@field default?   keywork.ThemeWidgetButtonState
----@field hover?     keywork.ThemeWidgetButtonState
----@field pressed?   keywork.ThemeWidgetButtonState
----@field disabled?  keywork.ThemeWidgetButtonState
----@field focused?   keywork.ThemeWidgetButtonFocus
-
----@class keywork.ThemeWidgetInput
----@field padding_x?      number
----@field padding_y?      number
----@field radius?         number
----@field font_size?      number
----@field line_height?    number
----@field background?     keywork.Color
----@field foreground?     keywork.Color
----@field placeholder?    keywork.Color
----@field border?         keywork.Color
----@field focused_border? keywork.Color
-
----@class keywork.ThemeWidgetChip
----@field padding_x?                   number
----@field padding_y?                   number
----@field radius?                      number
----@field min_height?                  number
----@field font_size?                   number
----@field line_height?                 number
----@field icon_size?                   number
----@field gap?                         number
----@field background?                  keywork.Color
----@field foreground?                  keywork.Color
----@field hover_background?            keywork.Color
----@field pressed_background?          keywork.Color
----@field focused_border?              keywork.Color
----@field focused_border_width?        number
----@field selected_background?         keywork.Color
----@field selected_foreground?         keywork.Color
----@field selected_hover_background?   keywork.Color
----@field selected_pressed_background? keywork.Color
 
 ---@class keywork.ThemeWidgetMenuItem
 ---@field padding_x?                 number
@@ -341,32 +297,45 @@
 ---@field thumb? keywork.Color
 
 ---@class keywork.ThemeWidgetComponents
----@field button?    keywork.ThemeWidgetButton
----@field input?     keywork.ThemeWidgetInput
----@field chip?      keywork.ThemeWidgetChip
----@field menu?      keywork.ThemeWidgetMenu
----@field separator? keywork.ThemeWidgetSeparator
----@field scrollbar? keywork.ThemeWidgetScrollbar
+---@field button?     keywork.ButtonRecipe
+---@field text_field? keywork.TextFieldRecipe
+---@field tag?        keywork.TokenRecipe
+---@field badge?      keywork.TokenRecipe
+---@field menu?       keywork.ThemeWidgetMenu
+---@field separator?  keywork.ThemeWidgetSeparator
+---@field scrollbar?  keywork.ThemeWidgetScrollbar
 
----@class keywork.ThemeButtonState
----@field background keywork.Color
----@field foreground keywork.Color
+---@class keywork.ButtonAppearanceRecipe
+---@field background         keywork.Color
+---@field foreground         keywork.Color
+---@field hover_background?  keywork.Color
+---@field pressed_background? keywork.Color
 
----@class keywork.ThemeButtonFocus
----@field border       keywork.Color
----@field border_width number
+---@class keywork.ButtonSizeRecipe
+---@field target      number
+---@field icon_size   number
+---@field font_size   number
+---@field line_height number
+---@field gap         number
+---@field padding_x   number
 
----@class keywork.ThemeButton
----@field padding_x number
----@field padding_y number
----@field radius    number
----@field default   keywork.ThemeButtonState
----@field hover     keywork.ThemeButtonState
----@field pressed   keywork.ThemeButtonState
----@field disabled  keywork.ThemeButtonState
----@field focused   keywork.ThemeButtonFocus
+---@class keywork.ButtonRecipe
+---@field radius         number
+---@field focused_border keywork.Color
+---@field sizes          table<string, keywork.ButtonSizeRecipe>
+---@field appearances    table<string, keywork.ButtonAppearanceRecipe>
+---@field selected       keywork.ButtonAppearanceRecipe
+---@field disabled       keywork.ButtonAppearanceRecipe
+---@field tones          table<string, keywork.ButtonToneRecipe>
 
----@class keywork.ThemeInput
+---@class keywork.ButtonToneRecipe
+---@field foreground         keywork.Color
+---@field background         keywork.Color
+---@field hover_background   keywork.Color
+---@field pressed_background keywork.Color
+---@field on_background      keywork.Color
+
+---@class keywork.TextFieldRecipe
 ---@field padding_x      number
 ---@field padding_y      number
 ---@field radius         number
@@ -378,25 +347,17 @@
 ---@field border         keywork.Color
 ---@field focused_border keywork.Color
 
----@class keywork.ThemeChip
----@field padding_x                   number
----@field padding_y                   number
----@field radius                      number
----@field min_height                  number
----@field font_size                   number
----@field line_height                 number
----@field icon_size                   number
----@field gap                         number
----@field background                  keywork.Color
----@field foreground                  keywork.Color
----@field hover_background            keywork.Color
----@field pressed_background          keywork.Color
----@field focused_border              keywork.Color
----@field focused_border_width        number
----@field selected_background         keywork.Color
----@field selected_foreground         keywork.Color
----@field selected_hover_background   keywork.Color
----@field selected_pressed_background keywork.Color
+---@class keywork.TokenRecipe
+---@field padding_x   number
+---@field padding_y?  number
+---@field radius      number
+---@field target      number
+---@field font_size   number
+---@field line_height number
+---@field icon_size   number
+---@field gap         number
+---@field background  keywork.Color
+---@field foreground  keywork.Color
 
 ---@class keywork.ThemeMenuItem
 ---@field padding_x                 number
@@ -445,12 +406,13 @@
 ---@field thumb keywork.Color
 
 ---@class keywork.ThemeComponents
----@field button    keywork.ThemeButton
----@field input     keywork.ThemeInput
----@field chip      keywork.ThemeChip
----@field menu      keywork.ThemeMenu
----@field separator keywork.ThemeSeparator
----@field scrollbar keywork.ThemeScrollbar
+---@field button     keywork.ButtonRecipe
+---@field text_field keywork.TextFieldRecipe
+---@field tag        keywork.TokenRecipe
+---@field badge      keywork.TokenRecipe
+---@field menu       keywork.ThemeMenu
+---@field separator  keywork.ThemeSeparator
+---@field scrollbar  keywork.ThemeScrollbar
 
 --- Resolved theme-shaped data accepted by `keywork.theme`. The native bridge
 --- supplies defaults for omitted fields, but descendants that read
@@ -583,36 +545,51 @@
 ---@class keywork.ContainerOptions: keywork.ContainerStyleOptions
 ---@field child keywork.Widget
 
----@class keywork.GestureOptions
+---@class keywork.GestureDetectorOptions
+---@field id?               string
+---@field child             keywork.Widget
+---@field cursor?           keywork.CursorShape
+---@field buttons?          'any' | keywork.PointerButton[]
+---@field on_pointer_down?  fun(event: keywork.TapEvent)
+---@field on_pointer_up?    fun(event: keywork.TapEvent)
+---@field on_pointer_cancel? fun(event: keywork.TapEvent)
+---@field on_hover?         fun(hovered: boolean)
+---@field on_scroll?        fun(event: keywork.ScrollEvent)
+
+---@class keywork.PressableOptions
 ---@field id                    string
 ---@field child                 keywork.Widget
+---@field action?               string
+---@field disabled?             boolean
 ---@field hover_background?     keywork.Color
 ---@field pressed_background?   keywork.Color
 ---@field focused_border?       keywork.Color
 ---@field focused_border_width? number
 ---@field cursor?               keywork.CursorShape
----@field activation?           'press' | 'release'
 ---@field buttons?              'any' | keywork.PointerButton[]
----@field on_tap?               fun(event: keywork.TapEvent)
----@field on_tap_down?          fun(event: keywork.TapEvent)
----@field on_tap_up?            fun(event: keywork.TapEvent)
----@field on_tap_cancel?        fun(event: keywork.TapEvent)
+---@field activation?           keywork.ActivationMode Defaults to `release`.
+---@field on_activate?          fun(event: keywork.TapEvent)
+---@field on_press_start?       fun(event: keywork.TapEvent)
+---@field on_press_end?         fun(event: keywork.TapEvent)
+---@field on_press_cancel?      fun(event: keywork.TapEvent)
 ---@field on_hover?             fun(hovered: boolean)
 ---@field on_scroll?            fun(event: keywork.ScrollEvent)
 
----@class keywork.PopupOptions
----@field content    keywork.Widget | fun(context: keywork.BuildContext): keywork.Widget
+---@class keywork.PopoverPlacement
 ---@field edge?      keywork.PopupEdge
 ---@field alignment? keywork.Alignment
 ---@field gap?       number
----@field width?     number
----@field height?    number
----@field on_close?  fun()
 
----@class keywork.AnchoredOptions
----@field id     string
----@field child  keywork.Widget
----@field popup? keywork.PopupOptions
+---@class keywork.PopoverOptions
+---@field id        string
+---@field anchor    keywork.Widget
+---@field open?     boolean
+---@field placement? keywork.PopoverPlacement
+---@field width?    number
+---@field height?   number
+---@field content   keywork.Widget | fun(context: keywork.BuildContext): keywork.Widget
+---@field shadow?   keywork.ShadowLayer[]
+---@field on_close? fun()
 
 ---@class keywork.FocusOptions
 ---@field id                 string
@@ -627,7 +604,7 @@
 ---@field child  keywork.Widget
 ---@field modal? boolean
 
----@class keywork.TextInputOptions
+---@class keywork.EditableTextOptions
 ---@field id                 string
 ---@field placeholder        string
 ---@field value?             string
@@ -636,7 +613,6 @@
 ---@field obscured?          boolean
 ---@field clear_on_submit?   boolean
 ---@field autofocus?         boolean
----@field variant?           'plain'
 ---@field background?        keywork.Color
 ---@field foreground?        keywork.Color
 ---@field placeholder_color? keywork.Color
@@ -648,16 +624,26 @@
 ---@field font_size?         number
 ---@field line_height?       number
 
----@class keywork.ScrollOptions
+---@class keywork.TextFieldOptions
+---@field id                string
+---@field placeholder?      string
+---@field value?            string
+---@field on_change?        fun(value: string)
+---@field on_submit?        fun(value: string)
+---@field obscured?         boolean
+---@field clear_on_submit?  boolean
+---@field autofocus?        boolean
+
+---@class keywork.ScrollViewOptions
 ---@field id    string
 ---@field child keywork.Widget
 ---@field axes? keywork.ScrollAxes
 
----@class keywork.ListOptions
+---@class keywork.ListViewOptions
 ---@field id           string
----@field count?       integer                             Defaults to zero.
----@field item_height? number                              Fixed item height. Omit to lazily measure variable-height items.
----@field selected?    integer                             One-based; nil or zero means no selection.
+---@field item_count?  integer                             Defaults to zero.
+---@field item_extent? number                              Fixed item height. Omit to lazily measure variable-height items.
+---@field reveal_index? integer                            One-based index to reveal.
 ---@field follow_end?  boolean                             Follow appends while already scrolled to the end.
 ---@field build_item   fun(index: integer): keywork.Widget
 
@@ -684,7 +670,7 @@
 ---@field axis?      keywork.SeparatorAxis
 ---@field margin?    number
 
----@class keywork.SpinnerOptions
+---@class keywork.ProgressRingOptions
 ---@field size?      number
 ---@field color?     keywork.Color
 ---@field period_ms? integer
@@ -720,88 +706,27 @@
 ---@field color?    keywork.Color
 ---@field symbolic? boolean
 
----@class keywork.IconLabelOptions
----@field size?        number
----@field color?       keywork.Color
----@field symbolic?    boolean
----@field label_size?  number
----@field font_size?   number
----@field line_height? number
----@field role?        keywork.TextRole
----@field spacing?     number
----@field align?       keywork.CrossAxisAlignment
+---@class keywork.TagOptions
+---@field icon?     string
+---@field label?    string
 
----@class keywork.ChipOptions
----@field id                           string
----@field theme?                       keywork.Theme
----@field child?                       keywork.Widget
----@field icon?                        string
----@field label?                       string
----@field icon_size?                   number
----@field size?                        number
----@field label_size?                  number
----@field font_size?                   number
----@field line_height?                 number
----@field role?                        keywork.TextRole
----@field spacing?                     number
----@field padding?                     number | keywork.EdgeInsets
----@field background?                  keywork.Color
----@field border?                      keywork.Color
----@field border_width?                number
----@field radius?                      number
----@field min_width?                   number
----@field min_height?                  number
----@field align?                       keywork.Alignment
----@field horizontal_align?            keywork.Alignment
----@field vertical_align?              keywork.Alignment
----@field color?                       keywork.Color
----@field hover_background?            keywork.Color
----@field pressed_background?          keywork.Color
----@field focused_border?              keywork.Color
----@field focused_border_width?        number
----@field selected?                    boolean
----@field selected_background?         keywork.Color
----@field selected_color?              keywork.Color
----@field selected_hover_background?   keywork.Color
----@field selected_pressed_background? keywork.Color
----@field cursor?                      keywork.CursorShape
----@field activation?                  'press' | 'release'
----@field on_tap?                      fun(event: keywork.TapEvent)
----@field on_tap_down?                 fun(event: keywork.TapEvent)
----@field on_tap_up?                   fun(event: keywork.TapEvent)
----@field on_tap_cancel?               fun(event: keywork.TapEvent)
+---@class keywork.BadgeOptions
+---@field icon?  string
+---@field label? string
 
----@class keywork.MenuOptions
----@field theme?        keywork.Theme
----@field background?   keywork.Color
----@field border?       keywork.Color
----@field border_width? number
----@field radius?       number
----@field shadow?       keywork.ShadowLayer[]
----@field padding?      number | keywork.EdgeInsets
----@field child         keywork.Widget
+---@class keywork.MenuSurfaceOptions
+---@field child keywork.Widget
 
 ---@class keywork.MenuItemOptions
----@field id                         string
----@field theme?                     keywork.Theme
----@field child                      keywork.Widget
----@field selected?                  boolean
----@field background?                keywork.Color
----@field hover_background?          keywork.Color | false
----@field pressed_background?        keywork.Color
----@field selected_background?       keywork.Color
----@field selected_hover_background? keywork.Color | false
----@field selected_pressed_background? keywork.Color
----@field radius?                    number
----@field min_height?                number
----@field padding?                   number | keywork.EdgeInsets
----@field cursor?                    keywork.CursorShape
----@field activation?                'press' | 'release'
----@field on_tap?                    fun(event: keywork.TapEvent)
----@field on_hover?                  fun(hovered: boolean)
+---@field id           string
+---@field child        keywork.Widget
+---@field selected?    boolean
+---@field disabled?    boolean
+---@field action?      string
+---@field on_activate? fun(event: keywork.TapEvent)
+---@field on_hover?    fun(hovered: boolean)
 
 ---@class keywork.MenuLabelOptions
----@field theme?      keywork.Theme
 ---@field text?       string
 ---@field child?      keywork.Widget
 ---@field color?      keywork.Color
@@ -809,51 +734,49 @@
 ---@field padding?    number | keywork.EdgeInsets
 
 ---@class keywork.MenuSeparatorOptions
----@field theme?     keywork.Theme
 ---@field color?     keywork.Color
 ---@field thickness? number
 ---@field margin?    number
 ---@field inset?     number
 ---@field axis?      keywork.SeparatorAxis
 
----@class keywork.IconButtonOptions
----@field id                           string
----@field theme?                       keywork.Theme
----@field icon?                        string
----@field size?                        number
----@field color?                       keywork.Color
----@field background?                  keywork.Color
----@field border?                      keywork.Color
----@field hover_background?            keywork.Color
----@field pressed_background?          keywork.Color
----@field focused_border?              keywork.Color
----@field focused_border_width?        number
----@field selected?                    boolean
----@field selected_background?         keywork.Color
----@field selected_color?              keywork.Color
----@field selected_hover_background?   keywork.Color
----@field selected_pressed_background? keywork.Color
----@field padding?                     number | keywork.EdgeInsets
----@field radius?                      number
----@field on_tap?                      fun(event: keywork.TapEvent)
----@field on_tap_down?                 fun(event: keywork.TapEvent)
----@field on_tap_up?                   fun(event: keywork.TapEvent)
----@field on_tap_cancel?               fun(event: keywork.TapEvent)
-
 ---@class keywork.PaddingOptions: keywork.EdgeInsets
 ---@field insets?  number | keywork.EdgeInsets
 ---@field padding? number | keywork.EdgeInsets
 ---@field child    keywork.Widget
 
----@class keywork.ButtonOptions
+---@class keywork.ButtonBaseOptions
 ---@field id          string
----@field label       string
----@field on_pressed? fun(event: keywork.TapEvent)
+---@field size?       'small' | 'medium'
+---@field appearance? 'primary' | 'secondary' | 'subtle'
+---@field tone?       'danger'
+---@field disabled?   boolean
+---@field activation? keywork.ActivationMode Defaults to `release`.
+---@field action?     string
+---@field on_activate? fun(event: keywork.TapEvent)
 
----@class keywork.ActionButtonOptions
----@field id        string
----@field label     string
----@field action_id string
+---@class keywork.ButtonOptions: keywork.ButtonBaseOptions
+---@field icon?  string
+---@field label? string
+
+---@class keywork.IconButtonOptions: keywork.ButtonBaseOptions
+---@field icon string
+
+---@class keywork.ToggleButtonOptions: keywork.ButtonBaseOptions
+---@field icon?    string
+---@field label?   string
+---@field selected boolean
+
+---@class keywork.FlexibleOptions
+---@field child keywork.Widget
+---@field flex? number
+
+---@class keywork.CenterOptions
+---@field child keywork.Widget
+
+---@class keywork.AlignOptions
+---@field alignment keywork.Alignment
+---@field child keywork.Widget
 
 ---@class keywork.ActionsOptions
 ---@field bindings table<string, fun()>
@@ -941,11 +864,6 @@ function M.theme_for(state, theme) end
 ---@return keywork.Widget
 function M.text(value, style) end
 
----@param value    string | number
----@param options? keywork.TextStyle
----@return keywork.Widget
-function M.label(value, options) end
-
 ---@param key   string
 ---@param child keywork.Widget
 ---@return keywork.Widget
@@ -968,31 +886,21 @@ function M.default_text_style(options) end
 ---@return keywork.Widget
 function M.icon_theme(options) end
 
----@param style? keywork.BoxOptions
----@param child  keywork.Widget
----@return keywork.Widget
-function M.box(style, child) end
-
----@overload fun(options: keywork.ContainerStyleOptions | nil, child: keywork.Widget): keywork.Widget
 ---@param options keywork.ContainerOptions
 ---@return keywork.Widget
 function M.container(options) end
 
----@param options keywork.GestureOptions
+---@param options keywork.GestureDetectorOptions
 ---@return keywork.Widget
-function M.gesture(options) end
+function M.gesture_detector(options) end
 
----@param options keywork.GestureOptions
+---@param options keywork.PressableOptions
 ---@return keywork.Widget
 function M.pressable(options) end
 
----@param options keywork.AnchoredOptions
+---@param options keywork.PopoverOptions
 ---@return keywork.Widget
-function M.anchored(options) end
-
----@param options keywork.PopupOptions
----@return keywork.PopupOptions
-function M.popup(options) end
+function M.popover(options) end
 
 ---@param options keywork.FocusOptions
 ---@return keywork.Widget
@@ -1002,17 +910,21 @@ function M.focus(options) end
 ---@return keywork.Widget
 function M.focus_scope(options) end
 
----@param options keywork.TextInputOptions
+---@param options keywork.EditableTextOptions
 ---@return keywork.Widget
-function M.text_input(options) end
+function M.editable_text(options) end
 
----@param options keywork.ScrollOptions
+---@param options keywork.TextFieldOptions
 ---@return keywork.Widget
-function M.scroll(options) end
+function M.text_field(options) end
 
----@param options keywork.ListOptions
+---@param options keywork.ScrollViewOptions
 ---@return keywork.Widget
-function M.list(options) end
+function M.scroll_view(options) end
+
+---@param options keywork.ListViewOptions
+---@return keywork.Widget
+function M.list_view(options) end
 
 ---@param options keywork.LinearOptions
 ---@return keywork.Widget
@@ -1022,20 +934,17 @@ function M.column(options) end
 ---@return keywork.Widget
 function M.row(options) end
 
----@param child keywork.Widget
----@param flex? number
+---@param options keywork.FlexibleOptions
 ---@return keywork.Widget
-function M.expanded(child, flex) end
+function M.expanded(options) end
 
----@param child keywork.Widget
----@param flex? number
+---@param options keywork.FlexibleOptions
 ---@return keywork.Widget
-function M.flexible(child, flex) end
+function M.flexible(options) end
 
----@overload fun(options: keywork.SizedStyleOptions | nil, child: keywork.Widget): keywork.Widget
 ---@param options keywork.SizedOptions
 ---@return keywork.Widget
-function M.sized(options) end
+function M.sized_box(options) end
 
 ---@param options? keywork.SeparatorOptions
 ---@return keywork.Widget
@@ -1045,9 +954,9 @@ function M.separator(options) end
 ---@return keywork.Widget
 function M.spacer(flex) end
 
----@param options? keywork.SpinnerOptions
+---@param options? keywork.ProgressRingOptions
 ---@return keywork.Widget
-function M.spinner(options) end
+function M.progress_ring(options) end
 
 ---@param options keywork.SvgIconOptions
 ---@return keywork.Widget
@@ -1061,19 +970,9 @@ function M.image(options) end
 ---@return keywork.Widget
 function M.icon(options) end
 
----@param icon_name string
----@param text?     string
----@param options?  keywork.IconLabelOptions
+---@param options keywork.MenuSurfaceOptions
 ---@return keywork.Widget
-function M.icon_label(icon_name, text, options) end
-
----@param options keywork.ChipOptions
----@return keywork.Widget
-function M.chip(options) end
-
----@param options keywork.MenuOptions
----@return keywork.Widget
-function M.menu(options) end
+function M.menu_surface(options) end
 
 ---@param options keywork.MenuItemOptions
 ---@return keywork.Widget
@@ -1095,17 +994,29 @@ function M.icon_button(options) end
 ---@return keywork.Widget
 function M.padding(options) end
 
----@param child keywork.Widget
+---@param options keywork.CenterOptions
 ---@return keywork.Widget
-function M.center(child) end
+function M.center(options) end
+
+---@param options keywork.AlignOptions
+---@return keywork.Widget
+function M.align(options) end
 
 ---@param options keywork.ButtonOptions
 ---@return keywork.Widget
 function M.button(options) end
 
----@param options keywork.ActionButtonOptions
+---@param options keywork.ToggleButtonOptions
 ---@return keywork.Widget
-function M.action_button(options) end
+function M.toggle_button(options) end
+
+---@param options keywork.TagOptions
+---@return keywork.Widget
+function M.tag(options) end
+
+---@param options keywork.BadgeOptions
+---@return keywork.Widget
+function M.badge(options) end
 
 ---@param options keywork.ActionsOptions
 ---@return keywork.Widget

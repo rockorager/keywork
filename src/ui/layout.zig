@@ -652,7 +652,6 @@ fn layoutElementInto(
 ) LayoutError!void {
     switch (element.widget) {
         .keyed => try layoutWrapper(allocator, element, node, .keyed, constraints, origin, measurer),
-        .button => try layoutWrapper(allocator, element, node, .button, constraints, origin, measurer),
         .actions => try layoutWrapper(allocator, element, node, .actions, constraints, origin, measurer),
         .shortcuts => try layoutWrapper(allocator, element, node, .shortcuts, constraints, origin, measurer),
         .theme => try layoutWrapper(allocator, element, node, .theme, constraints, origin, measurer),

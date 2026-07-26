@@ -99,7 +99,7 @@ const GestureOptions = struct {
     focused_border: ?keywork.Color = null,
     focused_border_width: f32 = 2,
     cursor: keywork.CursorShape = .default,
-    activation: keywork.Widget.ClickActivation = .press,
+    activation: keywork.Widget.ClickActivation = .release,
 
     fn hoverStyle(self: GestureOptions) ?keywork.Widget.ClickableStyle {
         if (self.hover_background == null) return null;
@@ -815,11 +815,14 @@ pub fn parse(
         errdefer if (on_scroll) |callback| callback.destroy(callback_allocator);
         const on_hover = try getOptionalFocusChangeCallbackField(lua_state, callback_allocator, table, "on_hover");
         errdefer if (on_hover) |callback| callback.destroy(callback_allocator);
+        const intent = try getOptionalIntentField(lua_state, allocator, table, "action_id");
+        errdefer if (intent) |intent_value| allocator.free(intent_value.action_id);
         const child = try parseChild(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
         return .{ .clickable = .{
             .id = id,
             .child = child,
             .on_click = on_click,
+            .intent = intent,
             .on_tap_down = on_tap_down,
             .on_tap_up = on_tap_up,
             .on_tap_cancel = on_tap_cancel,
@@ -897,13 +900,6 @@ pub fn parse(
         const id = try dupeStringField(lua_state, allocator, table, "id");
         const child = try parseChild(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
         return .{ .focus_scope = .{ .id = id, .child = child, .modal = options.modal } };
-    }
-    if (std.mem.eql(u8, kind, "button")) {
-        const id = try dupeStringField(lua_state, allocator, table, "id");
-        const label = try dupeStringField(lua_state, allocator, table, "label");
-        const on_pressed = try getOptionalTapCallbackField(lua_state, callback_allocator, table, "on_pressed");
-        const intent = try getOptionalIntentField(lua_state, allocator, table, "action_id");
-        return .{ .button = .{ .id = id, .label = label, .on_pressed = on_pressed, .intent = intent } };
     }
     if (std.mem.eql(u8, kind, "text_input")) {
         const id = try dupeStringField(lua_state, allocator, table, "id");
@@ -1200,20 +1196,20 @@ test "gesture buttons parse names and reject invalid values" {
     try std.testing.expectEqual(table, c.lua_gettop(lua_state));
 }
 
-test "gesture activation parses release and defaults to press" {
+test "gesture activation parses press and defaults to release" {
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);
 
     c.lua_newtable(lua_state);
     const table = c.lua_gettop(lua_state);
 
-    // Absent activation keeps the press default.
+    // Absent activation keeps the release default.
     const defaults = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
-    try std.testing.expectEqual(keywork.Widget.ClickActivation.press, defaults.activation);
+    try std.testing.expectEqual(keywork.Widget.ClickActivation.release, defaults.activation);
 
-    lua_value.setStringField(lua_state, table, "activation", "release");
+    lua_value.setStringField(lua_state, table, "activation", "press");
     const options = try lua_codec.decode(GestureOptions, lua_state, table, std.testing.allocator);
-    try std.testing.expectEqual(keywork.Widget.ClickActivation.release, options.activation);
+    try std.testing.expectEqual(keywork.Widget.ClickActivation.press, options.activation);
 
     // Unknown values are rejected rather than silently defaulted.
     lua_value.setStringField(lua_state, table, "activation", "click");

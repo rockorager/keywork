@@ -3166,7 +3166,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
         \\    self.count = 0
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "counter", child = kw.text(tostring(self.count)), on_tap = function()
+        \\    return kw.pressable({ id = "counter", child = kw.text(tostring(self.count)), on_activate = function()
         \\      self:set_state(function(s)
         \\        s.count = s.count + 1
         \\      end)
@@ -3207,7 +3207,7 @@ test "lua stateful widget prefers its build scope invalidator" {
         \\local kw = require("keywork")
         \\local Counter = kw.stateful({
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "counter", child = kw.text("counter"), on_tap = function()
+        \\    return kw.pressable({ id = "counter", child = kw.text("counter"), on_activate = function()
         \\      self:set_state()
         \\    end })
         \\  end,
@@ -3283,7 +3283,7 @@ test "lua stateful widget dispose runs when removed" {
         \\    disposed = true
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "remove", child = kw.text("remove"), on_tap = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
         \\  end,
         \\})
         \\local App = kw.stateful({
@@ -3342,7 +3342,7 @@ test "lua stateful set_state is inert after dispose" {
         \\    disposed = true
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "remove", child = kw.text("remove"), on_tap = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
         \\  end,
         \\})
         \\local App = kw.stateful({
@@ -3404,7 +3404,7 @@ test "widget scope is canceled on the loop turn after dispose" {
         \\    end)
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "remove", child = kw.text("remove"), on_tap = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
         \\  end,
         \\})
         \\local App = kw.stateful({
@@ -3500,7 +3500,7 @@ test "widget dispose releases its service subscription" {
         \\    end)
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.gesture({ id = "remove", child = kw.text(self.snapshot or "none"), on_tap = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text(self.snapshot or "none"), on_activate = self.props.on_remove })
         \\  end,
         \\})
         \\local App = kw.stateful({
@@ -3713,23 +3713,20 @@ test "lua stateful build context keeps ambient component theme" {
     const script =
         \\local kw = require("keywork")
         \\local theme = kw.resolve_theme(kw.theme_data({
-        \\  components = { chip = {
-        \\    min_height = 28,
-        \\    hover_background = 0xff00ff00,
-        \\    selected_background = 0xffff0000,
+        \\  components = { tag = {
+        \\    target = 28,
+        \\    background = 0xffff0000,
         \\  } },
         \\}), "dark")
         \\local App = kw.stateful({
         \\  build = function(self, context)
-        \\    local chip = context.theme.components.chip
+        \\    local tag = context.theme.components.tag
         \\    local status = context.theme.color_scheme == "dark"
-        \\      and chip.min_height == 28
-        \\      and chip.hover_background == 0xff00ff00
-        \\      and chip.selected_background == 0xffff0000
+        \\      and tag.target == 28
+        \\      and tag.background == 0xffff0000
         \\    return kw.column({ children = {
-        \\      kw.chip({ id = "hover", label = "Hover", on_tap = function() end }),
-        \\      kw.chip({ id = "selected", label = "Selected", selected = true }),
-        \\      kw.label(status and "ambient" or "missing"),
+        \\      kw.tag({ label = "Passive" }),
+        \\      kw.text(status and "ambient" or "missing"),
         \\    } })
         \\  end,
         \\})
@@ -3748,9 +3745,6 @@ test "lua stateful build context keeps ambient component theme" {
     try runtime.repaint();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"ambient\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ffff0000") != null);
-
-    try runtime.pointerMove(.{ .x = 5, .y = 5 });
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff00ff00") != null);
 }
 
 test "lua resolves theme families and component tokens" {
@@ -3774,7 +3768,7 @@ test "lua resolves theme families and component tokens" {
         \\    },
         \\  },
         \\  components = {
-        \\    input = {
+        \\    text_field = {
         \\      background = "surface_high",
         \\      foreground = "foreground",
         \\      placeholder = "muted",
@@ -3788,7 +3782,7 @@ test "lua resolves theme families and component tokens" {
         \\  build = function(self, context)
         \\    return kw.theme({
         \\      data = kw.resolve_theme(theme_family, context),
-        \\      child = kw.text_input({ id = "name", value = "", placeholder = "Name" }),
+        \\      child = kw.text_field({ id = "name", value = "", placeholder = "Name" }),
         \\    })
         \\  end,
         \\})
@@ -3823,14 +3817,29 @@ test "lua default theme exposes Fluent component tokens" {
         \\local theme = kw.resolve_theme(kw.theme_data(), "light")
         \\assert(fluent.text.body.size == 14 and fluent.text.body.line_height == 20)
         \\assert(theme.text.body.size == 14 and theme.text.body.line_height == 20)
-        \\assert(theme.components.button.padding_x == 12 and theme.components.button.padding_y == 6 and theme.components.button.radius == 4)
-        \\assert(theme.components.input.padding_x == 12 and theme.components.input.padding_y == 6 and theme.components.input.line_height == 20)
-        \\assert(theme.components.chip.min_height == 24 and theme.components.chip.font_size == 12 and theme.components.chip.line_height == 16)
+        \\assert(theme.components.button.sizes.medium.padding_x == 12 and theme.components.button.sizes.medium.target == 32)
+        \\assert(theme.components.button.sizes.medium.icon_size == 20 and theme.components.button.sizes.medium.gap == 6)
+        \\assert(theme.components.button.tones.danger.foreground == theme.colors.danger)
+        \\assert(theme.components.button.tones.danger.background == theme.colors.danger_background)
+        \\assert(theme.components.button.tones.danger.hover_background == theme.colors.danger_background_hover)
+        \\assert(theme.components.button.tones.danger.pressed_background == theme.colors.danger_background_pressed)
+        \\assert(theme.components.text_field.padding_x == 12 and theme.components.text_field.padding_y == 6 and theme.components.text_field.line_height == 20)
+        \\assert(theme.components.tag.target == 24 and theme.components.tag.font_size == 12 and theme.components.tag.line_height == 16)
         \\assert(theme.components.menu.padding == 4 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
         \\assert(theme.components.menu.separator.margin == 12 and theme.components.menu.separator.inset == 4)
         \\assert(theme.shadow[1] == nil and #theme.shadow[2] == 2 and #theme.shadow[5] == 2 and #theme.shadow[6] == 2)
         \\assert(#theme.components.menu.shadow == 2)
         \\assert(theme.components.separator.thickness == 1)
+        \\assert(not pcall(function() kw.button({ id = "bad", label = "Bad", typo = true }) end))
+        \\assert(not pcall(function() kw.button({ id = "bad", label = "Bad", action = "save", on_activate = function() end }) end))
+        \\local popover = kw.popover({
+        \\  id = "details",
+        \\  anchor = kw.text("anchor"),
+        \\  open = true,
+        \\  shadow = theme.shadow[2],
+        \\  content = kw.text("content"),
+        \\})
+        \\assert(popover.popup.content.type == "box" and popover.popup.content.shadow == theme.shadow[2])
         \\for _, scheme in ipairs({ "light", "dark" }) do
         \\  local resolved = kw.resolve_theme(kw.theme_data(), scheme)
         \\  assert(resolved.colors.surface == resolved.colors.neutral_background1)
@@ -3839,7 +3848,7 @@ test "lua default theme exposes Fluent component tokens" {
         \\  assert(resolved.colors.text_tertiary == resolved.colors.neutral_foreground3)
         \\  assert(resolved.colors.border == resolved.colors.neutral_stroke1)
         \\  assert(resolved.colors.fill == resolved.colors.neutral_background4)
-        \\  assert(resolved.components.chip.background == resolved.colors.brand_background2)
+        \\  assert(resolved.components.tag.background == resolved.colors.brand_background2)
         \\  assert(resolved.components.menu.item.selected_background == resolved.colors.subtle_background_selected)
         \\  assert(resolved.components.menu.item.pressed_background == resolved.colors.subtle_background_pressed)
         \\  assert(resolved.components.menu.border == resolved.colors.neutral_stroke2)
@@ -3849,7 +3858,7 @@ test "lua default theme exposes Fluent component tokens" {
         \\  assert(resolved.components.scrollbar.thumb == resolved.colors.scrollbar_overlay)
         \\end
         \\return kw.app({
-        \\  child = kw.label(theme.font_size[2] .. ":" .. theme.line_height[2]),
+        \\  child = kw.text(theme.font_size[2] .. ":" .. theme.line_height[2]),
         \\})
         \\
     ;
@@ -3866,6 +3875,37 @@ test "lua default theme exposes Fluent component tokens" {
     try std.testing.expectEqual(@as(f32, 14), root.text_style.font_size);
     try std.testing.expectEqual(@as(?f32, 20), root.text_style.line_height);
     try std.testing.expectEqual(@as(f32, 20), root.rect.height);
+}
+
+test "lua buttons default to release activation and accept press override" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\return kw.app({ child = kw.column({ children = {
+        \\  kw.button({ id = "release", label = "Release", on_activate = function() end }),
+        \\  kw.button({ id = "press", label = "Press", activation = "press", on_activate = function() end }),
+        \\} }) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "button-activation.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 200, .max_height = 100 }, .light);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(
+        keywork.Widget.ClickActivation.release,
+        keywork.findClickHitById(runtime.root.?, "release").?.activation,
+    );
+    try std.testing.expectEqual(
+        keywork.Widget.ClickActivation.press,
+        keywork.findClickHitById(runtime.root.?, "press").?.activation,
+    );
 }
 
 test "lua window declarations preserve numeric sizes and accept content height" {
@@ -3950,7 +3990,7 @@ test "lua flexible and main_align lay out through the parser" {
         \\return kw.app({ child = kw.column({
         \\  children = {
         \\    kw.row({ main_align = "space_between", children = { kw.text("L"), kw.text("R") } }),
-        \\    kw.row({ children = { kw.text("A"), kw.expanded(kw.text("B")) } }),
+        \\    kw.row({ children = { kw.text("A"), kw.expanded({ child = kw.text("B") }) } }),
         \\  },
         \\}) })
         \\

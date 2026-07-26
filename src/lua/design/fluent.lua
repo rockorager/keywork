@@ -114,6 +114,9 @@ local function light_colors()
         success = 0xff0e700e,
         warning = 0xffbc4b09,
         danger = 0xffb10e1c,
+        danger_background = 0xffc50f1f,
+        danger_background_hover = 0xffb10e1c,
+        danger_background_pressed = 0xff960b18,
         scrollbar_overlay = 0x80000000,
 
         background = "neutral_background2",
@@ -172,6 +175,9 @@ local function dark_colors()
         success = 0xff54b054,
         warning = 0xfffaa06b,
         danger = 0xffdc626d,
+        danger_background = 0xffc50f1f,
+        danger_background_hover = 0xffb10e1c,
+        danger_background_pressed = 0xff960b18,
         scrollbar_overlay = 0x99ffffff,
 
         background = "neutral_background2",
@@ -213,19 +219,34 @@ return {
     radius = radius,
     components = {
         button = {
-            padding_x = 12,
-            padding_y = 6,
             radius = 4,
-            default = { background = "brand_background", foreground = "on_accent" },
-            hover = { background = "brand_background_hover", foreground = "on_accent" },
-            pressed = { background = "brand_background_pressed", foreground = "on_accent" },
-            disabled = {
-                background = "neutral_background_disabled",
-                foreground = "neutral_foreground_disabled",
+            focused_border = "brand_stroke1",
+            sizes = {
+                medium = { target = 32, icon_size = 20, font_size = 14, line_height = 20, gap = 6, padding_x = 12 },
+                small = { target = 24, icon_size = 16, font_size = 12, line_height = 16, gap = 4, padding_x = 8 },
             },
-            focused = { border = "brand_stroke1", border_width = 2 },
+            appearances = {
+                primary = { background="brand_background", foreground="on_accent",
+                    hover_background="brand_background_hover", pressed_background="brand_background_pressed" },
+                secondary = { background="neutral_background1", foreground="neutral_foreground1",
+                    hover_background="neutral_background1_hover", pressed_background="neutral_background1_pressed" },
+                subtle = { background="subtle_background", foreground="neutral_foreground1",
+                    hover_background="subtle_background_hover", pressed_background="subtle_background_pressed" },
+            },
+            selected = { background="brand_background_selected", foreground="on_accent",
+                hover_background="brand_background_hover", pressed_background="brand_background_pressed" },
+            disabled = { background="neutral_background_disabled", foreground="neutral_foreground_disabled" },
+            tones = {
+                danger = {
+                    foreground = "danger",
+                    background = "danger_background",
+                    hover_background = "danger_background_hover",
+                    pressed_background = "danger_background_pressed",
+                    on_background = "on_danger",
+                },
+            },
         },
-        input = {
+        text_field = {
             padding_x = 12,
             padding_y = 6,
             radius = 4,
@@ -237,11 +258,11 @@ return {
             border = "neutral_stroke1",
             focused_border = "brand_stroke1",
         },
-        chip = {
+        tag = {
             padding_x = 8,
             padding_y = 4,
             radius = 4,
-            min_height = 24,
+            target = 24,
             font_size = 12,
             line_height = 16,
             icon_size = 12,
@@ -253,9 +274,17 @@ return {
             focused_border = "brand_stroke1",
             focused_border_width = 2,
             selected_background = "brand_background",
-            selected_foreground = "on_accent",
-            selected_hover_background = "brand_background_hover",
-            selected_pressed_background = "brand_background_pressed",
+        },
+        badge = {
+            padding_x = 6,
+            radius = 4,
+            target = 20,
+            font_size = 12,
+            line_height = 16,
+            icon_size = 12,
+            gap = 4,
+            background = "brand_background2",
+            foreground = "brand_foreground2",
         },
         menu = {
             background = "neutral_background1",

@@ -4,6 +4,16 @@ local ui = {}
 -- widget mechanics so additional design profiles do not duplicate this API.
 local default_theme = require("keywork.design.fluent")
 
+local function validate(options, allowed, name)
+    options = options or {}
+    for key in pairs(options) do
+        if not allowed[key] then
+            error(("unknown %s option: %s"):format(name, tostring(key)), 3)
+        end
+    end
+    return options
+end
+
 local function copy_table(value)
     local result = {}
     for key, child in pairs(value or {}) do
@@ -108,73 +118,26 @@ local function resolve_shadows(shadows, colors)
     return result
 end
 
-local function resolve_button(button, colors, space, radius)
-    button = button or {}
-    return {
-        padding_x = resolve_space(button.padding_x, space),
-        padding_y = resolve_space(button.padding_y, space),
-        radius = resolve_radius(button.radius, radius),
-        default = {
-            background = resolve_color(button.default and button.default.background, colors),
-            foreground = resolve_color(button.default and button.default.foreground, colors),
-        },
-        hover = {
-            background = resolve_color(button.hover and button.hover.background, colors),
-            foreground = resolve_color(button.hover and button.hover.foreground, colors),
-        },
-        pressed = {
-            background = resolve_color(button.pressed and button.pressed.background, colors),
-            foreground = resolve_color(button.pressed and button.pressed.foreground, colors),
-        },
-        disabled = {
-            background = resolve_color(button.disabled and button.disabled.background, colors),
-            foreground = resolve_color(button.disabled and button.disabled.foreground, colors),
-        },
-        focused = {
-            border = resolve_color(button.focused and button.focused.border, colors),
-            border_width = button.focused and button.focused.border_width,
-        },
-    }
-end
-
-local function resolve_input(input, colors, space, radius)
-    input = input or {}
-    return {
-        padding_x = resolve_space(input.padding_x, space),
-        padding_y = resolve_space(input.padding_y, space),
-        radius = resolve_radius(input.radius, radius),
-        font_size = input.font_size,
-        line_height = input.line_height,
-        background = resolve_color(input.background, colors),
-        foreground = resolve_color(input.foreground, colors),
-        placeholder = resolve_color(input.placeholder, colors),
-        border = resolve_color(input.border, colors),
-        focused_border = resolve_color(input.focused_border, colors),
-    }
-end
-
-local function resolve_chip(chip, colors, space, radius)
-    chip = chip or {}
-    return {
-        padding_x = resolve_space(chip.padding_x, space),
-        padding_y = resolve_space(chip.padding_y, space),
-        radius = resolve_radius(chip.radius, radius),
-        min_height = resolve_space(chip.min_height, space),
-        font_size = chip.font_size,
-        line_height = chip.line_height,
-        icon_size = resolve_space(chip.icon_size, space),
-        gap = resolve_space(chip.gap, space),
-        background = resolve_color(chip.background, colors),
-        foreground = resolve_color(chip.foreground, colors),
-        hover_background = resolve_color(chip.hover_background, colors),
-        pressed_background = resolve_color(chip.pressed_background, colors),
-        focused_border = resolve_color(chip.focused_border, colors),
-        focused_border_width = chip.focused_border_width,
-        selected_background = resolve_color(chip.selected_background, colors),
-        selected_foreground = resolve_color(chip.selected_foreground, colors),
-        selected_hover_background = resolve_color(chip.selected_hover_background, colors),
-        selected_pressed_background = resolve_color(chip.selected_pressed_background, colors),
-    }
+local function resolve_recipe(value, colors, space, radius, key)
+    if type(value) ~= "table" then
+        if key and (key:find("background", 1, true) or key:find("foreground", 1, true) or
+            key:find("border", 1, true) or key:find("color", 1, true) or key == "placeholder") then
+            return resolve_color(value, colors)
+        end
+        if key == "radius" then
+            return resolve_radius(value, radius)
+        end
+        if key == "padding_x" or key == "padding_y" or key == "gap" or
+            key == "target" or key == "icon_size" then
+            return resolve_space(value, space)
+        end
+        return value
+    end
+    local result = {}
+    for child_key, child in pairs(value) do
+        result[child_key] = resolve_recipe(child, colors, space, radius, child_key)
+    end
+    return result
 end
 
 local function resolve_menu(menu, colors, space, radius, shadow)
@@ -255,9 +218,10 @@ function ui.resolve_theme(theme, state_or_scheme)
     local radius = copy_table(theme.radius or {})
     local shadow = resolve_shadows(scheme.shadow or theme.shadow, colors)
     local components = {
-        button = resolve_button(theme.components and theme.components.button, colors, space, radius),
-        input = resolve_input(theme.components and theme.components.input, colors, space, radius),
-        chip = resolve_chip(theme.components and theme.components.chip, colors, space, radius),
+        button = resolve_recipe(theme.components and theme.components.button, colors, space, radius),
+        text_field = resolve_recipe(theme.components and theme.components.text_field, colors, space, radius),
+        tag = resolve_recipe(theme.components and theme.components.tag, colors, space, radius),
+        badge = resolve_recipe(theme.components and theme.components.badge, colors, space, radius),
         menu = resolve_menu(theme.components and theme.components.menu, colors, space, radius, shadow),
         separator = resolve_separator(theme.components and theme.components.separator, colors),
         scrollbar = resolve_scrollbar(theme.components and theme.components.scrollbar, colors),
@@ -281,7 +245,8 @@ function ui.theme_for(state, theme)
 end
 
 function ui.text(value, style)
-    style = style or {}
+    style = validate(style, { color=true, size=true, font_size=true, line_height=true, role=true,
+        max_lines=true, overflow=true, line_break=true }, "text style")
     return {
         type = "text",
         value = value,
@@ -294,20 +259,6 @@ function ui.text(value, style)
         overflow = style.overflow,
         line_break = style.line_break,
     }
-end
-
-function ui.label(value, options)
-    options = options or {}
-    return ui.text(value, {
-        color = options.color,
-        size = options.size,
-        font_size = options.font_size,
-        line_height = options.line_height,
-        role = options.role or "label",
-        max_lines = options.max_lines,
-        overflow = options.overflow,
-        line_break = options.line_break,
-    })
 end
 
 function ui.keyed(key, child)
@@ -345,7 +296,7 @@ function ui.stateful(spec)
 end
 
 function ui.theme(options)
-    options = options or {}
+    options = validate(options, { data=true, theme=true, child=true }, "theme")
     return {
         type = "theme",
         theme = options.data or options.theme,
@@ -354,7 +305,8 @@ function ui.theme(options)
 end
 
 function ui.default_text_style(options)
-    options = options or {}
+    options = validate(options, { color=true, size=true, font_size=true, line_height=true, child=true },
+        "default_text_style")
     return {
         type = "default_text_style",
         color = options.color,
@@ -366,7 +318,7 @@ function ui.default_text_style(options)
 end
 
 function ui.icon_theme(options)
-    options = options or {}
+    options = validate(options, { color=true, size=true, symbolic=true, child=true }, "icon_theme")
     return {
         type = "icon_theme",
         color = options.color,
@@ -376,8 +328,7 @@ function ui.icon_theme(options)
     }
 end
 
-function ui.box(style, child)
-    style = style or {}
+local function native_box(style, child)
     return {
         type = "box",
         background = style.background,
@@ -394,11 +345,11 @@ function ui.box(style, child)
     }
 end
 
-function ui.container(options, child)
-    options = options or {}
-    if options.child then
-        child = options.child
-    end
+function ui.container(options)
+    options = validate(options, { child=true, padding=true, background=true, border=true, border_width=true,
+        radius=true, shadow=true, min_width=true, min_height=true, align=true, horizontal_align=true,
+        vertical_align=true }, "container")
+    local child = options.child
     if options.padding then
         local padding = options.padding
         if type(padding) == "number" then
@@ -416,7 +367,7 @@ function ui.container(options, child)
             })
         end
     end
-    return ui.box({
+    return native_box({
         background = options.background,
         border = options.border,
         border_width = options.border_width,
@@ -430,21 +381,18 @@ function ui.container(options, child)
     }, child)
 end
 
-function ui.gesture(options)
+function ui.gesture_detector(options)
+    options = validate(options, { id=true, child=true, cursor=true, buttons=true, on_pointer_down=true,
+        on_pointer_up=true, on_pointer_cancel=true, on_hover=true, on_scroll=true }, "gesture_detector")
     return {
         type = "gesture",
         id = options.id,
         child = options.child,
-        hover_background = options.hover_background,
-        pressed_background = options.pressed_background,
-        focused_border = options.focused_border,
-        focused_border_width = options.focused_border_width,
         cursor = options.cursor,
-        activation = options.activation,
-        on_tap = options.on_tap,
-        on_tap_down = options.on_tap_down,
-        on_tap_up = options.on_tap_up,
-        on_tap_cancel = options.on_tap_cancel,
+        focusable = false,
+        on_tap_down = options.on_pointer_down,
+        on_tap_up = options.on_pointer_up,
+        on_tap_cancel = options.on_pointer_cancel,
         on_hover = options.on_hover,
         buttons = options.buttons,
         on_scroll = options.on_scroll,
@@ -452,20 +400,24 @@ function ui.gesture(options)
 end
 
 --- Composable press primitive: hover/pressed backgrounds, a focused
---- border, cursor shape, and tap callbacks around any child. The child
+--- border, cursor shape, and activation callbacks around any child. The child
 --- should be a box/container so state backgrounds and borders have
---- somewhere to paint. A pressable with `on_tap` participates in focus
+--- somewhere to paint. An enabled pressable with an action participates in focus
 --- traversal, so Enter/Space activate it and `focused_border` marks
 --- keyboard focus. Hover and press restyle in place without rebuilding
 --- the app. `on_hover(hovered)` fires on pointer enter/leave, driven only
 --- by real pointer motion (content scrolling beneath a stationary
 --- pointer does not re-fire it).
 ---
---- `on_tap` fires on pointer-down by default (the desktop feels
---- snappier). Pass `activation = "release"` to wait for pointer-up over
---- the same target, letting a press be aborted by dragging off before
---- letting go.
+--- By default, activation waits for pointer-up over the same target. Dragging
+--- outside or receiving a pointer cancellation aborts the press. Set
+--- `activation = "press"` to activate immediately on pointer-down instead.
 function ui.pressable(options)
+    options = validate(options, { id=true, child=true, action=true, disabled=true, hover_background=true,
+        pressed_background=true, focused_border=true, focused_border_width=true, cursor=true, buttons=true,
+        activation=true,
+        on_activate=true, on_press_start=true, on_press_end=true, on_press_cancel=true,
+        on_hover=true, on_scroll=true }, "pressable")
     return {
         type = "gesture",
         id = options.id,
@@ -475,22 +427,23 @@ function ui.pressable(options)
         focused_border = options.focused_border,
         focused_border_width = options.focused_border_width,
         cursor = options.cursor,
-        activation = options.activation,
-        on_tap = options.on_tap,
-        on_tap_down = options.on_tap_down,
-        on_tap_up = options.on_tap_up,
-        on_tap_cancel = options.on_tap_cancel,
+        activation = options.activation or "release",
+        focusable = not options.disabled and (options.on_activate ~= nil or options.action ~= nil),
+        action_id = not options.disabled and options.action or nil,
+        on_tap = not options.disabled and options.on_activate or nil,
+        on_tap_down = options.on_press_start,
+        on_tap_up = options.on_press_end,
+        on_tap_cancel = options.on_press_cancel,
         on_hover = options.on_hover,
         buttons = options.buttons,
         on_scroll = options.on_scroll,
     }
 end
 
---- Declares that a popup may hang off this widget's laid-out rect. The
---- child renders inline; when `popup` is set (see ui.popup) the runtime
---- realizes it as a separate surface anchored to this widget. Popup
+--- Declares that a popup may hang off this widget's laid-out rect. The anchor
+--- renders inline; open popovers are realized as separate surfaces. Popup
 --- existence is state-driven: builds that omit `popup` dismiss it.
-function ui.anchored(options)
+local function anchored(options)
     return {
         type = "anchored",
         id = options.id,
@@ -514,6 +467,8 @@ end
 --- request_activation_token) to it.
 ui.window = setmetatable({}, {
     __call = function(_, options)
+        options = validate(options, { id=true, title=true, width=true, height=true, output=true,
+            layer_shell=true, background_blur=true, on_close=true, child=true }, "window")
         return {
             id = options.id,
             title = options.title,
@@ -528,24 +483,43 @@ ui.window = setmetatable({}, {
     end,
 })
 
---- Popup declaration for ui.anchored. `content` is a widget table, or a
+--- `content` is a widget table, or a
 --- function receiving the popup's runtime state and returning one.
 --- `on_close` fires when Escape is pressed or the compositor dismisses the
 --- popup (for example a click elsewhere), so app state can stop declaring it.
-function ui.popup(options)
-    return {
-        content = options.content,
-        edge = options.edge,
-        alignment = options.alignment,
-        gap = options.gap,
-        width = options.width,
-        height = options.height,
-        on_close = options.on_close,
-    }
+function ui.popover(options)
+    options = validate(options, { id=true, anchor=true, open=true, placement=true, width=true, height=true,
+        content=true, shadow=true, on_close=true }, "popover")
+    local placement = validate(options.placement, { edge=true, alignment=true, gap=true }, "popover placement")
+    local content = options.content
+    if options.shadow and content then
+        if type(content) == "function" then
+            local builder = content
+            content = function(context)
+                return native_box({ shadow = options.shadow }, builder(context))
+            end
+        else
+            content = native_box({ shadow = options.shadow }, content)
+        end
+    end
+    return anchored({
+        id = options.id,
+        child = options.anchor,
+        popup = options.open and {
+            content = content,
+            edge = placement.edge,
+            alignment = placement.alignment,
+            gap = placement.gap,
+            width = options.width,
+            height = options.height,
+            on_close = options.on_close,
+        } or nil,
+    })
 end
 
 function ui.focus(options)
-    options = options or {}
+    options = validate(options, { id=true, child=true, autofocus=true, skip_traversal=true,
+        can_request_focus=true, on_focus_change=true }, "focus")
     return {
         type = "focus",
         id = options.id,
@@ -558,7 +532,7 @@ function ui.focus(options)
 end
 
 function ui.focus_scope(options)
-    options = options or {}
+    options = validate(options, { id=true, child=true, modal=true }, "focus_scope")
     return {
         type = "focus_scope",
         id = options.id,
@@ -567,8 +541,11 @@ function ui.focus_scope(options)
     }
 end
 
-function ui.text_input(options)
-    options = options or {}
+function ui.editable_text(options)
+    options = validate(options, { id=true, placeholder=true, value=true, on_change=true, on_submit=true,
+        obscured=true, clear_on_submit=true, autofocus=true, background=true, foreground=true,
+        placeholder_color=true, border=true, focused_border=true, padding_x=true, padding_y=true,
+        radius=true, font_size=true, line_height=true }, "editable_text")
     return {
         type = "text_input",
         id = options.id,
@@ -579,7 +556,6 @@ function ui.text_input(options)
         obscured = options.obscured or false,
         clear_on_submit = options.clear_on_submit or false,
         autofocus = options.autofocus or false,
-        variant = options.variant,
         background = options.background,
         foreground = options.foreground,
         placeholder_color = options.placeholder_color,
@@ -593,8 +569,30 @@ function ui.text_input(options)
     }
 end
 
-function ui.scroll(options)
-    options = options or {}
+local TextField = ui.stateful({
+    build = function(self, context)
+        local recipe = context.theme.components.text_field
+        local options = copy_table(self.props)
+        options.background = recipe.background
+        options.foreground = recipe.foreground
+        options.placeholder_color = recipe.placeholder
+        options.border = recipe.border
+        options.focused_border = recipe.focused_border
+        options.padding_x = recipe.padding_x
+        options.padding_y = recipe.padding_y
+        options.radius = recipe.radius
+        options.font_size = recipe.font_size
+        options.line_height = recipe.line_height
+        return ui.editable_text(options)
+    end,
+})
+function ui.text_field(options)
+    return TextField(validate(options, { id=true, placeholder=true, value=true, on_change=true, on_submit=true,
+        obscured=true, clear_on_submit=true, autofocus=true }, "text_field"))
+end
+
+function ui.scroll_view(options)
+    options = validate(options, { id=true, child=true, axes=true }, "scroll_view")
     return {
         type = "scroll",
         id = options.id,
@@ -603,21 +601,22 @@ function ui.scroll(options)
     }
 end
 
-function ui.list(options)
-    options = options or {}
+function ui.list_view(options)
+    options = validate(options, { id=true, item_count=true, item_extent=true, reveal_index=true,
+        follow_end=true, build_item=true }, "list_view")
     return {
         type = "list",
         id = options.id,
-        count = options.count,
-        item_height = options.item_height,
-        selected = options.selected,
+        count = options.item_count,
+        item_height = options.item_extent,
+        selected = options.reveal_index,
         follow_end = options.follow_end,
         build_item = options.build_item,
     }
 end
 
 function ui.column(options)
-    options = options or {}
+    options = validate(options, { children=true, spacing=true, align=true, main_align=true }, "column")
     return {
         type = "column",
         children = options.children,
@@ -628,7 +627,7 @@ function ui.column(options)
 end
 
 function ui.row(options)
-    options = options or {}
+    options = validate(options, { children=true, spacing=true, align=true, main_align=true }, "row")
     return {
         type = "row",
         children = options.children,
@@ -638,32 +637,32 @@ function ui.row(options)
     }
 end
 
-function ui.expanded(child, flex)
+function ui.expanded(options)
+    options = validate(options, { child=true, flex=true }, "expanded")
     return {
         type = "flexible",
-        child = child,
-        flex = flex or 1,
+        child = options.child,
+        flex = options.flex or 1,
         fit = "tight",
     }
 end
 
-function ui.flexible(child, flex)
+function ui.flexible(options)
+    options = validate(options, { child=true, flex=true }, "flexible")
     return {
         type = "flexible",
-        child = child,
-        flex = flex or 1,
+        child = options.child,
+        flex = options.flex or 1,
         fit = "loose",
     }
 end
 
-function ui.sized(options, child)
-    options = options or {}
-    if options.child then
-        child = options.child
-    end
+function ui.sized_box(options)
+    options = validate(options, { child=true, width=true, height=true, min_width=true, min_height=true,
+        max_width=true, max_height=true }, "sized_box")
     return {
         type = "sized",
-        child = child,
+        child = options.child,
         width = options.width,
         height = options.height,
         min_width = options.min_width,
@@ -674,7 +673,7 @@ function ui.sized(options, child)
 end
 
 function ui.separator(options)
-    options = options or {}
+    options = validate(options, { color=true, thickness=true, axis=true, margin=true }, "separator")
     return {
         type = "separator",
         color = options.color,
@@ -691,8 +690,8 @@ function ui.spacer(flex)
     }
 end
 
-function ui.spinner(options)
-    options = options or {}
+function ui.progress_ring(options)
+    options = validate(options, { size=true, color=true, period_ms=true }, "progress_ring")
     return {
         type = "spinner",
         size = options.size,
@@ -702,7 +701,7 @@ function ui.spinner(options)
 end
 
 function ui.svg_icon(options)
-    options = options or {}
+    options = validate(options, { path=true, size=true, color=true }, "svg_icon")
     return {
         type = "svg_icon",
         path = options.path,
@@ -712,7 +711,8 @@ function ui.svg_icon(options)
 end
 
 function ui.image(options)
-    options = options or {}
+    options = validate(options, { path=true, width=true, height=true, size=true, format=true, pixels=true,
+        fit=true, align=true, cache=true, revision=true }, "image")
     return {
         type = "image",
         path = options.path,
@@ -729,7 +729,7 @@ function ui.image(options)
 end
 
 function ui.icon(options)
-    options = options or {}
+    options = validate(options, { name=true, size=true, color=true, symbolic=true }, "icon")
     return {
         type = "icon",
         name = options.name,
@@ -739,7 +739,7 @@ function ui.icon(options)
     }
 end
 
-function ui.icon_label(icon_name, text, options)
+local function icon_label(icon_name, text, options)
     options = options or {}
     -- No size default here: a nil size falls through to the enclosing
     -- icon_theme context or the bridge's default.
@@ -754,7 +754,7 @@ function ui.icon_label(icon_name, text, options)
     if text and text ~= "" then
         table.insert(
             children,
-            ui.label(text, {
+            ui.text(text, {
                 color = options.color,
                 size = options.label_size,
                 font_size = options.font_size,
@@ -772,92 +772,200 @@ function ui.icon_label(icon_name, text, options)
     })
 end
 
-local function build_chip(options, theme)
-    local chip_theme = theme and theme.components and theme.components.chip or {}
-    local selected = options.selected or false
-    local background = options.background or chip_theme.background
-    if selected then
-        background = options.selected_background or chip_theme.selected_background or background
-    end
-    local color = options.color or chip_theme.foreground
-    if selected then
-        color = options.selected_color or chip_theme.selected_foreground or color
-    end
-    local hover_background = options.hover_background or chip_theme.hover_background
-    local pressed_background = options.pressed_background or chip_theme.pressed_background
-    if selected then
-        hover_background = options.selected_hover_background or chip_theme.selected_hover_background
-        pressed_background = options.selected_pressed_background or chip_theme.selected_pressed_background
-    end
+local button_keys = {
+    id = true,
+    icon = true,
+    label = true,
+    size = true,
+    appearance = true,
+    tone = true,
+    disabled = true,
+    activation = true,
+    on_activate = true,
+    action = true,
+}
+local icon_button_keys = {
+    id = true,
+    icon = true,
+    size = true,
+    appearance = true,
+    tone = true,
+    disabled = true,
+    activation = true,
+    on_activate = true,
+    action = true,
+}
+local toggle_button_keys = {
+    id = true,
+    icon = true,
+    label = true,
+    size = true,
+    appearance = true,
+    tone = true,
+    selected = true,
+    disabled = true,
+    activation = true,
+    on_activate = true,
+    action = true,
+}
 
-    local padding = options.padding
-    if not padding then
-        padding = {
-            x = chip_theme.padding_x or default_theme.components.chip.padding_x,
-            y = chip_theme.padding_y or default_theme.components.chip.padding_y,
-        }
+local function build_button(options, theme)
+    local recipe = theme.components.button
+    local size = options.size or "medium"
+    local appearance = options.appearance or options.default_appearance or "secondary"
+    if size ~= "small" and size ~= "medium" then
+        error("invalid button size: " .. tostring(size), 3)
     end
-
-    local child = options.child
-    if not child then
-        if options.icon then
-            child = ui.icon_label(options.icon, options.label, {
-                size = options.icon_size or options.size or chip_theme.icon_size,
-                color = color,
-                label_size = options.label_size or chip_theme.font_size,
-                font_size = options.font_size or chip_theme.font_size,
-                line_height = options.line_height or chip_theme.line_height,
-                role = options.role,
-                spacing = options.spacing or chip_theme.gap,
-            })
+    if not recipe.appearances[appearance] then
+        error("invalid button appearance: " .. tostring(appearance), 3)
+    end
+    local metrics = recipe.sizes[size]
+    local colors = recipe.appearances[appearance]
+    if options.selected then
+        colors = recipe.selected
+    end
+    if options.tone then
+        local tone = recipe.tones[options.tone]
+        if not tone then
+            error("invalid button tone: " .. tostring(options.tone), 3)
+        end
+        colors = copy_table(colors)
+        if options.selected or appearance == "primary" then
+            colors.background = tone.background
+            colors.foreground = tone.on_background
+            colors.hover_background = tone.hover_background
+            colors.pressed_background = tone.pressed_background
         else
-            child = ui.label(options.label or "", {
-                color = color,
-                size = options.label_size or chip_theme.font_size,
-                font_size = options.font_size or chip_theme.font_size,
-                line_height = options.line_height or chip_theme.line_height,
-                role = options.role,
-            })
+            colors.foreground = tone.foreground
         end
     end
-    return ui.gesture({
+    if options.disabled then
+        colors = {
+            background = recipe.disabled.background,
+            foreground = recipe.disabled.foreground,
+            hover_background = recipe.disabled.background,
+            pressed_background = recipe.disabled.background,
+        }
+    end
+    local child
+    if options.icon then
+        child = icon_label(options.icon, options.label, {
+            size = metrics.icon_size,
+            color = colors.foreground,
+            font_size = metrics.font_size,
+            line_height = metrics.line_height,
+            role = "label",
+            spacing = metrics.gap,
+        })
+    else
+        child = ui.text(options.label or "", {
+            role = "label",
+            color = colors.foreground,
+            font_size = metrics.font_size,
+            line_height = metrics.line_height,
+        })
+    end
+    return ui.pressable({
         id = options.id,
-        child = ui.container({
-            background = background,
-            border = options.border,
-            border_width = options.border_width,
-            radius = options.radius or chip_theme.radius,
-            min_width = options.min_width,
-            min_height = options.min_height or chip_theme.min_height,
-            align = options.align,
-            horizontal_align = options.horizontal_align,
-            vertical_align = options.vertical_align or "center",
-            padding = padding,
-        }, child),
-        hover_background = hover_background,
-        pressed_background = pressed_background,
-        focused_border = options.focused_border or chip_theme.focused_border,
-        focused_border_width = options.focused_border_width or chip_theme.focused_border_width,
-        cursor = options.cursor,
+        action = options.action,
+        disabled = options.disabled,
         activation = options.activation,
-        on_tap = options.on_tap,
-        on_tap_down = options.on_tap_down,
-        on_tap_up = options.on_tap_up,
-        on_tap_cancel = options.on_tap_cancel,
+        on_activate = options.on_activate,
+        hover_background = colors.hover_background,
+        pressed_background = colors.pressed_background,
+        focused_border = recipe.focused_border,
+        focused_border_width = 2,
+        child = ui.container({
+            background = colors.background,
+            radius = recipe.radius,
+            min_width = options.label and nil or metrics.target,
+            min_height = metrics.target,
+            padding = { x = options.label and metrics.padding_x or 0 },
+            horizontal_align = "center",
+            vertical_align = "center",
+            child = child,
+        }),
     })
 end
 
-local Chip = ui.stateful({
+local Button = ui.stateful({
     build = function(self, context)
-        return build_chip(self.props, self.props.theme or context.theme)
+        return build_button(self.props, context.theme)
     end,
 })
+local function button_options(options, name)
+    options = validate(options, button_keys, name)
+    if options.action and options.on_activate then
+        error(name .. " action and on_activate are mutually exclusive", 3)
+    end
+    return options
+end
+function ui.button(options)
+    return Button(button_options(options, "button"))
+end
+function ui.icon_button(options)
+    options = validate(options, icon_button_keys, "icon_button")
+    if options.action and options.on_activate then
+        error("icon_button action and on_activate are mutually exclusive", 2)
+    end
+    if not options.icon then
+        error("icon_button requires icon", 2)
+    end
+    local props = copy_table(options)
+    props.default_appearance = "subtle"
+    return Button(props)
+end
+function ui.toggle_button(options)
+    options = validate(options, toggle_button_keys, "toggle_button")
+    if options.action and options.on_activate then
+        error("toggle_button action and on_activate are mutually exclusive", 2)
+    end
+    if type(options.selected) ~= "boolean" then
+        error("toggle_button requires selected", 2)
+    end
+    local props = copy_table(options)
+    props.default_appearance = "subtle"
+    return Button(props)
+end
 
---- Chip metrics and colors come from the ambient theme. Pass `theme` only
---- to intentionally override `theme.components.chip`; explicit style options
---- always win.
-function ui.chip(options)
-    return Chip(options)
+local function token(options, theme, kind)
+    local recipe = theme.components[kind]
+    local child = options.icon and icon_label(options.icon, options.label, {
+        size = recipe.icon_size,
+        color = recipe.foreground,
+        font_size = recipe.font_size,
+        line_height = recipe.line_height,
+        spacing = recipe.gap,
+    }) or ui.text(options.label or "", {
+        role = "label",
+        color = recipe.foreground,
+        font_size = recipe.font_size,
+        line_height = recipe.line_height,
+    })
+    return ui.container({
+        background = recipe.background,
+        radius = recipe.radius,
+        min_height = recipe.target,
+        padding = { x = recipe.padding_x },
+        vertical_align = "center",
+        child = child,
+    })
+end
+local Tag = ui.stateful({
+    build = function(self, context)
+        return token(self.props, context.theme, "tag")
+    end,
+})
+local Badge = ui.stateful({
+    build = function(self, context)
+        return token(self.props, context.theme, "badge")
+    end,
+})
+function ui.tag(options)
+    return Tag(validate(options, { icon=true, label=true }, "tag"))
+end
+function ui.badge(options)
+    return Badge(validate(options, { icon=true, label=true }, "badge"))
 end
 
 local function build_menu(options, theme)
@@ -880,33 +988,22 @@ local Menu = ui.stateful({
 })
 
 --- Menu surface using the ambient `theme.components.menu` colors and metrics.
---- Placement remains the responsibility of ui.popup/ui.anchored.
-function ui.menu(options)
-    return Menu(options)
+--- Use this as popover content when menu placement and dismissal are needed.
+function ui.menu_surface(options)
+    return Menu(validate(options, { child=true }, "menu_surface"))
 end
 
 local function build_menu_item(options, theme)
     local menu_theme = theme and theme.components and theme.components.menu or {}
     local item_theme = menu_theme.item or {}
     local selected = options.selected or false
-    local background = options.background
-    local hover_background
-    local pressed_background = options.pressed_background or item_theme.pressed_background
-    if options.hover_background ~= false then
-        hover_background = options.hover_background or item_theme.hover_background
-    end
+    local background
+    local hover_background = item_theme.hover_background
+    local pressed_background = item_theme.pressed_background
     if selected then
-        background = options.selected_background or item_theme.selected_background or background
-        pressed_background = options.selected_pressed_background or item_theme.selected_pressed_background
-            or pressed_background
-        if options.hover_background ~= false then
-            if options.selected_hover_background == false then
-                hover_background = nil
-            else
-                hover_background = options.selected_hover_background or item_theme.selected_hover_background
-                    or hover_background
-            end
-        end
+        background = item_theme.selected_background
+        pressed_background = item_theme.selected_pressed_background or pressed_background
+        hover_background = item_theme.selected_hover_background or hover_background
     end
     local padding = options.padding
     if not padding then
@@ -924,16 +1021,17 @@ local function build_menu_item(options, theme)
         id = options.id,
         hover_background = hover_background,
         pressed_background = pressed_background,
-        cursor = options.cursor,
-        activation = options.activation,
-        on_tap = options.on_tap,
+        disabled = options.disabled,
+        action = options.action,
+        on_activate = options.on_activate,
         on_hover = options.on_hover,
         child = ui.container({
             background = background,
-            radius = options.radius or item_theme.radius,
-            min_height = options.min_height or item_theme.min_height,
+            radius = item_theme.radius,
+            min_height = item_theme.min_height,
             padding = padding,
-        }, child),
+            child = child,
+        }),
     })
 end
 
@@ -946,6 +1044,11 @@ local MenuItem = ui.stateful({
 --- Interactive row using the ambient `theme.components.menu.item` colors and
 --- metrics. `selected` lets keyboard and pointer selection share one highlight.
 function ui.menu_item(options)
+    options = validate(options, { id=true, child=true, selected=true, disabled=true,
+        action=true, on_activate=true, on_hover=true }, "menu_item")
+    if options.action and options.on_activate then
+        error("menu_item action and on_activate are mutually exclusive", 2)
+    end
     return MenuItem(options)
 end
 
@@ -953,7 +1056,7 @@ local function build_menu_label(options, theme)
     local menu_theme = theme and theme.components and theme.components.menu or {}
     local label_theme = menu_theme.label or {}
     local child = options.child
-        or ui.label(options.text or "", {
+        or ui.text(options.text or "", {
             color = options.color or label_theme.foreground,
             font_size = label_theme.font_size or default_theme.components.menu.label.font_size,
             line_height = label_theme.line_height or default_theme.components.menu.label.line_height,
@@ -988,7 +1091,8 @@ local MenuLabel = ui.stateful({
 
 --- Non-interactive menu row for a group or section name.
 function ui.menu_label(options)
-    return MenuLabel(options)
+    return MenuLabel(validate(options, { child=true, text=true, color=true, padding=true, min_height=true },
+        "menu_label"))
 end
 
 local function build_menu_separator(options, theme)
@@ -1013,38 +1117,13 @@ local MenuSeparator = ui.stateful({
 
 --- Themed divider between menu items or groups.
 function ui.menu_separator(options)
-    return MenuSeparator(options)
-end
-
-function ui.icon_button(options)
-    return ui.chip({
-        id = options.id,
-        theme = options.theme,
-        icon = options.icon,
-        icon_size = options.size or default_theme.space[4],
-        color = options.color,
-        background = options.background,
-        border = options.border,
-        hover_background = options.hover_background,
-        pressed_background = options.pressed_background,
-        focused_border = options.focused_border,
-        focused_border_width = options.focused_border_width,
-        selected = options.selected,
-        selected_background = options.selected_background,
-        selected_color = options.selected_color,
-        selected_hover_background = options.selected_hover_background,
-        selected_pressed_background = options.selected_pressed_background,
-        padding = options.padding or { all = default_theme.space[2] },
-        radius = options.radius,
-        on_tap = options.on_tap,
-        on_tap_down = options.on_tap_down,
-        on_tap_up = options.on_tap_up,
-        on_tap_cancel = options.on_tap_cancel,
-    })
+    return MenuSeparator(validate(options, { inset=true, color=true, thickness=true, margin=true, axis=true },
+        "menu_separator"))
 end
 
 function ui.padding(options)
-    options = options or {}
+    options = validate(options, { all=true, x=true, y=true, left=true, right=true, top=true, bottom=true,
+        insets=true, padding=true, child=true }, "padding")
     return {
         type = "padding",
         all = options.all,
@@ -1059,35 +1138,21 @@ function ui.padding(options)
     }
 end
 
-function ui.center(child)
+function ui.center(options)
+    options = validate(options, { child=true }, "center")
     return {
         type = "center",
-        child = child,
+        child = options.child,
     }
 end
 
-function ui.button(options)
-    options = options or {}
-    return {
-        type = "button",
-        id = options.id,
-        label = options.label,
-        on_pressed = options.on_pressed,
-    }
-end
-
-function ui.action_button(options)
-    options = options or {}
-    return {
-        type = "button",
-        id = options.id,
-        label = options.label,
-        action_id = options.action_id,
-    }
+function ui.align(options)
+    options = validate(options, { alignment=true, child=true }, "align")
+    return native_box({ align = options.alignment }, options.child)
 end
 
 function ui.actions(options)
-    options = options or {}
+    options = validate(options, { bindings=true, child=true }, "actions")
     return {
         type = "actions",
         bindings = options.bindings,
@@ -1096,7 +1161,7 @@ function ui.actions(options)
 end
 
 function ui.shortcuts(options)
-    options = options or {}
+    options = validate(options, { bindings=true, child=true }, "shortcuts")
     return {
         type = "shortcuts",
         bindings = options.bindings,

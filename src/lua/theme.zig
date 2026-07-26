@@ -33,8 +33,6 @@ pub fn parseField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) key
     var theme = keywork.Theme.fromColorScheme(stringField(lua_state, theme_table, "color_scheme") catch "light");
     theme.color_scheme = parseColorScheme(lua_state, theme_table, theme.color_scheme);
     theme.text_theme = parseTextTheme(lua_state, theme_table, theme.text_theme);
-    theme.button_theme = parseButtonTheme(lua_state, theme_table, theme.button_theme);
-    theme.input_theme = parseInputTheme(lua_state, theme_table, theme.input_theme);
     theme.separator_theme = parseSeparatorTheme(lua_state, theme_table, theme.separator_theme);
     theme.scrollbar_theme = parseScrollbarTheme(lua_state, theme_table, theme.scrollbar_theme);
     return theme;
@@ -90,78 +88,6 @@ fn parseTextStyleField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8
         .font_size = options.resolvedFontSize() orelse base.font_size,
         .line_height = options.line_height orelse base.line_height,
     };
-}
-
-fn parseButtonTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.ButtonTheme) keywork.ButtonTheme {
-    c.lua_getfield(lua_state, theme_table, "components");
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
-    const components_table = c.lua_gettop(lua_state);
-
-    c.lua_getfield(lua_state, components_table, "button");
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
-    const button_table = c.lua_gettop(lua_state);
-
-    var result = base;
-    result.padding_x = getNumberField(lua_state, button_table, "padding_x", result.padding_x);
-    result.padding_y = getNumberField(lua_state, button_table, "padding_y", result.padding_y);
-    result.radius = getNumberField(lua_state, button_table, "radius", result.radius);
-    parseButtonStateTheme(lua_state, button_table, "default", &result.background, &result.foreground);
-    parseButtonStateTheme(lua_state, button_table, "hover", &result.hover_background, &result.hover_foreground);
-    parseButtonStateTheme(lua_state, button_table, "pressed", &result.pressed_background, null);
-    parseButtonStateTheme(lua_state, button_table, "disabled", &result.disabled_background, &result.disabled_foreground);
-    parseButtonFocusTheme(lua_state, button_table, &result.focused_border, &result.focused_border_width);
-    return result;
-}
-
-fn parseButtonStateTheme(
-    lua_state: *c.lua_State,
-    button_table: c_int,
-    key: [*:0]const u8,
-    background: *?keywork.Color,
-    foreground: ?*?keywork.Color,
-) void {
-    c.lua_getfield(lua_state, button_table, key);
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
-    const state_table = c.lua_gettop(lua_state);
-    background.* = getOptionalColorField(lua_state, state_table, "background") orelse background.*;
-    if (foreground) |field| field.* = getOptionalColorField(lua_state, state_table, "foreground") orelse field.*;
-}
-
-fn parseButtonFocusTheme(lua_state: *c.lua_State, button_table: c_int, border: *?keywork.Color, border_width: *f32) void {
-    c.lua_getfield(lua_state, button_table, "focused");
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return;
-    const focused_table = c.lua_gettop(lua_state);
-    border.* = getOptionalColorField(lua_state, focused_table, "border") orelse border.*;
-    border_width.* = getNumberField(lua_state, focused_table, "border_width", border_width.*);
-}
-
-fn parseInputTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.InputTheme) keywork.InputTheme {
-    c.lua_getfield(lua_state, theme_table, "components");
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
-    const components_table = c.lua_gettop(lua_state);
-
-    c.lua_getfield(lua_state, components_table, "input");
-    defer pop(lua_state, 1);
-    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
-    const input_table = c.lua_gettop(lua_state);
-
-    var result = base;
-    result.background = getOptionalColorField(lua_state, input_table, "background") orelse result.background;
-    result.foreground = getOptionalColorField(lua_state, input_table, "foreground") orelse result.foreground;
-    result.placeholder = getOptionalColorField(lua_state, input_table, "placeholder") orelse result.placeholder;
-    result.border = getOptionalColorField(lua_state, input_table, "border") orelse result.border;
-    result.focused_border = getOptionalColorField(lua_state, input_table, "focused_border") orelse result.focused_border;
-    result.padding_x = getNumberField(lua_state, input_table, "padding_x", result.padding_x);
-    result.padding_y = getNumberField(lua_state, input_table, "padding_y", result.padding_y);
-    result.radius = getNumberField(lua_state, input_table, "radius", result.radius);
-    result.font_size = getNumberField(lua_state, input_table, "font_size", result.font_size);
-    result.line_height = getNumberField(lua_state, input_table, "line_height", result.line_height);
-    return result;
 }
 
 fn parseSeparatorTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.SeparatorTheme) keywork.SeparatorTheme {

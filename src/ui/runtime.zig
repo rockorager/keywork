@@ -697,7 +697,7 @@ test "tab traversal focuses widgets and enter activates focused clickable" {
         fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const input = keywork.widgets.textInput("input", "", "placeholder");
-            const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = increment });
+            const button = try keywork.widgets.clickable(scope.allocator, "button", keywork.widgets.text("Button"), .{ .ptr = self, .call_fn = increment });
             const children = [_]keywork.Widget{ input, button };
             return keywork.widgets.column(scope.allocator, &children, 4);
         }
@@ -1665,69 +1665,6 @@ test "obscured input masks graphemes and clears after submit" {
     try std.testing.expectEqualStrings("password", runtime.focused_id.?);
 }
 
-test "pointer hover restyles buttons without a full rebuild" {
-    const TestApp = struct {
-        builds: usize = 0,
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.builds += 1;
-            const theme: keywork.Theme = .{
-                .color_scheme = .light,
-                .button_theme = .{
-                    .background = keywork.colors.white,
-                    .foreground = keywork.colors.ink,
-                    .hover_background = keywork.colors.black,
-                },
-            };
-            const first = try keywork.widgets.button(scope.allocator, "first", "First", .{ .ptr = self, .call_fn = noop });
-            const second = try keywork.widgets.button(scope.allocator, "second", "Second", .{ .ptr = self, .call_fn = noop });
-            const children = [_]keywork.Widget{ first, second };
-            const column = try keywork.widgets.column(scope.allocator, &children, 4);
-            return keywork.widgets.theme(scope.allocator, theme, column);
-        }
-
-        fn noop(_: *anyopaque, _: keywork.TapEvent) !void {}
-
-        fn collectBoxBackgrounds(node: *const keywork.RenderNode, out: []keywork.Color, count: *usize) void {
-            if (node.kind == .box) {
-                out[count.*] = node.background;
-                count.* += 1;
-            }
-            for (node.children) |child| collectBoxBackgrounds(child, out, count);
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
-    defer runtime.deinit();
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-
-    var backgrounds: [8]keywork.Color = undefined;
-    var count: usize = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-
-    // Hovering the first button restyles only it, with no root rebuild.
-    try runtime.pointerMove(.{ .x = 5, .y = 5 });
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    count = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(keywork.colors.black, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-
-    // Leaving the surface clears the hover styling, still without rebuilds.
-    try runtime.pointerMove(null);
-    try std.testing.expectEqual(@as(usize, 1), app.builds);
-    count = 0;
-    TestApp.collectBoxBackgrounds(runtime.root.?, &backgrounds, &count);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[0]);
-    try std.testing.expectEqual(keywork.colors.white, backgrounds[1]);
-}
-
 test "pointer motion fires clickable hover callbacks on enter and leave" {
     const TestApp = struct {
         enters: usize = 0,
@@ -1769,63 +1706,6 @@ test "pointer motion fires clickable hover callbacks on enter and leave" {
     try runtime.pointerMove(null);
     try std.testing.expectEqual(@as(usize, 1), app.enters);
     try std.testing.expectEqual(@as(usize, 1), app.leaves);
-}
-
-test "intent button callbacks survive dirty-state restyles" {
-    const TestApp = struct {
-        first_actions: usize = 0,
-        second_actions: usize = 0,
-
-        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const theme: keywork.Theme = .{
-                .color_scheme = .light,
-                .button_theme = .{
-                    .background = keywork.colors.white,
-                    .foreground = keywork.colors.ink,
-                    .hover_background = keywork.colors.black,
-                    .padding_x = 0,
-                    .padding_y = 0,
-                },
-            };
-            const first = try keywork.widgets.actionButton(scope.allocator, "first", "First", "one");
-            const second = try keywork.widgets.actionButton(scope.allocator, "second", "Second", "two");
-            const children = [_]keywork.Widget{ first, second };
-            const column = try keywork.widgets.column(scope.allocator, &children, 4);
-            const action_bindings = [_]keywork.Widget.ActionBinding{
-                .{ .id = "one", .callback = .{ .ptr = self, .call_fn = incrementFirst } },
-                .{ .id = "two", .callback = .{ .ptr = self, .call_fn = incrementSecond } },
-            };
-            const actions = try keywork.widgets.actions(scope.allocator, &action_bindings, column);
-            return keywork.widgets.theme(scope.allocator, theme, actions);
-        }
-
-        fn incrementFirst(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.first_actions += 1;
-        }
-
-        fn incrementSecond(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.second_actions += 1;
-        }
-    };
-
-    var app: TestApp = .{};
-    var backend: TestBackend = .{};
-    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 200, .max_height = 120 });
-    defer runtime.deinit();
-
-    // Hovering restyles the first button through the dirty-state arena;
-    // retained subtrees are cloned and must own their adapted action
-    // callbacks rather than borrow arena memory that the reset frees.
-    try runtime.pointerMove(.{ .x = 5, .y = 5 });
-    try runtime.pointerMove(null);
-
-    try runtime.click(.{ .x = 5, .y = 5 });
-    try runtime.click(.{ .x = 5, .y = 25 });
-    try std.testing.expectEqual(@as(usize, 1), app.first_actions);
-    try std.testing.expectEqual(@as(usize, 1), app.second_actions);
 }
 
 test "shortcut invokes ambient action outside text input focus" {
@@ -1873,7 +1753,7 @@ test "bound tab fires its shortcut instead of traversal; shift-tab still travers
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var input = keywork.widgets.textInput("input", "", "placeholder");
             input.text_input.autofocus = true;
-            const button = try keywork.widgets.button(scope.allocator, "button", "Button", .{ .ptr = self, .call_fn = ignoreTap });
+            const button = try keywork.widgets.clickable(scope.allocator, "button", keywork.widgets.text("Button"), .{ .ptr = self, .call_fn = ignoreTap });
             const children = [_]keywork.Widget{ input, button };
             const column = try keywork.widgets.column(scope.allocator, &children, 4);
             const shortcut_bindings = [_]keywork.Widget.ShortcutBinding{
