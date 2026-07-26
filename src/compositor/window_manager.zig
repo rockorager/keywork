@@ -612,6 +612,9 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+    // Keep compositor commands on the output selected for a new window. A
+    // restored window must not change the user's current output selection.
+    if (restore == null) self.default_output = self.workspaces.items[workspace].output;
     self.reportWorkspaceOccupancy(workspace);
     if (restore != null) std.debug.assert(self.pending_session_restores.remove(xdg_id));
     return id;
@@ -688,6 +691,7 @@ fn addXwayland(self: *Self, xwayland_id: Xwm.WindowId) !?WindowId {
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+    self.default_output = self.workspaces.items[workspace].output;
     self.reportWorkspaceOccupancy(workspace);
     return id;
 }
