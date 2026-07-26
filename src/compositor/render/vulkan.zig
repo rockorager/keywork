@@ -98,6 +98,10 @@ dmabuf_source_formats: []render.DmabufFormatModifier,
 dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
+// Cached textures displaced this frame because their source changed size or
+// import kind. They are held here only until the frame's submission fence
+// takes ownership, so a resize never has to drain the device.
+retired_textures: std.ArrayList(Texture) = .empty,
 // Semaphores previously imported from DMA-BUF sync files, ready for reuse.
 // A semaphore enters the pool only after its owning submission's fence has
 // signaled, so its temporary payload has been consumed and a new sync file
@@ -2205,6 +2209,8 @@ pub fn deinit(self: *Self) void {
     for (self.wait_semaphore_pool.items) |semaphore| {
         self.device_wrapper.destroySemaphore(self.device, semaphore, null);
     }
+    std.debug.assert(self.retired_textures.items.len == 0);
+    self.retired_textures.deinit(self.allocator);
     self.wait_semaphore_pool.deinit(self.allocator);
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
     if (self.dmabuf_sampled_modifiers.len != 0) self.allocator.free(self.dmabuf_sampled_modifiers);
@@ -3485,9 +3491,14 @@ fn renderFrameWithCompletion(
         self.instances.items.len == 0 and
             self.draw_runs.items.len == 0 and
             self.blur_ops.items.len == 0 and
-            self.prepared_images.items.len == 0,
+            self.prepared_images.items.len == 0 and
+            self.retired_textures.items.len == 0,
     );
     var temporary_textures_pending = false;
+    // Set by the abandoned-frame cleanup below, which runs first because it
+    // is declared later. Replaced textures may only be destroyed here when
+    // that cleanup proved the device went idle.
+    var device_idled_after_failure = false;
     defer {
         self.instances.clearRetainingCapacity();
         self.draw_runs.clearRetainingCapacity();
@@ -3496,14 +3507,29 @@ fn renderFrameWithCompletion(
             for (self.prepared_images.items) |prepared| {
                 if (prepared.cache_id == null) self.destroyTexture(prepared.texture);
             }
+            // No submission took ownership, so nothing retires these later.
+            // Destroying them without a confirmed idle device could free an
+            // image the GPU is still reading, and a synchronization failure
+            // is already unrecoverable, so leak instead.
+            if (device_idled_after_failure) {
+                for (self.retired_textures.items) |texture| self.destroyTexture(texture);
+            } else if (self.retired_textures.items.len > 0) {
+                log.warn(
+                    "leaking {d} replaced texture(s): device never went idle",
+                    .{self.retired_textures.items.len},
+                );
+            }
         }
+        self.retired_textures.clearRetainingCapacity();
         self.prepared_images.clearRetainingCapacity();
     }
 
     var frame_succeeded = false;
     var new_calibration_identity: ?u64 = null;
     defer if (!frame_succeeded) {
-        self.device_wrapper.deviceWaitIdle(self.device) catch {};
+        if (self.device_wrapper.deviceWaitIdle(self.device)) |_| {
+            device_idled_after_failure = true;
+        } else |_| {}
         self.releaseAllPendingAfterDeviceIdle();
         self.resetCommandBufferForTarget(target_key);
         self.invalidateOutput(target_key);
@@ -4269,8 +4295,10 @@ fn renderFrameWithCompletion(
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id == null) temporary_texture_count += 1;
     }
-    submission.pending_textures.ensureTotalCapacity(self.allocator, temporary_texture_count) catch
-        return error.OutOfMemory;
+    submission.pending_textures.ensureUnusedCapacity(
+        self.allocator,
+        temporary_texture_count + self.retired_textures.items.len,
+    ) catch return error.OutOfMemory;
     for (self.prepared_images.items, 0..) |prepared, index| {
         if (!prepared.texture.imported or
             !isFirstImportedTexture(self.prepared_images.items, index)) continue;
@@ -4343,7 +4371,15 @@ fn renderFrameWithCompletion(
             submission.pending_textures.appendAssumeCapacity(prepared.texture);
         }
     }
+    for (self.retired_textures.items) |texture| {
+        submission.pending_textures.appendAssumeCapacity(texture);
+    }
+    self.retired_textures.clearRetainingCapacity();
     temporary_textures_pending = true;
+    // Retire against this frame's fence now that it is pending, so a stale
+    // texture never has to be destroyed before the submission that would
+    // have released it.
+    self.retireStaleTextures(submission);
     output.initialized = true;
     output.linear_initialized = true;
     if (new_calibration_identity) |identity| {
@@ -5177,6 +5213,25 @@ fn destroyImageAllocation(self: *Self, allocation: ImageAllocation) void {
     self.device_wrapper.freeMemory(self.device, allocation.memory, null);
 }
 
+/// Displaces the cached texture for `cache_id` so a replacement can take its
+/// place, deferring destruction to this frame's submission fence.
+///
+/// The old texture is still referenced by earlier submissions, but every
+/// submission targets `self.queue`, so this frame's fence cannot signal
+/// before those uses complete. That makes the fence a valid retirement point
+/// even though the cache entry is being reused in the same frame, which is
+/// what keeps a window resize off the device-drain path.
+fn retireReplacedTexture(self: *Self, cache_id: u64) Error!void {
+    self.retired_textures.ensureUnusedCapacity(self.allocator, 1) catch {
+        // Without room to defer, fall back to the drain this exists to
+        // avoid rather than leaking the displaced texture.
+        try self.drainAllPending();
+        self.destroyTexture(self.textures.fetchRemove(cache_id).?.value);
+        return;
+    };
+    self.retired_textures.appendAssumeCapacity(self.textures.fetchRemove(cache_id).?.value);
+}
+
 fn prepareTexture(
     self: *Self,
     buffer: render.PixelBuffer,
@@ -5239,9 +5294,7 @@ fn prepareTexture(
         }
         if (self.textures.get(source.id)) |existing| {
             if (existing.imported or !std.meta.eql(existing.size, buffer.size)) {
-                try self.drainAllPending();
-                const removed = self.textures.fetchRemove(source.id).?;
-                self.destroyTexture(removed.value);
+                try self.retireReplacedTexture(source.id);
             }
         }
         if (self.textures.getPtr(source.id)) |texture| {
@@ -5340,9 +5393,7 @@ fn prepareImportedTexture(
             !std.meta.eql(existing.size, buffer.size) or
             !std.meta.eql(existing.video_representation, video_representation))
         {
-            try self.drainAllPending();
-            const removed = self.textures.fetchRemove(source.id).?;
-            self.destroyTexture(removed.value);
+            try self.retireReplacedTexture(source.id);
         }
     }
     if (self.textures.getPtr(source.id)) |texture| {
@@ -5704,9 +5755,24 @@ fn makeTextureRoom(self: *Self) !void {
     self.destroyTexture(removed.value);
 }
 
-fn reclaimStaleResources(self: *Self) Error!void {
+/// Moves textures unused for `stale_frame_count` frames onto `submission`,
+/// which destroys them when it is next drained.
+///
+/// This is safe without a device drain because every submission the renderer
+/// makes targets `self.queue`, and a submit fence's synchronization scope
+/// covers all commands earlier in that queue's submission order. Once this
+/// frame's fence signals, every earlier use of these textures has therefore
+/// completed, including uses by an unrelated or dormant output. Staleness
+/// alone would not establish that: `frame_number` counts renderer-wide
+/// frames while rings are per-output, so a sleeping output can hold a
+/// submission far older than the stale window. Introducing a second queue
+/// would invalidate this and require real per-submission tracking.
+///
+/// Retiring is opportunistic. A failed reservation leaves the texture cached
+/// for a later frame rather than forcing a drain on the repaint path.
+fn retireStaleTextures(self: *Self, submission: *Submission) void {
+    std.debug.assert(submission.fence_pending);
     const oldest = self.frame_number -| stale_frame_count;
-    var drained = false;
     while (true) {
         var stale: ?u64 = null;
         var iterator = self.textures.iterator();
@@ -5716,13 +5782,22 @@ fn reclaimStaleResources(self: *Self) Error!void {
                 break;
             }
         }
-        const id = stale orelse break;
-        if (!drained) {
-            try self.drainAllPending();
-            drained = true;
-        }
-        self.destroyTexture(self.textures.fetchRemove(id).?.value);
+        const id = stale orelse return;
+        submission.pending_textures.ensureUnusedCapacity(self.allocator, 1) catch return;
+        submission.pending_textures.appendAssumeCapacity(
+            self.textures.fetchRemove(id).?.value,
+        );
     }
+}
+
+/// Reclaims stale calibration textures and pixel-buffer outputs. Both are
+/// referenced by recorded command buffers, so destroying them requires a
+/// device drain; both also change only when an output's color pipeline or
+/// target kind changes, so that drain stays off the steady-state path.
+/// Stale textures retire through `retireStaleTextures` instead.
+fn reclaimStaleResources(self: *Self) Error!void {
+    const oldest = self.frame_number -| stale_frame_count;
+    var drained = false;
     while (true) {
         var stale: ?u64 = null;
         var iterator = self.calibrations.iterator();
