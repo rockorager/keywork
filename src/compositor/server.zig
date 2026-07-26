@@ -266,6 +266,10 @@ const RenderOutput = struct {
     request_started_nanoseconds: ?i96,
     frame_callback_deadline_nanoseconds: ?i96,
     repaint_deadline_nanoseconds: ?i96,
+    /// Vblank the currently scheduled delayed repaint is aiming for, set by
+    /// scheduleRepaint and consumed by beginFrame. Null when the pending
+    /// repaint was scheduled immediately and thus targets no deadline.
+    repaint_target_vblank_nanoseconds: ?i96,
     pending_frame: ?PendingFrame,
     cursor_state: enum { software, activating, hardware, deactivating },
     cursor_transition_committed: bool,
@@ -289,7 +293,9 @@ const RenderOutput = struct {
             .request_nanoseconds = self.request_started_nanoseconds orelse
                 render_start_nanoseconds,
             .render_nanoseconds = render_start_nanoseconds,
+            .target_vblank_nanoseconds = self.repaint_target_vblank_nanoseconds,
         };
+        self.repaint_target_vblank_nanoseconds = null;
         self.request_started_nanoseconds = null;
         increment(&self.frame_statistics.frames_started);
     }
@@ -348,7 +354,7 @@ const RenderOutput = struct {
             info,
             self.backend.refreshMillihertz(),
         );
-        self.recordRenderBudget(&pending, presented_nanoseconds, refresh_nanoseconds);
+        self.recordRenderBudget(&pending, presented_nanoseconds);
         self.frame_statistics.recordPresentation(
             .{
                 .request_nanoseconds = pending.request_nanoseconds,
@@ -366,7 +372,6 @@ const RenderOutput = struct {
         self: *RenderOutput,
         pending: *const PendingFrame,
         presented_nanoseconds: i96,
-        refresh_nanoseconds: u64,
     ) void {
         const completion = pending.render_completion_nanoseconds;
         const commit = pending.commit_nanoseconds orelse unreachable;
@@ -375,7 +380,7 @@ const RenderOutput = struct {
             pending.render_nanoseconds,
             if (completion) |signal| @max(signal, commit) else null,
             presented_nanoseconds,
-            refresh_nanoseconds,
+            pending.target_vblank_nanoseconds,
         )) {
             .ignore => {},
             .reset => |cause| {
@@ -423,6 +428,9 @@ const PendingFrame = struct {
     render_fence_fd: ?std.posix.fd_t = null,
     render_completion_nanoseconds: ?i96 = null,
     path: ?FramePath = null,
+    /// Predicted vblank this frame was delayed toward, or null when the
+    /// repaint started immediately and had no particular deadline.
+    target_vblank_nanoseconds: ?i96 = null,
 
     fn trackRenderFence(self: *PendingFrame, render_fence_fd: ?std.posix.fd_t) void {
         const fd = render_fence_fd orelse return;
@@ -521,8 +529,9 @@ const RenderBudget = struct {
     }
 };
 
-/// Deadline misses beyond the refresh period by more than this clear the
-/// repaint-delay budget. Matches the frame statistics over-budget tolerance.
+/// Presentation later than the targeted vblank by more than this clears
+/// the repaint-delay budget. Absorbs vblank prediction jitter between the
+/// extrapolated target and the actual presentation timestamp.
 const repaint_miss_tolerance_nanoseconds = std.time.ns_per_ms;
 
 const RenderBudgetResetCause = enum { missed_deadline, no_timing };
@@ -533,9 +542,11 @@ const RenderBudgetUpdate = union(enum) {
     sample: u64,
 };
 
-/// Decides how a presented frame updates the repaint-delay budget. Any
-/// frame that missed its deadline resets the budget so a stale estimate
-/// cannot keep causing misses. Frames that render the primary plane
+/// Decides how a presented frame updates the repaint-delay budget. A
+/// delayed frame presented after the vblank it targeted resets the budget
+/// so a stale estimate cannot keep causing misses; immediate frames have
+/// no deadline the budget could have caused them to miss, so their cost
+/// only feeds the sample window. Frames that render the primary plane
 /// contribute a sample from render start until the frame is ready for the
 /// vblank: the later of GPU completion and DRM commit. Direct scanout
 /// performs no rendering and cannot sample, and a frame without a ready
@@ -546,13 +557,12 @@ fn renderBudgetUpdate(
     render_nanoseconds: i96,
     ready_nanoseconds: ?i96,
     presented_nanoseconds: i96,
-    refresh_nanoseconds: u64,
+    target_vblank_nanoseconds: ?i96,
 ) RenderBudgetUpdate {
-    const render_to_presentation = presented_nanoseconds - render_nanoseconds;
-    if (render_to_presentation >
-        @as(i96, refresh_nanoseconds +| repaint_miss_tolerance_nanoseconds))
-    {
-        return .{ .reset = .missed_deadline };
+    if (target_vblank_nanoseconds) |target| {
+        if (presented_nanoseconds > target + repaint_miss_tolerance_nanoseconds) {
+            return .{ .reset = .missed_deadline };
+        }
     }
     if (path == .direct_scanout) return .ignore;
     const ready = ready_nanoseconds orelse return .{ .reset = .no_timing };
@@ -662,50 +672,67 @@ test "repaint delay leaves the render budget and margin before vblank" {
 }
 
 test "render budget samples the later of GPU completion and commit" {
-    const refresh: u64 = 16_666_666;
+    const presented: i96 = 16_666_666;
     // GPU completion after commit: the fence signal bounds the sample.
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .sample = 5 * std.time.ns_per_ms },
-        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, refresh, refresh),
+        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, presented, null),
     );
     // Overlay scanout still renders the primary plane and samples too.
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .sample = 4 * std.time.ns_per_ms },
-        renderBudgetUpdate(.overlay_scanout, 0, 4 * std.time.ns_per_ms, refresh, refresh),
+        renderBudgetUpdate(.overlay_scanout, 0, 4 * std.time.ns_per_ms, presented, null),
     );
     // Direct scanout renders nothing and contributes no sample.
     try std.testing.expectEqual(
         RenderBudgetUpdate.ignore,
-        renderBudgetUpdate(.direct_scanout, 0, null, refresh, refresh),
+        renderBudgetUpdate(.direct_scanout, 0, null, presented, null),
     );
     // Unknown GPU completion disables delays rather than guessing.
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .reset = .no_timing },
-        renderBudgetUpdate(.composited, 0, null, refresh, refresh),
+        renderBudgetUpdate(.composited, 0, null, presented, null),
     );
     // A ready timestamp outside render-to-presentation is untrustworthy.
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .reset = .no_timing },
-        renderBudgetUpdate(.composited, 0, @as(i96, refresh) + 1, refresh, refresh),
+        renderBudgetUpdate(.composited, 0, presented + 1, presented, null),
     );
 }
 
-test "render budget resets on a missed deadline regardless of frame path" {
-    const refresh: u64 = 16_666_666;
-    const late: i96 = @as(i96, refresh) + 2 * std.time.ns_per_ms;
+test "render budget resets when a delayed frame misses its target vblank" {
+    const target: i96 = 16_666_666;
+    const late = target + 2 * std.time.ns_per_ms;
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .reset = .missed_deadline },
-        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, late, refresh),
+        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, late, target),
     );
     // Overlay and direct scanout misses must also invalidate a stale
     // budget so delayed frames cannot keep missing the same vblank.
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .reset = .missed_deadline },
-        renderBudgetUpdate(.overlay_scanout, 0, 5 * std.time.ns_per_ms, late, refresh),
+        renderBudgetUpdate(.overlay_scanout, 0, 5 * std.time.ns_per_ms, late, target),
     );
     try std.testing.expectEqual(
         RenderBudgetUpdate{ .reset = .missed_deadline },
-        renderBudgetUpdate(.direct_scanout, 0, null, late, refresh),
+        renderBudgetUpdate(.direct_scanout, 0, null, late, target),
+    );
+    // Presentation within the jitter tolerance of the target still samples.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate{ .sample = 5 * std.time.ns_per_ms },
+        renderBudgetUpdate(
+            .composited,
+            0,
+            5 * std.time.ns_per_ms,
+            target + repaint_miss_tolerance_nanoseconds,
+            target,
+        ),
+    );
+    // An immediate frame targets no vblank; even a slow presentation only
+    // feeds the sample window instead of resetting the budget.
+    try std.testing.expectEqual(
+        RenderBudgetUpdate{ .sample = 5 * std.time.ns_per_ms },
+        renderBudgetUpdate(.composited, 0, 5 * std.time.ns_per_ms, late, null),
     );
 }
 
@@ -1852,6 +1879,7 @@ fn addRenderOutput(
         .request_started_nanoseconds = null,
         .frame_callback_deadline_nanoseconds = null,
         .repaint_deadline_nanoseconds = null,
+        .repaint_target_vblank_nanoseconds = null,
         .pending_frame = null,
         .cursor_state = .software,
         .cursor_transition_committed = false,
@@ -4453,18 +4481,20 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
             interval,
         );
         output.repaint_deadline_nanoseconds = schedule.deadline_nanoseconds;
+        output.repaint_target_vblank_nanoseconds = null;
         const timer = output.timer orelse unreachable;
         timer.timerUpdate(schedule.delay_milliseconds) catch |err| {
             log.err("failed to schedule repaint: {t}", .{err});
             self.terminate();
             return;
         };
-    } else if (self.repaintDelayMilliseconds(output)) |delay_milliseconds| {
+    } else if (self.repaintDelay(output)) |delay| {
         // Deferring the render toward the predicted vblank shortens the
         // damage-to-presentation latency without missing the deadline.
         increment(&output.frame_statistics.repaints_delayed);
+        output.repaint_target_vblank_nanoseconds = delay.target_vblank_nanoseconds;
         const timer = output.timer orelse unreachable;
-        timer.timerUpdate(delay_milliseconds) catch |err| {
+        timer.timerUpdate(delay.delay_milliseconds) catch |err| {
             log.err("failed to schedule repaint: {t}", .{err});
             self.terminate();
             return;
@@ -4472,6 +4502,7 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     } else {
         std.debug.assert(output.repaint_idle == null);
         increment(&output.frame_statistics.repaints_immediate);
+        output.repaint_target_vblank_nanoseconds = null;
         output.repaint_idle = self.display.getEventLoop().addIdle(
             *RenderOutput,
             handleRenderIdle,
@@ -4485,16 +4516,25 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     output.render_scheduled = true;
 }
 
-/// Milliseconds to delay the pending repaint toward the next vblank, or
-/// null when the output must render immediately: the backend cannot predict
-/// vblanks, the render-cost window is not full, or the deadline is already
-/// too close.
-fn repaintDelayMilliseconds(self: *Self, output: *RenderOutput) ?i32 {
+const RepaintDelay = struct {
+    delay_milliseconds: i32,
+    target_vblank_nanoseconds: i96,
+};
+
+/// Delay for the pending repaint toward the next vblank together with the
+/// vblank it targets, or null when the output must render immediately: the
+/// backend cannot predict vblanks, the render-cost window is not full, or
+/// the deadline is already too close.
+fn repaintDelay(self: *Self, output: *RenderOutput) ?RepaintDelay {
     if (!output.backend.supportsRepaintDelay()) return null;
     const budget = output.render_budget.budgetNanoseconds() orelse return null;
     const now = nowNanoseconds(self.io);
     const next_vblank = output.backend.nextVblankNanoseconds(now) orelse return null;
-    return repaintDelayFromDeadline(now, next_vblank, budget);
+    const delay = repaintDelayFromDeadline(now, next_vblank, budget) orelse return null;
+    return .{
+        .delay_milliseconds = delay,
+        .target_vblank_nanoseconds = next_vblank,
+    };
 }
 
 fn scheduleFrameCallback(self: *Self, output: *RenderOutput) void {
@@ -9497,7 +9537,7 @@ test "general configuration maps window borders" {
         defaults.unfocused_border_width,
         defaults.unfocused_border_color orelse theme.default_palette.unfocused_border,
     ).?;
-    try std.testing.expectEqual(@as(u32, 1), default_unfocused.width);
+    try std.testing.expectEqual(@as(u32, 2), default_unfocused.width);
     try std.testing.expectEqual(
         renderColor(theme.default_palette.unfocused_border),
         default_unfocused.color,
@@ -9506,7 +9546,7 @@ test "general configuration maps window borders" {
         defaults.focused_border_width,
         defaults.focused_border_color orelse theme.default_palette.focused_border,
     ).?;
-    try std.testing.expectEqual(@as(u32, 1), default_focused.width);
+    try std.testing.expectEqual(@as(u32, 2), default_focused.width);
     try std.testing.expectEqual(
         renderColor(theme.default_palette.focused_border),
         default_focused.color,
