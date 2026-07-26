@@ -119,8 +119,6 @@ appearance_client_initialized: bool,
 configuration: ?Config.Store,
 palette: theme.Palette,
 reduced_motion: bool,
-layer_shell_effects: Scene.Effects,
-layer_shell_border: ?Scene.Borders,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -923,8 +921,6 @@ pub fn createWithVirtualOutput(
         .configuration = null,
         .palette = theme.default_palette,
         .reduced_motion = false,
-        .layer_shell_effects = Scene.default_effects,
-        .layer_shell_border = null,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -3152,17 +3148,13 @@ fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void 
     const effects = configuredWindowEffects(general, self.palette);
     self.window_manager.setWindowEffects(effects);
     self.applyWindowBorders(general);
-    if (!std.meta.eql(self.layer_shell_effects, effects.floating)) {
-        self.layer_shell_effects = effects.floating;
-        requestRepaint(self);
-    }
 }
 
 const Elevation = enum {
-    shadow4,
     shadow8,
     shadow16,
     shadow28,
+    shadow64,
 };
 
 const ElevationMetrics = struct {
@@ -3186,10 +3178,10 @@ fn configuredWindowEffects(
         general.focused_shadow_color orelse general.shadow_color,
     );
     return .{
-        .tiled = windowEffects(general, .shadow4, normal_colors),
-        .tiled_focused = windowEffects(general, .shadow8, focused_colors),
-        .floating = windowEffects(general, .shadow16, normal_colors),
-        .floating_focused = windowEffects(general, .shadow28, focused_colors),
+        .tiled = windowEffects(general, .shadow8, normal_colors),
+        .tiled_focused = windowEffects(general, .shadow16, focused_colors),
+        .floating = windowEffects(general, .shadow28, normal_colors),
+        .floating_focused = windowEffects(general, .shadow64, focused_colors),
     };
 }
 
@@ -3209,10 +3201,10 @@ fn configuredShadowColors(
 
 fn elevationMetrics(elevation: Elevation) ElevationMetrics {
     return switch (elevation) {
-        .shadow4 => .{ .ambient_blur_radius = 2, .key_offset_y = 2, .key_blur_radius = 4 },
         .shadow8 => .{ .ambient_blur_radius = 2, .key_offset_y = 4, .key_blur_radius = 8 },
         .shadow16 => .{ .ambient_blur_radius = 2, .key_offset_y = 8, .key_blur_radius = 16 },
         .shadow28 => .{ .ambient_blur_radius = 8, .key_offset_y = 14, .key_blur_radius = 28 },
+        .shadow64 => .{ .ambient_blur_radius = 8, .key_offset_y = 32, .key_blur_radius = 64 },
     };
 }
 
@@ -3246,9 +3238,6 @@ fn applyWindowBorders(self: *Self, general: Config.GeneralSettings) void {
         general.focused_border_color orelse self.palette.focused_border,
     );
     self.window_manager.setWindowBorders(unfocused, focused);
-    if (std.meta.eql(self.layer_shell_border, unfocused)) return;
-    self.layer_shell_border = unfocused;
-    requestRepaint(self);
 }
 
 fn windowBorder(width: u32, color: Config.Color) ?Scene.Borders {
@@ -3613,8 +3602,6 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const offset = self.subcompositor.surfaceOffset(surface_id);
     const damage = Surface.currentDamage(surfaces, surface_id) orelse
         return requestRepaint(self);
-    const layer_effects = std.meta.eql(surface_id, root) and
-        self.layer_shell.usesEffects(root);
     if (damage.isEmpty()) {
         if (Logging.enabled(.debug)) {
             const resource = Surface.resourceFor(surfaces, surface_id) orelse return;
@@ -3662,15 +3649,7 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
                 },
             );
         }
-        const global_effects = if (layer_effects) effects: {
-            const caster = window_geometry.shadowCaster(
-                global,
-                self.layer_shell_border,
-                self.layer_shell_effects.corner_radius,
-            );
-            break :effects damage_geometry.effectsRect(caster.rect, self.layer_shell_effects);
-        } else global;
-        self.damageGlobalRect(global_effects, root);
+        self.damageGlobalRect(global, root);
     }
 }
 
@@ -3808,18 +3787,6 @@ fn layerSurfaceNodeBounds(self: *Self, id: Scene.LayerSurfaceId) ?render.Rect {
         layer_surface.position.x,
         layer_surface.position.y,
     );
-    if (self.layerSurfaceEffectsRect(layer_surface)) |rect| {
-        const caster = window_geometry.shadowCaster(
-            rect,
-            self.layer_shell_border,
-            self.layer_shell_effects.corner_radius,
-        );
-        var effects = damage_geometry.effectsRect(caster.rect, self.layer_shell_effects);
-        if (self.layer_shell_border) |border| {
-            effects = effects.unionWith(damage_geometry.expandRect(rect, border.width));
-        }
-        bounds = if (bounds) |current| current.unionWith(effects) else effects;
-    }
     var popups = self.scene.layerPopupIterator(id);
     while (popups.next()) |entry| {
         const rect = self.popupTreeBounds(entry.popup, entry.position) orelse continue;
@@ -6691,9 +6658,6 @@ fn hitTestLayer(self: *Self, layer: Scene.Layer, x: f64, y: f64) ?Seat.PointerFo
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
-        if (self.layerSurfaceEffectsRect(layer_surface)) |rect| {
-            if (!window_geometry.pointInRoundedRect(x, y, rect, self.layer_shell_effects.corner_radius)) continue;
-        }
         if (self.hitTestSurface(
             layer_surface.surface_id,
             layer_surface.position,
@@ -8084,31 +8048,6 @@ fn handleScheduledRender(output_context: *RenderOutput) void {
     self.scheduleRepaint(output_context);
 }
 
-fn layerSurfaceRect(
-    layer_surface: *const Scene.LayerSurface,
-    size: render.Size,
-) ?render.Rect {
-    if (!layer_surface.mapped or size.width == 0 or size.height == 0) return null;
-    return .{
-        .x = layer_surface.position.x,
-        .y = layer_surface.position.y,
-        .width = size.width,
-        .height = size.height,
-    };
-}
-
-fn layerSurfaceEffectsRect(
-    self: *Self,
-    layer_surface: *const Scene.LayerSurface,
-) ?render.Rect {
-    if (!self.layer_shell.usesEffects(layer_surface.surface_id)) return null;
-    const buffer = Surface.currentBuffer(
-        self.compositor.surfaceStore(),
-        layer_surface.surface_id,
-    ) orelse return null;
-    return layerSurfaceRect(layer_surface, buffer.logical_size);
-}
-
 fn expandBackdropBlurDamage(
     self: *Self,
     render_output: *const RenderOutput,
@@ -8960,39 +8899,16 @@ fn renderLayerSurfaces(
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
-        const effects_rect = self.layerSurfaceEffectsRect(layer_surface);
-        const rounded_clip: ?render.RoundedClip = if (effects_rect) |rect|
-            if (self.layer_shell_effects.corner_radius == 0) null else .{ .rect = rect, .radius = self.layer_shell_effects.corner_radius }
-        else
-            null;
-        const capture_id = try self.renderSurfaceTreeCapture(frame, layer_surface.surface_id, layer_surface.position.x, layer_surface.position.y, rounded_clip, null);
-        if (effects_rect) |rect| {
-            try self.renderShadows(
-                frame,
-                rect,
-                self.layer_shell_effects,
-                self.layer_shell_border,
-                null,
-            );
-        }
+        const capture_id = try self.renderSurfaceTreeCapture(frame, layer_surface.surface_id, layer_surface.position.x, layer_surface.position.y, null, null);
         try self.renderSurfaceTreeContents(
             frame,
             layer_surface.surface_id,
             layer_surface.position.x,
             layer_surface.position.y,
-            rounded_clip,
+            null,
             null,
             capture_id,
         );
-        if (effects_rect) |rect| {
-            try self.renderBorders(
-                frame,
-                rect,
-                self.layer_shell_border,
-                self.layer_shell_effects.corner_radius,
-                null,
-            );
-        }
     }
 }
 
@@ -10006,13 +9922,14 @@ test "server creates and destroys protocol globals" {
 test "general configuration maps window shadows" {
     const defaults: Config.GeneralSettings = .{};
     const dark = configuredWindowEffects(defaults, theme.dark);
-    try std.testing.expectEqual(Scene.default_effects, dark.tiled);
-    try std.testing.expectEqual(Scene.Position{ .y = 4 }, dark.tiled_focused.key_shadow.?.offset);
-    try std.testing.expectEqual(@as(u32, 8), dark.tiled_focused.key_shadow.?.blur_radius);
-    try std.testing.expectEqual(Scene.Position{ .y = 8 }, dark.floating.key_shadow.?.offset);
-    try std.testing.expectEqual(@as(u32, 16), dark.floating.key_shadow.?.blur_radius);
-    try std.testing.expectEqual(Scene.Position{ .y = 14 }, dark.floating_focused.key_shadow.?.offset);
-    try std.testing.expectEqual(@as(u32, 28), dark.floating_focused.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 4 }, dark.tiled.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 8), dark.tiled.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 8 }, dark.tiled_focused.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 16), dark.tiled_focused.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 14 }, dark.floating.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 28), dark.floating.key_shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 32 }, dark.floating_focused.key_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 64), dark.floating_focused.key_shadow.?.blur_radius);
     try std.testing.expectEqual(renderColor(theme.dark.shadow_ambient), dark.tiled.ambient_shadow.?.color);
     try std.testing.expectEqual(renderColor(theme.dark.shadow_key), dark.tiled.key_shadow.?.color);
 
