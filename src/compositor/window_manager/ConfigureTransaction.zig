@@ -51,6 +51,10 @@ pub fn isInflight(self: *const ConfigureTransaction) bool {
     return self.state == .inflight;
 }
 
+pub fn hasPendingChange(self: *const ConfigureTransaction) bool {
+    return self.dirty;
+}
+
 /// Clears the coalesced-change flag and returns a timed-out transaction to idle.
 pub fn consumeDirty(self: *ConfigureTransaction) bool {
     const value = self.dirty;

@@ -2379,6 +2379,10 @@ fn publish(self: *Self) void {
             window.minimized,
             self.workspaces.items[window.workspace].active,
             plan,
+        ) and firstPublicationReady(
+            window.published_once,
+            self.isFloating(window),
+            self.transaction.hasPendingChange(),
         );
         if (plan) |placement| switch (window.backend) {
             .xdg => |id| self.xdg_shell.setWindowPosition(id, .{ .x = placement.rect.x, .y = placement.rect.y }),
@@ -2591,6 +2595,17 @@ fn repaintSuspended(minimized: bool, active: bool, plan: ?types.LayoutPlan) bool
 
 fn displayed(mapped: bool, minimized: bool, active: bool, plan: ?types.LayoutPlan) bool {
     return mapped and !repaintSuspended(minimized, active, plan);
+}
+
+/// A floating window's first commit can choose a natural size while its
+/// fallback placement is still behind the configure barrier. Keep it hidden
+/// until the coalesced relayout publishes the matching placement.
+fn firstPublicationReady(
+    published_once: bool,
+    floating: bool,
+    relayout_pending: bool,
+) bool {
+    return published_once or !floating or !relayout_pending;
 }
 
 fn configureTimeout(self: *Self) c_int {
@@ -2864,6 +2879,13 @@ test "hidden windows are suspended and not displayed" {
     try std.testing.expect(repaintSuspended(false, true, hidden));
     try std.testing.expect(repaintSuspended(false, true, null));
     try std.testing.expect(repaintSuspended(true, true, plan));
+}
+
+test "first floating publication waits for its coalesced relayout" {
+    try std.testing.expect(!firstPublicationReady(false, true, true));
+    try std.testing.expect(firstPublicationReady(false, true, false));
+    try std.testing.expect(firstPublicationReady(false, false, true));
+    try std.testing.expect(firstPublicationReady(true, true, true));
 }
 
 test "window borders distinguish focus and exclude fullscreen windows" {
