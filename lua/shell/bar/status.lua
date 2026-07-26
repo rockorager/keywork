@@ -54,14 +54,7 @@ local function battery_status_from_values(palette, percentage, state)
         name = "battery-level-100-plugged-in"
     end
 
-    local color = palette.success
-    if status ~= "Charging" and status ~= "Full" then
-        if capacity <= 15 then
-            color = palette.danger
-        elseif capacity <= 30 then
-            color = palette.warning
-        end
-    end
+    local color = capacity < 20 and palette.danger or palette.foreground
     return status_pill("battery", name, tostring(capacity) .. "%", color)
 end
 

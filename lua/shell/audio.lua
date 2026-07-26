@@ -105,7 +105,7 @@ local function volume_icon(kind, device)
 end
 
 local function volume_status(palette, device, on_tap)
-    local color = palette.accent
+    local color = palette.foreground
     if not device or device.muted or (device.volume or 0) <= 0 then
         color = palette.muted
     end

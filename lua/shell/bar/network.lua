@@ -47,7 +47,7 @@ local function pill_from_values(palette, operstate, essid, percent, on_tap)
     local name = "network-wireless-offline"
     local color = palette.error
     if operstate == "up" then
-        color = palette.accent
+        color = palette.foreground
         name = wifi_signal_icon(percent)
     end
     return status_pill("network", name, nil, color, { on_tap = on_tap })

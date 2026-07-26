@@ -273,9 +273,9 @@ local function status_pills_story()
                             spacing = theme.space[2],
                             align = "center",
                             children = {
-                                bar_util.status_pill("volume", "audio-volume-high", nil, palette.accent),
-                                bar_util.status_pill("network", "network-wireless-signal-good", nil, palette.accent),
-                                bar_util.status_pill("battery", "battery-level-80", "82%", palette.success),
+                                bar_util.status_pill("volume", "audio-volume-high", nil, palette.foreground),
+                                bar_util.status_pill("network", "network-wireless-signal-good", nil, palette.foreground),
+                                bar_util.status_pill("battery", "battery-level-80", "82%", palette.foreground),
                             },
                         }),
                     }),
