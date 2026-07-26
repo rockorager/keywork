@@ -83,6 +83,10 @@ local Level = kw.stateful({
 
         return kw.container({
             background = theme.colors.surface,
+            border = theme.colors.panel_border,
+            border_width = 1,
+            radius = theme.radius[5],
+            shadow = theme.shadow[5],
             min_width = M.width,
             min_height = M.height,
             padding = { x = theme.space[3] },

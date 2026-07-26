@@ -172,8 +172,7 @@ return kw.app({
         end
 
         if notification_server and has_output and #notification_server:visible() > 0 then
-            -- A zero-zone layer surface is already placed inside the bar's
-            -- exclusive zone; this margin is only the visual gap below it.
+            -- Match Fluent's default corner-toaster offsets.
             windows[#windows + 1] = kw.window({
                 id = "notifications",
                 width = notifications.width,
@@ -182,8 +181,8 @@ return kw.app({
                     layer = "overlay",
                     anchor = { "top", "right" },
                     margin = {
-                        top = notifications.gap,
-                        right = notifications.margin,
+                        top = notifications.vertical_offset,
+                        right = notifications.horizontal_offset,
                     },
                 },
                 child = notifications.Stack({

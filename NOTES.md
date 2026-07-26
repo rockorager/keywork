@@ -13,6 +13,11 @@ Fix these in `../keywork`, then simplify here.
 
 ## Resolved
 
+- **Timed surfaces could not preserve their remaining lifetime across hover.**
+  Keywork exposed timers but no monotonic time to Lua, and its composed button
+  widgets dropped the underlying pressable's hover callback. Keywork now
+  provides `loop.monotonic_ms()` and forwards button hover changes, allowing
+  notifications to pause expiry and resume with the exact time remaining.
 - **Window-set changes rebuilt every existing window.** `kw.app.invalidate()`
   was the only way to add or remove a managed window, so showing the OSD also
   rebuilt and repainted both full-resolution background surfaces. Keywork now
@@ -24,12 +29,12 @@ Fix these in `../keywork`, then simplify here.
   wallpaper exhausted it even though both resources could still grow. Keywork
   now grows staging as needed and only stops atlas recovery after one clean
   current-frame repack at the device limit.
-- **Blurred layer surfaces were not clipped to the compositor's rounded
-  corners.** Keywork correctly requested a full-surface blur region, but
-  keywork-compositor only used its layer-surface corner radius for the shadow;
-  it rendered both the client buffer and blur without the matching rounded
-  clip. Zero-zone layer surfaces now pass the compositor-owned clip through
-  both paths, and pointer hit-testing follows the visible shape.
+- **Client shadows were clipped at layer-shell and popup boundaries.** Keywork
+  sized native surfaces from layout bounds, so painted shadows had nowhere to
+  go unless every caller duplicated their outsets as transparent padding.
+  Keywork now derives native frame gutters from retained subtree paint bounds,
+  keeps layer placement and popup window geometry tied to visible content,
+  and excludes transparent gutters from input and blur regions.
 - **Managed top-level windows could not reflect compositor closes into app
   state.** Dropping a declaration destroyed a window, but closing an
   `xdg_toplevel` had no callback to clear the state that declared it, so the

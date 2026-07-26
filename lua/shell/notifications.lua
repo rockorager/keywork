@@ -14,10 +14,12 @@ local CLOSE_EXPIRED = 1
 local CLOSE_DISMISSED = 2
 local CLOSE_BY_CALL = 3
 local MAX_ID = 4294967295
+local MAX_VISIBLE = 4
 
 M.width = 380
-M.gap = 8
-M.margin = 12
+M.gap = 16
+M.horizontal_offset = 20
+M.vertical_offset = 16
 
 local entities = {
     amp = "&",
@@ -169,6 +171,9 @@ Server.__index = Server
 ---@field id          integer
 ---@field generation  integer
 ---@field timeout_ms? number
+---@field remaining_ms? number
+---@field expires_at_ms? number
+---@field hovered     boolean
 ---@field actions     table[]
 ---@field resident    boolean
 
@@ -264,6 +269,9 @@ function Server:invoke(id, key, activation_token)
         self.generation = self.generation + 1
         notification.generation = self.generation
         notification.timeout_ms = nil
+        notification.remaining_ms = nil
+        notification.expires_at_ms = nil
+        notification.hovered = false
     else
         self:remove(id, CLOSE_DISMISSED)
     end
@@ -284,18 +292,41 @@ end
 
 ---@param notification ShellNotification
 function Server:schedule_expiry(notification)
-    if not notification.timeout_ms then
+    local duration = notification.remaining_ms
+    if not duration or notification.hovered then
         return
     end
     local id = notification.id
     local generation = notification.generation
+    notification.expires_at_ms = loop.monotonic_ms() + duration
     loop.spawn(function()
-        loop.sleep(notification.timeout_ms)
+        loop.sleep(duration)
         local current = self.by_id[id] --[[@as ShellNotification?]]
         if current and current.generation == generation then
             self:remove(id, CLOSE_EXPIRED)
         end
     end)
+end
+
+function Server:set_hovered(id, hovered)
+    local notification = self.by_id[id]
+    if not notification or not notification.timeout_ms or notification.hovered == hovered then
+        return
+    end
+
+    notification.hovered = hovered
+    self.generation = self.generation + 1
+    notification.generation = self.generation
+    if hovered then
+        if notification.expires_at_ms then
+            notification.remaining_ms = math.max(0, notification.expires_at_ms - loop.monotonic_ms())
+            notification.expires_at_ms = nil
+        end
+    elseif notification.remaining_ms and notification.remaining_ms > 0 then
+        self:schedule_expiry(notification)
+    else
+        self:remove(id, CLOSE_EXPIRED)
+    end
 end
 
 function Server:notify(app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout)
@@ -329,7 +360,9 @@ function Server:notify(app_name, replaces_id, app_icon, summary, body, actions, 
         resident = hints.resident == true,
         timeout_ms = notification_timeout(expire_timeout, urgency),
         generation = self.generation,
+        hovered = false,
     }
+    notification.remaining_ms = notification.timeout_ms
 
     if not self.by_id[id] then
         table.insert(self.order, 1, id)
@@ -448,17 +481,18 @@ local function invoke(server, notification, action)
     server:invoke(notification.id, action.key, token)
 end
 
-local function action_buttons(server, notification)
+local function action_buttons(server, notification, on_hover)
     local buttons = {}
     for _, action in ipairs(notification.actions) do
         if action.key ~= "default" and #buttons < 3 then
             local current = action
             buttons[#buttons + 1] = kw.expanded({ child =
                 kw.button({
-                    id = "notification-action-" .. current.key,
+                    id = "notification-action-" .. notification.id .. "-" .. current.key,
                     label = current.label,
                     size = "small",
                     appearance = "secondary",
+                    on_hover = on_hover,
                     on_activate = function()
                         invoke(server, notification, current)
                     end,
@@ -475,7 +509,10 @@ local NotificationCard = kw.stateful({
         local notification = self.props.notification
         local theme = context.theme
         local action = default_action(notification)
-        local actions = action_buttons(server, notification)
+        local on_hover = function(hovered)
+            server:set_hovered(notification.id, hovered)
+        end
+        local actions = action_buttons(server, notification, on_hover)
         local icon
         if notification.image then
             icon = kw.image({
@@ -487,15 +524,15 @@ local NotificationCard = kw.stateful({
             })
         else
             local icon_name = notification.icon
-            local icon_tint = false
+            local icon_color
             if not icon_name or icon_name == "" then
                 icon_name = notification.urgency == 2 and "dialog-warning" or "dialog-information"
-                icon_tint = true
+                icon_color = notification.urgency == 2 and theme.colors.danger or theme.colors.text_secondary
             end
             icon = kw.icon({
                 name = icon_name,
                 size = theme.space[6],
-                color = icon_tint and theme.colors.text_secondary or nil,
+                color = icon_color,
             })
         end
 
@@ -509,10 +546,11 @@ local NotificationCard = kw.stateful({
             kw.spacer(),
         }
         header[#header + 1] = kw.icon_button({
-            id = "notification-close",
+            id = "notification-close-" .. notification.id,
             icon = "window-close",
             size = "small",
             appearance = "subtle",
+            on_hover = on_hover,
             on_activate = function()
                 server:dismiss(notification.id)
             end,
@@ -549,7 +587,8 @@ local NotificationCard = kw.stateful({
         })
         if action then
             content = kw.pressable({
-                id = "notification-content",
+                id = "notification-content-" .. notification.id,
+                on_hover = on_hover,
                 on_activate = function()
                     invoke(server, notification, action)
                 end,
@@ -568,12 +607,10 @@ local NotificationCard = kw.stateful({
             })
         end
 
-        local border = notification.urgency == 2 and theme.colors.danger or nil
         local card = kw.container({
             background = theme.colors.surface,
-            border = border,
-            border_width = border and 1 or nil,
             radius = theme.radius[4],
+            shadow = theme.shadow[4],
             min_width = M.width,
             padding = { x = theme.space[3], y = theme.space[2] },
             child = kw.column({
@@ -582,7 +619,11 @@ local NotificationCard = kw.stateful({
                 children = children,
             }),
         })
-        return card
+        return kw.gesture_detector({
+            id = "notification-hover-" .. notification.id,
+            on_hover = on_hover,
+            child = card,
+        })
     end,
 })
 
@@ -591,7 +632,7 @@ M.Card = NotificationCard
 local NotificationStack = kw.stateful({
     build = function(self)
         local children = {}
-        for _, notification in ipairs(self.props.server:visible()) do
+        for _, notification in ipairs(self.props.server:visible(MAX_VISIBLE)) do
             children[#children + 1] = NotificationCard({
                 key = "notification:" .. notification.id,
                 server = self.props.server,
