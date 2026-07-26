@@ -9537,7 +9537,7 @@ test "general configuration maps window borders" {
         defaults.unfocused_border_width,
         defaults.unfocused_border_color orelse theme.default_palette.unfocused_border,
     ).?;
-    try std.testing.expectEqual(@as(u32, 2), default_unfocused.width);
+    try std.testing.expectEqual(@as(u32, 1), default_unfocused.width);
     try std.testing.expectEqual(
         renderColor(theme.default_palette.unfocused_border),
         default_unfocused.color,

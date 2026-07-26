@@ -192,7 +192,7 @@ pub const GeneralSettings = struct {
     focused_shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0xa0 },
     unfocused_border_width: u32 = 1,
     unfocused_border_color: ?Color = null,
-    focused_border_width: u32 = 1,
+    focused_border_width: u32 = 2,
     focused_border_color: ?Color = null,
 };
 
