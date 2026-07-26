@@ -1582,7 +1582,7 @@ fn logModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
-    c.lua_createtable(lua_state, 0, 3);
+    c.lua_createtable(lua_state, 0, 4);
     const app_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "quit", luaQuit, 1);
@@ -1590,6 +1590,8 @@ fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
     lua_value.setClosureField(lua_state, app_table, "reload", luaReload, 1);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "invalidate", luaInvalidate, 1);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, app_table, "reconcile", luaReconcile, 1);
 
     c.lua_createtable(lua_state, 0, 1);
     lua_value.setClosureField(lua_state, -1, "__call", luaAppCall, 0);
@@ -1718,6 +1720,17 @@ fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     invalidator.invalidate() catch |err| {
         std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "invalidate failed");
+    };
+    return 0;
+}
+
+fn luaReconcile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const invalidator = app.invalidator orelse return 0;
+    invalidator.reconcile() catch |err| {
+        std.log.scoped(.keywork_luajit).warn("reconcile failed: {}", .{err});
+        return c.luaL_error(lua_state, "reconcile failed");
     };
     return 0;
 }
@@ -1876,6 +1889,7 @@ test "keywork core excludes optional capability modules" {
         \\assert(type(kw.app.quit) == "function")
         \\assert(type(kw.app.reload) == "function")
         \\assert(type(kw.app.invalidate) == "function")
+        \\assert(type(kw.app.reconcile) == "function")
         \\assert(type(kw.session_lock.unlock) == "function")
         \\assert(type(kw.session_lock.locked) == "function")
         \\assert(kw.invalidate == nil)
@@ -3249,6 +3263,7 @@ test "lua stateful widget prefers its build scope invalidator" {
         .ptr = &global_invalidator,
         .invalidate_fn = Counter.invalidate,
         .invalidate_state_fn = Counter.invalidate,
+        .reconcile_fn = Counter.invalidate,
     });
 
     var scoped_invalidator: Counter = .{};

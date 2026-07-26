@@ -951,7 +951,13 @@ fn WindowManager(comptime Backend: type) type {
                 .ptr = self,
                 .invalidate_fn = invalidateAll,
                 .invalidate_state_fn = invalidateStateAll,
+                .reconcile_fn = reconcileWindows,
             };
+        }
+
+        fn reconcileWindows(ptr: *anyopaque) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.reconcile_pending = true;
         }
 
         fn invalidateAll(ptr: *anyopaque) anyerror!void {

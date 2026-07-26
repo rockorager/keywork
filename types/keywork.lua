@@ -797,7 +797,8 @@
 ---@class keywork.AppNamespace
 ---@field quit       fun()
 ---@field reload     fun()
----@field invalidate fun()
+---@field invalidate fun() Rebuild the window set and all retained window content.
+---@field reconcile  fun() Rebuild only the window set, preserving retained content in existing windows.
 ---@operator call(keywork.AppOptions): keywork.App
 
 ---@class keywork.WindowNamespace

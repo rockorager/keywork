@@ -39,13 +39,13 @@ pub const UiColorScheme = enum {
     }
 };
 
-/// Rebuild-request interface an app host holds instead of a concrete
-/// runtime, so hosts work unchanged whether one runtime or a whole
-/// window set sits behind it.
+/// App-change interface a host holds instead of a concrete runtime, so hosts
+/// work unchanged whether one runtime or a whole window set sits behind it.
 pub const Invalidator = struct {
     ptr: *anyopaque,
     invalidate_fn: *const fn (ptr: *anyopaque) anyerror!void,
     invalidate_state_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    reconcile_fn: *const fn (ptr: *anyopaque) anyerror!void,
 
     pub fn invalidate(self: Invalidator) !void {
         try self.invalidate_fn(self.ptr);
@@ -55,11 +55,18 @@ pub const Invalidator = struct {
         try self.invalidate_state_fn(self.ptr);
     }
 
+    /// Re-evaluates declarative window existence without rebuilding retained
+    /// content in windows that remain present.
+    pub fn reconcile(self: Invalidator) !void {
+        try self.reconcile_fn(self.ptr);
+    }
+
     pub fn fromRuntime(runtime: *Runtime) Invalidator {
         return .{
             .ptr = runtime,
             .invalidate_fn = runtimeInvalidate,
             .invalidate_state_fn = runtimeInvalidateState,
+            .reconcile_fn = runtimeInvalidate,
         };
     }
 

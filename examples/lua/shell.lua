@@ -26,14 +26,14 @@ local colors = {
 
 -- App-level state shared by the window set and every window's widgets.
 -- Widget state (kw.stateful) is per-runtime, so anything that decides
--- which windows exist lives here and flips via kw.app.invalidate().
+-- which windows exist lives here and flips via kw.app.reconcile().
 local shell = {
     launcher_open = false,
 }
 
 local function set_launcher_open(open)
     shell.launcher_open = open
-    kw.app.invalidate()
+    kw.app.reconcile()
 end
 
 local function seconds_until_next_minute()
