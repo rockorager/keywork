@@ -185,6 +185,7 @@ pub const GeneralSettings = struct {
     focus_follows_mouse: bool = true,
     inner_gap: u32 = 16,
     outer_gap: u32 = 16,
+    corner_radius: u32 = 12,
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 44,
     shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 0x70 },
@@ -580,6 +581,7 @@ const GeneralSetting = enum {
     focus_follows_mouse,
     inner_gap,
     outer_gap,
+    corner_radius,
     shadow,
     shadow_blur_radius,
     shadow_color,
@@ -608,6 +610,7 @@ fn parseGeneralSetting(
         .focus_follows_mouse => general.settings.focus_follows_mouse = try parseGeneralToggle(value),
         .inner_gap => general.settings.inner_gap = try parseGeneralSize(value),
         .outer_gap => general.settings.outer_gap = try parseGeneralSize(value),
+        .corner_radius => general.settings.corner_radius = try parseGeneralSize(value),
         .shadow => general.settings.shadow_enabled = try parseGeneralToggle(value),
         .shadow_blur_radius => general.settings.shadow_blur_radius = try parseGeneralSize(value),
         .shadow_color => general.settings.shadow_color = try parseColor(value),
@@ -1320,6 +1323,7 @@ test "general settings parse and reject invalid directives" {
         \\focus-follows-mouse=disabled
         \\inner-gap=12
         \\outer-gap=16
+        \\corner-radius=8
         \\shadow=disabled
         \\shadow-blur-radius=48
         \\shadow-color=#10203040
@@ -1337,6 +1341,7 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expect(!snapshot.general.focus_follows_mouse);
     try std.testing.expectEqual(@as(u32, 12), snapshot.general.inner_gap);
     try std.testing.expectEqual(@as(u32, 16), snapshot.general.outer_gap);
+    try std.testing.expectEqual(@as(u32, 8), snapshot.general.corner_radius);
     try std.testing.expect(!snapshot.general.shadow_enabled);
     try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
     try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);

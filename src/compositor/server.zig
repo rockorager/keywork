@@ -3134,7 +3134,7 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
     // Preserve the default 0x70:0x50 ambient-to-contact balance for configured colors.
     const contact_alpha: u8 = @intCast((@as(u16, shadow_color.alpha) * 5 + 3) / 7);
     return .{
-        .corner_radius = defaults.corner_radius,
+        .corner_radius = general.corner_radius,
         .shadow = if (general.shadow_enabled) .{
             .offset = defaults.shadow.?.offset,
             .blur_radius = general.shadow_blur_radius,
