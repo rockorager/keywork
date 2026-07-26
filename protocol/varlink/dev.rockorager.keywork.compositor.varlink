@@ -151,7 +151,10 @@ type OutputStatistics (
     overlayScanoutRejections: OverlayScanoutRejections,
     cpuUploads: int,
     dmabufImports: int,
-    # Frames whose render-to-presentation latency exceeded one refresh period plus tolerance.
+    # Frames whose production time, from render start until ready for
+    # scanout (the later of DRM commit and GPU completion), exceeded one
+    # refresh period plus tolerance. Display queueing after the frame is
+    # ready does not count against the budget.
     framesOverBudget: int,
     # Repaints deferred toward a predicted vblank versus started immediately.
     repaintsDelayed: int,

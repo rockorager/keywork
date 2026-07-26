@@ -121,10 +121,6 @@ pub fn recordPresentation(
         timestamps.request_nanoseconds,
         presented_nanoseconds,
     );
-    const render_to_presentation = elapsedNanoseconds(
-        timestamps.render_nanoseconds,
-        presented_nanoseconds,
-    );
     var latency: FrameLatency = .{
         .request_to_presentation_microseconds = nanosecondsToMicroseconds(request_to_presentation),
         .request_to_render_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
@@ -140,6 +136,11 @@ pub fn recordPresentation(
             presented_nanoseconds,
         )),
     };
+    // Frame production ends when the frame is ready for scanout: the later
+    // of the DRM commit and GPU completion. Display queueing downstream of
+    // that point is outside the compositor's control and must not count
+    // against the frame budget.
+    var ready_nanoseconds = timestamps.commit_nanoseconds;
     if (timestamps.render_completion_nanoseconds) |completion_nanoseconds| {
         // DMA-fence and DRM vblank timestamps are both monotonic. Reject
         // out-of-range values so an unexpected clock domain cannot skew
@@ -147,6 +148,7 @@ pub fn recordPresentation(
         if (completion_nanoseconds >= timestamps.render_nanoseconds and
             completion_nanoseconds <= presented_nanoseconds)
         {
+            ready_nanoseconds = @max(ready_nanoseconds, completion_nanoseconds);
             latency.render_to_gpu_completion_microseconds = nanosecondsToMicroseconds(
                 elapsedNanoseconds(timestamps.render_nanoseconds, completion_nanoseconds),
             );
@@ -161,7 +163,11 @@ pub fn recordPresentation(
     }
     self.addLatency(latency);
     increment(&self.frames_presented);
-    if (render_to_presentation > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
+    const production_nanoseconds = elapsedNanoseconds(
+        timestamps.render_nanoseconds,
+        ready_nanoseconds,
+    );
+    if (production_nanoseconds > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
         increment(&self.frames_over_budget);
     }
 }
@@ -677,6 +683,16 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(u64, 1), statistics.frames_presented);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_over_budget);
 
+    // Display queueing after the frame is ready must not count against the
+    // budget: production took 1ms even though presentation came 12ms after
+    // render start.
+    statistics.recordPresentation(.{
+        .request_nanoseconds = 0,
+        .render_nanoseconds = 10 * std.time.ns_per_ms,
+        .commit_nanoseconds = 11 * std.time.ns_per_ms,
+    }, 22 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 0), statistics.frames_over_budget);
+
     statistics.recordPresentation(.{
         .request_nanoseconds = 20 * std.time.ns_per_ms,
         .render_nanoseconds = 21 * std.time.ns_per_ms,
@@ -695,10 +711,14 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fence_samples);
     try std.testing.expectEqual(@as(u64, 1), statistics.render_fences_signaled_before_commit);
 
+    // GPU completion arriving past one refresh period after render start is
+    // real compositor work exceeding the budget, even though the commit
+    // happened early.
     statistics.recordPresentation(.{
         .request_nanoseconds = 30 * std.time.ns_per_ms,
         .render_nanoseconds = 31 * std.time.ns_per_ms,
         .commit_nanoseconds = 32 * std.time.ns_per_ms,
+        .render_completion_nanoseconds = 42_500 * std.time.ns_per_us,
     }, 43 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u64, 1), statistics.frames_over_budget);
 
