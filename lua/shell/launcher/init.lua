@@ -362,8 +362,6 @@ local Launcher = kw.stateful({
                 },
                 child = kw.box({
                     background = theme.colors.surface,
-                    border = theme.colors.border,
-                    border_width = 1,
                     radius = theme.radius[4],
                 }, content),
             }),

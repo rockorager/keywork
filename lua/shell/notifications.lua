@@ -604,7 +604,7 @@ local NotificationCard = kw.stateful({
             })
         end
 
-        local border = notification.urgency == 2 and theme.colors.danger or theme.colors.border
+        local border = notification.urgency == 2 and theme.colors.danger or nil
         local card = kw.container({
             min_width = M.width,
             padding = { all = theme.space[1] },
@@ -612,7 +612,7 @@ local NotificationCard = kw.stateful({
             kw.container({
                 background = theme.colors.surface,
                 border = border,
-                border_width = 1,
+                border_width = border and 1 or nil,
                 radius = theme.radius[4],
                 min_width = M.width - 2 * theme.space[1],
                 padding = { x = theme.space[3], y = theme.space[2] },

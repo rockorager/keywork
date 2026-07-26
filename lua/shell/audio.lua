@@ -346,8 +346,6 @@ local Settings = kw.stateful({
             height = M.settings_height,
             child = kw.container({
                 background = palette.background,
-                border = palette.border,
-                border_width = 1,
                 radius = theme.radius[3],
                 padding = { all = palette.space[4] },
                 child = kw.column({
