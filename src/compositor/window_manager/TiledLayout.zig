@@ -25,8 +25,8 @@ free_nodes: std.ArrayList(NodeIndex) = .empty,
 root: ?NodeIndex = null,
 last_usable: ?types.Rect = null,
 split_ratio_percent: u8 = 50,
-outer_gap: u32 = 16,
-inner_gap: u32 = 16,
+outer_gap: u32 = 12,
+inner_gap: u32 = 12,
 
 pub const NodeIndex = u32;
 pub const Axis = enum { horizontal, vertical };

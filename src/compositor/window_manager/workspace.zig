@@ -269,10 +269,10 @@ test "setting tiled layout reconstructs tree order and tracks membership" {
         .{ .id = third, .current = types.Size.init(10, 10) },
     }, .{ .x = 0, .y = 0, .size = types.Size.init(120, 80) }, workspace.focused);
     defer plans.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(i32, 16), plans.items[0].rect.x);
-    try std.testing.expectEqual(@as(i32, 68), plans.items[1].rect.x);
-    try std.testing.expectEqual(@as(i32, 16), plans.items[1].rect.y);
-    try std.testing.expectEqual(@as(i32, 48), plans.items[2].rect.y);
+    try std.testing.expectEqual(@as(i32, 12), plans.items[0].rect.x);
+    try std.testing.expectEqual(@as(i32, 66), plans.items[1].rect.x);
+    try std.testing.expectEqual(@as(i32, 12), plans.items[1].rect.y);
+    try std.testing.expectEqual(@as(i32, 46), plans.items[2].rect.y);
 
     try std.testing.expectEqual(second, workspace.nextWindow(first, false).?);
     try std.testing.expect(workspace.swapWindows(first, second));

@@ -183,8 +183,8 @@ pub const Color = theme.Color;
 
 pub const GeneralSettings = struct {
     focus_follows_mouse: bool = true,
-    inner_gap: u32 = 16,
-    outer_gap: u32 = 16,
+    inner_gap: u32 = 12,
+    outer_gap: u32 = 12,
     corner_radius: u32 = 12,
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 44,
