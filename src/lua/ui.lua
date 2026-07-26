@@ -782,6 +782,7 @@ local button_keys = {
     disabled = true,
     activation = true,
     on_activate = true,
+    on_hover = true,
     action = true,
 }
 local icon_button_keys = {
@@ -793,6 +794,7 @@ local icon_button_keys = {
     disabled = true,
     activation = true,
     on_activate = true,
+    on_hover = true,
     action = true,
 }
 local toggle_button_keys = {
@@ -806,6 +808,7 @@ local toggle_button_keys = {
     disabled = true,
     activation = true,
     on_activate = true,
+    on_hover = true,
     action = true,
 }
 
@@ -871,6 +874,7 @@ local function build_button(options, theme)
         disabled = options.disabled,
         activation = options.activation,
         on_activate = options.on_activate,
+        on_hover = options.on_hover,
         hover_background = colors.hover_background,
         pressed_background = colors.pressed_background,
         focused_border = recipe.focused_border,

@@ -131,6 +131,11 @@ function Channel:canceled() end
 
 local M = {}
 
+--- Returns milliseconds from a monotonic clock with an unspecified epoch.
+--- Values are meaningful only when compared within the current boot.
+---@return number
+function M.monotonic_ms() end
+
 ---@param options keywork.loop.TimerOptions
 ---@return keywork.loop.Timer
 function M.timer(options) end

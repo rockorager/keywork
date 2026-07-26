@@ -278,6 +278,7 @@ pub const LuaTimer = struct {
 };
 
 pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Host) void {
+    lua_value.setClosureField(lua_state, loop_table, "monotonic_ms", luaMonotonicMilliseconds, 0);
     c.lua_pushlightuserdata(lua_state, host);
     lua_value.setClosureField(lua_state, loop_table, "timer", luaLoopTimer, 1);
     c.lua_pushlightuserdata(lua_state, host);
@@ -296,6 +297,18 @@ pub fn installResourceApis(lua_state: *c.lua_State, loop_table: c_int, host: *Ho
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
     return lua_value.upvaluePointer(*Host, lua_state, 1).*;
+}
+
+/// Returns elapsed milliseconds from Linux's monotonic clock. The epoch is
+/// deliberately unspecified; callers may only compare values from this boot.
+fn luaMonotonicMilliseconds(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    var now: linux.timespec = undefined;
+    if (linux.clock_gettime(.MONOTONIC, &now) != 0) return c.luaL_error(lua_state, "monotonic clock failed");
+    const milliseconds = @as(u64, @intCast(now.sec)) * std.time.ms_per_s +
+        @as(u64, @intCast(now.nsec)) / std.time.ns_per_ms;
+    c.lua_pushnumber(lua_state, @floatFromInt(milliseconds));
+    return 1;
 }
 
 fn fdWatchCallback(ctx: *anyopaque, _: *event_loop.EventLoop, events: u32) !void {

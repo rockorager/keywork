@@ -1905,8 +1905,13 @@ test "keywork core excludes optional capability modules" {
         \\assert(package.loaded["keywork.pipewire"] == nil)
         \\assert(package.loaded["keywork.audio"] == nil)
         \\assert(package.loaded["keywork.log"] == nil)
-        \\assert(type(require("keywork.loop").timer) == "function")
-        \\assert(require("keywork.loop").connect == nil)
+        \\local loop = require("keywork.loop")
+        \\assert(type(loop.timer) == "function")
+        \\assert(type(loop.monotonic_ms) == "function")
+        \\local before = loop.monotonic_ms()
+        \\local after = loop.monotonic_ms()
+        \\assert(type(before) == "number" and after >= before)
+        \\assert(loop.connect == nil)
         \\assert(type(require("keywork.net").connect) == "function")
         \\assert(type(require("keywork.process").spawn) == "function")
         \\assert(type(require("keywork.dbus").session) == "function")
@@ -3900,7 +3905,7 @@ test "lua buttons default to release activation and accept press override" {
     const script =
         \\local kw = require("keywork")
         \\return kw.app({ child = kw.column({ children = {
-        \\  kw.button({ id = "release", label = "Release", on_activate = function() end }),
+        \\  kw.button({ id = "release", label = "Release", on_activate = function() end, on_hover = function() end }),
         \\  kw.button({ id = "press", label = "Press", activation = "press", on_activate = function() end }),
         \\} }) })
         \\
@@ -3913,10 +3918,12 @@ test "lua buttons default to release activation and accept press override" {
     var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 200, .max_height = 100 }, .light);
     defer runtime.deinit();
 
+    const release = keywork.findClickHitById(runtime.root.?, "release").?;
     try std.testing.expectEqual(
         keywork.Widget.ClickActivation.release,
-        keywork.findClickHitById(runtime.root.?, "release").?.activation,
+        release.activation,
     );
+    try std.testing.expect(release.hover_change != null);
     try std.testing.expectEqual(
         keywork.Widget.ClickActivation.press,
         keywork.findClickHitById(runtime.root.?, "press").?.activation,

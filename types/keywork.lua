@@ -754,6 +754,7 @@
 ---@field activation? keywork.ActivationMode Defaults to `release`.
 ---@field action?     string
 ---@field on_activate? fun(event: keywork.TapEvent)
+---@field on_hover?   fun(hovered: boolean)
 
 ---@class keywork.ButtonOptions: keywork.ButtonBaseOptions
 ---@field icon?  string
