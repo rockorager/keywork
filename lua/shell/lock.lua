@@ -5,7 +5,7 @@ local M = {}
 
 local function avatar(theme, path)
     if path then
-        return kw.sized({
+        return kw.sized_box({
             width = 96,
             height = 96,
             child = kw.image({ path = path, fit = "cover" }),
@@ -52,7 +52,7 @@ M.View = kw.stateful({
             },
         })
 
-        local card = kw.sized({
+        local card = kw.sized_box({
             width = 360,
             child = kw.container({
                 background = theme.colors.surface,
@@ -64,13 +64,13 @@ M.View = kw.stateful({
                     align = "stretch",
                     spacing = theme.space[3],
                     children = {
-                        kw.center(avatar(theme, self.props.avatar_path)),
-                        kw.center(
-                            kw.text(self.props.username or "User", {
+                        kw.center({ child = avatar(theme, self.props.avatar_path) }),
+                        kw.center({
+                            child = kw.text(self.props.username or "User", {
                                 role = "title",
-                            })
-                        ),
-                        kw.text_input({
+                            }),
+                        }),
+                        kw.text_field({
                             id = "password",
                             placeholder = "Password",
                             autofocus = self.props.autofocus ~= false,
@@ -78,24 +78,24 @@ M.View = kw.stateful({
                             clear_on_submit = true,
                             on_submit = self.props.on_submit,
                         }),
-                        kw.center(
-                            kw.text(message, {
+                        kw.center({
+                            child = kw.text(message, {
                                 color = message_color,
                                 role = "label",
-                            })
-                        ),
+                            }),
+                        }),
                     },
                 }),
             }),
         })
 
-        return kw.box(
-            { background = theme.colors.background },
-            kw.center(
-                kw.column({
+        return kw.container({
+            background = theme.colors.background,
+            child = kw.center({
+                child = kw.column({
                     align = "center",
                     children = {
-                        kw.expanded(
+                        kw.expanded({ child =
                             kw.column({
                                 align = "center",
                                 children = {
@@ -104,13 +104,13 @@ M.View = kw.stateful({
                                     kw.spacer(),
                                 },
                             })
-                        ),
+                        }),
                         card,
-                        kw.expanded(kw.spacer()),
+                        kw.expanded({ child = kw.spacer() }),
                     },
-                })
-            )
-        )
+                }),
+            }),
+        })
     end,
 })
 

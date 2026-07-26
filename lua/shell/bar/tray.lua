@@ -312,19 +312,23 @@ local TrayItems = kw.stateful({
                 and kw.image({
                     width = pixmap.width,
                     height = pixmap.height,
-                    size = palette.space[4],
+                    size = 20,
                     format = "argb32",
                     pixels = pixmap.pixels,
                 })
-                or kw.icon({ name = icon_name })
+                or kw.icon({ name = icon_name, size = 20, color = palette.foreground })
             table.insert(
                 items,
-                kw.chip({
+                kw.pressable({
                     id = "tray-" .. item.id,
-                    child = icon,
-                    on_tap = function()
+                    on_activate = function()
                         self.host:activate(item)
                     end,
+                    child = kw.sized_box({
+                        width = 32,
+                        height = 32,
+                        child = kw.center({ child = icon }),
+                    }),
                 })
             )
         end

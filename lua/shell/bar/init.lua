@@ -9,16 +9,29 @@ local M = {}
 
 M.height = 40
 
--- Memoized per scheme: a stable palette identity keeps child update()
--- hooks from refreshing on every rebuild.
-local palette_cache = {}
-local function palette_for(theme)
-    local cached = palette_cache[theme.color_scheme]
-    if not cached then
-        cached = colors.palette(theme)
-        palette_cache[theme.color_scheme] = cached
+-- A stable palette identity keeps child update() hooks from refreshing on
+-- rebuilds that did not change colors. Include resolved color values so live
+-- theme or accent changes within one light/dark scheme replace the palette.
+local cached_palette_key
+local cached_palette
+local function palette_key(theme)
+    local entries = {}
+    for name, value in pairs(theme.colors or {}) do
+        if type(value) == "number" then
+            entries[#entries + 1] = name .. "=" .. value
+        end
     end
-    return cached
+    table.sort(entries)
+    return theme.color_scheme .. ":" .. table.concat(entries, ",")
+end
+
+local function palette_for(theme)
+    local key = palette_key(theme)
+    if cached_palette_key ~= key then
+        cached_palette_key = key
+        cached_palette = colors.palette(theme)
+    end
+    return cached_palette
 end
 
 -- One bar per output. props: output and show_tray (SNI hosts register on
@@ -50,18 +63,18 @@ local Bar = kw.stateful({
             child = kw.column({
                 align = "stretch",
                 children = {
-                    kw.expanded(
+                    kw.expanded({ child =
                         kw.container({
                             background = palette.background,
                             vertical_align = "center",
                             padding = { x = theme.space[2], y = theme.space[1] },
-                        },
-                            kw.row({
+                            child = kw.row({
                                 spacing = theme.space[3],
                                 align = "center",
                                 children = children,
-                            }))
-                    ),
+                            }),
+                        })
+                    }),
                     kw.separator({}),
                 },
             }),

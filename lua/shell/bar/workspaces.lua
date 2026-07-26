@@ -13,7 +13,7 @@ local label = util.label
 ---@field loading?   boolean
 ---@field activate?  fun(id: number)
 
----@param list shell.wayland.Workspace[]
+---@param list   shell.wayland.Workspace[]
 ---@param client shell.wayland.WorkspaceClient
 ---@return WorkspaceSnapshot
 local function snapshot(list, client)
@@ -125,24 +125,26 @@ local function WorkspaceSwitcher(props)
 
     local items = {}
     for _, workspace in ipairs(visible) do
-        local on_tap_down = nil
+        local on_activate = nil
         if workspace.can_activate and state.activate then
             local id = workspace.id
-            on_tap_down = function()
+            on_activate = function()
                 state.activate(id)
             end
         end
-        items[#items + 1] = kw.chip({
+        items[#items + 1] = kw.toggle_button({
             id = "workspace-" .. workspace.id,
             label = workspace.name,
-            selected = workspace.urgent or workspace.active,
-            on_tap_down = on_tap_down,
+            selected = workspace.active,
+            size = "medium",
+            appearance = "subtle",
+            tone = workspace.urgent and "danger" or nil,
+            on_activate = on_activate,
         })
     end
 
     if #items == 0 then
-        local message = state.loading and "loading workspaces"
-            or state.connected and "no workspaces"
+        local message = state.loading and "loading workspaces" or state.connected and "no workspaces"
             or "workspaces unavailable"
         items[1] = label(message, palette.muted)
     end

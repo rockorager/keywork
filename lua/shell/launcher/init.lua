@@ -6,7 +6,6 @@ local history = require("shell.launcher.history")
 
 local M = {}
 
-local row_height = 44
 local max_results = 64
 
 M.width = 640
@@ -134,28 +133,26 @@ local function move_selection(self, delta)
 end
 
 local function search_field(self, theme)
-    return kw.container(
-        { padding = { x = theme.space[4], y = theme.space[2] } },
-        kw.row({
+    return kw.container({
+        padding = { x = theme.space[4], y = theme.space[2] },
+        child = kw.row({
             spacing = theme.space[2],
             align = "center",
             children = {
                 kw.icon({ name = "system-search", color = theme.colors.text_tertiary }),
-                kw.expanded(
-                    kw.text_input({
+                kw.expanded({ child =
+                    kw.text_field({
                         id = "query",
                         placeholder = "Search apps…",
                         autofocus = true,
-                        variant = "plain",
-                        padding_y = theme.components.input.padding_y,
                         on_change = function(text)
                             set_query(self, text)
                         end,
                     })
-                ),
+                }),
             },
-        })
-    )
+        }),
+    })
 end
 
 local function divider()
@@ -164,6 +161,7 @@ end
 
 local function result_row(self, index, entry, theme)
     local selected = index == self.selected
+    local row_height = theme.components.menu.item.min_height + theme.space[3]
     return kw.pressable({
         id = "result-" .. entry.id,
         -- Raycast model: one highlight. Pointer hover moves the selection
@@ -178,7 +176,7 @@ local function result_row(self, index, entry, theme)
                 self:set_state()
             end
         end,
-        on_tap = function()
+        on_activate = function()
             run_action(self, entry, entry.actions[1])
         end,
         child = kw.container({
@@ -187,34 +185,36 @@ local function result_row(self, index, entry, theme)
             min_height = row_height,
             vertical_align = "center",
             padding = { x = theme.components.menu.item.padding_x },
-        },
-            kw.row({
+            child = kw.row({
                 spacing = theme.space[3],
                 align = "center",
                 children = {
                     entry_icon(entry, theme.space[5], theme),
                     kw.text(entry.title),
                     kw.spacer(),
-                    kw.label(entry.subtitle or "", { color = theme.colors.text_tertiary }),
+                    kw.text(entry.subtitle or "", { color = theme.colors.text_tertiary }),
                 },
-            })),
+            }),
+        }),
     })
 end
 
 local function result_list(self, theme)
+    local row_height = theme.components.menu.item.min_height + theme.space[3]
     if #self.results == 0 then
-        return kw.container(
-            { min_height = row_height, align = "center" },
-            kw.label("No matches", { color = theme.colors.text_tertiary })
-        )
+        return kw.container({
+            min_height = row_height,
+            align = "center",
+            child = kw.text("No matches", { color = theme.colors.text_tertiary }),
+        })
     end
     -- The list follows self.selected: moving the selection scrolls it
     -- into view, wheel scrolling roams freely until the next move.
-    return kw.list({
+    return kw.list_view({
         id = "results",
-        count = #self.results,
-        item_height = row_height,
-        selected = self.selected,
+        item_count = #self.results,
+        item_extent = row_height,
+        reveal_index = self.selected,
         build_item = function(index)
             return result_row(self, index, self.results[index], theme)
         end,
@@ -233,21 +233,20 @@ local function action_menu(self, entry)
             kw.menu_item({
                 id = "action-" .. index,
                 selected = selected,
-                hover_background = false,
                 on_hover = function(hovered)
                     if hovered and self.action_selected ~= index then
                         self.action_selected = index
                         self:set_state()
                     end
                 end,
-                on_tap = function()
+                on_activate = function()
                     run_action(self, entry, action)
                 end,
                 child = kw.text(action.title),
             })
         )
     end
-    return kw.menu({
+    return kw.menu_surface({
         child = kw.column({ align = "stretch", children = rows }),
     })
 end
@@ -261,48 +260,43 @@ local function footer(self, theme)
             spacing = theme.space[1],
             align = "center",
             children = {
-                kw.label(keys, { color = theme.colors.text_secondary, size = hint_size }),
-                kw.label(text, { color = hint_color, size = hint_size }),
+                kw.text(keys, { color = theme.colors.text_secondary, size = hint_size }),
+                kw.text(text, { color = hint_color, size = hint_size }),
             },
         })
     end
     local entry = self.results[self.selected]
     local count = #self.results
-    return kw.container(
-        { padding = { x = theme.space[4], y = theme.space[2] } },
-        kw.row({
+    return kw.container({
+        padding = { x = theme.space[4], y = theme.space[2] },
+        child = kw.row({
             spacing = theme.space[4],
             align = "center",
             children = {
-                kw.label(count == 1 and "1 result" or count .. " results", { color = hint_color, size = hint_size }),
+                kw.text(count == 1 and "1 result" or count .. " results", { color = hint_color, size = hint_size }),
                 kw.spacer(),
                 hint("↑↓", "select"),
                 hint("↵", "open"),
-                kw.anchored({
+                kw.popover({
                     id = "actions-anchor",
-                    popup = (self.actions_open and entry)
-                        and kw.popup({
-                            shadow = theme.components.menu.shadow,
-                            edge = "top",
-                            alignment = "end",
-                            gap = theme.space[2],
-                            width = 260,
-                            content = function()
+                    anchor = hint("↹", "actions"),
+                    open = self.actions_open and entry ~= nil,
+                    placement = { edge = "top", alignment = "end", gap = theme.space[2] },
+                    width = 260,
+                    content = function()
                                 return action_menu(self, entry)
                             end,
                             -- Escape with the menu open lands here (the runtime routes
             -- it to popups first), so it closes the menu, not the
             -- launcher.
-                            on_close = function()
+                    on_close = function()
                                 close_actions(self)
                             end,
-                        }) or nil,
-                    child = hint("↹", "actions"),
                 }),
                 hint("esc", "close"),
             },
-        })
-    )
+        }),
+    })
 end
 
 -- Launcher view hosted inside the shell's launcher window. The window's
@@ -328,7 +322,7 @@ local Launcher = kw.stateful({
                 divider(),
                 -- Expanded so the list's viewport is the remaining window
         -- height; the visible row count derives from it.
-                kw.expanded(kw.container({ padding = theme.space[2] }, result_list(self, theme))),
+                kw.expanded({ child = kw.container({ padding = theme.space[2], child = result_list(self, theme) }) }),
                 divider(),
                 footer(self, theme),
             },
@@ -360,10 +354,11 @@ local Launcher = kw.stateful({
                     tab = "actions",
                     escape = "dismiss",
                 },
-                child = kw.box({
+                child = kw.container({
                     background = theme.colors.surface,
                     radius = theme.radius[4],
-                }, content),
+                    child = content,
+                }),
             }),
         })
     end,

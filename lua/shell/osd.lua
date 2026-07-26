@@ -35,26 +35,31 @@ end
 
 local function level_bar(theme, value, muted)
     local fill_width = math.floor(TRACK_WIDTH * (muted and 0 or clamp(value, 0, 1)) + 0.5)
-    local fill = kw.sized(
-        { width = fill_width, height = 6 },
-        kw.container({
+    local track_height = theme.space[1]
+    local fill = kw.sized_box({
+        width = fill_width,
+        height = track_height,
+        child = kw.container({
             background = theme.colors.accent,
             radius = theme.radius[6],
             min_width = fill_width,
-            min_height = 6,
-        }, kw.text(""))
-    )
-    return kw.sized(
-        { width = TRACK_WIDTH, height = 6 },
-        kw.container({
+            min_height = track_height,
+            child = kw.text(""),
+        }),
+    })
+    return kw.sized_box({
+        width = TRACK_WIDTH,
+        height = track_height,
+        child = kw.container({
             background = theme.colors.fill_secondary,
             radius = theme.radius[6],
             min_width = TRACK_WIDTH,
-            min_height = 6,
+            min_height = track_height,
             horizontal_align = "start",
             vertical_align = "center",
-        }, fill)
-    )
+            child = fill,
+        }),
+    })
 end
 
 local Level = kw.stateful({
@@ -64,29 +69,24 @@ local Level = kw.stateful({
         local muted = self.props.muted == true
 
         return kw.container({
+            background = theme.colors.surface,
             min_width = M.width,
             min_height = M.height,
-            padding = { all = theme.space[1] },
-        },
-            kw.container({
-                background = theme.colors.surface,
-                min_width = M.width - 2 * theme.space[1],
-                min_height = M.height - 2 * theme.space[1],
-                padding = { x = theme.space[3] },
-                vertical_align = "center",
-            },
-                kw.row({
-                    align = "center",
-                    spacing = theme.space[3],
-                    children = {
-                        kw.icon({
-                            name = icon_for(self.props.kind, value, muted),
-                            size = 20,
-                            color = muted and theme.colors.text_tertiary or theme.colors.text,
-                        }),
-                        level_bar(theme, value, muted),
-                    },
-                })))
+            padding = { x = theme.space[3] },
+            vertical_align = "center",
+            child = kw.row({
+                align = "center",
+                spacing = theme.space[3],
+                children = {
+                    kw.icon({
+                        name = icon_for(self.props.kind, value, muted),
+                        size = theme.space[5],
+                        color = muted and theme.colors.text_tertiary or theme.colors.text,
+                    }),
+                    level_bar(theme, value, muted),
+                },
+            }),
+        })
     end,
 })
 

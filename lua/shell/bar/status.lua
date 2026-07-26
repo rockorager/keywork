@@ -105,7 +105,7 @@ local StatusItems = kw.stateful({
         local battery = self.battery or {}
         return kw.row({
             spacing = palette.space[2],
-            align = "center",
+            align = "baseline",
             children = {
                 audio.Audio({
                     key = "audio",
@@ -114,7 +114,7 @@ local StatusItems = kw.stateful({
                 }),
                 network.Network({ key = "network", colors = palette }),
                 battery_status_from_values(palette, battery.percentage, battery.state),
-                label(self.time),
+                kw.padding({ x = palette.space[1], child = label(self.time) }),
             },
         })
     end,

@@ -86,7 +86,7 @@ return kw.app({
         for index, output in ipairs(ctx.outputs) do
             -- Session lock requires a surface for every output, but only one
             -- surface should own the password input's editing state.
-            local child = kw.box({ background = theme.colors.background }, kw.spacer())
+            local child = kw.container({ background = theme.colors.background, child = kw.spacer() })
             if index == 1 then
                 child = lock.View({
                     key = "lock-view",

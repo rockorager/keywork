@@ -39,7 +39,7 @@ local function dbm_to_percent(dbm)
     return math.max(0, math.min(100, (dbm + 100) * 2))
 end
 
-local function pill_from_values(palette, operstate, essid, percent, on_tap)
+local function pill_from_values(palette, operstate, essid, percent, on_activate)
     if not percent and operstate == "up" then
         percent = essid ~= "" and 70 or 50
     end
@@ -50,7 +50,10 @@ local function pill_from_values(palette, operstate, essid, percent, on_tap)
         color = palette.foreground
         name = wifi_signal_icon(percent)
     end
-    return status_pill("network", name, nil, color, { on_tap = on_tap })
+    return status_pill("network", name, nil, color, {
+        tone = color == palette.error and "danger" or nil,
+        on_activate = on_activate,
+    })
 end
 
 local function wifi_menu(palette, wifi, on_select)
@@ -76,7 +79,7 @@ local function wifi_menu(palette, wifi, on_select)
         local text_color = entry.connected and palette.foreground or palette.muted
         local children = {
             kw.icon({ name = wifi_signal_icon(entry.percent), color = icon_color }),
-            kw.expanded(label(entry.name, text_color)),
+            kw.expanded({ child = label(entry.name, text_color) }),
         }
         if entry.secured and not entry.known then
             table.insert(children, kw.icon({ name = "network-wireless-encrypted", color = palette.subtle }))
@@ -88,7 +91,7 @@ local function wifi_menu(palette, wifi, on_select)
             rows,
             kw.menu_item({
                 id = "wifi-" .. entry.path,
-                on_tap = function()
+                on_activate = function()
                     on_select(entry)
                 end,
                 child = kw.row({
@@ -111,7 +114,7 @@ local function wifi_menu(palette, wifi, on_select)
         )
     end
 
-    return kw.menu({
+    return kw.menu_surface({
         child = kw.column({ children = rows }),
     })
 end
@@ -641,25 +644,20 @@ local Network = kw.stateful({
     build = function(self)
         local palette = self.props.colors
         local net = self.net or { operstate = "down", essid = "", percent = 0 }
-        return kw.anchored({
+        return kw.popover({
             id = "network",
-            popup = self.wifi_menu_open
-                and kw.popup({
-                    shadow = palette.theme.components.menu.shadow,
-                    edge = "bottom",
-                    alignment = "end",
-                    gap = palette.space[1],
-                    width = 300,
-                    content = function()
+            anchor = pill_from_values(palette, net.operstate, net.essid, net.percent, self.wifi_tap),
+            open = self.wifi_menu_open,
+            placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
+            width = 300,
+            content = function()
                         return self:build_wifi_menu()
                     end,
-                    on_close = function()
+            on_close = function()
                         self:set_state(function(state)
                             state.wifi_menu_open = false
                         end)
                     end,
-                }) or nil,
-            child = pill_from_values(palette, net.operstate, net.essid, net.percent, self.wifi_tap),
         })
     end,
 })

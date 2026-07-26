@@ -85,7 +85,7 @@ function M.set_default(device)
 end
 
 local function menu_label(value, color)
-    return kw.label(value, {
+    return kw.text(value, {
         color = color,
         max_lines = 1,
     })
@@ -104,13 +104,13 @@ local function volume_icon(kind, device)
     return prefix .. "-high"
 end
 
-local function volume_status(palette, device, on_tap)
+local function volume_status(palette, device, on_activate)
     local color = palette.foreground
     if not device or device.muted or (device.volume or 0) <= 0 then
         color = palette.muted
     end
     return status_pill("volume", volume_icon("volume", device), nil, color, {
-        on_tap = on_tap,
+        on_activate = on_activate,
     })
 end
 
@@ -152,7 +152,7 @@ local function device_row(palette, kind, device, on_select)
     local color = not device.default and palette.muted or nil
     return kw.menu_item({
         id = "audio-" .. kind .. "-" .. tostring(device.id),
-        on_tap = on_select
+        on_activate = on_select
             and function()
                 on_select(device)
             end or nil,
@@ -164,13 +164,13 @@ local function device_row(palette, kind, device, on_select)
                     name = device_icon(kind, device),
                     color = palette.muted,
                 }),
-                kw.expanded(menu_label(device_label(kind, device, true), color)),
+                kw.expanded({ child = menu_label(device_label(kind, device, true), color) }),
                 device.default
                     and kw.icon({
                         name = "object-select",
                         color = palette.foreground,
                     })
-                    or kw.sized({ width = 16 }, kw.text("")),
+                    or kw.sized_box({ width = palette.space[4], child = kw.text("") }),
             },
         }),
     })
@@ -216,18 +216,18 @@ local function audio_menu(palette, audio, on_select, on_open_settings)
     rows[#rows + 1] = kw.menu_separator({})
     rows[#rows + 1] = kw.menu_item({
         id = "audio-settings",
-        on_tap = on_open_settings,
+        on_activate = on_open_settings,
         child = kw.row({
             spacing = palette.space[2],
             align = "center",
             children = {
                 kw.icon({ name = "preferences-system-symbolic", color = palette.muted }),
-                kw.expanded(menu_label("Advanced audio settings…", palette.muted)),
+                kw.expanded({ child = menu_label("Advanced audio settings…", palette.muted) }),
                 kw.icon({ name = "pan-end-symbolic", color = palette.muted }),
             },
         }),
     })
-    return kw.menu({
+    return kw.menu_surface({
         child = kw.column({ children = rows }),
     })
 end
@@ -243,7 +243,7 @@ local function settings_menu(palette, audio, on_select)
     for _, row in ipairs(device_rows(palette, "source", audio.inputs or {}, on_select)) do
         rows[#rows + 1] = row
     end
-    return kw.menu({
+    return kw.menu_surface({
         child = kw.column({ children = rows }),
     })
 end
@@ -287,16 +287,13 @@ local Audio = kw.stateful({
     build = function(self)
         local palette = self.props.colors
         local audio = self.audio or {}
-        return kw.anchored({
+        return kw.popover({
             id = "audio",
-            popup = self.menu_open
-                and kw.popup({
-                    shadow = palette.theme.components.menu.shadow,
-                    edge = "bottom",
-                    alignment = "end",
-                    gap = palette.space[1],
-                    width = 420,
-                    content = function()
+            anchor = volume_status(palette, audio.output, self.audio_tap),
+            open = self.menu_open,
+            placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
+            width = 420,
+            content = function()
                         return audio_menu(
                             palette, self.audio,
                             function(device)
@@ -307,13 +304,11 @@ local Audio = kw.stateful({
                             end
                         )
                     end,
-                    on_close = function()
+            on_close = function()
                         self:set_state(function(state)
                             state.menu_open = false
                         end)
                     end,
-                }) or nil,
-            child = volume_status(palette, audio.output, self.audio_tap),
         })
     end,
 })
@@ -341,7 +336,7 @@ local Settings = kw.stateful({
         local theme = context.theme
         local palette = self.props.colors or bar_colors.palette(theme)
         local audio = self.props.audio or self.audio or {}
-        local content = kw.sized({
+        local content = kw.sized_box({
             width = M.settings_width,
             height = M.settings_height,
             child = kw.container({
@@ -360,28 +355,28 @@ local Settings = kw.stateful({
                                     color = palette.foreground,
                                     size = theme.font_size[5],
                                 }),
-                                kw.expanded(
+                                kw.expanded({ child =
                                     kw.column({
                                         spacing = palette.space[1],
                                         children = {
-                                            kw.label("Audio settings", { role = "title", max_lines = 1 }),
-                                            kw.label("Choose the default routes used by new applications.", {
+                                            kw.text("Audio settings", { role = "title", max_lines = 1 }),
+                                            kw.text("Choose the default routes used by new applications.", {
                                                 color = palette.muted,
                                                 max_lines = 1,
                                             }),
                                         },
                                     })
-                                ),
+                                }),
                             },
                         }),
-                        kw.expanded(
-                            kw.scroll({
+                        kw.expanded({ child =
+                            kw.scroll_view({
                                 id = "audio-settings-routes",
                                 child = settings_menu(palette, audio, function(device)
                                     self:select_device(device)
                                 end),
                             })
-                        ),
+                        }),
                     },
                 }),
             }),

@@ -18,6 +18,12 @@ Fix these in `../keywork`, then simplify here.
   wallpaper exhausted it even though both resources could still grow. Keywork
   now grows staging as needed and only stops atlas recovery after one clean
   current-frame repack at the device limit.
+- **Blurred layer surfaces were not clipped to the compositor's rounded
+  corners.** Keywork correctly requested a full-surface blur region, but
+  keywork-compositor only used its layer-surface corner radius for the shadow;
+  it rendered both the client buffer and blur without the matching rounded
+  clip. Zero-zone layer surfaces now pass the compositor-owned clip through
+  both paths, and pointer hit-testing follows the visible shape.
 - **Managed top-level windows could not reflect compositor closes into app
   state.** Dropping a declaration destroyed a window, but closing an
   `xdg_toplevel` had no callback to clear the state that declared it, so the

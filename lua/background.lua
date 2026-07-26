@@ -149,7 +149,7 @@ local Background = kw.stateful({
         local width = math.max(1, math.floor(context.window_width))
         local height = math.max(1, math.floor(context.window_height))
         local mode = setting(output, "mode", "stretch")
-        local color = setting(output, "color", 0xffffffff)
+        local color = setting(output, "color", context.theme.colors.background)
         local image = setting(output, "image", nil)
         local content = kw.spacer()
         if image and mode ~= "solid_color" then
@@ -162,13 +162,14 @@ local Background = kw.stateful({
                 cache = "frame",
             })
         end
-        return kw.container(
-            { background = color },
-            kw.sized({
+        return kw.container({
+            background = color,
+            child = kw.sized_box({
                 width = width,
                 height = height,
-            }, content)
-        )
+                child = content,
+            }),
+        })
     end,
 })
 

@@ -448,36 +448,22 @@ local function invoke(server, notification, action)
     server:invoke(notification.id, action.key, token)
 end
 
-local function action_buttons(server, notification, theme, on_hover)
+local function action_buttons(server, notification)
     local buttons = {}
-    local chip = theme.components.chip
     for _, action in ipairs(notification.actions) do
         if action.key ~= "default" and #buttons < 3 then
             local current = action
-            buttons[#buttons + 1] = kw.expanded(
-                kw.pressable({
+            buttons[#buttons + 1] = kw.expanded({ child =
+                kw.button({
                     id = "notification-action-" .. current.key,
-                    hover_background = chip.hover_background,
-                    pressed_background = chip.pressed_background,
-                    on_hover = on_hover,
-                    on_tap = function()
+                    label = current.label,
+                    size = "small",
+                    appearance = "secondary",
+                    on_activate = function()
                         invoke(server, notification, current)
                     end,
-                    child = kw.container({
-                        background = chip.background,
-                        radius = chip.radius,
-                        min_height = chip.min_height,
-                        align = "center",
-                        padding = { x = chip.padding_x, y = chip.padding_y },
-                    },
-                        kw.label(current.label, {
-                            color = chip.foreground,
-                            font_size = chip.font_size,
-                            line_height = chip.line_height,
-                            max_lines = 1,
-                        })),
                 })
-            )
+            })
         end
     end
     return buttons
@@ -488,21 +474,8 @@ local NotificationCard = kw.stateful({
         local server = self.props.server
         local notification = self.props.notification
         local theme = context.theme
-        local function set_hovered(hovered)
-            if self.hovered ~= hovered then
-                self.hovered = hovered
-                self:set_state()
-            end
-        end
-        local function set_close_hovered(hovered)
-            if self.hovered ~= hovered or self.close_hovered ~= hovered then
-                self.hovered = hovered
-                self.close_hovered = hovered
-                self:set_state()
-            end
-        end
         local action = default_action(notification)
-        local actions = action_buttons(server, notification, theme, set_hovered)
+        local actions = action_buttons(server, notification)
         local icon
         if notification.image then
             icon = kw.image({
@@ -527,7 +500,7 @@ local NotificationCard = kw.stateful({
         end
 
         local header = {
-            kw.label(notification.app_name, {
+            kw.text(notification.app_name, {
                 color = theme.colors.text_tertiary,
                 size = theme.font_size[1],
                 line_height = theme.line_height[1],
@@ -535,22 +508,14 @@ local NotificationCard = kw.stateful({
             }),
             kw.spacer(),
         }
-        header[#header + 1] = kw.gesture({
+        header[#header + 1] = kw.icon_button({
             id = "notification-close",
-            on_hover = set_close_hovered,
-            on_tap = function()
+            icon = "window-close",
+            size = "small",
+            appearance = "subtle",
+            on_activate = function()
                 server:dismiss(notification.id)
             end,
-            child = kw.container({
-                background = self.close_hovered and theme.colors.fill or nil,
-                radius = theme.radius[6],
-                padding = { all = theme.space[1] },
-            },
-                kw.icon({
-                    name = "window-close",
-                    size = theme.space[3],
-                    color = self.hovered and theme.colors.text_tertiary or theme.colors.surface,
-                })),
         })
 
         local text_children = {
@@ -558,12 +523,12 @@ local NotificationCard = kw.stateful({
                 align = "center",
                 children = header,
             }),
-            kw.label(notification.summary, {
+            kw.text(notification.summary, {
                 max_lines = 1,
             }),
         }
         if notification.body ~= "" then
-            text_children[#text_children + 1] = kw.label(notification.body, {
+            text_children[#text_children + 1] = kw.text(notification.body, {
                 color = theme.colors.text_secondary,
                 max_lines = 2,
             })
@@ -573,20 +538,19 @@ local NotificationCard = kw.stateful({
             spacing = theme.space[3],
             children = {
                 icon,
-                kw.expanded(
+                kw.expanded({ child =
                     kw.column({
                         align = "stretch",
                         spacing = theme.space[1],
                         children = text_children,
                     })
-                ),
+                }),
             },
         })
         if action then
-            content = kw.gesture({
+            content = kw.pressable({
                 id = "notification-content",
-                on_hover = set_hovered,
-                on_tap = function()
+                on_activate = function()
                     invoke(server, notification, action)
                 end,
                 child = content,
@@ -606,27 +570,19 @@ local NotificationCard = kw.stateful({
 
         local border = notification.urgency == 2 and theme.colors.danger or nil
         local card = kw.container({
+            background = theme.colors.surface,
+            border = border,
+            border_width = border and 1 or nil,
+            radius = theme.radius[4],
             min_width = M.width,
-            padding = { all = theme.space[1] },
-        },
-            kw.container({
-                background = theme.colors.surface,
-                border = border,
-                border_width = border and 1 or nil,
-                radius = theme.radius[4],
-                min_width = M.width - 2 * theme.space[1],
-                padding = { x = theme.space[3], y = theme.space[2] },
-            },
-                kw.column({
-                    align = "stretch",
-                    spacing = #actions > 0 and theme.space[2] or 0,
-                    children = children,
-                })))
-        return kw.gesture({
-            id = "notification-hover",
-            on_hover = set_hovered,
-            child = card,
+            padding = { x = theme.space[3], y = theme.space[2] },
+            child = kw.column({
+                align = "stretch",
+                spacing = #actions > 0 and theme.space[2] or 0,
+                children = children,
+            }),
         })
+        return card
     end,
 })
 

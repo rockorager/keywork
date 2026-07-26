@@ -191,7 +191,7 @@ local function workspace_story()
             local palette = bar_colors.palette(theme)
             return kw.theme({
                 data = palette.theme,
-                child = kw.sized({
+                child = kw.sized_box({
                     width = 220,
                     height = 40,
                     child = kw.container({
@@ -262,7 +262,7 @@ local function status_pills_story()
             local palette = bar_colors.palette(theme)
             return kw.theme({
                 data = palette.theme,
-                child = kw.sized({
+                child = kw.sized_box({
                     width = 180,
                     height = 40,
                     child = kw.container({
