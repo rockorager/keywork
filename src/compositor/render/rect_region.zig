@@ -85,6 +85,39 @@ pub fn differenceStrips(outer: render.Rect, removed: render.Rect) [4]?render.Rec
     return result;
 }
 
+/// Returns the largest axis-aligned rectangle wholly inside the rounded
+/// rectangle described by `rect` and `radius`, or null when the rounding
+/// leaves no such rectangle. Every pixel of the result lies inside the
+/// rounded shape, so an opaque rounded draw covers it completely.
+///
+/// Asserts `radius` is already clamped to half the shorter side.
+pub fn roundedRectInterior(rect: render.Rect, radius: u32) ?render.Rect {
+    std.debug.assert(radius <= @min(rect.width, rect.height) / 2);
+    const inset = radius * 2;
+    if (rect.width <= inset or rect.height <= inset) return null;
+    return .{
+        .x = @intCast(@as(i64, rect.x) + radius),
+        .y = @intCast(@as(i64, rect.y) + radius),
+        .width = rect.width - inset,
+        .height = rect.height - inset,
+    };
+}
+
+test "rounded rectangle interior insets by the corner radius" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 22, .y = 32, .width = 76, .height = 56 },
+        roundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 12).?,
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 10, .y = 20, .width = 100, .height = 80 },
+        roundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 0).?,
+    );
+    try std.testing.expectEqual(
+        @as(?render.Rect, null),
+        roundedRectInterior(.{ .x = 10, .y = 20, .width = 24, .height = 24 }, 12),
+    );
+}
+
 test "damage bounds cover only damaged visible pixels" {
     const visible: render.Rect = .{ .x = 10, .y = 10, .width = 100, .height = 80 };
     try std.testing.expectEqual(visible, damageBounds(null, visible).?);

@@ -5962,6 +5962,29 @@ fn imageCanReplace(image: render.Image) bool {
         image.rounded_clip == null;
 }
 
+/// Selects the sampling pipeline for `image`. The `replace` variants skip
+/// blending, so callers must only pass true for draws that cover their
+/// destination with fully opaque texels.
+fn imagePipeline(self: *const Self, image: render.Image, replace: bool) vk.Pipeline {
+    return switch (image.samplingFilter()) {
+        .nearest => if (image.buffer.color_description.transfer_function == .gamma22)
+            if (replace)
+                self.opaque_nearest_gamma22_image_pipeline
+            else
+                self.nearest_gamma22_image_pipeline
+        else if (replace)
+            self.opaque_nearest_image_pipeline
+        else
+            self.nearest_image_pipeline,
+        .linear => if (replace) self.opaque_image_pipeline else self.image_pipeline,
+        .reconstruction => if (replace)
+            self.opaque_reconstruction_image_pipeline
+        else
+            self.reconstruction_image_pipeline,
+        .area => if (replace) self.opaque_area_image_pipeline else self.area_image_pipeline,
+    };
+}
+
 fn validateCrossfadeSource(source: ?render.SourceRect, size: render.Size) Error!render.SourceRect {
     const rectangle: render.SourceRect = source orelse .{
         .x = 0,
@@ -6108,61 +6131,103 @@ fn compileDrawRuns(
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
             const dmabuf = image.buffer.dmabuf;
-            const replace = imageCanReplace(image);
-            const image_pipeline = if (backdrop != null)
+            // Backdrop and video sources bind a fixed pipeline that has no
+            // opaque counterpart, so neither the replace variant nor the
+            // rounded-interior split below applies to them.
+            const fixed_pipeline: ?vk.Pipeline = if (backdrop != null)
                 self.backdrop_image_pipeline
             else if (prepared.texture.pipeline != .null_handle)
                 prepared.texture.pipeline
-            else switch (image.samplingFilter()) {
-                .nearest => if (image.buffer.color_description.transfer_function == .gamma22)
-                    if (replace)
-                        self.opaque_nearest_gamma22_image_pipeline
-                    else
-                        self.nearest_gamma22_image_pipeline
-                else if (replace)
-                    self.opaque_nearest_image_pipeline
-                else
-                    self.nearest_image_pipeline,
-                .linear => if (replace) self.opaque_image_pipeline else self.image_pipeline,
-                .reconstruction => if (replace)
-                    self.opaque_reconstruction_image_pipeline
-                else
-                    self.reconstruction_image_pipeline,
-                .area => if (replace) self.opaque_area_image_pipeline else self.area_image_pipeline,
-            };
-            try self.emitDamaged(
-                frame,
-                clipped,
-                if (backdrop != null) .backdrop_image else .image,
-                image_pipeline,
-                prepared.texture.pipeline_layout,
-                prepared.texture.descriptor_set,
-                image.buffer.size,
-                color_math.sourceTransform(
-                    image.buffer.color_description,
-                    output_color_description,
-                ),
-                if (backdrop != null) null else prepared.texture.manual_ycbcr,
-                if (backdrop) |pending| pending.capture.op_index else null,
-                .{
-                    .destination = rectFloats(destination),
-                    .source = .{
-                        @floatCast(source.x),
-                        @floatCast(source.y),
-                        @floatCast(source.width),
-                        @floatCast(source.height),
-                    },
-                    .clip = undefined,
-                    .color = .{ 1, 1, 1, 1 },
-                    .rounded = rectFloats(rounded.rect),
-                    .parameters = .{
-                        @floatFromInt(radius),
-                        @floatFromInt(@intFromEnum(image.transform)),
-                        @floatFromInt(@intFromBool(dmabuf != null and dmabuf.?.y_inverted)),
-                        @as(f32, @floatFromInt(image.alpha_multiplier)) / @as(f32, @floatFromInt(std.math.maxInt(u32))),
-                    },
-                },
+            else
+                null;
+            const image_pipeline = fixed_pipeline orelse
+                self.imagePipeline(image, imageCanReplace(image));
+            // A rounded image that is otherwise opaque only blends within
+            // its corner bands. Drawing the interior through the opaque
+            // pipeline drops both the destination read and the per-pixel
+            // rounded-coverage math across the bulk of the surface.
+            const rounded_interior: ?render.Rect = if (fixed_pipeline == null and
+                radius > 0 and image.is_opaque and
+                image.alpha_multiplier == std.math.maxInt(u32))
+            interior: {
+                const shape = rect_region.roundedRectInterior(rounded.rect, radius) orelse
+                    break :interior null;
+                break :interior shape.intersection(clipped);
+            } else null;
+            const kind: PipelineKind = if (backdrop != null) .backdrop_image else .image;
+            const color_transform = color_math.sourceTransform(
+                image.buffer.color_description,
+                output_color_description,
             );
+            const manual_ycbcr = if (backdrop != null) null else prepared.texture.manual_ycbcr;
+            const backdrop_op_index = if (backdrop) |pending| pending.capture.op_index else null;
+            const instance: Instance = .{
+                .destination = rectFloats(destination),
+                .source = .{
+                    @floatCast(source.x),
+                    @floatCast(source.y),
+                    @floatCast(source.width),
+                    @floatCast(source.height),
+                },
+                .clip = undefined,
+                .color = .{ 1, 1, 1, 1 },
+                .rounded = rectFloats(rounded.rect),
+                .parameters = .{
+                    @floatFromInt(radius),
+                    @floatFromInt(@intFromEnum(image.transform)),
+                    @floatFromInt(@intFromBool(dmabuf != null and dmabuf.?.y_inverted)),
+                    @as(f32, @floatFromInt(image.alpha_multiplier)) / @as(f32, @floatFromInt(std.math.maxInt(u32))),
+                },
+            };
+            if (rounded_interior) |shape| {
+                // Zero radius is how an unrounded image encodes itself, so
+                // the interior draw runs the same shader path as one.
+                var opaque_instance = instance;
+                opaque_instance.rounded = .{ 0, 0, 0, 0 };
+                opaque_instance.parameters[0] = 0;
+                try self.emitDamaged(
+                    frame,
+                    shape,
+                    kind,
+                    self.imagePipeline(image, true),
+                    prepared.texture.pipeline_layout,
+                    prepared.texture.descriptor_set,
+                    image.buffer.size,
+                    color_transform,
+                    manual_ycbcr,
+                    backdrop_op_index,
+                    opaque_instance,
+                );
+                for (rect_region.differenceStrips(clipped, shape)) |strip| {
+                    try self.emitDamaged(
+                        frame,
+                        strip orelse continue,
+                        kind,
+                        image_pipeline,
+                        prepared.texture.pipeline_layout,
+                        prepared.texture.descriptor_set,
+                        image.buffer.size,
+                        color_transform,
+                        manual_ycbcr,
+                        backdrop_op_index,
+                        instance,
+                    );
+                }
+            } else {
+                try self.emitDamaged(
+                    frame,
+                    clipped,
+                    kind,
+                    image_pipeline,
+                    prepared.texture.pipeline_layout,
+                    prepared.texture.descriptor_set,
+                    image.buffer.size,
+                    color_transform,
+                    manual_ycbcr,
+                    backdrop_op_index,
+                    instance,
+                );
+            }
         },
         .shadow => |shadow| {
             if (shadow.color.alpha == 0 or shadow.rect.width == 0 or shadow.rect.height == 0) {
@@ -6219,7 +6284,7 @@ fn compileDrawRuns(
             };
             var raster_rects: [4]?render.Rect = @splat(null);
             if (shadow.cutout) |_| {
-                if (opaqueRoundedRectInterior(cutout.rect, cutout_radius)) |interior| {
+                if (rect_region.roundedRectInterior(cutout.rect, cutout_radius)) |interior| {
                     raster_rects = rect_region.differenceStrips(clipped, interior);
                 } else {
                     raster_rects[0] = clipped;
@@ -6455,18 +6520,6 @@ fn compileBackdropCapture(
     };
 }
 
-fn opaqueRoundedRectInterior(rect: render.Rect, radius: u32) ?render.Rect {
-    std.debug.assert(radius <= @min(rect.width, rect.height) / 2);
-    const inset = radius * 2;
-    if (rect.width <= inset or rect.height <= inset) return null;
-    return .{
-        .x = @intCast(@as(i64, rect.x) + radius),
-        .y = @intCast(@as(i64, rect.y) + radius),
-        .width = rect.width - inset,
-        .height = rect.height - inset,
-    };
-}
-
 fn emitDamaged(
     self: *Self,
     frame: render.Frame,
@@ -6512,21 +6565,6 @@ fn emitDamaged(
             visible_rect,
         );
     }
-}
-
-test "Vulkan shadow cutout excludes only the rounded rectangle interior" {
-    try std.testing.expectEqual(
-        render.Rect{ .x = 22, .y = 32, .width = 76, .height = 56 },
-        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 12).?,
-    );
-    try std.testing.expectEqual(
-        render.Rect{ .x = 10, .y = 20, .width = 100, .height = 80 },
-        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 0).?,
-    );
-    try std.testing.expectEqual(
-        @as(?render.Rect, null),
-        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 24, .height = 24 }, 12),
-    );
 }
 
 fn emitInstance(
