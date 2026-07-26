@@ -457,6 +457,9 @@ pub const RenderBackend = struct {
 
     pub const Frame = struct {
         size: Size,
+        /// Visible application content in frame coordinates. Null means the
+        /// whole frame, preserving ordinary toplevel/backend behavior.
+        content_rect: ?Rect = null,
         scale: f32,
         damage: []const Rect,
         display_list: []const PaintCommand,

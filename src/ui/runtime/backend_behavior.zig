@@ -106,6 +106,7 @@ pub fn presentFrame(self: anytype) !void {
     }
     self.frame_pending = try self.backend.present(.{
         .size = frame_size,
+        .content_rect = self.frame_content_rect,
         .scale = render_scale,
         .damage = &.{damage},
         .display_list = self.display_list.commands.items,
@@ -133,20 +134,38 @@ pub fn frameDone(self: anytype) !void {
 pub fn configure(self: anytype, size: keywork.Size) !void {
     if (size.width > 0 and size.height > 0) {
         self.configured_size = size;
+        const content_size = configuredContentSize(
+            size,
+            self.desired_root_frame_size orelse size,
+            self.frame_content_rect,
+        );
         if (!self.content_axes.any()) {
-            self.constraints = .{ .max_width = size.width, .max_height = size.height };
+            self.constraints = .{ .max_width = content_size.width, .max_height = content_size.height };
         } else {
             if (!self.content_axes.width) {
-                self.constraints.min_width = size.width;
-                self.constraints.max_width = size.width;
+                self.constraints.min_width = content_size.width;
+                self.constraints.max_width = content_size.width;
             }
             if (!self.content_axes.height) {
-                self.constraints.min_height = size.height;
-                self.constraints.max_height = size.height;
+                self.constraints.min_height = content_size.height;
+                self.constraints.max_height = content_size.height;
             }
         }
     }
     try self.invalidate();
+}
+
+pub fn configuredContentSize(size: keywork.Size, desired_frame_size: keywork.Size, content_rect: ?keywork.Rect) keywork.Size {
+    const rect = content_rect orelse return size;
+    return .{
+        .width = @max(1, size.width - @max(0, desired_frame_size.width - rect.width)),
+        .height = @max(1, size.height - @max(0, desired_frame_size.height - rect.height)),
+    };
+}
+
+test "configure size subtracts known paint gutters" {
+    const content = configuredContentSize(.{ .width = 118, .height = 70 }, .{ .width = 120, .height = 70 }, .{ .x = 10, .y = 5, .width = 100, .height = 60 });
+    try std.testing.expectEqual(keywork.Size{ .width = 98, .height = 60 }, content);
 }
 
 pub fn requestRepaint(self: anytype) !void {

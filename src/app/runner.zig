@@ -496,6 +496,7 @@ fn PopupManager(comptime Backend: type) type {
             /// force the compositor to resize the popup.
             requested_width: u31,
             requested_height: u31,
+            insets: wayland_window.SurfaceInsets,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             /// Borrowed from the main element tree; refreshed on every
@@ -583,7 +584,8 @@ fn PopupManager(comptime Backend: type) type {
         }
 
         fn createPopup(self: *Self, request: keywork.PopupRequest) !void {
-            const size = try self.measureContent(request.popup);
+            const measured = try self.measureContent(request.popup);
+            const size = measured.size;
             const width = try wayland_window.frameDimension(size.width);
             const height = try wayland_window.frameDimension(size.height);
             const rect = request.anchor_rect;
@@ -607,6 +609,7 @@ fn PopupManager(comptime Backend: type) type {
                 .edge = request.popup.placement.edge,
                 .alignment = request.popup.placement.alignment,
                 .gap = @intFromFloat(@round(request.popup.placement.gap)),
+                .insets = measured.insets,
             });
             errdefer self.backend.destroyWindow(win);
 
@@ -616,6 +619,7 @@ fn PopupManager(comptime Backend: type) type {
                 .anchor_rect = request.anchor_rect,
                 .requested_width = width,
                 .requested_height = height,
+                .insets = measured.insets,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
@@ -635,6 +639,7 @@ fn PopupManager(comptime Backend: type) type {
             // Popups clear to transparent like layer-shell surfaces: the content
             // paints its own background, so rounded corners stay see-through.
             surface.runtime.setFrameBackground(keywork.colors.transparent);
+            surface.runtime.setRootFrameMode(.paint_outsets);
             surface.runtime.setDeferredRepaint(true);
             surface.runtime.repaint_pending = true;
 
@@ -654,10 +659,11 @@ fn PopupManager(comptime Backend: type) type {
         /// The compositor's configure event then updates the runtime
         /// constraints used for subsequent frames.
         fn resizePopup(self: *Self, popup: *PopupSurface, request: keywork.PopupRequest) !void {
-            const size = try self.measureContent(request.popup);
+            const measured = try self.measureContent(request.popup);
+            const size = measured.size;
             const width = try wayland_window.frameDimension(size.width);
             const height = try wayland_window.frameDimension(size.height);
-            if (width == popup.requested_width and height == popup.requested_height) return;
+            if (width == popup.requested_width and height == popup.requested_height and std.meta.eql(measured.insets, popup.insets)) return;
 
             const rect = request.anchor_rect;
             const token = self.next_reposition_token;
@@ -673,9 +679,11 @@ fn PopupManager(comptime Backend: type) type {
                 .edge = request.popup.placement.edge,
                 .alignment = request.popup.placement.alignment,
                 .gap = @intFromFloat(@round(request.popup.placement.gap)),
+                .insets = measured.insets,
             }, token);
             popup.requested_width = width;
             popup.requested_height = height;
+            popup.insets = measured.insets;
         }
 
         fn destroyPopup(self: *Self, index: usize) void {
@@ -691,11 +699,9 @@ fn PopupManager(comptime Backend: type) type {
         /// Builds the popup content in a throwaway arena and lays it out to
         /// learn its natural size, so the surface can be created at the right
         /// dimensions before the popup runtime exists.
-        fn measureContent(self: *Self, popup: *const keywork.Widget.Popup) !keywork.Size {
-            if (popup.width) |width| if (popup.height) |height| {
-                return .{ .width = width, .height = height };
-            };
+        const PopupMeasurement = struct { size: keywork.Size, insets: wayland_window.SurfaceInsets };
 
+        fn measureContent(self: *Self, popup: *const keywork.Widget.Popup) !PopupMeasurement {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const arena_allocator = arena.allocator();
@@ -724,10 +730,18 @@ fn PopupManager(comptime Backend: type) type {
             var element = try keywork.buildElementTreeScoped(arena_allocator, &scope, &widget, constraints);
             defer keywork.destroyElementTree(arena_allocator, &element);
             const root = try keywork.buildRenderTreeFromElement(arena_allocator, &element, constraints, self.parent.renderBackend());
-            return .{
+            const size: keywork.Size = .{
                 .width = popup.width orelse @min(root.rect.width, constraints.max_width),
                 .height = popup.height orelse @min(root.rect.height, constraints.max_height),
             };
+            const content: keywork.Rect = .{ .x = root.rect.x, .y = root.rect.y, .width = size.width, .height = size.height };
+            const paint = root.paintBounds() orelse content;
+            return .{ .size = size, .insets = .{
+                .left = try wayland_window.frameInset(@max(0, content.x - paint.x)),
+                .top = try wayland_window.frameInset(@max(0, content.y - paint.y)),
+                .right = try wayland_window.frameInset(@max(0, paint.x + paint.width - content.x - content.width)),
+                .bottom = try wayland_window.frameInset(@max(0, paint.y + paint.height - content.y - content.height)),
+            } };
         }
 
         const popup_host_vtable: keywork.AppHost.VTable = .{ .build_widget = popupBuildWidget };
@@ -914,6 +928,8 @@ fn WindowManager(comptime Backend: type) type {
             win: *Backend.Window,
             layer_shell: bool,
             content_height: bool,
+            delegate_width: bool,
+            delegate_height: bool,
             size_negotiator: ?LayerSizeNegotiator = null,
             runtime_ready: bool,
             state_invalidation_pending: bool,
@@ -1130,6 +1146,8 @@ fn WindowManager(comptime Backend: type) type {
                 try self.contentHeightCap(decl.output, layer_shell.?)
             else
                 decl.height orelse self.options.height;
+            const protocol_width = try layerSurfaceDimension(layer_shell, width);
+            const protocol_height = try layerSurfaceDimension(layer_shell, height_cap);
             const output = if (decl.output) |name|
                 self.backend.findOutputByName(name) orelse return error.UnknownOutput
             else
@@ -1140,8 +1158,8 @@ fn WindowManager(comptime Backend: type) type {
             const win = try self.backend.createWindow(.{
                 .title = decl.title orelse self.options.title,
                 .app_id = self.options.app_id,
-                .width = try layerSurfaceDimension(layer_shell, width),
-                .height = try layerSurfaceDimension(layer_shell, height_cap),
+                .width = protocol_width,
+                .height = protocol_height,
                 .decorations = self.options.decorations,
                 .layer_shell = layer_shell,
                 .background_blur = background_blur,
@@ -1166,7 +1184,9 @@ fn WindowManager(comptime Backend: type) type {
                 .win = win,
                 .layer_shell = layer_shell != null,
                 .content_height = decl.content_height,
-                .size_negotiator = if (decl.content_height) try .init(size) else null,
+                .delegate_width = layer_shell != null and protocol_width == 0,
+                .delegate_height = layer_shell != null and protocol_height == 0,
+                .size_negotiator = if (layer_shell != null) try .init(size) else null,
                 .runtime_ready = false,
                 .state_invalidation_pending = false,
                 .runtime = undefined,
@@ -1201,13 +1221,14 @@ fn WindowManager(comptime Backend: type) type {
             managed.queue.popup_manager = managed.popups.hooks();
             managed.popups.runtime = &managed.runtime;
             if (managed.layer_shell) managed.runtime.setFrameBackground(keywork.colors.transparent);
+            if (managed.layer_shell) managed.runtime.setRootFrameMode(.symmetric_paint_outsets);
             managed.runtime.setDeferredRepaint(true);
             if (managed.state_invalidation_pending) {
                 managed.state_invalidation_pending = false;
                 try managed.runtime.invalidateState();
             }
-            if (managed.content_height) {
-                managed.runtime.setContentSizing(.{ .height = true });
+            if (managed.layer_shell) {
+                if (managed.content_height) managed.runtime.setContentSizing(.{ .height = true });
                 managed.runtime.setRootSizeHandler(managed, managedRootSize);
                 const generation = win.configureGeneration();
                 if (!try managed.runtime.reconsiderRootSize()) {
@@ -1258,7 +1279,14 @@ fn WindowManager(comptime Backend: type) type {
                 .present => true,
                 .wait => false,
                 .request => |request| blk: {
-                    try managed.manager.backend.requestLayerSize(managed.win, request.width, request.height);
+                    if (managed.runtime.frame_content_rect) |rect| {
+                        try managed.win.protocol.setLayerContentRect(request.width, request.height, rect);
+                    }
+                    try managed.manager.backend.requestLayerSize(
+                        managed.win,
+                        if (managed.delegate_width) 0 else request.width,
+                        if (managed.delegate_height) 0 else request.height,
+                    );
                     break :blk false;
                 },
             };
@@ -1268,7 +1296,11 @@ fn WindowManager(comptime Backend: type) type {
             const managed: *ManagedWindow = @ptrCast(@alignCast(ptr));
             if (managed.size_negotiator) |*negotiator| {
                 if (try negotiator.acceptConfigure(size)) {
-                    managed.runtime.constraints.max_height = @min(managed.runtime.constraints.max_height, size.height);
+                    const gutters = if (managed.runtime.frame_content_rect) |rect|
+                        @max(0, (managed.runtime.desired_root_frame_size orelse managed.runtime.configured_size).height - rect.height)
+                    else
+                        0;
+                    managed.runtime.constraints.max_height = @min(managed.runtime.constraints.max_height, @max(1, size.height - gutters));
                 }
             }
             try managed.runtime.configure(size);

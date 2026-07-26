@@ -81,6 +81,9 @@ pub const Runtime = struct {
     /// stay looser than the compositor-configured render buffer.
     constraints: Constraints,
     configured_size: Size,
+    root_frame_mode: RootFrameMode = .disabled,
+    frame_content_rect: ?keywork.Rect = null,
+    desired_root_frame_size: ?Size = null,
     content_axes: ContentAxes = .{},
     root_size_handler: ?RootSizeHandler = null,
     root_size_context: ?*anyopaque = null,
@@ -138,6 +141,13 @@ pub const Runtime = struct {
         pub fn any(self: ContentAxes) bool {
             return self.width or self.height;
         }
+    };
+
+    pub const RootFrameMode = enum { disabled, paint_outsets, symmetric_paint_outsets };
+
+    pub const RootFrame = struct {
+        size: Size,
+        content_rect: keywork.Rect,
     };
 
     /// Called after authoritative retained layout and before paint. False
@@ -214,21 +224,48 @@ pub const Runtime = struct {
         return self.configured_size;
     }
 
+    pub fn setRootFrameMode(self: *Runtime, mode: RootFrameMode) void {
+        self.root_frame_mode = mode;
+    }
+
     pub fn setContentSizing(self: *Runtime, axes: ContentAxes) void {
         self.content_axes = axes;
     }
 
     pub fn setRootSizeHandler(self: *Runtime, context: *anyopaque, handler: RootSizeHandler) void {
-        std.debug.assert(self.content_axes.any());
+        std.debug.assert(self.content_axes.any() or self.root_frame_mode != .disabled);
         self.root_size_context = context;
         self.root_size_handler = handler;
     }
 
     pub fn desiredFrameSize(self: *const Runtime) !Size {
         const root = self.root orelse return error.NotBuilt;
-        return .{
+        const content_size: Size = .{
             .width = @max(1, if (self.content_axes.width) root.rect.width else self.constraints.max_width),
             .height = @max(1, if (self.content_axes.height) root.rect.height else self.constraints.max_height),
+        };
+        return self.deriveRootFrame(content_size).size;
+    }
+
+    pub fn deriveRootFrame(self: *const Runtime, content_size: Size) RootFrame {
+        const content: keywork.Rect = .{ .x = 0, .y = 0, .width = content_size.width, .height = content_size.height };
+        if (self.root_frame_mode == .disabled) return .{ .size = content_size, .content_rect = content };
+        const root = self.root orelse return .{ .size = content_size, .content_rect = content };
+        const paint = root.framePaintBounds() orelse content;
+        // Surface geometry is integral in logical coordinates. Round each
+        // authoritative paint overhang outward so protocol geometry and the
+        // translated retained tree agree without clipping fractional edges.
+        const left = @ceil(@max(0, root.rect.x - paint.x));
+        const top = @ceil(@max(0, root.rect.y - paint.y));
+        const right = @ceil(@max(0, paint.x + paint.width - (root.rect.x + content.width)));
+        const bottom = @ceil(@max(0, paint.y + paint.height - (root.rect.y + content.height)));
+        const before_x = if (self.root_frame_mode == .symmetric_paint_outsets) @max(left, right) else left;
+        const before_y = if (self.root_frame_mode == .symmetric_paint_outsets) @max(top, bottom) else top;
+        const after_x = if (self.root_frame_mode == .symmetric_paint_outsets) before_x else right;
+        const after_y = if (self.root_frame_mode == .symmetric_paint_outsets) before_y else bottom;
+        return .{
+            .size = .{ .width = content.width + before_x + after_x, .height = content.height + before_y + after_y },
+            .content_rect = .{ .x = before_x, .y = before_y, .width = content.width, .height = content.height },
         };
     }
 
@@ -236,8 +273,15 @@ pub const Runtime = struct {
     /// this once during initial negotiation; normal frames call it after
     /// rebuild automatically.
     pub fn reconsiderRootSize(self: *Runtime) !bool {
-        if (!self.content_axes.any()) return true;
+        if (!self.content_axes.any() and self.root_frame_mode == .disabled) return true;
         const desired_size = try self.desiredFrameSize();
+        const content_size: Size = .{
+            .width = @max(1, if (self.content_axes.width) self.root.?.rect.width else self.constraints.max_width),
+            .height = @max(1, if (self.content_axes.height) self.root.?.rect.height else self.constraints.max_height),
+        };
+        const frame = self.deriveRootFrame(content_size);
+        self.frame_content_rect = frame.content_rect;
+        self.desired_root_frame_size = frame.size;
         if (self.root_size_handler) |handler| {
             if (!try handler(self.root_size_context.?, desired_size)) {
                 self.repaint_pending = true;
@@ -246,6 +290,10 @@ pub const Runtime = struct {
         } else {
             self.configured_size = desired_size;
         }
+        const root = self.root.?;
+        const dx = frame.content_rect.x - root.rect.x;
+        const dy = frame.content_rect.y - root.rect.y;
+        if (dx != 0 or dy != 0) keywork.translateNode(root, dx, dy);
         return true;
     }
 
@@ -390,6 +438,55 @@ pub const Runtime = struct {
         try lifecycle_reconciliation.rebuild(self);
     }
 };
+
+test "root paint frame is symmetric and retained translation is idempotent" {
+    var shadow: keywork.BoxShadow = .{};
+    try shadow.append(.{
+        .color = keywork.colors.black,
+        .offset_x = 2,
+        .offset_y = 1,
+        .spread = 3,
+    });
+    var root: RenderNode = .{
+        .kind = .box,
+        .rect = .{ .x = 0, .y = 0, .width = 100, .height = 40 },
+        .box_shadow = shadow,
+    };
+    var runtime: Runtime = undefined;
+    runtime.root = &root;
+    runtime.root_frame_mode = .symmetric_paint_outsets;
+    const first = runtime.deriveRootFrame(.{ .width = 100, .height = 40 });
+    try std.testing.expectEqual(Size{ .width = 110, .height = 48 }, first.size);
+    try std.testing.expectEqual(keywork.Rect{ .x = 5, .y = 4, .width = 100, .height = 40 }, first.content_rect);
+
+    keywork.translateNode(&root, first.content_rect.x, first.content_rect.y);
+    const second = runtime.deriveRootFrame(.{ .width = 100, .height = 40 });
+    try std.testing.expectEqual(first, second);
+    const dx = second.content_rect.x - root.rect.x;
+    const dy = second.content_rect.y - root.rect.y;
+    if (dx != 0 or dy != 0) keywork.translateNode(&root, dx, dy);
+    try std.testing.expectEqual(keywork.Point{ .x = 5, .y = 4 }, keywork.Point{ .x = root.rect.x, .y = root.rect.y });
+}
+
+test "root paint frame ignores conservative text damage overhang" {
+    var root: RenderNode = .{
+        .kind = .text,
+        .rect = .{ .x = 0, .y = 0, .width = 100, .height = 40 },
+        .text = "bar",
+        .text_style = .{ .color = keywork.colors.white, .font_size = 16 },
+    };
+    var runtime: Runtime = undefined;
+    runtime.root = &root;
+    runtime.root_frame_mode = .symmetric_paint_outsets;
+
+    try std.testing.expectEqual(
+        Runtime.RootFrame{
+            .size = .{ .width = 100, .height = 40 },
+            .content_rect = .{ .x = 0, .y = 0, .width = 100, .height = 40 },
+        },
+        runtime.deriveRootFrame(.{ .width = 100, .height = 40 }),
+    );
+}
 
 const TestBackend = struct {
     presents: usize = 0,

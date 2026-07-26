@@ -587,7 +587,9 @@ fn moveNode(node: *RenderNode, x: f32, y: f32) void {
     translateNode(node, dx, dy);
 }
 
-fn translateNode(node: *RenderNode, dx: f32, dy: f32) void {
+/// Translates an already-laid-out retained subtree, including cached paint,
+/// caret, child, and damage geometry.
+pub fn translateNode(node: *RenderNode, dx: f32, dy: f32) void {
     node.damage = unionPaintBounds(node.damage, node.paintBounds());
     node.rect.x += dx;
     node.rect.y += dy;

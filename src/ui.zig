@@ -58,6 +58,7 @@ pub const AppHost = model.AppHost;
 pub const PopupRequest = model.PopupRequest;
 pub const collectPopupRequests = model.collectPopupRequests;
 pub const buildRenderTreeFromElement = model.buildRenderTreeFromElement;
+pub const translateNode = model.translateNode;
 pub const buildElementTreeScoped = model.buildElementTreeScoped;
 pub const destroyElementTree = model.destroyElementTree;
 pub const updateElementTreeScoped = model.updateElementTreeScoped;

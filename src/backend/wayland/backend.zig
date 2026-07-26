@@ -151,6 +151,11 @@ pub fn Backend(comptime RendererAdapter: type) type {
                 _ = self.windows.orderedRemove(index);
                 break;
             };
+            // Vulkan WSI synchronizes while releasing its buffers. Queue the
+            // unmap first so compositors cannot render surface effects after
+            // the client content has already disappeared.
+            win.protocol.unmap();
+            _ = self.connection.display.flush();
             RendererAdapter.deinitWindow(self, &win.renderer);
             win.protocol.deinit();
             self.allocator.destroy(win);

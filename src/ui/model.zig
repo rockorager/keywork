@@ -1153,6 +1153,24 @@ pub const RenderNode = struct {
         return bounds;
     }
 
+    /// Returns paint bounds that need native surface space. Text uses its
+    /// layout rect here because its larger retained paint bounds are only a
+    /// conservative allowance for damage and culling.
+    pub fn framePaintBounds(self: *const RenderNode) ?Rect {
+        var bounds = unionPaintBounds(null, switch (self.kind) {
+            .text => if (self.text) |value| if (value.len == 0) null else self.rect else null,
+            else => self.deriveOwnPaintBounds(),
+        });
+        for (self.children) |child| bounds = unionPaintBounds(bounds, child.framePaintBounds());
+        if (self.kind.isViewport()) {
+            if (bounds) |value| {
+                const clipped = value.intersect(self.rect);
+                bounds = if (clipped.isEmpty()) null else clipped;
+            }
+        }
+        return bounds;
+    }
+
     pub fn deriveOwnPaintBounds(self: *const RenderNode) ?Rect {
         return switch (self.kind) {
             .text => if (self.text) |value| blk: {
@@ -3315,6 +3333,7 @@ const markElementLayoutDirty = layout_model.markElementLayoutDirty;
 const addRenderDamage = layout_model.addDamage;
 const constrainSized = layout_model.constrainSized;
 pub const collectDamage = layout_model.collectDamage;
+pub const translateNode = layout_model.translateNode;
 
 var test_callback_state: u8 = 0;
 

@@ -90,7 +90,7 @@
 ---@field blur?     number
 ---@field spread?   number
 
----@class keywork.ResolvedShadowLayer
+---@class keywork.ResolvedShadowLayer: keywork.ShadowLayer
 ---@field color?   keywork.Color
 ---@field offset_x number
 ---@field offset_y number

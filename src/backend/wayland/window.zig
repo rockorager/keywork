@@ -60,7 +60,25 @@ pub const PopupOptions = struct {
     edge: keywork.Widget.PopupPlacement.Edge = .bottom,
     alignment: keywork.Widget.Alignment = .start,
     gap: i32 = 0,
+    insets: SurfaceInsets = .{},
 };
+
+pub const SurfaceInsets = struct {
+    left: u31 = 0,
+    top: u31 = 0,
+    right: u31 = 0,
+    bottom: u31 = 0,
+
+    pub fn bufferWidth(self: SurfaceInsets, content: u31) !u31 {
+        return std.math.cast(u31, try std.math.add(u32, content, try std.math.add(u32, self.left, self.right))) orelse error.DimensionOverflow;
+    }
+
+    pub fn bufferHeight(self: SurfaceInsets, content: u31) !u31 {
+        return std.math.cast(u31, try std.math.add(u32, content, try std.math.add(u32, self.top, self.bottom))) orelse error.DimensionOverflow;
+    }
+};
+
+const LogicalRect = struct { x: i32, y: i32, width: u31, height: u31 };
 
 /// Protocol state shared by every renderer targeting a Wayland surface.
 /// Renderer-owned buffers and swapchains deliberately remain outside this
@@ -82,11 +100,14 @@ pub const Surface = struct {
     /// ext-background-effect-v1 is unavailable.
     background_effect: ?*ext.BackgroundEffectSurfaceV1 = null,
     background_blur: bool = false,
-    background_blur_width: ?u31 = null,
-    background_blur_height: ?u31 = null,
-    opaque_width: ?u31 = null,
-    opaque_height: ?u31 = null,
+    blur_rect: ?LogicalRect = null,
+    opaque_rect: ?LogicalRect = null,
+    input_rect: ?LogicalRect = null,
     layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
+    layer_options: ?wayland_options.LayerShellOptions = null,
+    layer_insets: SurfaceInsets = .{},
+    pointer_interactivity: wayland_options.LayerShellOptions.PointerInteractivity = .auto,
+    popup_insets: SurfaceInsets = .{},
     configured: bool = false,
     configure_generation: u64 = 0,
     closed: bool = false,
@@ -140,6 +161,8 @@ pub const Surface = struct {
                 layer_options.keyboard_interactivity
             else
                 null,
+            .layer_options = options.layer_shell,
+            .pointer_interactivity = if (options.layer_shell) |layer_options| layer_options.pointer_interactivity else .auto,
             .width = options.width,
             .height = options.height,
         };
@@ -174,6 +197,8 @@ pub const Surface = struct {
         // instead of an xdg parent.
         if (parent.shell_role == .layer) parent.shell_role.layer.surface.getPopup(popup);
 
+        try configurePopupGeometry(compositor, surface, xdg_surface, options);
+
         const background_effect = try createBackgroundEffect(connection, surface, parent.background_blur);
         errdefer if (background_effect) |effect| effect.destroy();
         const scale_objects = createScaleObjects(connection, surface);
@@ -187,8 +212,9 @@ pub const Surface = struct {
             .shell_role = .{ .popup = .{ .surface = xdg_surface, .popup = popup } },
             .background_effect = background_effect,
             .background_blur = parent.background_blur,
-            .width = options.width,
-            .height = options.height,
+            .width = try options.insets.bufferWidth(options.width),
+            .height = try options.insets.bufferHeight(options.height),
+            .popup_insets = options.insets,
             .scale = if (scale_objects.fractional_scale != null or parent.fractional_scale == null) parent.scale else 1,
         };
     }
@@ -208,6 +234,8 @@ pub const Surface = struct {
         const positioner = try wm_base.createPositioner();
         defer positioner.destroy();
         configurePopupPositioner(positioner, options);
+        try configurePopupGeometry(connection.compositor orelse return error.NoWlCompositor, self.surface, role.surface, options);
+        self.popup_insets = options.insets;
         role.popup.reposition(positioner, token);
     }
 
@@ -221,6 +249,14 @@ pub const Surface = struct {
         if (self.decoration) |decoration| decoration.destroy();
         self.shell_role.destroy();
         self.surface.destroy();
+    }
+
+    /// Unmaps ordinary windows before their renderer releases the attached
+    /// buffer. Session lock surfaces prohibit null-buffer commits.
+    pub fn unmap(self: *Surface) void {
+        if (self.isSessionLock()) return;
+        self.surface.attach(null, 0, 0);
+        self.surface.commit();
     }
 
     /// Starts a compositor-driven interactive move. `serial` must come
@@ -266,9 +302,10 @@ pub const Surface = struct {
     /// Configures the mapping from the physical render buffer to the
     /// surface's logical coordinate space. Fractional scaling uses a
     /// viewport; the core fallback uses an integer buffer scale.
-    pub fn configureBuffer(self: *Surface, logical_width: u31, logical_height: u31, fully_opaque: bool) !void {
-        try self.configureOpaqueRegion(logical_width, logical_height, fully_opaque);
-        try self.configureBackgroundBlur(logical_width, logical_height);
+    pub fn configureBuffer(self: *Surface, logical_width: u31, logical_height: u31, content_rect: ?keywork.Rect, fully_opaque: bool) !void {
+        const content = try logicalContentRect(logical_width, logical_height, content_rect);
+        try self.configureRegions(content, fully_opaque);
+        try self.configureLayerMargins(content, logical_width, logical_height);
         if (self.viewport) |viewport| {
             if (self.surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
                 self.surface.setBufferScale(1);
@@ -281,37 +318,52 @@ pub const Surface = struct {
         self.surface.setBufferScale(scale);
     }
 
-    /// Regions use logical surface coordinates and are copied by Wayland.
-    /// Queue changed geometry immediately before the renderer's surface
-    /// commit so pixels, opacity, and blur stay atomic.
-    fn configureOpaqueRegion(self: *Surface, logical_width: u31, logical_height: u31, fully_opaque: bool) !void {
-        if (!fully_opaque) {
-            if (self.opaque_width == null) return;
-            self.surface.setOpaqueRegion(null);
-            self.opaque_width = null;
-            self.opaque_height = null;
-            return;
-        }
-        if (self.opaque_width == logical_width and self.opaque_height == logical_height) return;
+    fn configureRegions(self: *Surface, content: LogicalRect, fully_opaque: bool) !void {
         const compositor = self.connection.compositor orelse return error.NoWlCompositor;
-        const region = try compositor.createRegion();
-        defer region.destroy();
-        region.add(0, 0, @intCast(logical_width), @intCast(logical_height));
-        self.surface.setOpaqueRegion(region);
-        self.opaque_width = logical_width;
-        self.opaque_height = logical_height;
+        if (!fully_opaque) {
+            if (self.opaque_rect != null) {
+                self.surface.setOpaqueRegion(null);
+                self.opaque_rect = null;
+            }
+        } else if (self.opaque_rect == null or !std.meta.eql(self.opaque_rect.?, content)) {
+            const opaque_region = try compositor.createRegion();
+            defer opaque_region.destroy();
+            opaque_region.add(content.x, content.y, @intCast(content.width), @intCast(content.height));
+            self.surface.setOpaqueRegion(opaque_region);
+            self.opaque_rect = content;
+        }
+        if (self.pointer_interactivity != .none and
+            (self.shell_role == .layer or self.shell_role == .popup) and
+            (self.input_rect == null or !std.meta.eql(self.input_rect.?, content)))
+        {
+            const input = try compositor.createRegion();
+            defer input.destroy();
+            input.add(content.x, content.y, @intCast(content.width), @intCast(content.height));
+            self.surface.setInputRegion(input);
+            self.input_rect = content;
+        }
+        if (self.background_effect) |effect| if (self.blur_rect == null or !std.meta.eql(self.blur_rect.?, content)) {
+            const blur = try compositor.createRegion();
+            defer blur.destroy();
+            blur.add(content.x, content.y, @intCast(content.width), @intCast(content.height));
+            effect.setBlurRegion(blur);
+            self.blur_rect = content;
+        };
     }
 
-    fn configureBackgroundBlur(self: *Surface, logical_width: u31, logical_height: u31) !void {
-        const effect = self.background_effect orelse return;
-        if (self.background_blur_width == logical_width and self.background_blur_height == logical_height) return;
-        const compositor = self.connection.compositor orelse return error.NoWlCompositor;
-        const region = try compositor.createRegion();
-        defer region.destroy();
-        region.add(0, 0, @intCast(logical_width), @intCast(logical_height));
-        effect.setBlurRegion(region);
-        self.background_blur_width = logical_width;
-        self.background_blur_height = logical_height;
+    fn configureLayerMargins(self: *Surface, content: LogicalRect, frame_width: u31, frame_height: u31) !void {
+        const options = self.layer_options orelse return;
+        const left: u31 = @intCast(content.x);
+        const top: u31 = @intCast(content.y);
+        const insets: SurfaceInsets = .{ .left = left, .top = top, .right = frame_width - left - content.width, .bottom = frame_height - top - content.height };
+        if (std.meta.eql(insets, self.layer_insets)) return;
+        self.shell_role.layer.surface.setMargin(
+            options.margin.top - if (options.anchors.top) @as(i32, @intCast(insets.top)) else 0,
+            options.margin.right - if (options.anchors.right) @as(i32, @intCast(insets.right)) else 0,
+            options.margin.bottom - if (options.anchors.bottom) @as(i32, @intCast(insets.bottom)) else 0,
+            options.margin.left - if (options.anchors.left) @as(i32, @intCast(insets.left)) else 0,
+        );
+        self.layer_insets = insets;
     }
 
     fn attachBackgroundEffect(self: *Surface, manager: *ext.BackgroundEffectManagerV1) void {
@@ -364,13 +416,19 @@ pub const Surface = struct {
             .layer => |role| role.surface,
             else => return error.NotLayerSurface,
         };
-        std.debug.assert(width > 0 and height > 0);
+        const anchors = self.layer_options.?.anchors;
+        std.debug.assert(width > 0 or (anchors.left and anchors.right));
+        std.debug.assert(height > 0 or (anchors.top and anchors.bottom));
         layer_surface.setSize(width, height);
         // A configure dimension of zero delegates that axis to the client;
-        // retain this request so currentSize then reflects the accepted size.
-        self.width = width;
-        self.height = height;
+        // retain explicit requests so currentSize reflects the accepted size.
+        if (width > 0) self.width = width;
+        if (height > 0) self.height = height;
         self.surface.commit();
+    }
+
+    pub fn setLayerContentRect(self: *Surface, frame_width: u31, frame_height: u31, rect: keywork.Rect) !void {
+        try self.configureLayerMargins(try logicalContentRect(frame_width, frame_height, rect), frame_width, frame_height);
     }
 
     pub fn isSessionLock(self: *const Surface) bool {
@@ -540,8 +598,8 @@ pub const Surface = struct {
     fn popupListener(_: *xdg.Popup, event: xdg.Popup.Event, self: *Surface) void {
         switch (event) {
             .configure => |configure| {
-                if (configure.width > 0) self.width = @intCast(configure.width);
-                if (configure.height > 0) self.height = @intCast(configure.height);
+                if (configure.width > 0) self.width = self.popup_insets.bufferWidth(@intCast(configure.width)) catch self.width;
+                if (configure.height > 0) self.height = self.popup_insets.bufferHeight(@intCast(configure.height)) catch self.height;
             },
             .popup_done => self.closed = true,
             .repositioned => {},
@@ -1291,6 +1349,40 @@ fn configurePopupPositioner(positioner: *xdg.Positioner, options: PopupOptions) 
     positioner.setOffset(offset.x, offset.y);
 }
 
+fn logicalContentRect(frame_width: u31, frame_height: u31, rect: ?keywork.Rect) !LogicalRect {
+    const value = rect orelse return .{ .x = 0, .y = 0, .width = frame_width, .height = frame_height };
+    const x = try frameCoordinate(value.x);
+    const y = try frameCoordinate(value.y);
+    const width = try frameDimension(value.width);
+    const height = try frameDimension(value.height);
+    if (@as(u32, @intCast(x)) + width > frame_width or @as(u32, @intCast(y)) + height > frame_height) return error.InvalidContentRect;
+    return .{ .x = x, .y = y, .width = width, .height = height };
+}
+
+fn frameCoordinate(value: f32) !i32 {
+    if (!std.math.isFinite(value) or value < 0 or @as(f64, value) > std.math.maxInt(i32)) return error.InvalidContentRect;
+    return @intFromFloat(@ceil(value));
+}
+
+fn configurePopupGeometry(compositor: *wl.Compositor, surface: *wl.Surface, xdg_surface: *xdg.Surface, options: PopupOptions) !void {
+    const left: i32 = @intCast(options.insets.left);
+    const top: i32 = @intCast(options.insets.top);
+    const width: i32 = @intCast(options.width);
+    const height: i32 = @intCast(options.height);
+    xdg_surface.setWindowGeometry(left, top, width, height);
+    const region = try compositor.createRegion();
+    defer region.destroy();
+    region.add(left, top, width, height);
+    surface.setInputRegion(region);
+}
+
+test "popup inset geometry expands its buffer around content" {
+    const insets: SurfaceInsets = .{ .left = 3, .top = 4, .right = 5, .bottom = 6 };
+    try std.testing.expectEqual(@as(u31, 28), try insets.bufferWidth(20));
+    try std.testing.expectEqual(@as(u31, 20), try insets.bufferHeight(10));
+    try std.testing.expectEqual(LogicalRect{ .x = 3, .y = 4, .width = 20, .height = 10 }, try logicalContentRect(28, 20, .{ .x = 3, .y = 4, .width = 20, .height = 10 }));
+}
+
 fn layer(value: wayland_options.LayerShellOptions.Layer) zwlr.LayerShellV1.Layer {
     return switch (value) {
         .background => .background,
@@ -1385,4 +1477,9 @@ pub fn frameDimension(value: f32) !u31 {
     const rounded = @ceil(value);
     if (rounded > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
     return @intFromFloat(rounded);
+}
+
+pub fn frameInset(value: f32) !u31 {
+    if (!std.math.isFinite(value) or value < 0 or value > @as(f32, @floatFromInt(std.math.maxInt(u31)))) return error.InvalidFrameSize;
+    return @intFromFloat(@ceil(value));
 }
