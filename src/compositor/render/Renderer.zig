@@ -653,15 +653,7 @@ fn pruneOccludedCommands(
         } else if (command_geometry.visibleRect(command, frame_size)) |visible| {
             if (commandCanBePruned(command)) {
                 uncovered.setRectangle(visible.x, visible.y, visible.width, visible.height);
-                var covered_rectangles = coverage.rectangleIterator();
-                while (covered_rectangles.next()) |covered| {
-                    try uncovered.subtract(
-                        covered.x,
-                        covered.y,
-                        @intCast(covered.width),
-                        @intCast(covered.height),
-                    );
-                }
+                try uncovered.subtractRegion(&coverage);
                 if (uncovered.isEmpty()) continue;
 
                 if (commandCanBeClipped(command)) {

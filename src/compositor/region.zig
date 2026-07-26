@@ -107,6 +107,20 @@ pub fn add(self: *Self, x: i32, y: i32, width: i32, height: i32) Error!void {
     }
 }
 
+/// Removes every rectangle of `other` from `self` in one pass. Prefer this
+/// over repeated `subtract` calls: each of those builds a temporary region
+/// and rewrites `self`, so subtracting a region rectangle by rectangle costs
+/// one full region rewrite per rectangle.
+pub fn subtractRegion(self: *Self, other: *const Self) Error!void {
+    if (pixman.pixman_region32_subtract(
+        &self.region,
+        &self.region,
+        @constCast(&other.region),
+    ) == 0) {
+        return error.OutOfMemory;
+    }
+}
+
 pub fn subtract(self: *Self, x: i32, y: i32, width: i32, height: i32) Error!void {
     if (width <= 0 or height <= 0) return;
 
