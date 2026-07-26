@@ -2724,6 +2724,20 @@ fn releaseOutput(self: *Self, key: TargetKey) void {
     if (self.outputs.fetchRemove(key)) |removed| self.destroyOutput(removed.value);
 }
 
+/// Nonblocking telemetry probe: reports whether the submission's GPU work
+/// is still executing. `fence_pending` alone is insufficient because it
+/// stays true after the fence signals, until drainSubmission reclaims the
+/// slot. Never blocks and never mutates submission state; a status-query
+/// failure conservatively reports no overlap.
+fn submissionStillExecuting(self: *Self, submission: *const Submission) bool {
+    if (!submission.fence_pending) return false;
+    const status = self.device_wrapper.getFenceStatus(
+        self.device,
+        submission.fence,
+    ) catch return false;
+    return status == .not_ready;
+}
+
 fn drainSubmission(self: *Self, submission: *Submission) Error!void {
     if (!submission.fence_pending) {
         std.debug.assert(submission.pending_wait_semaphores.items.len == 0);
@@ -3425,9 +3439,11 @@ fn renderFrameWithCompletion(
     };
     // The slot being left is the frame submitted last; if its fence has not
     // signaled yet, this frame's preparation overlaps that GPU work.
-    if (output.currentSubmission().fence_pending) self.submission_overlap_frames += 1;
+    if (self.submissionStillExecuting(output.currentSubmission())) {
+        self.submission_overlap_frames += 1;
+    }
     const submission = output.advanceSubmission();
-    if (submission.fence_pending) {
+    if (self.submissionStillExecuting(submission)) {
         self.submission_slot_waits += 1;
         const wait_start = monotonicNanoseconds();
         try self.drainSubmission(submission);
