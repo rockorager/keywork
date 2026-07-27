@@ -159,6 +159,8 @@ local function resolve_menu(menu, colors, space, radius, shadow)
             radius = resolve_radius(item.radius, radius),
             font_size = item.font_size,
             line_height = item.line_height,
+            foreground = resolve_color(item.foreground, colors),
+            disabled_foreground = resolve_color(item.disabled_foreground, colors),
             hover_background = resolve_color(item.hover_background, colors),
             pressed_background = resolve_color(item.pressed_background, colors),
             selected_background = resolve_color(item.selected_background, colors),
@@ -1016,10 +1018,18 @@ local function build_menu_item(options, theme)
             y = item_theme.padding_y or default_theme.components.menu.item.padding_y,
         }
     end
-    local child = ui.default_text_style({
-        font_size = item_theme.font_size or default_theme.components.menu.item.font_size,
-        line_height = item_theme.line_height or default_theme.components.menu.item.line_height,
-        child = options.child,
+    local foreground = item_theme.foreground
+    if options.disabled then
+        foreground = item_theme.disabled_foreground
+    end
+    local child = ui.icon_theme({
+        color = foreground,
+        child = ui.default_text_style({
+            color = foreground,
+            font_size = item_theme.font_size or default_theme.components.menu.item.font_size,
+            line_height = item_theme.line_height or default_theme.components.menu.item.line_height,
+            child = options.child,
+        }),
     })
     return ui.pressable({
         id = options.id,

@@ -300,6 +300,8 @@ return {
                 radius = 4,
                 font_size = 14,
                 line_height = 20,
+                foreground = "neutral_foreground1",
+                disabled_foreground = "neutral_foreground_disabled",
                 hover_background = "subtle_background_hover",
                 pressed_background = "subtle_background_pressed",
                 selected_background = "subtle_background_selected",

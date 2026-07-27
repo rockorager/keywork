@@ -3846,6 +3846,8 @@ test "lua default theme exposes Fluent component tokens" {
         \\assert(theme.components.text_field.padding_x == 12 and theme.components.text_field.padding_y == 6 and theme.components.text_field.line_height == 20)
         \\assert(theme.components.tag.target == 24 and theme.components.tag.font_size == 12 and theme.components.tag.line_height == 16)
         \\assert(theme.components.menu.padding == 4 and theme.components.menu.item.min_height == 32 and theme.components.menu.item.radius == 4)
+        \\assert(theme.components.menu.item.foreground == theme.colors.neutral_foreground1)
+        \\assert(theme.components.menu.item.disabled_foreground == theme.colors.neutral_foreground_disabled)
         \\assert(theme.components.menu.separator.margin == 12 and theme.components.menu.separator.inset == 4)
         \\assert(theme.shadow[1] == nil and #theme.shadow[2] == 2 and #theme.shadow[5] == 2 and #theme.shadow[6] == 2)
         \\assert(#theme.components.menu.shadow == 2)
@@ -3869,6 +3871,8 @@ test "lua default theme exposes Fluent component tokens" {
         \\  assert(resolved.colors.border == resolved.colors.neutral_stroke1)
         \\  assert(resolved.colors.fill == resolved.colors.neutral_background4)
         \\  assert(resolved.components.tag.background == resolved.colors.brand_background2)
+        \\  assert(resolved.components.menu.item.foreground == resolved.colors.neutral_foreground1)
+        \\  assert(resolved.components.menu.item.disabled_foreground == resolved.colors.neutral_foreground_disabled)
         \\  assert(resolved.components.menu.item.selected_background == resolved.colors.subtle_background_selected)
         \\  assert(resolved.components.menu.item.pressed_background == resolved.colors.subtle_background_pressed)
         \\  assert(resolved.components.menu.border == resolved.colors.neutral_stroke2)
@@ -3895,6 +3899,38 @@ test "lua default theme exposes Fluent component tokens" {
     try std.testing.expectEqual(@as(f32, 14), root.text_style.font_size);
     try std.testing.expectEqual(@as(?f32, 20), root.text_style.line_height);
     try std.testing.expectEqual(@as(f32, 20), root.rect.height);
+}
+
+test "lua disabled menu items use the disabled foreground" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\return kw.app({ child = kw.menu_item({
+        \\  id = "disabled",
+        \\  disabled = true,
+        \\  child = kw.text("Unavailable"),
+        \\}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "disabled-menu-item.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 200, .max_height = 100 }, .light);
+    defer runtime.deinit();
+
+    const root = runtime.root.?;
+    try std.testing.expect(keywork.findClickHitById(root, "disabled") == null);
+    var node = root;
+    while (node.kind != .text) {
+        try std.testing.expectEqual(@as(usize, 1), node.children.len);
+        node = node.children[0];
+    }
+    try std.testing.expectEqual(keywork.colors.neutral_foreground_disabled_light, node.text_style.color);
 }
 
 test "lua buttons default to release activation and accept press override" {

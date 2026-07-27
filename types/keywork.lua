@@ -182,6 +182,8 @@
 ---@field radius?                    keywork.ThemeMetricRef
 ---@field font_size?                 number
 ---@field line_height?               number
+---@field foreground?                keywork.ColorRef
+---@field disabled_foreground?       keywork.ColorRef
 ---@field hover_background?          keywork.ColorRef
 ---@field pressed_background?        keywork.ColorRef
 ---@field selected_background?       keywork.ColorRef
@@ -366,6 +368,8 @@
 ---@field radius                    number
 ---@field font_size                 number
 ---@field line_height               number
+---@field foreground                keywork.Color
+---@field disabled_foreground       keywork.Color
 ---@field hover_background          keywork.Color
 ---@field pressed_background        keywork.Color
 ---@field selected_background       keywork.Color
