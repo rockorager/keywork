@@ -134,7 +134,10 @@ Fix these in `../keywork`, then simplify here.
   menu rebuilt with newly discovered rows, but its `xdg_popup` retained the
   height measured when it opened and clipped them. Fixed in keywork: dirty
   parent-owned popup content is remeasured and size changes are applied with
-  `xdg_popup.reposition`.
+  `xdg_popup.reposition`. A follow-up race let the new content paint against
+  the old constraints while that reposition was awaiting its configure,
+  leaving text outside a stale menu background. Popup repaint now waits for
+  the configure and then rebuilds at the accepted size.
 - **Clicking parent-window empty space didn't dismiss anchored popups.**
   Fixed in keywork: a press on the parent surface outside every live
   popup's anchor calls the popups' `on_close` and consumes the press
