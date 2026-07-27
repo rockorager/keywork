@@ -5,30 +5,44 @@ const cli = @import("cli.zig");
 const app_options = @import("options.zig");
 const runner = @import("runner.zig");
 const event_loop = @import("../linux/event_loop.zig");
+const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const lua_module = @import("../lua/app.zig");
 
 const Application = @This();
 
 allocator: std.mem.Allocator,
 loop: event_loop.EventLoop,
+systemd_event: *SystemdEvent,
 lua: lua_module.App,
 
 pub fn init(allocator: std.mem.Allocator, script_path: []const u8) !Application {
     var loop = try event_loop.EventLoop.init(allocator);
     errdefer loop.deinit();
+    const systemd_event = try SystemdEvent.create(allocator);
+    errdefer systemd_event.destroy(allocator);
     var lua = try lua_module.App.init(allocator, script_path);
     errdefer lua.deinit();
-    return .{ .allocator = allocator, .loop = loop, .lua = lua };
+    lua.useSystemdEvent(systemd_event);
+    return .{
+        .allocator = allocator,
+        .loop = loop,
+        .systemd_event = systemd_event,
+        .lua = lua,
+    };
 }
 
 pub fn deinit(self: *Application) void {
     self.lua.unbindRuntime();
     self.lua.unbindEventLoop();
     self.lua.deinit();
+    self.systemd_event.unregister();
+    self.systemd_event.destroy(self.allocator);
     self.loop.deinit();
 }
 
 pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void {
+    try self.systemd_event.register(&self.loop);
+    defer self.systemd_event.unregister();
     self.lua.setScriptArgs(run_options.app_args);
     try self.lua.ensureLoaded();
     const window = self.lua.window_config;
@@ -55,6 +69,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .background_blur = window.background_blur,
         .session_lock = window.session_lock,
         .log_writer = &stdout_writer.interface,
+        .systemd_event = self.systemd_event,
         .runtime_context = &self.lua,
         .windows_host = self.lua.windowsHost(),
         .bind_runtime = lua_module.App.bindRuntimeOpaque,

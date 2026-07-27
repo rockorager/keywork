@@ -84,13 +84,14 @@ pub fn build(b: *std.Build) void {
     xkb_c.linkSystemLibrary("xkbcommon", .{ .use_pkg_config = .force });
     const xkb_c_module = xkb_c.createModule();
 
-    const dbus_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/ffi/dbus_c.h"),
+    requirePkgConfigVersion(b, "libsystemd", "257");
+    const systemd_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ffi/systemd_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    dbus_c.linkSystemLibrary("dbus-1", .{ .use_pkg_config = .force });
-    const dbus_c_module = dbus_c.createModule();
+    systemd_c.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
+    const systemd_c_module = systemd_c.createModule();
 
     requirePkgConfigVersion(b, "libcurl", "7.45.0");
     const curl_c = b.addTranslateC(.{
@@ -143,7 +144,7 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("linebreak", linebreak_module);
     app_module.addImport("z2d", z2d_module);
     app_module.addImport("xkb_c", xkb_c_module);
-    app_module.addImport("dbus_c", dbus_c_module);
+    app_module.addImport("systemd_c", systemd_c_module);
     app_module.addImport("curl_c", curl_c_module);
     app_module.addImport("pipewire_c", pipewire_c_module);
     app_module.addCSourceFile(.{ .file = b.path("src/ffi/pipewire_c.c") });
@@ -234,7 +235,7 @@ fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("wayland-cursor", .{});
     module.linkSystemLibrary("vulkan", .{});
     module.linkSystemLibrary("xkbcommon", .{});
-    module.linkSystemLibrary("dbus-1", .{});
+    module.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
     module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
     module.linkSystemLibrary("fontconfig", .{});
     module.linkSystemLibrary("freetype", .{});

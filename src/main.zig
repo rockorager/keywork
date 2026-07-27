@@ -137,7 +137,9 @@ test {
     _ = @import("lua/pipewire.zig");
     _ = @import("lua/process.zig");
     _ = @import("lua/storybook.zig");
+    _ = @import("lua/varlink.zig");
     _ = @import("lua/xdg.zig");
     _ = @import("app/platform.zig");
     _ = @import("linux/event_loop.zig");
+    _ = @import("linux/SystemdEvent.zig");
 }

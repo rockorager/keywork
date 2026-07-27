@@ -3,7 +3,8 @@
 const std = @import("std");
 const event_loop = @import("event_loop.zig");
 const linux_syscall = @import("syscall.zig");
-const c = @import("dbus_c");
+const SystemdEvent = @import("SystemdEvent.zig");
+const systemd = @import("systemd_c");
 
 const linux = std.os.linux;
 const log = std.log.scoped(.keywork_desktop_settings);
@@ -31,6 +32,7 @@ pub const ColorScheme = enum {
 
 pub const Client = struct {
     backend: Backend,
+    systemd_event: ?*SystemdEvent,
     color_scheme: ColorScheme = .no_preference,
     change_context: ?*anyopaque = null,
     change_handler: ?ChangeHandler = null,
@@ -44,12 +46,26 @@ pub const Client = struct {
 
     pub const ChangeHandler = *const fn (ctx: *anyopaque, color_scheme: ColorScheme) void;
 
-    pub fn init() !Client {
+    pub fn init(systemd_event: ?*SystemdEvent) !Client {
         const prefer = PreferClient.init() catch |err| {
             log.debug("prefer varlink unavailable, using portal: {}", .{err});
-            return .{ .backend = .{ .portal = try PortalClient.init() } };
+            const bridge = systemd_event orelse return error.SystemdEventUnavailable;
+            return .{
+                .backend = .{ .portal = try PortalClient.init(bridge) },
+                .systemd_event = systemd_event,
+            };
         };
-        return .{ .backend = .{ .prefer = prefer } };
+        return .{ .backend = .{ .prefer = prefer }, .systemd_event = systemd_event };
+    }
+
+    /// Starts the portal query after this Client has reached its stable
+    /// address. sd-bus callbacks retain pointers into the selected backend.
+    pub fn startColorSchemeRead(self: *Client) !void {
+        switch (self.backend) {
+            .prefer => {},
+            .portal => |*portal| try portal.start(self),
+            .none => return error.DesktopSettingsUnavailable,
+        }
     }
 
     pub fn deinit(self: *Client) void {
@@ -72,7 +88,7 @@ pub const Client = struct {
     pub fn eventLoopFd(self: *const Client) i32 {
         return switch (self.backend) {
             .prefer => |prefer| prefer.fd,
-            .portal => |portal| portal.fd,
+            .portal => invalid_fd,
             .none => invalid_fd,
         };
     }
@@ -95,7 +111,7 @@ pub const Client = struct {
                 self.source_handle = null;
                 prefer.deinit();
             },
-            .portal => |*portal| portal.dispatch(),
+            .portal => {},
             .none => {},
         }
     }
@@ -111,11 +127,18 @@ pub const Client = struct {
                 prefer.deinit();
                 self.backend = .none;
 
-                const portal = PortalClient.init() catch |err| {
+                const bridge = self.systemd_event orelse return false;
+                const portal = PortalClient.init(bridge) catch |err| {
                     log.warn("desktop settings fallback unavailable: {}", .{err});
                     return false;
                 };
                 self.backend = .{ .portal = portal };
+                self.backend.portal.start(self) catch |err| {
+                    log.warn("desktop settings fallback query failed: {}", .{err});
+                    self.backend.portal.deinit(self);
+                    self.backend = .none;
+                    return false;
+                };
                 if (self.backend.portal.finishColorSchemeRead()) |color_scheme| {
                     self.updateColorScheme(color_scheme, "portal");
                 }
@@ -138,7 +161,7 @@ pub const Client = struct {
         if (self.change_handler) |handler| handler(self.change_context.?, color_scheme);
     }
 
-    fn handlePortalSettingChanged(self: *Client, message: *c.DBusMessage) void {
+    fn handlePortalSettingChanged(self: *Client, message: *systemd.sd_bus_message) void {
         const color_scheme = portalSettingChanged(message) orelse return;
         self.updateColorScheme(color_scheme, "portal");
     }
@@ -257,102 +280,105 @@ const PreferClient = struct {
 };
 
 const PortalClient = struct {
-    connection: *c.DBusConnection,
-    fd: i32,
-    pending_read: ?*c.DBusPendingCall = null,
-    filter_installed: bool = false,
+    bus: *systemd.sd_bus,
+    bridge: *SystemdEvent,
+    pending_read: ?*systemd.sd_bus_slot = null,
+    signal_match: ?*systemd.sd_bus_slot = null,
+    initial_color_scheme: ?ColorScheme = null,
+    initial_complete: bool = false,
+    attached: bool = false,
 
-    fn init() !PortalClient {
-        const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse return error.DBusUnavailable;
+    fn init(bridge: *SystemdEvent) !PortalClient {
+        var bus: ?*systemd.sd_bus = null;
+        try checkSystemd(systemd.sd_bus_open_user(&bus));
+        return .{ .bus = bus.?, .bridge = bridge };
+    }
+
+    fn deinit(self: *PortalClient, _: *Client) void {
+        if (self.pending_read) |slot| _ = systemd.sd_bus_slot_unref(slot);
+        if (self.signal_match) |slot| _ = systemd.sd_bus_slot_unref(slot);
+        if (self.attached) _ = systemd.sd_bus_detach_event(self.bus);
+        _ = systemd.sd_bus_flush_close_unref(self.bus);
+        self.pending_read = null;
+        self.signal_match = null;
+        self.attached = false;
+    }
+
+    fn start(self: *PortalClient, client: *Client) !void {
+        std.debug.assert(self.signal_match == null);
+        try checkSystemd(systemd.sd_bus_add_match(
+            self.bus,
+            &self.signal_match,
+            "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'",
+            portalSignal,
+            client,
+        ));
         errdefer {
-            c.dbus_connection_close(connection);
-            c.dbus_connection_unref(connection);
+            _ = systemd.sd_bus_slot_unref(self.signal_match);
+            self.signal_match = null;
         }
-
-        c.dbus_bus_add_match(connection, "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'", null);
-
-        var fd: c_int = -1;
-        if (c.dbus_connection_get_unix_fd(connection, &fd) == 0 or fd < 0) return error.DBusUnavailable;
-
-        var self: PortalClient = .{ .connection = connection, .fd = @intCast(fd) };
-        self.sendColorSchemeRead();
-        return self;
+        try self.sendColorSchemeRead();
     }
 
-    fn deinit(self: *PortalClient, client: *Client) void {
-        if (self.pending_read) |pending| {
-            c.dbus_pending_call_cancel(pending);
-            c.dbus_pending_call_unref(pending);
-            self.pending_read = null;
-        }
-        if (self.filter_installed) c.dbus_connection_remove_filter(self.connection, dbusFilter, client);
-        c.dbus_connection_close(self.connection);
-        c.dbus_connection_unref(self.connection);
-        self.fd = invalid_fd;
-    }
-
-    fn installSignalFilter(self: *PortalClient, client: *Client) !void {
-        std.debug.assert(!self.filter_installed);
-        if (c.dbus_connection_add_filter(self.connection, dbusFilter, client, null) == 0) return error.OutOfMemory;
-        self.filter_installed = true;
-    }
-
-    fn dispatch(self: *PortalClient) void {
-        _ = c.dbus_connection_read_write(self.connection, 0);
-        while (c.dbus_connection_dispatch(self.connection) == c.DBUS_DISPATCH_DATA_REMAINS) {}
+    fn installSignalFilter(self: *PortalClient, _: *Client) !void {
+        std.debug.assert(!self.attached);
+        try checkSystemd(systemd.sd_bus_attach_event(self.bus, self.bridge.sdEvent(), 0));
+        self.attached = true;
     }
 
     /// Send the portal color-scheme query without waiting for the reply,
     /// so the round trip through the session bus overlaps the caller's
     /// window setup. finishColorSchemeRead collects the result.
-    fn sendColorSchemeRead(self: *PortalClient) void {
-        const message = c.dbus_message_new_method_call(
+    fn sendColorSchemeRead(self: *PortalClient) !void {
+        var message: ?*systemd.sd_bus_message = null;
+        try checkSystemd(systemd.sd_bus_message_new_method_call(
+            self.bus,
+            &message,
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.Settings",
             "ReadOne",
-        ) orelse return;
-        defer c.dbus_message_unref(message);
-
-        var iter: c.DBusMessageIter = undefined;
-        c.dbus_message_iter_init_append(message, &iter);
-        var namespace: [*:0]const u8 = "org.freedesktop.appearance";
-        dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &namespace) catch return;
-        var key: [*:0]const u8 = "color-scheme";
-        dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &key) catch return;
-
-        var pending: ?*c.DBusPendingCall = null;
-        if (c.dbus_connection_send_with_reply(self.connection, message, &pending, 1000) == 0) return;
-        self.pending_read = pending;
-        // Push the request onto the wire now; the reply lands while the
-        // caller does other setup.
-        _ = c.dbus_connection_flush(self.connection);
+        ));
+        defer _ = systemd.sd_bus_message_unref(message);
+        try appendSystemdString(message.?, "org.freedesktop.appearance");
+        try appendSystemdString(message.?, "color-scheme");
+        try checkSystemd(systemd.sd_bus_call_async(
+            self.bus,
+            &self.pending_read,
+            message,
+            initialColorSchemeReply,
+            self,
+            std.time.us_per_s,
+        ));
     }
 
     fn finishColorSchemeRead(self: *PortalClient) ?ColorScheme {
-        const pending = self.pending_read orelse return null;
+        if (self.pending_read == null) return null;
+        while (!self.initial_complete) {
+            const processed = systemd.sd_bus_process(self.bus, null);
+            if (processed < 0) break;
+            if (processed > 0) continue;
+            if (systemd.sd_bus_wait(self.bus, std.time.us_per_s) < 0) break;
+        }
+        const pending = self.pending_read.?;
         self.pending_read = null;
-        defer c.dbus_pending_call_unref(pending);
-
-        c.dbus_pending_call_block(pending);
-        const reply = c.dbus_pending_call_steal_reply(pending) orelse return null;
-        defer c.dbus_message_unref(reply);
-        if (c.dbus_message_get_type(reply) != c.DBUS_MESSAGE_TYPE_METHOD_RETURN) return null;
-
-        var reply_iter: c.DBusMessageIter = undefined;
-        if (c.dbus_message_iter_init(reply, &reply_iter) == 0) return null;
-        return portalColorScheme(dbusVariantUint32(&reply_iter) orelse return null);
+        _ = systemd.sd_bus_slot_unref(pending);
+        return self.initial_color_scheme;
     }
 };
 
-fn dbusFilter(_: ?*c.DBusConnection, message: ?*c.DBusMessage, user_data: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
-    const self: *Client = @ptrCast(@alignCast(user_data orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
-    const msg = message orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-    if (c.dbus_message_is_signal(msg, "org.freedesktop.portal.Settings", "SettingChanged") != 0) {
-        self.handlePortalSettingChanged(msg);
-        return c.DBUS_HANDLER_RESULT_HANDLED;
-    }
-    return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+fn initialColorSchemeReply(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*c]systemd.sd_bus_error) callconv(.c) c_int {
+    const self: *PortalClient = @ptrCast(@alignCast(user_data orelse return 0));
+    self.initial_complete = true;
+    const reply = message orelse return 0;
+    self.initial_color_scheme = portalColorScheme(readVariantUint32(reply) orelse return 0);
+    return 0;
+}
+
+fn portalSignal(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*c]systemd.sd_bus_error) callconv(.c) c_int {
+    const self: *Client = @ptrCast(@alignCast(user_data orelse return 0));
+    self.handlePortalSettingChanged(message orelse return 0);
+    return 0;
 }
 
 fn writePreferRequest(fd: i32) !void {
@@ -395,22 +421,16 @@ fn preferColorScheme(response: []const u8) !ColorScheme {
         error.InvalidPreferResponse;
 }
 
-fn portalSettingChanged(message: *c.DBusMessage) ?ColorScheme {
-    var iter: c.DBusMessageIter = undefined;
-    if (c.dbus_message_iter_init(message, &iter) == 0) return null;
-    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return null;
-    var namespace_ptr: [*:0]const u8 = undefined;
-    c.dbus_message_iter_get_basic(&iter, @ptrCast(&namespace_ptr));
+fn portalSettingChanged(message: *systemd.sd_bus_message) ?ColorScheme {
+    var namespace_ptr: [*c]const u8 = null;
+    if (systemd.sd_bus_message_read_basic(message, systemd.SD_BUS_TYPE_STRING, @ptrCast(&namespace_ptr)) <= 0) return null;
     if (!std.mem.eql(u8, std.mem.span(namespace_ptr), "org.freedesktop.appearance")) return null;
 
-    if (c.dbus_message_iter_next(&iter) == 0) return null;
-    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return null;
-    var key_ptr: [*:0]const u8 = undefined;
-    c.dbus_message_iter_get_basic(&iter, @ptrCast(&key_ptr));
+    var key_ptr: [*c]const u8 = null;
+    if (systemd.sd_bus_message_read_basic(message, systemd.SD_BUS_TYPE_STRING, @ptrCast(&key_ptr)) <= 0) return null;
     if (!std.mem.eql(u8, std.mem.span(key_ptr), "color-scheme")) return null;
 
-    if (c.dbus_message_iter_next(&iter) == 0) return null;
-    return portalColorScheme(dbusVariantUint32(&iter) orelse return null);
+    return portalColorScheme(readVariantUint32(message) orelse return null);
 }
 
 fn portalColorScheme(value: u32) ColorScheme {
@@ -421,18 +441,19 @@ fn portalColorScheme(value: u32) ColorScheme {
     };
 }
 
-fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
-    const opaque_value: *const anyopaque = @ptrCast(value);
-    if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
+fn checkSystemd(result: c_int) !void {
+    if (result < 0) return error.SystemdOperationFailed;
 }
 
-fn dbusVariantUint32(iter: *c.DBusMessageIter) ?u32 {
-    if (c.dbus_message_iter_get_arg_type(iter) != c.DBUS_TYPE_VARIANT) return null;
-    var variant: c.DBusMessageIter = undefined;
-    c.dbus_message_iter_recurse(iter, &variant);
-    if (c.dbus_message_iter_get_arg_type(&variant) != c.DBUS_TYPE_UINT32) return null;
+fn appendSystemdString(message: *systemd.sd_bus_message, value: [*:0]const u8) !void {
+    try checkSystemd(systemd.sd_bus_message_append_basic(message, systemd.SD_BUS_TYPE_STRING, value));
+}
+
+fn readVariantUint32(message: *systemd.sd_bus_message) ?u32 {
+    if (systemd.sd_bus_message_enter_container(message, systemd.SD_BUS_TYPE_VARIANT, "u") <= 0) return null;
+    defer _ = systemd.sd_bus_message_exit_container(message);
     var value: u32 = 0;
-    c.dbus_message_iter_get_basic(&variant, &value);
+    if (systemd.sd_bus_message_read_basic(message, systemd.SD_BUS_TYPE_UINT32, &value) <= 0) return null;
     return value;
 }
 

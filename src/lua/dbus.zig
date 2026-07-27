@@ -1,13 +1,13 @@
 //! Lua D-Bus integration for keywork.dbus.
 
 const std = @import("std");
-const event_loop = @import("../linux/event_loop.zig");
+const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_task = @import("task.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
-const dbus_c = @import("dbus_c");
+const systemd = @import("systemd_c");
 
 const linux = std.os.linux;
 const invalid_fd: i32 = -1;
@@ -23,7 +23,7 @@ pub const Host = struct {
     pub const VTable = struct {
         allocator: *const fn (*anyopaque) std.mem.Allocator,
         luaState: *const fn (*anyopaque) *c.lua_State,
-        eventLoop: *const fn (*anyopaque) ?*event_loop.EventLoop,
+        systemdEvent: *const fn (*anyopaque) anyerror!*SystemdEvent,
         addBus: *const fn (*anyopaque, Kind) anyerror!*Bus,
     };
 
@@ -33,8 +33,8 @@ pub const Host = struct {
     fn luaState(self: Host) *c.lua_State {
         return self.vtable.luaState(self.ptr);
     }
-    fn eventLoop(self: Host) ?*event_loop.EventLoop {
-        return self.vtable.eventLoop(self.ptr);
+    fn systemdEvent(self: Host) !*SystemdEvent {
+        return try self.vtable.systemdEvent(self.ptr);
     }
     fn addBus(self: Host, kind: Kind) !*Bus {
         return self.vtable.addBus(self.ptr, kind);
@@ -44,13 +44,6 @@ pub const Host = struct {
 pub const Kind = enum {
     session,
     system,
-
-    fn busType(self: Kind) dbus_c.DBusBusType {
-        return switch (self) {
-            .session => dbus_c.DBUS_BUS_SESSION,
-            .system => dbus_c.DBUS_BUS_SYSTEM,
-        };
-    }
 };
 
 fn hostFromLua(lua_state: *c.lua_State) Host {
@@ -114,11 +107,16 @@ fn getIntegerField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, de
     return @intCast(c.lua_tointeger(lua_state, -1));
 }
 
+fn checkDbus(result: c_int) !void {
+    if (result < 0) return error.DBusOperationFailed;
+}
+
 const Subscription = struct {
     bus: *Bus,
     stream: lua_coro.Stream = .{},
     handle_ref: c_int = -1,
     match_rule: ?[:0]const u8 = null,
+    slot: ?*systemd.sd_bus_slot = null,
     sender: ?[]const u8 = null,
     path: ?[]const u8 = null,
     path_namespace: ?[]const u8 = null,
@@ -129,9 +127,8 @@ const Subscription = struct {
     pub fn cancel(self: *Subscription, lua_state: *c.lua_State, mode: lua_coro.CancelMode) void {
         if (self.canceled) return;
         self.canceled = true;
-        if (self.match_rule) |rule| {
-            if (!self.bus.closed) dbus_c.dbus_bus_remove_match(self.bus.connection, rule.ptr, null);
-        }
+        if (self.slot) |slot| _ = systemd.sd_bus_slot_unref(slot);
+        self.slot = null;
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
         // End the stream last so a resumed reader observes the subscription
@@ -154,31 +151,6 @@ const Subscription = struct {
         self.deinit(allocator, lua_state);
         allocator.destroy(self);
     }
-
-    fn matches(self: *const Subscription, message: *dbus_c.DBusMessage) bool {
-        if (self.canceled) return false;
-        if (self.sender) |expected| {
-            const actual = dbus_c.dbus_message_get_sender(message) orelse return false;
-            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
-        }
-        if (self.interface) |expected| {
-            const actual = dbus_c.dbus_message_get_interface(message) orelse return false;
-            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
-        }
-        if (self.member) |expected| {
-            const actual = dbus_c.dbus_message_get_member(message) orelse return false;
-            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
-        }
-        if (self.path) |expected| {
-            const actual = dbus_c.dbus_message_get_path(message) orelse return false;
-            if (!std.mem.eql(u8, expected, std.mem.span(actual))) return false;
-        }
-        if (self.path_namespace) |expected| {
-            const actual = dbus_c.dbus_message_get_path(message) orelse return false;
-            if (!std.mem.startsWith(u8, std.mem.span(actual), expected)) return false;
-        }
-        return true;
-    }
 };
 
 const OwnedName = struct {
@@ -190,7 +162,7 @@ const OwnedName = struct {
     fn release(self: *OwnedName) void {
         if (self.released) return;
         self.released = true;
-        if (!self.bus.closed) _ = dbus_c.dbus_bus_release_name(self.bus.connection, self.name.ptr, null);
+        if (!self.bus.closed) _ = systemd.sd_bus_release_name(self.bus.connection, self.name.ptr);
         lua_handle.invalidate(self.bus.host.luaState(), self.handle_ref);
         self.handle_ref = -1;
     }
@@ -255,14 +227,14 @@ const BusLease = struct {
 const PendingReply = struct {
     bus: *Bus,
     /// The incoming call message, ref'd for the lifetime of the handler.
-    message: *dbus_c.DBusMessage,
+    message: *systemd.sd_bus_message,
     handle_ref: c_int = -1,
 
     /// Drops the handle and message without sending anything.
     fn destroy(self: *PendingReply, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         lua_handle.invalidate(lua_state, self.handle_ref);
         self.handle_ref = -1;
-        dbus_c.dbus_message_unref(self.message);
+        _ = systemd.sd_bus_message_unref(self.message);
         allocator.destroy(self);
     }
 };
@@ -272,14 +244,14 @@ const Call = struct {
     /// Registry ref of the coroutine parked on this call, or -1 while the
     /// call is still being armed.
     ref: c_int = -1,
-    pending: ?*dbus_c.DBusPendingCall = null,
+    slot: ?*systemd.sd_bus_slot = null,
     completed: bool = false,
 
     /// Resumes the parked caller with the reply table, or nil and an error
     /// name. Destroying an uncompleted call (bus close, teardown) never
     /// resumes: the await simply never returns and the coroutine becomes
     /// collectible once the ref is dropped.
-    fn complete(self: *Call) void {
+    fn complete(self: *Call, message: ?*systemd.sd_bus_message) void {
         if (self.completed) return;
         self.completed = true;
         if (self.ref < 0) return;
@@ -289,15 +261,14 @@ const Call = struct {
         const thread = c.lua_tothread(lua_state, -1).?;
         pop(lua_state, 1);
 
-        const reply = if (self.pending) |pending| dbus_c.dbus_pending_call_steal_reply(pending) else null;
-        if (reply) |message| {
-            defer dbus_c.dbus_message_unref(message);
-            if (dbus_c.dbus_message_get_type(message) == dbus_c.DBUS_MESSAGE_TYPE_ERROR) {
+        if (message) |reply| {
+            const dbus_error = systemd.sd_bus_message_get_error(reply);
+            if (dbus_error != null) {
                 c.lua_pushnil(thread);
-                pushOptionalDbusString(thread, dbus_c.dbus_message_get_error_name(message));
+                pushOptionalDbusString(thread, dbus_error[0].name);
                 lua_coro.resumeThread(thread, 2);
             } else {
-                pushDbusReply(thread, message);
+                pushDbusReply(thread, reply);
                 lua_coro.resumeThread(thread, 1);
             }
         } else {
@@ -308,14 +279,8 @@ const Call = struct {
     }
 
     fn deinit(self: *Call, lua_state: *c.lua_State) void {
-        if (self.pending) |pending| {
-            // Clearing the notify guarantees libdbus never calls back with
-            // this soon-to-be-freed state, regardless of cancel semantics.
-            _ = dbus_c.dbus_pending_call_set_notify(pending, null, null, null);
-            if (!self.completed) dbus_c.dbus_pending_call_cancel(pending);
-            dbus_c.dbus_pending_call_unref(pending);
-        }
-        self.pending = null;
+        if (self.slot) |slot| _ = systemd.sd_bus_slot_unref(slot);
+        self.slot = null;
         if (self.ref >= 0) c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, self.ref);
         self.ref = -1;
     }
@@ -329,8 +294,7 @@ const Call = struct {
 pub const Bus = struct {
     host: Host,
     kind: Kind,
-    connection: *dbus_c.DBusConnection,
-    fd: i32,
+    connection: *systemd.sd_bus,
     subscriptions: std.ArrayList(*Subscription) = .empty,
     pending_calls: std.ArrayList(*Call) = .empty,
     pending_replies: std.ArrayList(*PendingReply) = .empty,
@@ -341,13 +305,7 @@ pub const Bus = struct {
     refs: usize = 0,
     registered: bool = false,
     closed: bool = false,
-    /// True while dbus_connection_dispatch is on the C stack.
-    dispatching: bool = false,
-    /// Set when close() ran during dispatch; dispatch() finishes the
-    /// connection teardown once libdbus unwinds.
-    pending_close: bool = false,
-    filter_installed: bool = false,
-    source_handle: ?event_loop.EventLoop.SourceHandle = null,
+    filter_slot: ?*systemd.sd_bus_slot = null,
 
     pub fn create(host: Host, kind: Kind) !*Bus {
         const allocator = host.allocator();
@@ -360,59 +318,42 @@ pub const Bus = struct {
     }
 
     fn init(host: Host, kind: Kind) !Bus {
-        const connection = dbus_c.dbus_bus_get_private(kind.busType(), null) orelse return error.DBusUnavailable;
-        errdefer {
-            dbus_c.dbus_connection_close(connection);
-            dbus_c.dbus_connection_unref(connection);
-        }
-        dbus_c.dbus_connection_set_exit_on_disconnect(connection, 0);
-        var fd: c_int = -1;
-        if (dbus_c.dbus_connection_get_unix_fd(connection, &fd) == 0 or fd < 0) return error.DBusUnavailable;
+        var connection: ?*systemd.sd_bus = null;
+        const result = switch (kind) {
+            .session => systemd.sd_bus_open_user(&connection),
+            .system => systemd.sd_bus_open_system(&connection),
+        };
+        try checkDbus(result);
+        errdefer _ = systemd.sd_bus_flush_close_unref(connection);
+        try checkDbus(systemd.sd_bus_set_exit_on_disconnect(connection, 0));
         const self: Bus = .{
             .host = host,
             .kind = kind,
-            .connection = connection,
-            .fd = @intCast(fd),
+            .connection = connection.?,
         };
         return self;
     }
 
     fn installFilter(self: *Bus) !void {
-        if (self.filter_installed) return;
-        if (dbus_c.dbus_connection_add_filter(self.connection, dbusFilter, self, null) == 0) return error.OutOfMemory;
-        self.filter_installed = true;
+        if (self.filter_slot != null) return;
+        try checkDbus(systemd.sd_bus_add_filter(self.connection, &self.filter_slot, dbusFilter, self));
     }
 
     pub fn register(self: *Bus) !void {
         if (self.registered or self.closed) return;
-        const loop = self.host.eventLoop() orelse return;
-        self.source_handle = try loop.addFd(.{
-            .fd = self.fd,
-            .events = linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR,
-            .ctx = self,
-            .callback = dbusBusCallback,
-        });
-        errdefer {
-            if (self.source_handle) |handle| loop.removeSource(handle);
-            self.source_handle = null;
-            self.registered = false;
-        }
+        const bridge = try self.host.systemdEvent();
+        try checkDbus(systemd.sd_bus_attach_event(self.connection, bridge.sdEvent(), 0));
         self.registered = true;
     }
 
     pub fn unregister(self: *Bus) void {
-        if (self.host.eventLoop()) |loop| if (self.source_handle) |handle| loop.removeSource(handle);
-        self.source_handle = null;
+        if (self.registered) _ = systemd.sd_bus_detach_event(self.connection);
         self.registered = false;
     }
 
     pub fn close(self: *Bus) void {
         if (self.closed) return;
-        if (self.registered) {
-            if (self.host.eventLoop()) |loop| if (self.source_handle) |handle| loop.removeSource(handle);
-            self.registered = false;
-            self.source_handle = null;
-        }
+        self.unregister();
         const lua_state = self.host.luaState();
         // Drop parked readers without resuming them: close may already be
         // on the C stack of a resumed waiter (see pending calls below).
@@ -441,10 +382,8 @@ pub const Bus = struct {
         for (self.pending_replies.items) |pending| pending.destroy(self.host.allocator(), lua_state);
         self.pending_replies.clearRetainingCapacity();
 
-        if (self.filter_installed) {
-            dbus_c.dbus_connection_remove_filter(self.connection, dbusFilter, self);
-            self.filter_installed = false;
-        }
+        if (self.filter_slot) |slot| _ = systemd.sd_bus_slot_unref(slot);
+        self.filter_slot = null;
         self.closed = true;
 
         // Close may come from teardown rather than the last lease release;
@@ -458,21 +397,11 @@ pub const Bus = struct {
         self.refs = 0;
         clearSharedBus(lua_state, self);
 
-        // When close is triggered by a coroutine resumed from inside
-        // dbus_connection_dispatch, the connection must stay alive until
-        // libdbus unwinds; dispatch() finishes the job.
-        if (self.dispatching) {
-            self.pending_close = true;
-            return;
-        }
         self.finishClose();
     }
 
     fn finishClose(self: *Bus) void {
-        self.pending_close = false;
-        dbus_c.dbus_connection_close(self.connection);
-        dbus_c.dbus_connection_unref(self.connection);
-        self.fd = invalid_fd;
+        _ = systemd.sd_bus_flush_close_unref(self.connection);
     }
 
     fn deinit(self: *Bus, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -510,7 +439,13 @@ pub const Bus = struct {
         };
         errdefer subscription.deinit(self.host.allocator(), lua_state);
         subscription.match_rule = try buildDbusMatchRule(self.host.allocator(), subscription);
-        dbus_c.dbus_bus_add_match(self.connection, subscription.match_rule.?.ptr, null);
+        try checkDbus(systemd.sd_bus_add_match(
+            self.connection,
+            &subscription.slot,
+            subscription.match_rule.?.ptr,
+            dbusSubscriptionCallback,
+            subscription,
+        ));
 
         try self.subscriptions.append(self.host.allocator(), subscription);
         return subscription;
@@ -518,14 +453,14 @@ pub const Bus = struct {
 
     fn requestName(self: *Bus, lua_state: *c.lua_State, options_index: c_int) !*OwnedName {
         const name = try stringFromStack(lua_state, options_index);
-        var flags: c_uint = 0;
+        var flags: u64 = systemd.SD_BUS_NAME_QUEUE;
         if (c.lua_type(lua_state, options_index + 1) == c.LUA_TTABLE) {
-            if (boolField(lua_state, options_index + 1, "allow_replacement")) flags |= 0x1;
-            if (boolField(lua_state, options_index + 1, "replace_existing")) flags |= 0x2;
-            if (boolField(lua_state, options_index + 1, "do_not_queue")) flags |= 0x4;
+            if (boolField(lua_state, options_index + 1, "allow_replacement")) flags |= systemd.SD_BUS_NAME_ALLOW_REPLACEMENT;
+            if (boolField(lua_state, options_index + 1, "replace_existing")) flags |= systemd.SD_BUS_NAME_REPLACE_EXISTING;
+            if (boolField(lua_state, options_index + 1, "do_not_queue")) flags &= ~@as(u64, systemd.SD_BUS_NAME_QUEUE);
         }
-        const result = dbus_c.dbus_bus_request_name(self.connection, tryZTemp(name).ptr, flags, null);
-        if (result != 1 and result != 4) return error.DBusNameUnavailable;
+        const result = systemd.sd_bus_request_name(self.connection, tryZTemp(name).ptr, flags);
+        if (result <= 0) return error.DBusNameUnavailable;
 
         const owned = try self.host.allocator().create(OwnedName);
         errdefer self.host.allocator().destroy(owned);
@@ -545,7 +480,7 @@ pub const Bus = struct {
                 return;
             }
         }
-        if (!self.closed) _ = dbus_c.dbus_bus_release_name(self.connection, tryZTemp(name).ptr, null);
+        if (!self.closed) _ = systemd.sd_bus_release_name(self.connection, tryZTemp(name).ptr);
     }
 
     fn exportObject(self: *Bus, lua_state: *c.lua_State, path_index: c_int, spec_index: c_int) !*ExportedObject {
@@ -580,12 +515,10 @@ pub const Bus = struct {
         const path = try stringField(lua_state, options_index, "path");
         const interface = try stringField(lua_state, options_index, "interface");
         const member = try stringField(lua_state, options_index, "member");
-        const message = dbus_c.dbus_message_new_method_call(destination.ptr, path.ptr, interface.ptr, member.ptr) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(message);
-
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(message, &iter);
-        try appendDbusLuaArgs(lua_state, options_index, &iter);
+        var message: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_method_call(self.connection, &message, destination.ptr, path.ptr, interface.ptr, member.ptr));
+        defer _ = systemd.sd_bus_message_unref(message);
+        try appendDbusLuaArgs(lua_state, options_index, message.?);
 
         const timeout_ms = getIntegerField(lua_state, options_index, "timeout_ms", 1000);
         const call_state = try self.host.allocator().create(Call);
@@ -593,17 +526,20 @@ pub const Bus = struct {
         call_state.* = .{ .bus = self };
         errdefer call_state.deinit(lua_state);
 
-        var pending: ?*dbus_c.DBusPendingCall = null;
-        if (dbus_c.dbus_connection_send_with_reply(self.connection, message, &pending, @intCast(timeout_ms)) == 0) return error.OutOfMemory;
-        call_state.pending = pending orelse return error.DBusCallFailed;
-
         try self.pending_calls.append(self.host.allocator(), call_state);
         errdefer _ = self.removePendingCall(call_state);
-        if (dbus_c.dbus_pending_call_set_notify(call_state.pending, dbusCallNotify, call_state, null) == 0) return error.OutOfMemory;
+        const call_result = systemd.sd_bus_call_async(
+            self.connection,
+            &call_state.slot,
+            message,
+            dbusCallNotify,
+            call_state,
+            @as(u64, @intCast(timeout_ms)) * std.time.us_per_ms,
+        );
+        if (call_result < 0) return error.DBusCallFailed;
         // The ref transfers only once nothing can fail, so the errdefer
         // above and the call's deinit never unref twice.
         call_state.ref = thread_ref;
-        dbus_c.dbus_connection_flush(self.connection);
     }
 
     fn removePendingCall(self: *Bus, pending_call: *Call) bool {
@@ -616,48 +552,22 @@ pub const Bus = struct {
         return false;
     }
 
-    fn dispatch(self: *Bus) void {
-        // A dispatched message may resume a coroutine that closes this bus
-        // (e.g. releasing the last lease); close() then defers the real
-        // connection teardown to here, after libdbus is off the C stack.
-        self.dispatching = true;
-        defer {
-            self.dispatching = false;
-            if (self.pending_close) self.finishClose();
-        }
-        _ = dbus_c.dbus_connection_read_write(self.connection, 0);
-        while (!self.pending_close and
-            dbus_c.dbus_connection_dispatch(self.connection) == dbus_c.DBUS_DISPATCH_DATA_REMAINS)
-        {}
-    }
-
     fn emitSignal(self: *Bus, lua_state: *c.lua_State, options_index: c_int) !void {
         const path = try stringField(lua_state, options_index, "path");
         const interface = try stringField(lua_state, options_index, "interface");
         const member = try stringField(lua_state, options_index, "member");
-        const message = dbus_c.dbus_message_new_signal(path.ptr, interface.ptr, member.ptr) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(message);
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(message, &iter);
-        try appendDbusLuaArgs(lua_state, options_index, &iter);
-        if (dbus_c.dbus_connection_send(self.connection, message, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+        var message: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_signal(self.connection, &message, path.ptr, interface.ptr, member.ptr));
+        defer _ = systemd.sd_bus_message_unref(message);
+        try appendDbusLuaArgs(lua_state, options_index, message.?);
+        try checkDbus(systemd.sd_bus_send(self.connection, message, null));
     }
 
-    fn handleSignal(self: *Bus, message: *dbus_c.DBusMessage) !void {
-        const lua_state = self.host.luaState();
-        for (self.subscriptions.items) |subscription| {
-            if (!subscription.matches(message)) continue;
-            pushDbusSignal(lua_state, message);
-            try subscription.stream.deliver(self.host.allocator(), lua_state);
-        }
-    }
-
-    fn handleMethodCall(self: *Bus, message: *dbus_c.DBusMessage) !bool {
-        const path_z = dbus_c.dbus_message_get_path(message) orelse return false;
+    fn handleMethodCall(self: *Bus, message: *systemd.sd_bus_message) !bool {
+        const path_z = optionalSystemdString(systemd.sd_bus_message_get_path(message)) orelse return false;
         const object = self.exportedObjectForPath(path_z) orelse return false;
-        const interface_z = dbus_c.dbus_message_get_interface(message) orelse return false;
-        const member_z = dbus_c.dbus_message_get_member(message) orelse return false;
+        const interface_z = optionalSystemdString(systemd.sd_bus_message_get_interface(message)) orelse return false;
+        const member_z = optionalSystemdString(systemd.sd_bus_message_get_member(message)) orelse return false;
         const interface = std.mem.span(interface_z);
         const member = std.mem.span(member_z);
 
@@ -676,7 +586,7 @@ pub const Bus = struct {
         return try self.callExportedMethod(object, message, interface, member);
     }
 
-    fn callExportedMethod(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, member: []const u8) !bool {
+    fn callExportedMethod(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, interface: []const u8, member: []const u8) !bool {
         const lua_state = self.host.luaState();
         const original_top = c.lua_gettop(lua_state);
         defer c.lua_settop(lua_state, original_top);
@@ -699,10 +609,9 @@ pub const Bus = struct {
         // so a handler that never yields replies before dispatch returns.
         const allocator = self.host.allocator();
         const pending = try allocator.create(PendingReply);
-        _ = dbus_c.dbus_message_ref(message);
-        pending.* = .{ .bus = self, .message = message };
+        pending.* = .{ .bus = self, .message = systemd.sd_bus_message_ref(message).? };
         self.pending_replies.append(allocator, pending) catch |err| {
-            dbus_c.dbus_message_unref(message);
+            _ = systemd.sd_bus_message_unref(pending.message);
             allocator.destroy(pending);
             return err;
         };
@@ -737,7 +646,7 @@ pub const Bus = struct {
         return false;
     }
 
-    fn handlePropertiesMethod(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, member: []const u8) !void {
+    fn handlePropertiesMethod(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, member: []const u8) !void {
         if (std.mem.eql(u8, member, "Get")) {
             const pair = methodCallStringPair(message) orelse {
                 try self.replyError(message, "org.freedesktop.DBus.Error.InvalidArgs", "Get requires interface and property");
@@ -761,63 +670,67 @@ pub const Bus = struct {
         }
     }
 
-    fn replyValues(self: *Bus, message: *dbus_c.DBusMessage, lua_state: *c.lua_State, first_index: c_int, count: usize) !void {
-        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(reply);
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(reply, &iter);
+    fn replyValues(self: *Bus, message: *systemd.sd_bus_message, lua_state: *c.lua_State, first_index: c_int, count: usize) !void {
+        var reply: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_method_return(message, &reply));
+        defer _ = systemd.sd_bus_message_unref(reply);
         var offset: usize = 0;
         while (offset < count) : (offset += 1) {
             const index = first_index + @as(c_int, @intCast(offset));
             if (c.lua_isnil(lua_state, index)) continue;
-            try appendLuaValueToDbusIter(lua_state, index, &iter);
+            try appendLuaValueToDbusIter(lua_state, index, reply.?);
         }
-        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+        try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
     }
 
-    fn replyString(self: *Bus, message: *dbus_c.DBusMessage, value: []const u8) !void {
-        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(reply);
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(reply, &iter);
-        var value_z = tryZTemp(value);
-        try appendDbusBasic(&iter, dbus_c.DBUS_TYPE_STRING, &value_z.ptr);
-        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+    fn replyString(self: *Bus, message: *systemd.sd_bus_message, value: []const u8) !void {
+        var reply: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_method_return(message, &reply));
+        defer _ = systemd.sd_bus_message_unref(reply);
+        const value_z = try self.host.allocator().dupeZ(u8, value);
+        defer self.host.allocator().free(value_z);
+        try appendDbusBasic(reply.?, systemd.SD_BUS_TYPE_STRING, value_z.ptr);
+        try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
     }
 
-    fn replyError(self: *Bus, message: *dbus_c.DBusMessage, name: []const u8, text: []const u8) !void {
-        const error_message = dbus_c.dbus_message_new_error(message, tryZTemp(name).ptr, tryZTemp(text).ptr) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(error_message);
-        if (dbus_c.dbus_connection_send(self.connection, error_message, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+    fn replyError(self: *Bus, message: *systemd.sd_bus_message, name: []const u8, text: []const u8) !void {
+        const allocator = self.host.allocator();
+        const name_z = try allocator.dupeZ(u8, name);
+        defer allocator.free(name_z);
+        const text_z = try allocator.dupeZ(u8, text);
+        defer allocator.free(text_z);
+        var error_message: ?*systemd.sd_bus_message = null;
+        var dbus_error: systemd.sd_bus_error = .{
+            .name = name_z.ptr,
+            .message = text_z.ptr,
+            ._need_free = 0,
+        };
+        try checkDbus(systemd.sd_bus_message_new_method_error(message, &error_message, &dbus_error));
+        defer _ = systemd.sd_bus_message_unref(error_message);
+        try checkDbus(systemd.sd_bus_send(self.connection, error_message, null));
     }
 
-    fn replyPropertyGet(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, property: []const u8) !void {
+    fn replyPropertyGet(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, interface: []const u8, property: []const u8) !void {
         const lua_state = self.host.luaState();
         const original_top = c.lua_gettop(lua_state);
         defer c.lua_settop(lua_state, original_top);
         try pushPropertyGetterResult(lua_state, object, interface, property);
         const signature = try propertySignature(lua_state, object, interface, property);
 
-        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(reply);
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(reply, &iter);
-        var variant: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
-        try appendLuaValueWithSignature(lua_state, -1, signature, &variant);
-        if (dbus_c.dbus_message_iter_close_container(&iter, &variant) == 0) return error.OutOfMemory;
-        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+        var reply: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_method_return(message, &reply));
+        defer _ = systemd.sd_bus_message_unref(reply);
+        try openDbusContainer(reply.?, systemd.SD_BUS_TYPE_VARIANT, signature);
+        try appendLuaValueWithSignature(lua_state, -1, signature, reply.?);
+        try closeDbusContainer(reply.?);
+        try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
     }
 
     /// Handles org.freedesktop.DBus.Properties.Set: unwraps the variant
     /// into a Lua value, invokes the exported property's `set` function,
     /// and replies with an empty method return. Properties without a `set`
     /// function are read-only.
-    fn replyPropertySet(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8, property: []const u8) !void {
+    fn replyPropertySet(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, interface: []const u8, property: []const u8) !void {
         const lua_state = self.host.luaState();
         const original_top = c.lua_gettop(lua_state);
         defer c.lua_settop(lua_state, original_top);
@@ -851,17 +764,15 @@ pub const Bus = struct {
         try self.replyValues(message, lua_state, original_top, 0);
     }
 
-    fn replyPropertiesGetAll(self: *Bus, object: *ExportedObject, message: *dbus_c.DBusMessage, interface: []const u8) !void {
+    fn replyPropertiesGetAll(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, interface: []const u8) !void {
         const lua_state = self.host.luaState();
         const original_top = c.lua_gettop(lua_state);
         defer c.lua_settop(lua_state, original_top);
 
-        const reply = dbus_c.dbus_message_new_method_return(message) orelse return error.OutOfMemory;
-        defer dbus_c.dbus_message_unref(reply);
-        var iter: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_init_append(reply, &iter);
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
+        var reply: ?*systemd.sd_bus_message = null;
+        try checkDbus(systemd.sd_bus_message_new_method_return(message, &reply));
+        defer _ = systemd.sd_bus_message_unref(reply);
+        try openDbusContainer(reply.?, systemd.SD_BUS_TYPE_ARRAY, "{sv}");
 
         c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, object.ref);
         c.lua_getfield(lua_state, -1, tryZTemp(interface).ptr);
@@ -891,49 +802,47 @@ pub const Bus = struct {
                         pop(lua_state, 2);
                         continue;
                     }
-                    try appendPropertyDictEntry(lua_state, &array, property_name, signature, -1);
+                    try appendPropertyDictEntry(lua_state, reply.?, property_name, signature, -1);
                     pop(lua_state, 2);
                 }
             }
         }
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
-        if (dbus_c.dbus_connection_send(self.connection, reply, null) == 0) return error.OutOfMemory;
-        dbus_c.dbus_connection_flush(self.connection);
+        try closeDbusContainer(reply.?);
+        try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
     }
 };
 
-fn dbusCallNotify(_: ?*dbus_c.DBusPendingCall, user_data: ?*anyopaque) callconv(.c) void {
-    const call: *Call = @ptrCast(@alignCast(user_data orelse return));
-    call.complete();
+fn dbusCallNotify(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*c]systemd.sd_bus_error) callconv(.c) c_int {
+    const call: *Call = @ptrCast(@alignCast(user_data orelse return 0));
+    call.complete(message);
     _ = call.bus.removePendingCall(call);
     call.destroy(call.bus.host.allocator(), call.bus.host.luaState());
+    return 0;
 }
 
-fn dbusBusCallback(ctx: *anyopaque, _: *event_loop.EventLoop, _: u32) !void {
-    const bus: *Bus = @ptrCast(@alignCast(ctx));
-    if (bus.closed) return;
-    bus.dispatch();
+fn dbusSubscriptionCallback(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*c]systemd.sd_bus_error) callconv(.c) c_int {
+    const subscription: *Subscription = @ptrCast(@alignCast(user_data orelse return 0));
+    if (subscription.canceled or subscription.bus.closed) return 0;
+    const bus = subscription.bus;
+    const lua_state = bus.host.luaState();
+    pushDbusSignal(lua_state, message orelse return 0);
+    subscription.stream.deliver(bus.host.allocator(), lua_state) catch |err| {
+        std.log.scoped(.keywork_luajit).warn("dbus signal dispatch failed: {}", .{err});
+    };
+    return 0;
 }
 
-fn dbusFilter(_: ?*dbus_c.DBusConnection, message: ?*dbus_c.DBusMessage, user_data: ?*anyopaque) callconv(.c) dbus_c.DBusHandlerResult {
-    const bus: *Bus = @ptrCast(@alignCast(user_data orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
-    const msg = message orelse return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-    switch (dbus_c.dbus_message_get_type(msg)) {
-        dbus_c.DBUS_MESSAGE_TYPE_SIGNAL => {
-            bus.handleSignal(msg) catch |err| {
-                std.log.scoped(.keywork_luajit).warn("dbus signal dispatch failed: {}", .{err});
-            };
-            return dbus_c.DBUS_HANDLER_RESULT_HANDLED;
-        },
-        dbus_c.DBUS_MESSAGE_TYPE_METHOD_CALL => {
-            const handled = bus.handleMethodCall(msg) catch |err| blk: {
-                std.log.scoped(.keywork_luajit).warn("dbus method dispatch failed: {}", .{err});
-                break :blk true;
-            };
-            return if (handled) dbus_c.DBUS_HANDLER_RESULT_HANDLED else dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-        },
-        else => return dbus_c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED,
-    }
+fn dbusFilter(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*c]systemd.sd_bus_error) callconv(.c) c_int {
+    const bus: *Bus = @ptrCast(@alignCast(user_data orelse return 0));
+    if (bus.closed) return 0;
+    const msg = message orelse return 0;
+    var message_type: u8 = 0;
+    if (systemd.sd_bus_message_get_type(msg, &message_type) < 0 or message_type != systemd.SD_BUS_MESSAGE_METHOD_CALL) return 0;
+    const handled = bus.handleMethodCall(msg) catch |err| blk: {
+        std.log.scoped(.keywork_luajit).warn("dbus method dispatch failed: {}", .{err});
+        break :blk true;
+    };
+    return if (handled) 1 else 0;
 }
 
 fn luaDbusString(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -1166,11 +1075,12 @@ fn luaDbusUniqueName(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushlstring(lua_state, "closed", "closed".len);
         return 2;
     };
-    const name = dbus_c.dbus_bus_get_unique_name(bus.connection) orelse {
+    var name: [*c]const u8 = null;
+    if (systemd.sd_bus_get_unique_name(bus.connection, &name) < 0 or name == null) {
         c.lua_pushnil(lua_state);
         c.lua_pushlstring(lua_state, "no unique name", "no unique name".len);
         return 2;
-    };
+    }
     const span = std.mem.span(name);
     c.lua_pushlstring(lua_state, span.ptr, span.len);
     return 1;
@@ -1290,7 +1200,7 @@ fn luaUnexportDbusObject(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-fn appendDbusLuaArgs(lua_state: *c.lua_State, options_index: c_int, iter: *dbus_c.DBusMessageIter) !void {
+fn appendDbusLuaArgs(lua_state: *c.lua_State, options_index: c_int, message: *systemd.sd_bus_message) !void {
     c.lua_getfield(lua_state, options_index, "args");
     defer pop(lua_state, 1);
     if (c.lua_isnil(lua_state, -1)) return;
@@ -1309,65 +1219,64 @@ fn appendDbusLuaArgs(lua_state: *c.lua_State, options_index: c_int, iter: *dbus_
             pop(lua_state, 1);
             return;
         }
-        try appendLuaValueToDbusIter(lua_state, -1, iter);
+        try appendLuaValueToDbusIter(lua_state, -1, message);
         pop(lua_state, 1);
     }
 }
 
-fn appendLuaValueToDbusIter(lua_state: *c.lua_State, index: c_int, iter: *dbus_c.DBusMessageIter) anyerror!void {
+fn appendLuaValueToDbusIter(lua_state: *c.lua_State, index: c_int, message: *systemd.sd_bus_message) anyerror!void {
     const absolute = absoluteIndex(lua_state, index);
     if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) {
         c.lua_getfield(lua_state, absolute, "__dbus_type");
         defer pop(lua_state, 1);
         if (!c.lua_isnil(lua_state, -1)) {
             const type_name = try stringFromStack(lua_state, -1);
-            if (std.mem.eql(u8, type_name, "string")) return appendTypedField(lua_state, absolute, "s", iter);
-            if (std.mem.eql(u8, type_name, "object_path")) return appendTypedField(lua_state, absolute, "o", iter);
-            if (std.mem.eql(u8, type_name, "boolean")) return appendTypedField(lua_state, absolute, "b", iter);
-            if (std.mem.eql(u8, type_name, "int32")) return appendTypedField(lua_state, absolute, "i", iter);
-            if (std.mem.eql(u8, type_name, "uint32")) return appendTypedField(lua_state, absolute, "u", iter);
-            if (std.mem.eql(u8, type_name, "double")) return appendTypedField(lua_state, absolute, "d", iter);
-            if (std.mem.eql(u8, type_name, "array")) return appendTypedArray(lua_state, absolute, iter);
-            if (std.mem.eql(u8, type_name, "variant")) return appendTypedVariant(lua_state, absolute, iter);
+            if (std.mem.eql(u8, type_name, "string")) return appendTypedField(lua_state, absolute, "s", message);
+            if (std.mem.eql(u8, type_name, "object_path")) return appendTypedField(lua_state, absolute, "o", message);
+            if (std.mem.eql(u8, type_name, "boolean")) return appendTypedField(lua_state, absolute, "b", message);
+            if (std.mem.eql(u8, type_name, "int32")) return appendTypedField(lua_state, absolute, "i", message);
+            if (std.mem.eql(u8, type_name, "uint32")) return appendTypedField(lua_state, absolute, "u", message);
+            if (std.mem.eql(u8, type_name, "double")) return appendTypedField(lua_state, absolute, "d", message);
+            if (std.mem.eql(u8, type_name, "array")) return appendTypedArray(lua_state, absolute, message);
+            if (std.mem.eql(u8, type_name, "variant")) return appendTypedVariant(lua_state, absolute, message);
             return error.UnsupportedDbusArgument;
         }
     }
     switch (c.lua_type(lua_state, absolute)) {
-        c.LUA_TSTRING => try appendLuaValueWithSignature(lua_state, absolute, "s", iter),
-        c.LUA_TBOOLEAN => try appendLuaValueWithSignature(lua_state, absolute, "b", iter),
-        c.LUA_TNUMBER => try appendLuaValueWithSignature(lua_state, absolute, "d", iter),
+        c.LUA_TSTRING => try appendLuaValueWithSignature(lua_state, absolute, "s", message),
+        c.LUA_TBOOLEAN => try appendLuaValueWithSignature(lua_state, absolute, "b", message),
+        c.LUA_TNUMBER => try appendLuaValueWithSignature(lua_state, absolute, "d", message),
         else => return error.UnsupportedDbusArgument,
     }
 }
 
-fn appendTypedField(lua_state: *c.lua_State, table: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+fn appendTypedField(lua_state: *c.lua_State, table: c_int, signature: []const u8, message: *systemd.sd_bus_message) !void {
     c.lua_getfield(lua_state, table, "value");
     defer pop(lua_state, 1);
-    try appendLuaValueWithSignature(lua_state, -1, signature, iter);
+    try appendLuaValueWithSignature(lua_state, -1, signature, message);
 }
 
-fn appendTypedArray(lua_state: *c.lua_State, table: c_int, iter: *dbus_c.DBusMessageIter) !void {
+fn appendTypedArray(lua_state: *c.lua_State, table: c_int, message: *systemd.sd_bus_message) !void {
     c.lua_getfield(lua_state, table, "signature");
     const signature = try stringFromStack(lua_state, -1);
     defer pop(lua_state, 1);
     c.lua_getfield(lua_state, table, "value");
     defer pop(lua_state, 1);
-    try appendArrayWithSignature(lua_state, -1, signature, iter);
+    try appendArrayWithSignature(lua_state, -1, signature, message);
 }
 
-fn appendTypedVariant(lua_state: *c.lua_State, table: c_int, iter: *dbus_c.DBusMessageIter) !void {
+fn appendTypedVariant(lua_state: *c.lua_State, table: c_int, message: *systemd.sd_bus_message) !void {
     c.lua_getfield(lua_state, table, "signature");
     const signature = try stringFromStack(lua_state, -1);
     defer pop(lua_state, 1);
     c.lua_getfield(lua_state, table, "value");
     defer pop(lua_state, 1);
-    var variant: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
-    try appendLuaValueWithSignature(lua_state, -1, signature, &variant);
-    if (dbus_c.dbus_message_iter_close_container(iter, &variant) == 0) return error.OutOfMemory;
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, signature);
+    try appendLuaValueWithSignature(lua_state, -1, signature, message);
+    try closeDbusContainer(message);
 }
 
-fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) anyerror!void {
+fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, message: *systemd.sd_bus_message) anyerror!void {
     if (signature.len == 0) return;
     const absolute = absoluteIndex(lua_state, index);
     if (c.lua_type(lua_state, absolute) == c.LUA_TTABLE) {
@@ -1375,64 +1284,63 @@ fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature:
         if (!c.lua_isnil(lua_state, -1)) {
             const type_name = try stringFromStack(lua_state, -1);
             pop(lua_state, 1);
-            if (std.mem.eql(u8, type_name, "array") or std.mem.eql(u8, type_name, "variant")) return appendLuaValueToDbusIter(lua_state, absolute, iter);
+            if (std.mem.eql(u8, type_name, "array") or std.mem.eql(u8, type_name, "variant")) return appendLuaValueToDbusIter(lua_state, absolute, message);
             c.lua_getfield(lua_state, absolute, "value");
             defer pop(lua_state, 1);
-            return appendLuaValueWithSignature(lua_state, -1, signature, iter);
+            return appendLuaValueWithSignature(lua_state, -1, signature, message);
         }
         pop(lua_state, 1);
     }
-    if (signature[0] == 'a') return appendArrayWithSignature(lua_state, index, signature[1..], iter);
-    if (signature[0] == '(') return appendStructWithSignature(lua_state, index, signature, iter);
+    if (signature[0] == 'a') return appendArrayWithSignature(lua_state, index, signature[1..], message);
+    if (signature[0] == '(') return appendStructWithSignature(lua_state, index, signature, message);
     switch (signature[0]) {
         's' => {
-            var value = tryZTemp(try stringFromStack(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_STRING, &value.ptr);
+            const value = tryZTemp(try stringFromStack(lua_state, index));
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, value.ptr);
         },
         'o' => {
-            var value = tryZTemp(try stringFromStack(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_OBJECT_PATH, &value.ptr);
+            const value = tryZTemp(try stringFromStack(lua_state, index));
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_OBJECT_PATH, value.ptr);
         },
         'b' => {
-            var value: dbus_c.dbus_bool_t = if (c.lua_toboolean(lua_state, index) != 0) 1 else 0;
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BOOLEAN, &value);
+            var value: c_int = if (c.lua_toboolean(lua_state, index) != 0) 1 else 0;
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_BOOLEAN, &value);
         },
         'i' => {
             var value: i32 = @intCast(c.lua_tointeger(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_INT32, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_INT32, &value);
         },
         'u' => {
             var value: u32 = @intCast(c.lua_tointeger(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_UINT32, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_UINT32, &value);
         },
         'y' => {
             var value: u8 = @intCast(c.lua_tointeger(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_BYTE, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_BYTE, &value);
         },
         'n' => {
             var value: i16 = @intCast(c.lua_tointeger(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_INT16, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_INT16, &value);
         },
         'q' => {
             var value: u16 = @intCast(c.lua_tointeger(lua_state, index));
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_UINT16, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_UINT16, &value);
         },
         'd' => {
             var value: f64 = c.lua_tonumber(lua_state, index);
-            try appendDbusBasic(iter, dbus_c.DBUS_TYPE_DOUBLE, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_DOUBLE, &value);
         },
-        'v' => try appendLuaValueToDbusIter(lua_state, index, iter),
+        'v' => try appendLuaValueToDbusIter(lua_state, index, message),
         else => return error.UnsupportedDbusArgument,
     }
 }
 
-fn appendArrayWithSignature(lua_state: *c.lua_State, index: c_int, element_signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+fn appendArrayWithSignature(lua_state: *c.lua_State, index: c_int, element_signature: []const u8, message: *systemd.sd_bus_message) !void {
     try expectType(lua_state, index, c.LUA_TTABLE);
-    var array: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_ARRAY, tryZTemp(element_signature).ptr, &array) == 0) return error.OutOfMemory;
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, element_signature);
     const table = absoluteIndex(lua_state, index);
     if (element_signature.len > 0 and element_signature[0] == '{') {
-        try appendDictEntries(lua_state, table, element_signature, &array);
+        try appendDictEntries(lua_state, table, element_signature, message);
     } else {
         var item_index: c_int = 1;
         while (true) : (item_index += 1) {
@@ -1441,16 +1349,16 @@ fn appendArrayWithSignature(lua_state: *c.lua_State, index: c_int, element_signa
                 pop(lua_state, 1);
                 break;
             }
-            try appendLuaValueWithSignature(lua_state, -1, element_signature, &array);
+            try appendLuaValueWithSignature(lua_state, -1, element_signature, message);
             pop(lua_state, 1);
         }
     }
-    if (dbus_c.dbus_message_iter_close_container(iter, &array) == 0) return error.OutOfMemory;
+    try closeDbusContainer(message);
 }
 
 /// Appends a Lua map as D-Bus dict entries. `element_signature` is the
 /// full entry signature including braces (e.g. `{sv}`).
-fn appendDictEntries(lua_state: *c.lua_State, table: c_int, element_signature: []const u8, array: *dbus_c.DBusMessageIter) !void {
+fn appendDictEntries(lua_state: *c.lua_State, table: c_int, element_signature: []const u8, message: *systemd.sd_bus_message) !void {
     if (element_signature.len < 4 or element_signature[element_signature.len - 1] != '}') return error.InvalidDbusSignature;
     const inner = element_signature[1 .. element_signature.len - 1];
     const key_length = try signatureElementLength(inner);
@@ -1460,38 +1368,36 @@ fn appendDictEntries(lua_state: *c.lua_State, table: c_int, element_signature: [
 
     c.lua_pushnil(lua_state);
     while (c.lua_next(lua_state, table) != 0) {
-        var entry: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_DICT_ENTRY, inner);
         // Append a copy of the key: serializing may lua_tolstring it,
         // and converting the original in place would corrupt lua_next.
         c.lua_pushvalue(lua_state, -2);
-        try appendLuaValueWithSignature(lua_state, -1, key_signature, &entry);
+        try appendLuaValueWithSignature(lua_state, -1, key_signature, message);
         pop(lua_state, 1);
-        try appendLuaValueWithSignature(lua_state, -1, value_signature, &entry);
-        if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+        try appendLuaValueWithSignature(lua_state, -1, value_signature, message);
+        try closeDbusContainer(message);
         pop(lua_state, 1);
     }
 }
 
 /// Appends a positional Lua sequence as a D-Bus struct. `signature`
 /// includes the surrounding parentheses (e.g. `(sa(us))`).
-fn appendStructWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, iter: *dbus_c.DBusMessageIter) !void {
+fn appendStructWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, message: *systemd.sd_bus_message) !void {
     if (signature.len < 3 or signature[signature.len - 1] != ')') return error.InvalidDbusSignature;
     try expectType(lua_state, index, c.LUA_TTABLE);
     const table = absoluteIndex(lua_state, index);
-    var strukt: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(iter, dbus_c.DBUS_TYPE_STRUCT, null, &strukt) == 0) return error.OutOfMemory;
     const fields = signature[1 .. signature.len - 1];
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_STRUCT, fields);
     var offset: usize = 0;
     var item_index: c_int = 1;
     while (offset < fields.len) : (item_index += 1) {
         const field_length = try signatureElementLength(fields[offset..]);
         c.lua_rawgeti(lua_state, table, item_index);
         defer pop(lua_state, 1);
-        try appendLuaValueWithSignature(lua_state, -1, fields[offset..][0..field_length], &strukt);
+        try appendLuaValueWithSignature(lua_state, -1, fields[offset..][0..field_length], message);
         offset += field_length;
     }
-    if (dbus_c.dbus_message_iter_close_container(iter, &strukt) == 0) return error.OutOfMemory;
+    try closeDbusContainer(message);
 }
 
 /// Length of the first complete single type in a D-Bus signature.
@@ -1518,21 +1424,26 @@ fn matchedContainerLength(signature: []const u8, open: u8, close: u8) error{Inva
     return error.InvalidDbusSignature;
 }
 
-fn appendPropertyDictEntry(lua_state: *c.lua_State, array: *dbus_c.DBusMessageIter, name: []const u8, signature: []const u8, value_index: c_int) !void {
-    var entry: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
-    var name_z = tryZTemp(name);
-    try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &name_z.ptr);
-    var variant: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, tryZTemp(signature).ptr, &variant) == 0) return error.OutOfMemory;
-    try appendLuaValueWithSignature(lua_state, value_index, signature, &variant);
-    if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
-    if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+fn appendPropertyDictEntry(lua_state: *c.lua_State, message: *systemd.sd_bus_message, name: []const u8, signature: []const u8, value_index: c_int) !void {
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_DICT_ENTRY, "sv");
+    try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, tryZTemp(name).ptr);
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, signature);
+    try appendLuaValueWithSignature(lua_state, value_index, signature, message);
+    try closeDbusContainer(message);
+    try closeDbusContainer(message);
 }
 
-fn appendDbusBasic(iter: *dbus_c.DBusMessageIter, type_: c_int, value: anytype) !void {
+fn appendDbusBasic(message: *systemd.sd_bus_message, type_: c_int, value: anytype) !void {
     const opaque_value: *const anyopaque = @ptrCast(value);
-    if (dbus_c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
+    try checkDbus(systemd.sd_bus_message_append_basic(message, @intCast(type_), opaque_value));
+}
+
+fn openDbusContainer(message: *systemd.sd_bus_message, type_: c_int, contents: []const u8) !void {
+    try checkDbus(systemd.sd_bus_message_open_container(message, @intCast(type_), tryZTemp(contents).ptr));
+}
+
+fn closeDbusContainer(message: *systemd.sd_bus_message) !void {
+    try checkDbus(systemd.sd_bus_message_close_container(message));
 }
 
 fn buildDbusMatchRule(allocator: std.mem.Allocator, subscription: *const Subscription) ![:0]const u8 {
@@ -1553,21 +1464,21 @@ fn appendDbusMatchField(writer: *std.Io.Writer, name: []const u8, value: ?[]cons
     try writer.print(",{s}='{s}'", .{ name, field });
 }
 
-fn pushDbusSignal(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+fn pushDbusSignal(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
     c.lua_createtable(lua_state, 0, 6);
     const table = c.lua_gettop(lua_state);
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_sender(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_sender(message));
     c.lua_setfield(lua_state, table, "sender");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_path(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_path(message));
     c.lua_setfield(lua_state, table, "path");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_interface(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_interface(message));
     c.lua_setfield(lua_state, table, "interface");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_member(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_member(message));
     c.lua_setfield(lua_state, table, "member");
 
-    const signature = dbus_c.dbus_message_get_signature(message);
-    if (signature) |sig| {
-        c.lua_pushstring(lua_state, sig);
+    const signature = systemd.sd_bus_message_get_signature(message, 1);
+    if (signature != null) {
+        c.lua_pushstring(lua_state, signature);
     } else {
         c.lua_pushnil(lua_state);
     }
@@ -1577,12 +1488,12 @@ fn pushDbusSignal(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
     c.lua_setfield(lua_state, table, "args");
 }
 
-fn pushDbusReply(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+fn pushDbusReply(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
     c.lua_createtable(lua_state, 0, 2);
     const table = c.lua_gettop(lua_state);
-    const signature = dbus_c.dbus_message_get_signature(message);
-    if (signature) |sig| {
-        c.lua_pushstring(lua_state, sig);
+    const signature = systemd.sd_bus_message_get_signature(message, 1);
+    if (signature != null) {
+        c.lua_pushstring(lua_state, signature);
     } else {
         c.lua_pushnil(lua_state);
     }
@@ -1592,52 +1503,48 @@ fn pushDbusReply(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
     c.lua_setfield(lua_state, table, "args");
 }
 
-fn pushCallTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+fn pushCallTable(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
     c.lua_createtable(lua_state, 0, 6);
     const table = c.lua_gettop(lua_state);
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_sender(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_sender(message));
     c.lua_setfield(lua_state, table, "sender");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_path(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_path(message));
     c.lua_setfield(lua_state, table, "path");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_interface(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_interface(message));
     c.lua_setfield(lua_state, table, "interface");
-    pushOptionalDbusString(lua_state, dbus_c.dbus_message_get_member(message));
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_member(message));
     c.lua_setfield(lua_state, table, "member");
-    const serial = dbus_c.dbus_message_get_serial(message);
+    var serial: u64 = 0;
+    _ = systemd.sd_bus_message_get_cookie(message, &serial);
     lua_value.setNumberField(lua_state, table, "serial", @floatFromInt(serial));
 }
 
-fn pushDbusMessageArgs(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) usize {
+fn pushDbusMessageArgs(lua_state: *c.lua_State, message: *systemd.sd_bus_message) usize {
     var count: usize = 0;
-    var iter: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_init(message, &iter) != 0) {
-        while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) {
-            pushDbusIterValue(lua_state, &iter);
-            count += 1;
-            if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
-        }
+    _ = systemd.sd_bus_message_rewind(message, 1);
+    while (systemd.sd_bus_message_at_end(message, 1) == 0) {
+        pushDbusIterValue(lua_state, message);
+        count += 1;
     }
     return count;
 }
 
-fn methodCallStringPair(message: *dbus_c.DBusMessage) ?struct { interface: []const u8, property: []const u8 } {
+fn methodCallStringPair(message: *systemd.sd_bus_message) ?struct { interface: []const u8, property: []const u8 } {
     const interface = methodCallString(message, 0) orelse return null;
     const property = methodCallString(message, 1) orelse return null;
     return .{ .interface = interface, .property = property };
 }
 
-fn methodCallString(message: *dbus_c.DBusMessage, wanted_index: usize) ?[]const u8 {
-    var iter: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_init(message, &iter) == 0) return null;
+fn methodCallString(message: *systemd.sd_bus_message, wanted_index: usize) ?[]const u8 {
+    _ = systemd.sd_bus_message_rewind(message, 1);
     var index: usize = 0;
-    while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) : (index += 1) {
+    while (systemd.sd_bus_message_at_end(message, 1) == 0) : (index += 1) {
         if (index == wanted_index) {
-            if (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_STRING) return null;
-            var value: [*:0]const u8 = undefined;
-            dbus_c.dbus_message_iter_get_basic(&iter, @ptrCast(&value));
+            var value: [*c]const u8 = null;
+            if (systemd.sd_bus_message_read_basic(message, systemd.SD_BUS_TYPE_STRING, @ptrCast(&value)) <= 0) return null;
             return std.mem.span(value);
         }
-        if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
+        if (skipDbusValue(message) <= 0) break;
     }
     return null;
 }
@@ -1645,15 +1552,14 @@ fn methodCallString(message: *dbus_c.DBusMessage, wanted_index: usize) ?[]const 
 /// Pushes method-call argument `wanted_index` (0-based) as a Lua value, or
 /// returns false when the message has too few arguments. Variants decode
 /// transparently like all other incoming values.
-fn pushMethodCallArg(lua_state: *c.lua_State, message: *dbus_c.DBusMessage, wanted_index: usize) bool {
-    var iter: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_init(message, &iter) == 0) return false;
+fn pushMethodCallArg(lua_state: *c.lua_State, message: *systemd.sd_bus_message, wanted_index: usize) bool {
+    _ = systemd.sd_bus_message_rewind(message, 1);
     var index: usize = 0;
     while (index < wanted_index) : (index += 1) {
-        if (dbus_c.dbus_message_iter_next(&iter) == 0) return false;
+        if (skipDbusValue(message) <= 0) return false;
     }
-    if (dbus_c.dbus_message_iter_get_arg_type(&iter) == dbus_c.DBUS_TYPE_INVALID) return false;
-    pushDbusIterValue(lua_state, &iter);
+    if (systemd.sd_bus_message_at_end(message, 1) != 0) return false;
+    pushDbusIterValue(lua_state, message);
     return true;
 }
 
@@ -1820,23 +1726,25 @@ fn writeDbusSignatureArgs(writer: *std.Io.Writer, signature: []const u8, directi
     }
 }
 
-fn pushDbusArgsTable(lua_state: *c.lua_State, message: *dbus_c.DBusMessage) void {
+fn pushDbusArgsTable(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
     c.lua_createtable(lua_state, 0, 0);
     const args_table = c.lua_gettop(lua_state);
-    var iter: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_init(message, &iter) != 0) {
-        var arg_index: c_int = 1;
-        while (dbus_c.dbus_message_iter_get_arg_type(&iter) != dbus_c.DBUS_TYPE_INVALID) : (arg_index += 1) {
-            pushDbusIterValue(lua_state, &iter);
-            c.lua_rawseti(lua_state, args_table, arg_index);
-            if (dbus_c.dbus_message_iter_next(&iter) == 0) break;
-        }
+    _ = systemd.sd_bus_message_rewind(message, 1);
+    var arg_index: c_int = 1;
+    while (systemd.sd_bus_message_at_end(message, 1) == 0) : (arg_index += 1) {
+        pushDbusIterValue(lua_state, message);
+        c.lua_rawseti(lua_state, args_table, arg_index);
     }
 }
 
-fn pushOptionalDbusString(lua_state: *c.lua_State, value: ?[*:0]const u8) void {
-    if (value) |ptr| {
-        c.lua_pushstring(lua_state, ptr);
+fn optionalSystemdString(value: [*c]const u8) ?[*:0]const u8 {
+    if (value == null) return null;
+    return @ptrCast(value);
+}
+
+fn pushOptionalDbusString(lua_state: *c.lua_State, value: [*c]const u8) void {
+    if (optionalSystemdString(value)) |string| {
+        c.lua_pushstring(lua_state, string);
     } else {
         c.lua_pushnil(lua_state);
     }
@@ -1881,138 +1789,159 @@ fn pushUnixFd(lua_state: *c.lua_State, value: i32) void {
     _ = c.lua_setmetatable(lua_state, -2);
 }
 
-fn pushDbusIterValue(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
-    switch (dbus_c.dbus_message_iter_get_arg_type(iter)) {
-        dbus_c.DBUS_TYPE_STRING, dbus_c.DBUS_TYPE_OBJECT_PATH, dbus_c.DBUS_TYPE_SIGNATURE => {
-            var value: [*:0]const u8 = undefined;
-            dbus_c.dbus_message_iter_get_basic(iter, @ptrCast(&value));
+fn pushDbusIterValue(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
+    var type_: u8 = 0;
+    var contents: [*c]const u8 = null;
+    if (systemd.sd_bus_message_peek_type(message, &type_, &contents) <= 0) {
+        c.lua_pushnil(lua_state);
+        return;
+    }
+    switch (type_) {
+        systemd.SD_BUS_TYPE_STRING, systemd.SD_BUS_TYPE_OBJECT_PATH, systemd.SD_BUS_TYPE_SIGNATURE => {
+            var value: [*c]const u8 = null;
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0 or value == null) return c.lua_pushnil(lua_state);
             c.lua_pushstring(lua_state, value);
         },
-        dbus_c.DBUS_TYPE_BOOLEAN => {
-            var value: dbus_c.dbus_bool_t = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+        systemd.SD_BUS_TYPE_BOOLEAN => {
+            var value: c_int = 0;
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushboolean(lua_state, if (value != 0) 1 else 0);
         },
-        dbus_c.DBUS_TYPE_BYTE => {
+        systemd.SD_BUS_TYPE_BYTE => {
             var value: u8 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_INT16 => {
+        systemd.SD_BUS_TYPE_INT16 => {
             var value: i16 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_UINT16 => {
+        systemd.SD_BUS_TYPE_UINT16 => {
             var value: u16 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_INT32 => {
+        systemd.SD_BUS_TYPE_INT32 => {
             var value: i32 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_UINT32 => {
+        systemd.SD_BUS_TYPE_UINT32 => {
             var value: u32 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_INT64 => {
+        systemd.SD_BUS_TYPE_INT64 => {
             var value: i64 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_UINT64 => {
+        systemd.SD_BUS_TYPE_UINT64 => {
             var value: u64 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, @floatFromInt(value));
         },
-        dbus_c.DBUS_TYPE_DOUBLE => {
+        systemd.SD_BUS_TYPE_DOUBLE => {
             var value: f64 = 0;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0) return c.lua_pushnil(lua_state);
             c.lua_pushnumber(lua_state, value);
         },
-        dbus_c.DBUS_TYPE_UNIX_FD => {
-            // libdbus duplicates the descriptor here, sets FD_CLOEXEC, and
-            // transfers ownership of that duplicate to the caller.
+        systemd.SD_BUS_TYPE_UNIX_FD => {
+            // sd-bus owns the descriptor returned by read_basic. Duplicate
+            // it with CLOEXEC before transferring ownership to Lua.
             var value: c_int = invalid_fd;
-            dbus_c.dbus_message_iter_get_basic(iter, &value);
-            if (value < 0) {
+            if (systemd.sd_bus_message_read_basic(message, type_, @ptrCast(&value)) <= 0 or value < 0) {
                 c.lua_pushnil(lua_state);
             } else {
-                pushUnixFd(lua_state, @intCast(value));
+                const duplicate = linux.fcntl(value, linux.F.DUPFD_CLOEXEC, 0);
+                if (linux.errno(duplicate) != .SUCCESS) c.lua_pushnil(lua_state) else pushUnixFd(lua_state, @intCast(duplicate));
             }
         },
-        dbus_c.DBUS_TYPE_VARIANT => {
-            var child: dbus_c.DBusMessageIter = undefined;
-            dbus_c.dbus_message_iter_recurse(iter, &child);
-            pushDbusIterValue(lua_state, &child);
+        systemd.SD_BUS_TYPE_VARIANT => {
+            if (systemd.sd_bus_message_enter_container(message, type_, contents) <= 0) return c.lua_pushnil(lua_state);
+            pushDbusIterValue(lua_state, message);
+            _ = systemd.sd_bus_message_exit_container(message);
         },
-        dbus_c.DBUS_TYPE_ARRAY => {
-            if (dbus_c.dbus_message_iter_get_element_type(iter) == dbus_c.DBUS_TYPE_DICT_ENTRY) {
-                pushDbusIterDict(lua_state, iter);
-            } else if (dbus_c.dbus_message_iter_get_element_type(iter) == dbus_c.DBUS_TYPE_BYTE) {
-                pushDbusIterByteArray(lua_state, iter);
+        systemd.SD_BUS_TYPE_ARRAY => {
+            const element_signature = if (contents == null) "" else std.mem.span(contents);
+            if (element_signature.len > 0 and element_signature[0] == '{') {
+                pushDbusIterDict(lua_state, message, element_signature);
+            } else if (std.mem.eql(u8, element_signature, "y")) {
+                pushDbusIterByteArray(lua_state, message);
             } else {
-                pushDbusIterSequence(lua_state, iter);
+                pushDbusIterSequence(lua_state, message, type_, element_signature);
             }
         },
-        dbus_c.DBUS_TYPE_STRUCT, dbus_c.DBUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, iter),
-        else => c.lua_pushnil(lua_state),
+        systemd.SD_BUS_TYPE_STRUCT, systemd.SD_BUS_TYPE_DICT_ENTRY => pushDbusIterSequence(lua_state, message, type_, if (contents == null) "" else std.mem.span(contents)),
+        else => {
+            _ = skipDbusValue(message);
+            c.lua_pushnil(lua_state);
+        },
     }
 }
 
-fn pushDbusIterByteArray(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
-    var elements: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_recurse(iter, &elements);
-    var bytes: [*c]const u8 = null;
-    var count: c_int = 0;
-    dbus_c.dbus_message_iter_get_fixed_array(&elements, @ptrCast(&bytes), &count);
-    if (count <= 0) {
+fn pushDbusIterByteArray(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
+    var bytes: ?*const anyopaque = null;
+    var count: usize = 0;
+    if (systemd.sd_bus_message_read_array(message, systemd.SD_BUS_TYPE_BYTE, &bytes, &count) <= 0 or count == 0) {
         c.lua_pushliteral(lua_state, "");
     } else {
-        c.lua_pushlstring(lua_state, bytes, @intCast(count));
+        c.lua_pushlstring(lua_state, @ptrCast(bytes.?), count);
     }
 }
 
 /// Decodes a D-Bus dictionary (an array of dict entries, e.g. `a{sv}`)
 /// into a Lua map keyed by the entry keys instead of a positional array
 /// of `{key, value}` pairs.
-fn pushDbusIterDict(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+fn pushDbusIterDict(lua_state: *c.lua_State, message: *systemd.sd_bus_message, signature: []const u8) void {
     c.lua_createtable(lua_state, 0, 0);
     const table = c.lua_gettop(lua_state);
-    var entries: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_recurse(iter, &entries);
-    while (dbus_c.dbus_message_iter_get_arg_type(&entries) != dbus_c.DBUS_TYPE_INVALID) {
-        var entry: dbus_c.DBusMessageIter = undefined;
-        dbus_c.dbus_message_iter_recurse(&entries, &entry);
-        pushDbusIterValue(lua_state, &entry);
+    if (systemd.sd_bus_message_enter_container(message, systemd.SD_BUS_TYPE_ARRAY, tryZTemp(signature).ptr) <= 0) return;
+    while (systemd.sd_bus_message_at_end(message, 0) == 0) {
+        const inner = signature[1 .. signature.len - 1];
+        if (systemd.sd_bus_message_enter_container(message, systemd.SD_BUS_TYPE_DICT_ENTRY, tryZTemp(inner).ptr) <= 0) break;
+        pushDbusIterValue(lua_state, message);
         // Keys are basic D-Bus types, so nil only appears on malformed
         // input; nil keys are illegal in Lua tables, so drop the entry.
         if (c.lua_isnil(lua_state, -1)) {
             pop(lua_state, 1);
-        } else if (dbus_c.dbus_message_iter_next(&entry) != 0) {
-            pushDbusIterValue(lua_state, &entry);
+        } else if (systemd.sd_bus_message_at_end(message, 0) == 0) {
+            pushDbusIterValue(lua_state, message);
             c.lua_settable(lua_state, table);
         } else {
             pop(lua_state, 1);
         }
-        if (dbus_c.dbus_message_iter_next(&entries) == 0) break;
+        _ = systemd.sd_bus_message_exit_container(message);
     }
+    _ = systemd.sd_bus_message_exit_container(message);
 }
 
-fn pushDbusIterSequence(lua_state: *c.lua_State, iter: *dbus_c.DBusMessageIter) void {
+fn pushDbusIterSequence(lua_state: *c.lua_State, message: *systemd.sd_bus_message, type_: u8, contents: []const u8) void {
     c.lua_createtable(lua_state, 0, 0);
     const table = c.lua_gettop(lua_state);
-    var child: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_recurse(iter, &child);
+    if (systemd.sd_bus_message_enter_container(message, type_, tryZTemp(contents).ptr) <= 0) return;
     var index: c_int = 1;
-    while (dbus_c.dbus_message_iter_get_arg_type(&child) != dbus_c.DBUS_TYPE_INVALID) : (index += 1) {
-        pushDbusIterValue(lua_state, &child);
+    while (systemd.sd_bus_message_at_end(message, 0) == 0) : (index += 1) {
+        pushDbusIterValue(lua_state, message);
         c.lua_rawseti(lua_state, table, index);
-        if (dbus_c.dbus_message_iter_next(&child) == 0) break;
     }
+    _ = systemd.sd_bus_message_exit_container(message);
+}
+
+fn skipDbusValue(message: *systemd.sd_bus_message) c_int {
+    var type_: u8 = 0;
+    var contents: [*c]const u8 = null;
+    if (systemd.sd_bus_message_peek_type(message, &type_, &contents) <= 0) return 0;
+    const inner = if (contents == null) "" else std.mem.span(contents);
+    var signature_buffer: [4096]u8 = undefined;
+    const signature = switch (type_) {
+        systemd.SD_BUS_TYPE_ARRAY => std.fmt.bufPrintZ(&signature_buffer, "a{s}", .{inner}) catch return -1,
+        systemd.SD_BUS_TYPE_STRUCT => std.fmt.bufPrintZ(&signature_buffer, "({s})", .{inner}) catch return -1,
+        systemd.SD_BUS_TYPE_DICT_ENTRY => std.fmt.bufPrintZ(&signature_buffer, "{{{s}}}", .{inner}) catch return -1,
+        else => std.fmt.bufPrintZ(&signature_buffer, "{c}", .{type_}) catch return -1,
+    };
+    return systemd.sd_bus_message_skip(message, signature.ptr);
 }
 
 fn tryZTemp(value: []const u8) [:0]const u8 {
@@ -2024,21 +1953,30 @@ fn tryZTemp(value: []const u8) [:0]const u8 {
     return dbus_temp_z_buffers[slot][0..value.len :0];
 }
 
-fn testAppendVariantString(entry: *dbus_c.DBusMessageIter, value: [*:0]const u8) !void {
-    var variant: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(entry, dbus_c.DBUS_TYPE_VARIANT, "s", &variant) == 0) return error.OutOfMemory;
-    var ptr = value;
-    try appendDbusBasic(&variant, dbus_c.DBUS_TYPE_STRING, &ptr);
-    if (dbus_c.dbus_message_iter_close_container(entry, &variant) == 0) return error.OutOfMemory;
+fn testMessage() !*systemd.sd_bus_message {
+    var bus: ?*systemd.sd_bus = null;
+    try checkDbus(systemd.sd_bus_open_user(&bus));
+    defer _ = systemd.sd_bus_unref(bus);
+    var message: ?*systemd.sd_bus_message = null;
+    try checkDbus(systemd.sd_bus_message_new_signal(bus, &message, "/test", "test.Interface", "Test"));
+    return message.?;
 }
 
-fn testAppendDictEntryString(array: *dbus_c.DBusMessageIter, key: [*:0]const u8, value: [*:0]const u8) !void {
-    var entry: dbus_c.DBusMessageIter = undefined;
-    if (dbus_c.dbus_message_iter_open_container(array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
-    var key_ptr = key;
-    try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key_ptr);
-    try testAppendVariantString(&entry, value);
-    if (dbus_c.dbus_message_iter_close_container(array, &entry) == 0) return error.OutOfMemory;
+fn sealTestMessage(message: *systemd.sd_bus_message) !void {
+    try checkDbus(systemd.sd_bus_message_seal(message, 1, 0));
+}
+
+fn testAppendVariantString(message: *systemd.sd_bus_message, value: [*:0]const u8) !void {
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, "s");
+    try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, value);
+    try closeDbusContainer(message);
+}
+
+fn testAppendDictEntryString(message: *systemd.sd_bus_message, key: [*:0]const u8, value: [*:0]const u8) !void {
+    try openDbusContainer(message, systemd.SD_BUS_TYPE_DICT_ENTRY, "sv");
+    try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, key);
+    try testAppendVariantString(message, value);
+    try closeDbusContainer(message);
 }
 
 test signatureElementLength {
@@ -2078,13 +2016,10 @@ test "dbus UNIX_FD replies decode to owning Lua userdata" {
     var source_fd: c_int = @intCast(opened);
     defer _ = linux.close(source_fd);
 
-    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
-    defer dbus_c.dbus_message_unref(message);
-    var append_iter: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_init_append(message, &append_iter);
-    // Appending duplicates source_fd for the message; message unref and
-    // linux.close above release those two owners independently.
-    try appendDbusBasic(&append_iter, dbus_c.DBUS_TYPE_UNIX_FD, &source_fd);
+    const message = try testMessage();
+    defer _ = systemd.sd_bus_message_unref(message);
+    try appendDbusBasic(message, systemd.SD_BUS_TYPE_UNIX_FD, &source_fd);
+    try sealTestMessage(message);
 
     // Decoding creates a third owner. Exercise both methods, including an
     // idempotent close, without exposing the descriptor to Lua.
@@ -2102,11 +2037,10 @@ test "dbus UNIX_FD replies decode to owning Lua userdata" {
     if (c.luaL_loadstring(lua_state, check_script) != 0) return error.LoadFailed;
     if (c.lua_pcall(lua_state, 0, 0, 0) != 0) return error.ScriptFailed;
 
-    // A fresh read is another libdbus-owned duplicate. Drop its only Lua
+    // A fresh read is another owned duplicate. Drop its only Lua
     // reference and verify __gc closes it.
-    var read_iter: dbus_c.DBusMessageIter = undefined;
-    try std.testing.expect(dbus_c.dbus_message_iter_init(message, &read_iter) != 0);
-    pushDbusIterValue(lua_state, &read_iter);
+    _ = systemd.sd_bus_message_rewind(message, 1);
+    pushDbusIterValue(lua_state, message);
     const collected_fd = unixFd(lua_state, -1).*;
     try std.testing.expect(collected_fd >= 0);
     try std.testing.expect(linux.fcntl(collected_fd, linux.F.GETFD, 0) < 4096);
@@ -2144,14 +2078,13 @@ test "dbus dict and struct arguments encode from Lua tables" {
     if (c.luaL_loadstring(lua_state, build_script) != 0) return error.LoadFailed;
     if (c.lua_pcall(lua_state, 0, 0, 0) != 0) return error.ScriptFailed;
 
-    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
-    defer dbus_c.dbus_message_unref(message);
-    var iter: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_init_append(message, &iter);
+    const message = try testMessage();
+    defer _ = systemd.sd_bus_message_unref(message);
 
     c.lua_getglobal(lua_state, "payload");
-    try appendDbusLuaArgs(lua_state, absoluteIndex(lua_state, -1), &iter);
+    try appendDbusLuaArgs(lua_state, absoluteIndex(lua_state, -1), message);
     pop(lua_state, 1);
+    try sealTestMessage(message);
 
     pushDbusArgsTable(lua_state, message);
     c.lua_setglobal(lua_state, "args");
@@ -2174,92 +2107,74 @@ test "dbus dict and struct arguments encode from Lua tables" {
 }
 
 test "dbus dicts decode to Lua maps, arrays and structs to sequences" {
-    const message = dbus_c.dbus_message_new_signal("/test", "test.Interface", "Test") orelse return error.OutOfMemory;
-    defer dbus_c.dbus_message_unref(message);
-
-    var iter: dbus_c.DBusMessageIter = undefined;
-    dbus_c.dbus_message_iter_init_append(message, &iter);
+    const message = try testMessage();
+    defer _ = systemd.sd_bus_message_unref(message);
 
     // arg 1: a{sv} with a string, an int32, and a nested a{sv}.
     {
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
-        try testAppendDictEntryString(&array, "name", "keywork");
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "{sv}");
+        try testAppendDictEntryString(message, "name", "keywork");
         {
-            var entry: dbus_c.DBusMessageIter = undefined;
-            if (dbus_c.dbus_message_iter_open_container(&array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
-            var key: [*:0]const u8 = "count";
-            try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key);
-            var variant: dbus_c.DBusMessageIter = undefined;
-            if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, "i", &variant) == 0) return error.OutOfMemory;
+            try openDbusContainer(message, systemd.SD_BUS_TYPE_DICT_ENTRY, "sv");
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, "count");
+            try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, "i");
             var count: i32 = 7;
-            try appendDbusBasic(&variant, dbus_c.DBUS_TYPE_INT32, &count);
-            if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
-            if (dbus_c.dbus_message_iter_close_container(&array, &entry) == 0) return error.OutOfMemory;
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_INT32, &count);
+            try closeDbusContainer(message);
+            try closeDbusContainer(message);
         }
         {
-            var entry: dbus_c.DBusMessageIter = undefined;
-            if (dbus_c.dbus_message_iter_open_container(&array, dbus_c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
-            var key: [*:0]const u8 = "nested";
-            try appendDbusBasic(&entry, dbus_c.DBUS_TYPE_STRING, &key);
-            var variant: dbus_c.DBusMessageIter = undefined;
-            if (dbus_c.dbus_message_iter_open_container(&entry, dbus_c.DBUS_TYPE_VARIANT, "a{sv}", &variant) == 0) return error.OutOfMemory;
-            var nested: dbus_c.DBusMessageIter = undefined;
-            if (dbus_c.dbus_message_iter_open_container(&variant, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &nested) == 0) return error.OutOfMemory;
-            try testAppendDictEntryString(&nested, "inner", "value");
-            if (dbus_c.dbus_message_iter_close_container(&variant, &nested) == 0) return error.OutOfMemory;
-            if (dbus_c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
-            if (dbus_c.dbus_message_iter_close_container(&array, &entry) == 0) return error.OutOfMemory;
+            try openDbusContainer(message, systemd.SD_BUS_TYPE_DICT_ENTRY, "sv");
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, "nested");
+            try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, "a{sv}");
+            try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "{sv}");
+            try testAppendDictEntryString(message, "inner", "value");
+            try closeDbusContainer(message);
+            try closeDbusContainer(message);
+            try closeDbusContainer(message);
         }
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        try closeDbusContainer(message);
     }
 
     // arg 2: plain string array stays a sequence.
     {
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "s", &array) == 0) return error.OutOfMemory;
-        var first: [*:0]const u8 = "x";
-        var second: [*:0]const u8 = "y";
-        try appendDbusBasic(&array, dbus_c.DBUS_TYPE_STRING, &first);
-        try appendDbusBasic(&array, dbus_c.DBUS_TYPE_STRING, &second);
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "s");
+        try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, "x");
+        try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, "y");
+        try closeDbusContainer(message);
     }
 
     // arg 3: struct stays a positional sequence.
     {
-        var strukt: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_STRUCT, null, &strukt) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_STRUCT, "is");
         var number: i32 = 5;
-        var text: [*:0]const u8 = "s";
-        try appendDbusBasic(&strukt, dbus_c.DBUS_TYPE_INT32, &number);
-        try appendDbusBasic(&strukt, dbus_c.DBUS_TYPE_STRING, &text);
-        if (dbus_c.dbus_message_iter_close_container(&iter, &strukt) == 0) return error.OutOfMemory;
+        try appendDbusBasic(message, systemd.SD_BUS_TYPE_INT32, &number);
+        try appendDbusBasic(message, systemd.SD_BUS_TYPE_STRING, "s");
+        try closeDbusContainer(message);
     }
 
     // arg 4: empty dict decodes to an empty table.
     {
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "{sv}", &array) == 0) return error.OutOfMemory;
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "{sv}");
+        try closeDbusContainer(message);
     }
 
     // arg 5: byte arrays decode to strings rather than one Lua number per byte.
     {
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "y", &array) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "y");
         for ([_]u8{ 0, 127, 255 }) |byte| {
             var value = byte;
-            try appendDbusBasic(&array, dbus_c.DBUS_TYPE_BYTE, &value);
+            try appendDbusBasic(message, systemd.SD_BUS_TYPE_BYTE, &value);
         }
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        try closeDbusContainer(message);
     }
 
     // arg 6: empty byte arrays are empty strings, not null pointers.
     {
-        var array: dbus_c.DBusMessageIter = undefined;
-        if (dbus_c.dbus_message_iter_open_container(&iter, dbus_c.DBUS_TYPE_ARRAY, "y", &array) == 0) return error.OutOfMemory;
-        if (dbus_c.dbus_message_iter_close_container(&iter, &array) == 0) return error.OutOfMemory;
+        try openDbusContainer(message, systemd.SD_BUS_TYPE_ARRAY, "y");
+        try closeDbusContainer(message);
     }
+    try sealTestMessage(message);
 
     const lua_state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(lua_state);

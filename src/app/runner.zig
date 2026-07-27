@@ -5,6 +5,7 @@ const keywork = @import("../ui.zig");
 
 const desktop_settings = @import("../linux/desktop_settings.zig");
 const event_loop = @import("../linux/event_loop.zig");
+const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const app_options = @import("options.zig");
 const app_windows = @import("windows.zig");
@@ -46,6 +47,7 @@ pub const Options = struct {
     background_blur: bool = false,
     session_lock: bool = false,
     log_writer: *std.Io.Writer,
+    systemd_event: ?*SystemdEvent = null,
     runtime_context: ?*anyopaque = null,
     /// Declarative window-set host; when present the Wayland backends run
     /// one runtime per declared window instead of a single main window.
@@ -145,11 +147,16 @@ fn runWayland(
 ) !void {
     // Start the Prefer or portal color-scheme query before window setup so
     // the round trip overlaps the compositor configuring the surface.
-    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
+    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init(options.systemd_event) catch |err| blk: {
         log.warn("desktop settings unavailable: {}", .{err});
         break :blk null;
     };
     defer if (settings_client) |*settings| settings.deinit();
+    if (settings_client) |*settings| settings.startColorSchemeRead() catch |err| {
+        log.warn("desktop settings query unavailable: {}", .{err});
+        settings.deinit();
+        settings_client = null;
+    };
 
     var initial_constraints = constraints;
     var backend = try Backend.create(allocator);
@@ -237,13 +244,16 @@ fn runWayland(
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
     defer if (settings_source) |handle| loop.removeSource(handle);
     if (settings_client) |*settings| {
-        settings_source = try loop.addFd(.{
-            .fd = settings.eventLoopFd(),
-            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
-            .ctx = settings,
-            .callback = desktop_settings.Client.eventLoopCallback,
-        });
-        settings.setEventLoopSource(settings_source.?);
+        const settings_fd = settings.eventLoopFd();
+        if (settings_fd != -1) {
+            settings_source = try loop.addFd(.{
+                .fd = settings_fd,
+                .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+                .ctx = settings,
+                .callback = desktop_settings.Client.eventLoopCallback,
+            });
+            settings.setEventLoopSource(settings_source.?);
+        }
     }
     loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
     defer loop.clearAfterPlatformHook();
@@ -796,11 +806,16 @@ fn runWaylandWindowed(
 ) !void {
     const Manager = WindowManager(Backend);
 
-    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
+    var settings_client: ?desktop_settings.Client = desktop_settings.Client.init(options.systemd_event) catch |err| blk: {
         log.warn("desktop settings unavailable: {}", .{err});
         break :blk null;
     };
     defer if (settings_client) |*settings| settings.deinit();
+    if (settings_client) |*settings| settings.startColorSchemeRead() catch |err| {
+        log.warn("desktop settings query unavailable: {}", .{err});
+        settings.deinit();
+        settings_client = null;
+    };
 
     var backend = try Backend.create(allocator);
     defer backend.destroy();
@@ -858,13 +873,16 @@ fn runWaylandWindowed(
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
     defer if (settings_source) |handle| loop.removeSource(handle);
     if (settings_client) |*settings| {
-        settings_source = try loop.addFd(.{
-            .fd = settings.eventLoopFd(),
-            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
-            .ctx = settings,
-            .callback = desktop_settings.Client.eventLoopCallback,
-        });
-        settings.setEventLoopSource(settings_source.?);
+        const settings_fd = settings.eventLoopFd();
+        if (settings_fd != -1) {
+            settings_source = try loop.addFd(.{
+                .fd = settings_fd,
+                .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+                .ctx = settings,
+                .callback = desktop_settings.Client.eventLoopCallback,
+            });
+            settings.setEventLoopSource(settings_source.?);
+        }
     }
     loop.setAfterPlatformHook(&manager, Manager.afterPlatformHook);
     defer loop.clearAfterPlatformHook();

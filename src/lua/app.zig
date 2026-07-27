@@ -7,6 +7,7 @@ const log_backend_mod = @import("../backend/log.zig");
 const event_loop = @import("../linux/event_loop.zig");
 const icon_theme = @import("../linux/icon_theme.zig");
 const linux_syscall = @import("../linux/syscall.zig");
+const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const lua_config = @import("config.zig");
 const lua_curl = @import("curl.zig");
 const lua_process = @import("process.zig");
@@ -20,6 +21,7 @@ const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
 const lua_testing = @import("testing.zig");
 const lua_value = @import("value.zig");
+const lua_varlink = @import("varlink.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
@@ -36,6 +38,8 @@ const LuaProcess = lua_process.LuaProcess;
 const LuaSocket = lua_socket.LuaSocket;
 const NetConnection = lua_net.Connection;
 const DbusBus = lua_dbus.Bus;
+const VarlinkServer = lua_varlink.Server;
+const VarlinkClient = lua_varlink.Client;
 const PipeWireConnection = lua_pipewire.Connection;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
@@ -81,6 +85,8 @@ pub const App = struct {
     sockets: std.ArrayList(*LuaSocket) = .empty,
     net_connections: std.ArrayList(*NetConnection) = .empty,
     dbus_buses: std.ArrayList(*DbusBus) = .empty,
+    varlink_servers: std.ArrayList(*VarlinkServer) = .empty,
+    varlink_clients: std.ArrayList(*VarlinkClient) = .empty,
     pipewire_connections: std.ArrayList(*PipeWireConnection) = .empty,
     tasks: std.ArrayList(*LuaTask) = .empty,
     scopes: std.ArrayList(*LuaScope) = .empty,
@@ -89,11 +95,14 @@ pub const App = struct {
     pending_scope_cancels: std.ArrayList(*LuaScope) = .empty,
     scope_cancel_timer: ?*event_loop.EventLoop.Timer = null,
     dbus_host: lua_dbus.Host = undefined,
+    varlink_host: lua_varlink.Host = undefined,
     loop_host: lua_loop.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
     socket_host: lua_socket.Host = undefined,
     net_host: lua_net.Host = undefined,
     curl_runtime: ?*lua_curl.Runtime = null,
+    systemd_event: ?*SystemdEvent = null,
+    owns_systemd_event: bool = false,
     event_loop: ?*event_loop.EventLoop = null,
     invalidator: ?runtime_mod.Invalidator = null,
     /// Desktop services (clipboard, activation tokens, interactive
@@ -183,6 +192,14 @@ pub const App = struct {
         if (self.curl_runtime) |runtime| runtime.destroy();
         for (self.dbus_buses.items) |bus| bus.destroy(self.allocator, self.state);
         self.dbus_buses.deinit(self.allocator);
+        for (self.varlink_servers.items) |server| server.destroy(self.allocator, self.state);
+        self.varlink_servers.deinit(self.allocator);
+        for (self.varlink_clients.items) |client| client.destroy(self.allocator, self.state);
+        self.varlink_clients.deinit(self.allocator);
+        if (self.systemd_event) |bridge| if (self.owns_systemd_event) {
+            bridge.unregister();
+            bridge.destroy(self.allocator);
+        };
         for (self.pipewire_connections.items) |connection| connection.destroy(self.allocator, self.state);
         self.pipewire_connections.deinit(self.allocator);
         self.pending_scope_cancels.deinit(self.allocator);
@@ -223,6 +240,7 @@ pub const App = struct {
         for (self.sockets.items) |socket| try socket.register();
         for (self.net_connections.items) |connection| try connection.register();
         if (self.curl_runtime) |runtime| try runtime.register();
+        if (self.systemd_event) |bridge| if (self.owns_systemd_event) try bridge.register(loop);
         for (self.dbus_buses.items) |bus| try bus.register();
         for (self.pipewire_connections.items) |connection| try connection.register();
         if (self.pending_scope_cancels.items.len > 0) try self.armScopeCancelTimer(loop);
@@ -269,6 +287,7 @@ pub const App = struct {
         for (self.net_connections.items) |connection| connection.unregister(loop);
         if (self.curl_runtime) |runtime| runtime.unregister();
         for (self.dbus_buses.items) |bus| bus.unregister();
+        if (self.systemd_event) |bridge| if (self.owns_systemd_event) bridge.unregister();
         for (self.pipewire_connections.items) |connection| connection.unregister(loop);
         self.event_loop = null;
     }
@@ -308,6 +327,18 @@ pub const App = struct {
         self.unbindEventLoop();
     }
 
+    /// Borrows the process-level sd-event bridge. All sd-bus and sd-varlink
+    /// users must detach before the owner destroys it.
+    pub fn useSystemdEvent(self: *App, bridge: *SystemdEvent) void {
+        std.debug.assert(self.systemd_event == null);
+        self.systemd_event = bridge;
+        self.owns_systemd_event = false;
+    }
+
+    pub fn systemdEvent(self: *App) !*SystemdEvent {
+        return self.ensureSystemdEvent();
+    }
+
     pub fn shouldRunHeadlessOpaque(ctx: *anyopaque) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
         return self.hasLiveAsyncResources();
@@ -332,6 +363,8 @@ pub const App = struct {
         for (self.sockets.items) |socket| if (!socket.canceled and socket.fd != invalid_fd) return true;
         for (self.net_connections.items) |connection| if (connection.live()) return true;
         for (self.dbus_buses.items) |bus| if (!bus.closed) return true;
+        for (self.varlink_servers.items) |server| if (!server.closed) return true;
+        for (self.varlink_clients.items) |client| if (!client.closed) return true;
         for (self.pipewire_connections.items) |connection| if (!connection.closed) return true;
         return false;
     }
@@ -809,6 +842,8 @@ pub const App = struct {
         for (self.sockets.items) |socket| socket.cancel(self.state, .silent);
         for (self.net_connections.items) |connection| connection.cancel(self.state, .silent);
         for (self.dbus_buses.items) |bus| bus.close();
+        for (self.varlink_servers.items) |server| server.close(self.state);
+        for (self.varlink_clients.items) |client| client.close(self.state, .silent);
         for (self.pipewire_connections.items) |connection| connection.cancel(self.state, .silent);
     }
 
@@ -1017,6 +1052,34 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &dbus_host_vtable };
     }
 
+    fn addVarlinkServer(self: *App, options: lua_varlink.ServeOptions) !*VarlinkServer {
+        const server = try VarlinkServer.create(self.varlinkHost(), options);
+        errdefer server.destroy(self.allocator, self.state);
+        try self.varlink_servers.append(self.allocator, server);
+        return server;
+    }
+
+    fn addVarlinkClient(self: *App, address: []const u8) !*VarlinkClient {
+        const client = try VarlinkClient.create(self.varlinkHost(), address);
+        errdefer client.destroy(self.allocator, self.state);
+        try self.varlink_clients.append(self.allocator, client);
+        return client;
+    }
+
+    fn varlinkHost(self: *App) lua_varlink.Host {
+        return .{ .ptr = self, .vtable = &varlink_host_vtable };
+    }
+
+    fn ensureSystemdEvent(self: *App) !*SystemdEvent {
+        if (self.systemd_event) |bridge| return bridge;
+        const bridge = try SystemdEvent.create(self.allocator);
+        errdefer bridge.destroy(self.allocator);
+        if (self.event_loop) |loop| try bridge.register(loop);
+        self.systemd_event = bridge;
+        self.owns_systemd_event = true;
+        return bridge;
+    }
+
     fn addPipeWireConnection(self: *App, realtime: bool) !*PipeWireConnection {
         const connection = try PipeWireConnection.create(self.pipewireHost(), realtime);
         errdefer connection.destroy(self.allocator, self.state);
@@ -1179,8 +1242,16 @@ fn socketHostAddSocket(ptr: *anyopaque, fd: i32) anyerror!*LuaSocket {
 const dbus_host_vtable: lua_dbus.Host.VTable = .{
     .allocator = hostAllocator,
     .luaState = hostLuaState,
-    .eventLoop = hostEventLoop,
+    .systemdEvent = varlinkHostSystemdEvent,
     .addBus = dbusHostAddBus,
+};
+
+const varlink_host_vtable: lua_varlink.Host.VTable = .{
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .systemdEvent = varlinkHostSystemdEvent,
+    .addServer = varlinkHostAddServer,
+    .addClient = varlinkHostAddClient,
 };
 
 const pipewire_host_vtable: lua_pipewire.Host.VTable = .{
@@ -1198,6 +1269,21 @@ fn pipewireHostAddConnection(ptr: *anyopaque, realtime: bool) anyerror!*PipeWire
 fn dbusHostAddBus(ptr: *anyopaque, kind: lua_dbus.Kind) anyerror!*DbusBus {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addDbusBus(kind);
+}
+
+fn varlinkHostSystemdEvent(ptr: *anyopaque) anyerror!*SystemdEvent {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.ensureSystemdEvent();
+}
+
+fn varlinkHostAddServer(ptr: *anyopaque, options: lua_varlink.ServeOptions) anyerror!*VarlinkServer {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addVarlinkServer(options);
+}
+
+fn varlinkHostAddClient(ptr: *anyopaque, address: []const u8) anyerror!*VarlinkClient {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addVarlinkClient(address);
 }
 
 fn scriptChanged(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
@@ -1295,6 +1381,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
         .{ .name = "keywork.net", .loader = netModuleLoader, .uses_app = true },
         .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
         .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
+        .{ .name = "keywork.varlink", .loader = varlinkModuleLoader, .uses_app = true },
         .{ .name = "keywork.pipewire", .loader = pipewireModuleLoader, .uses_app = true },
         .{ .name = "keywork.audio", .loader = audioModuleLoader },
         .{ .name = "keywork.log", .loader = logModuleLoader },
@@ -1552,6 +1639,14 @@ fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
     app.dbus_host = app.dbusHost();
     lua_dbus.pushModule(lua_state, &app.dbus_host);
+    return 1;
+}
+
+fn varlinkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    app.varlink_host = app.varlinkHost();
+    lua_varlink.pushModule(lua_state, &app.varlink_host);
     return 1;
 }
 
@@ -2722,6 +2817,74 @@ test "lua bus:call awaits replies and reports peer errors as nil, err" {
 
     try expectLuaBoolean(&app, "got_id", true);
     try expectLuaBoolean(&app, "got_error", true);
+}
+
+test "lua varlink supports calls, errors, and streaming over the shared event loop" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const relative_socket_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "varlink.sock" });
+    defer allocator.free(relative_socket_path);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const socket_path = try std.fs.path.join(allocator, &.{ cwd, relative_socket_path });
+    defer allocator.free(socket_path);
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local varlink = require("keywork.varlink")
+        \\local server = assert(varlink.serve({{
+        \\  address = "{s}",
+        \\  methods = {{
+        \\    ["org.keywork.Test.Echo"] = function(_, parameters)
+        \\      return {{ text = parameters.text, nested = parameters.nested }}
+        \\    end,
+        \\    ["org.keywork.Test.Fail"] = function(call)
+        \\      call:error("org.keywork.Test.Failed", {{ reason = "expected" }})
+        \\    end,
+        \\    ["org.keywork.Test.Stream"] = function(call)
+        \\      assert(call.more)
+        \\      assert(call:notify({{ step = 1 }}))
+        \\      loop.sleep(1)
+        \\      assert(call:notify({{ step = 2 }}))
+        \\      return {{ step = 3 }}
+        \\    end,
+        \\  }},
+        \\}}))
+        \\local client = assert(varlink.connect("{s}"))
+        \\done = false
+        \\loop.spawn(function()
+        \\  local echo, echo_err = client:call("org.keywork.Test.Echo", {{ text = "hello", nested = {{ value = 42 }} }})
+        \\  echo_ok = echo_err == nil and echo.text == "hello" and echo.nested.value == 42
+        \\  local failed, error_id, error_parameters = client:call("org.keywork.Test.Fail")
+        \\  error_ok = failed == nil and error_id == "org.keywork.Test.Failed" and error_parameters.reason == "expected"
+        \\  local request = assert(client:observe("org.keywork.Test.Stream"))
+        \\  local steps = {{}}
+        \\  for response in request:replies() do
+        \\    assert(response.error == nil)
+        \\    table.insert(steps, response.parameters.step)
+        \\  end
+        \\  stream_ok = #steps == 3 and steps[1] == 1 and steps[2] == 2 and steps[3] == 3
+        \\  client:close()
+        \\  server:close()
+        \\  done = true
+        \\end)
+        \\return kw.app({{ child = kw.text("varlink") }})
+        \\
+    , .{ socket_path, socket_path });
+    defer allocator.free(script);
+    var app = try initTestApp(allocator, &tmp, "varlink.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+
+    try runUntilLuaBoolean(&loop, &app, "done", 5000);
+    try expectLuaBooleans(&app, &.{ "echo_ok", "error_ok", "stream_ok", "done" });
 }
 
 test "lua bus:subscribe streams signals to a coroutine reader" {

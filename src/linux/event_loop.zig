@@ -15,6 +15,7 @@ pub const EventLoop = struct {
     timers: std.ArrayList(*Timer) = .empty,
     file_watches: std.ArrayList(*FileWatch) = .empty,
     wayland: ?WaylandSource = null,
+    pre_poll: ?PrePollSource = null,
     after_platform_hook: ?PhaseHook = null,
     after_platform_context: ?*anyopaque = null,
     end_turn_hook: ?PhaseHook = null,
@@ -86,6 +87,14 @@ pub const EventLoop = struct {
     pub const WaylandPrepare = struct {
         events: u32,
         dispatched_pending: bool = false,
+    };
+
+    /// A subordinate event source that may discover ready userspace work
+    /// while arming itself. Returning true requests a non-blocking turn so
+    /// phase hooks observe work dispatched from prepare().
+    pub const PrePollSource = struct {
+        ctx: *anyopaque,
+        prepare: *const fn (ctx: *anyopaque) anyerror!bool,
     };
 
     pub const Timer = struct {
@@ -404,6 +413,16 @@ pub const EventLoop = struct {
         self.wayland = null;
     }
 
+    pub fn setPrePoll(self: *EventLoop, source: PrePollSource) void {
+        std.debug.assert(self.pre_poll == null);
+        self.pre_poll = source;
+    }
+
+    pub fn clearPrePoll(self: *EventLoop, ctx: *anyopaque) void {
+        const source = self.pre_poll orelse return;
+        if (source.ctx == ctx) self.pre_poll = null;
+    }
+
     pub fn setAfterPlatformHook(self: *EventLoop, context: *anyopaque, hook: PhaseHook) void {
         self.after_platform_context = context;
         self.after_platform_hook = hook;
@@ -467,6 +486,13 @@ pub const EventLoop = struct {
                 // turn delivers the resulting semantic events without
                 // blocking for unrelated fd activity.
                 if (prepared.dispatched_pending) {
+                    try self.dispatchTurn(0, &.{});
+                    continue;
+                }
+            }
+
+            if (self.pre_poll) |source| {
+                if (try source.prepare(source.ctx)) {
                     try self.dispatchTurn(0, &.{});
                     continue;
                 }

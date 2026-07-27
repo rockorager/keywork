@@ -88,6 +88,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
         .height = 800,
         .backend = .wayland_shm,
         .log_writer = writer,
+        .systemd_event = try app.systemdEvent(),
         .runtime_context = &app,
         .bind_runtime = lua_app.App.bindRuntimeOpaque,
         .bind_platform = lua_app.App.bindPlatformOpaque,

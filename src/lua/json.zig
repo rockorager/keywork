@@ -88,18 +88,22 @@ fn luaEncode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.luaL_checkany(lua_state, 1);
     const allocator = lua_value.upvalueAllocator(lua_state, 1);
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    var jw: std.json.Stringify = .{ .writer = &out.writer };
-    encodeValue(lua_state, 1, &jw, 0) catch |err| {
-        // luaL_error longjmps past Zig defers, so release explicitly first.
-        out.deinit();
+    const text = encodeAlloc(lua_state, 1, allocator) catch |err| {
         return c.luaL_error(lua_state, encodeErrorMessage(err));
     };
-
-    const text = out.written();
+    defer allocator.free(text);
     c.lua_pushlstring(lua_state, text.ptr, text.len);
-    out.deinit();
     return 1;
+}
+
+/// Encodes one Lua value as owned JSON text. The caller owns the returned
+/// allocation. This is also the native JSON boundary used by Varlink.
+pub fn encodeAlloc(lua_state: *c.lua_State, index: c_int, allocator: std.mem.Allocator) EncodeError![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try encodeValue(lua_state, index, &jw, 0);
+    return try out.toOwnedSlice();
 }
 
 fn encodeValue(lua_state: *c.lua_State, index: c_int, jw: *std.json.Stringify, depth: usize) EncodeError!void {
@@ -209,15 +213,19 @@ fn luaDecode(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const allocator = lua_value.upvalueAllocator(lua_state, 1);
 
     // Malformed input is expected runtime data, so decode reports nil, err.
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch |err| {
+    pushDecoded(lua_state, allocator, input) catch |err| {
         return lua_value.pushNilError(lua_state, err);
     };
-    defer parsed.deinit();
-
-    pushJsonValue(lua_state, parsed.value) catch {
-        return lua_value.pushNilMessage(lua_state, "DocumentTooDeep");
-    };
     return 1;
+}
+
+/// Decodes JSON text and pushes the corresponding Lua value.
+pub fn pushDecoded(lua_state: *c.lua_State, allocator: std.mem.Allocator, input: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch |err| {
+        return err;
+    };
+    defer parsed.deinit();
+    try pushJsonValue(lua_state, parsed.value);
 }
 
 fn pushJsonValue(lua_state: *c.lua_State, value: std.json.Value) error{StackOverflow}!void {
