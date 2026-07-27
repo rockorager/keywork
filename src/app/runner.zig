@@ -505,6 +505,9 @@ fn PopupManager(comptime Backend: type) type {
             requested_width: u31,
             requested_height: u31,
             insets: wayland_window.SurfaceInsets,
+            /// A reposition request is in flight. Keep the previous valid
+            /// frame until its configure updates runtime constraints.
+            resize_pending: bool = false,
             runtime: runtime_mod.Runtime,
             queue: QueuedPlatformEvents,
             /// Borrowed from the main element tree; refreshed on every
@@ -571,7 +574,9 @@ fn PopupManager(comptime Backend: type) type {
                 }
             }
 
-            for (self.popups.items) |popup| try popup.runtime.flushPendingRepaint();
+            for (self.popups.items) |popup| {
+                if (!popup.resize_pending) try popup.runtime.flushPendingRepaint();
+            }
             if (had_popups and self.popups.items.len == 0) {
                 self.backend.setPopupKeyboardFocus(self.parent, false);
             }
@@ -628,6 +633,7 @@ fn PopupManager(comptime Backend: type) type {
                 .requested_width = width,
                 .requested_height = height,
                 .insets = measured.insets,
+                .resize_pending = false,
                 .runtime = undefined,
                 .queue = .{ .allocator = self.allocator, .runtime = undefined, .popup_surface = true },
                 .popup = request.popup,
@@ -644,6 +650,7 @@ fn PopupManager(comptime Backend: type) type {
             setRuntimeClipboard(&surface.runtime, self.backend);
             surface.queue.runtime = &surface.runtime;
             surface.queue.popup_manager = self.hooks();
+            surface.queue.configure_hook = .{ .ctx = surface, .func = popupConfigure };
             // Popups clear to transparent like layer-shell surfaces: the content
             // paints its own background, so rounded corners stay see-through.
             surface.runtime.setFrameBackground(keywork.colors.transparent);
@@ -692,6 +699,7 @@ fn PopupManager(comptime Backend: type) type {
             popup.requested_width = width;
             popup.requested_height = height;
             popup.insets = measured.insets;
+            popup.resize_pending = true;
         }
 
         fn destroyPopup(self: *Self, index: usize) void {
@@ -764,6 +772,12 @@ fn PopupManager(comptime Backend: type) type {
                 .interaction = scope.interaction,
                 .app_context = context,
             });
+        }
+
+        fn popupConfigure(ptr: *anyopaque, size: keywork.Size) anyerror!void {
+            const surface: *PopupSurface = @ptrCast(@alignCast(ptr));
+            surface.resize_pending = false;
+            try surface.runtime.configure(size);
         }
 
         fn invalidatePopupState(ptr: *anyopaque) anyerror!void {
