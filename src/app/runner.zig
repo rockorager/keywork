@@ -143,8 +143,8 @@ fn runWayland(
     options: Options,
     comptime Backend: type,
 ) !void {
-    // Send the portal color-scheme query before window setup so the dbus
-    // round trip completes while the compositor configures the surface.
+    // Start the Prefer or portal color-scheme query before window setup so
+    // the round trip overlaps the compositor configuring the surface.
     var settings_client: ?desktop_settings.Client = desktop_settings.Client.init() catch |err| blk: {
         log.warn("desktop settings unavailable: {}", .{err});
         break :blk null;
@@ -169,7 +169,12 @@ fn runWayland(
     const configured_size = win.currentSize();
     initial_constraints = .{ .max_width = configured_size.width, .max_height = configured_size.height };
 
-    if (settings_client) |*settings| settings.finishColorSchemeRead();
+    if (settings_client) |*settings| {
+        if (!settings.finishColorSchemeRead()) {
+            settings.deinit();
+            settings_client = null;
+        }
+    }
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     var raster_cache: keywork.RasterCache = .{};
@@ -231,12 +236,15 @@ fn runWayland(
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
     defer if (settings_source) |handle| loop.removeSource(handle);
-    if (settings_client) |*settings| settings_source = try loop.addFd(.{
-        .fd = settings.eventLoopFd(),
-        .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
-        .ctx = settings,
-        .callback = desktop_settings.Client.eventLoopCallback,
-    });
+    if (settings_client) |*settings| {
+        settings_source = try loop.addFd(.{
+            .fd = settings.eventLoopFd(),
+            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+            .ctx = settings,
+            .callback = desktop_settings.Client.eventLoopCallback,
+        });
+        settings.setEventLoopSource(settings_source.?);
+    }
     loop.setAfterPlatformHook(&queue, QueuedPlatformEvents.afterPlatformHook);
     defer loop.clearAfterPlatformHook();
     loop.setEndTurnHook(&queue, QueuedPlatformEvents.endTurnHook);
@@ -786,7 +794,12 @@ fn runWaylandWindowed(
     if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
     defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
 
-    if (settings_client) |*settings| settings.finishColorSchemeRead();
+    if (settings_client) |*settings| {
+        if (!settings.finishColorSchemeRead()) {
+            settings.deinit();
+            settings_client = null;
+        }
+    }
     const initial_color_scheme: runtime_mod.UiColorScheme = if (settings_client) |settings| uiColorScheme(settings.color_scheme) else .no_preference;
 
     var raster_cache: keywork.RasterCache = .{};
@@ -830,12 +843,15 @@ fn runWaylandWindowed(
     defer backend.uninstallEventTimers();
     var settings_source: ?event_loop.EventLoop.SourceHandle = null;
     defer if (settings_source) |handle| loop.removeSource(handle);
-    if (settings_client) |*settings| settings_source = try loop.addFd(.{
-        .fd = settings.eventLoopFd(),
-        .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
-        .ctx = settings,
-        .callback = desktop_settings.Client.eventLoopCallback,
-    });
+    if (settings_client) |*settings| {
+        settings_source = try loop.addFd(.{
+            .fd = settings.eventLoopFd(),
+            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP,
+            .ctx = settings,
+            .callback = desktop_settings.Client.eventLoopCallback,
+        });
+        settings.setEventLoopSource(settings_source.?);
+    }
     loop.setAfterPlatformHook(&manager, Manager.afterPlatformHook);
     defer loop.clearAfterPlatformHook();
     loop.setEndTurnHook(&manager, Manager.endTurnHook);
