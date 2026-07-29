@@ -1,0 +1,14 @@
+[Unit]
+Description=Keywork desktop shell
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.rockorager.keywork
+ExecStart=%h/.local/bin/keywork-shell
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

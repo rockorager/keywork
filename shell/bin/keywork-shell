@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+script=lua/init.lua
+
+# Lock is normally started by the shell in its own transient systemd unit;
+# --foreground is the internal entry point run by that unit.
+case "${1-}" in
+lock)
+  shift
+  if [ "${1-}" = "--foreground" ]; then
+    script=lua/lock.lua
+    shift
+  elif dbus-send --session --print-reply --type=method_call \
+      --dest=dev.rockorager.keywork /dev/rockorager/keywork \
+      dev.rockorager.keywork.Lock >/dev/null; then
+    exit 0
+  else
+    exec systemd-run --user --unit=keywork-shell-lock --collect --quiet \
+      --service-type=exec keywork-shell lock --foreground
+  fi
+  ;;
+launcher)
+  exec dbus-send --session --print-reply --type=method_call \
+    --dest=dev.rockorager.keywork /dev/rockorager/keywork \
+    dev.rockorager.keywork.ToggleLauncher >/dev/null
+  ;;
+volume|microphone)
+  kind=$1
+  action=${2-}
+  case "$action" in
+  up|down|mute) ;;
+  *)
+    echo "usage: keywork-shell $kind {up|down|mute}" >&2
+    exit 2
+    ;;
+  esac
+  exec dbus-send --session --print-reply --type=method_call \
+    --dest=dev.rockorager.keywork /dev/rockorager/keywork \
+    dev.rockorager.keywork.AdjustAudio string:"$kind" string:"$action" >/dev/null
+  ;;
+brightness)
+  action=${2-}
+  case "$action" in
+  up|down) ;;
+  *)
+    echo "usage: keywork-shell brightness {up|down}" >&2
+    exit 2
+    ;;
+  esac
+  exec dbus-send --session --print-reply --type=method_call \
+    --dest=dev.rockorager.keywork /dev/rockorager/keywork \
+    dev.rockorager.keywork.AdjustBrightness string:"$action" >/dev/null
+  ;;
+background)
+  shift
+  for option in "$@"; do
+    case "$option" in
+    -h|--help)
+      cat <<'EOF'
+Usage: keywork-shell background <options...>
+
+  -c, --color RRGGBB     Set the background color.
+  -h, --help             Show this help message and quit.
+  -i, --image <path>     Set the image to display.
+  -m, --mode <mode>      Set stretch, fill, fit, center, or solid_color.
+  -o, --output <name>    Select an output, or * for all outputs.
+
+The tile mode supported by swaybg is not implemented yet.
+EOF
+      exit 0
+      ;;
+    esac
+  done
+  payload=$(printf '%s\n' "$@")
+  exec dbus-send --session --print-reply --type=method_call \
+    --dest=dev.rockorager.keywork /dev/rockorager/keywork \
+    dev.rockorager.keywork.ConfigureBackground string:"$payload" >/dev/null
+  ;;
+esac
+
+app_dir=${KEYWORK_SHELL_DATADIR:-${XDG_DATA_HOME:-$HOME/.local/share}/keywork-shell}
+if [ "${LUA_CPATH+x}" ]; then
+  LUA_CPATH="$app_dir/lua/?.so;$app_dir/lua/?/init.so;$LUA_CPATH"
+else
+  LUA_CPATH="$app_dir/lua/?.so;$app_dir/lua/?/init.so;;"
+fi
+export LUA_CPATH
+
+if [ "${KEYWORK_SHELL_KEYWORK+x}" ]; then
+  keywork=$KEYWORK_SHELL_KEYWORK
+elif [ -x "$HOME/.local/bin/keywork" ]; then
+  keywork=$HOME/.local/bin/keywork
+else
+  keywork=keywork
+fi
+
+exec "$keywork" --script="$app_dir/$script" "$@"
