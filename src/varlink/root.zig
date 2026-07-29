@@ -1,4 +1,7 @@
 //! Generic Varlink wire framing, encoding, and synchronous client.
+//!
+//! Product interfaces, dispatch policy, and event-loop integration remain
+//! owned by consumers.
 
 const std = @import("std");
 

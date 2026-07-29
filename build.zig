@@ -18,10 +18,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const varlink = b.addModule("varlink", .{
+        .root_source_file = b.path("src/varlink/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const test_step = b.step("test", "Run all unit tests and formatting checks");
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
+    const varlink_tests = b.addTest(.{ .root_module = varlink });
+    test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
 
     const lint_step = b.step("lint", "Run all static analysis");
     const check_step = b.step("check", "Run all tests and static analysis");
@@ -36,6 +43,7 @@ pub fn build(b: *std.Build) void {
         optimize,
         use_llvm,
         keywork_loop,
+        varlink,
         ui_output,
         wayland_sources.wayland_xml,
         wayland_sources.protocols,
@@ -53,7 +61,15 @@ pub fn build(b: *std.Build) void {
         lua_jit,
         test_step,
     );
-    compositor.add(b, target, optimize, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
+    compositor.add(
+        b,
+        target,
+        optimize,
+        varlink,
+        wayland_sources.wayland_xml,
+        wayland_sources.protocols,
+        test_step,
+    );
 
     const format_paths = &.{
         "build.zig",

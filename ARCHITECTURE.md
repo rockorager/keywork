@@ -146,6 +146,12 @@ creates each module and wires dependencies explicitly.
 - Build helpers under `build/` configure the graph. Product source does not
   import them.
 
+The `varlink` module owns only generic wire types, framing, encoding, and its
+synchronous client. Compositor interfaces and dispatch remain compositor-owned;
+runtime consumers retain their own event-loop integration and product policy.
+The Lua host continues to use its libsystemd-backed adapter for asynchronous
+Varlink clients and servers.
+
 Module names and roots are part of the architecture. Add or change them in the
 root build and document non-obvious dependency direction changes here.
 
@@ -156,10 +162,10 @@ Current source module roots are:
 | `keywork-loop` | `src/loop/event_loop.zig` | none |
 | `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
-| `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
+| `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
 | `keywork-lua` | `src/lua/root.zig` | public native modules |
 | `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |
-| `varlink` | `src/compositor/varlink/root.zig` | none |
+| `varlink` | `src/varlink/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 
 The `keywork` executable root is `src/lua/main.zig`. It consumes the adapter

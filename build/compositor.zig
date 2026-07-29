@@ -5,6 +5,7 @@ pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    varlink: *std.Build.Module,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -148,11 +149,6 @@ pub fn add(
         .optimize = optimize,
     });
 
-    const varlink = b.addModule("varlink", .{
-        .root_source_file = b.path("src/compositor/varlink/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const control = b.addModule("keywork-control", .{
         .root_source_file = b.path("src/compositor/control/root.zig"),
         .target = target,
@@ -234,8 +230,6 @@ pub fn add(
         .root_module = compositor,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-    const varlink_tests = b.addTest(.{ .root_module = varlink });
-    test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
     const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_module });
     test_step.dependOn(&b.addRunArtifact(keyworkctl_tests).step);
 

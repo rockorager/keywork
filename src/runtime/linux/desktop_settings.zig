@@ -5,14 +5,13 @@ const event_loop = @import("keywork-loop");
 const linux_syscall = @import("syscall.zig");
 const SystemdEvent = @import("SystemdEvent.zig");
 const systemd = @import("systemd_c");
+const varlink = @import("varlink");
 
 const linux = std.os.linux;
 const log = std.log.scoped(.keywork_desktop_settings);
 const invalid_fd: i32 = -1;
 
 const prefer_socket_relative_path = "varlink/registry/dev.rockorager.Prefer";
-const prefer_watch_request =
-    "{\"method\":\"dev.rockorager.Prefer.WatchAppearance\",\"parameters\":{},\"more\":true}\x00";
 const prefer_initial_timeout_ms = 1000;
 const prefer_read_buffer_size = 4096;
 
@@ -264,14 +263,13 @@ const PreferClient = struct {
     }
 
     fn consumeFrames(self: *PreferClient, client: *Client) !void {
-        var consumed: usize = 0;
-        while (std.mem.indexOfScalar(u8, self.read_buffer[consumed..self.read_length], 0)) |relative_end| {
-            const frame_end = consumed + relative_end;
-            const color_scheme = try preferColorScheme(self.read_buffer[consumed..frame_end]);
+        var frames: varlink.FrameIterator = .init(self.read_buffer[0..self.read_length]);
+        while (try frames.next()) |frame| {
+            const color_scheme = try preferColorScheme(frame);
             client.updateColorScheme(color_scheme, "prefer");
             self.received_initial = true;
-            consumed = frame_end + 1;
         }
+        const consumed = frames.consumed();
         if (consumed == 0) return;
         const remaining = self.read_length - consumed;
         @memmove(self.read_buffer[0..remaining], self.read_buffer[consumed..self.read_length]);
@@ -382,12 +380,20 @@ fn portalSignal(message: ?*systemd.sd_bus_message, user_data: ?*anyopaque, _: [*
 }
 
 fn writePreferRequest(fd: i32) !void {
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(std.heap.page_allocator);
+    try varlink.encode(std.heap.page_allocator, &request, .{
+        .method = "dev.rockorager.Prefer.WatchAppearance",
+        .parameters = struct {}{},
+        .more = true,
+    }, prefer_read_buffer_size);
+
     var written: usize = 0;
-    while (written < prefer_watch_request.len) {
+    while (written < request.items.len) {
         const result = linux.sendto(
             fd,
-            prefer_watch_request.ptr + written,
-            prefer_watch_request.len - written,
+            request.items.ptr + written,
+            request.items.len - written,
             linux.MSG.NOSIGNAL,
             null,
             0,
@@ -404,21 +410,24 @@ fn writePreferRequest(fd: i32) !void {
 }
 
 fn preferColorScheme(response: []const u8) !ColorScheme {
-    const Response = struct {
-        parameters: struct {
-            appearance: struct {
-                colorScheme: []const u8,
-            },
+    const Parameters = struct {
+        appearance: struct {
+            colorScheme: ColorScheme,
         },
-        continues: bool,
     };
-    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, response, .{
+    var reply = std.json.parseFromSlice(varlink.Reply, std.heap.page_allocator, response, .{
         .ignore_unknown_fields = true,
     }) catch return error.InvalidPreferResponse;
-    defer parsed.deinit();
-    if (!parsed.value.continues) return error.InvalidPreferResponse;
-    return std.meta.stringToEnum(ColorScheme, parsed.value.parameters.appearance.colorScheme) orelse
-        error.InvalidPreferResponse;
+    defer reply.deinit();
+    if (!reply.value.continues) return error.InvalidPreferResponse;
+    var parameters = std.json.parseFromValue(
+        Parameters,
+        std.heap.page_allocator,
+        reply.value.parameters orelse return error.InvalidPreferResponse,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.InvalidPreferResponse;
+    defer parameters.deinit();
+    return parameters.value.appearance.colorScheme;
 }
 
 fn portalSettingChanged(message: *systemd.sd_bus_message) ?ColorScheme {
