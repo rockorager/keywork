@@ -107,6 +107,39 @@ const c = @cImport({
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
+
+fn logProtocolError(
+    _: *wl.Server,
+    direction: wl.ProtocolLogger.Type,
+    message: *const wl.ProtocolLogger.LogMessage,
+) void {
+    if (direction != .event or
+        !std.mem.eql(u8, std.mem.span(message.resource.getClass()), "wl_display") or
+        !std.mem.eql(u8, std.mem.span(message.message.name), "error") or
+        message.arguments_count < 3)
+    {
+        return;
+    }
+    const arguments = message.arguments orelse return;
+    const credentials = message.resource.getClient().getCredentials();
+    const description = arguments[2].s orelse "unknown protocol error";
+    const object: ?*wl.Resource = @ptrCast(arguments[0].o);
+    if (object) |resource| {
+        log.err("Wayland protocol error for pid {d}: {s}@{d} code {d}: {s}", .{
+            credentials.pid,
+            resource.getClass(),
+            resource.getId(),
+            arguments[1].u,
+            description,
+        });
+    } else {
+        log.err("Wayland protocol error for pid {d}: unknown object code {d}: {s}", .{
+            credentials.pid,
+            arguments[1].u,
+            description,
+        });
+    }
+}
 const linux_button_left = 0x110;
 
 allocator: std.mem.Allocator,
@@ -908,6 +941,7 @@ pub fn createWithVirtualOutput(
 
     const display = try wl.Server.create();
     errdefer display.destroy();
+    display.addProtocolLogger(*wl.Server, logProtocolError, display);
     try display.initShm();
 
     self.* = .{
