@@ -1,7 +1,7 @@
 //! Platform-neutral CPU rasterization for Keywork display lists.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const TextRenderer = @import("text.zig");
 const c = @import("pixman_c");
 

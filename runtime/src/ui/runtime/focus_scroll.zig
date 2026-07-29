@@ -1,7 +1,7 @@
 //! Focus traversal and scroll-reveal helpers for the UI runtime.
 
 const std = @import("std");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 
 const log = std.log.scoped(.keywork);
 

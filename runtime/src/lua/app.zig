@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const app_windows = @import("../app/windows.zig");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const log_backend_mod = @import("../backend/log.zig");
 const event_loop = @import("keywork-loop");
 const icon_theme = @import("../linux/icon_theme.zig");
@@ -26,7 +26,7 @@ const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
 const platform_mod = @import("../app/platform.zig");
-const runtime_mod = @import("../ui/runtime.zig");
+const runtime_mod = @import("keywork-ui-runtime");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;

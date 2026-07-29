@@ -1,7 +1,7 @@
 //! Lua image widget decoding and rendering.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const lua_codec = @import("codec.zig");
 const lua_value = @import("value.zig");
 const image_c = @import("image_c");

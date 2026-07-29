@@ -1,14 +1,14 @@
 //! Interactive and headless Storybook commands.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const cli = @import("cli.zig");
 const runner = @import("runner.zig");
 const memory_backend = @import("../backend/memory.zig");
 const event_loop = @import("keywork-loop");
 const lua_app = @import("../lua/app.zig");
 const lua_storybook = @import("../lua/storybook.zig");
-const runtime_mod = @import("../ui/runtime.zig");
+const runtime_mod = @import("keywork-ui-runtime");
 
 const schema_version = 2;
 

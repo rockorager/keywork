@@ -24,6 +24,8 @@ priorities. More specific `AGENTS.md` files add component-local rules.
 
 - Root `build.zig` and `build.zig.zon` are the source of truth for all Zig
   modules, dependencies, artifacts, tests, generated bindings, and installs.
+- Run Zig build, test, and formatting steps from the repository root. There
+  are no component-local Zig build graphs.
 - Files under `build/` may organize root build logic but are not product
   modules.
 - Root `Makefile` is a phony task facade. Do not model Zig source dependencies

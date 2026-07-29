@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const event_loop = @import("keywork-loop");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const wayland = @import("wayland");
 const xkb = @import("xkb_c");
 

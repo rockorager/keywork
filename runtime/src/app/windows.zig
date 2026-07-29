@@ -7,7 +7,7 @@
 //! app declares only an id.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const wayland_options = @import("../backend/wayland/options.zig");
 
 pub const WindowDeclaration = struct {

@@ -1,7 +1,7 @@
 //! Process and event-loop runner for the Keywork Lua runtime.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 
 const desktop_settings = @import("../linux/desktop_settings.zig");
 const event_loop = @import("keywork-loop");
@@ -10,7 +10,7 @@ const log_backend_mod = @import("../backend/log.zig");
 const app_options = @import("options.zig");
 const app_windows = @import("windows.zig");
 const platform_mod = @import("platform.zig");
-const runtime_mod = @import("../ui/runtime.zig");
+const runtime_mod = @import("keywork-ui-runtime");
 const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
 const wayland_vulkan = @import("../backend/wayland/vulkan.zig");

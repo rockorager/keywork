@@ -1,7 +1,7 @@
 //! Small comptime Lua table codec for app-side option structs.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 

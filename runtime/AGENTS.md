@@ -15,8 +15,9 @@ system.
   workaround. Record unresolved consumer pain in `../shell/NOTES.md`.
 - Keep native widget defaults synchronized with the built-in profile as
   described in `DESIGN.md`.
-- Keep tests inline and ensure the runtime test roots, including
-  `src/main.zig`, remain registered in the root build's `test` step.
-
-During build migration, use `zig build test` from this directory to verify the
-unchanged component build. Use the root task once the root build graph lands.
+- Keep tests inline and ensure `keywork-ui`, `keywork-ui-runtime`, and the
+  executable runtime rooted at `src/main.zig` remain registered in the root
+  build's `test` step.
+- Code outside `keywork-ui` and `keywork-ui-runtime` must import those modules
+  by name. Do not reach into their source trees from application, backend,
+  graphics, or Lua code.

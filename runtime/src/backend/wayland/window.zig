@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const event_loop = @import("keywork-loop");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const wayland_options = @import("options.zig");
 const wayland = @import("wayland");
 

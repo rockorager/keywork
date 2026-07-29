@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const raster = @import("../../graphics/raster.zig");
 const TextRenderer = @import("../../graphics/text.zig");
 const SharedBackend = @import("backend.zig").Backend;

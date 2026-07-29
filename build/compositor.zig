@@ -1,13 +1,15 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
+pub fn add(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+) void {
     const scanner = Scanner.create(b, .{});
-    const vulkan = b.dependency("vulkan", .{
-        .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
+    const vulkan = b.dependency("compositor_vulkan", .{
+        .registry = b.dependency("compositor_vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
@@ -56,17 +58,17 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/input-method-unstable-v2.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-output-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-screencopy-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/gtk-shell.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/virtual-keyboard-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/wlr-output-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/gtk-shell.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/virtual-keyboard-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 2);
@@ -142,21 +144,21 @@ pub fn build(b: *std.Build) void {
     });
 
     const varlink = b.addModule("varlink", .{
-        .root_source_file = b.path("src/varlink/root.zig"),
+        .root_source_file = b.path("compositor/src/varlink/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const control = b.createModule(.{
-        .root_source_file = b.path("src/control/root.zig"),
+    const control = b.addModule("keywork-control", .{
+        .root_source_file = b.path("compositor/src/control/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     control.addAnonymousImport("control-interface", .{
-        .root_source_file = b.path("protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
+        .root_source_file = b.path("compositor/protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
     });
 
     const compositor = b.createModule(.{
-        .root_source_file = b.path("src/compositor/main.zig"),
+        .root_source_file = b.path("compositor/src/compositor/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -166,7 +168,7 @@ pub fn build(b: *std.Build) void {
     compositor.addImport("wayland", wayland);
     compositor.addImport("vulkan", vulkan);
     compositor.addAnonymousImport("default-config", .{
-        .root_source_file = b.path("resources/keywork.conf"),
+        .root_source_file = b.path("compositor/resources/keywork.conf"),
     });
     addVulkanShader(b, compositor, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
     addVulkanShader(b, compositor, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
@@ -249,7 +251,7 @@ pub fn build(b: *std.Build) void {
         .root_module = compositor,
     });
     const keyworkctl_module = b.createModule(.{
-        .root_source_file = b.path("src/keyworkctl/main.zig"),
+        .root_source_file = b.path("compositor/src/keyworkctl/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -263,40 +265,38 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     b.installArtifact(keyworkctl);
     b.installFile(
-        "resources/keywork-session.target",
+        "compositor/resources/keywork-session.target",
         "share/systemd/user/keywork-session.target",
     );
     b.installFile(
-        "resources/keywork-xdg-autostart.service",
+        "compositor/resources/keywork-xdg-autostart.service",
         "share/systemd/user/keywork-xdg-autostart.service",
     );
     b.installFile(
-        "resources/keywork-xdg-autostart.target",
+        "compositor/resources/keywork-xdg-autostart.target",
         "share/systemd/user/keywork-xdg-autostart.target",
     );
     b.installFile(
-        "resources/keywork.desktop",
+        "compositor/resources/keywork.desktop",
         "share/wayland-sessions/keywork.desktop",
     );
     b.installFile(
-        "resources/keywork-portals.conf",
+        "compositor/resources/keywork-portals.conf",
         "share/xdg-desktop-portal/keywork-portals.conf",
     );
     b.installFile(
-        "resources/keywork.conf",
+        "compositor/resources/keywork.conf",
         "share/keywork/keywork.conf",
     );
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the application");
+    const run_step = b.step("run-compositor", "Run the compositor");
     run_step.dependOn(&run_cmd.step);
 
-    const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
         .root_module = compositor,
     });
@@ -334,11 +334,6 @@ pub fn build(b: *std.Build) void {
     );
     renderer_check_step.dependOn(&renderer_conformance_run.step);
     renderer_check_step.dependOn(&renderer_scene_run.step);
-
-    const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
-    fmt_step.dependOn(&fmt_check.step);
-    test_step.dependOn(fmt_step);
 }
 
 fn addVulkanShader(
@@ -359,7 +354,7 @@ fn addVulkanShaderVariant(
 ) void {
     const compile = b.addSystemCommand(&.{ "glslc", "-O" });
     for (defines) |value| compile.addArg(b.fmt("-D{s}", .{value}));
-    compile.addFileArg(b.path(source_path));
+    compile.addFileArg(b.path(b.fmt("compositor/{s}", .{source_path})));
     compile.addArg("-o");
     const spirv = compile.addOutputFileArg(b.fmt("{s}.spv", .{name}));
     module.addAnonymousImport(name, .{ .root_source_file = spirv });

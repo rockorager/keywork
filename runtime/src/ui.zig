@@ -1,9 +1,10 @@
-//! Internal UI engine facade.
+//! Native retained UI engine facade.
 
 const model = @import("ui/model.zig");
 const types = @import("ui/types.zig");
 const display = @import("ui/display.zig");
 
+pub const animation = @import("ui/animation.zig");
 pub const Color = types.Color;
 pub const ShadowLayer = types.ShadowLayer;
 pub const BoxShadow = types.BoxShadow;
@@ -89,3 +90,14 @@ pub const shortcutAllowedWhileEditing = model.shortcutAllowedWhileEditing;
 pub const findShortcutAction = model.findShortcutAction;
 pub const findFocusedShortcutAction = model.findFocusedShortcutAction;
 pub const collectDamage = model.collectDamage;
+
+test {
+    _ = @import("ui/animation.zig");
+    _ = @import("ui/display.zig");
+    _ = @import("ui/hit_testing.zig");
+    _ = @import("ui/layout.zig");
+    _ = @import("ui/model.zig");
+    _ = @import("ui/paint.zig");
+    _ = @import("ui/shortcuts.zig");
+    _ = @import("ui/types.zig");
+}

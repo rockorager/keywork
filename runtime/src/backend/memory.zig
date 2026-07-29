@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const image_c = @import("image_c");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const raster = @import("../graphics/raster.zig");
 const TextRenderer = @import("../graphics/text.zig");
 

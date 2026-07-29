@@ -1,7 +1,7 @@
 //! SVG icon render object support.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const c = @import("image_c");
 
 const log = std.log.scoped(.keywork_svg);

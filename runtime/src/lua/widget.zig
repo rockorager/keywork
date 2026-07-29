@@ -1,7 +1,7 @@
 //! Lua widget parsing and Lua-backed widget runtime objects.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const icon_theme = @import("../linux/icon_theme.zig");
 const lua_codec = @import("codec.zig");
 const lua_handle = @import("handle.zig");

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const uucode = @import("uucode");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const focus_scroll = @import("focus_scroll.zig");
 
 const log = std.log.scoped(.keywork);

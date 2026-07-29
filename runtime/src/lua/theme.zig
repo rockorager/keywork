@@ -1,7 +1,7 @@
 //! Lua theme table decoding.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 const lua_codec = @import("codec.zig");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");

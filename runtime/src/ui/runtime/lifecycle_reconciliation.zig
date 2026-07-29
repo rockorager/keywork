@@ -1,7 +1,7 @@
 //! Rebuild lifecycle and tree reconciliation helpers for the UI runtime.
 
 const std = @import("std");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const focus_scroll = @import("focus_scroll.zig");
 
 pub fn currentState(self: anytype) @TypeOf(self.*).State {

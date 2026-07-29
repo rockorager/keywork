@@ -1,5 +1,5 @@
 //! Builds LuaJIT from the upstream tarball by replicating its Makefile
-//! bootstrap: minilua runs DynASM and genversion, then buildvm emits the
+//! bootstrap: minilua runs DynASM and genversion; then buildvm emits the
 //! generated VM assembly and definition headers used by the final library.
 
 const std = @import("std");

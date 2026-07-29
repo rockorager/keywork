@@ -24,7 +24,10 @@ resources, examples, and public Lua type information.
 
 The runtime is a general Wayland application platform. It must not acquire
 shell policy or compositor implementation details to make an individual
-consumer easier to implement.
+consumer easier to implement. `keywork-ui` owns the retained model and render
+contract; `keywork-ui-runtime` owns platform-neutral lifecycle, input, and
+backend orchestration around that model. Neither module may depend on Lua, the
+event loop, the application host, or platform backends.
 
 ### Compositor (`compositor/`)
 
@@ -62,17 +65,17 @@ would obscure its ownership.
 Arrows mean "depends on":
 
 ```diagram
-┌─────────┐    public Lua/application API    ┌─────────┐     ┌──────────────┐
-│  shell  │ ────────────────────────────────▶│ runtime │────▶│ keywork-loop │
-└────┬────┘                                  └────┬────┘     └──────────────┘
-     │                                            │
-     │ shared protocol XML                        │ shared protocol XML
-     │             ┌───────────┐                  │
-     └────────────▶│ protocols │◀─────────────────┘
-                   └─────▲─────┘
-                         │ shared protocol XML
-                   ┌─────┴──────┐
-                   │ compositor │
+┌─────────┐    public Lua/application API    ┌─────────┐────▶┌────────────────────┐
+│  shell  │ ────────────────────────────────▶│ runtime │     │ keywork-ui-runtime │
+└────┬────┘                                  └────┬────┘─┐   └─────────┬──────────┘
+     │                                            │      │             ▼
+     │ shared protocol XML                        │      │      ┌────────────┐
+     │             ┌───────────┐                  │      │      │ keywork-ui │
+     └────────────▶│ protocols │◀─────────────────┘      │      └────────────┘
+                   └─────▲─────┘                         │
+                         │ shared protocol XML           │      ┌──────────────┐
+                   ┌─────┴──────┐                        └─────▶│ keywork-loop │
+                   │ compositor │                               └──────────────┘
                    └────────────┘
 ```
 
@@ -80,9 +83,11 @@ The compositor and runtime have no source-code dependency on each other. The
 shell may rely on the runtime's public Lua/application contract, but it may not
 reach into runtime implementation files. Session integration between the
 compositor and shell is a deployed-process contract, not permission for source
-imports between them. The runtime consumes `keywork-loop`; the loop has no
-dependency on any product component. Compositor consumption may be added later
-through the named module without introducing a compositor-runtime dependency.
+imports between them. The runtime consumes `keywork-ui-runtime` and
+`keywork-loop`; the UI runtime consumes `keywork-ui`. None of those modules
+depends on product-level runtime policy. Compositor consumption of
+`keywork-loop` may be added later without introducing a compositor-runtime
+dependency.
 
 There is intentionally no general-purpose `common/` directory. Shared code is
 promoted only when it has a stable responsibility and a clear owner.
@@ -103,6 +108,22 @@ creates each module and wires dependencies explicitly.
 
 Module names and roots are part of the architecture. Add or change them in the
 root build and document non-obvious dependency direction changes here.
+
+Current source module roots are:
+
+| Module | Root | Direct module dependencies |
+| --- | --- | --- |
+| `keywork-loop` | `loop/src/event_loop.zig` | none |
+| `keywork-ui` | `runtime/src/ui.zig` | `uucode`, `linebreak`, `z2d` |
+| `keywork-ui-runtime` | `runtime/src/ui/runtime.zig` | `keywork-ui`, `uucode` |
+| `linebreak` | `runtime/lib/linebreak/root.zig` | `uucode` |
+| `varlink` | `compositor/src/varlink/root.zig` | none |
+| `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |
+
+The runtime executable owns platform backends and hosts the native UI modules.
+Its application and Lua layers remain one module until their current
+lifecycle/host dependency cycle is removed. Do not create named facades that
+preserve that cycle while implying those layers are independent.
 
 ## Build ownership
 

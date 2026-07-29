@@ -1,9 +1,9 @@
 # Keywork
 
-This repository is the future home of the Keywork runtime, compositor, and
-desktop shell. The monorepo migration is intentionally incremental: first
-preserve each repository and its history, then consolidate shared build and
-protocol infrastructure without mixing those moves with product changes.
+This repository contains the Keywork native application runtime and UI,
+Wayland compositor, and desktop shell. Their histories remain intact while a
+single build graph enables explicit modules and coordinated changes without
+erasing component ownership.
 
 ## Repository layout
 
@@ -21,18 +21,36 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and dependency rules.
 
 ## Build model
 
-The completed repository will have one root `build.zig` and
-`build.zig.zon`. The root build will create named modules for every Zig
-subproject and build all Zig artifacts in one graph and cache. Source code may
-use relative imports within a module, but dependencies between modules must be
-explicit named imports wired by the root build.
+Root `build.zig` and `build.zig.zon` build every Zig artifact in one graph and
+cache. Current named source modules include `keywork-loop`, `keywork-ui`,
+`keywork-ui-runtime`, `linebreak`, `varlink`, and `keywork-control`. Source may
+use relative imports within a cohesive module; dependencies between modules
+are explicit named imports wired by the root build.
 
 The shell's existing Makefile remains responsible for its C modules and
-Wayland code generation. A small root Makefile will be the human-facing task
-facade and will delegate to the Zig build and to `$(MAKE) -C shell`.
+Wayland code generation. The root Makefile is the human-facing task facade and
+delegates shell work to `$(MAKE) -C shell`.
 
-Zig 0.16 is a developer prerequisite. This repository does not install or
-select compilers or system packages.
+Zig 0.16 and the native development libraries used by both products are
+developer prerequisites. Shell linting and formatting additionally require
+`emmylua_check` and `luafmt`; this repository does not install or select tools
+or system packages.
+
+Common commands:
+
+| Command | Action |
+| --- | --- |
+| `make` | Build all Zig artifacts and validate/build shell native modules |
+| `make test` | Run all Zig tests |
+| `make check` | Run all Zig tests and shell checks |
+| `make lint` | Run shell static analysis |
+| `make fmt` | Format Zig, Lua, and Lua type sources |
+| `make install` | Install Zig artifacts under `PREFIX` (default `~/.local`) |
+| `make install-shell` | Install the shell and its user service under `PREFIX` |
+
+Direct Zig steps such as `zig build test`, `zig build run`,
+`zig build run-compositor`, and `zig build renderer-check` are also available
+from the repository root.
 
 ## Migration status
 
@@ -50,10 +68,8 @@ Migration phases:
 - [x] Import all three source histories without changing their contents.
 - [x] Establish repository-wide guidance and scoped component guidance.
 - [x] Extract the Linux reactor as the named `keywork-loop` module.
-- [ ] Replace the two independent Zig builds with one root build graph.
+- [x] Replace the two independent Zig builds with one root build graph.
+- [x] Promote the native UI model and orchestration to named modules.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
-- [ ] Add the root Make task facade and verify build, test, and formatting parity.
-- [ ] Remove transitional component build and tool-runner configuration.
-
-Until those phases are complete, component-local commands remain the source
-of truth for validation.
+- [x] Add the root Make task facade and verify build, test, and formatting parity.
+- [x] Remove transitional component build and tool-runner configuration.

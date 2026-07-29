@@ -1,7 +1,7 @@
 //! Experimental Wayland/Vulkan render backend.
 
 const std = @import("std");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const SharedBackend = @import("backend.zig").Backend;
 const VulkanRenderer = @import("vulkan/renderer.zig").Renderer;
 const window = @import("window.zig");

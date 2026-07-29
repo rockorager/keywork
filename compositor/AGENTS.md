@@ -21,6 +21,3 @@ applies here.
 - When changing vendored or adapted Wayland XML, update its provenance,
   revision, and SHA-256 metadata. Until shared protocols are elevated, that
   metadata lives in `protocol/README.md`.
-
-During build migration, use `zig build test` from this directory to verify the
-unchanged component build. Use the root task once the root build graph lands.

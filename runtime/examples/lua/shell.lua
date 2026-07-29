@@ -15,7 +15,7 @@ local loop = require("keywork.loop")
 -- Run with:
 --   zig build run-lua-shell-example
 -- or:
---   zig build run -- examples/lua/shell.lua
+--   zig build run -- runtime/examples/lua/shell.lua
 
 local colors = {
     background = 0xf0111113,

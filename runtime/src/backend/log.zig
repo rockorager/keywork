@@ -1,7 +1,7 @@
 //! Text log render backend.
 
 const std = @import("std");
-const ui = @import("../ui.zig");
+const ui = @import("keywork-ui");
 
 pub const LogBackend = struct {
     writer: *std.Io.Writer,

@@ -1,4 +1,4 @@
-//! Builds stb_image and stb_image_resize from the upstream header-only package.
+//! Builds stb_image and stb_image_resize from their upstream header-only package.
 
 const std = @import("std");
 

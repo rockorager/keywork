@@ -1,7 +1,7 @@
-//! Runtime orchestration for Keywork applications.
+//! Platform-neutral retained UI lifecycle, input, and rendering orchestration.
 
 const std = @import("std");
-const keywork = @import("../ui.zig");
+const keywork = @import("keywork-ui");
 
 const log = std.log.scoped(.keywork);
 
@@ -19,7 +19,7 @@ const RenderBackend = keywork.RenderBackend;
 const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
 
-const animation = @import("animation.zig");
+const animation = keywork.animation;
 const backend_behavior = @import("runtime/backend_behavior.zig");
 const focus_scroll = @import("runtime/focus_scroll.zig");
 const input_behavior = @import("runtime/input.zig");
@@ -1070,7 +1070,7 @@ test "non-left buttons do not start scrollbar drags" {
 const FakeClock = struct {
     now_ns: u64 = 0,
 
-    fn clock(self: *FakeClock) @import("animation.zig").Clock {
+    fn clock(self: *FakeClock) animation.Clock {
         return .{ .ptr = self, .now_fn = now };
     }
 
@@ -1090,7 +1090,6 @@ test "scrollbar reveals on scroll and fades out on the animation clock" {
         }
     };
 
-    const animation_module = @import("animation.zig");
     var fake_clock: FakeClock = .{};
     var app: TestApp = .{};
     var backend: TestBackend = .{};
@@ -1112,17 +1111,17 @@ test "scrollbar reveals on scroll and fades out on the animation clock" {
     try std.testing.expect(runtime.repaint_pending);
 
     // The thumb holds at full alpha, then eases out.
-    fake_clock.now_ns = animation_module.scrollbar_fade_hold_ms * std.time.ns_per_ms / 2;
+    fake_clock.now_ns = animation.scrollbar_fade_hold_ms * std.time.ns_per_ms / 2;
     try runtime.repaint();
     try std.testing.expectEqual(@as(f32, 1), runtime.root.?.scrollbar_alpha);
 
-    fake_clock.now_ns = (animation_module.scrollbar_fade_hold_ms + animation_module.scrollbar_fade_duration_ms / 2) * std.time.ns_per_ms;
+    fake_clock.now_ns = (animation.scrollbar_fade_hold_ms + animation.scrollbar_fade_duration_ms / 2) * std.time.ns_per_ms;
     try runtime.repaint();
     try std.testing.expect(runtime.root.?.scrollbar_alpha > 0 and runtime.root.?.scrollbar_alpha < 1);
     try std.testing.expect(runtime.animations_active);
 
     // Completion lands at exactly invisible and drops the frame demand.
-    fake_clock.now_ns = animation_module.scrollbar_fade_total_ns;
+    fake_clock.now_ns = animation.scrollbar_fade_total_ns;
     try runtime.repaint();
     try std.testing.expectApproxEqAbs(@as(f32, 0), runtime.root.?.scrollbar_alpha, 0.001);
     try std.testing.expect(!runtime.animations_active);
@@ -2261,4 +2260,11 @@ test "modal focus scope traps autofocus traversal and focus requests" {
     try runtime.clearFocus();
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
+}
+
+test {
+    _ = @import("runtime/backend_behavior.zig");
+    _ = @import("runtime/focus_scroll.zig");
+    _ = @import("runtime/input.zig");
+    _ = @import("runtime/lifecycle_reconciliation.zig");
 }

@@ -1,7 +1,7 @@
 //! Repaint and backend presentation behavior for the UI runtime.
 
 const std = @import("std");
-const keywork = @import("../../ui.zig");
+const keywork = @import("keywork-ui");
 const lifecycle_reconciliation = @import("lifecycle_reconciliation.zig");
 
 const log = std.log.scoped(.keywork);
