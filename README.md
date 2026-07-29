@@ -56,8 +56,9 @@ Common commands:
 | `make install-shell` | Install the shell and its user service under `PREFIX` |
 
 Direct Zig steps such as `zig build test`, `zig build run`,
-`zig build run-compositor`, and `zig build renderer-check` are also available
-from the repository root.
+`zig build run-native-example`, `zig build run-compositor`, and
+`zig build renderer-check` are also available from the repository root. The
+native example opens a Wayland window without compiling or linking LuaJIT.
 
 ## Migration status
 
@@ -79,7 +80,7 @@ Migration phases:
 - [x] Promote the native UI model and orchestration to named modules.
 - [x] Replace runner callback fields with one typed host-binding contract.
 - [x] Expose the Lua-free `keywork-runtime` module.
-- [ ] Add a native Wayland application proving the no-LuaJIT path.
+- [x] Add a native Wayland application proving the no-LuaJIT path.
 - [ ] Relocate native UI and Lua host source to top-level components.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [x] Add the root Make task facade and verify build, test, and formatting parity.

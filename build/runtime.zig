@@ -168,6 +168,28 @@ pub fn add(
     keywork_runtime_module.addImport("pixman_c", pixman_c_module);
     linkKeyworkNativeSystemLibraries(keywork_runtime_module);
 
+    const native_example_module = b.createModule(.{
+        .root_source_file = b.path("runtime/examples/native/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    native_example_module.addImport("keywork-loop", keywork_loop_module);
+    native_example_module.addImport("keywork-runtime", keywork_runtime_module);
+    native_example_module.addImport("keywork-ui", keywork_ui_module);
+
+    const native_example = b.addExecutable(.{
+        .name = "keywork-native-example",
+        .root_module = native_example_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
+    });
+    const native_example_step = b.step("native-example", "Build the native Wayland example");
+    native_example_step.dependOn(&native_example.step);
+    const run_native_example = b.addRunArtifact(native_example);
+    const run_native_example_step = b.step("run-native-example", "Run the native Wayland example");
+    run_native_example_step.dependOn(&run_native_example.step);
+
     const app_module = b.createModule(.{
         .root_source_file = b.path("runtime/src/main.zig"),
         .target = target,
