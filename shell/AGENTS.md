@@ -1,9 +1,11 @@
 # AGENTS.md
 
-keywork-shell is a Linux desktop shell built on [keywork](../keywork), a Lua/Wayland
-app runtime under active development. This repo is a playground for keywork's APIs:
-when we hit pain points or bugs, note them in NOTES.md and fix them in `../keywork`
-rather than working around them here.
+The root repository guidance applies here. Keywork Shell is a Linux desktop
+shell built on the Lua/Wayland application runtime in `../runtime/`.
+
+This component is a demanding consumer and playground for runtime APIs. When
+it exposes runtime pain or bugs, record them in `NOTES.md` and fix them in
+`../runtime/` rather than working around them here.
 
 First target: a bar + launcher in a single keywork process, using the multi-window
 API (`kw.app({ windows = function(ctx) ... end })`). The shell owns
@@ -12,8 +14,11 @@ toggle the launcher via `keywork-shell launcher` (dbus-send).
 
 ## Conventions
 
-- Lua (LuaJIT) targeting the keywork runtime; structure mirrors the sibling repos:
-  `bin/` shell wrapper, `lua/shell/` modules, Makefile with `check` / `run` / `install`.
+- Use Lua targeting LuaJIT and the Keywork runtime. Keep the `bin/` wrapper,
+  `lua/shell/` modules, and shell-owned native helpers within this component.
 - Theme via `kw.resolve_theme` / `context.theme`; no hardcoded colors outside a
   palette module (see `lua/shell/bar/colors.lua`).
-- `make check` byte-compiles all Lua with `luajit -b` — run it before finishing.
+- `shell/Makefile` owns C module compilation and C Wayland binding generation;
+  do not move those dependencies into the root task facade.
+- Run `make check` from this directory before finishing shell changes. It
+  builds native modules and byte-compiles all Lua with `luajit -b`.

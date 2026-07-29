@@ -46,12 +46,12 @@ revisions before any files are reorganized:
 
 Migration phases:
 
-1. Import all three source histories without changing their contents.
-2. Establish repository-wide guidance and scoped component guidance.
-3. Replace the two independent Zig builds with one root build graph.
-4. Elevate shared vendored Wayland XML to `protocols/` with provenance.
-5. Add the root Make task facade and verify build, test, and formatting parity.
-6. Remove transitional component build and tool-runner configuration.
+- [x] Import all three source histories without changing their contents.
+- [x] Establish repository-wide guidance and scoped component guidance.
+- [ ] Replace the two independent Zig builds with one root build graph.
+- [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
+- [ ] Add the root Make task facade and verify build, test, and formatting parity.
+- [ ] Remove transitional component build and tool-runner configuration.
 
 Until those phases are complete, component-local commands remain the source
 of truth for validation.
