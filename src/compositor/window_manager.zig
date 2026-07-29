@@ -248,6 +248,8 @@ const OutputWorkspace = struct {
     workspace: workspace_mod.Workspace = .{},
 };
 
+const WorkspaceFocus = enum { preserve, output };
+
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
@@ -759,12 +761,14 @@ fn outputNamed(self: *Self, name: []const u8) ?OutputLayout.Id {
     return null;
 }
 
+fn pointerOutput(self: *Self) OutputLayout.Id {
+    const position = self.seat.pointerPosition() orelse return self.default_output;
+    const output = self.outputs.outputAt(position.x, position.y) orelse return self.default_output;
+    return output.id;
+}
+
 fn initialWorkspace(self: *Self) ?usize {
-    const output = if (self.seat.pointerPosition()) |position|
-        if (self.outputs.outputAt(position.x, position.y)) |entry| entry.id else self.default_output
-    else
-        self.default_output;
-    return self.workspaceFor(output) orelse self.workspaceFor(self.default_output);
+    return self.workspaceFor(self.pointerOutput()) orelse self.workspaceFor(self.default_output);
 }
 
 fn appendOutputWorkspaces(self: *Self, output: OutputLayout.Id) !void {
@@ -1011,7 +1015,7 @@ fn activateWindow(self: *Self, id: WindowId) bool {
     }
     _ = self.layer_shell.relinquishNonExclusiveFocus();
     if (!workspace.active) {
-        const activated = self.activateWorkspace(workspace.output, workspace.number, true);
+        const activated = self.activateWorkspace(workspace.output, workspace.number, true, .output);
         std.debug.assert(activated);
         return true;
     }
@@ -1869,18 +1873,24 @@ pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
 }
 
 pub fn switchWorkspace(self: *Self, number: u8) void {
-    _ = self.activateWorkspace(self.default_output, number, true);
+    _ = self.activateWorkspace(self.pointerOutput(), number, true, .preserve);
 }
 
 pub fn activateWorkspaceFromProtocol(self: *Self, output: OutputLayout.Id, number: u8) bool {
-    return self.activateWorkspace(output, number, false);
+    return self.activateWorkspace(output, number, false, .output);
 }
 
-fn activateWorkspace(self: *Self, output: OutputLayout.Id, number: u8, notify_protocol: bool) bool {
+fn activateWorkspace(
+    self: *Self,
+    output: OutputLayout.Id,
+    number: u8,
+    notify_protocol: bool,
+    focus: WorkspaceFocus,
+) bool {
     const current = self.workspaceFor(output) orelse return false;
     const target = self.workspaceNumber(output, number) orelse return false;
-    const output_changed = !std.meta.eql(self.default_output, output);
-    self.default_output = output;
+    const output_changed = focus == .output and !std.meta.eql(self.default_output, output);
+    if (focus == .output) self.default_output = output;
     if (current == target) {
         if (output_changed) self.relayout();
         return true;
@@ -2825,6 +2835,68 @@ test "each output owns ten numbered workspaces" {
     try std.testing.expectEqual(@as(usize, 10), manager.workspaceFor(second).?);
     try std.testing.expectEqual(@as(usize, 9), manager.workspaceNumber(first, 10).?);
     try std.testing.expectEqual(@as(usize, 19), manager.workspaceNumber(second, 10).?);
+}
+
+test "workspace switching targets the pointer output without changing keyboard focus" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+
+    var outputs: OutputLayout = undefined;
+    outputs.init(std.testing.allocator, display, &surfaces);
+    defer outputs.deinit();
+
+    const first = try outputs.add(.{
+        .size = .{ .width = 1280, .height = 720 },
+        .physical_size = .{ .width = 1280, .height = 720 },
+        .scale = 1,
+        .name = "HEADLESS-1",
+        .description = "Keywork headless output",
+        .model = "headless",
+    });
+    defer std.debug.assert(outputs.remove(first));
+    const second = try outputs.add(.{
+        .position = .{ .x = 1280 },
+        .size = .{ .width = 1920, .height = 1080 },
+        .physical_size = .{ .width = 1920, .height = 1080 },
+        .scale = 1,
+        .name = "HEADLESS-2",
+        .description = "Keywork headless output 2",
+        .model = "headless",
+    });
+    defer std.debug.assert(outputs.remove(second));
+
+    var seat: Seat = undefined;
+    try seat.init(std.testing.allocator, std.testing.io, display, "default", &surfaces);
+    defer seat.deinit();
+    seat.pointerMotion(0, 1280, 0, null);
+
+    var manager: Self = undefined;
+    manager.allocator = std.testing.allocator;
+    manager.outputs = &outputs;
+    manager.seat = &seat;
+    manager.default_output = first;
+    manager.windows = .{};
+    manager.workspaces = .empty;
+    defer {
+        for (manager.workspaces.items) |*entry| entry.workspace.deinit(std.testing.allocator);
+        manager.workspaces.deinit(std.testing.allocator);
+    }
+    manager.transaction = .{};
+    manager.transaction.begin(1);
+    manager.geometry_listener = null;
+    try manager.appendOutputWorkspaces(first);
+    try manager.appendOutputWorkspaces(second);
+
+    const target = manager.pointerOutput();
+    try std.testing.expectEqual(second, target);
+    try std.testing.expect(manager.activateWorkspace(target, 2, false, .preserve));
+    try std.testing.expectEqual(first, manager.default_output);
+    try std.testing.expect(manager.workspaces.items[manager.workspaceFor(first).?].active);
+    try std.testing.expect(!manager.workspaces.items[manager.workspaceNumber(second, 1).?].active);
+    try std.testing.expect(manager.workspaces.items[manager.workspaceNumber(second, 2).?].active);
 }
 
 test "workspace transition waits for the transaction containing the latest switch" {

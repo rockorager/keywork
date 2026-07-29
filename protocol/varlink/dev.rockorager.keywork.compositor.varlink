@@ -236,7 +236,7 @@ method ToggleFloating (target: WindowTarget) -> ()
 # Change the active workspace's layout.
 method SetLayout (layout: Layout) -> ()
 
-# Activate a numbered workspace on the focused output.
+# Activate a numbered workspace on the output under the pointer.
 method SwitchWorkspace (workspace: int) -> ()
 
 # Move the focused window to a numbered workspace on the focused output.
