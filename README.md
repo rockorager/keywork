@@ -27,6 +27,12 @@ cache. Current named source modules include `keywork-loop`, `keywork-ui`,
 use relative imports within a cohesive module; dependencies between modules
 are explicit named imports wired by the root build.
 
+The current physical layout is transitional. The target separates native UI,
+native application runtime, and the Lua host so Zig applications can use the
+full Wayland platform without building or linking LuaJIT. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
+monorepo stop conditions.
+
 The shell's existing Makefile remains responsible for its C modules and
 Wayland code generation. The root Makefile is the human-facing task facade and
 delegates shell work to `$(MAKE) -C shell`.
@@ -70,6 +76,10 @@ Migration phases:
 - [x] Extract the Linux reactor as the named `keywork-loop` module.
 - [x] Replace the two independent Zig builds with one root build graph.
 - [x] Promote the native UI model and orchestration to named modules.
+- [ ] Replace runner callback fields with one typed host-binding contract.
+- [ ] Expose the Lua-free `keywork-runtime` module.
+- [ ] Add a native Wayland application proving the no-LuaJIT path.
+- [ ] Relocate native UI and Lua host source to top-level components.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [x] Add the root Make task facade and verify build, test, and formatting parity.
 - [x] Remove transitional component build and tool-runner configuration.

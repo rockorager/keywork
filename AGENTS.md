@@ -8,6 +8,10 @@ priorities. More specific `AGENTS.md` files add component-local rules.
 
 - Keep loop, runtime, compositor, shell, and shared protocol ownership aligned
   with `ARCHITECTURE.md`.
+- Treat the target dependency graph in `ARCHITECTURE.md` as authoritative even
+  while UI and Lua source remain under transitional paths in `runtime/`.
+- Native UI and runtime modules must compile without LuaJIT. Lua may consume
+  their public contracts; they must never import Lua source.
 - Relative Zig imports are allowed within one cohesive module. Cross-module
   and cross-component imports must use named modules wired in root
   `build.zig`; never reach through another component with relative paths.
@@ -19,11 +23,16 @@ priorities. More specific `AGENTS.md` files add component-local rules.
   vendored Wayland XML and provenance, not compositor control APIs.
 - During migration, separate history-preserving moves from build changes and
   behavior changes so each can be reviewed and verified independently.
+- Make boundaries compiler-enforced and prove the native no-Lua path before
+  relocating source. Do not deepen transitional directory coupling.
 
 ## Build system ownership
 
 - Root `build.zig` and `build.zig.zon` are the source of truth for all Zig
   modules, dependencies, artifacts, tests, generated bindings, and installs.
+- Build graph construction must not execute system dependency probes. Attach
+  checks and generators to the artifacts or steps that need them so focused
+  component commands remain isolated.
 - Run Zig build, test, and formatting steps from the repository root. There
   are no component-local Zig build graphs.
 - Files under `build/` may organize root build logic but are not product
