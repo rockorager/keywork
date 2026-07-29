@@ -15,10 +15,10 @@ system.
   workaround. Record unresolved consumer pain in `../shell/NOTES.md`.
 - Keep native widget defaults synchronized with the built-in profile as
   described in `DESIGN.md`.
-- Keep tests inline and ensure `keywork-ui`, `keywork-ui-runtime`,
+- Keep tests inline and ensure `keywork-ui`, `keywork-ui-engine`,
   `keywork-runtime`, and the Lua executable rooted at `src/main.zig` remain
   registered as separate roots in the root build's `test` step.
-- Code outside `keywork-ui` and `keywork-ui-runtime` must import those modules
+- Code outside `keywork-ui` and `keywork-ui-engine` must import those modules
   by name. Do not reach into their source trees from application, backend,
   graphics, or Lua code.
 - The current UI and Lua nesting is transitional. Keep `app/`, `backend/`,

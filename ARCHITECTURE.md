@@ -32,8 +32,7 @@ Owns the platform-neutral native UI implementation:
 
 Neither module may depend on Lua, the event loop, a concrete application host,
 Wayland, or a concrete rendering backend. During migration these modules
-remain physically under `runtime/src/ui*` and the engine retains its temporary
-`keywork-ui-runtime` name.
+remain physically under `runtime/src/ui*`.
 
 ### Native runtime (`runtime/`)
 
@@ -157,8 +156,8 @@ Current transitional source module roots are:
 | --- | --- | --- |
 | `keywork-loop` | `loop/src/event_loop.zig` | none |
 | `keywork-ui` | `runtime/src/ui.zig` | `uucode`, `linebreak`, `z2d` |
-| `keywork-ui-runtime` | `runtime/src/ui/runtime.zig` | `keywork-ui`, `uucode` |
-| `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-runtime` |
+| `keywork-ui-engine` | `runtime/src/ui/runtime.zig` | `keywork-ui`, `uucode` |
+| `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
 | `linebreak` | `runtime/lib/linebreak/root.zig` | `uucode` |
 | `varlink` | `compositor/src/varlink/root.zig` | none |
 | `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |

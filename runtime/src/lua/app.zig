@@ -36,7 +36,7 @@ const lua_varlink = @import("varlink.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
-const runtime_mod = @import("keywork-ui-runtime");
+const runtime_mod = @import("keywork-ui-engine");
 const c = @import("luajit_c");
 
 const linux = std.os.linux;

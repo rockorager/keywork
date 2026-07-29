@@ -4,7 +4,7 @@ const HostBindings = @This();
 
 const event_loop = @import("keywork-loop");
 const platform_mod = @import("platform.zig");
-const runtime_mod = @import("keywork-ui-runtime");
+const runtime_mod = @import("keywork-ui-engine");
 
 ptr: *anyopaque,
 vtable: *const VTable,

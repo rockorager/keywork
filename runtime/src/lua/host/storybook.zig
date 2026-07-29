@@ -8,7 +8,7 @@ const memory_backend = native_runtime.MemoryBackend;
 const event_loop = @import("keywork-loop");
 const lua_app = @import("../app.zig");
 const lua_storybook = @import("../storybook.zig");
-const runtime_mod = @import("keywork-ui-runtime");
+const runtime_mod = @import("keywork-ui-engine");
 
 const schema_version = 2;
 

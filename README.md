@@ -23,7 +23,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and dependency rules.
 
 Root `build.zig` and `build.zig.zon` build every Zig artifact in one graph and
 cache. Current named source modules include `keywork-loop`, `keywork-ui`,
-`keywork-ui-runtime`, `keywork-runtime`, `linebreak`, `varlink`, and
+`keywork-ui-engine`, `keywork-runtime`, `linebreak`, `varlink`, and
 `keywork-control`. Source may use relative imports within a cohesive module;
 dependencies between modules are explicit named imports wired by the root
 build.

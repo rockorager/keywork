@@ -91,13 +91,13 @@ pub fn add(
     keywork_ui_module.addImport("linebreak", linebreak_module);
     keywork_ui_module.addImport("z2d", z2d_module);
 
-    const keywork_ui_runtime_module = b.addModule("keywork-ui-runtime", .{
+    const keywork_ui_engine_module = b.addModule("keywork-ui-engine", .{
         .root_source_file = b.path("runtime/src/ui/runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
-    keywork_ui_runtime_module.addImport("keywork-ui", keywork_ui_module);
-    keywork_ui_runtime_module.addImport("uucode", uucode_module);
+    keywork_ui_engine_module.addImport("keywork-ui", keywork_ui_module);
+    keywork_ui_engine_module.addImport("uucode", uucode_module);
 
     const xkb_c = b.addTranslateC(.{
         .root_source_file = b.path("runtime/src/ffi/xkb_c.h"),
@@ -160,7 +160,7 @@ pub fn add(
     });
     keywork_runtime_module.addImport("keywork-loop", keywork_loop_module);
     keywork_runtime_module.addImport("keywork-ui", keywork_ui_module);
-    keywork_runtime_module.addImport("keywork-ui-runtime", keywork_ui_runtime_module);
+    keywork_runtime_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
     keywork_runtime_module.addImport("wayland", wayland_mod);
     keywork_runtime_module.addImport("image_c", image_c_module);
     keywork_runtime_module.linkLibrary(stb_lib.library);
@@ -204,7 +204,7 @@ pub fn add(
     app_module.addImport("keywork-runtime", keywork_runtime_module);
     app_module.addImport("keywork-loop", keywork_loop_module);
     app_module.addImport("keywork-ui", keywork_ui_module);
-    app_module.addImport("keywork-ui-runtime", keywork_ui_runtime_module);
+    app_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
     app_module.addImport("image_c", image_c_module);
     app_module.addImport("systemd_c", systemd_c_module);
     app_module.addImport("curl_c", curl_c_module);
@@ -276,8 +276,8 @@ pub fn add(
     test_step.dependOn(&b.addRunArtifact(keywork_runtime_tests).step);
     const keywork_ui_tests = b.addTest(.{ .root_module = keywork_ui_module });
     test_step.dependOn(&b.addRunArtifact(keywork_ui_tests).step);
-    const keywork_ui_runtime_tests = b.addTest(.{ .root_module = keywork_ui_runtime_module });
-    test_step.dependOn(&b.addRunArtifact(keywork_ui_runtime_tests).step);
+    const keywork_ui_engine_tests = b.addTest(.{ .root_module = keywork_ui_engine_module });
+    test_step.dependOn(&b.addRunArtifact(keywork_ui_engine_tests).step);
     const linebreak_tests = b.addTest(.{ .root_module = linebreak_module });
     test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
 }
