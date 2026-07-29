@@ -1,8 +1,7 @@
 //! Lua keywork.app root configuration parsing.
 
 const std = @import("std");
-const app_options = @import("../app/options.zig");
-const wayland_options = @import("../backend/wayland/options.zig");
+const native_runtime = @import("keywork-runtime");
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 
@@ -11,13 +10,13 @@ const pop = lua_value.pop;
 pub const Config = struct {
     app_id: ?[:0]u8 = null,
     title: ?[:0]u8 = null,
-    backend: ?app_options.BackendKind = null,
+    backend: ?native_runtime.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
     /// Preferred toplevel decoration policy; null means the runner's
     /// default (server-side).
-    decorations: ?wayland_options.Decorations = null,
-    layer_shell: ?wayland_options.LayerShellOptions = null,
+    decorations: ?native_runtime.Decorations = null,
+    layer_shell: ?native_runtime.LayerShellOptions = null,
     /// Ask the compositor to blur content behind the full window surface.
     background_blur: bool = false,
     /// Request ext-session-lock and make every declared window a lock
@@ -85,8 +84,8 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
     return config;
 }
 
-pub fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !wayland_options.LayerShellOptions {
-    var options: wayland_options.LayerShellOptions = .{};
+pub fn parseLayerShellTable(lua_state: *c.lua_State, table_index: c_int) !native_runtime.LayerShellOptions {
+    var options: native_runtime.LayerShellOptions = .{};
 
     if (try checkStringField(lua_state, table_index, "layer")) |name| {
         options.layer = if (std.mem.eql(u8, name, "background"))
@@ -210,7 +209,7 @@ fn checkBoolField(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u
     };
 }
 
-fn backendFromName(name: []const u8) ?app_options.BackendKind {
+fn backendFromName(name: []const u8) ?native_runtime.BackendKind {
     if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
     if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
     if (std.mem.eql(u8, name, "log")) return .log;

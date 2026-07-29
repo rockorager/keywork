@@ -158,6 +158,7 @@ Current transitional source module roots are:
 | `keywork-loop` | `loop/src/event_loop.zig` | none |
 | `keywork-ui` | `runtime/src/ui.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-runtime` | `runtime/src/ui/runtime.zig` | `keywork-ui`, `uucode` |
+| `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-runtime` |
 | `linebreak` | `runtime/lib/linebreak/root.zig` | `uucode` |
 | `varlink` | `compositor/src/varlink/root.zig` | none |
 | `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |
@@ -172,10 +173,10 @@ Target source module roots are:
 | `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
 | `keywork-lua` | `lua/src/root.zig` | public native modules only |
 
-The current application/Lua directory cycle is not a permitted target
-dependency. `application.zig`, `storybook.zig`, `testing.zig`, and the current
-executable root are Lua-host lifecycle code and will move to the Lua component.
-Lua imports of native contracts point in the intended direction.
+Lua-owned lifecycle code now lives under `runtime/src/lua/host/`, and the Lua
+host consumes native runtime source through `keywork-runtime`. The current
+executable root remains at `runtime/src/main.zig` until the top-level Lua
+component move. Native modules must not regain imports into the Lua tree.
 
 ## Native application acceptance criteria
 
@@ -229,8 +230,8 @@ Perform the remaining migration in this order:
 7. Align root Make semantics.
 8. Elevate only genuinely shared protocol snapshots with provenance.
 
-Do not begin source relocation before the native runtime module and example
-prove the intended dependency direction.
+Gates 1 through 3 are complete. Do not begin top-level component relocation
+before the native example proves the intended dependency direction.
 
 ## Monorepo stop conditions
 

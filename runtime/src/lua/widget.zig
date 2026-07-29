@@ -2,14 +2,19 @@
 
 const std = @import("std");
 const keywork = @import("keywork-ui");
-const icon_theme = @import("../linux/icon_theme.zig");
+const native_runtime = @import("keywork-runtime");
+const icon_theme = struct {
+    const lookupIconSizedPreferred = native_runtime.lookupIconSizedPreferred;
+};
+const svg_icon = struct {
+    const icon = native_runtime.svgIcon;
+};
 const lua_codec = @import("codec.zig");
 const lua_handle = @import("handle.zig");
 const lua_image = @import("image.zig");
 const lua_task = @import("task.zig");
 const lua_theme = @import("theme.zig");
 const lua_value = @import("value.zig");
-const svg_icon = @import("../graphics/svg_icon.zig");
 const c = @import("luajit_c");
 
 const State = keywork.AppContext;
@@ -186,7 +191,7 @@ const TextInputOptions = struct {
 
 const ParseContext = struct {
     icon: IconOptions = .{},
-    icon_cache: ?*icon_theme.Cache = null,
+    icon_cache: ?*native_runtime.IconThemeCache = null,
     /// Render scale used to select icon files at physical resolution.
     icon_scale: f32 = 1,
     /// Intrinsic image dimensions per path, so raster icons skip the

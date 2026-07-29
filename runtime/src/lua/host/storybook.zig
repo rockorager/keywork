@@ -3,8 +3,8 @@
 const std = @import("std");
 const keywork = @import("keywork-ui");
 const cli = @import("cli.zig");
-const runner = @import("../../app/runner.zig");
-const memory_backend = @import("../../backend/memory.zig");
+const native_runtime = @import("keywork-runtime");
+const memory_backend = native_runtime.MemoryBackend;
 const event_loop = @import("keywork-loop");
 const lua_app = @import("../app.zig");
 const lua_storybook = @import("../storybook.zig");
@@ -81,7 +81,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
         try allocator.dupeZ(u8, "Keywork Storybook");
     defer allocator.free(title);
 
-    try runner.run(allocator, &loop, app.host(), .{
+    try native_runtime.run(allocator, &loop, app.host(), .{
         .title = title,
         .app_id = "dev.keywork.Storybook",
         .width = 1200,

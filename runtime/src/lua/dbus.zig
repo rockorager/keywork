@@ -1,7 +1,7 @@
 //! Lua D-Bus integration for keywork.dbus.
 
 const std = @import("std");
-const SystemdEvent = @import("../linux/SystemdEvent.zig");
+const SystemdEvent = @import("keywork-runtime").SystemdEvent;
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_task = @import("task.zig");

@@ -3,7 +3,8 @@
 //! applications can persist state without shelling out.
 
 const std = @import("std");
-const linux_syscall = @import("../linux/syscall.zig");
+const native_runtime = @import("keywork-runtime");
+const linux_syscall = native_runtime.linux;
 const lua_value = @import("value.zig");
 const c = @import("luajit_c");
 

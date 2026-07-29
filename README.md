@@ -23,9 +23,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and dependency rules.
 
 Root `build.zig` and `build.zig.zon` build every Zig artifact in one graph and
 cache. Current named source modules include `keywork-loop`, `keywork-ui`,
-`keywork-ui-runtime`, `linebreak`, `varlink`, and `keywork-control`. Source may
-use relative imports within a cohesive module; dependencies between modules
-are explicit named imports wired by the root build.
+`keywork-ui-runtime`, `keywork-runtime`, `linebreak`, `varlink`, and
+`keywork-control`. Source may use relative imports within a cohesive module;
+dependencies between modules are explicit named imports wired by the root
+build.
 
 The current physical layout is transitional. The target separates native UI,
 native application runtime, and the Lua host so Zig applications can use the
@@ -77,7 +78,7 @@ Migration phases:
 - [x] Replace the two independent Zig builds with one root build graph.
 - [x] Promote the native UI model and orchestration to named modules.
 - [x] Replace runner callback fields with one typed host-binding contract.
-- [ ] Expose the Lua-free `keywork-runtime` module.
+- [x] Expose the Lua-free `keywork-runtime` module.
 - [ ] Add a native Wayland application proving the no-LuaJIT path.
 - [ ] Relocate native UI and Lua host source to top-level components.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.

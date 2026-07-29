@@ -1,15 +1,14 @@
 //! Command-line parsing for the Keywork executable.
 
 const std = @import("std");
-const app_options = @import("../../app/options.zig");
-const wayland_options = @import("../../backend/wayland/options.zig");
+const native_runtime = @import("keywork-runtime");
 
 pub const Options = struct {
-    backend: ?app_options.BackendKind = null,
+    backend: ?native_runtime.BackendKind = null,
     width: ?f32 = null,
     height: ?f32 = null,
     script_path: []const u8 = "",
-    layer_shell: ?wayland_options.LayerShellOptions = null,
+    layer_shell: ?native_runtime.LayerShellOptions = null,
     /// Arguments after the script path, forwarded verbatim to the Lua
     /// application via the `arg` global.
     app_args: []const [:0]const u8 = &.{},
@@ -249,15 +248,15 @@ test "test command accepts its help option" {
     try std.testing.expect(options.help);
 }
 
-fn parseLayer(value: []const u8) wayland_options.LayerShellOptions.Layer {
+fn parseLayer(value: []const u8) native_runtime.LayerShellOptions.Layer {
     if (std.mem.eql(u8, value, "background")) return .background;
     if (std.mem.eql(u8, value, "bottom")) return .bottom;
     if (std.mem.eql(u8, value, "overlay")) return .overlay;
     return .top;
 }
 
-fn parseAnchors(value: []const u8) wayland_options.LayerShellOptions.AnchorSet {
-    var result: wayland_options.LayerShellOptions.AnchorSet = .{};
+fn parseAnchors(value: []const u8) native_runtime.LayerShellOptions.AnchorSet {
+    var result: native_runtime.LayerShellOptions.AnchorSet = .{};
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |anchor| {
         if (std.mem.eql(u8, anchor, "top")) result.top = true;
@@ -268,7 +267,7 @@ fn parseAnchors(value: []const u8) wayland_options.LayerShellOptions.AnchorSet {
     return result;
 }
 
-fn parseKeyboardInteractivity(value: []const u8) wayland_options.LayerShellOptions.KeyboardInteractivity {
+fn parseKeyboardInteractivity(value: []const u8) native_runtime.LayerShellOptions.KeyboardInteractivity {
     if (std.mem.eql(u8, value, "exclusive")) return .exclusive;
     if (std.mem.eql(u8, value, "on-demand") or std.mem.eql(u8, value, "on_demand")) return .on_demand;
     return .none;

@@ -1,14 +1,24 @@
 //! LuaJIT application host and native Keywork bindings.
 
 const std = @import("std");
-const HostBindings = @import("../app/HostBindings.zig");
-const app_windows = @import("../app/windows.zig");
+const native_runtime = @import("keywork-runtime");
+const HostBindings = native_runtime.HostBindings;
+const app_windows = struct {
+    const WindowsHost = native_runtime.WindowsHost;
+    const WindowsContext = native_runtime.WindowsContext;
+    const WindowDeclaration = native_runtime.WindowDeclaration;
+};
+const platform_mod = struct {
+    const Platform = native_runtime.Platform;
+    const resizeEdgeFromName = native_runtime.resizeEdgeFromName;
+};
+const log_backend_mod = struct {
+    const LogBackend = native_runtime.LogBackend;
+};
+const linux_syscall = native_runtime.linux;
 const keywork = @import("keywork-ui");
-const log_backend_mod = @import("../backend/log.zig");
 const event_loop = @import("keywork-loop");
-const icon_theme = @import("../linux/icon_theme.zig");
-const linux_syscall = @import("../linux/syscall.zig");
-const SystemdEvent = @import("../linux/SystemdEvent.zig");
+const SystemdEvent = native_runtime.SystemdEvent;
 const lua_config = @import("config.zig");
 const lua_curl = @import("curl.zig");
 const lua_process = @import("process.zig");
@@ -26,7 +36,6 @@ const lua_varlink = @import("varlink.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
 const lua_xdg = @import("xdg.zig");
-const platform_mod = @import("../app/platform.zig");
 const runtime_mod = @import("keywork-ui-runtime");
 const c = @import("luajit_c");
 
@@ -109,7 +118,7 @@ pub const App = struct {
     /// Desktop services (clipboard, activation tokens, interactive
     /// move/resize) bridged from the windowing backend; null on
     /// headless backends.
-    platform: ?platform_mod.Platform = null,
+    platform: ?native_runtime.Platform = null,
     /// Registry refs of the child widget tables from the last window-set
     /// build, keyed by window id (keys owned by `allocator`).
     window_children: std.StringHashMapUnmanaged(c_int) = .empty,
@@ -117,7 +126,7 @@ pub const App = struct {
     /// build, keyed by window id (keys owned by `allocator`).
     window_close_callbacks: std.StringHashMapUnmanaged(c_int) = .empty,
     script_watch: ?*event_loop.EventLoop.FileWatch = null,
-    icon_cache: icon_theme.Cache,
+    icon_cache: native_runtime.IconThemeCache,
     png_dims: lua_image.DimsCache,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {

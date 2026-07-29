@@ -2,10 +2,9 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const app_options = @import("../../app/options.zig");
-const runner = @import("../../app/runner.zig");
+const native_runtime = @import("keywork-runtime");
 const event_loop = @import("keywork-loop");
-const SystemdEvent = @import("../../linux/SystemdEvent.zig");
+const SystemdEvent = native_runtime.SystemdEvent;
 const lua_module = @import("../app.zig");
 
 const Application = @This();
@@ -50,7 +49,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;
     // Apps declaring a window set need a windowing backend by default.
     const backend = run_options.backend orelse window.backend orelse
-        if (layer_shell != null or window.has_windows or window.session_lock) app_options.BackendKind.wayland_shm else .log;
+        if (layer_shell != null or window.has_windows or window.session_lock) native_runtime.BackendKind.wayland_shm else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
 
@@ -58,7 +57,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
     var stdout_writer = std.Io.File.stdout().writer(init_io, &stdout_buffer);
     defer stdout_writer.interface.flush() catch {};
 
-    try runner.run(self.allocator, &self.loop, self.lua.host(), .{
+    try native_runtime.run(self.allocator, &self.loop, self.lua.host(), .{
         .title = title,
         .app_id = window.app_id orelse "dev.keywork.Keywork",
         .width = run_options.width orelse window.width orelse 640,

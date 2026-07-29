@@ -121,15 +121,8 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("lua/host/Application.zig");
-    _ = @import("app/runner.zig");
     _ = @import("lua/host/storybook.zig");
     _ = @import("lua/host/testing.zig");
-    _ = @import("backend/memory.zig");
-    _ = @import("backend/wayland/input.zig");
-    _ = @import("backend/wayland/shm.zig");
-    _ = @import("backend/wayland/vulkan/renderer.zig");
-    _ = @import("backend/wayland/window.zig");
-    _ = @import("graphics/raster.zig");
     _ = @import("lua/app.zig");
     _ = @import("lua/coro.zig");
     _ = @import("lua/dbus.zig");
@@ -139,6 +132,4 @@ test {
     _ = @import("lua/storybook.zig");
     _ = @import("lua/varlink.zig");
     _ = @import("lua/xdg.zig");
-    _ = @import("app/platform.zig");
-    _ = @import("linux/SystemdEvent.zig");
 }

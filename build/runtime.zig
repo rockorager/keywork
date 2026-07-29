@@ -147,30 +147,44 @@ pub fn add(
 
     const lua = luajit.add(b, target, optimize);
 
+    const keywork_runtime_module = b.addModule("keywork-runtime", .{
+        .root_source_file = b.path("runtime/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    keywork_runtime_module.addImport("keywork-loop", keywork_loop_module);
+    keywork_runtime_module.addImport("keywork-ui", keywork_ui_module);
+    keywork_runtime_module.addImport("keywork-ui-runtime", keywork_ui_runtime_module);
+    keywork_runtime_module.addImport("wayland", wayland_mod);
+    keywork_runtime_module.addImport("image_c", image_c_module);
+    keywork_runtime_module.linkLibrary(stb_lib.library);
+    keywork_runtime_module.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
+    keywork_runtime_module.addImport("vulkan", vulkan_mod);
+    keywork_runtime_module.addImport("uucode", uucode_module);
+    keywork_runtime_module.addImport("xkb_c", xkb_c_module);
+    keywork_runtime_module.addImport("systemd_c", systemd_c_module);
+    keywork_runtime_module.addImport("text_c", text_c_module);
+    keywork_runtime_module.addImport("pixman_c", pixman_c_module);
+    linkKeyworkNativeSystemLibraries(keywork_runtime_module);
+
     const app_module = b.createModule(.{
         .root_source_file = b.path("runtime/src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    app_module.addImport("keywork-runtime", keywork_runtime_module);
     app_module.addImport("keywork-loop", keywork_loop_module);
     app_module.addImport("keywork-ui", keywork_ui_module);
     app_module.addImport("keywork-ui-runtime", keywork_ui_runtime_module);
-    app_module.addImport("wayland", wayland_mod);
     app_module.addImport("image_c", image_c_module);
-    app_module.linkLibrary(stb_lib.library);
-    app_module.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
-    app_module.addImport("vulkan", vulkan_mod);
-    app_module.addImport("uucode", uucode_module);
-    app_module.addImport("xkb_c", xkb_c_module);
     app_module.addImport("systemd_c", systemd_c_module);
     app_module.addImport("curl_c", curl_c_module);
     app_module.addImport("pipewire_c", pipewire_c_module);
     app_module.addCSourceFile(.{ .file = b.path("runtime/src/ffi/pipewire_c.c") });
     app_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
-    app_module.addImport("text_c", text_c_module);
-    app_module.addImport("pixman_c", pixman_c_module);
-    linkKeyworkSystemLibraries(app_module);
+    app_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
 
     const luajit_c = b.addTranslateC(.{
         .root_source_file = b.path("runtime/src/ffi/luajit_c.h"),
@@ -227,6 +241,12 @@ pub fn add(
     });
     app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    const keywork_runtime_tests = b.addTest(.{
+        .root_module = keywork_runtime_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
+    });
+    test_step.dependOn(&b.addRunArtifact(keywork_runtime_tests).step);
     const keywork_ui_tests = b.addTest(.{ .root_module = keywork_ui_module });
     test_step.dependOn(&b.addRunArtifact(keywork_ui_tests).step);
     const keywork_ui_runtime_tests = b.addTest(.{ .root_module = keywork_ui_runtime_module });
@@ -235,13 +255,12 @@ pub fn add(
     test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
 }
 
-fn linkKeyworkSystemLibraries(module: *std.Build.Module) void {
+fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("wayland-client", .{});
     module.linkSystemLibrary("wayland-cursor", .{});
     module.linkSystemLibrary("vulkan", .{});
     module.linkSystemLibrary("xkbcommon", .{});
     module.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
-    module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
     module.linkSystemLibrary("fontconfig", .{});
     module.linkSystemLibrary("freetype", .{});
     module.linkSystemLibrary("harfbuzz", .{});
