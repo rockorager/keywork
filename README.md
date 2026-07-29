@@ -49,12 +49,13 @@ Common commands:
 | Command | Action |
 | --- | --- |
 | `make` | Build all Zig artifacts and validate/build shell native modules |
-| `make test` | Run all Zig tests |
-| `make check` | Run all Zig tests and shell checks |
+| `make test` | Run all Zig tests and shell checks |
+| `make check` | Run all tests and static analysis |
 | `make lint` | Run shell static analysis |
 | `make fmt` | Format Zig, Lua, and Lua type sources |
-| `make install` | Install Zig artifacts under `PREFIX` (default `~/.local`) |
-| `make install-shell` | Install the shell and its user service under `PREFIX` |
+| `make install` | Install Zig artifacts, shell files, and its user service under `PREFIX` (default `~/.local`) |
+| `make install-zig` | Install only Zig artifacts under `PREFIX` |
+| `make install-shell` | Install only the shell and its user service under `PREFIX` |
 
 Direct Zig steps such as `zig build test`, `zig build run`,
 `zig build run-native-example`, `zig build run-compositor`, and
