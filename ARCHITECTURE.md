@@ -196,8 +196,9 @@ The native boundary is complete only when all of these are true:
 - `zig build` is the sole repository task interface. Aggregate steps whose
   names imply the whole repository operate on both native and shell sources;
   focused shell steps remain available where useful.
-- Privileged PAM installation remains the explicit `install-pam` step and is
-  never part of the default install.
+- Privileged PAM and GDM session installation remain explicit focused steps
+  and are never part of the default install. The build runner stays
+  unprivileged; only their final file installation commands elevate.
 - Procedural automation belongs in `scripts/`, not embedded shell fragments in
   configuration files.
 

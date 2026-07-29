@@ -61,12 +61,30 @@ Common commands:
 | `zig build icons` | Generate the pinned Fluent icon theme in the Zig cache |
 | `zig build run-shell` | Build, validate, and run the desktop shell |
 | `zig build -p ~/.local` | Install all artifacts and service assets under `~/.local` |
-| `sudo zig build install-pam` | Install the PAM service under `/etc/pam.d` |
+| `zig build install-gdm-session -p ~/.local` | Install a system-visible GDM entry targeting the user-local compositor |
+| `zig build install-pam` | Install the PAM service under `/etc/pam.d` |
+
+Install a release build for the current user, followed by the two small system
+integration files:
+
+```sh
+zig build -Doptimize=ReleaseSafe -p "$HOME/.local"
+zig build install-gdm-session -p "$HOME/.local"
+zig build install-pam
+systemctl --user daemon-reload
+```
 
 Additional focused steps such as `zig build run`, `zig build
 run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
 are available from the repository root. The native example opens a Wayland
 window without compiling or linking LuaJIT.
+
+GDM discovers session definitions only from system data directories and does
+not expand `$HOME` in `Exec`. The `install-gdm-session` step therefore runs the
+build as the current user, generates a descriptor containing the selected
+prefix's absolute compositor path, and elevates only the final `install`
+command. `install-pam` follows the same privilege boundary. Set `SUDO=doas` to
+use `doas` instead of `sudo` for either focused step.
 
 ## Migration status
 

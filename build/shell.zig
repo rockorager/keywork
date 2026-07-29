@@ -162,11 +162,14 @@ pub fn add(
 
     const pam_dir = b.option([]const u8, "pam-dir", "PAM service directory") orelse "/etc/pam.d";
     const destdir = b.graph.environ_map.get("DESTDIR") orelse "";
-    const install_pam = b.addSystemCommand(&.{ "install", "-Dm0644" });
+    const install_pam = if (destdir.len == 0)
+        b.addSystemCommand(&.{ b.graph.environ_map.get("SUDO") orelse "sudo", "install", "-Dm0644" })
+    else
+        b.addSystemCommand(&.{ "install", "-Dm0644" });
     install_pam.addFileArg(b.path("src/shell/pam/keywork-shell"));
     install_pam.addArg(b.fmt("{s}{s}/keywork-shell", .{ destdir, std.mem.trimEnd(u8, pam_dir, "/") }));
     install_pam.has_side_effects = true;
-    const install_pam_step = b.step("install-pam", "Install the shell PAM service (may require root)");
+    const install_pam_step = b.step("install-pam", "Install the shell PAM service with elevation");
     install_pam_step.dependOn(&install_pam.step);
 }
 

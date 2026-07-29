@@ -220,6 +220,7 @@ pub fn add(
         "src/compositor/resources/keywork.conf",
         "share/keywork/keywork.conf",
     );
+    addGdmSessionInstallStep(b);
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
@@ -266,6 +267,45 @@ pub fn add(
     );
     renderer_check_step.dependOn(&renderer_conformance_run.step);
     renderer_check_step.dependOn(&renderer_scene_run.step);
+}
+
+fn addGdmSessionInstallStep(b: *std.Build) void {
+    const compositor_path = b.getInstallPath(.bin, "keywork-compositor");
+    const session = b.addWriteFiles().add(
+        "keywork.desktop",
+        b.fmt(
+            \\[Desktop Entry]
+            \\Name=Keywork
+            \\Comment=Keywork Wayland desktop
+            \\Exec={s}
+            \\Type=Application
+            \\DesktopNames=keywork
+            \\
+        , .{compositor_path}),
+    );
+
+    const session_dir = b.option(
+        []const u8,
+        "wayland-session-dir",
+        "System Wayland session directory",
+    ) orelse "/usr/local/share/wayland-sessions";
+    const destdir = b.graph.environ_map.get("DESTDIR") orelse "";
+    const install_session = if (destdir.len == 0)
+        b.addSystemCommand(&.{ b.graph.environ_map.get("SUDO") orelse "sudo", "install", "-Dm0644" })
+    else
+        b.addSystemCommand(&.{ "install", "-Dm0644" });
+    install_session.addFileArg(session);
+    install_session.addArg(b.fmt(
+        "{s}{s}/keywork.desktop",
+        .{ destdir, std.mem.trimEnd(u8, session_dir, "/") },
+    ));
+    install_session.has_side_effects = true;
+
+    const install_session_step = b.step(
+        "install-gdm-session",
+        "Install a system-visible GDM session for the selected prefix",
+    );
+    install_session_step.dependOn(&install_session.step);
 }
 
 fn addRendererShaders(b: *std.Build, module: *std.Build.Module) void {
