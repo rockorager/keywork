@@ -7,6 +7,7 @@ const desktop_settings = @import("../linux/desktop_settings.zig");
 const event_loop = @import("keywork-loop");
 const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const log_backend_mod = @import("../backend/log.zig");
+const HostBindings = @import("HostBindings.zig");
 const app_options = @import("options.zig");
 const app_windows = @import("windows.zig");
 const platform_mod = @import("platform.zig");
@@ -48,18 +49,12 @@ pub const Options = struct {
     session_lock: bool = false,
     log_writer: *std.Io.Writer,
     systemd_event: ?*SystemdEvent = null,
-    runtime_context: ?*anyopaque = null,
+    /// Optional lifecycle integration for an embedding language or native
+    /// host. The runner remains usable without host bindings.
+    host_bindings: ?HostBindings = null,
     /// Declarative window-set host; when present the Wayland backends run
     /// one runtime per declared window instead of a single main window.
     windows_host: ?app_windows.WindowsHost = null,
-    bind_runtime: ?*const fn (ctx: *anyopaque, runtime: *runtime_mod.Runtime) void = null,
-    bind_invalidator: ?*const fn (ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void = null,
-    bind_platform: ?*const fn (ctx: *anyopaque, platform: platform_mod.Platform) void = null,
-    unbind_platform: ?*const fn (ctx: *anyopaque) void = null,
-    unbind_runtime: ?*const fn (ctx: *anyopaque) void = null,
-    bind_event_loop: ?*const fn (ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void = null,
-    unbind_event_loop: ?*const fn (ctx: *anyopaque) void = null,
-    should_run_headless: ?*const fn (ctx: *anyopaque) bool = null,
 };
 
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
@@ -109,14 +104,14 @@ fn runHeadlessRuntime(
         &raster_cache,
     );
     defer runtime.deinit();
-    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
-    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
     runtime.setDeferredRepaint(true);
-    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
-    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
     try runtime.repaint();
-    if (options.should_run_headless) |should_run| {
-        if (should_run(options.runtime_context.?)) {
+    if (options.host_bindings) |bindings| {
+        if (bindings.shouldRunHeadless()) {
             var headless_loop: HeadlessLoop = .{ .runtime = &runtime, .options = &options };
             loop.setEndTurnHook(&headless_loop, HeadlessLoop.endTurn);
             defer loop.clearEndTurnHook();
@@ -132,8 +127,8 @@ const HeadlessLoop = struct {
     fn endTurn(ctx: *anyopaque, loop: *event_loop.EventLoop) !void {
         const self: *HeadlessLoop = @ptrCast(@alignCast(ctx));
         try self.runtime.flushPendingRepaint();
-        const should_run = self.options.should_run_headless orelse return;
-        if (!should_run(self.options.runtime_context.?)) loop.quit();
+        const bindings = self.options.host_bindings orelse return;
+        if (!bindings.shouldRunHeadless()) loop.quit();
     }
 };
 
@@ -161,8 +156,8 @@ fn runWayland(
     var initial_constraints = constraints;
     var backend = try Backend.create(allocator);
     defer backend.destroy();
-    if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
-    defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(platform_mod.WaylandPlatform(Backend).platform(backend));
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
     const win = try backend.createWindow(.{
         .title = options.title,
         .app_id = options.app_id,
@@ -196,12 +191,12 @@ fn runWayland(
     );
     defer runtime.deinit();
     setRuntimeClipboard(&runtime, backend);
-    if (options.bind_runtime) |bind| bind(options.runtime_context.?, &runtime);
-    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
     if (options.layer_shell != null) runtime.setFrameBackground(keywork.colors.transparent);
     runtime.setDeferredRepaint(true);
-    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
-    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
 
     var queue: QueuedPlatformEvents = .{ .allocator = allocator, .runtime = &runtime };
     defer queue.deinit();
@@ -820,8 +815,8 @@ fn runWaylandWindowed(
     var backend = try Backend.create(allocator);
     defer backend.destroy();
     if (options.session_lock) try backend.beginSessionLock();
-    if (options.bind_platform) |bind| bind(options.runtime_context.?, platform_mod.WaylandPlatform(Backend).platform(backend));
-    defer if (options.unbind_platform) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(platform_mod.WaylandPlatform(Backend).platform(backend));
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
 
     if (settings_client) |*settings| {
         if (!settings.finishColorSchemeRead()) {
@@ -844,10 +839,10 @@ fn runWaylandWindowed(
     defer manager.deinit();
     backend.setOutputsChangedHandler(&manager, Manager.outputsChanged);
 
-    if (options.bind_invalidator) |bind| bind(options.runtime_context.?, manager.invalidator());
-    defer if (options.unbind_runtime) |unbind| unbind(options.runtime_context.?);
-    if (options.bind_event_loop) |bind| try bind(options.runtime_context.?, loop);
-    defer if (options.unbind_event_loop) |unbind| unbind(options.runtime_context.?);
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(manager.invalidator());
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
 
     if (settings_client) |*settings| {
         try settings.installSignalFilter();

@@ -89,13 +89,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
         .backend = .wayland_shm,
         .log_writer = writer,
         .systemd_event = try app.systemdEvent(),
-        .runtime_context = &app,
-        .bind_runtime = lua_app.App.bindRuntimeOpaque,
-        .bind_platform = lua_app.App.bindPlatformOpaque,
-        .unbind_platform = lua_app.App.unbindPlatformOpaque,
-        .unbind_runtime = lua_app.App.unbindRuntimeOpaque,
-        .bind_event_loop = lua_app.App.bindEventLoopOpaque,
-        .unbind_event_loop = lua_app.App.unbindEventLoopOpaque,
+        .host_bindings = app.hostBindings(),
     });
 }
 

@@ -76,7 +76,7 @@ Migration phases:
 - [x] Extract the Linux reactor as the named `keywork-loop` module.
 - [x] Replace the two independent Zig builds with one root build graph.
 - [x] Promote the native UI model and orchestration to named modules.
-- [ ] Replace runner callback fields with one typed host-binding contract.
+- [x] Replace runner callback fields with one typed host-binding contract.
 - [ ] Expose the Lua-free `keywork-runtime` module.
 - [ ] Add a native Wayland application proving the no-LuaJIT path.
 - [ ] Relocate native UI and Lua host source to top-level components.

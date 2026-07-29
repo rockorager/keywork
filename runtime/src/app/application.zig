@@ -32,7 +32,7 @@ pub fn init(allocator: std.mem.Allocator, script_path: []const u8) !Application 
 }
 
 pub fn deinit(self: *Application) void {
-    self.lua.unbindRuntime();
+    self.lua.unbindInvalidator();
     self.lua.unbindEventLoop();
     self.lua.deinit();
     self.systemd_event.unregister();
@@ -70,15 +70,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .session_lock = window.session_lock,
         .log_writer = &stdout_writer.interface,
         .systemd_event = self.systemd_event,
-        .runtime_context = &self.lua,
+        .host_bindings = self.lua.hostBindings(),
         .windows_host = self.lua.windowsHost(),
-        .bind_runtime = lua_module.App.bindRuntimeOpaque,
-        .bind_invalidator = lua_module.App.bindInvalidatorOpaque,
-        .bind_platform = lua_module.App.bindPlatformOpaque,
-        .unbind_platform = lua_module.App.unbindPlatformOpaque,
-        .unbind_runtime = lua_module.App.unbindRuntimeOpaque,
-        .bind_event_loop = lua_module.App.bindEventLoopOpaque,
-        .unbind_event_loop = lua_module.App.unbindEventLoopOpaque,
-        .should_run_headless = lua_module.App.shouldRunHeadlessOpaque,
     });
 }

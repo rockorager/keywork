@@ -1,6 +1,7 @@
 //! LuaJIT application host and native Keywork bindings.
 
 const std = @import("std");
+const HostBindings = @import("../app/HostBindings.zig");
 const app_windows = @import("../app/windows.zig");
 const keywork = @import("keywork-ui");
 const log_backend_mod = @import("../backend/log.zig");
@@ -251,12 +252,12 @@ pub const App = struct {
         }
     }
 
-    pub fn bindRuntime(self: *App, runtime: *runtime_mod.Runtime) void {
-        self.invalidator = .fromRuntime(runtime);
-    }
-
     pub fn bindInvalidator(self: *App, invalidator: runtime_mod.Invalidator) void {
         self.invalidator = invalidator;
+    }
+
+    pub fn bindRuntime(self: *App, runtime: *runtime_mod.Runtime) void {
+        self.bindInvalidator(.fromRuntime(runtime));
     }
 
     pub fn bindPlatform(self: *App, platform: platform_mod.Platform) void {
@@ -267,9 +268,13 @@ pub const App = struct {
         self.platform = null;
     }
 
-    pub fn unbindRuntime(self: *App) void {
+    pub fn unbindInvalidator(self: *App) void {
         self.stopLifecycleLog();
         self.invalidator = null;
+    }
+
+    pub fn unbindRuntime(self: *App) void {
+        self.unbindInvalidator();
     }
 
     pub fn unbindEventLoop(self: *App) void {
@@ -292,41 +297,6 @@ pub const App = struct {
         self.event_loop = null;
     }
 
-    pub fn bindRuntimeOpaque(ctx: *anyopaque, runtime: *runtime_mod.Runtime) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.bindRuntime(runtime);
-    }
-
-    pub fn bindInvalidatorOpaque(ctx: *anyopaque, invalidator: runtime_mod.Invalidator) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.bindInvalidator(invalidator);
-    }
-
-    pub fn bindPlatformOpaque(ctx: *anyopaque, platform: platform_mod.Platform) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.bindPlatform(platform);
-    }
-
-    pub fn unbindPlatformOpaque(ctx: *anyopaque) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.unbindPlatform();
-    }
-
-    pub fn unbindRuntimeOpaque(ctx: *anyopaque) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.unbindRuntime();
-    }
-
-    pub fn bindEventLoopOpaque(ctx: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        try self.bindEventLoop(loop);
-    }
-
-    pub fn unbindEventLoopOpaque(ctx: *anyopaque) void {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        self.unbindEventLoop();
-    }
-
     /// Borrows the process-level sd-event bridge. All sd-bus and sd-varlink
     /// users must detach before the owner destroys it.
     pub fn useSystemdEvent(self: *App, bridge: *SystemdEvent) void {
@@ -339,9 +309,8 @@ pub const App = struct {
         return self.ensureSystemdEvent();
     }
 
-    pub fn shouldRunHeadlessOpaque(ctx: *anyopaque) bool {
-        const self: *App = @ptrCast(@alignCast(ctx));
-        return self.hasLiveAsyncResources();
+    pub fn hostBindings(self: *App) HostBindings {
+        return .{ .ptr = self, .vtable = &host_bindings_vtable };
     }
 
     pub fn host(self: *App) keywork.AppHost {
@@ -1144,6 +1113,51 @@ pub const App = struct {
         while (self.pending_scope_cancels.pop()) |scope| scope.cancel(self.state, .resume_reader);
     }
 };
+
+const host_bindings_vtable: HostBindings.VTable = .{
+    .bind_invalidator = hostBindInvalidator,
+    .unbind_invalidator = hostUnbindInvalidator,
+    .bind_platform = hostBindPlatform,
+    .unbind_platform = hostUnbindPlatform,
+    .bind_event_loop = hostBindEventLoop,
+    .unbind_event_loop = hostUnbindEventLoop,
+    .should_run_headless = hostShouldRunHeadless,
+};
+
+fn hostBindInvalidator(ptr: *anyopaque, invalidator: runtime_mod.Invalidator) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.bindInvalidator(invalidator);
+}
+
+fn hostUnbindInvalidator(ptr: *anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.unbindInvalidator();
+}
+
+fn hostBindPlatform(ptr: *anyopaque, platform: platform_mod.Platform) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.bindPlatform(platform);
+}
+
+fn hostUnbindPlatform(ptr: *anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.unbindPlatform();
+}
+
+fn hostBindEventLoop(ptr: *anyopaque, loop: *event_loop.EventLoop) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    try app.bindEventLoop(loop);
+}
+
+fn hostUnbindEventLoop(ptr: *anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    app.unbindEventLoop();
+}
+
+fn hostShouldRunHeadless(ptr: *anyopaque) bool {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.hasLiveAsyncResources();
+}
 
 const process_host_vtable: lua_process.Host.VTable = .{
     .allocator = hostAllocator,
