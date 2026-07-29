@@ -6,8 +6,7 @@ const cli = @import("cli.zig");
 const native_runtime = @import("keywork-runtime");
 const memory_backend = native_runtime.MemoryBackend;
 const event_loop = @import("keywork-loop");
-const lua_app = @import("../app.zig");
-const lua_storybook = @import("../storybook.zig");
+const lua_module = @import("keywork-lua");
 const runtime_mod = @import("keywork-ui-engine");
 
 const schema_version = 2;
@@ -72,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: cli.StorybookOptio
 fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
-    var app = try lua_app.App.initStorybookBrowser(allocator, options.script_path);
+    var app = try lua_module.App.initStorybookBrowser(allocator, options.script_path);
     defer app.deinit();
     const catalog = try app.storyCatalog();
     const title = if (catalog.title) |book_title|
@@ -94,7 +93,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
 }
 
 fn list(allocator: std.mem.Allocator, options: cli.StorybookOptions, writer: *std.Io.Writer) !void {
-    var app = try lua_app.App.initStorybook(allocator, options.script_path);
+    var app = try lua_module.App.initStorybook(allocator, options.script_path);
     defer app.deinit();
     const catalog = try app.storyCatalog();
 
@@ -136,7 +135,7 @@ fn snapshot(allocator: std.mem.Allocator, io: std.Io, options: cli.StorybookOpti
     // This VM is catalog discovery only. Every rendered story below gets a
     // fresh VM and Runtime so globals, modules, tasks, and widget state cannot
     // leak between snapshots.
-    var discovery = try lua_app.App.initStorybook(allocator, options.script_path);
+    var discovery = try lua_module.App.initStorybook(allocator, options.script_path);
     defer discovery.deinit();
     const catalog = try discovery.storyCatalog();
     if (options.story_id) |id| _ = catalog.find(id) orelse return error.UnknownStory;
@@ -170,7 +169,7 @@ fn renderStory(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: cli.StorybookOptions,
-    story: lua_storybook.Story,
+    story: lua_module.Story,
 ) !SnapshotOutput {
     const file_name = try std.fmt.allocPrint(allocator, "{s}.png", .{story.id});
     defer allocator.free(file_name);
@@ -178,7 +177,7 @@ fn renderStory(
     errdefer allocator.free(path);
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
 
-    var app = try lua_app.App.initStorybook(allocator, options.script_path);
+    var app = try lua_module.App.initStorybook(allocator, options.script_path);
     defer app.deinit();
     try app.selectStory(story.id);
 
@@ -220,7 +219,7 @@ fn renderStory(
     };
 }
 
-fn storyOutput(story: lua_storybook.Story) StoryOutput {
+fn storyOutput(story: lua_module.Story) StoryOutput {
     return .{
         .id = story.id,
         .group = story.group,
@@ -230,7 +229,7 @@ fn storyOutput(story: lua_storybook.Story) StoryOutput {
     };
 }
 
-fn viewportOutput(story: lua_storybook.Story) ViewportOutput {
+fn viewportOutput(story: lua_module.Story) ViewportOutput {
     return .{
         .width = story.width,
         .height = if (story.content_height) .content else .{ .fixed = story.height },
@@ -238,7 +237,7 @@ fn viewportOutput(story: lua_storybook.Story) ViewportOutput {
     };
 }
 
-fn runtimeColorScheme(scheme: lua_storybook.ColorScheme) runtime_mod.UiColorScheme {
+fn runtimeColorScheme(scheme: lua_module.StoryColorScheme) runtime_mod.UiColorScheme {
     return switch (scheme) {
         .light => .light,
         .dark => .dark,
@@ -276,7 +275,7 @@ fn writeJson(writer: *std.Io.Writer, value: anytype) !void {
 }
 
 test "story output keeps declared rendering metadata" {
-    const story: lua_storybook.Story = .{
+    const story: lua_module.Story = .{
         .id = @constCast("button/default"),
         .group = @constCast("Button"),
         .name = @constCast("Default"),
@@ -293,7 +292,7 @@ test "story output keeps declared rendering metadata" {
 }
 
 test "storybook JSON schema represents content viewport height" {
-    const story: lua_storybook.Story = .{
+    const story: lua_module.Story = .{
         .id = @constCast("notice/default"),
         .name = @constCast("Default"),
         .index = 1,
@@ -338,7 +337,7 @@ test "content-height Storybook snapshot uses exact measured pixel height" {
     const output_path = try std.fs.path.join(allocator, &.{ root_path, "snapshots" });
     defer allocator.free(output_path);
 
-    var discovery = try lua_app.App.initStorybook(allocator, script_path);
+    var discovery = try lua_module.App.initStorybook(allocator, script_path);
     defer discovery.deinit();
     const parsed_story = (try discovery.storyCatalog()).stories[0];
     try std.testing.expect(parsed_story.content_height);
@@ -353,7 +352,7 @@ test "content-height Storybook snapshot uses exact measured pixel height" {
     try std.testing.expectEqual(@as(u31, 760), result.pixel_width);
     try std.testing.expectEqual(@as(u31, 74), result.pixel_height);
 
-    var browser = try lua_app.App.initStorybookBrowser(allocator, script_path);
+    var browser = try lua_module.App.initStorybookBrowser(allocator, script_path);
     defer browser.deinit();
     var browser_backend = try memory_backend.init(allocator, 1);
     defer browser_backend.deinit();

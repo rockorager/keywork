@@ -123,13 +123,5 @@ test {
     _ = @import("lua/host/Application.zig");
     _ = @import("lua/host/storybook.zig");
     _ = @import("lua/host/testing.zig");
-    _ = @import("lua/app.zig");
-    _ = @import("lua/coro.zig");
-    _ = @import("lua/dbus.zig");
-    _ = @import("lua/json.zig");
-    _ = @import("lua/pipewire.zig");
-    _ = @import("lua/process.zig");
-    _ = @import("lua/storybook.zig");
-    _ = @import("lua/varlink.zig");
-    _ = @import("lua/xdg.zig");
+    _ = @import("keywork-lua");
 }

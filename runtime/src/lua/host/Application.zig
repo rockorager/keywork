@@ -5,7 +5,7 @@ const cli = @import("cli.zig");
 const native_runtime = @import("keywork-runtime");
 const event_loop = @import("keywork-loop");
 const SystemdEvent = native_runtime.SystemdEvent;
-const lua_module = @import("../app.zig");
+const lua_module = @import("keywork-lua");
 
 const Application = @This();
 

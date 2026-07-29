@@ -195,23 +195,23 @@ pub fn add(
     const run_native_example_step = b.step("run-native-example", "Run the native Wayland example");
     run_native_example_step.dependOn(&run_native_example.step);
 
-    const app_module = b.createModule(.{
-        .root_source_file = b.path("runtime/src/main.zig"),
+    const keywork_lua_module = b.addModule("keywork-lua", .{
+        .root_source_file = b.path("runtime/src/lua/app.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    app_module.addImport("keywork-runtime", keywork_runtime_module);
-    app_module.addImport("keywork-loop", keywork_loop_module);
-    app_module.addImport("keywork-ui", keywork_ui_module);
-    app_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
-    app_module.addImport("image_c", image_c_module);
-    app_module.addImport("systemd_c", systemd_c_module);
-    app_module.addImport("curl_c", curl_c_module);
-    app_module.addImport("pipewire_c", pipewire_c_module);
-    app_module.addCSourceFile(.{ .file = b.path("runtime/src/ffi/pipewire_c.c") });
-    app_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
-    app_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
+    keywork_lua_module.addImport("keywork-runtime", keywork_runtime_module);
+    keywork_lua_module.addImport("keywork-loop", keywork_loop_module);
+    keywork_lua_module.addImport("keywork-ui", keywork_ui_module);
+    keywork_lua_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
+    keywork_lua_module.addImport("image_c", image_c_module);
+    keywork_lua_module.addImport("systemd_c", systemd_c_module);
+    keywork_lua_module.addImport("curl_c", curl_c_module);
+    keywork_lua_module.addImport("pipewire_c", pipewire_c_module);
+    keywork_lua_module.addCSourceFile(.{ .file = b.path("runtime/src/ffi/pipewire_c.c") });
+    keywork_lua_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
+    keywork_lua_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
 
     const luajit_c = b.addTranslateC(.{
         .root_source_file = b.path("runtime/src/ffi/luajit_c.h"),
@@ -220,8 +220,20 @@ pub fn add(
     });
     luajit_c.addIncludePath(lua.include_dir);
     luajit_c.addIncludePath(lua.generated_include_dir);
-    app_module.addImport("luajit_c", luajit_c.createModule());
-    app_module.linkLibrary(lua.library);
+    keywork_lua_module.addImport("luajit_c", luajit_c.createModule());
+    keywork_lua_module.linkLibrary(lua.library);
+
+    const app_module = b.createModule(.{
+        .root_source_file = b.path("runtime/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    app_module.addImport("keywork-lua", keywork_lua_module);
+    app_module.addImport("keywork-runtime", keywork_runtime_module);
+    app_module.addImport("keywork-loop", keywork_loop_module);
+    app_module.addImport("keywork-ui", keywork_ui_module);
+    app_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
 
     const exe = b.addExecutable(.{
         .name = "keywork",
@@ -268,6 +280,13 @@ pub fn add(
     });
     app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    const keywork_lua_tests = b.addTest(.{
+        .root_module = keywork_lua_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
+    });
+    keywork_lua_tests.rdynamic = true;
+    test_step.dependOn(&b.addRunArtifact(keywork_lua_tests).step);
     const keywork_runtime_tests = b.addTest(.{
         .root_module = keywork_runtime_module,
         .use_llvm = use_llvm,

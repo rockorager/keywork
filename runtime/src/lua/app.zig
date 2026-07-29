@@ -61,6 +61,9 @@ const pop = lua_value.pop;
 const stringFromStack = lua_value.stringFromStack;
 
 pub const WindowConfig = lua_config.Config;
+pub const Story = lua_storybook.Story;
+pub const StoryColorScheme = lua_storybook.ColorScheme;
+pub const deinitTestResults = lua_testing.deinitResults;
 
 pub const RootKind = enum {
     application,

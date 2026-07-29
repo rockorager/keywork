@@ -157,6 +157,7 @@ Current transitional source module roots are:
 | `keywork-ui` | `ui/src/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
+| `keywork-lua` | `runtime/src/lua/app.zig` | public native modules |
 | `linebreak` | `ui/lib/linebreak/root.zig` | `uucode` |
 | `varlink` | `compositor/src/varlink/root.zig` | none |
 | `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |
@@ -171,10 +172,11 @@ Target source module roots are:
 | `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
 | `keywork-lua` | `lua/src/root.zig` | public native modules only |
 
-Lua-owned lifecycle code now lives under `runtime/src/lua/host/`, and the Lua
-host consumes native runtime source through `keywork-runtime`. The current
-executable root remains at `runtime/src/main.zig` until the top-level Lua
-component move. Native modules must not regain imports into the Lua tree.
+Lua-owned lifecycle code now lives under `runtime/src/lua/host/`. The
+executable consumes the adapter through `keywork-lua`, and the adapter consumes
+native runtime source through public named modules. Both roots remain under
+`runtime/src/` until the top-level Lua component move. Native modules must not
+regain imports into the Lua tree.
 
 ## Native application acceptance criteria
 

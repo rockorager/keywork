@@ -2,8 +2,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const lua_app = @import("../app.zig");
-const lua_testing = @import("../testing.zig");
+const lua_module = @import("keywork-lua");
 
 const Summary = struct {
     passed: usize = 0,
@@ -68,7 +67,7 @@ fn runFile(
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
-    var app = lua_app.App.initTest(allocator, path) catch |err| {
+    var app = lua_module.App.initTest(allocator, path) catch |err| {
         summary.errors += 1;
         try writer.print("ERROR {s}\n    {s}\n", .{ path, @errorName(err) });
         return;
@@ -85,7 +84,7 @@ fn runFile(
         }
         return;
     };
-    defer lua_testing.deinitResults(allocator, results);
+    defer lua_module.deinitTestResults(allocator, results);
 
     for (results) |result| {
         switch (result.status) {
