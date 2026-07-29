@@ -1,7 +1,7 @@
 # AGENTS.md
 
 The root Zig, safety, documentation, and module-boundary guidance applies
-here. Read `../DESIGN.md` before changing the built-in visual system.
+here. Read `../../DESIGN.md` before changing the built-in visual system.
 
 ## UI ownership
 
@@ -13,10 +13,10 @@ here. Read `../DESIGN.md` before changing the built-in visual system.
   or a concrete rendering backend. Platform and host integration belongs in
   consumers of their public contracts.
 - The engine imports `keywork-ui` by module name. Code outside these modules
-  must do the same rather than reaching into `ui/src` or `ui/engine`.
-- `lib/linebreak` is an implementation module owned by UI text layout. Keep
+  must do the same rather than reaching into `src/ui` or `src/ui/engine`.
+- `linebreak/` is an implementation module owned by UI text layout. Keep
   its Unicode data and license provenance with it.
 - Keep native widget defaults synchronized with the built-in profile in
-  `../DESIGN.md`.
+  `../../DESIGN.md`.
 - Keep tests inline and register `keywork-ui`, `keywork-ui-engine`, and the
   line-breaking module as separate roots in the repository test graph.

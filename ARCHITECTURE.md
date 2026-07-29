@@ -4,14 +4,15 @@ This document defines the target source ownership and allowed dependency
 directions. A monorepo makes coordinated changes easier; it does not erase
 component boundaries.
 
-The repository is still migrating from imported repository-shaped directories
-to the target components below. During that migration, make API boundaries
-real before moving their source. Keep history-preserving moves separate from
-behavior and build changes.
+All implementation components are direct children of the repository-wide
+`src/` tree. Component directories do not contain another nested `src/`.
+Examples, resources, language metadata, and private protocols may remain with
+the component that owns them; repository-wide build support and genuinely
+shared protocols live outside `src/`.
 
 ## Target components
 
-### Loop (`loop/`)
+### Loop (`src/loop/`)
 
 Owns the `keywork-loop` Zig module: a concrete Linux reactor built on epoll,
 eventfd, timerfd, and inotify. It owns source dispatch and lifetime safety, but
@@ -21,7 +22,7 @@ The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
 the loop's generic callback and phase contracts.
 
-### UI (`ui/`)
+### UI (`src/ui/`)
 
 Owns the platform-neutral native UI implementation:
 
@@ -33,7 +34,7 @@ Owns the platform-neutral native UI implementation:
 Neither module may depend on Lua, the event loop, a concrete application host,
 Wayland, or a concrete rendering backend.
 
-### Native runtime (`runtime/`)
+### Native runtime (`src/runtime/`)
 
 Owns `keywork-runtime`: the general Wayland application platform, including
 application lifecycle, window declarations, platform services, Wayland
@@ -43,7 +44,7 @@ The native runtime depends on the UI and loop modules. It must compile and link
 without LuaJIT and must not acquire shell or compositor policy. Native Zig
 applications and language adapters consume the same public runtime contract.
 
-### Lua host (`lua/`)
+### Lua host (`src/lua/`)
 
 Owns `keywork-lua`, the `keywork` executable, LuaJIT integration, Lua-facing
 APIs, script lifecycle, Storybook and test commands, Lua examples, and public
@@ -53,7 +54,7 @@ Lua is a first-class adapter to the native runtime, not the owner of native
 application lifecycle. It may depend on the runtime, UI, and loop modules;
 those modules must never depend on it.
 
-### Compositor (`compositor/`)
+### Compositor (`src/compositor/`)
 
 Owns the Wayland compositor, window-management policy, renderer integration,
 the compositor Varlink interface and server, `keyworkctl`, and session assets
@@ -63,7 +64,7 @@ Its control implementation is compositor-private. User-facing commands must
 remain synchronized across configuration keybindings, Varlink declarations
 and dispatch, and `keyworkctl` parsing and help.
 
-### Shell (`shell/`)
+### Shell (`src/shell/`)
 
 Owns the Lua desktop experience: bar, launcher, lock screen, notifications,
 backgrounds, OSD, shell D-Bus API, native C helpers, PAM policy, and shell
@@ -138,7 +139,7 @@ creates each module and wires dependencies explicitly.
 - A relative `@import("path.zig")` is allowed within one cohesive module.
 - Crossing a module or component boundary requires a named `@import("...")`
   supplied by the root build.
-- Imports such as `@import("../../compositor/src/...")` are forbidden.
+- Imports such as `@import("../../compositor/...")` are forbidden.
 - A module exposes dependencies through its root's public API; consumers do
   not reach through it to implementation files.
 - Build helpers under `build/` configure the graph. Product source does not
@@ -151,16 +152,16 @@ Current source module roots are:
 
 | Module | Root | Direct module dependencies |
 | --- | --- | --- |
-| `keywork-loop` | `loop/src/event_loop.zig` | none |
-| `keywork-ui` | `ui/src/root.zig` | `uucode`, `linebreak`, `z2d` |
-| `keywork-ui-engine` | `ui/engine/root.zig` | `keywork-ui`, `uucode` |
-| `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
-| `keywork-lua` | `lua/src/root.zig` | public native modules |
-| `linebreak` | `ui/lib/linebreak/root.zig` | `uucode` |
-| `varlink` | `compositor/src/varlink/root.zig` | none |
-| `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |
+| `keywork-loop` | `src/loop/event_loop.zig` | none |
+| `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
+| `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
+| `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
+| `keywork-lua` | `src/lua/root.zig` | public native modules |
+| `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |
+| `varlink` | `src/compositor/varlink/root.zig` | none |
+| `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 
-The `keywork` executable root is `lua/src/main.zig`. It consumes the adapter
+The `keywork` executable root is `src/lua/main.zig`. It consumes the adapter
 through `keywork-lua`, and the adapter consumes native runtime source through
 public named modules. Native modules must not import the Lua tree.
 
@@ -171,7 +172,7 @@ The native boundary is complete only when all of these are true:
 - A repository example opens and drives a real Wayland window as a native Zig
   application using `keywork-runtime` and `keywork-ui`.
 - Building that example does not build or link LuaJIT.
-- `runtime/src/app/`, `backend/`, `graphics/`, and `linux/` have no imports from
+- `src/runtime/app/`, `backend/`, `graphics/`, and `linux/` have no imports from
   the Lua component.
 - The Lua host consumes native source only through named modules and their
   public declarations.
@@ -189,10 +190,10 @@ The native boundary is complete only when all of these are true:
   particular, formatting and compositor-only work must not require runtime
   libraries, and native runtime work must not require LuaJIT unless it selects
   the Lua host.
-- `shell/Makefile` owns shell C compilation, C Wayland binding generation,
+- `src/shell/Makefile` owns shell C compilation, C Wayland binding generation,
   shell checks, and shell installation details.
 - The root `Makefile` is a phony task facade only. It must not duplicate Zig
-  source dependencies. It delegates recursively with `$(MAKE) -C shell` so
+  source dependencies. It delegates recursively with `$(MAKE) -C src/shell` so
   Make flags and jobserver behavior are preserved.
 - Root targets whose names imply the whole repository operate on both Zig and
   shell components. Component-only variants use explicit names such as
@@ -215,6 +216,7 @@ The migration was performed in this order:
 6. Relocate the UI and Lua components in history-preserving move commits.
 7. Align root Make semantics.
 8. Elevate only genuinely shared protocol snapshots with provenance.
+9. Consolidate implementation components under one root `src/` namespace.
 
 All migration gates are complete. Future boundary changes remain subject to
 the ownership and dependency rules above.

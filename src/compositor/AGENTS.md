@@ -19,5 +19,4 @@ applies here.
 
 - Keep first-party compositor protocols and interfaces in this component.
 - When changing vendored or adapted Wayland XML, update its provenance,
-  revision, and SHA-256 metadata. Until shared protocols are elevated, that
-  metadata lives in `protocol/README.md`.
+  revision, and SHA-256 metadata in `protocol/README.md`.

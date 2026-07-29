@@ -3,7 +3,7 @@
 Keywork generates bindings for standard protocols supplied by `zig-wayland`
 and for the compositor-owned definitions under `wayland/` and `varlink/`.
 This manifest covers files owned by this component; shared snapshots and their
-provenance live in [`../../protocols/`](../../protocols/README.md). System
+provenance live in [`../../../protocols/`](../../../protocols/README.md). System
 protocol files named in the root build remain owned and versioned by the
 `zig-wayland` dependency.
 

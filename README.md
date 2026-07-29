@@ -9,12 +9,12 @@ erasing component ownership.
 
 | Path | Owner |
 | --- | --- |
-| `loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
-| `ui/` | The platform-neutral retained UI model and engine |
-| `runtime/` | The native Wayland application runtime and platform backends |
-| `lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
-| `compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
-| `shell/` | The Lua desktop shell and its native C helpers |
+| `src/loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
+| `src/ui/` | The platform-neutral retained UI model and engine |
+| `src/runtime/` | The native Wayland application runtime and platform backends |
+| `src/lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
+| `src/compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
+| `src/shell/` | The Lua desktop shell and its native C helpers |
 | `protocols/` | Shared vendored Wayland protocol XML and its provenance metadata |
 | `build/` | Helpers used only by the root Zig build graph |
 | `scripts/` | Procedural repository automation that does not belong in Make or `build.zig` |
@@ -35,9 +35,9 @@ platform without building or linking LuaJIT. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
 monorepo stop conditions.
 
-The shell's existing Makefile remains responsible for its C modules and
+The shell's component Makefile remains responsible for its C modules and
 Wayland code generation. The root Makefile is the human-facing task facade and
-delegates shell work to `$(MAKE) -C shell`.
+delegates shell work to `$(MAKE) -C src/shell`.
 
 Zig 0.16 and the native development libraries used by both products are
 developer prerequisites. Shell linting and formatting additionally require
@@ -64,14 +64,14 @@ native example opens a Wayland window without compiling or linking LuaJIT.
 
 ## Migration status
 
-The source repositories are imported with unsquashed history at fixed
-revisions before any files are reorganized:
+The source repositories were imported with unsquashed history at fixed
+revisions before files were reorganized:
 
-| Destination | Source | Imported revision |
-| --- | --- | --- |
-| `runtime/` | `https://github.com/rockorager/keywork.git` | `0c381bd544ab8ffedc97f28fb3bfe3f85b5a79bc` |
-| `compositor/` | `https://github.com/rockorager/keywork-compositor.git` | `6f26973d4451b804a80e6511002a5fc824590f85` |
-| `shell/` | `https://github.com/rockorager/keywork-shell.git` | `d37444d3d183dfe0cba0f695c32abd71a707051c` |
+| Source | Imported revision |
+| --- | --- |
+| `https://github.com/rockorager/keywork.git` | `0c381bd544ab8ffedc97f28fb3bfe3f85b5a79bc` |
+| `https://github.com/rockorager/keywork-compositor.git` | `6f26973d4451b804a80e6511002a5fc824590f85` |
+| `https://github.com/rockorager/keywork-shell.git` | `d37444d3d183dfe0cba0f695c32abd71a707051c` |
 
 Migration phases:
 
@@ -87,3 +87,4 @@ Migration phases:
 - [x] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [x] Add the root Make task facade and verify build, test, and formatting parity.
 - [x] Remove transitional component build and tool-runner configuration.
+- [x] Consolidate implementation components under one root `src/` tree.

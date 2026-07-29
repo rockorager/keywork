@@ -49,7 +49,7 @@ pub fn add(
     const stb_lib = stb.add(b, target, optimize);
 
     const image_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/image_c.h"),
+        .root_source_file = b.path("src/runtime/ffi/image_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -65,12 +65,12 @@ pub fn add(
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .build_config_path = b.path("ui/lib/linebreak/uucode_config.zig"),
+        .build_config_path = b.path("src/ui/linebreak/uucode_config.zig"),
     });
     const uucode_module = uucode_dep.module("uucode");
 
     const linebreak_module = b.addModule("linebreak", .{
-        .root_source_file = b.path("ui/lib/linebreak/root.zig"),
+        .root_source_file = b.path("src/ui/linebreak/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -83,7 +83,7 @@ pub fn add(
     const z2d_module = z2d_dep.module("z2d");
 
     const keywork_ui_module = b.addModule("keywork-ui", .{
-        .root_source_file = b.path("ui/src/root.zig"),
+        .root_source_file = b.path("src/ui/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -92,7 +92,7 @@ pub fn add(
     keywork_ui_module.addImport("z2d", z2d_module);
 
     const keywork_ui_engine_module = b.addModule("keywork-ui-engine", .{
-        .root_source_file = b.path("ui/engine/root.zig"),
+        .root_source_file = b.path("src/ui/engine/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -100,7 +100,7 @@ pub fn add(
     keywork_ui_engine_module.addImport("uucode", uucode_module);
 
     const xkb_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/xkb_c.h"),
+        .root_source_file = b.path("src/runtime/ffi/xkb_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -108,7 +108,7 @@ pub fn add(
     const xkb_c_module = xkb_c.createModule();
 
     const systemd_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/systemd_c.h"),
+        .root_source_file = b.path("src/runtime/ffi/systemd_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -117,7 +117,7 @@ pub fn add(
     const systemd_c_module = systemd_c.createModule();
 
     const curl_c = b.addTranslateC(.{
-        .root_source_file = b.path("lua/src/ffi/curl_c.h"),
+        .root_source_file = b.path("src/lua/ffi/curl_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -126,14 +126,14 @@ pub fn add(
     const curl_c_module = curl_c.createModule();
 
     const pipewire_c = b.addTranslateC(.{
-        .root_source_file = b.path("lua/src/ffi/pipewire_c.h"),
+        .root_source_file = b.path("src/lua/ffi/pipewire_c.h"),
         .target = target,
         .optimize = optimize,
     });
     const pipewire_c_module = pipewire_c.createModule();
 
     const text_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/text_c.h"),
+        .root_source_file = b.path("src/runtime/ffi/text_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -143,7 +143,7 @@ pub fn add(
     const text_c_module = text_c.createModule();
 
     const pixman_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/pixman_c.h"),
+        .root_source_file = b.path("src/runtime/ffi/pixman_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -153,7 +153,7 @@ pub fn add(
     const lua = luajit.add(b, target, optimize);
 
     const keywork_runtime_module = b.addModule("keywork-runtime", .{
-        .root_source_file = b.path("runtime/src/root.zig"),
+        .root_source_file = b.path("src/runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -174,7 +174,7 @@ pub fn add(
     linkKeyworkNativeSystemLibraries(keywork_runtime_module);
 
     const native_example_module = b.createModule(.{
-        .root_source_file = b.path("runtime/examples/native/main.zig"),
+        .root_source_file = b.path("src/runtime/examples/native/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -196,7 +196,7 @@ pub fn add(
     run_native_example_step.dependOn(&run_native_example.step);
 
     const keywork_lua_module = b.addModule("keywork-lua", .{
-        .root_source_file = b.path("lua/src/root.zig"),
+        .root_source_file = b.path("src/lua/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -209,12 +209,12 @@ pub fn add(
     keywork_lua_module.addImport("systemd_c", systemd_c_module);
     keywork_lua_module.addImport("curl_c", curl_c_module);
     keywork_lua_module.addImport("pipewire_c", pipewire_c_module);
-    keywork_lua_module.addCSourceFile(.{ .file = b.path("lua/src/ffi/pipewire_c.c") });
+    keywork_lua_module.addCSourceFile(.{ .file = b.path("src/lua/ffi/pipewire_c.c") });
     keywork_lua_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
     keywork_lua_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
 
     const luajit_c = b.addTranslateC(.{
-        .root_source_file = b.path("lua/src/ffi/luajit_c.h"),
+        .root_source_file = b.path("src/lua/ffi/luajit_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -224,7 +224,7 @@ pub fn add(
     keywork_lua_module.linkLibrary(lua.library);
 
     const app_module = b.createModule(.{
-        .root_source_file = b.path("lua/src/main.zig"),
+        .root_source_file = b.path("src/lua/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -247,13 +247,13 @@ pub fn add(
 
     b.installArtifact(exe);
     b.installDirectory(.{
-        .source_dir = b.path("lua/types"),
+        .source_dir = b.path("src/lua/types"),
         .install_dir = .prefix,
         .install_subdir = "share/keywork/emmylua",
         .include_extensions = &.{".lua"},
     });
     b.installDirectory(.{
-        .source_dir = b.path("runtime/resources/icons"),
+        .source_dir = b.path("src/runtime/resources/icons"),
         .install_dir = .prefix,
         .install_subdir = "share/icons",
     });
@@ -267,11 +267,11 @@ pub fn add(
     run_step.dependOn(&run_cmd.step);
 
     // Window options come from the script's keywork.window declaration.
-    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "lua/examples/layershell.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "lua/examples/layershell.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "lua/examples/bar.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "lua/examples/bar.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "lua/examples/shell.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "src/lua/examples/layershell.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "src/lua/examples/layershell.lua", &.{"--backend=vulkan"});
+    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "src/lua/examples/bar.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "src/lua/examples/bar.lua", &.{"--backend=vulkan"});
+    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "src/lua/examples/shell.lua", &.{});
 
     const app_tests = b.addTest(.{
         .root_module = app_module,

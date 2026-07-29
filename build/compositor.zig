@@ -63,17 +63,17 @@ pub fn add(
     scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/input-method-unstable-v2.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/wlr-output-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/wlr-screencopy-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/gtk-shell.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/virtual-keyboard-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/upstream/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/wlr-output-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/gtk-shell.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/virtual-keyboard-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wayland/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wayland/wlr-output-power-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("src/compositor/protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 2);
@@ -149,21 +149,21 @@ pub fn add(
     });
 
     const varlink = b.addModule("varlink", .{
-        .root_source_file = b.path("compositor/src/varlink/root.zig"),
+        .root_source_file = b.path("src/compositor/varlink/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const control = b.addModule("keywork-control", .{
-        .root_source_file = b.path("compositor/src/control/root.zig"),
+        .root_source_file = b.path("src/compositor/control/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     control.addAnonymousImport("control-interface", .{
-        .root_source_file = b.path("compositor/protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
+        .root_source_file = b.path("src/compositor/protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
     });
 
     const compositor = b.createModule(.{
-        .root_source_file = b.path("compositor/src/compositor/main.zig"),
+        .root_source_file = b.path("src/compositor/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -173,7 +173,7 @@ pub fn add(
     compositor.addImport("wayland", wayland);
     compositor.addImport("vulkan", vulkan);
     compositor.addAnonymousImport("default-config", .{
-        .root_source_file = b.path("compositor/resources/keywork.conf"),
+        .root_source_file = b.path("src/compositor/resources/keywork.conf"),
     });
     addVulkanShader(b, compositor, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
     addVulkanShader(b, compositor, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
@@ -256,7 +256,7 @@ pub fn add(
         .root_module = compositor,
     });
     const keyworkctl_module = b.createModule(.{
-        .root_source_file = b.path("compositor/src/keyworkctl/main.zig"),
+        .root_source_file = b.path("src/compositor/keyworkctl/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -270,27 +270,27 @@ pub fn add(
     b.installArtifact(exe);
     b.installArtifact(keyworkctl);
     b.installFile(
-        "compositor/resources/keywork-session.target",
+        "src/compositor/resources/keywork-session.target",
         "share/systemd/user/keywork-session.target",
     );
     b.installFile(
-        "compositor/resources/keywork-xdg-autostart.service",
+        "src/compositor/resources/keywork-xdg-autostart.service",
         "share/systemd/user/keywork-xdg-autostart.service",
     );
     b.installFile(
-        "compositor/resources/keywork-xdg-autostart.target",
+        "src/compositor/resources/keywork-xdg-autostart.target",
         "share/systemd/user/keywork-xdg-autostart.target",
     );
     b.installFile(
-        "compositor/resources/keywork.desktop",
+        "src/compositor/resources/keywork.desktop",
         "share/wayland-sessions/keywork.desktop",
     );
     b.installFile(
-        "compositor/resources/keywork-portals.conf",
+        "src/compositor/resources/keywork-portals.conf",
         "share/xdg-desktop-portal/keywork-portals.conf",
     );
     b.installFile(
-        "compositor/resources/keywork.conf",
+        "src/compositor/resources/keywork.conf",
         "share/keywork/keywork.conf",
     );
 
@@ -359,7 +359,7 @@ fn addVulkanShaderVariant(
 ) void {
     const compile = b.addSystemCommand(&.{ "glslc", "-O" });
     for (defines) |value| compile.addArg(b.fmt("-D{s}", .{value}));
-    compile.addFileArg(b.path(b.fmt("compositor/{s}", .{source_path})));
+    compile.addFileArg(b.path(source_path));
     compile.addArg("-o");
     const spirv = compile.addOutputFileArg(b.fmt("{s}.spv", .{name}));
     module.addAnonymousImport(name, .{ .root_source_file = spirv });

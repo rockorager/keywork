@@ -1,6 +1,6 @@
 # AGENTS.md
 
-The root guidance applies here. Read `../VISION.md` for Keywork's product
+The root guidance applies here. Read `../../VISION.md` for Keywork's product
 model and design priorities.
 
 ## Runtime ownership

@@ -12,7 +12,7 @@ build-zig:
 	zig build
 
 build-shell:
-	+$(MAKE) -C shell
+	+$(MAKE) -C src/shell
 
 test: test-zig test-shell
 
@@ -20,14 +20,14 @@ test-zig:
 	zig build test
 
 test-shell:
-	+$(MAKE) -C shell check
+	+$(MAKE) -C src/shell check
 
 check: test lint
 
 lint: lint-shell
 
 lint-shell:
-	+$(MAKE) -C shell lint
+	+$(MAKE) -C src/shell lint
 
 fmt: fmt-zig fmt-shell
 
@@ -35,7 +35,7 @@ fmt-zig:
 	zig build format
 
 fmt-shell:
-	+$(MAKE) -C shell fmt
+	+$(MAKE) -C src/shell fmt
 
 install: install-zig install-shell
 
@@ -43,7 +43,7 @@ install-zig:
 	zig build --prefix "$(PREFIX)"
 
 install-shell:
-	+$(MAKE) -C shell install PREFIX="$(PREFIX)"
+	+$(MAKE) -C src/shell install PREFIX="$(PREFIX)"
 
 clean: clean-zig clean-shell
 
@@ -51,4 +51,4 @@ clean-zig:
 	rm -rf .zig-cache zig-out
 
 clean-shell:
-	+$(MAKE) -C shell clean
+	+$(MAKE) -C src/shell clean

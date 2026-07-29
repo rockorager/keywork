@@ -3,12 +3,14 @@
 Read `ARCHITECTURE.md` before changing component boundaries or dependencies.
 Read `VISION.md` before changing Keywork's product model or design priorities.
 Read `DESIGN.md` before changing the built-in visual system. More specific
-`AGENTS.md` files add component-local rules.
+`AGENTS.md` files under `src/` add component-local rules.
 
 ## Monorepo boundaries
 
 - Keep loop, UI, runtime, Lua, compositor, shell, and shared protocol
   ownership aligned with `ARCHITECTURE.md`.
+- Keep implementation components as direct children of the repository-wide
+  `src/` tree. Do not add a second component-local `src/` directory.
 - Treat the dependency graph in `ARCHITECTURE.md` as authoritative.
 - Native UI and runtime modules must compile without LuaJIT. Lua may consume
   their public contracts; they must never import Lua source.
@@ -38,8 +40,8 @@ Read `DESIGN.md` before changing the built-in visual system. More specific
 - Files under `build/` may organize root build logic but are not product
   modules.
 - Root `Makefile` is a phony task facade. Do not model Zig source dependencies
-  there; delegate shell work with `$(MAKE) -C shell`.
-- `shell/Makefile` owns native shell modules and C/Wayland code generation.
+  there; delegate shell work with `$(MAKE) -C src/shell`.
+- `src/shell/Makefile` owns native shell modules and C/Wayland code generation.
 - Put procedural repository automation in `scripts/` rather than embedding
   substantial shell programs in Make or tool configuration.
 - Zig 0.16 is a prerequisite. Do not add automatic compiler or system package

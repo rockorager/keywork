@@ -8,7 +8,7 @@ local kw = require("keywork")
 --                fades back out after a short hold
 --
 -- Run with:
---   zig build run -- lua/examples/animations.lua
+--   zig build run -- src/lua/examples/animations.lua
 
 local function rows()
     local children = {}

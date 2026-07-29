@@ -48,7 +48,7 @@ IDLE_PROTOCOL_CODE := $(WAYLAND_PROTOCOL_DIR)/ext-idle-notify-v1-protocol.c
 WORKSPACE_PROTOCOL_XML := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)/staging/ext-workspace/ext-workspace-v1.xml
 WORKSPACE_PROTOCOL_HEADER := $(WAYLAND_PROTOCOL_DIR)/ext-workspace-v1-client-protocol.h
 WORKSPACE_PROTOCOL_CODE := $(WAYLAND_PROTOCOL_DIR)/ext-workspace-v1-protocol.c
-OUTPUT_POWER_PROTOCOL_XML := ../protocols/wayland/wlr-output-power-management-unstable-v1.xml
+OUTPUT_POWER_PROTOCOL_XML := ../../protocols/wayland/wlr-output-power-management-unstable-v1.xml
 OUTPUT_POWER_PROTOCOL_HEADER := $(WAYLAND_PROTOCOL_DIR)/wlr-output-power-management-unstable-v1-client-protocol.h
 OUTPUT_POWER_PROTOCOL_CODE := $(WAYLAND_PROTOCOL_DIR)/wlr-output-power-management-unstable-v1-protocol.c
 PAM_SERVICE := pam/keywork-shell

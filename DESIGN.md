@@ -7,7 +7,7 @@ compact, keyboard-focused Linux desktop rather than reproducing Windows UI.
 
 ## Sources of truth
 
-The built-in profile is defined in `lua/src/design/fluent.lua`. It contains:
+The built-in profile is defined in `src/lua/design/fluent.lua`. It contains:
 
 - light and dark semantic color schemes
 - the Fluent Web brand ramp
@@ -15,8 +15,8 @@ The built-in profile is defined in `lua/src/design/fluent.lua`. It contains:
 - elevation shadows
 - component tokens and interaction states
 
-`lua/src/ui.lua` contains only generic theme resolution and widget mechanics.
-Native defaults in `ui/src/types.zig` mirror the built-in profile for widgets
+`src/lua/ui.lua` contains only generic theme resolution and widget mechanics.
+Native defaults in `src/ui/types.zig` mirror the built-in profile for widgets
 created without a Lua theme. Keep those defaults synchronized when changing
 the profile.
 
@@ -72,13 +72,13 @@ the artwork supplied by their desktop entry or protocol.
 The theme inherits `Adwaita` and `hicolor` so application and MIME icons keep
 working. `KEYWORK_ICON_THEME` and then `GTK_ICON_THEME` override the default.
 
-The icon package is pinned in `runtime/design/fluent/package-lock.json`. To
+The icon package is pinned in `src/runtime/design/fluent/package-lock.json`. To
 update the generated theme:
 
 ```bash
-python runtime/tools/update-fluent-icons.py
+python src/runtime/tools/update-fluent-icons.py
 ```
 
 The updater verifies the package SHA-512 digest and rebuilds
-`runtime/resources/icons/Keywork` deterministically. Normal builds use the
+`src/runtime/resources/icons/Keywork` deterministically. Normal builds use the
 generated resources and do not require network access.

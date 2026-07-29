@@ -154,13 +154,13 @@ Fix these in `../keywork`, then simplify here.
 - **Popup surfaces cleared to opaque theme background.** Rounded menu
   corners showed opaque squares: layer-shell windows get
   `setFrameBackground(transparent)` but popup runtimes in
-  [runner.zig](../keywork/src/app/runner.zig) `createPopup` didn't. Fixed in
+  [runner.zig](../runtime/app/runner.zig) `createPopup` didn't. Fixed in
   keywork — popups now clear transparent and content paints its own
   background.
 - **Hover highlight lost on rebuild while pointer rests on target.** Any
   full rebuild (clock tick, status update) rewrote hovered clickables with
   their base background: `updateElementTreeScoped`'s `.clickable` branch in
-  [model.zig](../keywork/src/ui/model.zig) passed the raw child instead of
+  [model.zig](../ui/model.zig) passed the raw child instead of
   `clickableStyledChild(...)` like the build path does. Fixed in keywork
   (with regression test "clickable keeps hover background through tree
   update"); highlight now survives rebuilds until the pointer moves off.

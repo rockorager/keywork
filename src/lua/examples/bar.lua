@@ -1096,7 +1096,7 @@ local App = kw.stateful({
                     spacing = 6,
                     align = "center",
                     children = {
-                        kw.svg_icon({ path = "lua/examples/icons/bolt.svg", size = 16, color = palette.accent }),
+                        kw.svg_icon({ path = "src/lua/examples/icons/bolt.svg", size = 16, color = palette.accent }),
                         label("Keywork", palette),
                     },
                 }),

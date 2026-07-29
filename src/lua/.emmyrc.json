@@ -5,6 +5,6 @@
   },
   "workspace": {
     "library": ["./types"],
-    "ignoreDir": [".zig-cache", "build", "zig-out", "zig-pkg", "src"]
+    "ignoreDir": [".zig-cache", "build", "zig-out", "zig-pkg"]
   }
 }

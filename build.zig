@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const use_llvm = b.option(bool, "llvm", "Use the LLVM backend and LLD linker");
 
     const keywork_loop = b.addModule("keywork-loop", .{
-        .root_source_file = b.path("loop/src/event_loop.zig"),
+        .root_source_file = b.path("src/loop/event_loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -27,12 +27,7 @@ pub fn build(b: *std.Build) void {
         "build.zig",
         "build.zig.zon",
         "build",
-        "loop/src",
-        "ui",
-        "runtime/src",
-        "runtime/examples",
-        "lua/src",
-        "compositor/src",
+        "src",
     };
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = format_paths, .check = true });

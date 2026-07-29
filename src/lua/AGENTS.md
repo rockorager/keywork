@@ -1,8 +1,8 @@
 # AGENTS.md
 
 The root Zig, safety, documentation, and module-boundary guidance applies
-here. Read `../VISION.md` for product priorities and `../DESIGN.md` before
-changing the built-in visual system.
+here. Read `../../VISION.md` for product priorities and `../../DESIGN.md`
+before changing the built-in visual system.
 
 ## Lua host ownership
 
