@@ -1,8 +1,8 @@
 //! Command-line parsing for the Keywork executable.
 
 const std = @import("std");
-const app_options = @import("options.zig");
-const wayland_options = @import("../backend/wayland/options.zig");
+const app_options = @import("../../app/options.zig");
+const wayland_options = @import("../../backend/wayland/options.zig");
 
 pub const Options = struct {
     backend: ?app_options.BackendKind = null,

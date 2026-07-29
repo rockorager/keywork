@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const app_options = @import("options.zig");
-const runner = @import("runner.zig");
+const app_options = @import("../../app/options.zig");
+const runner = @import("../../app/runner.zig");
 const event_loop = @import("keywork-loop");
-const SystemdEvent = @import("../linux/SystemdEvent.zig");
-const lua_module = @import("../lua/app.zig");
+const SystemdEvent = @import("../../linux/SystemdEvent.zig");
+const lua_module = @import("../app.zig");
 
 const Application = @This();
 

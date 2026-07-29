@@ -3,11 +3,11 @@
 const std = @import("std");
 const keywork = @import("keywork-ui");
 const cli = @import("cli.zig");
-const runner = @import("runner.zig");
-const memory_backend = @import("../backend/memory.zig");
+const runner = @import("../../app/runner.zig");
+const memory_backend = @import("../../backend/memory.zig");
 const event_loop = @import("keywork-loop");
-const lua_app = @import("../lua/app.zig");
-const lua_storybook = @import("../lua/storybook.zig");
+const lua_app = @import("../app.zig");
+const lua_storybook = @import("../storybook.zig");
 const runtime_mod = @import("keywork-ui-runtime");
 
 const schema_version = 2;

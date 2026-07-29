@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const lua_app = @import("../lua/app.zig");
-const lua_testing = @import("../lua/testing.zig");
+const lua_app = @import("../app.zig");
+const lua_testing = @import("../testing.zig");
 
 const Summary = struct {
     passed: usize = 0,
