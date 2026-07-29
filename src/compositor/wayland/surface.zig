@@ -756,6 +756,10 @@ pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
     return self.pending_attachment.hasBuffer() or self.state().has_committed_buffer;
 }
 
+pub fn hasBufferAttached(self: *Self) bool {
+    return self.pending_attachment.hasBuffer() or self.state().current_buffer != null;
+}
+
 pub fn releaseRole(self: *Self, context: *anyopaque) void {
     const handler = self.role_handler orelse return;
     std.debug.assert(handler.context == context);
@@ -2825,6 +2829,41 @@ test "callback-only commits require precise empty damage" {
     surface_state.current_damage.clear();
     surface_state.current_damage_precise = false;
     try std.testing.expect(!currentCommitIsCallbackOnly(&surface_state));
+}
+
+test "detached buffers remain in surface commit history" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    var surface: Self = .{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .id = id,
+        .resource = undefined,
+        .pending_attachment = .{},
+        .has_pending_attachment = false,
+        .role_handler = null,
+        .viewport_handler = null,
+        .content_type_handler = null,
+        .color_representation_handler = null,
+        .alpha_modifier_handler = null,
+        .tearing_control_handler = null,
+        .fifo_handler = null,
+        .commit_timer_handler = null,
+        .background_effect_handler = null,
+        .explicit_sync_handler = null,
+        .commit_listeners = .empty,
+        .notifying_commit_listeners = false,
+    };
+    defer surface.commit_listeners.deinit(std.testing.allocator);
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    surface.state().has_committed_buffer = true;
+    try std.testing.expect(!surface.hasBufferAttached());
+    try std.testing.expect(surface.hasBufferAttachedOrCommitted());
 }
 
 test "SHM snapshot copying updates only damaged rows" {

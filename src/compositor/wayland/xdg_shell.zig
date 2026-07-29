@@ -66,6 +66,18 @@ const XdgRole = union(enum) {
     popup: PopupId,
 };
 
+// GTK and Chromium retain wl_surface objects while rebuilding their xdg role
+// objects. Preserve the permanent role and only allow the same xdg role to be
+// assigned again when the replacement xdg_surface chooses its role.
+fn xdgReservationRole(existing: ?Surface.Role) ?Surface.Role {
+    const role = existing orelse return .xdg_toplevel;
+    return switch (role) {
+        .xdg_toplevel => .xdg_toplevel,
+        .xdg_popup => .xdg_popup,
+        else => null,
+    };
+}
+
 const PositionerRules = popup_placement.Rules;
 const PopupPlacement = popup_placement.Placement;
 
@@ -1550,15 +1562,20 @@ const XdgSurfaceResource = struct {
             .toplevel_resource = null,
         };
 
-        if (surface.assignedRole() != null) {
+        const existing_role = surface.assignedRole();
+        const reservation_role = xdgReservationRole(existing_role) orelse {
             wm_base_resource.postError(.role, "wl_surface already has a role");
             var removed = shell.xdg_surfaces.remove(state_id) orelse unreachable;
             removed.deinit(shell.allocator);
             shell.allocator.destroy(self);
             resource.destroy();
             return;
-        }
-        if (surface.hasBufferAttachedOrCommitted()) {
+        };
+        const invalid_buffer_state = if (existing_role == null)
+            surface.hasBufferAttachedOrCommitted()
+        else
+            surface.hasBufferAttached();
+        if (invalid_buffer_state) {
             wm_base_resource.postError(
                 .invalid_surface_state,
                 "wl_surface already has a buffer attached or committed",
@@ -1569,7 +1586,7 @@ const XdgSurfaceResource = struct {
             resource.destroy();
             return;
         }
-        surface.reserveRole(.xdg_toplevel, .{
+        surface.reserveRole(reservation_role, .{
             .context = self,
             .before_commit = beforeSurfaceCommit,
             .after_commit = afterSurfaceStateCommit,
@@ -2223,7 +2240,7 @@ const ToplevelDecorationResource = struct {
         }
         if (resource.getVersion() == 1) {
             const surface = toplevel.xdg_surface_resource.surface;
-            if (surface == null or surface.?.hasBufferAttachedOrCommitted()) {
+            if (surface == null or surface.?.hasBufferAttached()) {
                 resource.postError(
                     .unconfigured_buffer,
                     "version 1 decoration created after a buffer was attached",
@@ -2580,6 +2597,23 @@ const ToplevelResource = struct {
         };
     }
 };
+
+test "xdg wrapper recreation reserves only compatible permanent roles" {
+    try std.testing.expectEqual(
+        Surface.Role.xdg_toplevel,
+        xdgReservationRole(null).?,
+    );
+    try std.testing.expectEqual(
+        Surface.Role.xdg_toplevel,
+        xdgReservationRole(.xdg_toplevel).?,
+    );
+    try std.testing.expectEqual(
+        Surface.Role.xdg_popup,
+        xdgReservationRole(.xdg_popup).?,
+    );
+    try std.testing.expect(xdgReservationRole(.subsurface) == null);
+    try std.testing.expect(xdgReservationRole(.cursor) == null);
+}
 
 test "popup configure acknowledgements retain the matched placement" {
     var state: XdgSurfaceState = .{ .surface_id = undefined };
