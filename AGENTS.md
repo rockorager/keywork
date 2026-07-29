@@ -7,7 +7,7 @@ Read `DESIGN.md` before changing the built-in visual system. More specific
 
 ## Monorepo boundaries
 
-- Keep loop, UI, runtime, Lua, compositor, shell, and shared protocol
+- Keep loop, UI, runtime, Lua, compositor, shell, and Wayland protocol
   ownership aligned with `ARCHITECTURE.md`.
 - Keep implementation components as direct children of the repository-wide
   `src/` tree. Do not add a second component-local `src/` directory.
@@ -21,8 +21,12 @@ Read `DESIGN.md` before changing the built-in visual system. More specific
   expose implementation directories to make a single consumer convenient.
 - Do not create a generic shared-code directory. Promote code only when it has
   multiple real consumers, a coherent responsibility, and a clear owner.
-- Keep product-owned contracts with their product. Shared `protocols/` is for
-  vendored Wayland XML and provenance, not compositor control APIs.
+- Keep every checked-in Wayland XML file and its provenance under
+  `protocols/wayland/`, including single-consumer and first-party compatibility
+  schemas. Centralized storage does not change the component that owns its
+  behavior.
+- Keep non-Wayland product contracts with their product. In particular, the
+  compositor Varlink control interface remains compositor-owned.
 - During migration, separate history-preserving moves from build changes and
   behavior changes so each can be reviewed and verified independently.
 - Make boundaries compiler-enforced and prove the native no-Lua path before

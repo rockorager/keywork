@@ -31,7 +31,7 @@ pub fn add(
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
     scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
-    scanner.addCustomProtocol(b.path("protocols/wayland/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     // Generate current core surface events, then negotiate every global down
     // to the version advertised by the compositor at runtime.
     scanner.generate("wl_compositor", 7);

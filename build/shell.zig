@@ -51,7 +51,7 @@ pub fn add(
     const output_power = scanProtocol(
         b,
         scanner,
-        b.path("protocols/wayland/wlr-output-power-management-unstable-v1.xml"),
+        b.path("protocols/wayland/upstream/wlr-output-power-management-unstable-v1.xml"),
         "wlr-output-power-management-unstable-v1",
     );
 

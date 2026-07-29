@@ -6,9 +6,9 @@ component boundaries.
 
 All implementation components are direct children of the repository-wide
 `src/` tree. Component directories do not contain another nested `src/`.
-Examples, resources, language metadata, and private protocols may remain with
-the component that owns them; repository-wide build support and genuinely
-shared protocols live outside `src/`.
+Examples, resources, language metadata, and non-Wayland product interfaces may
+remain with the component that owns them. Repository-wide build support and
+all checked-in Wayland XML live outside `src/`.
 
 ## Target components
 
@@ -76,14 +76,15 @@ the runtime rather than hidden behind shell-specific workarounds.
 
 ### Protocols (`protocols/`)
 
-Owns byte-for-byte shared snapshots of external Wayland protocol XML and a
-manifest recording source revision, hash, license, and whether each file is an
-upstream snapshot or an adaptation.
+Owns the repository-wide location and provenance manifest for every checked-in
+Wayland protocol XML file. Byte-for-byte external snapshots live under
+`protocols/wayland/upstream/`; adapted and first-party compatibility schemas
+live directly under `protocols/wayland/`.
 
-Product-owned interfaces remain with their products. In particular, the
-compositor Varlink interface is not shared protocol infrastructure. A protocol
-used by only one component may also remain component-owned when elevating it
-would obscure its ownership.
+Centralized storage does not transfer behavioral ownership. The manifest names
+each consumer, while non-Wayland product interfaces remain with their products.
+In particular, the compositor Varlink interface is not Wayland protocol
+infrastructure and remains compositor-owned.
 
 ## Dependency directions
 
@@ -213,7 +214,7 @@ The migration was performed in this order:
 5. Remove configuration-time dependency probes and add focused build steps.
 6. Relocate the UI and Lua components in history-preserving move commits.
 7. Establish repository-wide build and check semantics.
-8. Elevate only genuinely shared protocol snapshots with provenance.
+8. Centralize all checked-in Wayland XML and provenance under `protocols/`.
 9. Consolidate implementation components under one root `src/` namespace.
 
 All migration gates are complete. Future boundary changes remain subject to

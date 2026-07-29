@@ -15,7 +15,7 @@ erasing component ownership.
 | `src/lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
 | `src/compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
 | `src/shell/` | The Lua desktop shell and its native C helpers |
-| `protocols/` | Shared vendored Wayland protocol XML and its provenance metadata |
+| `protocols/` | All checked-in Wayland protocol XML and its provenance metadata |
 | `build/` | Helpers used only by the root Zig build graph |
 | `scripts/` | Procedural repository automation that does not belong directly in `build.zig` |
 

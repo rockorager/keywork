@@ -17,6 +17,8 @@ applies here.
 
 ## Protocols
 
-- Keep first-party compositor protocols and interfaces in this component.
+- Keep the first-party Varlink control interface in this component.
+- Keep all Wayland XML, including compositor-only and first-party compatibility
+  schemas, under `../../protocols/wayland/`.
 - When changing vendored or adapted Wayland XML, update its provenance,
-  revision, and SHA-256 metadata in `protocol/README.md`.
+  revision, and SHA-256 metadata in `../../protocols/README.md`.
