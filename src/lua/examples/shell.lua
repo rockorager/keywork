@@ -13,8 +13,6 @@ local loop = require("keywork.loop")
 --              window's existence follows it; Escape flips it back
 --
 -- Run with:
---   zig build run-lua-shell-example
--- or:
 --   zig build run -- src/lua/examples/shell.lua
 
 local colors = {

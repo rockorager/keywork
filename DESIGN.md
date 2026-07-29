@@ -72,13 +72,7 @@ the artwork supplied by their desktop entry or protocol.
 The theme inherits `Adwaita` and `hicolor` so application and MIME icons keep
 working. `KEYWORK_ICON_THEME` and then `GTK_ICON_THEME` override the default.
 
-The icon package is pinned in `src/runtime/design/fluent/package-lock.json`. To
-update the generated theme:
-
-```bash
-python src/runtime/tools/update-fluent-icons.py
-```
-
-The updater verifies the package SHA-512 digest and rebuilds
-`src/runtime/resources/icons/Keywork` deterministically. Normal builds use the
-generated resources and do not require network access.
+The icon package and its content hash are pinned in `build.zig.zon`. Normal
+builds generate the theme deterministically in the Zig cache and install it
+under `share/icons/Keywork`; generated icons are not checked into the
+repository.

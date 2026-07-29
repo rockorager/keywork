@@ -10,10 +10,8 @@ local colors = {
 -- `--backend=vulkan` or `--backend=log` still work for debugging.
 --
 -- Run with:
---   zig build run-lua-layershell-example
---   zig build run-lua-vulkan-layershell-example
--- or:
 --   zig build run -- src/lua/examples/layershell.lua
+--   zig build run -- src/lua/examples/layershell.lua --backend=vulkan
 local App = keywork.stateful({
     build = function(self, state)
         local theme = keywork.resolve_theme(

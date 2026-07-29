@@ -237,23 +237,13 @@ pub fn add(
         .root_module = compositor,
         .filters = &.{"renderer conformance:"},
     });
-    const renderer_conformance_step = b.step(
-        "renderer-conformance",
-        "Run renderer reference-vector conformance tests",
-    );
     const renderer_conformance_run = b.addRunArtifact(renderer_conformance_tests);
-    renderer_conformance_step.dependOn(&renderer_conformance_run.step);
 
     const renderer_scene_tests = b.addTest(.{
         .root_module = compositor,
         .filters = &.{"reproducible scene:"},
     });
-    const renderer_scene_step = b.step(
-        "renderer-scenes",
-        "Run reproducible renderer scene tests",
-    );
     const renderer_scene_run = b.addRunArtifact(renderer_scene_tests);
-    renderer_scene_step.dependOn(&renderer_scene_run.step);
 
     const renderer_check_step = b.step(
         "renderer-check",

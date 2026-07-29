@@ -95,20 +95,14 @@ pub fn add(
     shell_lint.addArgs(&.{"--config"});
     shell_lint.addFileArg(b.path("src/shell/.emmyrc.json"));
     shell_lint.addArg("--warnings-as-errors");
-    const shell_lint_step = b.step("lint-shell", "Run shell static analysis");
-    shell_lint_step.dependOn(&shell_lint.step);
-    lint_step.dependOn(shell_lint_step);
+    lint_step.dependOn(&shell_lint.step);
 
     const lua_formatter = b.graph.environ_map.get("LUAFMT") orelse "luafmt";
     const shell_fmt = addLuaFormat(b, lua_formatter, true);
-    const shell_fmt_step = b.step("fmt-shell", "Check shell formatting");
-    shell_fmt_step.dependOn(&shell_fmt.step);
-    fmt_step.dependOn(shell_fmt_step);
+    fmt_step.dependOn(&shell_fmt.step);
 
     const shell_format = addLuaFormat(b, lua_formatter, false);
-    const shell_format_step = b.step("format-shell", "Format shell sources");
-    shell_format_step.dependOn(&shell_format.step);
-    format_step.dependOn(shell_format_step);
+    format_step.dependOn(&shell_format.step);
 
     const install_auth = b.addInstallArtifact(auth, .{
         .dest_dir = .{ .override = .prefix },

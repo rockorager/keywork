@@ -143,8 +143,6 @@ pub fn add(
         .use_llvm = use_llvm,
         .use_lld = use_llvm,
     });
-    const native_example_step = b.step("native-example", "Build the native Wayland example");
-    native_example_step.dependOn(&native_example.step);
     const run_native_example = b.addRunArtifact(native_example);
     const run_native_example_step = b.step("run-native-example", "Run the native Wayland example");
     run_native_example_step.dependOn(&run_native_example.step);
@@ -195,9 +193,5 @@ fn addFluentIcons(b: *std.Build) std.Build.LazyPath {
     generate.addDirectoryArg(fluent_icons.path(""));
     generate.addFileArg(b.path("src/runtime/design/fluent/aliases.json"));
     generate.addFileArg(b.path("src/runtime/design/fluent/LICENSE"));
-    const output = generate.addOutputDirectoryArg("Keywork");
-
-    const icons_step = b.step("icons", "Generate the bundled Fluent icon theme");
-    icons_step.dependOn(&generate.step);
-    return output;
+    return generate.addOutputDirectoryArg("Keywork");
 }

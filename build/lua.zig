@@ -100,13 +100,6 @@ pub fn add(
     const run_step = b.step("run", "Run a Lua application (pass -- <script.lua>)");
     run_step.dependOn(&run_cmd.step);
 
-    // Window options come from the script's keywork.window declaration.
-    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "src/lua/examples/layershell.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "src/lua/examples/layershell.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "src/lua/examples/bar.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "src/lua/examples/bar.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "src/lua/examples/shell.lua", &.{});
-
     const app_tests = b.addTest(.{
         .root_module = app_module,
         .use_llvm = use_llvm,
@@ -128,14 +121,4 @@ pub fn add(
 fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) *std.Build.Step.Run {
     const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
     return b.addSystemCommand(&.{ pkg_config, b.fmt("--atleast-version={s}", .{minimum_version}), package });
-}
-
-fn addExampleRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, description: []const u8, script: []const u8, fixed_args: []const []const u8) void {
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.addPrefixedFileArg("--script=", b.path(script));
-    run_cmd.addArgs(fixed_args);
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step(name, description);
-    run_step.dependOn(&run_cmd.step);
 }
