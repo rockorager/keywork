@@ -4,6 +4,10 @@ Keywork is a native Zig application and UI platform for Wayland. LuaJIT is its
 first high-level application host, not a requirement of the UI engine or event
 loop.
 
+Keywork aims to be **systemd for the desktop**: a coherent, Varlink-first
+foundation for the runtime, service, integration, and UI facilities that
+desktop applications otherwise assemble piecemeal.
+
 Applications may be native Zig programs or Lua scripts (`keywork <script.lua>`)
 running on the same retained widget tree and Vulkan or CPU rendering backends.
 The platform should scale from status bars and layer-shell overlays to full
@@ -11,8 +15,9 @@ desktop applications without forcing native applications through Lua.
 
 Beyond the UI engine, Keywork provides an asynchronous runtime and standard
 library for application code: common utilities desktop applications need —
-D-Bus, PipeWire, XDG integration, processes, timers, robust client-side
-networking — built on the same event loop that drives the UI.
+Varlink-first service IPC, D-Bus compatibility, PipeWire, XDG integration,
+processes, timers, robust client-side networking — built on the same event
+loop that drives the UI.
 
 ## Principles
 
@@ -30,6 +35,12 @@ networking — built on the same event loop that drives the UI.
    concepts (layer-shell, xdg-toplevel, fractional scaling) are exposed
    directly rather than hidden behind portability shims.
 
-4. **Faithful to Linux desktop standards.** XDG base directories, icon
-   themes, desktop entries, D-Bus, portals. Keywork applications behave like
-   first-class citizens of the Linux desktop, not a parallel ecosystem.
+4. **Varlink first, D-Bus compatible.** Every Keywork-owned service interface
+   and IPC contract uses Varlink as its canonical API. D-Bus is a compatibility
+   and interoperability layer for existing desktop services, never the model
+   new Keywork interfaces are designed around.
+
+5. **Faithful to Linux desktop standards.** XDG base directories, icon
+   themes, desktop entries, D-Bus interoperability, portals. Keywork
+   applications behave like first-class citizens of the Linux desktop, not a
+   parallel ecosystem.
