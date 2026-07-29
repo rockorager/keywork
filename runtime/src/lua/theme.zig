@@ -1,0 +1,139 @@
+//! Lua theme table decoding.
+
+const std = @import("std");
+const keywork = @import("../ui.zig");
+const lua_codec = @import("codec.zig");
+const lua_value = @import("value.zig");
+const c = @import("luajit_c");
+
+const pop = lua_value.pop;
+const stringField = lua_value.stringField;
+
+pub const TextOptions = struct {
+    color: ?keywork.Color = null,
+    size: ?f32 = null,
+    font_size: ?f32 = null,
+    line_height: ?f32 = null,
+    role: ?keywork.TextRole = null,
+    max_lines: ?u32 = null,
+    overflow: ?keywork.Widget.TextOverflow = null,
+    line_break: keywork.Widget.LineBreakStrategy = .greedy,
+
+    pub fn resolvedFontSize(self: TextOptions) ?f32 {
+        return self.font_size orelse self.size;
+    }
+};
+
+pub fn parseField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) keywork.Theme {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return .default;
+    const theme_table = c.lua_gettop(lua_state);
+
+    var theme = keywork.Theme.fromColorScheme(stringField(lua_state, theme_table, "color_scheme") catch "light");
+    theme.color_scheme = parseColorScheme(lua_state, theme_table, theme.color_scheme);
+    theme.text_theme = parseTextTheme(lua_state, theme_table, theme.text_theme);
+    theme.separator_theme = parseSeparatorTheme(lua_state, theme_table, theme.separator_theme);
+    theme.scrollbar_theme = parseScrollbarTheme(lua_state, theme_table, theme.scrollbar_theme);
+    return theme;
+}
+
+fn parseColorScheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.ColorScheme) keywork.ColorScheme {
+    c.lua_getfield(lua_state, theme_table, "colors");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const colors_table = c.lua_gettop(lua_state);
+    return .{
+        .brightness = base.brightness,
+        .background = getColorField(lua_state, colors_table, "background", base.background),
+        .foreground = getColorField(lua_state, colors_table, "foreground", base.foreground),
+        .primary = getColorField(lua_state, colors_table, "primary", base.primary),
+        .on_primary = getColorField(lua_state, colors_table, "on_primary", base.on_primary),
+        .surface = getColorField(lua_state, colors_table, "surface", base.surface),
+        .surface_high = getColorField(lua_state, colors_table, "surface_high", base.surface_high),
+        .surface_low = getColorField(lua_state, colors_table, "surface_low", base.surface_low),
+        .border = getColorField(lua_state, colors_table, "border", base.border),
+        .muted = getColorField(lua_state, colors_table, "muted", base.muted),
+        .error_color = getColorField(lua_state, colors_table, "error", base.error_color),
+        .on_error = getColorField(lua_state, colors_table, "on_error", base.on_error),
+    };
+}
+
+fn parseTextTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.TextTheme) keywork.TextTheme {
+    c.lua_getfield(lua_state, theme_table, "text");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const text_table = c.lua_gettop(lua_state);
+    var result = base;
+    result.body = parseTextStyleField(lua_state, text_table, "body", result.body);
+    result.label = parseTextStyleField(lua_state, text_table, "label", result.label);
+    result.title = parseTextStyleField(lua_state, text_table, "title", result.title);
+    return result;
+}
+
+fn parseTextStyleField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, base: keywork.TextStyle) keywork.TextStyle {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return base;
+    if (c.lua_isnumber(lua_state, -1) != 0) {
+        var result = base;
+        result.color = lua_codec.decodeColor(lua_state, -1) catch result.color;
+        return result;
+    }
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+
+    const options = lua_codec.decode(TextOptions, lua_state, -1, std.heap.page_allocator) catch return base;
+    return .{
+        .color = options.color orelse base.color,
+        .font_size = options.resolvedFontSize() orelse base.font_size,
+        .line_height = options.line_height orelse base.line_height,
+    };
+}
+
+fn parseSeparatorTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.SeparatorTheme) keywork.SeparatorTheme {
+    c.lua_getfield(lua_state, theme_table, "components");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const components_table = c.lua_gettop(lua_state);
+
+    c.lua_getfield(lua_state, components_table, "separator");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const separator_table = c.lua_gettop(lua_state);
+    return .{ .color = getOptionalColorField(lua_state, separator_table, "color") orelse base.color };
+}
+
+fn parseScrollbarTheme(lua_state: *c.lua_State, theme_table: c_int, base: keywork.ScrollbarTheme) keywork.ScrollbarTheme {
+    c.lua_getfield(lua_state, theme_table, "components");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const components_table = c.lua_gettop(lua_state);
+
+    c.lua_getfield(lua_state, components_table, "scrollbar");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return base;
+    const scrollbar_table = c.lua_gettop(lua_state);
+    return .{
+        .track = getOptionalColorField(lua_state, scrollbar_table, "track") orelse base.track,
+        .thumb = getOptionalColorField(lua_state, scrollbar_table, "thumb") orelse base.thumb,
+    };
+}
+
+fn getNumberField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: f32) f32 {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    if (c.lua_isnumber(lua_state, -1) == 0) return default;
+    return @floatCast(c.lua_tonumber(lua_state, -1));
+}
+
+fn getColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8, default: keywork.Color) keywork.Color {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    return lua_codec.decodeColor(lua_state, -1) catch default;
+}
+
+fn getOptionalColorField(lua_state: *c.lua_State, table: c_int, key: [*:0]const u8) ?keywork.Color {
+    c.lua_getfield(lua_state, table, key);
+    defer pop(lua_state, 1);
+    return lua_codec.decodeColor(lua_state, -1) catch null;
+}
