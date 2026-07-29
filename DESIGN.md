@@ -7,8 +7,7 @@ compact, keyboard-focused Linux desktop rather than reproducing Windows UI.
 
 ## Sources of truth
 
-The built-in profile is defined in `runtime/src/lua/design/fluent.lua`. It
-contains:
+The built-in profile is defined in `lua/src/design/fluent.lua`. It contains:
 
 - light and dark semantic color schemes
 - the Fluent Web brand ramp
@@ -16,10 +15,10 @@ contains:
 - elevation shadows
 - component tokens and interaction states
 
-`runtime/src/lua/ui.lua` contains only generic theme resolution and widget
-mechanics. Native defaults in `ui/src/types.zig` mirror the built-in profile
-for widgets created without a Lua theme. Keep those defaults synchronized when
-changing the profile.
+`lua/src/ui.lua` contains only generic theme resolution and widget mechanics.
+Native defaults in `ui/src/types.zig` mirror the built-in profile for widgets
+created without a Lua theme. Keep those defaults synchronized when changing
+the profile.
 
 The current compact desktop baseline uses 14px/20px body text, 32px controls,
 4px control radii, and Fluent overlay scrollbars. These are Keywork profile

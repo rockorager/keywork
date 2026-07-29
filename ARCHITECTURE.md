@@ -51,9 +51,7 @@ Lua type information.
 
 Lua is a first-class adapter to the native runtime, not the owner of native
 application lifecycle. It may depend on the runtime, UI, and loop modules;
-those modules must never depend on it. During migration this source remains
-under `runtime/src/lua/` and a few Lua-owned lifecycle files remain under
-`runtime/src/app/`.
+those modules must never depend on it.
 
 ### Compositor (`compositor/`)
 
@@ -149,7 +147,7 @@ creates each module and wires dependencies explicitly.
 Module names and roots are part of the architecture. Add or change them in the
 root build and document non-obvious dependency direction changes here.
 
-Current transitional source module roots are:
+Current source module roots are:
 
 | Module | Root | Direct module dependencies |
 | --- | --- | --- |
@@ -157,26 +155,14 @@ Current transitional source module roots are:
 | `keywork-ui` | `ui/src/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
-| `keywork-lua` | `runtime/src/lua/app.zig` | public native modules |
+| `keywork-lua` | `lua/src/root.zig` | public native modules |
 | `linebreak` | `ui/lib/linebreak/root.zig` | `uucode` |
 | `varlink` | `compositor/src/varlink/root.zig` | none |
 | `keywork-control` | `compositor/src/control/root.zig` | embedded compositor interface |
 
-Target source module roots are:
-
-| Module | Root | Direct Keywork dependencies |
-| --- | --- | --- |
-| `keywork-loop` | `loop/src/event_loop.zig` | none |
-| `keywork-ui` | `ui/src/root.zig` | none |
-| `keywork-ui-engine` | `ui/engine/root.zig` | `keywork-ui` |
-| `keywork-runtime` | `runtime/src/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine` |
-| `keywork-lua` | `lua/src/root.zig` | public native modules only |
-
-Lua-owned lifecycle code now lives under `runtime/src/lua/host/`. The
-executable consumes the adapter through `keywork-lua`, and the adapter consumes
-native runtime source through public named modules. Both roots remain under
-`runtime/src/` until the top-level Lua component move. Native modules must not
-regain imports into the Lua tree.
+The `keywork` executable root is `lua/src/main.zig`. It consumes the adapter
+through `keywork-lua`, and the adapter consumes native runtime source through
+public named modules. Native modules must not import the Lua tree.
 
 ## Native application acceptance criteria
 
@@ -230,8 +216,7 @@ Perform the remaining migration in this order:
 7. Align root Make semantics.
 8. Elevate only genuinely shared protocol snapshots with provenance.
 
-Gates 1 through 3 are complete. Do not begin top-level component relocation
-before the native example proves the intended dependency direction.
+Gates 1 through 6 are complete.
 
 ## Monorepo stop conditions
 

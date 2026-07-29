@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         "ui",
         "runtime/src",
         "runtime/examples",
+        "lua/src",
         "compositor/src",
     };
     const fmt_step = b.step("fmt", "Check code formatting");

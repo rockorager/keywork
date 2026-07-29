@@ -13,7 +13,7 @@ local colors = {
 --   zig build run-lua-layershell-example
 --   zig build run-lua-vulkan-layershell-example
 -- or:
---   zig build run -- runtime/examples/lua/layershell.lua
+--   zig build run -- lua/examples/layershell.lua
 local App = keywork.stateful({
     build = function(self, state)
         local theme = keywork.resolve_theme(

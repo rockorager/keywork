@@ -1,4 +1,4 @@
-//! LuaJIT application host and native Keywork bindings.
+//! Keywork LuaJIT adapter and native bindings.
 
 const std = @import("std");
 const native_runtime = @import("keywork-runtime");

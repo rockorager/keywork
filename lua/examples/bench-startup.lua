@@ -6,7 +6,7 @@ local keywork = require("keywork")
 -- frame is painted, committed, and flushed, but the process exits without
 -- waiting for the compositor to acknowledge it. That measures pure engine
 -- startup work with low variance:
---   hyperfine 'zig-out/bin/keywork examples/lua/bench-startup.lua'
+--   hyperfine 'zig-out/bin/keywork lua/examples/bench-startup.lua'
 return keywork.app({
     app_id = "dev.keywork.BenchStartup",
     backend = "cpu",

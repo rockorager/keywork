@@ -117,7 +117,7 @@ pub fn add(
     const systemd_c_module = systemd_c.createModule();
 
     const curl_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/curl_c.h"),
+        .root_source_file = b.path("lua/src/ffi/curl_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -126,7 +126,7 @@ pub fn add(
     const curl_c_module = curl_c.createModule();
 
     const pipewire_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/pipewire_c.h"),
+        .root_source_file = b.path("lua/src/ffi/pipewire_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -196,7 +196,7 @@ pub fn add(
     run_native_example_step.dependOn(&run_native_example.step);
 
     const keywork_lua_module = b.addModule("keywork-lua", .{
-        .root_source_file = b.path("runtime/src/lua/app.zig"),
+        .root_source_file = b.path("lua/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -209,12 +209,12 @@ pub fn add(
     keywork_lua_module.addImport("systemd_c", systemd_c_module);
     keywork_lua_module.addImport("curl_c", curl_c_module);
     keywork_lua_module.addImport("pipewire_c", pipewire_c_module);
-    keywork_lua_module.addCSourceFile(.{ .file = b.path("runtime/src/ffi/pipewire_c.c") });
+    keywork_lua_module.addCSourceFile(.{ .file = b.path("lua/src/ffi/pipewire_c.c") });
     keywork_lua_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
     keywork_lua_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
 
     const luajit_c = b.addTranslateC(.{
-        .root_source_file = b.path("runtime/src/ffi/luajit_c.h"),
+        .root_source_file = b.path("lua/src/ffi/luajit_c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -224,7 +224,7 @@ pub fn add(
     keywork_lua_module.linkLibrary(lua.library);
 
     const app_module = b.createModule(.{
-        .root_source_file = b.path("runtime/src/main.zig"),
+        .root_source_file = b.path("lua/src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -247,7 +247,7 @@ pub fn add(
 
     b.installArtifact(exe);
     b.installDirectory(.{
-        .source_dir = b.path("runtime/types"),
+        .source_dir = b.path("lua/types"),
         .install_dir = .prefix,
         .install_subdir = "share/keywork/emmylua",
         .include_extensions = &.{".lua"},
@@ -267,11 +267,11 @@ pub fn add(
     run_step.dependOn(&run_cmd.step);
 
     // Window options come from the script's keywork.window declaration.
-    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "runtime/examples/lua/layershell.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "runtime/examples/lua/layershell.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "runtime/examples/lua/bar.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "runtime/examples/lua/bar.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "runtime/examples/lua/shell.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "lua/examples/layershell.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "lua/examples/layershell.lua", &.{"--backend=vulkan"});
+    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "lua/examples/bar.lua", &.{});
+    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "lua/examples/bar.lua", &.{"--backend=vulkan"});
+    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "lua/examples/shell.lua", &.{});
 
     const app_tests = b.addTest(.{
         .root_module = app_module,

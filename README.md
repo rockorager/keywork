@@ -11,7 +11,8 @@ erasing component ownership.
 | --- | --- |
 | `loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
 | `ui/` | The platform-neutral retained UI model and engine |
-| `runtime/` | The native Wayland application runtime and transitional Lua host |
+| `runtime/` | The native Wayland application runtime and platform backends |
+| `lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
 | `compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
 | `shell/` | The Lua desktop shell and its native C helpers |
 | `protocols/` | Shared vendored Wayland protocol XML and its provenance metadata |
@@ -29,9 +30,8 @@ and `keywork-control`. Source may use relative imports within a cohesive
 module; dependencies between modules are explicit named imports wired by the
 root build.
 
-The current physical layout remains transitional while the Lua host is nested
-under `runtime/`. Native UI and runtime modules already allow Zig applications
-to use the full Wayland platform without building or linking LuaJIT. See
+Native UI and runtime modules allow Zig applications to use the full Wayland
+platform without building or linking LuaJIT. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
 monorepo stop conditions.
 
@@ -82,7 +82,7 @@ Migration phases:
 - [x] Replace runner callback fields with one typed host-binding contract.
 - [x] Expose the Lua-free `keywork-runtime` module.
 - [x] Add a native Wayland application proving the no-LuaJIT path.
-- [ ] Relocate native UI and Lua host source to top-level components.
+- [x] Relocate native UI and Lua host source to top-level components.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [x] Add the root Make task facade and verify build, test, and formatting parity.
 - [x] Remove transitional component build and tool-runner configuration.

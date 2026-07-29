@@ -1,10 +1,10 @@
 //! Keywork LuaJIT application runtime.
 
 const std = @import("std");
-const cli = @import("lua/host/cli.zig");
-const Application = @import("lua/host/Application.zig");
-const storybook = @import("lua/host/storybook.zig");
-const testing = @import("lua/host/testing.zig");
+const cli = @import("host/cli.zig");
+const Application = @import("host/Application.zig");
+const storybook = @import("host/storybook.zig");
+const testing = @import("host/testing.zig");
 
 pub const std_options: std.Options = .{
     .logFn = logWithTimestamp,
@@ -120,8 +120,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("lua/host/Application.zig");
-    _ = @import("lua/host/storybook.zig");
-    _ = @import("lua/host/testing.zig");
+    _ = @import("host/Application.zig");
+    _ = @import("host/storybook.zig");
+    _ = @import("host/testing.zig");
     _ = @import("keywork-lua");
 }
