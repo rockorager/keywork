@@ -84,6 +84,6 @@ Migration phases:
 - [x] Expose the Lua-free `keywork-runtime` module.
 - [x] Add a native Wayland application proving the no-LuaJIT path.
 - [x] Relocate native UI and Lua host source to top-level components.
-- [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
+- [x] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [x] Add the root Make task facade and verify build, test, and formatting parity.
 - [x] Remove transitional component build and tool-runner configuration.

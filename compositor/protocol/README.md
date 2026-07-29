@@ -1,9 +1,11 @@
 # Protocol provenance
 
 Keywork generates bindings for standard protocols supplied by `zig-wayland`
-and for the definitions under `wayland/` and `varlink/`. This manifest covers
-the files committed to this repository; system protocol files named in
-`build.zig` remain owned and versioned by the `zig-wayland` dependency.
+and for the compositor-owned definitions under `wayland/` and `varlink/`.
+This manifest covers files owned by this component; shared snapshots and their
+provenance live in [`../../protocols/`](../../protocols/README.md). System
+protocol files named in the root build remain owned and versioned by the
+`zig-wayland` dependency.
 
 `wayland/upstream/` is reserved for byte-for-byte upstream snapshots. Wayland
 files directly under `wayland/` are first-party interfaces or documented
@@ -22,8 +24,6 @@ and SHA-256 here; local edits belong outside `wayland/upstream/`.
 | `wayland/upstream/wlr-data-control-unstable-v1.xml` | [wlr-protocols `unstable/wlr-data-control-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/92feabdfd77ab141ff76c3a9ce327dcbb8e57b1c/unstable/wlr-data-control-unstable-v1.xml) | `92feabdfd77ab141ff76c3a9ce327dcbb8e57b1c` | `5f10d6bf9bfa9d12266a6f423fb77bbb98e415f6d64fe24680710ffb362a7082` | MIT/X11-style, embedded |
 | `wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml` | [wlr-protocols `unstable/wlr-foreign-toplevel-management-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/005d69d048ccceb2af3f5b86665821e8fa9a87b8/unstable/wlr-foreign-toplevel-management-unstable-v1.xml) | `005d69d048ccceb2af3f5b86665821e8fa9a87b8` | `4ecc4588858e29fe680a33521e1f22bcf22071d66d1553fe96b4ddec03d591d2` | MIT/X11-style, embedded |
 | `wayland/upstream/wlr-gamma-control-unstable-v1.xml` | [wlr-protocols `unstable/wlr-gamma-control-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/29d4a59df8cbbc719fea9fe84689a45569410a86/unstable/wlr-gamma-control-unstable-v1.xml) | `29d4a59df8cbbc719fea9fe84689a45569410a86` | `4065cbc291a80348b7ef311168fbfb5cf245efe977a6dc32211291ef1a9529a1` | MIT/X11-style, embedded |
-| `wayland/upstream/wlr-layer-shell-unstable-v1.xml` | [wlr-protocols `unstable/wlr-layer-shell-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/2b8d43325b7012cc3f9b55c08d26e50e42beac7d/unstable/wlr-layer-shell-unstable-v1.xml) | `2b8d43325b7012cc3f9b55c08d26e50e42beac7d` | `87e0b9c837aecd6977f76f3c47d73088b7159871f5d979dc1840f6cadb5e2ed8` | MIT/X11-style, embedded |
-| `wayland/upstream/wlr-output-power-management-unstable-v1.xml` | [wlr-protocols `unstable/wlr-output-power-management-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/9b9479f9a3f982a811e483b45be3fd4ad726999c/unstable/wlr-output-power-management-unstable-v1.xml) | `9b9479f9a3f982a811e483b45be3fd4ad726999c` | `7ebd98f3449d246a57829e4b4dd9fbc3ef98e3dd42fa94ea102f14f490eb20de` | MIT/Expat-style, embedded |
 | `wayland/upstream/wlr-virtual-pointer-unstable-v1.xml` | [wlr-protocols `unstable/wlr-virtual-pointer-unstable-v1.xml`](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/c11408942e2fb54d41dadb84cdf844331076ae11/unstable/wlr-virtual-pointer-unstable-v1.xml) | `c11408942e2fb54d41dadb84cdf844331076ae11` | `3ff6d540be0bc5228195bf072bde42117ea17945a5c2061add5d3cf97d6bb524` | MIT/Expat-style, embedded |
 
 `input-method-unstable-v2` was proposed to wayland-protocols but never merged;

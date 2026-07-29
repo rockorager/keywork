@@ -71,8 +71,8 @@ pub fn add(
     scanner.addCustomProtocol(b.path("compositor/protocol/wayland/gtk-shell.xml"));
     scanner.addCustomProtocol(b.path("compositor/protocol/wayland/virtual-keyboard-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
-    scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wayland/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocols/wayland/wlr-output-power-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("compositor/protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);

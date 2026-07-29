@@ -203,7 +203,7 @@ The native boundary is complete only when all of these are true:
 
 ## Migration gates
 
-Perform the remaining migration in this order:
+The migration was performed in this order:
 
 1. Replace the runner's opaque context and callback collection with one typed
    host-binding interface.
@@ -216,7 +216,8 @@ Perform the remaining migration in this order:
 7. Align root Make semantics.
 8. Elevate only genuinely shared protocol snapshots with provenance.
 
-Gates 1 through 6 are complete.
+All migration gates are complete. Future boundary changes remain subject to
+the ownership and dependency rules above.
 
 ## Monorepo stop conditions
 
