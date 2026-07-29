@@ -140,15 +140,15 @@ local function search_field(self, theme)
             align = "center",
             children = {
                 kw.icon({ name = "system-search", color = theme.colors.text_tertiary }),
-                kw.expanded({ child =
-                    kw.text_field({
+                kw.expanded({
+                    child = kw.text_field({
                         id = "query",
                         placeholder = "Search apps…",
                         autofocus = true,
                         on_change = function(text)
                             set_query(self, text)
                         end,
-                    })
+                    }),
                 }),
             },
         }),
@@ -284,14 +284,14 @@ local function footer(self, theme)
                     placement = { edge = "top", alignment = "end", gap = theme.space[2] },
                     width = 260,
                     content = function()
-                                return action_menu(self, entry)
-                            end,
-                            -- Escape with the menu open lands here (the runtime routes
+                        return action_menu(self, entry)
+                    end,
+                    -- Escape with the menu open lands here (the runtime routes
             -- it to popups first), so it closes the menu, not the
             -- launcher.
                     on_close = function()
-                                close_actions(self)
-                            end,
+                        close_actions(self)
+                    end,
                 }),
                 hint("esc", "close"),
             },

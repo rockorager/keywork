@@ -95,15 +95,15 @@ M.View = kw.stateful({
                 child = kw.column({
                     align = "center",
                     children = {
-                        kw.expanded({ child =
-                            kw.column({
+                        kw.expanded({
+                            child = kw.column({
                                 align = "center",
                                 children = {
                                     kw.spacer(2),
                                     clock_view,
                                     kw.spacer(),
                                 },
-                            })
+                            }),
                         }),
                         card,
                         kw.expanded({ child = kw.spacer() }),

@@ -856,11 +856,11 @@ M.session_lock = SessionLock
 function M.theme_data(options) end
 
 ---@param theme?           keywork.ThemeData
----@param state_or_scheme? keywork.BuildContext | keywork.ColorScheme
+---@param state_or_scheme? keywork.BuildContext | keywork.WindowsContext | keywork.ColorScheme
 ---@return keywork.Theme
 function M.resolve_theme(theme, state_or_scheme) end
 
----@param state  keywork.BuildContext
+---@param state  keywork.BuildContext | keywork.WindowsContext
 ---@param theme? keywork.ThemeData
 ---@return keywork.Theme
 function M.theme_for(state, theme) end

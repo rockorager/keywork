@@ -18,7 +18,8 @@ toggle the launcher via `keywork-shell launcher` (dbus-send).
   `lua/shell/` modules, and shell-owned native helpers within this component.
 - Theme via `kw.resolve_theme` / `context.theme`; no hardcoded colors outside a
   palette module (see `lua/shell/bar/colors.lua`).
-- `src/shell/Makefile` owns C module compilation and C/Wayland code generation;
-  do not move those dependencies into the root task facade.
-- Run `make check` from this directory before finishing shell changes. It
-  builds native modules and byte-compiles all Lua with `luajit -b`.
+- Root `build.zig` owns C module compilation, C/Wayland code generation, Lua
+  checks, formatting, and installation. Do not add a component-local build
+  graph or task runner.
+- Run `zig build shell` from the repository root before finishing shell
+  changes. It builds native modules and byte-compiles all Lua with `luajit -b`.

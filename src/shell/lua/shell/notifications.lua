@@ -168,14 +168,14 @@ local Server = {}
 Server.__index = Server
 
 ---@class ShellNotification
----@field id          integer
----@field generation  integer
----@field timeout_ms? number
----@field remaining_ms? number
+---@field id             integer
+---@field generation     integer
+---@field timeout_ms?    number
+---@field remaining_ms?  number
 ---@field expires_at_ms? number
----@field hovered     boolean
----@field actions     table[]
----@field resident    boolean
+---@field hovered        boolean
+---@field actions        table[]
+---@field resident       boolean
 
 ---@class NotificationServer
 ---@field by_id      table<integer, ShellNotification>
@@ -486,8 +486,8 @@ local function action_buttons(server, notification, on_hover)
     for _, action in ipairs(notification.actions) do
         if action.key ~= "default" and #buttons < 3 then
             local current = action
-            buttons[#buttons + 1] = kw.expanded({ child =
-                kw.button({
+            buttons[#buttons + 1] = kw.expanded({
+                child = kw.button({
                     id = "notification-action-" .. notification.id .. "-" .. current.key,
                     label = current.label,
                     size = "small",
@@ -496,7 +496,7 @@ local function action_buttons(server, notification, on_hover)
                     on_activate = function()
                         invoke(server, notification, current)
                     end,
-                })
+                }),
             })
         end
     end
@@ -576,12 +576,12 @@ local NotificationCard = kw.stateful({
             spacing = theme.space[3],
             children = {
                 icon,
-                kw.expanded({ child =
-                    kw.column({
+                kw.expanded({
+                    child = kw.column({
                         align = "stretch",
                         spacing = theme.space[1],
                         children = text_children,
-                    })
+                    }),
                 }),
             },
         })

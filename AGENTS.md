@@ -39,11 +39,11 @@ Read `DESIGN.md` before changing the built-in visual system. More specific
   are no component-local Zig build graphs.
 - Files under `build/` may organize root build logic but are not product
   modules.
-- Root `Makefile` is a phony task facade. Do not model Zig source dependencies
-  there; delegate shell work with `$(MAKE) -C src/shell`.
-- `src/shell/Makefile` owns native shell modules and C/Wayland code generation.
-- Put procedural repository automation in `scripts/` rather than embedding
-  substantial shell programs in Make or tool configuration.
+- `zig build` is the only repository task entry point. Keep native shell
+  modules, C/Wayland code generation, Lua checks, and installation in that
+  graph rather than adding a second task runner.
+- Put substantial procedural repository automation in `scripts/` rather than
+  embedding shell programs in build configuration.
 - Zig 0.16 is a prerequisite. Do not add automatic compiler or system package
   installation without an explicit toolchain policy change.
 

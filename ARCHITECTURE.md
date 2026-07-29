@@ -190,15 +190,13 @@ The native boundary is complete only when all of these are true:
   particular, formatting and compositor-only work must not require runtime
   libraries, and native runtime work must not require LuaJIT unless it selects
   the Lua host.
-- `src/shell/Makefile` owns shell C compilation, C Wayland binding generation,
-  shell checks, and shell installation details.
-- The root `Makefile` is a phony task facade only. It must not duplicate Zig
-  source dependencies. It delegates recursively with `$(MAKE) -C src/shell` so
-  Make flags and jobserver behavior are preserved.
-- Root targets whose names imply the whole repository operate on both Zig and
-  shell components. Component-only variants use explicit names such as
-  `install-zig` or `install-shell`; privileged PAM installation remains an
-  explicit shell operation.
+- The root Zig graph owns shell C compilation, C Wayland binding generation,
+  Lua checks, formatting, and installation alongside the native artifacts.
+- `zig build` is the sole repository task interface. Aggregate steps whose
+  names imply the whole repository operate on both native and shell sources;
+  focused shell steps remain available where useful.
+- Privileged PAM installation remains the explicit `install-pam` step and is
+  never part of the default install.
 - Procedural automation belongs in `scripts/`, not embedded shell fragments in
   configuration files.
 
@@ -214,7 +212,7 @@ The migration was performed in this order:
 4. Add the native Wayland example and enforce the no-LuaJIT acceptance gate.
 5. Remove configuration-time dependency probes and add focused build steps.
 6. Relocate the UI and Lua components in history-preserving move commits.
-7. Align root Make semantics.
+7. Establish repository-wide build and check semantics.
 8. Elevate only genuinely shared protocol snapshots with provenance.
 9. Consolidate implementation components under one root `src/` namespace.
 

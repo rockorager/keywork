@@ -13,7 +13,10 @@ M.height = 40
 -- rebuilds that did not change colors. Include resolved color values so live
 -- theme or accent changes within one light/dark scheme replace the palette.
 local cached_palette_key
+---@type ShellBarPalette?
 local cached_palette
+---@param theme keywork.Theme
+---@return string
 local function palette_key(theme)
     local entries = {}
     for name, value in pairs(theme.colors or {}) do
@@ -25,13 +28,15 @@ local function palette_key(theme)
     return theme.color_scheme .. ":" .. table.concat(entries, ",")
 end
 
+---@param theme keywork.Theme
+---@return ShellBarPalette
 local function palette_for(theme)
     local key = palette_key(theme)
     if cached_palette_key ~= key then
         cached_palette_key = key
         cached_palette = colors.palette(theme)
     end
-    return cached_palette
+    return assert(cached_palette)
 end
 
 -- One bar per output. props: output and show_tray (SNI hosts register on
@@ -63,8 +68,8 @@ local Bar = kw.stateful({
             child = kw.column({
                 align = "stretch",
                 children = {
-                    kw.expanded({ child =
-                        kw.container({
+                    kw.expanded({
+                        child = kw.container({
                             background = palette.background,
                             vertical_align = "center",
                             padding = { x = theme.space[2], y = theme.space[1] },
@@ -73,7 +78,7 @@ local Bar = kw.stateful({
                                 align = "center",
                                 children = children,
                             }),
-                        })
+                        }),
                     }),
                     kw.separator({}),
                 },

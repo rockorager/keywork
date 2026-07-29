@@ -651,13 +651,13 @@ local Network = kw.stateful({
             placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
             width = 300,
             content = function()
-                        return self:build_wifi_menu()
-                    end,
+                return self:build_wifi_menu()
+            end,
             on_close = function()
-                        self:set_state(function(state)
-                            state.wifi_menu_open = false
-                        end)
-                    end,
+                self:set_state(function(state)
+                    state.wifi_menu_open = false
+                end)
+            end,
         })
     end,
 })

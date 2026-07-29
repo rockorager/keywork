@@ -3,16 +3,21 @@ const Scanner = @import("wayland").Scanner;
 const luajit = @import("luajit.zig");
 const stb = @import("stb.zig");
 
+pub const Output = struct {
+    executable: *std.Build.Step.Compile,
+};
+
 pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     use_llvm: ?bool,
     keywork_loop_module: *std.Build.Module,
+    lua: luajit.LuaJit,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
-) void {
+) Output {
     const scanner = Scanner.create(b, .{
         .wayland_xml = wayland_xml,
         .wayland_protocols = wayland_protocols,
@@ -149,8 +154,6 @@ pub fn add(
     });
     pixman_c.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
     const pixman_c_module = pixman_c.createModule();
-
-    const lua = luajit.add(b, target, optimize);
 
     const keywork_runtime_module = b.addModule("keywork-runtime", .{
         .root_source_file = b.path("src/runtime/root.zig"),
@@ -299,6 +302,8 @@ pub fn add(
     test_step.dependOn(&b.addRunArtifact(keywork_ui_engine_tests).step);
     const linebreak_tests = b.addTest(.{ .root_module = linebreak_module });
     test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
+
+    return .{ .executable = exe };
 }
 
 fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {

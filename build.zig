@@ -1,6 +1,8 @@
 const std = @import("std");
 const runtime = @import("build/runtime.zig");
 const compositor = @import("build/compositor.zig");
+const luajit = @import("build/luajit.zig");
+const shell = @import("build/shell.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -19,8 +21,14 @@ pub fn build(b: *std.Build) void {
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
 
+    const lint_step = b.step("lint", "Run all static analysis");
+    const check_step = b.step("check", "Run all tests and static analysis");
+    check_step.dependOn(test_step);
+    check_step.dependOn(lint_step);
+
     const wayland_sources = stageWaylandSources(b);
-    runtime.add(b, target, optimize, use_llvm, keywork_loop, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
+    const lua = luajit.add(b, target, optimize);
+    const runtime_output = runtime.add(b, target, optimize, use_llvm, keywork_loop, lua, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
     compositor.add(b, target, optimize, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
 
     const format_paths = &.{
@@ -37,6 +45,20 @@ pub fn build(b: *std.Build) void {
     const format_step = b.step("format", "Format code");
     const format = b.addFmt(.{ .paths = format_paths });
     format_step.dependOn(&format.step);
+
+    shell.add(
+        b,
+        target,
+        optimize,
+        use_llvm,
+        lua,
+        runtime_output.executable,
+        wayland_sources.protocols,
+        test_step,
+        lint_step,
+        fmt_step,
+        format_step,
+    );
 }
 
 const WaylandSources = struct {

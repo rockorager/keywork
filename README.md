@@ -17,7 +17,7 @@ erasing component ownership.
 | `src/shell/` | The Lua desktop shell and its native C helpers |
 | `protocols/` | Shared vendored Wayland protocol XML and its provenance metadata |
 | `build/` | Helpers used only by the root Zig build graph |
-| `scripts/` | Procedural repository automation that does not belong in Make or `build.zig` |
+| `scripts/` | Procedural repository automation that does not belong directly in `build.zig` |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and dependency rules.
 
@@ -35,9 +35,9 @@ platform without building or linking LuaJIT. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
 monorepo stop conditions.
 
-The shell's component Makefile remains responsible for its C modules and
-Wayland code generation. The root Makefile is the human-facing task facade and
-delegates shell work to `$(MAKE) -C src/shell`.
+The same Zig graph builds the shell's native C modules, generates its Wayland
+bindings, checks its Lua sources, and installs its application and service
+assets. There is no secondary task runner or component-local build graph.
 
 Zig 0.16 and the native development libraries used by both products are
 developer prerequisites. Shell linting and formatting additionally require
@@ -48,19 +48,20 @@ Common commands:
 
 | Command | Action |
 | --- | --- |
-| `make` | Build all Zig artifacts and validate/build shell native modules |
-| `make test` | Run all Zig tests and shell checks |
-| `make check` | Run all tests and static analysis |
-| `make lint` | Run shell static analysis |
-| `make fmt` | Format Zig, Lua, and Lua type sources |
-| `make install` | Install Zig artifacts, shell files, and its user service under `PREFIX` (default `~/.local`) |
-| `make install-zig` | Install only Zig artifacts under `PREFIX` |
-| `make install-shell` | Install only the shell and its user service under `PREFIX` |
+| `zig build` | Build and install all artifacts under `zig-out`, including the shell |
+| `zig build test` | Run all native tests, shell checks, and formatting checks |
+| `zig build check` | Run all tests and static analysis |
+| `zig build lint` | Run shell static analysis |
+| `zig build fmt` | Check Zig, Lua, and Lua type formatting |
+| `zig build format` | Format Zig, Lua, and Lua type sources |
+| `zig build run-shell` | Build, validate, and run the desktop shell |
+| `zig build -p ~/.local` | Install all artifacts and service assets under `~/.local` |
+| `sudo zig build install-pam` | Install the PAM service under `/etc/pam.d` |
 
-Direct Zig steps such as `zig build test`, `zig build run`,
-`zig build run-native-example`, `zig build run-compositor`, and
-`zig build renderer-check` are also available from the repository root. The
-native example opens a Wayland window without compiling or linking LuaJIT.
+Additional focused steps such as `zig build run`, `zig build
+run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
+are available from the repository root. The native example opens a Wayland
+window without compiling or linking LuaJIT.
 
 ## Migration status
 
@@ -85,6 +86,6 @@ Migration phases:
 - [x] Add a native Wayland application proving the no-LuaJIT path.
 - [x] Relocate native UI and Lua host source to top-level components.
 - [x] Elevate shared vendored Wayland XML to `protocols/` with provenance.
-- [x] Add the root Make task facade and verify build, test, and formatting parity.
+- [x] Make the root Zig graph the sole build, test, format, and install interface.
 - [x] Remove transitional component build and tool-runner configuration.
 - [x] Consolidate implementation components under one root `src/` tree.

@@ -69,10 +69,12 @@ local Level = kw.stateful({
             return
         end
         self.level = controller:visible()
-        self.scope:on_cancel(controller:subscribe(function(level)
-            self.level = level
-            self:set_state()
-        end))
+        self.scope:on_cancel(
+            controller:subscribe(function(level)
+                self.level = level
+                self:set_state()
+            end)
+        )
     end,
 
     build = function(self, context)

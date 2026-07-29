@@ -9,7 +9,7 @@
   },
   "workspace": {
     "library": [
-      "~/.local/share/keywork/emmylua",
+      "../lua/types",
       "./types"
     ],
     "workspaceRoots": [

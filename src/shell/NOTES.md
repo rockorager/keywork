@@ -93,7 +93,8 @@ Fix these in `../keywork`, then simplify here.
   a matching route from its actual volume/mute properties and observes that
   route as the source of truth, matching WirePlumber's mixer behavior.
 - **`require` needed a LUA_PATH bootstrap.** Both `bin/keywork-shell` and
-  `make run` exported `LUA_PATH` so `require("shell.*")` could resolve.
+  the former development run task exported `LUA_PATH` so
+  `require("shell.*")` could resolve.
   Fixed in keywork: the script's directory is prepended to `package.path`
   (`<dir>/?.lua;<dir>/?/init.lua`). The entry point moved to `lua/init.lua`
   so `lua/` is the module root, and the bootstrap is gone.

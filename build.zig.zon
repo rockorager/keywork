@@ -45,8 +45,8 @@
         "build.zig",
         "build.zig.zon",
         "build",
-        "loop",
-        "runtime",
-        "compositor",
+        "protocols",
+        "scripts",
+        "src",
     },
 }

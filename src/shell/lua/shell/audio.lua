@@ -294,21 +294,21 @@ local Audio = kw.stateful({
             placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
             width = 420,
             content = function()
-                        return audio_menu(
-                            palette, self.audio,
-                            function(device)
-                                self:select_device(device)
-                            end,
-                            function()
-                                self:open_settings()
-                            end
-                        )
+                return audio_menu(
+                    palette, self.audio,
+                    function(device)
+                        self:select_device(device)
                     end,
+                    function()
+                        self:open_settings()
+                    end
+                )
+            end,
             on_close = function()
-                        self:set_state(function(state)
-                            state.menu_open = false
-                        end)
-                    end,
+                self:set_state(function(state)
+                    state.menu_open = false
+                end)
+            end,
         })
     end,
 })
@@ -355,8 +355,8 @@ local Settings = kw.stateful({
                                     color = palette.foreground,
                                     size = theme.font_size[5],
                                 }),
-                                kw.expanded({ child =
-                                    kw.column({
+                                kw.expanded({
+                                    child = kw.column({
                                         spacing = palette.space[1],
                                         children = {
                                             kw.text("Audio settings", { role = "title", max_lines = 1 }),
@@ -365,17 +365,17 @@ local Settings = kw.stateful({
                                                 max_lines = 1,
                                             }),
                                         },
-                                    })
+                                    }),
                                 }),
                             },
                         }),
-                        kw.expanded({ child =
-                            kw.scroll_view({
+                        kw.expanded({
+                            child = kw.scroll_view({
                                 id = "audio-settings-routes",
                                 child = settings_menu(palette, audio, function(device)
                                     self:select_device(device)
                                 end),
-                            })
+                            }),
                         }),
                     },
                 }),
