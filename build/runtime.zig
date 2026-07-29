@@ -1,10 +1,12 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
-const luajit = @import("luajit.zig");
 const stb = @import("stb.zig");
+const ui = @import("ui.zig");
 
 pub const Output = struct {
-    executable: *std.Build.Step.Compile,
+    module: *std.Build.Module,
+    image_c: *std.Build.Module,
+    systemd_c: *std.Build.Module,
 };
 
 pub fn add(
@@ -13,7 +15,7 @@ pub fn add(
     optimize: std.builtin.OptimizeMode,
     use_llvm: ?bool,
     keywork_loop_module: *std.Build.Module,
-    lua: luajit.LuaJit,
+    ui_output: ui.Output,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -67,43 +69,6 @@ pub fn add(
         .registry = b.dependency("runtime_vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
 
-    const uucode_dep = b.dependency("uucode", .{
-        .target = target,
-        .optimize = optimize,
-        .build_config_path = b.path("src/ui/linebreak/uucode_config.zig"),
-    });
-    const uucode_module = uucode_dep.module("uucode");
-
-    const linebreak_module = b.addModule("linebreak", .{
-        .root_source_file = b.path("src/ui/linebreak/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    linebreak_module.addImport("uucode", uucode_module);
-
-    const z2d_dep = b.dependency("z2d", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const z2d_module = z2d_dep.module("z2d");
-
-    const keywork_ui_module = b.addModule("keywork-ui", .{
-        .root_source_file = b.path("src/ui/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    keywork_ui_module.addImport("uucode", uucode_module);
-    keywork_ui_module.addImport("linebreak", linebreak_module);
-    keywork_ui_module.addImport("z2d", z2d_module);
-
-    const keywork_ui_engine_module = b.addModule("keywork-ui-engine", .{
-        .root_source_file = b.path("src/ui/engine/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    keywork_ui_engine_module.addImport("keywork-ui", keywork_ui_module);
-    keywork_ui_engine_module.addImport("uucode", uucode_module);
-
     const xkb_c = b.addTranslateC(.{
         .root_source_file = b.path("src/runtime/ffi/xkb_c.h"),
         .target = target,
@@ -120,22 +85,6 @@ pub fn add(
     systemd_c.step.dependOn(&requirePkgConfigVersion(b, "libsystemd", "257").step);
     systemd_c.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
     const systemd_c_module = systemd_c.createModule();
-
-    const curl_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lua/ffi/curl_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    curl_c.step.dependOn(&requirePkgConfigVersion(b, "libcurl", "7.45.0").step);
-    curl_c.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
-    const curl_c_module = curl_c.createModule();
-
-    const pipewire_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lua/ffi/pipewire_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const pipewire_c_module = pipewire_c.createModule();
 
     const text_c = b.addTranslateC(.{
         .root_source_file = b.path("src/runtime/ffi/text_c.h"),
@@ -162,14 +111,14 @@ pub fn add(
         .link_libc = true,
     });
     keywork_runtime_module.addImport("keywork-loop", keywork_loop_module);
-    keywork_runtime_module.addImport("keywork-ui", keywork_ui_module);
-    keywork_runtime_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
+    keywork_runtime_module.addImport("keywork-ui", ui_output.module);
+    keywork_runtime_module.addImport("keywork-ui-engine", ui_output.engine_module);
     keywork_runtime_module.addImport("wayland", wayland_mod);
     keywork_runtime_module.addImport("image_c", image_c_module);
     keywork_runtime_module.linkLibrary(stb_lib.library);
     keywork_runtime_module.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
     keywork_runtime_module.addImport("vulkan", vulkan_mod);
-    keywork_runtime_module.addImport("uucode", uucode_module);
+    keywork_runtime_module.addImport("uucode", ui_output.uucode_module);
     keywork_runtime_module.addImport("xkb_c", xkb_c_module);
     keywork_runtime_module.addImport("systemd_c", systemd_c_module);
     keywork_runtime_module.addImport("text_c", text_c_module);
@@ -184,7 +133,7 @@ pub fn add(
     });
     native_example_module.addImport("keywork-loop", keywork_loop_module);
     native_example_module.addImport("keywork-runtime", keywork_runtime_module);
-    native_example_module.addImport("keywork-ui", keywork_ui_module);
+    native_example_module.addImport("keywork-ui", ui_output.module);
 
     const native_example = b.addExecutable(.{
         .name = "keywork-native-example",
@@ -198,63 +147,6 @@ pub fn add(
     const run_native_example_step = b.step("run-native-example", "Run the native Wayland example");
     run_native_example_step.dependOn(&run_native_example.step);
 
-    const keywork_lua_module = b.addModule("keywork-lua", .{
-        .root_source_file = b.path("src/lua/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    keywork_lua_module.addImport("keywork-runtime", keywork_runtime_module);
-    keywork_lua_module.addImport("keywork-loop", keywork_loop_module);
-    keywork_lua_module.addImport("keywork-ui", keywork_ui_module);
-    keywork_lua_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
-    keywork_lua_module.addImport("image_c", image_c_module);
-    keywork_lua_module.addImport("systemd_c", systemd_c_module);
-    keywork_lua_module.addImport("curl_c", curl_c_module);
-    keywork_lua_module.addImport("pipewire_c", pipewire_c_module);
-    keywork_lua_module.addCSourceFile(.{ .file = b.path("src/lua/ffi/pipewire_c.c") });
-    keywork_lua_module.linkSystemLibrary("libpipewire-0.3", .{ .use_pkg_config = .force });
-    keywork_lua_module.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
-
-    const luajit_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lua/ffi/luajit_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    luajit_c.addIncludePath(lua.include_dir);
-    luajit_c.addIncludePath(lua.generated_include_dir);
-    keywork_lua_module.addImport("luajit_c", luajit_c.createModule());
-    keywork_lua_module.linkLibrary(lua.library);
-
-    const app_module = b.createModule(.{
-        .root_source_file = b.path("src/lua/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    app_module.addImport("keywork-lua", keywork_lua_module);
-    app_module.addImport("keywork-runtime", keywork_runtime_module);
-    app_module.addImport("keywork-loop", keywork_loop_module);
-    app_module.addImport("keywork-ui", keywork_ui_module);
-    app_module.addImport("keywork-ui-engine", keywork_ui_engine_module);
-
-    const exe = b.addExecutable(.{
-        .name = "keywork",
-        .root_module = app_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    // Lua C modules resolve the statically linked LuaJIT API from the host
-    // executable when dlopen loads them.
-    exe.rdynamic = true;
-
-    b.installArtifact(exe);
-    b.installDirectory(.{
-        .source_dir = b.path("src/lua/types"),
-        .install_dir = .prefix,
-        .install_subdir = "share/keywork/emmylua",
-        .include_extensions = &.{".lua"},
-    });
     const fluent_icons = addFluentIcons(b);
     b.installDirectory(.{
         .source_dir = fluent_icons,
@@ -262,49 +154,18 @@ pub fn add(
         .install_subdir = "share/icons/Keywork",
     });
 
-    const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const run_step = b.step("run", "Run a Lua application (pass -- <script.lua>)");
-    run_step.dependOn(&run_cmd.step);
-
-    // Window options come from the script's keywork.window declaration.
-    addExampleRunStep(b, exe, "run-lua-layershell-example", "Run the Lua layer-shell example", "src/lua/examples/layershell.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-layershell-example", "Run the Lua Vulkan layer-shell example", "src/lua/examples/layershell.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-bar-example", "Run the Lua desktop bar example", "src/lua/examples/bar.lua", &.{});
-    addExampleRunStep(b, exe, "run-lua-vulkan-bar-example", "Run the Lua Vulkan desktop bar example", "src/lua/examples/bar.lua", &.{"--backend=vulkan"});
-    addExampleRunStep(b, exe, "run-lua-shell-example", "Run the Lua desktop shell example", "src/lua/examples/shell.lua", &.{});
-
-    const app_tests = b.addTest(.{
-        .root_module = app_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    app_tests.rdynamic = true;
-    test_step.dependOn(&b.addRunArtifact(app_tests).step);
-    const keywork_lua_tests = b.addTest(.{
-        .root_module = keywork_lua_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    keywork_lua_tests.rdynamic = true;
-    test_step.dependOn(&b.addRunArtifact(keywork_lua_tests).step);
     const keywork_runtime_tests = b.addTest(.{
         .root_module = keywork_runtime_module,
         .use_llvm = use_llvm,
         .use_lld = use_llvm,
     });
     test_step.dependOn(&b.addRunArtifact(keywork_runtime_tests).step);
-    const keywork_ui_tests = b.addTest(.{ .root_module = keywork_ui_module });
-    test_step.dependOn(&b.addRunArtifact(keywork_ui_tests).step);
-    const keywork_ui_engine_tests = b.addTest(.{ .root_module = keywork_ui_engine_module });
-    test_step.dependOn(&b.addRunArtifact(keywork_ui_engine_tests).step);
-    const linebreak_tests = b.addTest(.{ .root_module = linebreak_module });
-    test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
 
-    return .{ .executable = exe };
+    return .{
+        .module = keywork_runtime_module,
+        .image_c = image_c_module,
+        .systemd_c = systemd_c_module,
+    };
 }
 
 fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {
@@ -337,14 +198,4 @@ fn addFluentIcons(b: *std.Build) std.Build.LazyPath {
     const icons_step = b.step("icons", "Generate the bundled Fluent icon theme");
     icons_step.dependOn(&generate.step);
     return output;
-}
-
-fn addExampleRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, description: []const u8, script: []const u8, fixed_args: []const []const u8) void {
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.addPrefixedFileArg("--script=", b.path(script));
-    run_cmd.addArgs(fixed_args);
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step(name, description);
-    run_step.dependOn(&run_cmd.step);
 }

@@ -1,8 +1,10 @@
 const std = @import("std");
-const runtime = @import("build/runtime.zig");
 const compositor = @import("build/compositor.zig");
+const lua_host = @import("build/lua.zig");
 const luajit = @import("build/luajit.zig");
+const runtime = @import("build/runtime.zig");
 const shell = @import("build/shell.zig");
+const ui = @import("build/ui.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -27,8 +29,30 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(lint_step);
 
     const wayland_sources = stageWaylandSources(b);
-    const lua = luajit.add(b, target, optimize);
-    const runtime_output = runtime.add(b, target, optimize, use_llvm, keywork_loop, lua, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
+    const ui_output = ui.add(b, target, optimize, test_step);
+    const runtime_output = runtime.add(
+        b,
+        target,
+        optimize,
+        use_llvm,
+        keywork_loop,
+        ui_output,
+        wayland_sources.wayland_xml,
+        wayland_sources.protocols,
+        test_step,
+    );
+    const lua_jit = luajit.add(b, target, optimize);
+    const lua_output = lua_host.add(
+        b,
+        target,
+        optimize,
+        use_llvm,
+        keywork_loop,
+        ui_output,
+        runtime_output,
+        lua_jit,
+        test_step,
+    );
     compositor.add(b, target, optimize, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
 
     const format_paths = &.{
@@ -51,8 +75,8 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         use_llvm,
-        lua,
-        runtime_output.executable,
+        lua_jit,
+        lua_output.executable,
         wayland_sources.protocols,
         test_step,
         lint_step,
