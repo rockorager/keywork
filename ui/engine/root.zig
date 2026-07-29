@@ -20,10 +20,10 @@ const RenderNode = keywork.RenderNode;
 const Size = keywork.Size;
 
 const animation = keywork.animation;
-const backend_behavior = @import("runtime/backend_behavior.zig");
-const focus_scroll = @import("runtime/focus_scroll.zig");
-const input_behavior = @import("runtime/input.zig");
-const lifecycle_reconciliation = @import("runtime/lifecycle_reconciliation.zig");
+const backend_behavior = @import("backend_behavior.zig");
+const focus_scroll = @import("focus_scroll.zig");
+const input_behavior = @import("input.zig");
+const lifecycle_reconciliation = @import("lifecycle_reconciliation.zig");
 
 pub const UiColorScheme = enum {
     no_preference,
@@ -2263,8 +2263,8 @@ test "modal focus scope traps autofocus traversal and focus requests" {
 }
 
 test {
-    _ = @import("runtime/backend_behavior.zig");
-    _ = @import("runtime/focus_scroll.zig");
-    _ = @import("runtime/input.zig");
-    _ = @import("runtime/lifecycle_reconciliation.zig");
+    _ = @import("backend_behavior.zig");
+    _ = @import("focus_scroll.zig");
+    _ = @import("input.zig");
+    _ = @import("lifecycle_reconciliation.zig");
 }

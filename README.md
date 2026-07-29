@@ -10,7 +10,8 @@ erasing component ownership.
 | Path | Owner |
 | --- | --- |
 | `loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
-| `runtime/` | The Zig/Lua application runtime currently developed as `keywork` |
+| `ui/` | The platform-neutral retained UI model and engine |
+| `runtime/` | The native Wayland application runtime and transitional Lua host |
 | `compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
 | `shell/` | The Lua desktop shell and its native C helpers |
 | `protocols/` | Shared vendored Wayland protocol XML and its provenance metadata |
@@ -28,9 +29,9 @@ cache. Current named source modules include `keywork-loop`, `keywork-ui`,
 dependencies between modules are explicit named imports wired by the root
 build.
 
-The current physical layout is transitional. The target separates native UI,
-native application runtime, and the Lua host so Zig applications can use the
-full Wayland platform without building or linking LuaJIT. See
+The current physical layout remains transitional while the Lua host is nested
+under `runtime/`. Native UI and runtime modules already allow Zig applications
+to use the full Wayland platform without building or linking LuaJIT. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
 monorepo stop conditions.
 

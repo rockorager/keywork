@@ -65,12 +65,12 @@ pub fn add(
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .build_config_path = b.path("runtime/lib/linebreak/uucode_config.zig"),
+        .build_config_path = b.path("ui/lib/linebreak/uucode_config.zig"),
     });
     const uucode_module = uucode_dep.module("uucode");
 
     const linebreak_module = b.addModule("linebreak", .{
-        .root_source_file = b.path("runtime/lib/linebreak/root.zig"),
+        .root_source_file = b.path("ui/lib/linebreak/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -83,7 +83,7 @@ pub fn add(
     const z2d_module = z2d_dep.module("z2d");
 
     const keywork_ui_module = b.addModule("keywork-ui", .{
-        .root_source_file = b.path("runtime/src/ui.zig"),
+        .root_source_file = b.path("ui/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -92,7 +92,7 @@ pub fn add(
     keywork_ui_module.addImport("z2d", z2d_module);
 
     const keywork_ui_engine_module = b.addModule("keywork-ui-engine", .{
-        .root_source_file = b.path("runtime/src/ui/runtime.zig"),
+        .root_source_file = b.path("ui/engine/root.zig"),
         .target = target,
         .optimize = optimize,
     });

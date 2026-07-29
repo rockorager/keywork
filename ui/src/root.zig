@@ -1,10 +1,10 @@
 //! Native retained UI engine facade.
 
-const model = @import("ui/model.zig");
-const types = @import("ui/types.zig");
-const display = @import("ui/display.zig");
+const model = @import("model.zig");
+const types = @import("types.zig");
+const display = @import("display.zig");
 
-pub const animation = @import("ui/animation.zig");
+pub const animation = @import("animation.zig");
 pub const Color = types.Color;
 pub const ShadowLayer = types.ShadowLayer;
 pub const BoxShadow = types.BoxShadow;
@@ -92,12 +92,12 @@ pub const findFocusedShortcutAction = model.findFocusedShortcutAction;
 pub const collectDamage = model.collectDamage;
 
 test {
-    _ = @import("ui/animation.zig");
-    _ = @import("ui/display.zig");
-    _ = @import("ui/hit_testing.zig");
-    _ = @import("ui/layout.zig");
-    _ = @import("ui/model.zig");
-    _ = @import("ui/paint.zig");
-    _ = @import("ui/shortcuts.zig");
-    _ = @import("ui/types.zig");
+    _ = @import("animation.zig");
+    _ = @import("display.zig");
+    _ = @import("hit_testing.zig");
+    _ = @import("layout.zig");
+    _ = @import("model.zig");
+    _ = @import("paint.zig");
+    _ = @import("shortcuts.zig");
+    _ = @import("types.zig");
 }

@@ -1,8 +1,7 @@
 # AGENTS.md
 
 The root guidance applies here. Read `VISION.md` for Keywork's product model
-and design priorities. Read `DESIGN.md` before changing the built-in visual
-system.
+and design priorities.
 
 ## Runtime ownership
 
@@ -13,17 +12,15 @@ system.
   changes.
 - Fix runtime pain discovered by the shell here rather than adding a shell
   workaround. Record unresolved consumer pain in `../shell/NOTES.md`.
-- Keep native widget defaults synchronized with the built-in profile as
-  described in `DESIGN.md`.
-- Keep tests inline and ensure `keywork-ui`, `keywork-ui-engine`,
-  `keywork-runtime`, and the Lua executable rooted at `src/main.zig` remain
-  registered as separate roots in the root build's `test` step.
-- Code outside `keywork-ui` and `keywork-ui-engine` must import those modules
-  by name. Do not reach into their source trees from application, backend,
-  graphics, or Lua code.
-- The current UI and Lua nesting is transitional. Keep `app/`, `backend/`,
+- Keep tests inline and ensure `keywork-runtime` and the Lua executable rooted
+  at `src/main.zig` remain registered as separate roots in the repository test
+  graph.
+- Consume `keywork-ui` and `keywork-ui-engine` by name; never reach into
+  `../ui/` with relative source imports.
+- The current Lua nesting is transitional. Keep `app/`, `backend/`,
   `graphics/`, and `linux/` free of Lua imports. Lua consumes their public
-  declarations through `keywork-runtime`, never through relative source paths.
+  declarations through `keywork-runtime`, never through relative source
+  paths.
 - New native runtime APIs must not require Lua state or LuaJIT types. Put
   language-specific adaptation in `lua/` and express native host interaction
   through typed contracts.

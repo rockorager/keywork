@@ -2,14 +2,15 @@
 
 Read `ARCHITECTURE.md` before changing component boundaries or dependencies.
 Read `runtime/VISION.md` before changing Keywork's product model or design
-priorities. More specific `AGENTS.md` files add component-local rules.
+priorities. Read `DESIGN.md` before changing the built-in visual system. More
+specific `AGENTS.md` files add component-local rules.
 
 ## Monorepo boundaries
 
-- Keep loop, runtime, compositor, shell, and shared protocol ownership aligned
-  with `ARCHITECTURE.md`.
+- Keep loop, UI, runtime, Lua, compositor, shell, and shared protocol
+  ownership aligned with `ARCHITECTURE.md`.
 - Treat the target dependency graph in `ARCHITECTURE.md` as authoritative even
-  while UI and Lua source remain under transitional paths in `runtime/`.
+  while Lua source remains under transitional paths in `runtime/`.
 - Native UI and runtime modules must compile without LuaJIT. Lua may consume
   their public contracts; they must never import Lua source.
 - Relative Zig imports are allowed within one cohesive module. Cross-module

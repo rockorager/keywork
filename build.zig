@@ -28,8 +28,8 @@ pub fn build(b: *std.Build) void {
         "build.zig.zon",
         "build",
         "loop/src",
+        "ui",
         "runtime/src",
-        "runtime/lib",
         "runtime/examples",
         "compositor/src",
     };
