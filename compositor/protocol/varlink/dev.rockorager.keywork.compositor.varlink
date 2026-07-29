@@ -1,0 +1,268 @@
+# Control the Keywork compositor's built-in window-management policy.
+interface dev.rockorager.keywork.compositor
+
+# A direction relative to the currently focused window.
+type Direction (next, previous, left, down, up, right)
+
+# A window selected for an operation.
+type WindowTarget (focused)
+
+# A built-in workspace layout.
+type Layout (tiled)
+
+# Logging verbosity selected for the compositor.
+type LogLevel (error, warning, info, debug)
+
+# An RGBA color with channels in the inclusive range 0 through 255.
+type Color (
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int
+)
+
+# A window border. A width of zero disables the border.
+type Border (
+    width: int,
+    color: Color
+)
+
+# A rectangle in global logical compositor coordinates.
+type Rectangle (
+    x: int,
+    y: int,
+    width: int,
+    height: int
+)
+
+# The protocol through which a window is managed.
+type WindowProtocol (xdg_shell, xwayland)
+
+# A snapshot of a managed window. The opaque ID is unique for the compositor's lifetime.
+# The rectangle is absent when the window has no published geometry.
+type Window (
+    id: string,
+    protocol: WindowProtocol,
+    title: ?string,
+    appId: ?string,
+    pid: ?int,
+    rect: ?Rectangle,
+    output: string,
+    workspace: int,
+    focused: bool,
+    visible: bool,
+    floating: bool,
+    fullscreen: bool,
+    maximized: bool,
+    minimized: bool
+)
+
+# Rolling latency distribution in microseconds.
+type LatencyStatistics (
+    samples: int,
+    p50Microseconds: int,
+    p95Microseconds: int,
+    p99Microseconds: int,
+    maximumMicroseconds: int
+)
+
+# Reasons composited frames could not use direct scanout.
+type DirectScanoutRejections (
+    noFullscreenSurface: int,
+    nonOpaqueSurface: int,
+    surfaceTransform: int,
+    nonDmabuf: int,
+    yInverted: int,
+    missingBufferIdentity: int,
+    colorConversion: int,
+    unsupportedBackend: int,
+    outputUnavailable: int,
+    outputBusy: int,
+    deviceInactive: int,
+    unsupportedFormatOrModifier: int,
+    unsupportedLayout: int,
+    framebufferImportFailed: int,
+    pageFlipFailed: int
+)
+
+# Reasons composited images could not be promoted to an overlay plane.
+type OverlayScanoutRejections (
+    noTopmostSurface: int,
+    nonOpaqueSurface: int,
+    clippedSurface: int,
+    transformedSurface: int,
+    scaledSurface: int,
+    outsideOutput: int,
+    nonDmabuf: int,
+    nonRgbSurface: int,
+    yInverted: int,
+    missingBufferIdentity: int,
+    colorConversion: int,
+    unsupportedBackend: int,
+    outputUnavailable: int,
+    outputBusy: int,
+    deviceInactive: int,
+    noOverlayPlane: int,
+    unsupportedFormatOrModifier: int,
+    unsupportedLayout: int,
+    synchronizationFailed: int,
+    framebufferImportFailed: int,
+    atomicTestFailed: int,
+    pageFlipFailed: int
+)
+
+# The path used for the most recently committed frame.
+type FramePath (none, composited, direct_scanout, overlay_scanout)
+
+# A renderer working or output scanout buffer format.
+type BufferFormat (none, argb8888, xrgb8888, abgr8888, xbgr8888, xrgb2101010, rgba16f_linear)
+
+# The output-space transform applied during presentation.
+type OutputTransform (normal)
+
+# Diagnostic state for the most recently committed frame.
+type FrameDiagnostics (
+    path: FramePath,
+    workingFormat: BufferFormat,
+    scanoutFormat: BufferFormat,
+    outputTransform: OutputTransform,
+    damageRectangles: int,
+    damagedPixels: int
+)
+
+# Per-output frame processing and presentation statistics.
+type OutputStatistics (
+    name: string,
+    width: int,
+    height: int,
+    refreshMillihertz: int,
+    lastFrame: FrameDiagnostics,
+    framesRequested: int,
+    framesStarted: int,
+    framesPresented: int,
+    framesDiscarded: int,
+    acquireRetries: int,
+    compositedFrames: int,
+    directScanoutCandidates: int,
+    directScanoutFrames: int,
+    directScanoutRejections: DirectScanoutRejections,
+    overlayScanoutCandidates: int,
+    overlayScanoutFrames: int,
+    overlayScanoutRejections: OverlayScanoutRejections,
+    cpuUploads: int,
+    dmabufImports: int,
+    # Frames whose production time, from render start until ready for
+    # scanout (the later of DRM commit and GPU completion), exceeded one
+    # refresh period plus tolerance. Display queueing after the frame is
+    # ready does not count against the budget.
+    framesOverBudget: int,
+    # Repaints deferred toward a predicted vblank versus started immediately.
+    repaintsDelayed: int,
+    repaintsImmediate: int,
+    # Repaint-delay budget invalidations: presented frames that missed their
+    # deadline, and frames without trustworthy GPU completion timing.
+    renderBudgetResetsMissedDeadline: int,
+    renderBudgetResetsNoTiming: int,
+    # Current warmed worst-case render cost driving repaint delays, or 0 while
+    # the sample window is not full and delays are disabled.
+    renderBudgetMicroseconds: int,
+    gpuExecution: LatencyStatistics,
+    gpuComposition: LatencyStatistics,
+    gpuPreparation: LatencyStatistics,
+    gpuSolidComposition: LatencyStatistics,
+    gpuImageComposition: LatencyStatistics,
+    gpuShadow: LatencyStatistics,
+    gpuBlurDownsample: LatencyStatistics,
+    gpuBlurUpsample: LatencyStatistics,
+    gpuBlurComposite: LatencyStatistics,
+    gpuCompositionOverhead: LatencyStatistics,
+    gpuOutputEncode: LatencyStatistics,
+    gpuFrameFinish: LatencyStatistics,
+    requestToPresentation: LatencyStatistics,
+    requestToRender: LatencyStatistics,
+    renderToCommit: LatencyStatistics,
+    commitToPresentation: LatencyStatistics,
+    renderFenceSamples: int,
+    renderFencesSignaledBeforeCommit: int,
+    renderToGpuCompletion: LatencyStatistics,
+    gpuCompletionToPresentation: LatencyStatistics
+)
+
+# Instantaneous compositor-owned resource state. Mapped buffer capacity is the
+# usable capacity of retained renderer staging and instance buffers; it excludes
+# Vulkan image allocations, client-owned buffers, and process memory.
+type ResourceStatistics (
+    rendererTargets: int,
+    pixelRendererTargets: int,
+    offscreenRendererTargets: int,
+    dmabufRendererTargets: int,
+    cachedTextures: int,
+    importedTextures: int,
+    pendingTextures: int,
+    pendingGpuSubmissions: int,
+    calibrationTextures: int,
+    videoGraphicsPipelines: int,
+    blurScratchImages: int,
+    backdropCacheImages: int,
+    mappedBufferCapacityBytes: int,
+    linuxDmabufBuffers: int,
+    screencopyFrames: int,
+    imageCopyCaptureSessions: int,
+    imageCopyCaptureFrames: int,
+    captureBuffers: int,
+    # Cumulative GPU submission-ring telemetry since start or the last
+    # statistics reset: frames prepared while the previous frame was still
+    # executing on the GPU, and frames that blocked on an exhausted ring.
+    gpuSubmissionOverlapFrames: int,
+    gpuSubmissionSlotWaits: int,
+    gpuSubmissionSlotWaitMicroseconds: int
+)
+
+# Change focus within the active workspace.
+method Focus (direction: Direction) -> ()
+
+# Reorder the focused window within the active workspace.
+method MoveFocused (direction: Direction) -> ()
+
+# Ask a window to close.
+method Close (target: WindowTarget) -> ()
+
+# Toggle whether a window fills its output.
+method ToggleFullscreen (target: WindowTarget) -> ()
+
+# Toggle whether a window participates in the tiling layout.
+method ToggleFloating (target: WindowTarget) -> ()
+
+# Change the active workspace's layout.
+method SetLayout (layout: Layout) -> ()
+
+# Activate a numbered workspace on the output under the pointer.
+method SwitchWorkspace (workspace: int) -> ()
+
+# Move the focused window to a numbered workspace on the focused output.
+method MoveFocusedToWorkspace (workspace: int) -> ()
+
+# Return a snapshot of mapped windows and their published logical geometry.
+method GetWindows () -> (windows: []Window)
+
+# Return per-output performance counters and instantaneous resource state, then
+# optionally reset only the performance counters.
+method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics, resources: ?ResourceStatistics)
+
+# Change the border rendered around unfocused windows and window-like layer surfaces.
+method SetUnfocusedBorder (border: Border) -> ()
+
+# Change the maximum log level without restarting the compositor.
+method SetLogLevel (level: LogLevel) -> ()
+
+# Parse and atomically apply the selected configuration.
+method ReloadConfiguration () -> ()
+
+# Shut down the Keywork graphical session.
+method Quit () -> ()
+
+# The requested workspace number is outside Keywork's supported range.
+error InvalidWorkspace (workspace: int)
+
+# The selected configuration could not be read or validated.
+error ConfigurationReloadFailed (message: string)

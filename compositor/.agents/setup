@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo apt-get update
+sudo apt-get install -y \
+  bison \
+  curl \
+  glslc \
+  hwdata \
+  libevdev-dev \
+  libexpat1-dev \
+  libffi-dev \
+  libdrm-dev \
+  libgbm-dev \
+  libinput-dev \
+  liblcms2-dev \
+  libmtdev-dev \
+  libpixman-1-dev \
+  libseat-dev \
+  libsystemd-dev \
+  libudev-dev \
+  libvulkan-dev \
+  libwayland-dev \
+  libxcb-composite0-dev \
+  libxcb-icccm4-dev \
+  libxcb-res0-dev \
+  libxcb-xfixes0-dev \
+  libxcb1-dev \
+  libxcursor-dev \
+  libxkbcommon-dev \
+  libxml2-dev \
+  meson \
+  ninja-build \
+  pkg-config \
+  wayland-protocols \
+  xkb-data \
+  xz-utils
+
+if ! pkg-config --atleast-version=2.4.134 libdrm; then
+  libdrm_version=2.4.134
+  libdrm_archive="libdrm-${libdrm_version}.tar.xz"
+  libdrm_url="https://dri.freedesktop.org/libdrm/${libdrm_archive}"
+  libdrm_sha256=ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${libdrm_archive}" "${libdrm_url}"
+  echo "${libdrm_sha256}  ${temporary_directory}/${libdrm_archive}" | sha256sum --check
+  tar -xJf "${temporary_directory}/${libdrm_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/libdrm-${libdrm_version}/build" \
+    "${temporary_directory}/libdrm-${libdrm_version}" \
+    --buildtype=release \
+    --prefix=/usr \
+    -Dcairo-tests=disabled \
+    -Dman-pages=disabled \
+    -Dtests=false \
+    -Dvalgrind=disabled
+  ninja -C "${temporary_directory}/libdrm-${libdrm_version}/build"
+  sudo ninja -C "${temporary_directory}/libdrm-${libdrm_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --atleast-version=1.31.3 libinput; then
+  libinput_version=1.31.3
+  libinput_archive="libinput-${libinput_version}.tar.gz"
+  libinput_url="https://gitlab.freedesktop.org/libinput/libinput/-/archive/${libinput_version}/${libinput_archive}"
+  libinput_sha256=b6749bf6f1890f6631c0a70a027c35fec9d2e096a39f720548896e41474a9854
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${libinput_archive}" "${libinput_url}"
+  echo "${libinput_sha256}  ${temporary_directory}/${libinput_archive}" | sha256sum --check
+  tar -xzf "${temporary_directory}/${libinput_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/libinput-${libinput_version}/build" \
+    "${temporary_directory}/libinput-${libinput_version}" \
+    --buildtype=release \
+    --prefix=/usr \
+    -Ddebug-gui=false \
+    -Ddocumentation=false \
+    -Dlibwacom=false \
+    -Dlua-plugins=disabled \
+    -Dtests=false
+  ninja -C "${temporary_directory}/libinput-${libinput_version}/build"
+  sudo ninja -C "${temporary_directory}/libinput-${libinput_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --atleast-version=1.11.0 xkbcommon; then
+  xkbcommon_version=1.11.0
+  xkbcommon_archive="libxkbcommon-${xkbcommon_version}.tar.gz"
+  xkbcommon_url="https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-${xkbcommon_version}.tar.gz"
+  xkbcommon_sha256=78a6b14f16e9a55025978c252e53ce9e16a02bfdb929550b9a0db5af87db7e02
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${xkbcommon_archive}" "${xkbcommon_url}"
+  echo "${xkbcommon_sha256}  ${temporary_directory}/${xkbcommon_archive}" | sha256sum --check
+  tar -xzf "${temporary_directory}/${xkbcommon_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/libxkbcommon-xkbcommon-${xkbcommon_version}/build" \
+    "${temporary_directory}/libxkbcommon-xkbcommon-${xkbcommon_version}" \
+    --buildtype=release \
+    --prefix=/usr \
+    -Denable-bash-completion=false \
+    -Denable-docs=false \
+    -Denable-tools=false \
+    -Denable-wayland=false \
+    -Denable-x11=false \
+    -Denable-xkbregistry=false
+  ninja -C "${temporary_directory}/libxkbcommon-xkbcommon-${xkbcommon_version}/build"
+  sudo ninja -C "${temporary_directory}/libxkbcommon-xkbcommon-${xkbcommon_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --atleast-version=2.19 lcms2; then
+  lcms2_version=2.19
+  lcms2_archive="lcms2-${lcms2_version}.tar.gz"
+  lcms2_url="https://github.com/mm2/Little-CMS/releases/download/lcms${lcms2_version}/${lcms2_archive}"
+  lcms2_sha256=49e7e134e4299733dd0eda434fa468997a28ab3d33fa397c642b03644f552216
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${lcms2_archive}" "${lcms2_url}"
+  echo "${lcms2_sha256}  ${temporary_directory}/${lcms2_archive}" | sha256sum --check
+  tar -xzf "${temporary_directory}/${lcms2_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/lcms2-${lcms2_version}/build" \
+    "${temporary_directory}/lcms2-${lcms2_version}" \
+    --buildtype=release \
+    --prefix=/usr \
+    -Djpeg=disabled \
+    -Dtests=disabled \
+    -Dtiff=disabled \
+    -Dutils=false
+  ninja -C "${temporary_directory}/lcms2-${lcms2_version}/build"
+  sudo ninja -C "${temporary_directory}/lcms2-${lcms2_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --atleast-version=1.26 wayland-server; then
+  wayland_version=1.26.0
+  wayland_archive="wayland-${wayland_version}.tar.xz"
+  wayland_url="https://gitlab.freedesktop.org/wayland/wayland/-/releases/${wayland_version}/downloads/${wayland_archive}"
+  wayland_sha256=64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${wayland_archive}" "${wayland_url}"
+  echo "${wayland_sha256}  ${temporary_directory}/${wayland_archive}" | sha256sum --check
+  tar -xJf "${temporary_directory}/${wayland_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/wayland-${wayland_version}/build" \
+    "${temporary_directory}/wayland-${wayland_version}" \
+    --buildtype=release \
+    --prefix=/usr/local \
+    -Ddocumentation=false \
+    -Dtests=false
+  ninja -C "${temporary_directory}/wayland-${wayland_version}/build"
+  sudo ninja -C "${temporary_directory}/wayland-${wayland_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --atleast-version=1.49 wayland-protocols; then
+  wayland_protocols_version=1.49
+  wayland_protocols_archive="wayland-protocols-${wayland_protocols_version}.tar.xz"
+  wayland_protocols_url="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/${wayland_protocols_version}/downloads/${wayland_protocols_archive}"
+  wayland_protocols_sha256=ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${wayland_protocols_archive}" "${wayland_protocols_url}"
+  echo "${wayland_protocols_sha256}  ${temporary_directory}/${wayland_protocols_archive}" | sha256sum --check
+  tar -xJf "${temporary_directory}/${wayland_protocols_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/wayland-protocols-${wayland_protocols_version}/build" \
+    "${temporary_directory}/wayland-protocols-${wayland_protocols_version}" \
+    --prefix=/usr/local \
+    --wrap-mode=nofallback \
+    -Dtests=false
+  sudo meson install -C "${temporary_directory}/wayland-protocols-${wayland_protocols_version}/build"
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+if ! pkg-config --exists libdisplay-info; then
+  display_info_version=0.3.0
+  display_info_archive="libdisplay-info-${display_info_version}.tar.xz"
+  display_info_url="https://gitlab.freedesktop.org/emersion/libdisplay-info/-/releases/${display_info_version}/downloads/${display_info_archive}"
+  display_info_sha256=6ae77cd937f9cf7d1321d35c116062c4911e8447010a6a713ac4286f7a9d5987
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${display_info_archive}" "${display_info_url}"
+  echo "${display_info_sha256}  ${temporary_directory}/${display_info_archive}" | sha256sum --check
+  tar -xJf "${temporary_directory}/${display_info_archive}" -C "${temporary_directory}"
+  meson setup \
+    "${temporary_directory}/libdisplay-info-${display_info_version}/build" \
+    "${temporary_directory}/libdisplay-info-${display_info_version}" \
+    --buildtype=release \
+    --prefix=/usr/local
+  ninja -C "${temporary_directory}/libdisplay-info-${display_info_version}/build"
+  sudo ninja -C "${temporary_directory}/libdisplay-info-${display_info_version}/build" install
+  sudo ldconfig
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi
+
+zig_version=0.16.0
+zig_archive="zig-x86_64-linux-${zig_version}.tar.xz"
+zig_url="https://ziglang.org/download/${zig_version}/${zig_archive}"
+zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+zig_root="${HOME}/.local/opt/zig-${zig_version}"
+
+if [[ ! -x "${zig_root}/zig" ]]; then
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${zig_archive}" "${zig_url}"
+  echo "${zig_sha256}  ${temporary_directory}/${zig_archive}" | sha256sum --check
+  mkdir -p "${HOME}/.local/opt"
+  tar -xJf "${temporary_directory}/${zig_archive}" -C "${temporary_directory}"
+  mv "${temporary_directory}/zig-x86_64-linux-${zig_version}" "${zig_root}"
+fi
+
+mkdir -p "${HOME}/.local/bin"
+ln -sfn "${zig_root}/zig" "${HOME}/.local/bin/zig"
+
+zigdoc_version=0.5.1
+zigdoc_platform=linux-x64
+zigdoc_archive="zigdoc-v${zigdoc_version}-${zigdoc_platform}.tar.gz"
+zigdoc_url="https://github.com/rockorager/zigdoc/releases/download/v${zigdoc_version}/${zigdoc_archive}"
+zigdoc_sha256=5bf35ad1dbd60ee0eaa6edb83b8ef950796b3348879b1f1df3d0719ffc9d0df2
+
+if [[ ! -x "${HOME}/.local/bin/zigdoc" ]]; then
+  temporary_directory="$(mktemp -d)"
+  trap 'rm -rf "${temporary_directory}"' EXIT
+  curl --fail --location --output "${temporary_directory}/${zigdoc_archive}" "${zigdoc_url}"
+  echo "${zigdoc_sha256}  ${temporary_directory}/${zigdoc_archive}" | sha256sum --check
+  tar -xzf "${temporary_directory}/${zigdoc_archive}" -C "${temporary_directory}"
+  install -m 0755 \
+    "${temporary_directory}/zigdoc-v${zigdoc_version}-${zigdoc_platform}/zigdoc" \
+    "${HOME}/.local/bin/zigdoc"
+  rm -rf "${temporary_directory}"
+  trap - EXIT
+fi

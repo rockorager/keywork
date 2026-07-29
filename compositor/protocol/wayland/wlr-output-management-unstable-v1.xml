@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wlr_output_management_unstable_v1">
+  <copyright>
+    Copyright © 2019 Purism SPC
+
+    Permission to use, copy, modify, distribute, and sell this
+    software and its documentation for any purpose is hereby granted
+    without fee, provided that the above copyright notice appear in
+    all copies and that both that copyright notice and this permission
+    notice appear in supporting documentation, and that the name of
+    the copyright holders not be used in advertising or publicity
+    pertaining to distribution of the software without specific,
+    written prior permission. The copyright holders make no
+    representations about the suitability of this software for any
+    purpose. It is provided "as is" without express or implied
+    warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+  </copyright>
+
+  <description summary="protocol to configure output devices">
+    This protocol exposes interfaces to obtain and modify output device
+    configuration.
+  </description>
+
+  <interface name="zwlr_output_manager_v1" version="4">
+    <description summary="output device configuration manager">
+      Output devices are represented as heads. Heads remain advertised while
+      disabled and may expose one or more modes. The done event makes changes
+      atomic and supplies the serial used to create a configuration.
+    </description>
+    <event name="head">
+      <arg name="head" type="new_id" interface="zwlr_output_head_v1"/>
+    </event>
+    <event name="done">
+      <arg name="serial" type="uint"/>
+    </event>
+    <request name="create_configuration">
+      <arg name="id" type="new_id" interface="zwlr_output_configuration_v1"/>
+      <arg name="serial" type="uint"/>
+    </request>
+    <request name="stop"/>
+    <event name="finished" type="destructor"/>
+  </interface>
+
+  <interface name="zwlr_output_head_v1" version="4">
+    <description summary="output device">
+      A head is a connected output device and remains advertised while it is
+      disabled. Its mutable properties are changed through a complete output
+      configuration.
+    </description>
+    <event name="name">
+      <arg name="name" type="string"/>
+    </event>
+    <event name="description">
+      <arg name="description" type="string"/>
+    </event>
+    <event name="physical_size">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+    <event name="mode">
+      <arg name="mode" type="new_id" interface="zwlr_output_mode_v1"/>
+    </event>
+    <event name="enabled">
+      <arg name="enabled" type="int"/>
+    </event>
+    <event name="current_mode">
+      <arg name="mode" type="object" interface="zwlr_output_mode_v1"/>
+    </event>
+    <event name="position">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </event>
+    <event name="transform">
+      <arg name="transform" type="int" enum="wl_output.transform"/>
+    </event>
+    <event name="scale">
+      <arg name="scale" type="fixed"/>
+    </event>
+    <event name="finished"/>
+    <event name="make" since="2">
+      <arg name="make" type="string"/>
+    </event>
+    <event name="model" since="2">
+      <arg name="model" type="string"/>
+    </event>
+    <event name="serial_number" since="2">
+      <arg name="serial_number" type="string"/>
+    </event>
+    <request name="release" type="destructor" since="3"/>
+    <enum name="adaptive_sync_state" since="4">
+      <entry name="disabled" value="0"/>
+      <entry name="enabled" value="1"/>
+    </enum>
+    <event name="adaptive_sync" since="4">
+      <arg name="state" type="uint" enum="adaptive_sync_state"/>
+    </event>
+  </interface>
+
+  <interface name="zwlr_output_mode_v1" version="3">
+    <description summary="output mode">
+      A mode describes one size and refresh rate supported by a head.
+    </description>
+    <event name="size">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+    <event name="refresh">
+      <arg name="refresh" type="int"/>
+    </event>
+    <event name="preferred"/>
+    <event name="finished"/>
+    <request name="release" type="destructor" since="3"/>
+  </interface>
+
+  <interface name="zwlr_output_configuration_v1" version="4">
+    <description summary="complete output configuration">
+      Every advertised head must be enabled or disabled exactly once before
+      the configuration is tested or applied.
+    </description>
+    <enum name="error">
+      <entry name="already_configured_head" value="1"/>
+      <entry name="unconfigured_head" value="2"/>
+      <entry name="already_used" value="3"/>
+    </enum>
+    <request name="enable_head">
+      <arg name="id" type="new_id" interface="zwlr_output_configuration_head_v1"/>
+      <arg name="head" type="object" interface="zwlr_output_head_v1"/>
+    </request>
+    <request name="disable_head">
+      <arg name="head" type="object" interface="zwlr_output_head_v1"/>
+    </request>
+    <request name="apply"/>
+    <request name="test"/>
+    <event name="succeeded"/>
+    <event name="failed"/>
+    <event name="cancelled"/>
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="zwlr_output_configuration_head_v1" version="4">
+    <description summary="configuration for an enabled head">
+      Each mutable property may be set at most once.
+    </description>
+    <enum name="error">
+      <entry name="already_set" value="1"/>
+      <entry name="invalid_mode" value="2"/>
+      <entry name="invalid_custom_mode" value="3"/>
+      <entry name="invalid_transform" value="4"/>
+      <entry name="invalid_scale" value="5"/>
+      <entry name="invalid_adaptive_sync_state" value="6" since="4"/>
+    </enum>
+    <request name="set_mode">
+      <arg name="mode" type="object" interface="zwlr_output_mode_v1"/>
+    </request>
+    <request name="set_custom_mode">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="refresh" type="int"/>
+    </request>
+    <request name="set_position">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+    <request name="set_transform">
+      <arg name="transform" type="int" enum="wl_output.transform"/>
+    </request>
+    <request name="set_scale">
+      <arg name="scale" type="fixed"/>
+    </request>
+    <request name="set_adaptive_sync" since="4">
+      <arg name="state" type="uint" enum="zwlr_output_head_v1.adaptive_sync_state"/>
+    </request>
+  </interface>
+</protocol>

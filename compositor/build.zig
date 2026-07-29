@@ -1,0 +1,366 @@
+const std = @import("std");
+const Scanner = @import("wayland").Scanner;
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const scanner = Scanner.create(b, .{});
+    const vulkan = b.dependency("vulkan", .{
+        .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
+    }).module("vulkan-zig");
+    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/text-input/text-input-unstable-v3.xml");
+    scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
+    scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
+    scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
+    scanner.addSystemProtocol("stable/linux-dmabuf/linux-dmabuf-v1.xml");
+    scanner.addSystemProtocol("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml");
+    scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
+    scanner.addSystemProtocol("staging/fifo/fifo-v1.xml");
+    scanner.addSystemProtocol("staging/commit-timing/commit-timing-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-dialog/xdg-dialog-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-system-bell/xdg-system-bell-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-session-management/xdg-session-management-v1.xml");
+    scanner.addSystemProtocol("staging/ext-transient-seat/ext-transient-seat-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
+    scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
+    scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addSystemProtocol("staging/content-type/content-type-v1.xml");
+    scanner.addSystemProtocol("staging/color-management/color-management-v1.xml");
+    scanner.addSystemProtocol("staging/color-representation/color-representation-v1.xml");
+    scanner.addSystemProtocol("staging/alpha-modifier/alpha-modifier-v1.xml");
+    scanner.addSystemProtocol("staging/security-context/security-context-v1.xml");
+    scanner.addSystemProtocol("staging/drm-lease/drm-lease-v1.xml");
+    scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
+    scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
+    scanner.addSystemProtocol("staging/ext-idle-notify/ext-idle-notify-v1.xml");
+    scanner.addSystemProtocol("staging/ext-data-control/ext-data-control-v1.xml");
+    scanner.addSystemProtocol("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml");
+    scanner.addSystemProtocol("staging/ext-image-capture-source/ext-image-capture-source-v1.xml");
+    scanner.addSystemProtocol("staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml");
+    scanner.addSystemProtocol("staging/ext-workspace/ext-workspace-v1.xml");
+    scanner.addSystemProtocol("staging/xwayland-shell/xwayland-shell-v1.xml");
+    scanner.addSystemProtocol("unstable/xwayland-keyboard-grab/xwayland-keyboard-grab-unstable-v1.xml");
+    scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
+    scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/relative-pointer/relative-pointer-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
+    scanner.addSystemProtocol("staging/pointer-warp/pointer-warp-v1.xml");
+    scanner.addSystemProtocol("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
+    scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-output-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/gtk-shell.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/virtual-keyboard-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
+    scanner.generate("wl_compositor", 7);
+    scanner.generate("wl_subcompositor", 1);
+    scanner.generate("wl_shm", 2);
+    scanner.generate("wl_fixes", 1);
+    scanner.generate("wl_output", 4);
+    scanner.generate("wl_seat", 10);
+    scanner.generate("wl_data_device_manager", 4);
+    scanner.generate("xdg_wm_base", 7);
+    scanner.generate("zxdg_decoration_manager_v1", 2);
+    scanner.generate("zwp_primary_selection_device_manager_v1", 1);
+    scanner.generate("zwp_text_input_manager_v3", 2);
+    scanner.generate("wp_viewporter", 1);
+    scanner.generate("wp_fractional_scale_manager_v1", 1);
+    scanner.generate("wp_presentation", 2);
+    scanner.generate("zwp_linux_dmabuf_v1", 6);
+    scanner.generate("wp_linux_drm_syncobj_manager_v1", 1);
+    scanner.generate("wp_tearing_control_manager_v1", 1);
+    scanner.generate("wp_fifo_manager_v1", 1);
+    scanner.generate("wp_commit_timing_manager_v1", 1);
+    scanner.generate("xdg_toplevel_drag_manager_v1", 1);
+    scanner.generate("xdg_toplevel_icon_manager_v1", 1);
+    scanner.generate("xdg_wm_dialog_v1", 1);
+    scanner.generate("xdg_system_bell_v1", 1);
+    scanner.generate("xdg_toplevel_tag_manager_v1", 1);
+    scanner.generate("xdg_session_manager_v1", 1);
+    scanner.generate("ext_transient_seat_manager_v1", 1);
+    scanner.generate("xdg_activation_v1", 1);
+    scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
+    scanner.generate("wp_cursor_shape_manager_v1", 2);
+    scanner.generate("wp_content_type_manager_v1", 1);
+    scanner.generate("wp_color_manager_v1", 3);
+    scanner.generate("wp_color_representation_manager_v1", 1);
+    scanner.generate("wp_alpha_modifier_v1", 1);
+    scanner.generate("wp_security_context_manager_v1", 1);
+    scanner.generate("wp_drm_lease_device_v1", 1);
+    scanner.generate("ext_background_effect_manager_v1", 1);
+    scanner.generate("ext_session_lock_manager_v1", 1);
+    scanner.generate("ext_idle_notifier_v1", 2);
+    scanner.generate("ext_data_control_manager_v1", 1);
+    scanner.generate("ext_foreign_toplevel_list_v1", 1);
+    scanner.generate("ext_output_image_capture_source_manager_v1", 1);
+    scanner.generate("ext_foreign_toplevel_image_capture_source_manager_v1", 1);
+    scanner.generate("ext_image_copy_capture_manager_v1", 1);
+    scanner.generate("ext_workspace_manager_v1", 1);
+    scanner.generate("xwayland_shell_v1", 1);
+    scanner.generate("zwp_xwayland_keyboard_grab_manager_v1", 1);
+    scanner.generate("zwp_tablet_manager_v2", 2);
+    scanner.generate("zwp_pointer_gestures_v1", 3);
+    scanner.generate("zwp_relative_pointer_manager_v1", 1);
+    scanner.generate("zwp_pointer_constraints_v1", 1);
+    scanner.generate("wp_pointer_warp_v1", 1);
+    scanner.generate("zwp_idle_inhibit_manager_v1", 1);
+    scanner.generate("zwp_keyboard_shortcuts_inhibit_manager_v1", 1);
+    scanner.generate("zxdg_exporter_v2", 1);
+    scanner.generate("zxdg_importer_v2", 1);
+    scanner.generate("zxdg_output_manager_v1", 3);
+    scanner.generate("zwp_input_method_manager_v2", 1);
+    scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
+    scanner.generate("zwlr_virtual_pointer_manager_v1", 2);
+    scanner.generate("zwlr_data_control_manager_v1", 2);
+    scanner.generate("zwlr_foreign_toplevel_manager_v1", 3);
+    scanner.generate("zwlr_output_manager_v1", 4);
+    scanner.generate("zwlr_screencopy_manager_v1", 3);
+    scanner.generate("gtk_shell1", 5);
+    scanner.generate("zwlr_layer_shell_v1", 5);
+    scanner.generate("zwlr_output_power_manager_v1", 1);
+    scanner.generate("zwlr_gamma_control_manager_v1", 1);
+
+    const wayland = b.createModule(.{
+        .root_source_file = scanner.result,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const varlink = b.addModule("varlink", .{
+        .root_source_file = b.path("src/varlink/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const control = b.createModule(.{
+        .root_source_file = b.path("src/control/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    control.addAnonymousImport("control-interface", .{
+        .root_source_file = b.path("protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
+    });
+
+    const compositor = b.createModule(.{
+        .root_source_file = b.path("src/compositor/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    compositor.addImport("keywork-control", control);
+    compositor.addImport("varlink", varlink);
+    compositor.addImport("wayland", wayland);
+    compositor.addImport("vulkan", vulkan);
+    compositor.addAnonymousImport("default-config", .{
+        .root_source_file = b.path("resources/keywork.conf"),
+    });
+    addVulkanShader(b, compositor, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
+    addVulkanShader(b, compositor, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
+    addVulkanShader(b, compositor, "vulkan-image", "src/compositor/render/shaders/image.frag");
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-crossfade",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_CROSSFADE"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-image-nearest",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_NEAREST"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-image-nearest-gamma22",
+        "src/compositor/render/shaders/image.frag",
+        &.{ "KEYWORK_NEAREST", "KEYWORK_TRANSFER_GAMMA22" },
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-backdrop-image",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_BACKDROP"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-image-catmull-rom",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_CATMULL_ROM"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-image-area",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_AREA"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-video-manual",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_MANUAL_YCBCR"},
+    );
+    addVulkanShader(b, compositor, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
+    addVulkanShader(b, compositor, "vulkan-blur-downsample", "src/compositor/render/shaders/blur_downsample.frag");
+    addVulkanShader(b, compositor, "vulkan-blur-upsample", "src/compositor/render/shaders/blur_upsample.frag");
+    addVulkanShader(b, compositor, "vulkan-encode", "src/compositor/render/shaders/encode.frag");
+    addVulkanShader(b, compositor, "vulkan-encode-calibrated", "src/compositor/render/shaders/encode_calibrated.frag");
+    compositor.linkSystemLibrary("lcms2", .{});
+    compositor.linkSystemLibrary("libdisplay-info", .{});
+    compositor.linkSystemLibrary("libdrm", .{});
+    compositor.linkSystemLibrary("gbm", .{});
+    compositor.linkSystemLibrary("libinput", .{});
+    compositor.linkSystemLibrary("pixman-1", .{});
+    compositor.linkSystemLibrary("xcursor", .{});
+    compositor.linkSystemLibrary("libseat", .{});
+    compositor.linkSystemLibrary("libsystemd", .{});
+    compositor.linkSystemLibrary("libudev", .{});
+    compositor.linkSystemLibrary("wayland-client", .{});
+    compositor.linkSystemLibrary("wayland-server", .{});
+    compositor.linkSystemLibrary("xkbcommon", .{});
+    compositor.linkSystemLibrary("xcb", .{});
+    compositor.linkSystemLibrary("xcb-composite", .{});
+    compositor.linkSystemLibrary("xcb-icccm", .{});
+    compositor.linkSystemLibrary("xcb-res", .{});
+    compositor.linkSystemLibrary("xcb-xfixes", .{});
+
+    const exe = b.addExecutable(.{
+        .name = "keywork-compositor",
+        .root_module = compositor,
+    });
+    const keyworkctl_module = b.createModule(.{
+        .root_source_file = b.path("src/keyworkctl/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    keyworkctl_module.addImport("varlink", varlink);
+    keyworkctl_module.addImport("keywork-control", control);
+    const keyworkctl = b.addExecutable(.{
+        .name = "keyworkctl",
+        .root_module = keyworkctl_module,
+    });
+
+    b.installArtifact(exe);
+    b.installArtifact(keyworkctl);
+    b.installFile(
+        "resources/keywork-session.target",
+        "share/systemd/user/keywork-session.target",
+    );
+    b.installFile(
+        "resources/keywork-xdg-autostart.service",
+        "share/systemd/user/keywork-xdg-autostart.service",
+    );
+    b.installFile(
+        "resources/keywork-xdg-autostart.target",
+        "share/systemd/user/keywork-xdg-autostart.target",
+    );
+    b.installFile(
+        "resources/keywork.desktop",
+        "share/wayland-sessions/keywork.desktop",
+    );
+    b.installFile(
+        "resources/keywork-portals.conf",
+        "share/xdg-desktop-portal/keywork-portals.conf",
+    );
+    b.installFile(
+        "resources/keywork.conf",
+        "share/keywork/keywork.conf",
+    );
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    const run_step = b.step("run", "Run the application");
+    run_step.dependOn(&run_cmd.step);
+
+    const test_step = b.step("test", "Run unit tests");
+    const exe_tests = b.addTest(.{
+        .root_module = compositor,
+    });
+    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    const varlink_tests = b.addTest(.{ .root_module = varlink });
+    test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
+    const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_module });
+    test_step.dependOn(&b.addRunArtifact(keyworkctl_tests).step);
+
+    const renderer_conformance_tests = b.addTest(.{
+        .root_module = compositor,
+        .filters = &.{"renderer conformance:"},
+    });
+    const renderer_conformance_step = b.step(
+        "renderer-conformance",
+        "Run renderer reference-vector conformance tests",
+    );
+    const renderer_conformance_run = b.addRunArtifact(renderer_conformance_tests);
+    renderer_conformance_step.dependOn(&renderer_conformance_run.step);
+
+    const renderer_scene_tests = b.addTest(.{
+        .root_module = compositor,
+        .filters = &.{"reproducible scene:"},
+    });
+    const renderer_scene_step = b.step(
+        "renderer-scenes",
+        "Run reproducible renderer scene tests",
+    );
+    const renderer_scene_run = b.addRunArtifact(renderer_scene_tests);
+    renderer_scene_step.dependOn(&renderer_scene_run.step);
+
+    const renderer_check_step = b.step(
+        "renderer-check",
+        "Run renderer conformance and reproducible scene tests",
+    );
+    renderer_check_step.dependOn(&renderer_conformance_run.step);
+    renderer_check_step.dependOn(&renderer_scene_run.step);
+
+    const fmt_step = b.step("fmt", "Check code formatting");
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
+    fmt_step.dependOn(&fmt_check.step);
+    test_step.dependOn(fmt_step);
+}
+
+fn addVulkanShader(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+    source_path: []const u8,
+) void {
+    addVulkanShaderVariant(b, module, name, source_path, &.{});
+}
+
+fn addVulkanShaderVariant(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+    source_path: []const u8,
+    defines: []const []const u8,
+) void {
+    const compile = b.addSystemCommand(&.{ "glslc", "-O" });
+    for (defines) |value| compile.addArg(b.fmt("-D{s}", .{value}));
+    compile.addFileArg(b.path(source_path));
+    compile.addArg("-o");
+    const spirv = compile.addOutputFileArg(b.fmt("{s}.spv", .{name}));
+    module.addAnonymousImport(name, .{ .root_source_file = spirv });
+}

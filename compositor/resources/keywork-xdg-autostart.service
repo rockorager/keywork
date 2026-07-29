@@ -1,0 +1,12 @@
+[Unit]
+Description=Wait for the Keywork status notifier before desktop autostart
+Wants=keywork-shell.service
+After=keywork-session.target keywork-shell.service
+PartOf=keywork-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'deadline=$$(($$(date +%%s) + 25)); while [ "$$(date +%%s)" -lt "$$deadline" ]; do if [ "$$(busctl --user --timeout=2s get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered 2>/dev/null)" = "b true" ]; then exit 0; fi; sleep 0.5; done; echo "Keywork status notifier did not become ready; continuing desktop autostart" >&2'
+ExecStart=systemctl --user --no-block start keywork-xdg-autostart.target
+RemainAfterExit=yes
+TimeoutStartSec=30

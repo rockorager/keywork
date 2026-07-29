@@ -1,0 +1,5 @@
+[Unit]
+Description=XDG autostart for the Keywork session
+BindsTo=xdg-desktop-autostart.target
+PartOf=keywork-session.target
+After=keywork-session.target
