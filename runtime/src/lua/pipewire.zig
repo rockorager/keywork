@@ -8,7 +8,7 @@
 //! are disabled unless explicitly requested by the application.
 
 const std = @import("std");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");
 const lua_task = @import("task.zig");

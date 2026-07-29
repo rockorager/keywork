@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
     // system CRT objects (e.g. .sframe sections from GCC 16's crt1.o).
     const use_llvm = b.option(bool, "llvm", "Use the LLVM backend and LLD linker");
 
+    const keywork_loop_module = b.addModule("keywork-loop", .{
+        .root_source_file = b.path("../loop/src/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
@@ -135,6 +141,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    app_module.addImport("keywork-loop", keywork_loop_module);
     app_module.addImport("wayland", wayland_mod);
     app_module.addImport("image_c", image_c_module);
     app_module.linkLibrary(stb_lib.library);
@@ -221,11 +228,13 @@ pub fn build(b: *std.Build) void {
     });
     app_tests.rdynamic = true;
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    const keywork_loop_tests = b.addTest(.{ .root_module = keywork_loop_module });
+    test_step.dependOn(&b.addRunArtifact(keywork_loop_tests).step);
     const linebreak_tests = b.addTest(.{ .root_module = linebreak_module });
     test_step.dependOn(&b.addRunArtifact(linebreak_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "lib", "examples", "build", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "lib", "examples", "build", "../loop/src", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
 }

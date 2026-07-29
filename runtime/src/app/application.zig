@@ -4,7 +4,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const app_options = @import("options.zig");
 const runner = @import("runner.zig");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const lua_module = @import("../lua/app.zig");
 

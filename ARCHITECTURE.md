@@ -6,6 +6,16 @@ boundaries.
 
 ## Components
 
+### Loop (`loop/`)
+
+Owns the `keywork-loop` Zig module: a concrete Linux reactor built on epoll,
+eventfd, timerfd, and inotify. It owns source dispatch and lifetime safety, but
+not application lifecycle or protocol-specific policy.
+
+The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
+Wayland libraries. Consumer-owned adapters may integrate those systems through
+the loop's generic callback and phase contracts.
+
 ### Runtime (`runtime/`)
 
 Owns the native Zig engine, LuaJIT integration, Lua-facing APIs, retained UI
@@ -52,9 +62,9 @@ would obscure its ownership.
 Arrows mean "depends on":
 
 ```diagram
-┌─────────┐    public Lua/application API    ┌─────────┐
-│  shell  │ ────────────────────────────────▶│ runtime │
-└────┬────┘                                  └────┬────┘
+┌─────────┐    public Lua/application API    ┌─────────┐     ┌──────────────┐
+│  shell  │ ────────────────────────────────▶│ runtime │────▶│ keywork-loop │
+└────┬────┘                                  └────┬────┘     └──────────────┘
      │                                            │
      │ shared protocol XML                        │ shared protocol XML
      │             ┌───────────┐                  │
@@ -70,7 +80,9 @@ The compositor and runtime have no source-code dependency on each other. The
 shell may rely on the runtime's public Lua/application contract, but it may not
 reach into runtime implementation files. Session integration between the
 compositor and shell is a deployed-process contract, not permission for source
-imports between them.
+imports between them. The runtime consumes `keywork-loop`; the loop has no
+dependency on any product component. Compositor consumption may be added later
+through the named module without introducing a compositor-runtime dependency.
 
 There is intentionally no general-purpose `common/` directory. Shared code is
 promoted only when it has a stable responsibility and a clear owner.

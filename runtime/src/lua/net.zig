@@ -7,7 +7,7 @@
 //! same shared curl runtime.
 
 const std = @import("std");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const lua_coro = @import("coro.zig");
 const lua_curl = @import("curl.zig");
 const lua_handle = @import("handle.zig");

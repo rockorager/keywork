@@ -9,6 +9,7 @@ protocol infrastructure without mixing those moves with product changes.
 
 | Path | Owner |
 | --- | --- |
+| `loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
 | `runtime/` | The Zig/Lua application runtime currently developed as `keywork` |
 | `compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
 | `shell/` | The Lua desktop shell and its native C helpers |
@@ -48,6 +49,7 @@ Migration phases:
 
 - [x] Import all three source histories without changing their contents.
 - [x] Establish repository-wide guidance and scoped component guidance.
+- [x] Extract the Linux reactor as the named `keywork-loop` module.
 - [ ] Replace the two independent Zig builds with one root build graph.
 - [ ] Elevate shared vendored Wayland XML to `protocols/` with provenance.
 - [ ] Add the root Make task facade and verify build, test, and formatting parity.

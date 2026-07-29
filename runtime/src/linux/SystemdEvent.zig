@@ -7,7 +7,7 @@
 const SystemdEvent = @This();
 
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
+const event_loop = @import("keywork-loop");
 const systemd = @import("systemd_c");
 
 const linux = std.os.linux;

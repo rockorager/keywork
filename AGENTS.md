@@ -6,8 +6,8 @@ priorities. More specific `AGENTS.md` files add component-local rules.
 
 ## Monorepo boundaries
 
-- Keep runtime, compositor, shell, and shared protocol ownership aligned with
-  `ARCHITECTURE.md`.
+- Keep loop, runtime, compositor, shell, and shared protocol ownership aligned
+  with `ARCHITECTURE.md`.
 - Relative Zig imports are allowed within one cohesive module. Cross-module
   and cross-component imports must use named modules wired in root
   `build.zig`; never reach through another component with relative paths.

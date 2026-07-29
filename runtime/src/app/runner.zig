@@ -4,7 +4,7 @@ const std = @import("std");
 const keywork = @import("../ui.zig");
 
 const desktop_settings = @import("../linux/desktop_settings.zig");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const app_options = @import("options.zig");

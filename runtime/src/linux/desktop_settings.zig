@@ -1,7 +1,7 @@
 //! Linux desktop settings from Prefer, with XDG Desktop Portal fallback.
 
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
+const event_loop = @import("keywork-loop");
 const linux_syscall = @import("syscall.zig");
 const SystemdEvent = @import("SystemdEvent.zig");
 const systemd = @import("systemd_c");

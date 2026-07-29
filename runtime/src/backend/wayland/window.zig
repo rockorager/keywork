@@ -1,7 +1,7 @@
 //! Shared Wayland window protocol and event-loop integration.
 
 const std = @import("std");
-const event_loop = @import("../../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const keywork = @import("../../ui.zig");
 const wayland_options = @import("options.zig");
 const wayland = @import("wayland");

@@ -3,7 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
-const event_loop = @import("../../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const keywork = @import("../../ui.zig");
 const wayland = @import("wayland");
 const xkb = @import("xkb_c");

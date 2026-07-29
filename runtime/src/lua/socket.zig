@@ -1,7 +1,7 @@
 //! Unix-domain byte streams used by keywork.net.connect.
 
 const std = @import("std");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const linux_syscall = @import("../linux/syscall.zig");
 const lua_coro = @import("coro.zig");
 const lua_handle = @import("handle.zig");

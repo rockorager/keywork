@@ -1,7 +1,6 @@
 //! Small Linux epoll event loop with a Wayland prepare-read integration point.
 
 const std = @import("std");
-const linux_syscall = @import("syscall.zig");
 
 const linux = std.os.linux;
 
@@ -633,7 +632,12 @@ fn epollWait(fd: i32, events: *[EventLoop.max_events]linux.epoll_event, timeout_
     }
 }
 
-const linuxFd = linux_syscall.fd;
+fn linuxFd(result: usize) !i32 {
+    return switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        else => error.LinuxSyscallFailed,
+    };
+}
 
 fn inotifyWatchFd(result: usize) !i32 {
     return switch (linux.errno(result)) {
@@ -643,7 +647,12 @@ fn inotifyWatchFd(result: usize) !i32 {
     };
 }
 
-const linuxVoid = linux_syscall.check;
+fn linuxVoid(result: usize) !void {
+    return switch (linux.errno(result)) {
+        .SUCCESS => {},
+        else => error.LinuxSyscallFailed,
+    };
+}
 
 fn milliseconds(value: u64) !linux.timespec {
     if (value == 0) return error.InvalidTimerInterval;

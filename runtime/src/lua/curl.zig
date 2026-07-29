@@ -7,7 +7,7 @@
 //! socket plumbing without exposing libcurl to Lua.
 
 const std = @import("std");
-const event_loop = @import("../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const curl_c = @import("curl_c");
 
 const linux = std.os.linux;

@@ -1,7 +1,7 @@
 //! Renderer-independent Wayland backend lifecycle.
 
 const std = @import("std");
-const event_loop = @import("../../linux/event_loop.zig");
+const event_loop = @import("keywork-loop");
 const keywork = @import("../../ui.zig");
 const WaylandInput = @import("input.zig");
 const data_device = @import("data_device.zig");
