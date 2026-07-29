@@ -1,9 +1,8 @@
 # Keywork
 
 This repository contains the Keywork native application runtime and UI,
-Wayland compositor, and desktop shell. Their histories remain intact while a
-single build graph enables explicit modules and coordinated changes without
-erasing component ownership.
+Wayland compositor, and desktop shell. A single build graph enables explicit
+modules and coordinated changes without erasing component ownership.
 
 ## Repository layout
 
@@ -32,12 +31,12 @@ root build.
 
 Native UI and runtime modules allow Zig applications to use the full Wayland
 platform without building or linking LuaJIT. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the target graph, migration gates, and
-monorepo stop conditions.
+[ARCHITECTURE.md](ARCHITECTURE.md) for the dependency graph and ownership
+boundaries.
 
 The same Zig graph builds the shell's native C modules, generates its Wayland
 bindings, checks its Lua sources, and installs its application and service
-assets. There is no secondary task runner or component-local build graph.
+assets.
 
 The bundled Keywork icon theme is generated in the Zig cache from the pinned
 Fluent package dependency and installed under `share/icons`; generated SVGs
@@ -85,30 +84,3 @@ build as the current user, generates a descriptor containing the selected
 prefix's absolute compositor path, and elevates only the final `install`
 command. `install-pam` follows the same privilege boundary. Set `SUDO=doas` to
 use `doas` instead of `sudo` for either focused step.
-
-## Migration status
-
-The source repositories were imported with unsquashed history at fixed
-revisions before files were reorganized:
-
-| Source | Imported revision |
-| --- | --- |
-| `https://github.com/rockorager/keywork.git` | `0c381bd544ab8ffedc97f28fb3bfe3f85b5a79bc` |
-| `https://github.com/rockorager/keywork-compositor.git` | `6f26973d4451b804a80e6511002a5fc824590f85` |
-| `https://github.com/rockorager/keywork-shell.git` | `d37444d3d183dfe0cba0f695c32abd71a707051c` |
-
-Migration phases:
-
-- [x] Import all three source histories without changing their contents.
-- [x] Establish repository-wide guidance and scoped component guidance.
-- [x] Extract the Linux reactor as the named `keywork-loop` module.
-- [x] Replace the two independent Zig builds with one root build graph.
-- [x] Promote the native UI model and orchestration to named modules.
-- [x] Replace runner callback fields with one typed host-binding contract.
-- [x] Expose the Lua-free `keywork-runtime` module.
-- [x] Add a native Wayland application proving the no-LuaJIT path.
-- [x] Relocate native UI and Lua host source to top-level components.
-- [x] Elevate shared vendored Wayland XML to `protocols/` with provenance.
-- [x] Make the root Zig graph the sole build, test, format, and install interface.
-- [x] Remove transitional component build and tool-runner configuration.
-- [x] Consolidate implementation components under one root `src/` tree.

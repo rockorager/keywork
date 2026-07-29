@@ -1,6 +1,6 @@
 # Keywork monorepo architecture
 
-This document defines the target source ownership and allowed dependency
+This document defines source ownership and allowed dependency
 directions. A monorepo makes coordinated changes easier; it does not erase
 component boundaries.
 
@@ -10,7 +10,7 @@ Examples, resources, language metadata, and non-Wayland product interfaces may
 remain with the component that owns them. Repository-wide build support and
 all checked-in Wayland XML live outside `src/`.
 
-## Target components
+## Components
 
 ### Loop (`src/loop/`)
 
@@ -207,34 +207,6 @@ The native boundary is complete only when all of these are true:
   unprivileged; only their final file installation commands elevate.
 - Procedural automation belongs in `scripts/`, not embedded shell fragments in
   configuration files.
-
-## Migration gates
-
-The migration was performed in this order:
-
-1. Replace the runner's opaque context and callback collection with one typed
-   host-binding interface.
-2. Move Lua-owned lifecycle files beside the Lua host, without changing
-   behavior.
-3. Expose `keywork-runtime` and make the Lua host consume it by name.
-4. Add the native Wayland example and enforce the no-LuaJIT acceptance gate.
-5. Remove configuration-time dependency probes and add focused build steps.
-6. Relocate the UI and Lua components in history-preserving move commits.
-7. Establish repository-wide build and check semantics.
-8. Centralize all checked-in Wayland XML and provenance under `protocols/`.
-9. Consolidate implementation components under one root `src/` namespace.
-
-All migration gates are complete. Future boundary changes remain subject to
-the ownership and dependency rules above.
-
-## Monorepo stop conditions
-
-Reconsider separate repositories if components require incompatible Zig
-versions for more than a transitional period, shared dependency-version
-conflicts become routine, external consumers require independent module
-versioning, or coordinated cross-component changes become rare. Do not split
-the repository merely to compensate for a boundary that can be represented as
-a named module.
 
 ## Change placement
 

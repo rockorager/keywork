@@ -411,7 +411,7 @@ fn handleMessage(
             .vendor = "rockorager",
             .product = "Keywork compositor",
             .version = "0.0.0",
-            .url = "https://github.com/rockorager/keywork-compositor",
+            .url = "https://github.com/rockorager/keywork",
             .interfaces = [_][]const u8{ service_interface_name, interface_name },
         } });
         return;

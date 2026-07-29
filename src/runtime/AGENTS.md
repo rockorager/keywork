@@ -8,7 +8,7 @@ model and design priorities.
 - Keep the runtime useful as a general Wayland application platform. Do not
   add shell policy or compositor implementation details to its APIs.
 - Fix runtime pain discovered by the shell here rather than adding a shell
-  workaround. Record unresolved consumer pain in `../shell/NOTES.md`.
+  workaround.
 - Keep tests inline and ensure `keywork-runtime` remains registered as its own
   root in the repository test graph.
 - Consume `keywork-ui` and `keywork-ui-engine` by name; never reach into

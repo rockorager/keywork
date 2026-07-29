@@ -27,10 +27,6 @@ Read `DESIGN.md` before changing the built-in visual system. More specific
   behavior.
 - Keep non-Wayland product contracts with their product. In particular, the
   compositor Varlink control interface remains compositor-owned.
-- During migration, separate history-preserving moves from build changes and
-  behavior changes so each can be reviewed and verified independently.
-- Make boundaries compiler-enforced and prove the native no-Lua path before
-  relocating source. Do not deepen transitional directory coupling.
 
 ## Build system ownership
 
