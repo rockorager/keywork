@@ -39,6 +39,10 @@ The same Zig graph builds the shell's native C modules, generates its Wayland
 bindings, checks its Lua sources, and installs its application and service
 assets. There is no secondary task runner or component-local build graph.
 
+The bundled Keywork icon theme is generated in the Zig cache from the pinned
+Fluent package dependency and installed under `share/icons`; generated SVGs
+are not checked into the repository.
+
 Zig 0.16 and the native development libraries used by both products are
 developer prerequisites. Shell linting and formatting additionally require
 `emmylua_check` and `luafmt`; this repository does not install or select tools
@@ -54,6 +58,7 @@ Common commands:
 | `zig build lint` | Run shell static analysis |
 | `zig build fmt` | Check Zig, Lua, and Lua type formatting |
 | `zig build format` | Format Zig, Lua, and Lua type sources |
+| `zig build icons` | Generate the pinned Fluent icon theme in the Zig cache |
 | `zig build run-shell` | Build, validate, and run the desktop shell |
 | `zig build -p ~/.local` | Install all artifacts and service assets under `~/.local` |
 | `sudo zig build install-pam` | Install the PAM service under `/etc/pam.d` |

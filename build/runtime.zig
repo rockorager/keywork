@@ -255,10 +255,11 @@ pub fn add(
         .install_subdir = "share/keywork/emmylua",
         .include_extensions = &.{".lua"},
     });
+    const fluent_icons = addFluentIcons(b);
     b.installDirectory(.{
-        .source_dir = b.path("src/runtime/resources/icons"),
+        .source_dir = fluent_icons,
         .install_dir = .prefix,
-        .install_subdir = "share/icons",
+        .install_subdir = "share/icons/Keywork",
     });
 
     const run_cmd = b.addRunArtifact(exe);
@@ -321,6 +322,21 @@ fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {
 fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) *std.Build.Step.Run {
     const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
     return b.addSystemCommand(&.{ pkg_config, b.fmt("--atleast-version={s}", .{minimum_version}), package });
+}
+
+fn addFluentIcons(b: *std.Build) std.Build.LazyPath {
+    const fluent_icons = b.dependency("fluent_icons", .{});
+    const python = b.graph.environ_map.get("PYTHON") orelse "python3";
+    const generate = b.addSystemCommand(&.{python});
+    generate.addFileArg(b.path("scripts/generate-fluent-icons"));
+    generate.addDirectoryArg(fluent_icons.path(""));
+    generate.addFileArg(b.path("src/runtime/design/fluent/aliases.json"));
+    generate.addFileArg(b.path("src/runtime/design/fluent/LICENSE"));
+    const output = generate.addOutputDirectoryArg("Keywork");
+
+    const icons_step = b.step("icons", "Generate the bundled Fluent icon theme");
+    icons_step.dependOn(&generate.step);
+    return output;
 }
 
 fn addExampleRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, description: []const u8, script: []const u8, fixed_args: []const []const u8) void {

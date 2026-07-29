@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Deterministically generate Keywork's XDG theme from a Fluent package."""
+
+import json
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+
+STEM = re.compile(r"^(.+)_(\d+)_(regular|filled|light|color)\.svg$")
+
+
+def main():
+    if len(sys.argv) != 5:
+        raise SystemExit(
+            "usage: generate-fluent-icons PACKAGE ALIASES LICENSE OUTPUT"
+        )
+
+    package_root = Path(sys.argv[1])
+    aliases_path = Path(sys.argv[2])
+    license_path = Path(sys.argv[3])
+    output = Path(sys.argv[4])
+    package = json.loads((package_root / "package.json").read_text())
+    if package.get("name") != "@fluentui/svg-icons":
+        raise RuntimeError("dependency is not @fluentui/svg-icons")
+
+    source = package_root / "icons"
+    aliases = json.loads(aliases_path.read_text())
+    assets = {}
+    for path in sorted(source.rglob("*.svg")):
+        relative = path.relative_to(source).with_suffix("").as_posix()
+        if not STEM.match(path.name):
+            raise RuntimeError(f"unexpected SVG name: {relative}.svg")
+        assets[relative] = path
+    if not assets:
+        raise RuntimeError("Fluent package contains no SVG icons")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix="keywork-icons-", dir=output.parent))
+    try:
+        directories = set()
+        for relative, source_path in sorted(assets.items()):
+            match = STEM.match(source_path.name)
+            size = int(match.group(2))
+            directory = f"{size}x{size}/fluent"
+            directories.add(directory)
+            destination = temporary / directory / f"{relative}.svg"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, destination)
+
+        for name, spec in sorted(aliases.items()):
+            target, context = spec[:2]
+            candidates = regular_candidates(assets, target)
+            if not candidates:
+                raise RuntimeError(f"alias {name} target does not exist: {target}")
+            for stem in candidates:
+                size = int(stem.rsplit("_", 2)[1])
+                directory = f"{size}x{size}/{context}"
+                directories.add(directory)
+                destination = temporary / directory
+                destination.mkdir(parents=True, exist_ok=True)
+                for alias_name in (name, name + "-symbolic"):
+                    shutil.copyfile(assets[stem], destination / f"{alias_name}.svg")
+
+        # Battery level names use Fluent's 0..10 scale. Generic charge is used
+        # only if a level-specific charging glyph is absent.
+        for level in range(0, 101, 10):
+            add_battery_alias(
+                temporary,
+                directories,
+                assets,
+                f"battery-level-{level}",
+                f"battery_{level // 10}",
+                None,
+            )
+            add_battery_alias(
+                temporary,
+                directories,
+                assets,
+                f"battery-level-{level}-charging",
+                f"battery_charge_{level // 10}",
+                "battery_charge",
+            )
+        add_battery_alias(
+            temporary,
+            directories,
+            assets,
+            "battery-full-charging",
+            "battery_charge_10",
+            "battery_charge",
+        )
+        add_battery_alias(
+            temporary,
+            directories,
+            assets,
+            "battery-level-100-plugged-in",
+            "battery_charge_10",
+            "battery_charge",
+        )
+
+        directory_list = sorted(
+            directories, key=lambda directory: (int(directory.split("x", 1)[0]), directory)
+        )
+        lines = [
+            "[Icon Theme]",
+            "Name=Keywork",
+            "Comment=Fluent System Icons packaged for Keywork",
+            "Inherits=Adwaita,hicolor",
+            "Directories=" + ",".join(directory_list),
+            "",
+        ]
+        for directory in directory_list:
+            size = directory.split("x", 1)[0]
+            context = directory.rsplit("/", 1)[1]
+            lines += [f"[{directory}]", f"Size={size}", "Type=Fixed"]
+            if context != "fluent":
+                lines.append(
+                    "Context="
+                    + ("MimeTypes" if context == "mimetypes" else context.title())
+                )
+            lines.append("")
+        (temporary / "index.theme").write_text("\n".join(lines), newline="\n")
+        shutil.copyfile(license_path, temporary / "LICENSE")
+        if output.exists():
+            shutil.rmtree(output)
+        temporary.rename(output)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    print(
+        f"generated {len(assets)} Fluent {package['version']} SVGs "
+        f"and {len(aliases) + 24} XDG alias names"
+    )
+
+
+def regular_candidates(assets, target):
+    return sorted(
+        (
+            stem
+            for stem in assets
+            if "/" not in stem
+            and re.fullmatch(re.escape(target) + r"_\d+_regular", stem)
+        ),
+        key=lambda stem: int(stem.rsplit("_", 2)[1]),
+    )
+
+
+def add_battery_alias(root, directories, assets, name, target, fallback):
+    candidates = regular_candidates(assets, target)
+    if not candidates and fallback:
+        candidates = regular_candidates(assets, fallback)
+    if not candidates:
+        raise RuntimeError(f"battery alias {name} has no target {target}")
+    for stem in candidates:
+        size = int(stem.rsplit("_", 2)[1])
+        directory = f"{size}x{size}/status"
+        directories.add(directory)
+        destination = root / directory
+        destination.mkdir(parents=True, exist_ok=True)
+        for alias in (name, name + "-symbolic"):
+            shutil.copyfile(assets[stem], destination / f"{alias}.svg")
+
+
+if __name__ == "__main__":
+    main()

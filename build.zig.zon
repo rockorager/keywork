@@ -32,6 +32,10 @@
             .url = "git+https://github.com/vancluever/z2d?ref=v0.11.0#5184a79622dce6b885c45ef6666f8c92385bed10",
             .hash = "z2d-0.11.0-j5P_HtLzDwBGyQt49DrT0v4BuVqI_SRs6CXsuj7eBVhR",
         },
+        .fluent_icons = .{
+            .url = "https://registry.npmjs.org/@fluentui/svg-icons/-/svg-icons-1.1.334.tgz",
+            .hash = "N-V-__8AAG3xyQDWvODUXOkvonjQyz--gr32nZXy027iXeWd",
+        },
         .stb = .{
             .url = "git+https://github.com/nothings/stb#31c1ad37456438565541f4919958214b6e762fb4",
             .hash = "N-V-__8AAN1DTgAKvlSQnjJwSg4ZY2JP5OHmzKOcA4BewA4Y",
