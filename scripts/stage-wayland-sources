@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+pkg_config=$1
+output=$2
+
+wayland_data=$("$pkg_config" --variable=pkgdatadir wayland-scanner)
+protocols_data=$("$pkg_config" --variable=pkgdatadir wayland-protocols)
+
+rm -rf "$output"
+mkdir -p "$output"
+ln -s "$wayland_data/wayland.xml" "$output/wayland.xml"
+ln -s "$protocols_data" "$output/wayland-protocols"

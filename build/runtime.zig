@@ -9,9 +9,14 @@ pub fn add(
     optimize: std.builtin.OptimizeMode,
     use_llvm: ?bool,
     keywork_loop_module: *std.Build.Module,
+    wayland_xml: std.Build.LazyPath,
+    wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
 ) void {
-    const scanner = Scanner.create(b, .{});
+    const scanner = Scanner.create(b, .{
+        .wayland_xml = wayland_xml,
+        .wayland_protocols = wayland_protocols,
+    });
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
@@ -49,7 +54,7 @@ pub fn add(
         .optimize = optimize,
     });
     image_c.addSystemIncludePath(stb_lib.include_dir);
-    requirePkgConfigVersion(b, "resvg", "0.47.0");
+    image_c.step.dependOn(&requirePkgConfigVersion(b, "resvg", "0.47.0").step);
     image_c.linkSystemLibrary("resvg", .{ .use_pkg_config = .force });
     const image_c_module = image_c.createModule();
 
@@ -102,21 +107,21 @@ pub fn add(
     xkb_c.linkSystemLibrary("xkbcommon", .{ .use_pkg_config = .force });
     const xkb_c_module = xkb_c.createModule();
 
-    requirePkgConfigVersion(b, "libsystemd", "257");
     const systemd_c = b.addTranslateC(.{
         .root_source_file = b.path("runtime/src/ffi/systemd_c.h"),
         .target = target,
         .optimize = optimize,
     });
+    systemd_c.step.dependOn(&requirePkgConfigVersion(b, "libsystemd", "257").step);
     systemd_c.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
     const systemd_c_module = systemd_c.createModule();
 
-    requirePkgConfigVersion(b, "libcurl", "7.45.0");
     const curl_c = b.addTranslateC(.{
         .root_source_file = b.path("runtime/src/ffi/curl_c.h"),
         .target = target,
         .optimize = optimize,
     });
+    curl_c.step.dependOn(&requirePkgConfigVersion(b, "libcurl", "7.45.0").step);
     curl_c.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
     const curl_c_module = curl_c.createModule();
 
@@ -289,9 +294,9 @@ fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
 }
 
-fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) void {
+fn requirePkgConfigVersion(b: *std.Build, package: []const u8, minimum_version: []const u8) *std.Build.Step.Run {
     const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
-    _ = b.run(&.{ pkg_config, b.fmt("--atleast-version={s}", .{minimum_version}), package });
+    return b.addSystemCommand(&.{ pkg_config, b.fmt("--atleast-version={s}", .{minimum_version}), package });
 }
 
 fn addExampleRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, description: []const u8, script: []const u8, fixed_args: []const []const u8) void {

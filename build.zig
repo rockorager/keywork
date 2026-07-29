@@ -19,8 +19,9 @@ pub fn build(b: *std.Build) void {
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
 
-    runtime.add(b, target, optimize, use_llvm, keywork_loop, test_step);
-    compositor.add(b, target, optimize, test_step);
+    const wayland_sources = stageWaylandSources(b);
+    runtime.add(b, target, optimize, use_llvm, keywork_loop, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
+    compositor.add(b, target, optimize, wayland_sources.wayland_xml, wayland_sources.protocols, test_step);
 
     const format_paths = &.{
         "build.zig",
@@ -40,4 +41,22 @@ pub fn build(b: *std.Build) void {
     const format_step = b.step("format", "Format code");
     const format = b.addFmt(.{ .paths = format_paths });
     format_step.dependOn(&format.step);
+}
+
+const WaylandSources = struct {
+    wayland_xml: std.Build.LazyPath,
+    protocols: std.Build.LazyPath,
+};
+
+fn stageWaylandSources(b: *std.Build) WaylandSources {
+    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
+    const stage = b.addSystemCommand(&.{"sh"});
+    stage.addFileArg(b.path("scripts/stage-wayland-sources"));
+    stage.addArg(pkg_config);
+    const output = stage.addOutputDirectoryArg("wayland-sources");
+    stage.has_side_effects = true;
+    return .{
+        .wayland_xml = output.path(b, "wayland.xml"),
+        .protocols = output.path(b, "wayland-protocols"),
+    };
 }

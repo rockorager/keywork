@@ -5,9 +5,14 @@ pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    wayland_xml: std.Build.LazyPath,
+    wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
 ) void {
-    const scanner = Scanner.create(b, .{});
+    const scanner = Scanner.create(b, .{
+        .wayland_xml = wayland_xml,
+        .wayland_protocols = wayland_protocols,
+    });
     const vulkan = b.dependency("compositor_vulkan", .{
         .registry = b.dependency("compositor_vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
