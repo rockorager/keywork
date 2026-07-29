@@ -175,81 +175,8 @@ pub fn add(
     compositor.addAnonymousImport("default-config", .{
         .root_source_file = b.path("src/compositor/resources/keywork.conf"),
     });
-    addVulkanShader(b, compositor, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
-    addVulkanShader(b, compositor, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
-    addVulkanShader(b, compositor, "vulkan-image", "src/compositor/render/shaders/image.frag");
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-crossfade",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_CROSSFADE"},
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-image-nearest",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_NEAREST"},
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-image-nearest-gamma22",
-        "src/compositor/render/shaders/image.frag",
-        &.{ "KEYWORK_NEAREST", "KEYWORK_TRANSFER_GAMMA22" },
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-backdrop-image",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_BACKDROP"},
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-image-catmull-rom",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_CATMULL_ROM"},
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-image-area",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_AREA"},
-    );
-    addVulkanShaderVariant(
-        b,
-        compositor,
-        "vulkan-video-manual",
-        "src/compositor/render/shaders/image.frag",
-        &.{"KEYWORK_MANUAL_YCBCR"},
-    );
-    addVulkanShader(b, compositor, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
-    addVulkanShader(b, compositor, "vulkan-blur-downsample", "src/compositor/render/shaders/blur_downsample.frag");
-    addVulkanShader(b, compositor, "vulkan-blur-upsample", "src/compositor/render/shaders/blur_upsample.frag");
-    addVulkanShader(b, compositor, "vulkan-encode", "src/compositor/render/shaders/encode.frag");
-    addVulkanShader(b, compositor, "vulkan-encode-calibrated", "src/compositor/render/shaders/encode_calibrated.frag");
-    compositor.linkSystemLibrary("lcms2", .{});
-    compositor.linkSystemLibrary("libdisplay-info", .{});
-    compositor.linkSystemLibrary("libdrm", .{});
-    compositor.linkSystemLibrary("gbm", .{});
-    compositor.linkSystemLibrary("libinput", .{});
-    compositor.linkSystemLibrary("pixman-1", .{});
-    compositor.linkSystemLibrary("xcursor", .{});
-    compositor.linkSystemLibrary("libseat", .{});
-    compositor.linkSystemLibrary("libsystemd", .{});
-    compositor.linkSystemLibrary("libudev", .{});
-    compositor.linkSystemLibrary("wayland-client", .{});
-    compositor.linkSystemLibrary("wayland-server", .{});
-    compositor.linkSystemLibrary("xkbcommon", .{});
-    compositor.linkSystemLibrary("xcb", .{});
-    compositor.linkSystemLibrary("xcb-composite", .{});
-    compositor.linkSystemLibrary("xcb-icccm", .{});
-    compositor.linkSystemLibrary("xcb-res", .{});
-    compositor.linkSystemLibrary("xcb-xfixes", .{});
+    addRendererShaders(b, compositor);
+    linkSystemLibraries(compositor);
 
     const exe = b.addExecutable(.{
         .name = "keywork-compositor",
@@ -339,6 +266,45 @@ pub fn add(
     );
     renderer_check_step.dependOn(&renderer_conformance_run.step);
     renderer_check_step.dependOn(&renderer_scene_run.step);
+}
+
+fn addRendererShaders(b: *std.Build, module: *std.Build.Module) void {
+    addVulkanShader(b, module, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
+    addVulkanShader(b, module, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
+    addVulkanShader(b, module, "vulkan-image", "src/compositor/render/shaders/image.frag");
+    addVulkanShaderVariant(b, module, "vulkan-crossfade", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_CROSSFADE"});
+    addVulkanShaderVariant(b, module, "vulkan-image-nearest", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_NEAREST"});
+    addVulkanShaderVariant(b, module, "vulkan-image-nearest-gamma22", "src/compositor/render/shaders/image.frag", &.{ "KEYWORK_NEAREST", "KEYWORK_TRANSFER_GAMMA22" });
+    addVulkanShaderVariant(b, module, "vulkan-backdrop-image", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_BACKDROP"});
+    addVulkanShaderVariant(b, module, "vulkan-image-catmull-rom", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_CATMULL_ROM"});
+    addVulkanShaderVariant(b, module, "vulkan-image-area", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_AREA"});
+    addVulkanShaderVariant(b, module, "vulkan-video-manual", "src/compositor/render/shaders/image.frag", &.{"KEYWORK_MANUAL_YCBCR"});
+    addVulkanShader(b, module, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
+    addVulkanShader(b, module, "vulkan-blur-downsample", "src/compositor/render/shaders/blur_downsample.frag");
+    addVulkanShader(b, module, "vulkan-blur-upsample", "src/compositor/render/shaders/blur_upsample.frag");
+    addVulkanShader(b, module, "vulkan-encode", "src/compositor/render/shaders/encode.frag");
+    addVulkanShader(b, module, "vulkan-encode-calibrated", "src/compositor/render/shaders/encode_calibrated.frag");
+}
+
+fn linkSystemLibraries(module: *std.Build.Module) void {
+    module.linkSystemLibrary("lcms2", .{});
+    module.linkSystemLibrary("libdisplay-info", .{});
+    module.linkSystemLibrary("libdrm", .{});
+    module.linkSystemLibrary("gbm", .{});
+    module.linkSystemLibrary("libinput", .{});
+    module.linkSystemLibrary("pixman-1", .{});
+    module.linkSystemLibrary("xcursor", .{});
+    module.linkSystemLibrary("libseat", .{});
+    module.linkSystemLibrary("libsystemd", .{});
+    module.linkSystemLibrary("libudev", .{});
+    module.linkSystemLibrary("wayland-client", .{});
+    module.linkSystemLibrary("wayland-server", .{});
+    module.linkSystemLibrary("xkbcommon", .{});
+    module.linkSystemLibrary("xcb", .{});
+    module.linkSystemLibrary("xcb-composite", .{});
+    module.linkSystemLibrary("xcb-icccm", .{});
+    module.linkSystemLibrary("xcb-res", .{});
+    module.linkSystemLibrary("xcb-xfixes", .{});
 }
 
 fn addVulkanShader(
