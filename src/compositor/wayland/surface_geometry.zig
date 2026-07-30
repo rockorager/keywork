@@ -51,24 +51,36 @@ fn swapsAxes(transform: wl.Output.Transform) bool {
     };
 }
 
+fn transformedSize(buffer_size: render.Size, transform: wl.Output.Transform) render.Size {
+    return if (swapsAxes(transform))
+        .{ .width = buffer_size.height, .height = buffer_size.width }
+    else
+        buffer_size;
+}
+
 fn logicalSize(
     buffer_size: render.Size,
     scale: i32,
     transform: wl.Output.Transform,
+    allow_non_divisible_scale: bool,
 ) error{InvalidSize}!render.Size {
     if (scale <= 0 or !validTransform(transform)) return error.InvalidSize;
 
-    const transformed: render.Size = if (swapsAxes(transform))
-        .{ .width = buffer_size.height, .height = buffer_size.width }
-    else
-        buffer_size;
+    const transformed = transformedSize(buffer_size, transform);
     const unsigned_scale: u32 = @intCast(scale);
-    if (transformed.width % unsigned_scale != 0 or
-        transformed.height % unsigned_scale != 0) return error.InvalidSize;
+    // Cursor themes and CSS cursors can provide odd-sized buffers at an
+    // integer scale. Established compositors accept those once the cursor role
+    // is assigned rather than disconnecting the client. Ceiling division keeps
+    // the complete image covered and avoids a zero-sized logical extent.
+    if (!allow_non_divisible_scale and
+        (transformed.width % unsigned_scale != 0 or
+            transformed.height % unsigned_scale != 0)) return error.InvalidSize;
 
     return .{
-        .width = transformed.width / unsigned_scale,
-        .height = transformed.height / unsigned_scale,
+        .width = std.math.divCeil(u32, transformed.width, unsigned_scale) catch
+            return error.InvalidSize,
+        .height = std.math.divCeil(u32, transformed.height, unsigned_scale) catch
+            return error.InvalidSize,
     };
 }
 
@@ -77,8 +89,14 @@ pub fn calculate(
     scale: i32,
     transform: wl.Output.Transform,
     viewport: ViewportState,
+    allow_non_divisible_scale: bool,
 ) Error!Geometry {
-    const base_size = logicalSize(buffer_size, scale, transform) catch
+    const base_size = logicalSize(
+        buffer_size,
+        scale,
+        transform,
+        allow_non_divisible_scale,
+    ) catch
         return error.InvalidSize;
     const source = viewport.source orelse return .{
         .logical_size = viewport.destination orelse base_size,
@@ -87,9 +105,10 @@ pub fn calculate(
 
     const right = @as(i64, source.x) + source.width;
     const bottom = @as(i64, source.y) + source.height;
+    const transformed = transformedSize(buffer_size, transform);
     if (source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
-        right > @as(i64, base_size.width) * 256 or
-        bottom > @as(i64, base_size.height) * 256)
+        right * scale > @as(i64, transformed.width) * 256 or
+        bottom * scale > @as(i64, transformed.height) * 256)
     {
         return error.ViewportOutOfBuffer;
     }
@@ -121,15 +140,42 @@ pub fn calculate(
 test "logical surface size accounts for scale and transform" {
     try std.testing.expectEqual(
         render.Size{ .width = 100, .height = 50 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .normal),
+        try logicalSize(.{ .width = 200, .height = 100 }, 2, .normal, false),
     );
     try std.testing.expectEqual(
         render.Size{ .width = 50, .height = 100 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .@"90"),
+        try logicalSize(.{ .width = 200, .height = 100 }, 2, .@"90", false),
     );
     try std.testing.expectError(
         error.InvalidSize,
-        logicalSize(.{ .width = 201, .height = 100 }, 2, .normal),
+        logicalSize(.{ .width = 201, .height = 100 }, 2, .normal, false),
+    );
+}
+
+test "cursor compatibility covers non-divisible buffer scale" {
+    const geometry = try calculate(
+        .{ .width = 31, .height = 17 },
+        2,
+        .normal,
+        .{},
+        true,
+    );
+    try std.testing.expectEqual(
+        render.Size{ .width = 16, .height = 9 },
+        geometry.logical_size,
+    );
+    try std.testing.expectError(
+        error.ViewportOutOfBuffer,
+        calculate(
+            .{ .width = 31, .height = 17 },
+            2,
+            .normal,
+            .{
+                .source = .{ .x = 0, .y = 0, .width = 16 * 256, .height = 8 * 256 },
+                .destination = .{ .width = 16, .height = 8 },
+            },
+            true,
+        ),
     );
 }
 
@@ -139,6 +185,7 @@ test "viewport destination defines logical surface size" {
         1,
         .normal,
         .{ .destination = .{ .width = 800, .height = 600 } },
+        false,
     );
     try std.testing.expectEqual(
         render.Size{ .width = 800, .height = 600 },
@@ -156,6 +203,7 @@ test "viewport source is validated and converted to buffer coordinates" {
             .source = .{ .x = 256, .y = 512, .width = 512, .height = 256 },
             .destination = .{ .width = 4, .height = 2 },
         },
+        false,
     );
     try std.testing.expectEqual(
         render.Size{ .width = 4, .height = 2 },
@@ -172,6 +220,7 @@ test "viewport source is validated and converted to buffer coordinates" {
             2,
             .normal,
             .{ .source = .{ .x = 768, .y = 0, .width = 512, .height = 256 } },
+            false,
         ),
     );
     try std.testing.expectError(
@@ -181,6 +230,7 @@ test "viewport source is validated and converted to buffer coordinates" {
             2,
             .normal,
             .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
+            false,
         ),
     );
 }
