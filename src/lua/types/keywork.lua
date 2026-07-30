@@ -20,6 +20,7 @@
 ---@alias keywork.ImageFit 'fill'|'cover'|'contain'|'none'
 ---@alias keywork.ImageAlignment 'top_left'|'top_center'|'top_right'|'center_left'|'center'|'center_right'|'bottom_left'|'bottom_center'|'bottom_right'
 ---@alias keywork.ImageCache 'auto'|'frame'
+---@alias keywork.PixelBufferFormat 'argb8888_premultiplied'|'argb8888_straight'|'xrgb8888'
 ---@alias keywork.ShortcutKey 'enter'|'space'|'backspace'|'tab'|'escape'|'up'|'down'
 ---@alias keywork.ResizeEdge 'top'|'bottom'|'left'|'right'|'top_left'|'top_right'|'bottom_left'|'bottom_right'|'top-left'|'top-right'|'bottom-left'|'bottom-right'
 ---@alias keywork.ThemeMetricRef number|string
@@ -704,6 +705,40 @@
 
 ---@alias keywork.ImageOptions keywork.FileImageOptions | keywork.PixelImageOptions
 
+---@class keywork.DamageRect
+---@field x      number Source-pixel x coordinate.
+---@field y      number Source-pixel y coordinate.
+---@field width  number Source-pixel width.
+---@field height number Source-pixel height.
+
+---@class keywork.PixelBufferCommitOptions
+---@field damage? keywork.DamageRect[] Omit for full-buffer damage. Disjoint rectangles are preserved.
+
+---@class keywork.PixelBuffer
+local PixelBuffer = {}
+
+--- Opens synchronous direct access to the stable SHM mapping.
+---@return userdata? pointer LuaJIT FFI pointer, valid until commit.
+---@return integer|string byte_length_or_error
+---@return integer? stride_bytes
+function PixelBuffer:begin_write() end
+
+--- Publishes one revision and invalidates the application automatically.
+---@param options? keywork.PixelBufferCommitOptions
+---@return integer? revision
+---@return string? error
+function PixelBuffer:commit(options) end
+
+---@class keywork.PixelBufferCreateOptions
+---@field width   integer
+---@field height  integer
+---@field format? keywork.PixelBufferFormat
+
+---@class keywork.PixelBufferWidgetOptions
+---@field buffer  keywork.PixelBuffer
+---@field width?  number Logical display width; requires height.
+---@field height? number Logical display height; requires width.
+
 ---@class keywork.IconOptions
 ---@field name      string
 ---@field size?     number
@@ -837,6 +872,15 @@ function SessionLock.unlock() end
 ---@return string? error
 function SessionLock.locked() end
 
+---@class keywork.PixelBufferNamespace
+---@operator call(keywork.PixelBufferWidgetOptions): keywork.Widget
+local PixelBufferNamespace = {}
+
+---@param options keywork.PixelBufferCreateOptions
+---@return keywork.PixelBuffer? buffer
+---@return string? error
+function PixelBufferNamespace.new(options) end
+
 local M = {}
 
 ---@type keywork.AppNamespace
@@ -850,6 +894,9 @@ M.clipboard = Clipboard
 
 ---@type keywork.SessionLockNamespace
 M.session_lock = SessionLock
+
+---@type keywork.PixelBufferNamespace
+M.pixel_buffer = PixelBufferNamespace
 
 ---@param options? keywork.ThemeOverrides
 ---@return keywork.ThemeData

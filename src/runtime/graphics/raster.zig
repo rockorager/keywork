@@ -40,7 +40,7 @@ pub fn rasterize(
             .fill_rect => |fill| try fillRect(target, pixels, width, height, scale, fill.rect, fill.color, clip),
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
             .alpha_image => |image| try alphaImage(target, pixels, width, height, scale, image, clip),
-            .color_image => |image| colorImage(pixels, width, height, scale, image, clip),
+            .color_image => |image| try colorImage(target, pixels, width, height, scale, image, clip),
             .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
     }
@@ -196,22 +196,38 @@ fn alphaImage(
 }
 
 fn colorImage(
+    target: *c.pixman_image_t,
     pixels: []u32,
     width: u31,
     height: u31,
     scale: f32,
     image: keywork.PaintCommand.ColorImage,
     clip: ?TextRenderer.PixelClip,
-) void {
+) !void {
     if (image.width == 0 or image.height == 0) return;
     const image_width: usize = @intCast(image.width);
     const image_height: usize = @intCast(image.height);
-    const dst_x0 = clampPixel(@floor(image.rect.x * scale), width);
-    const dst_y0 = clampPixel(@floor(image.rect.y * scale), height);
-    var start_x = dst_x0;
-    var start_y = dst_y0;
-    var dst_x1 = @min(dst_x0 + image_width, width);
-    var dst_y1 = @min(dst_y0 + image_height, height);
+    const image_stride: usize = @intCast(image.stride);
+    if (image_stride < image_width) return error.InvalidImage;
+    const rows_before_last = try std.math.mul(usize, image_height - 1, image_stride);
+    const source_size = try std.math.add(usize, rows_before_last, image_width);
+    if (image.pixels.len < source_size) return error.InvalidImage;
+
+    const left = image.rect.x * scale;
+    const top = image.rect.y * scale;
+    const destination_width = image.rect.width * scale;
+    const destination_height = image.rect.height * scale;
+    if (!std.math.isFinite(left) or !std.math.isFinite(top) or
+        !std.math.isFinite(destination_width) or destination_width <= 0 or
+        !std.math.isFinite(destination_height) or destination_height <= 0)
+    {
+        return error.InvalidImage;
+    }
+
+    var start_x = clampPixel(@floor(left), width);
+    var start_y = clampPixel(@floor(top), height);
+    var dst_x1 = clampPixel(@ceil(left + destination_width), width);
+    var dst_y1 = clampPixel(@ceil(top + destination_height), height);
     if (clip) |value| {
         start_x = @max(start_x, clampClip(value.x0, width));
         start_y = @max(start_y, clampClip(value.y0, height));
@@ -220,17 +236,113 @@ fn colorImage(
     }
     if (start_x >= dst_x1 or start_y >= dst_y1) return;
 
-    var y = start_y;
-    while (y < dst_y1) : (y += 1) {
-        const row = y - dst_y0;
-        var x = start_x;
-        while (x < dst_x1) : (x += 1) {
-            const column = x - dst_x0;
-            const source = image.pixels[row * image_width + column];
-            if (source.a == 0) continue;
-            blendPixel(pixels, width, x, y, source, 255);
+    const exact_size = destination_width == @as(f32, @floatFromInt(image_width)) and
+        destination_height == @as(f32, @floatFromInt(image_height));
+    const integral_origin = left == @floor(left) and top == @floor(top);
+    if (exact_size and integral_origin) {
+        const destination_x: i64 = @intFromFloat(left);
+        const destination_y: i64 = @intFromFloat(top);
+        const source_x: usize = @intCast(@as(i64, @intCast(start_x)) - destination_x);
+        const source_y: usize = @intCast(@as(i64, @intCast(start_y)) - destination_y);
+        if (image.format == .xrgb8888) {
+            const source_pixels: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(image.pixels)));
+            var y = start_y;
+            while (y < dst_y1) : (y += 1) {
+                const source_row = source_y + y - start_y;
+                @memcpy(
+                    pixels[y * width + start_x .. y * width + dst_x1],
+                    source_pixels[source_row * image_stride + source_x ..][0 .. dst_x1 - start_x],
+                );
+                for (pixels[y * width + start_x .. y * width + dst_x1]) |*pixel| pixel.* |= 0xff000000;
+            }
+            return;
+        }
+        if (image.format == .argb8888_premultiplied) {
+            const source = c.pixman_image_create_bits_no_clear(
+                @intCast(c.PIXMAN_a8r8g8b8),
+                @intCast(image.width),
+                @intCast(image.height),
+                @ptrCast(@constCast(image.pixels.ptr)),
+                @intCast(image.stride * @sizeOf(u32)),
+            ) orelse return error.OutOfMemory;
+            defer _ = c.pixman_image_unref(source);
+            c.pixman_image_composite32(
+                @intCast(c.PIXMAN_OP_OVER),
+                source,
+                null,
+                target,
+                @intCast(source_x),
+                @intCast(source_y),
+                0,
+                0,
+                @intCast(start_x),
+                @intCast(start_y),
+                @intCast(dst_x1 - start_x),
+                @intCast(dst_y1 - start_y),
+            );
+            return;
         }
     }
+
+    var y = start_y;
+    while (y < dst_y1) : (y += 1) {
+        const source_y = sourceCoordinate(y, top, destination_height, image_height);
+        var x = start_x;
+        while (x < dst_x1) : (x += 1) {
+            const source_x = sourceCoordinate(x, left, destination_width, image_width);
+            compositeColorImagePixel(pixels, width, x, y, image.pixels[source_y * image_stride + source_x], image.format);
+        }
+    }
+}
+
+fn sourceCoordinate(pixel: usize, origin: f32, destination_extent: f32, source_extent: usize) usize {
+    std.debug.assert(source_extent > 0);
+    const position = (@as(f64, @floatFromInt(pixel)) + 0.5 - @as(f64, origin)) /
+        @as(f64, destination_extent) * @as(f64, @floatFromInt(source_extent));
+    const maximum: f64 = @floatFromInt(source_extent - 1);
+    return @intFromFloat(std.math.clamp(@floor(position), 0, maximum));
+}
+
+fn compositeColorImagePixel(
+    pixels: []u32,
+    width: u31,
+    x: usize,
+    y: usize,
+    source: keywork.Color,
+    format: keywork.PixelFormat,
+) void {
+    const index = y * width + x;
+    switch (format) {
+        .xrgb8888 => pixels[index] = @as(u32, @bitCast(source)) | 0xff000000,
+        .argb8888_straight => {
+            if (source.a == 0) return;
+            if (source.a == 255) {
+                pixels[index] = @bitCast(source);
+                return;
+            }
+            const destination: keywork.Color = @bitCast(pixels[index]);
+            pixels[index] = @bitCast(source.blendOver(destination, 255));
+        },
+        .argb8888_premultiplied => {
+            if (source.a == 0) return;
+            if (source.a == 255) {
+                pixels[index] = @bitCast(source);
+                return;
+            }
+            const destination: keywork.Color = @bitCast(pixels[index]);
+            pixels[index] = @bitCast(blendPremultipliedOver(source, destination));
+        },
+    }
+}
+
+fn blendPremultipliedOver(source: keywork.Color, destination: keywork.Color) keywork.Color {
+    const inverse_alpha = 255 - @as(u32, source.a);
+    return .{
+        .a = @intCast(@as(u32, source.a) + (@as(u32, destination.a) * inverse_alpha + 127) / 255),
+        .r = @intCast(@min(255, @as(u32, source.r) + (@as(u32, destination.r) * inverse_alpha + 127) / 255)),
+        .g = @intCast(@min(255, @as(u32, source.g) + (@as(u32, destination.g) * inverse_alpha + 127) / 255)),
+        .b = @intCast(@min(255, @as(u32, source.b) + (@as(u32, destination.b) * inverse_alpha + 127) / 255)),
+    };
 }
 
 pub fn clampClip(value: i32, max_value: u31) usize {
@@ -441,4 +553,84 @@ test "opaque leading full-frame fill can replace clear" {
         .color = keywork.Color.argb(254, 12, 34, 56),
     } };
     try std.testing.expectEqual(null, fullFrameFill(translucent, 400, 300, 1));
+}
+
+test "color image scales padded xrgb rows into its destination rect" {
+    const source = [_]keywork.Color{
+        keywork.Color.argb(0, 255, 0, 0),
+        keywork.Color.argb(0, 0, 0, 255),
+        keywork.colors.white,
+    };
+    var pixels: [4]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        4,
+        1,
+        @ptrCast(&pixels),
+        4 * @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    try colorImage(target, &pixels, 4, 1, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = 4, .height = 1 },
+        .width = 2,
+        .height = 1,
+        .pixels = &source,
+        .stride = 3,
+        .format = .xrgb8888,
+        .cache_key = 0,
+        .revision = 0,
+    }, null);
+
+    const red: u32 = @bitCast(keywork.Color.argb(255, 255, 0, 0));
+    const blue: u32 = @bitCast(keywork.Color.argb(255, 0, 0, 255));
+    try std.testing.expectEqualSlices(u32, &.{ red, red, blue, blue }, &pixels);
+}
+
+test "color image does not multiply premultiplied alpha twice" {
+    var premultiplied: [1]u32 = @splat(@bitCast(keywork.colors.black));
+    const source = [_]keywork.Color{keywork.Color.argb(128, 64, 0, 0)};
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        1,
+        1,
+        @ptrCast(&premultiplied),
+        @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    try colorImage(target, &premultiplied, 1, 1, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .width = 1,
+        .height = 1,
+        .pixels = &source,
+        .stride = 1,
+        .format = .argb8888_premultiplied,
+        .cache_key = 0,
+        .revision = 0,
+    }, null);
+
+    try std.testing.expectEqual(@as(u32, @bitCast(keywork.Color.argb(255, 64, 0, 0))), premultiplied[0]);
+}
+
+test "color image clamps source coordinates before integer conversion" {
+    const source = [_]keywork.Color{keywork.colors.white};
+    var pixels: [1]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        1,
+        1,
+        @ptrCast(&pixels),
+        @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    try colorImage(target, &pixels, 1, 1, 1, .{
+        .rect = .{ .x = 0.25, .y = 0.25, .width = 1e-30, .height = 1e-30 },
+        .width = 1,
+        .height = 1,
+        .pixels = &source,
+        .stride = 1,
+        .format = .xrgb8888,
+        .cache_key = 0,
+        .revision = 0,
+    }, null);
+    try std.testing.expectEqual(@as(u32, @bitCast(keywork.colors.white)), pixels[0]);
 }

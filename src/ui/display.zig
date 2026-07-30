@@ -16,6 +16,14 @@ pub const AlphaMask = struct {
     stride: u32,
 };
 
+/// Interpretation of packed 0xAARRGGBB pixels supplied by an image producer.
+/// `xrgb8888` ignores the high byte and treats every source pixel as opaque.
+pub const PixelFormat = enum {
+    argb8888_straight,
+    argb8888_premultiplied,
+    xrgb8888,
+};
+
 pub const PaintCommand = union(enum) {
     fill_rect: FillRect,
     text: TextRun,
@@ -48,14 +56,17 @@ pub const PaintCommand = union(enum) {
         dither: bool = false,
     };
 
-    /// Full-color image with straight (non-premultiplied) alpha, pixels in
-    /// the framework's ARGB Color layout.
+    /// Full-color packed ARGB image. Rows may be padded; `stride` is measured
+    /// in pixels. The pixels are borrowed for one synchronous present.
     pub const ColorImage = struct {
         rect: Rect,
         width: u32,
         height: u32,
         pixels: []const Color,
+        stride: u32,
+        format: PixelFormat,
         cache_key: u64,
+        revision: u64,
     };
 };
 
@@ -355,7 +366,41 @@ pub const DisplayList = struct {
     }
 
     pub fn colorImage(self: *DisplayList, allocator: std.mem.Allocator, rect: Rect, width: u32, height: u32, pixels: []const Color, cache_key: u64) !void {
-        try self.commands.append(allocator, .{ .color_image = .{ .rect = rect, .width = width, .height = height, .pixels = pixels, .cache_key = cache_key } });
+        try self.colorImageStrided(
+            allocator,
+            rect,
+            width,
+            height,
+            pixels,
+            width,
+            .argb8888_straight,
+            cache_key,
+            0,
+        );
+    }
+
+    pub fn colorImageStrided(
+        self: *DisplayList,
+        allocator: std.mem.Allocator,
+        rect: Rect,
+        width: u32,
+        height: u32,
+        pixels: []const Color,
+        stride: u32,
+        format: PixelFormat,
+        cache_key: u64,
+        revision: u64,
+    ) !void {
+        try self.commands.append(allocator, .{ .color_image = .{
+            .rect = rect,
+            .width = width,
+            .height = height,
+            .pixels = pixels,
+            .stride = stride,
+            .format = format,
+            .cache_key = cache_key,
+            .revision = revision,
+        } });
     }
 };
 

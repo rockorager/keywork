@@ -92,6 +92,7 @@ const AtlasSlot = struct {
     y: u32,
     width: u32,
     height: u32,
+    revision: u64 = 0,
 };
 
 /// Axis-aligned quad in pixel space with its atlas UV window.
@@ -1186,32 +1187,61 @@ pub const Renderer = struct {
     /// Uploads a straight-alpha color image as premultiplied BGRA texels.
     fn ensureAtlasColorImage(self: *Self, image: keywork.PaintCommand.ColorImage) !AtlasSlot {
         if (image.width == 0 or image.height == 0) return error.EmptyImage;
-        if (image.pixels.len != @as(usize, image.width) * @as(usize, image.height)) return error.InvalidImage;
+        if (image.stride < image.width) return error.InvalidImage;
+        const rows_before_last = try std.math.mul(usize, image.height - 1, image.stride);
+        const source_size = try std.math.add(usize, rows_before_last, image.width);
+        if (image.pixels.len < source_size) return error.InvalidImage;
 
         const key: AtlasKey = .{ .color_image = image.cache_key };
-        if (self.atlas_slots.get(key)) |slot| return slot;
+        if (self.atlas_slots.getPtr(key)) |slot| {
+            if (slot.revision == image.revision) return slot.*;
+            try self.uploadAtlasColorImage(image, slot.*);
+            slot.revision = image.revision;
+            return slot.*;
+        }
 
-        const slot = try self.allocateAtlasSlot(image.width, image.height);
+        var slot = try self.allocateAtlasSlot(image.width, image.height);
+        slot.revision = image.revision;
         errdefer _ = self.atlas_slots.remove(key);
         try self.atlas_slots.put(self.allocator, key, slot);
 
+        try self.uploadAtlasColorImage(image, slot);
+        return slot;
+    }
+
+    fn uploadAtlasColorImage(self: *Self, image: keywork.PaintCommand.ColorImage, slot: AtlasSlot) !void {
         self.prepareAtlasUpload();
 
-        const image_size: vk.DeviceSize = @intCast(image.pixels.len * 4);
+        const pixel_count = try std.math.mul(usize, image.width, image.height);
+        const image_size: vk.DeviceSize = @intCast(try std.math.mul(usize, pixel_count, 4));
         if (self.staging_used + image_size > self.staging_buffer.size) return error.ImageUploadTooLarge;
-        const texels = try self.allocator.alloc(u8, image.pixels.len * 4);
-        defer self.allocator.free(texels);
-        for (image.pixels, 0..) |pixel, index| {
-            const alpha: u32 = pixel.a;
-            texels[index * 4 + 0] = @intCast((@as(u32, pixel.b) * alpha + 127) / 255);
-            texels[index * 4 + 1] = @intCast((@as(u32, pixel.g) * alpha + 127) / 255);
-            texels[index * 4 + 2] = @intCast((@as(u32, pixel.r) * alpha + 127) / 255);
-            texels[index * 4 + 3] = pixel.a;
+        if (image.format == .argb8888_premultiplied) {
+            for (0..image.height) |row| {
+                const source = image.pixels[row * image.stride ..][0..image.width];
+                try self.writeBuffer(
+                    self.staging_buffer,
+                    self.staging_used + row * image.width * 4,
+                    std.mem.sliceAsBytes(source),
+                );
+            }
+        } else {
+            const texels = try self.allocator.alloc(u8, pixel_count * 4);
+            defer self.allocator.free(texels);
+            for (0..image.height) |row| {
+                for (0..image.width) |column| {
+                    const pixel = image.pixels[row * image.stride + column];
+                    const index = row * image.width + column;
+                    const alpha: u32 = if (image.format == .xrgb8888) 255 else pixel.a;
+                    texels[index * 4 + 0] = @intCast((@as(u32, pixel.b) * alpha + 127) / 255);
+                    texels[index * 4 + 1] = @intCast((@as(u32, pixel.g) * alpha + 127) / 255);
+                    texels[index * 4 + 2] = @intCast((@as(u32, pixel.r) * alpha + 127) / 255);
+                    texels[index * 4 + 3] = @intCast(alpha);
+                }
+            }
+            try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
         }
-        try self.writeBuffer(self.staging_buffer, self.staging_used, texels);
 
         self.copyStagingToAtlas(slot, image_size);
-        return slot;
     }
 
     fn ensureAtlasImage(self: *Self, image: keywork.PaintCommand.AlphaImage) !AtlasSlot {
@@ -1354,13 +1384,11 @@ pub const Renderer = struct {
     }
 
     fn appendColorImageVertices(self: *Self, image: keywork.PaintCommand.ColorImage, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {
-        const x0 = image.rect.x * scale;
-        const y0 = image.rect.y * scale;
         try self.appendQuad(.{
-            .x0 = x0,
-            .y0 = y0,
-            .x1 = x0 + @as(f32, @floatFromInt(slot.width)),
-            .y1 = y0 + @as(f32, @floatFromInt(slot.height)),
+            .x0 = image.rect.x * scale,
+            .y0 = image.rect.y * scale,
+            .x1 = (image.rect.x + image.rect.width) * scale,
+            .y1 = (image.rect.y + image.rect.height) * scale,
             .uv_left = @as(f32, @floatFromInt(slot.x)) / @as(f32, @floatFromInt(self.atlas_size)),
             .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
             .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),

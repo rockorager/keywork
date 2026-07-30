@@ -3,6 +3,7 @@
 const model = @import("model.zig");
 const types = @import("types.zig");
 const display = @import("display.zig");
+const damage_region = @import("damage_region.zig");
 
 pub const animation = @import("animation.zig");
 pub const Color = types.Color;
@@ -28,6 +29,7 @@ pub const Intent = types.Intent;
 pub const Size = types.Size;
 pub const Point = types.Point;
 pub const Rect = types.Rect;
+pub const DamageRegion = damage_region.DamageRegion;
 pub const EdgeInsets = types.EdgeInsets;
 pub const Constraints = types.Constraints;
 pub const Widget = model.Widget;
@@ -38,6 +40,8 @@ pub const RenderNode = model.RenderNode;
 pub const PaintCommand = display.PaintCommand;
 pub const DisplayList = display.DisplayList;
 pub const AlphaMask = display.AlphaMask;
+pub const PixelFormat = display.PixelFormat;
+pub const PixelBuffer = @import("PixelBuffer.zig");
 pub const RasterCache = display.RasterCache;
 pub const RenderBackend = display.RenderBackend;
 pub const TextMeasurer = display.TextMeasurer;
@@ -90,14 +94,17 @@ pub const shortcutAllowedWhileEditing = model.shortcutAllowedWhileEditing;
 pub const findShortcutAction = model.findShortcutAction;
 pub const findFocusedShortcutAction = model.findFocusedShortcutAction;
 pub const collectDamage = model.collectDamage;
+pub const collectDamageRegion = model.collectDamageRegion;
 
 test {
     _ = @import("animation.zig");
+    _ = @import("damage_region.zig");
     _ = @import("display.zig");
     _ = @import("hit_testing.zig");
     _ = @import("layout.zig");
     _ = @import("model.zig");
     _ = @import("paint.zig");
+    _ = @import("PixelBuffer.zig");
     _ = @import("shortcuts.zig");
     _ = @import("types.zig");
 }

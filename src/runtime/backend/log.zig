@@ -33,8 +33,8 @@ pub const LogBackend = struct {
                     .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height, @as(u32, @bitCast(image.color)) },
                 ),
                 .color_image => |image| try self.writer.print(
-                    "color_image x={d} y={d} w={d} h={d} pixels={d}x{d}\n",
-                    .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height },
+                    "color_image x={d} y={d} w={d} h={d} pixels={d}x{d} stride={d} format={t}\n",
+                    .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height, image.stride, image.format },
                 ),
                 .set_clip => |clip| if (clip) |rect| {
                     try self.writer.print(

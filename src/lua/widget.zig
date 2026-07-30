@@ -12,6 +12,7 @@ const svg_icon = struct {
 const lua_codec = @import("codec.zig");
 const lua_handle = @import("handle.zig");
 const lua_image = @import("image.zig");
+const lua_pixel_buffer = @import("pixel_buffer.zig");
 const lua_task = @import("task.zig");
 const lua_theme = @import("theme.zig");
 const lua_value = @import("value.zig");
@@ -1009,6 +1010,9 @@ pub fn parse(
     }
     if (std.mem.eql(u8, kind, "image")) {
         return try lua_image.parse(lua_state, allocator, parse_context.png_dims, table);
+    }
+    if (std.mem.eql(u8, kind, "pixel_buffer")) {
+        return try lua_pixel_buffer.parseWidget(lua_state, allocator, table);
     }
     if (std.mem.eql(u8, kind, "icon")) {
         const options = try lua_codec.decode(IconOptions, lua_state, table, allocator);

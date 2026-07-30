@@ -83,22 +83,31 @@ pub fn presentFrame(self: anytype) !void {
     // present: skip it, so app-wide state invalidations don't repaint
     // clean windows. A size or scale change (or first frame) still
     // repaints the full frame conservatively.
-    const collected = keywork.collectDamage(root);
-    if (collected == null and !self.animations_active) {
+    var damage: keywork.DamageRegion = .{};
+    keywork.collectDamageRegion(root, &damage);
+    if (damage.isEmpty() and !self.animations_active) {
         // Never skip while animating: the present's frame callback is
         // what sustains the animation loop, so skipping would stall it.
         if (self.presented_size) |presented| {
             if (std.meta.eql(presented, frame_size) and self.presented_scale == render_scale) return;
         }
     }
-    const damage = if (collected) |dirty| dirty.intersect(full_frame) else full_frame;
+    if (damage.isEmpty() or self.presented_size == null or
+        !std.meta.eql(self.presented_size.?, frame_size) or self.presented_scale != render_scale)
+    {
+        damage.clear();
+        damage.add(full_frame);
+    } else {
+        damage.intersect(full_frame);
+        if (damage.isEmpty()) return;
+    }
     self.display_list.clearRetainingCapacity(self.allocator);
     const raster_cache = self.rasterCache();
     raster_cache.beginFrame();
     defer raster_cache.endFrame(self.allocator);
     const background = self.frameBackground();
     if (background.a > 0) try self.display_list.fillRect(self.allocator, full_frame, background);
-    const partial_paint_bounds = try self.backend.partialPaintBounds(frame_size, render_scale, &.{damage});
+    const partial_paint_bounds = try self.backend.partialPaintBounds(frame_size, render_scale, damage.slice());
     if (partial_paint_bounds) |paint_bounds| {
         try keywork.paintDamagedScaled(self.allocator, root, &self.display_list, raster_cache, render_scale, paint_bounds);
     } else {
@@ -108,7 +117,7 @@ pub fn presentFrame(self: anytype) !void {
         .size = frame_size,
         .content_rect = self.frame_content_rect,
         .scale = render_scale,
-        .damage = &.{damage},
+        .damage = damage.slice(),
         .display_list = self.display_list.commands.items,
         // Source-over painting cannot reduce the alpha established by the
         // full-frame background.

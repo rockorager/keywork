@@ -13,6 +13,7 @@ const colors = model.colors;
 const Size = model.Size;
 const Point = model.Point;
 const Rect = model.Rect;
+const DamageRegion = model.DamageRegion;
 const Constraints = model.Constraints;
 const TextMeasurer = model.TextMeasurer;
 const ResolvedTextStyle = model.ResolvedTextStyle;
@@ -49,8 +50,9 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     const bounds_changed = !std.meta.eql(old_paint_bounds, new_paint_bounds);
     const paint_changed = node.needs_paint;
     var damage = node.damage;
-    if (bounds_changed or paint_changed) {
-        damage = unionPaintBounds(unionPaintBounds(damage, old_paint_bounds), new_paint_bounds);
+    if (bounds_changed or (paint_changed and !node.paint_damage_precomputed)) {
+        addPaintBounds(&damage, old_paint_bounds);
+        addPaintBounds(&damage, new_paint_bounds);
     }
     node.* = value;
     node.children = children;
@@ -58,22 +60,13 @@ fn commitRenderNode(node: *RenderNode, value: RenderNode) void {
     node.constraints = constraints;
     node.paint_bounds = new_paint_bounds;
     node.damage = damage;
+    node.paint_damage_precomputed = false;
     node.needs_layout = false;
     node.needs_paint = false;
 }
 
-fn unionDamage(damage: ?Rect, rect: Rect) ?Rect {
-    if (rect.isEmpty()) return damage;
-    const existing = damage orelse return rect;
-    const x0 = @min(existing.x, rect.x);
-    const y0 = @min(existing.y, rect.y);
-    const x1 = @max(existing.x + existing.width, rect.x + rect.width);
-    const y1 = @max(existing.y + existing.height, rect.y + rect.height);
-    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
-}
-
-fn unionPaintBounds(damage: ?Rect, paint_bounds: ?Rect) ?Rect {
-    return if (paint_bounds) |bounds| unionDamage(damage, bounds) else damage;
+fn addPaintBounds(damage: *DamageRegion, paint_bounds: ?Rect) void {
+    if (paint_bounds) |bounds| damage.add(bounds);
 }
 
 const ellipsis = "…";
@@ -555,20 +548,30 @@ fn wrapText(
 /// Accumulates damage on a retained node outside of layout, for changes
 /// (animation ticks) that repaint without re-laying-out anything.
 pub fn addDamage(node: *RenderNode, rect: Rect) void {
-    node.damage = unionDamage(node.damage, rect);
+    node.damage.add(rect);
 }
 
 /// Collects and clears the damage accumulated across the tree since the
 /// last collection. Null means nothing changed.
 pub fn collectDamage(node: *RenderNode) ?Rect {
-    var damage = node.damage;
-    node.damage = null;
+    var damage = node.damage.bounds();
+    node.damage.clear();
     for (node.children) |child| {
         if (collectDamage(child)) |child_damage| {
-            damage = unionDamage(damage, child_damage);
+            var region: DamageRegion = .{};
+            if (damage) |rect| region.add(rect);
+            region.add(child_damage);
+            damage = region.bounds();
         }
     }
     return damage;
+}
+
+/// Collects and clears every disjoint damage rectangle in the retained tree.
+pub fn collectDamageRegion(node: *RenderNode, result: *DamageRegion) void {
+    result.addRegion(&node.damage);
+    node.damage.clear();
+    for (node.children) |child| collectDamageRegion(child, result);
 }
 
 fn ensureChildSlice(allocator: std.mem.Allocator, node: *RenderNode, count: usize) ![]*RenderNode {
@@ -590,7 +593,7 @@ fn moveNode(node: *RenderNode, x: f32, y: f32) void {
 /// Translates an already-laid-out retained subtree, including cached paint,
 /// caret, child, and damage geometry.
 pub fn translateNode(node: *RenderNode, dx: f32, dy: f32) void {
-    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    addPaintBounds(&node.damage, node.paintBounds());
     node.rect.x += dx;
     node.rect.y += dy;
     if (node.paint_bounds) |*bounds| {
@@ -598,7 +601,7 @@ pub fn translateNode(node: *RenderNode, dx: f32, dy: f32) void {
         bounds.y += dy;
     }
     if (node.caret_x) |caret_x| node.caret_x = caret_x + dx;
-    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    addPaintBounds(&node.damage, node.paintBounds());
     for (node.children) |child| translateNode(child, dx, dy);
 }
 
@@ -1098,11 +1101,11 @@ fn crossExtent(comptime kind: RenderNode.Kind, child: *const RenderNode) f32 {
 /// covered region. Returns whether the size actually changed.
 fn resizeNode(node: *RenderNode, width: f32, height: f32) bool {
     if (node.rect.width == width and node.rect.height == height) return false;
-    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    addPaintBounds(&node.damage, node.paintBounds());
     node.rect.width = width;
     node.rect.height = height;
     node.paint_bounds = node.derivePaintBounds();
-    node.damage = unionPaintBounds(node.damage, node.paintBounds());
+    addPaintBounds(&node.damage, node.paintBounds());
     return true;
 }
 
@@ -1526,7 +1529,7 @@ test "text paint overhang contributes to retained damage" {
 
     const expected: Rect = .{ .x = 4, .y = -6, .width = 48, .height = 48 };
     try std.testing.expectEqual(expected, text.paint_bounds.?);
-    try std.testing.expectEqual(expected, text.damage.?);
+    try std.testing.expectEqual(expected, text.damage.bounds().?);
 }
 
 test "changing a box shadow damages old and new overhangs" {
@@ -1548,7 +1551,7 @@ test "changing a box shadow damages old and new overhangs" {
         .box_shadow = new_shadow,
     });
 
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 2, .width = 30, .height = 26 }, box.damage.?);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 2, .width = 30, .height = 26 }, box.damage.bounds().?);
     try std.testing.expectEqual(Rect{ .x = 10, .y = 2, .width = 26, .height = 26 }, box.paint_bounds.?);
 }
 
@@ -1575,7 +1578,7 @@ test "removing an overflowing child damages its retained paint bounds" {
         .rect = parent.rect,
     });
 
-    try std.testing.expectEqual(child.rect, parent.damage.?);
+    try std.testing.expectEqual(child.rect, parent.damage.bounds().?);
     try std.testing.expectEqual(@as(?Rect, null), parent.paint_bounds);
 }
 

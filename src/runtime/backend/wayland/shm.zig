@@ -13,6 +13,68 @@ const linux = std.os.linux;
 const posix = std.posix;
 const wl = wayland.client.wl;
 
+const PixelRegion = struct {
+    clips: [keywork.DamageRegion.max_rects]TextRenderer.PixelClip = undefined,
+    len: u8 = 0,
+
+    fn slice(self: *const PixelRegion) []const TextRenderer.PixelClip {
+        return self.clips[0..self.len];
+    }
+
+    fn add(self: *PixelRegion, clip: TextRenderer.PixelClip) void {
+        if (clip.x0 >= clip.x1 or clip.y0 >= clip.y1) return;
+        var merged = clip;
+        var index: usize = 0;
+        while (index < self.len) {
+            const current = self.clips[index];
+            if (!clipsOverlapOrTouch(current, merged)) {
+                index += 1;
+                continue;
+            }
+            merged = unionClips(current, merged);
+            self.len -= 1;
+            self.clips[index] = self.clips[self.len];
+            index = 0;
+        }
+        if (self.len < self.clips.len) {
+            self.clips[self.len] = merged;
+            self.len += 1;
+            return;
+        }
+        var collapsed = merged;
+        for (self.slice()) |current| collapsed = unionClips(collapsed, current);
+        self.clips[0] = collapsed;
+        self.len = 1;
+    }
+
+    fn bounds(self: *const PixelRegion) ?TextRenderer.PixelClip {
+        if (self.len == 0) return null;
+        var result = self.clips[0];
+        for (self.slice()[1..]) |clip| result = unionClips(result, clip);
+        return result;
+    }
+
+    fn contains(self: *const PixelRegion, clip: TextRenderer.PixelClip) bool {
+        for (self.slice()) |current| {
+            if (clipContains(current, clip)) return true;
+        }
+        return false;
+    }
+};
+
+fn clipsOverlapOrTouch(a: TextRenderer.PixelClip, b: TextRenderer.PixelClip) bool {
+    return a.x0 < b.x1 and b.x0 < a.x1 and a.y0 < b.y1 and b.y0 < a.y1;
+}
+
+fn unionClips(a: TextRenderer.PixelClip, b: TextRenderer.PixelClip) TextRenderer.PixelClip {
+    return .{
+        .x0 = @min(a.x0, b.x0),
+        .y0 = @min(a.y0, b.y0),
+        .x1 = @max(a.x1, b.x1),
+        .y1 = @max(a.y1, b.y1),
+    };
+}
+
 const RendererAdapter = struct {
     pub const BackendResources = TextRenderer;
     pub const WindowResources = struct {
@@ -56,20 +118,28 @@ const RendererAdapter = struct {
         const width = try window.scaledFrameDimension(logical_width, protocol.scale);
         const height = try window.scaledFrameDimension(logical_height, protocol.scale);
         const buffer = try acquireBuffer(win, width, height);
-        const damage_clip = partialDamageClip(win, frame, buffer, width, height);
-        if (frame.partial_display_list and damage_clip == null) return error.PartialPaintUnavailable;
-        try raster.rasterize(&win.backend.renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, damage_clip);
+        const damage_region = partialDamageRegion(win, frame, buffer, width, height);
+        if (frame.partial_display_list and damage_region == null) return error.PartialPaintUnavailable;
+        if (damage_region) |region| {
+            for (region.slice()) |clip| {
+                try raster.rasterize(&win.backend.renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, clip);
+            }
+        } else {
+            try raster.rasterize(&win.backend.renderer, buffer.pixels(), width, height, protocol.scale, frame.display_list, null);
+        }
         win.renderer.last_rendered = buffer;
         win.renderer.last_rendered_scale = protocol.scale;
 
         try protocol.armFrameCallback();
         protocol.surface.attach(buffer.wl_buffer, 0, 0);
-        if (damage_clip) |clip| {
-            const x0: i32 = @max(0, clip.x0);
-            const y0: i32 = @max(0, clip.y0);
-            const x1: i32 = @min(@as(i32, width), clip.x1);
-            const y1: i32 = @min(@as(i32, height), clip.y1);
-            protocol.damagePixels(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
+        if (damage_region) |region| {
+            for (region.slice()) |clip| {
+                const x0: i32 = @max(0, clip.x0);
+                const y0: i32 = @max(0, clip.y0);
+                const x1: i32 = @min(@as(i32, width), clip.x1);
+                const y1: i32 = @min(@as(i32, height), clip.y1);
+                protocol.damagePixels(x0, y0, @max(0, x1 - x0), @max(0, y1 - y0));
+            }
         } else {
             protocol.damagePixels(0, 0, width, height);
         }
@@ -79,12 +149,13 @@ const RendererAdapter = struct {
         buffer.busy = true;
         win.renderer.frame_counter += 1;
         buffer.frame = win.renderer.frame_counter;
-        win.renderer.history.record(
-            win.renderer.frame_counter,
-            width,
-            height,
-            damage_clip orelse .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height },
-        );
+        var committed_region: PixelRegion = .{};
+        if (damage_region) |region| {
+            committed_region = region;
+        } else {
+            committed_region.add(.{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height });
+        }
+        win.renderer.history.record(win.renderer.frame_counter, width, height, committed_region);
         _ = win.backend.connection.display.flush();
         return true;
     }
@@ -98,7 +169,7 @@ const RendererAdapter = struct {
     }
 
     pub fn partialPaintBounds(win: anytype, size: keywork.Size, scale: f32, damage: []const keywork.Rect) !?keywork.Rect {
-        if (!win.protocol.configured or scale != win.protocol.scale or damage.len != 1) return null;
+        if (!win.protocol.configured or scale != win.protocol.scale or damage.len == 0) return null;
 
         const logical_width = try window.frameLogicalDimension(size.width, win.protocol.width);
         const logical_height = try window.frameLogicalDimension(size.height, win.protocol.height);
@@ -107,7 +178,9 @@ const RendererAdapter = struct {
         const last = win.renderer.last_rendered orelse return null;
         if (win.renderer.last_rendered_scale != scale or last.width != width or last.height != height) return null;
 
-        const clip = TextRenderer.PixelClip.fromRect(damage[0], scale);
+        var region: PixelRegion = .{};
+        for (damage) |rect| region.add(TextRenderer.PixelClip.fromRect(rect, scale));
+        const clip = region.bounds() orelse return null;
         if (clip.x0 >= clip.x1 or clip.y0 >= clip.y1) return null;
         if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
 
@@ -129,21 +202,23 @@ const RendererAdapter = struct {
     /// when a full redraw is required. Partial redraw needs the
     /// previous frame's content: either the acquired buffer already
     /// holds it, or it is copied over from the buffer that does.
-    fn partialDamageClip(win: anytype, frame: keywork.RenderBackend.Frame, buffer: *Buffer, width: u31, height: u31) ?TextRenderer.PixelClip {
-        if (frame.damage.len != 1) return null;
-        const clip = TextRenderer.PixelClip.fromRect(frame.damage[0], win.protocol.scale);
-        if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= width and clip.y1 >= height) return null;
+    fn partialDamageRegion(win: anytype, frame: keywork.RenderBackend.Frame, buffer: *Buffer, width: u31, height: u31) ?PixelRegion {
+        if (frame.damage.len == 0) return null;
+        var region: PixelRegion = .{};
+        for (frame.damage) |rect| region.add(TextRenderer.PixelClip.fromRect(rect, win.protocol.scale));
+        const bounds = region.bounds() orelse return null;
+        if (region.len == 1 and bounds.x0 <= 0 and bounds.y0 <= 0 and bounds.x1 >= width and bounds.y1 >= height) return null;
 
         const last = win.renderer.last_rendered orelse return null;
         if (win.renderer.last_rendered_scale != win.protocol.scale) return null;
-        if (last == buffer) return clip;
+        if (last == buffer) return region;
         if (last.width != width or last.height != height) return null;
         if (win.renderer.history.canRepair(buffer.frame, width, height)) {
-            repairRegions(buffer.pixels(), last.pixels(), width, height, win.renderer.history.entries[0..win.renderer.history.len], buffer.frame, clip);
+            repairRegions(buffer.pixels(), last.pixels(), width, height, win.renderer.history.entries[0..win.renderer.history.len], buffer.frame, region);
         } else {
             copyPixels(buffer.pixels(), last.pixels());
         }
-        return clip;
+        return region;
     }
 
     fn acquireBuffer(win: anytype, width: u31, height: u31) !*Buffer {
@@ -316,10 +391,10 @@ const DamageHistory = struct {
 
     const Entry = struct {
         frame: u64,
-        clip: TextRenderer.PixelClip,
+        region: PixelRegion,
     };
 
-    fn record(self: *DamageHistory, frame: u64, width: u31, height: u31, clip: TextRenderer.PixelClip) void {
+    fn record(self: *DamageHistory, frame: u64, width: u31, height: u31, region: PixelRegion) void {
         if (self.width != width or self.height != height) {
             self.len = 0;
             self.width = width;
@@ -329,7 +404,7 @@ const DamageHistory = struct {
         const count = @min(self.len + 1, capacity);
         var index = count - 1;
         while (index > 0) : (index -= 1) self.entries[index] = self.entries[index - 1];
-        self.entries[0] = .{ .frame = frame, .clip = clip };
+        self.entries[0] = .{ .frame = frame, .region = region };
         self.len = count;
     }
 
@@ -353,12 +428,14 @@ fn repairRegions(
     height: u31,
     entries: []const DamageHistory.Entry,
     buffer_frame: u64,
-    repaint: TextRenderer.PixelClip,
+    repaint: PixelRegion,
 ) void {
     for (entries) |entry| {
         if (entry.frame <= buffer_frame) break;
-        if (clipContains(repaint, entry.clip)) continue;
-        copyRegion(dst, src, width, height, entry.clip);
+        for (entry.region.slice()) |clip| {
+            if (repaint.contains(clip)) continue;
+            copyRegion(dst, src, width, height, clip);
+        }
     }
 }
 
@@ -448,7 +525,9 @@ test "damage history covers only retained consecutive frames" {
 
     var frame: u64 = 1;
     while (frame <= 10) : (frame += 1) {
-        history.record(frame, 4, 4, .{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 });
+        var region: PixelRegion = .{};
+        region.add(.{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 });
+        history.record(frame, 4, 4, region);
     }
     // Capacity 8: frames 3..10 retained, so buffers as old as frame 2
     // are repairable (their first missing frame is 3).
@@ -463,8 +542,12 @@ test "damage history covers only retained consecutive frames" {
 
 test "damage history resets when the frame size changes" {
     var history: DamageHistory = .{};
-    history.record(1, 4, 4, .{ .x0 = 0, .y0 = 0, .x1 = 4, .y1 = 4 });
-    history.record(2, 8, 8, .{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 });
+    var first: PixelRegion = .{};
+    first.add(.{ .x0 = 0, .y0 = 0, .x1 = 4, .y1 = 4 });
+    history.record(1, 4, 4, first);
+    var second: PixelRegion = .{};
+    second.add(.{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 });
+    history.record(2, 8, 8, second);
     try std.testing.expectEqual(@as(usize, 1), history.len);
     try std.testing.expect(!history.canRepair(2, 4, 4));
     try std.testing.expect(history.canRepair(2, 8, 8));
@@ -477,14 +560,20 @@ test "stale buffer repair copies only interim damage" {
     for (&src, 0..) |*pixel, index| pixel.* = @intCast(index + 100);
     var dst: [width * height]u32 = @splat(0);
 
+    var bottom: PixelRegion = .{};
+    bottom.add(.{ .x0 = 0, .y0 = 3, .x1 = 4, .y1 = 4 });
+    var middle: PixelRegion = .{};
+    middle.add(.{ .x0 = 1, .y0 = 1, .x1 = 3, .y1 = 2 });
+    var top: PixelRegion = .{};
+    top.add(.{ .x0 = 0, .y0 = 0, .x1 = 4, .y1 = 1 });
     const entries = [_]DamageHistory.Entry{
-        .{ .frame = 5, .clip = .{ .x0 = 0, .y0 = 3, .x1 = 4, .y1 = 4 } },
-        .{ .frame = 4, .clip = .{ .x0 = 1, .y0 = 1, .x1 = 3, .y1 = 2 } },
-        .{ .frame = 3, .clip = .{ .x0 = 0, .y0 = 0, .x1 = 4, .y1 = 1 } },
+        .{ .frame = 5, .region = bottom },
+        .{ .frame = 4, .region = middle },
+        .{ .frame = 3, .region = top },
     };
     // Buffer last held frame 3, so frames 4 and 5 are missing. The
     // current repaint covers frame 5's clip, leaving only frame 4's.
-    repairRegions(&dst, &src, width, height, &entries, 3, .{ .x0 = 0, .y0 = 3, .x1 = 4, .y1 = 4 });
+    repairRegions(&dst, &src, width, height, &entries, 3, bottom);
 
     const expected = [width * height]u32{
         0, 0,   0,   0,
@@ -493,6 +582,23 @@ test "stale buffer repair copies only interim damage" {
         0, 0,   0,   0,
     };
     try std.testing.expectEqualSlices(u32, &expected, &dst);
+}
+
+test "stale buffer repair does not mistake a damage bounding box for its region" {
+    const width: u31 = 5;
+    const height: u31 = 1;
+    const src = [width * height]u32{ 10, 11, 12, 13, 14 };
+    var dst: [width * height]u32 = @splat(0);
+
+    var historical: PixelRegion = .{};
+    historical.add(.{ .x0 = 2, .y0 = 0, .x1 = 3, .y1 = 1 });
+    const entries = [_]DamageHistory.Entry{.{ .frame = 2, .region = historical }};
+    var repaint: PixelRegion = .{};
+    repaint.add(.{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 });
+    repaint.add(.{ .x0 = 4, .y0 = 0, .x1 = 5, .y1 = 1 });
+
+    repairRegions(&dst, &src, width, height, &entries, 1, repaint);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 12, 0, 0 }, &dst);
 }
 
 test "copyRegion clamps out-of-bounds clips" {

@@ -27,6 +27,7 @@ const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_net = @import("net.zig");
 const lua_pipewire = @import("pipewire.zig");
+const lua_pixel_buffer = @import("pixel_buffer.zig");
 const lua_socket = @import("socket.zig");
 const lua_storybook = @import("storybook.zig");
 const lua_task = @import("task.zig");
@@ -111,6 +112,7 @@ pub const App = struct {
     varlink_host: lua_varlink.Host = undefined,
     loop_host: lua_loop.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
+    pixel_buffer_host: lua_pixel_buffer.Host = undefined,
     socket_host: lua_socket.Host = undefined,
     net_host: lua_net.Host = undefined,
     curl_runtime: ?*lua_curl.Runtime = null,
@@ -1465,6 +1467,12 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     c.lua_setfield(lua_state, keywork_table, "clipboard");
     pushSessionLockNamespace(lua_state, app);
     c.lua_setfield(lua_state, keywork_table, "session_lock");
+    app.pixel_buffer_host = .{
+        .ptr = app,
+        .allocator_fn = hostAllocator,
+        .invalidate_fn = loopHostInvalidate,
+    };
+    lua_pixel_buffer.install(lua_state, keywork_table, &app.pixel_buffer_host);
     installWindowOperations(lua_state, keywork_table, app);
     return 1;
 }

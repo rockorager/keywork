@@ -730,6 +730,18 @@ function ui.image(options)
     }
 end
 
+ui.pixel_buffer = setmetatable({}, {
+    __call = function(_, options)
+        options = validate(options, { buffer=true, width=true, height=true }, "pixel_buffer")
+        return {
+            type = "pixel_buffer",
+            buffer = options.buffer,
+            width = options.width,
+            height = options.height,
+        }
+    end,
+})
+
 function ui.icon(options)
     options = validate(options, { name=true, size=true, color=true, symbolic=true }, "icon")
     return {

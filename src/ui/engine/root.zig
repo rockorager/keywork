@@ -772,14 +772,14 @@ test "backend capability gates damage-only display lists" {
     try runtime.repaint();
 
     const right = runtime.root.?.children[1];
-    right.damage = right.rect;
+    right.damage.add(right.rect);
     try runtime.repaint();
     try std.testing.expect(!backend.last_partial);
     try std.testing.expectEqual(@as(usize, 1), backend.left_fills);
     try std.testing.expectEqual(@as(usize, 1), backend.right_fills);
 
     backend.allow_partial = true;
-    right.damage = right.rect;
+    right.damage.add(right.rect);
     try runtime.repaint();
     try std.testing.expect(backend.last_partial);
     try std.testing.expectEqual(@as(usize, 0), backend.left_fills);
@@ -1564,15 +1564,17 @@ test "present damage covers every display-list change during fast wheel scroll" 
             return entries;
         }
 
-        fn checkCovered(self: *@This(), entry: Entry, damage: keywork.Rect, side: []const u8) void {
+        fn checkCovered(self: *@This(), entry: Entry, damage: []const keywork.Rect, side: []const u8) void {
             const effective = if (entry.clip) |clip| entry.rect.intersect(clip) else entry.rect;
             if (effective.isEmpty()) return;
             const epsilon = 0.01;
-            const covered = damage.x <= effective.x + epsilon and
-                damage.y <= effective.y + epsilon and
-                damage.x + damage.width >= effective.x + effective.width - epsilon and
-                damage.y + damage.height >= effective.y + effective.height - epsilon;
-            if (covered) return;
+            for (damage) |rect| {
+                const covered = rect.x <= effective.x + epsilon and
+                    rect.y <= effective.y + epsilon and
+                    rect.x + rect.width >= effective.x + effective.width - epsilon and
+                    rect.y + rect.height >= effective.y + effective.height - epsilon;
+                if (covered) return;
+            }
             self.violations += 1;
             std.debug.print(
                 "present {d}: {s} {t} \"{s}\" at {any} (clip {any}) outside damage {any}\n",
@@ -1585,8 +1587,7 @@ test "present damage covers every display-list change during fast wheel scroll" 
             self.presents += 1;
             var current = try snapshot(self.allocator, frame.display_list);
             errdefer freeEntries(self.allocator, &current);
-            try std.testing.expectEqual(@as(usize, 1), frame.damage.len);
-            const damage = frame.damage[0];
+            try std.testing.expect(frame.damage.len > 0);
 
             if (self.presents > 1) {
                 const matched = try self.allocator.alloc(bool, self.prev.items.len);
@@ -1599,11 +1600,11 @@ test "present damage covers every display-list change during fast wheel scroll" 
                     if (found) |index| {
                         matched[index] = true;
                     } else {
-                        self.checkCovered(entry, damage, "new");
+                        self.checkCovered(entry, frame.damage, "new");
                     }
                 }
                 for (self.prev.items, 0..) |old, index| {
-                    if (!matched[index]) self.checkCovered(old, damage, "vacated");
+                    if (!matched[index]) self.checkCovered(old, frame.damage, "vacated");
                 }
             }
 

@@ -4,6 +4,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const display = @import("display.zig");
 const animation = @import("animation.zig");
+const damage_region = @import("damage_region.zig");
 
 pub const Color = types.Color;
 pub const ShadowLayer = types.ShadowLayer;
@@ -21,6 +22,7 @@ pub const FocusNode = types.FocusNode;
 pub const Size = types.Size;
 pub const Point = types.Point;
 pub const Rect = types.Rect;
+pub const DamageRegion = damage_region.DamageRegion;
 pub const EdgeInsets = types.EdgeInsets;
 pub const Constraints = types.Constraints;
 pub const KeyInput = types.KeyInput;
@@ -744,6 +746,10 @@ pub const Widget = union(enum) {
             /// Paint commands must stay within `context.rect`; partial frame
             /// generation uses that rect as the render object's paint bound.
             paint: *const fn (ptr: *const anyopaque, context: PaintContext) anyerror!void,
+            /// Reports the pixels changed between two retained instances.
+            /// Implementations append widget-local rectangles translated into
+            /// `rect`; omitting this callback conservatively damages `rect`.
+            damage: ?*const fn (old_ptr: *const anyopaque, new_ptr: *const anyopaque, rect: Rect, result: *DamageRegion) void = null,
             hit_test: ?*const fn (ptr: *const anyopaque, rect: Rect, point: Point) ?[]const u8 = null,
         };
 
@@ -1090,9 +1096,12 @@ pub const RenderNode = struct {
     /// separately from `rect` because descendants and glyphs may overhang
     /// layout geometry. Viewports clip it to their rect.
     paint_bounds: ?Rect = null,
-    /// Union of this node's previous and current bounds accumulated since
-    /// the damage was last collected; null when the node has not changed.
-    damage: ?Rect = null,
+    /// Paint damage accumulated since the last collection. A bounded region
+    /// preserves normal disjoint updates without per-node allocations.
+    damage: DamageRegion = .{},
+    /// Render-object damage can be computed while both old and new widget
+    /// payloads are alive, before the old retained widget is destroyed.
+    paint_damage_precomputed: bool = false,
     /// Child nodes are owned by the corresponding child elements; this
     /// slice only borrows them and is refreshed on every layout.
     children: []*RenderNode = &.{},
@@ -2699,7 +2708,23 @@ fn replaceElementWidgetThemed(allocator: std.mem.Allocator, element: *Element, w
 
 fn markElementWidgetDirtyIfChanged(element: *Element, widget: Widget) void {
     if (!widgetLayoutEqual(element.widget, widget)) markElementLayoutDirty(element);
-    if (!widgetPaintEqual(element.widget, widget)) markElementPaintDirty(element);
+    if (!widgetPaintEqual(element.widget, widget)) {
+        if (element.render_node) |node| {
+            switch (element.widget) {
+                .render_object => |old_object| switch (widget) {
+                    .render_object => |new_object| if (old_object.vtable == new_object.vtable) {
+                        if (new_object.vtable.damage) |damage| {
+                            damage(old_object.ptr, new_object.ptr, node.rect, &node.damage);
+                            node.paint_damage_precomputed = true;
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        markElementPaintDirty(element);
+    }
 }
 
 fn markElementPaintDirty(element: *Element) void {
@@ -3333,6 +3358,7 @@ const markElementLayoutDirty = layout_model.markElementLayoutDirty;
 const addRenderDamage = layout_model.addDamage;
 const constrainSized = layout_model.constrainSized;
 pub const collectDamage = layout_model.collectDamage;
+pub const collectDamageRegion = layout_model.collectDamageRegion;
 pub const translateNode = layout_model.translateNode;
 
 var test_callback_state: u8 = 0;
