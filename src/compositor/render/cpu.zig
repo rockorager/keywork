@@ -360,7 +360,9 @@ fn drawShadow(
     shadow: render_types.Shadow,
     damage: ?[]const render_types.Rect,
 ) Error!void {
-    if (shadow.rect.width == 0 or shadow.rect.height == 0 or shadow.color.alpha == 0) return;
+    const bottom_color = shadow.bottom_color orelse shadow.color;
+    if (shadow.rect.width == 0 or shadow.rect.height == 0 or
+        (shadow.color.alpha == 0 and bottom_color.alpha == 0)) return;
 
     const spread: i64 = shadow.spread;
     const shape_x = @as(i64, shadow.rect.x) - spread;
@@ -417,14 +419,7 @@ fn drawShadow(
             .radius = @floatFromInt(cutout_radius),
         } else null,
     };
-    const color: pixman.pixman_color_t = .{
-        .red = expand(shadow.color.red),
-        .green = expand(shadow.color.green),
-        .blue = expand(shadow.color.blue),
-        .alpha = expand(shadow.color.alpha),
-    };
-    const source = pixman.pixman_image_create_solid_fill(&color) orelse
-        return error.OutOfMemory;
+    const source = try createShadowSource(shadow, shape_y, shape_height);
     defer _ = pixman.pixman_image_unref(source);
     const cutout_interior = if (shadow.cutout) |cutout|
         rect_region.roundedRectInterior(cutout.rect, cutout_radius)
@@ -438,6 +433,73 @@ fn drawShadow(
     } else {
         try drawShadowDamage(destination, source, raster, composite_rect, cutout_interior);
     }
+}
+
+fn createShadowSource(
+    shadow: render_types.Shadow,
+    shape_y: i64,
+    shape_height: i64,
+) Error!*pixman.pixman_image_t {
+    const top = pixmanColor(shadow.color);
+    const bottom_color = shadow.bottom_color orelse
+        return pixman.pixman_image_create_solid_fill(&top) orelse error.OutOfMemory;
+    const start_y = pixmanFixed(shape_y) orelse
+        return pixman.pixman_image_create_solid_fill(&top) orelse error.OutOfMemory;
+    const end_y = pixmanFixed(shape_y + shape_height) orelse
+        return pixman.pixman_image_create_solid_fill(&top) orelse error.OutOfMemory;
+    const bottom = straightPixmanColor(bottom_color);
+    const start: pixman.pixman_point_fixed_t = .{
+        .x = 0,
+        .y = start_y,
+    };
+    const end: pixman.pixman_point_fixed_t = .{
+        .x = 0,
+        .y = end_y,
+    };
+    const stops = [_]pixman.pixman_gradient_stop_t{
+        .{ .x = 0, .color = straightPixmanColor(shadow.color) },
+        .{ .x = 1 << 16, .color = bottom },
+    };
+    const source = pixman.pixman_image_create_linear_gradient(
+        &start,
+        &end,
+        &stops,
+        stops.len,
+    ) orelse return error.OutOfMemory;
+    pixman.pixman_image_set_repeat(source, pixman.PIXMAN_REPEAT_PAD);
+    return source;
+}
+
+fn pixmanColor(color: render_types.Color) pixman.pixman_color_t {
+    return .{
+        .red = expand(color.red),
+        .green = expand(color.green),
+        .blue = expand(color.blue),
+        .alpha = expand(color.alpha),
+    };
+}
+
+fn straightPixmanColor(color: render_types.Color) pixman.pixman_color_t {
+    if (color.alpha == 0) return .{ .red = 0, .green = 0, .blue = 0, .alpha = 0 };
+    const alpha: u32 = color.alpha;
+    return .{
+        .red = unpremultiplyPixmanComponent(color.red, alpha),
+        .green = unpremultiplyPixmanComponent(color.green, alpha),
+        .blue = unpremultiplyPixmanComponent(color.blue, alpha),
+        .alpha = expand(color.alpha),
+    };
+}
+
+fn unpremultiplyPixmanComponent(component: u8, alpha: u32) u16 {
+    const straight = (@as(u32, expand(component)) * 255 + alpha / 2) / alpha;
+    return @intCast(@min(straight, std.math.maxInt(u16)));
+}
+
+fn pixmanFixed(value: i64) ?pixman.pixman_fixed_t {
+    const scaled = std.math.mul(i64, value, 1 << 16) catch return null;
+    if (scaled < std.math.minInt(pixman.pixman_fixed_t) or
+        scaled > std.math.maxInt(pixman.pixman_fixed_t)) return null;
+    return @intCast(scaled);
 }
 
 const ShadowRaster = struct {
@@ -533,8 +595,8 @@ fn drawShadowRect(
         source,
         mask,
         destination,
-        0,
-        0,
+        rect.x,
+        rect.y,
         0,
         0,
         rect.x,
@@ -1666,6 +1728,76 @@ test "CPU renderer draws blurred rounded shadows" {
     try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(5, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));
+}
+
+test "CPU renderer interpolates shadow colors continuously from top to bottom" {
+    const size: render_types.Size = .{ .width = 3, .height = 6 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = size.height },
+            .corner_radius = 0,
+            .blur_radius = 0,
+            .spread = 0,
+            .color = render_types.Color.rgba(255, 0, 0, 255),
+            .bottom_color = render_types.Color.rgba(0, 0, 255, 255),
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    var previous_red: u8 = 255;
+    var previous_blue: u8 = 0;
+    for (0..size.height) |y| {
+        const pixel = output.pixel(1, @intCast(y));
+        const red: u8 = @truncate(pixel >> 16);
+        const blue: u8 = @truncate(pixel);
+        try std.testing.expect(red < previous_red);
+        try std.testing.expect(blue > previous_blue);
+        try std.testing.expectEqual(@as(u8, 255), @as(u8, @truncate(pixel >> 24)));
+        previous_red = red;
+        previous_blue = blue;
+    }
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(0, 3));
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(2, 3));
+}
+
+test "CPU shadow gradients preserve premultiplied translucent colors" {
+    const size: render_types.Size = .{ .width = 1, .height = 4 };
+    const color = render_types.Color.rgba(255, 64, 0, 128);
+    const solid_commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = size.height },
+            .corner_radius = 0,
+            .blur_radius = 0,
+            .spread = 0,
+            .color = color,
+        } },
+    };
+    const gradient_commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = size.height },
+            .corner_radius = 0,
+            .blur_radius = 0,
+            .spread = 0,
+            .color = color,
+            .bottom_color = color,
+        } },
+    };
+    var solid = try headless.init(std.testing.allocator, size);
+    defer solid.deinit();
+    var gradient = try headless.init(std.testing.allocator, size);
+    defer gradient.deinit();
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+
+    try renderer.render(.{ .size = size, .commands = &solid_commands }, solid.target());
+    try renderer.render(.{ .size = size, .commands = &gradient_commands }, gradient.target());
+    try std.testing.expectEqualSlices(u32, solid.target().pixels, gradient.target().pixels);
 }
 
 test "CPU renderer cuts the rounded window interior out of shadows" {

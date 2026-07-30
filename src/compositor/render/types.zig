@@ -484,7 +484,10 @@ pub const Shadow = struct {
     corner_radius: u32,
     blur_radius: u32,
     spread: i32,
+    /// Top color. When `bottom_color` is set, the renderer interpolates between
+    /// the two colors over the shadow shape's full vertical extent.
     color: Color,
+    bottom_color: ?Color = null,
     cutout: ?RoundedClip = null,
     clip: ?Rect = null,
 };

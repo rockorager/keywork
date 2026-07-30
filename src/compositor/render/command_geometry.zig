@@ -141,7 +141,10 @@ pub fn visibleRect(command: render.Command, frame_size: render.Size) ?render.Rec
 }
 
 fn shadowVisibleRect(shadow: render.Shadow, frame_size: render.Size) ?render.Rect {
-    if (shadow.color.alpha == 0 or shadow.rect.width == 0 or shadow.rect.height == 0) {
+    const bottom_color = shadow.bottom_color orelse shadow.color;
+    if ((shadow.color.alpha == 0 and bottom_color.alpha == 0) or
+        shadow.rect.width == 0 or shadow.rect.height == 0)
+    {
         return null;
     }
     const spread: i64 = shadow.spread;

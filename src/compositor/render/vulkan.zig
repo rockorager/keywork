@@ -6305,7 +6305,10 @@ fn compileDrawRuns(
             }
         },
         .shadow => |shadow| {
-            if (shadow.color.alpha == 0 or shadow.rect.width == 0 or shadow.rect.height == 0) {
+            const bottom_color = shadow.bottom_color orelse shadow.color;
+            if ((shadow.color.alpha == 0 and bottom_color.alpha == 0) or
+                shadow.rect.width == 0 or shadow.rect.height == 0)
+            {
                 continue;
             }
             const spread: i64 = shadow.spread;
@@ -6341,7 +6344,7 @@ fn compileDrawRuns(
             );
             const instance: Instance = .{
                 .destination = rectFloats(cutout.rect),
-                .source = .{ 0, 0, 1, 1 },
+                .source = color_math.linearColor(bottom_color, output_color_description),
                 .clip = undefined,
                 .color = color_math.linearColor(shadow.color, output_color_description),
                 .rounded = .{

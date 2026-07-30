@@ -84,15 +84,39 @@ fn fullBorder(borders: Scene.Borders) bool {
         borders.edges.left and borders.edges.right;
 }
 
+fn mixBorderColor(color: render.Color, target: u8, amount: u8) render.Color {
+    std.debug.assert(color.red <= color.alpha);
+    std.debug.assert(color.green <= color.alpha);
+    std.debug.assert(color.blue <= color.alpha);
+    return .{
+        .red = mixColorComponent(color.red, target, amount),
+        .green = mixColorComponent(color.green, target, amount),
+        .blue = mixColorComponent(color.blue, target, amount),
+        .alpha = color.alpha,
+    };
+}
+
+fn mixColorComponent(component: u8, target: u8, amount: u8) u8 {
+    if (component == target or amount == 0) return component;
+    if (component < target) {
+        const distance: u16 = target - component;
+        const adjustment = (distance * amount + 127) / 255;
+        return component + @as(u8, @intCast(adjustment));
+    }
+    const distance: u16 = component - target;
+    const adjustment = (distance * amount + 127) / 255;
+    return component - @as(u8, @intCast(adjustment));
+}
+
 /// Emits the draw commands for one window border into `commands`.
 ///
-/// A border enclosing all four edges becomes a single rounded-rect frame whose
-/// thickness comes from `spread`. That keeps the thickness uniform under
-/// fractional output scaling: `spread` is rounded to device pixels exactly
-/// once, whereas four independent rects round each edge on its own and differ
-/// by a pixel depending on where the window sits on the pixel grid. The frame's
-/// outer corners are `corner_radius + width`, so a square window still gets
-/// slightly rounded outer corners.
+/// A border enclosing all four edges becomes one rounded-rect frame with a
+/// continuous vertical gradient. Its thickness stays uniform under fractional
+/// output scaling because `spread` is rounded to device pixels exactly once;
+/// four independent edge rects would each round differently depending on where
+/// the window sits on the pixel grid. The frame's outer corners are
+/// `corner_radius + width`, so a square window still gets slightly rounded
+/// outer corners.
 ///
 /// Partial borders fall back to one solid rect per edge and inherit that
 /// per-edge rounding. Every returned command is clipped to `clip`.
@@ -110,7 +134,8 @@ pub fn makeBorderCommands(
             .corner_radius = corner_radius,
             .blur_radius = 0,
             .spread = @intCast(width),
-            .color = borders.color,
+            .color = mixBorderColor(borders.color, borders.color.alpha, 160),
+            .bottom_color = borders.color,
             .cutout = .{ .rect = content_rect, .radius = corner_radius },
             .clip = clip,
         } };
@@ -310,6 +335,8 @@ test "window borders occupy only requested exterior edges and corners" {
         .height = 54,
     }, result[2].solid_rect.rect);
     try std.testing.expectEqual(color, result[0].solid_rect.color);
+    try std.testing.expectEqual(color, result[1].solid_rect.color);
+    try std.testing.expectEqual(color, result[2].solid_rect.color);
     try std.testing.expectEqual(render.Rect{
         .x = 0,
         .y = 0,
@@ -338,8 +365,17 @@ test "window border follows rounded content corners" {
     try std.testing.expectEqual(@as(u32, 12), border.corner_radius);
     try std.testing.expectEqual(@as(u32, 0), border.blur_radius);
     try std.testing.expectEqual(@as(i32, 4), border.spread);
+    try std.testing.expectEqual(
+        render.Color{ .red = 0xd0, .green = 0xb8, .blue = 0xac, .alpha = 0xff },
+        border.color,
+    );
+    try std.testing.expectEqual(
+        render.Color{ .red = 0x80, .green = 0x40, .blue = 0x20, .alpha = 0xff },
+        border.bottom_color.?,
+    );
     try std.testing.expectEqual(content, border.cutout.?.rect);
     try std.testing.expectEqual(@as(u32, 12), border.cutout.?.radius);
+    try std.testing.expectEqual(@as(?render.Rect, null), border.clip);
     try std.testing.expect(pointInBorderCommand(50, 18, result[0]));
     try std.testing.expect(pointInBorderCommand(12, 22, result[0]));
     try std.testing.expect(!pointInBorderCommand(7, 17, result[0]));

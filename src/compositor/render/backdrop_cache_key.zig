@@ -44,6 +44,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashScalar(hasher, shadow.blur_radius);
             hashScalar(hasher, shadow.spread);
             hashColor(hasher, shadow.color);
+            hashOptionalColor(hasher, shadow.bottom_color);
             hashOptionalRoundedClip(hasher, shadow.cutout);
             hashOptionalRect(hasher, shadow.clip);
         },
@@ -127,6 +128,15 @@ fn hashColor(hasher: *std.hash.Wyhash, color: render.Color) void {
     hashScalar(hasher, color.green);
     hashScalar(hasher, color.blue);
     hashScalar(hasher, color.alpha);
+}
+
+fn hashOptionalColor(hasher: *std.hash.Wyhash, color: ?render.Color) void {
+    if (color) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashColor(hasher, present);
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
 }
 
 fn hashBackdropBlurFinish(hasher: *std.hash.Wyhash, finish: render.BackdropBlurFinish) void {

@@ -13,6 +13,7 @@ layout(push_constant) uniform Push {
 } pc;
 layout(location=0) in vec2 pixel;
 layout(location=1) flat in vec4 dest;
+layout(location=2) flat in vec4 bottom_color;
 layout(location=3) flat in vec4 color;
 layout(location=4) flat in vec4 rounded;
 layout(location=5) flat in vec4 parameters;
@@ -59,7 +60,8 @@ void main() {
     float cutout=parameters.w>0.5 ? 1.0-roundedRectCoverage(pixel,dest,parameters.z) : 1.0;
     if (cutout<=0.0) discard;
     float coverage=parameters.y>0.0 ? roundedBoxShadow(rounded.xy,rounded.xy+rounded.zw,pixel,parameters.y*0.5,parameters.x) : roundedRectCoverage(pixel,rounded,parameters.x);
-    vec4 shaded=color*coverage;
+    float gradient_position=clamp((pixel.y-rounded.y)/rounded.w,0.0,1.0);
+    vec4 shaded=mix(color,bottom_color,gradient_position)*coverage;
     shaded*=cutout;
     out_color=shaded;
 }
