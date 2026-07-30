@@ -2000,10 +2000,12 @@ test "CPU renderer damage-scoped shadows match a full render" {
     for (0..size.height) |y| for (0..size.width) |x| {
         const damaged = (x >= 1 and x < 3 and y >= 1 and y < 4) or
             (x >= 8 and x < 10 and y >= 5 and y < 8);
+        const pixel_x: u32 = @intCast(x);
+        const pixel_y: u32 = @intCast(y);
         if (damaged) {
-            try std.testing.expectEqual(expected.pixel(x, y), actual.pixel(x, y));
+            try std.testing.expectEqual(expected.pixel(pixel_x, pixel_y), actual.pixel(pixel_x, pixel_y));
         } else {
-            try std.testing.expectEqual(@as(u32, 0), actual.pixel(x, y));
+            try std.testing.expectEqual(@as(u32, 0), actual.pixel(pixel_x, pixel_y));
         }
     };
 }
