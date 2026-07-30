@@ -2,25 +2,22 @@ local kw = require("keywork")
 local dbus = require("keywork.dbus")
 local log = require("keywork.log")
 local loop = require("keywork.loop")
-local process = require("keywork.process")
 local service = require("keywork.service")
 local util = require("shell.bar.util")
 
-local trim = util.trim
 local label = util.label
 local status_pill = util.status_pill
 
 local DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
-local DBUS_OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 
-local IWD = "net.connman.iwd"
-local IWD_STATION = "net.connman.iwd.Station"
-local IWD_NETWORK = "net.connman.iwd.Network"
-local IWD_AGENT = "net.connman.iwd.SignalLevelAgent"
-local IWD_AGENT_PATH = "/dev/keywork/bar/SignalLevelAgent"
--- dBm thresholds aligned with the 80/60/40/20 percent icon buckets.
-local IWD_SIGNAL_LEVELS = { -60, -70, -80, -90 }
-local IWD_LEVEL_PERCENT = { 90, 70, 50, 30, 10 }
+local NETWORK_MANAGER = "org.freedesktop.NetworkManager"
+local NETWORK_MANAGER_PATH = "/org/freedesktop/NetworkManager"
+local NM_DEVICE = "org.freedesktop.NetworkManager.Device"
+local NM_WIRELESS = "org.freedesktop.NetworkManager.Device.Wireless"
+local NM_ACCESS_POINT = "org.freedesktop.NetworkManager.AccessPoint"
+local NM_SETTINGS_CONNECTION = "org.freedesktop.NetworkManager.Settings.Connection"
+local NM_DEVICE_TYPE_WIFI = 2
+local NM_DEVICE_STATE_ACTIVATED = 100
 
 local function wifi_signal_icon(percent)
     if percent >= 80 then
@@ -33,10 +30,6 @@ local function wifi_signal_icon(percent)
         return "network-wireless-signal-weak"
     end
     return "network-wireless-signal-none"
-end
-
-local function dbm_to_percent(dbm)
-    return math.max(0, math.min(100, (dbm + 100) * 2))
 end
 
 local function pill_from_values(palette, operstate, essid, percent, on_activate)
@@ -127,392 +120,404 @@ local WifiMenu = kw.stateful({
     end,
 })
 
-local SHELL_NETWORK_SCRIPT = [==[
-iface=$(ls /sys/class/net 2>/dev/null | grep -E '^wl|^wlan' | head -n1)
-if [ -z "$iface" ]; then
-  printf 'down\n\n0\n'
-  exit 0
-fi
-operstate=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || printf 'down')
-essid=''
-dbm=''
-if command -v iw >/dev/null 2>&1; then
-  link=$(iw dev "$iface" link 2>/dev/null)
-  essid=$(printf '%s\n' "$link" | sed -n 's/^[[:space:]]*SSID: //p' | head -n1)
-  dbm=$(printf '%s\n' "$link" | sed -n 's/^[[:space:]]*signal: \(-\{0,1\}[0-9]\{1,\}\) dBm.*/\1/p' | head -n1)
-elif command -v iwctl >/dev/null 2>&1; then
-  show=$(iwctl station "$iface" show 2>/dev/null)
-  essid=$(printf '%s\n' "$show" | sed -n 's/^[[:space:]]*Connected network[[:space:]]*//p' | head -n1 | sed 's/[[:space:]]*$//')
-  dbm=$(printf '%s\n' "$show" | sed -n 's/^[[:space:]]*RSSI[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\) dBm.*/\1/p' | head -n1)
-elif command -v iwgetid >/dev/null 2>&1; then
-  essid=$(iwgetid -r 2>/dev/null || true)
-fi
-if [ -n "$dbm" ]; then
-  quality=$(( (dbm + 100) * 2 ))
-  [ "$quality" -gt 100 ] && quality=100
-  [ "$quality" -lt 0 ] && quality=0
-else
-  quality=$(awk -v iface="$iface:" '$1 == iface { printf "%d", ($3 * 100 / 70 + 0.5) }' /proc/net/wireless 2>/dev/null)
-fi
-printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
-]==]
-
 local network_service = service.define("shell.bar.network", function(self)
     -- Published connection snapshot; percent stays nil until known so the
     -- pill can fall back to its optimistic guess.
     local st = { operstate = "down", essid = "", percent = nil }
 
-    ---@type { bus: keywork.dbus.Bus?, station: string?, percent: number?, refresh: function? }
-    local net = { bus = nil, station = nil, percent = nil }
+    ---@type { bus: keywork.dbus.Bus?, device: string?, last_scan: number?, scanning: boolean, scan_generation: integer, refresh: function? }
+    local net = { bus = nil, device = nil, last_scan = nil, scanning = false, scan_generation = 0 }
+    local commands = {}
+
+    local function publish()
+        local available = net.bus ~= nil and net.device ~= nil
+        self:publish({
+            operstate = st.operstate,
+            essid = st.essid,
+            percent = st.percent,
+            scan = available and commands.scan or nil,
+            list = available and commands.list or nil,
+            connect = available and commands.connect or nil,
+        })
+    end
+
+    local function get_all(path, interface, timeout_ms)
+        local reply, err = assert(net.bus):call({
+            destination = NETWORK_MANAGER,
+            path = path,
+            interface = DBUS_PROPERTIES,
+            member = "GetAll",
+            args = { interface },
+            timeout_ms = timeout_ms,
+        })
+        if not reply then
+            return nil, err
+        end
+        return (reply.args or {})[1] or {}
+    end
 
     -- Commands published with the snapshot. They are plain closures over the
     -- service's bus and run on the caller's task, so a disposed widget
     -- abandons its own in-flight calls.
 
     local function scan()
-        if not net.bus or not net.station then
-            return
+        local bus, device = net.bus, net.device
+        if not bus or not device then
+            return nil, "NetworkManager unavailable"
         end
-        -- Errors here are usually "already scanning"; the results land via
-        -- the Scanning PropertiesChanged signal either way.
-        net.bus:call({
-            destination = IWD,
-            path = net.station,
-            interface = IWD_STATION,
-            member = "Scan",
+
+        net.scanning = true
+        net.scan_generation = net.scan_generation + 1
+        local generation = net.scan_generation
+        publish()
+        local reply, err = bus:call({
+            destination = NETWORK_MANAGER,
+            path = device,
+            interface = NM_WIRELESS,
+            member = "RequestScan",
+            args = { dbus.array("{sv}", {}) },
             timeout_ms = 2000,
         })
+        if not reply then
+            net.scanning = false
+            publish()
+            return nil, err
+        end
+
+        -- NetworkManager reports completion by changing LastScan. Bound the
+        -- indicator in case a driver accepts the request but never completes.
+        self.scope:spawn(function()
+            local timer = loop.timer({ delay = 15.0 })
+            for _ in timer:ticks() do
+                if net.scanning and net.scan_generation == generation then
+                    net.scanning = false
+                    publish()
+                end
+            end
+        end)
+        return reply
     end
 
     -- Returns { networks, scanning } or nil on transient D-Bus failures so
     -- callers can retain their last good snapshot.
     local function list()
-        local bus, station = net.bus, net.station
-        if not bus or not station then
+        local bus, device = net.bus, net.device
+        if not bus or not device then
             return nil
         end
-        local ordered_reply, ordered_err = bus:call({
-            destination = IWD,
-            path = station,
-            interface = IWD_STATION,
-            member = "GetOrderedNetworks",
+
+        local device_props, device_err = get_all(device, NM_DEVICE, 2000)
+        if not device_props then
+            log.warn("NetworkManager device properties failed", device_err or "unknown")
+            return nil
+        end
+        local wireless_props, wireless_err = get_all(device, NM_WIRELESS, 2000)
+        if not wireless_props then
+            log.warn("NetworkManager wireless properties failed", wireless_err or "unknown")
+            return nil
+        end
+
+        local access_points_reply, access_points_err = bus:call({
+            destination = NETWORK_MANAGER,
+            path = device,
+            interface = NM_WIRELESS,
+            member = "GetAllAccessPoints",
             timeout_ms = 3000,
         })
-        if not ordered_reply then
-            log.warn("iwd GetOrderedNetworks failed", ordered_err or "unknown")
+        if not access_points_reply then
+            log.warn("NetworkManager GetAllAccessPoints failed", access_points_err or "unknown")
             return nil
         end
-        -- Get all network metadata in one call instead of issuing a GetAll for
-        -- every row. GetOrderedNetworks is still needed for order and strength.
-        local managed_reply, managed_err = bus:call({
-            destination = IWD,
-            path = "/",
-            interface = DBUS_OBJECT_MANAGER,
-            member = "GetManagedObjects",
-            timeout_ms = 3000,
-        })
-        if not managed_reply then
-            log.warn("iwd GetManagedObjects failed", managed_err or "unknown")
-            return nil
-        end
-        local scanning = false
-        ---@type table<string, table?>
-        local network_props = {}
-        for path, interfaces in pairs((managed_reply.args or {})[1] or {}) do
-            if path == station and interfaces[IWD_STATION] then
-                scanning = interfaces[IWD_STATION].Scanning == true
-            end
-            if interfaces[IWD_NETWORK] then
-                network_props[path] = interfaces[IWD_NETWORK]
+
+        -- AvailableConnections is already filtered by NetworkManager for this
+        -- device. Resolve their SSIDs so known profiles can be activated
+        -- directly and rendered without a lock badge.
+        local known_ssids = {}
+        for _, connection_path in ipairs(device_props.AvailableConnections or {}) do
+            local settings_reply = bus:call({
+                destination = NETWORK_MANAGER,
+                path = connection_path,
+                interface = NM_SETTINGS_CONNECTION,
+                member = "GetSettings",
+                timeout_ms = 2000,
+            })
+            local settings = settings_reply and ((settings_reply.args or {})[1] or {}) or nil
+            local wireless = settings and settings["802-11-wireless"] or nil
+            local ssid = wireless and wireless.ssid or nil
+            if type(ssid) == "string" and ssid ~= "" then
+                known_ssids[ssid] = true
             end
         end
-        local networks = {}
-        for i, entry in ipairs((ordered_reply.args or {})[1] or {}) do
-            if i > 12 then
-                break
-            end
-            local path = entry[1]
-            local props = network_props[path]
-            if props then
-                table.insert(networks, {
+
+        local active_path = wireless_props.ActiveAccessPoint
+        local networks_by_ssid = {}
+        for _, path in ipairs((access_points_reply.args or {})[1] or {}) do
+            local props = get_all(path, NM_ACCESS_POINT, 2000)
+            local name = props and props.Ssid or nil
+            if type(name) == "string" and name ~= "" then
+                local flags = tonumber(props.Flags) or 0
+                local candidate = {
                     path = path,
-                    name = props.Name or "?",
-                    secured = props.Type ~= nil and props.Type ~= "open",
-                    known = props.KnownNetwork ~= nil,
-                    connected = props.Connected == true,
-                    percent = dbm_to_percent((tonumber(entry[2]) or -10000) / 100),
-                })
+                    name = name,
+                    secured = flags % 2 == 1 or (tonumber(props.WpaFlags) or 0) ~= 0
+                        or (tonumber(props.RsnFlags) or 0) ~= 0,
+                    known = known_ssids[name] == true,
+                    connected = path == active_path,
+                    percent = math.max(0, math.min(100, tonumber(props.Strength) or 0)),
+                }
+                local previous = networks_by_ssid[name]
+                if not previous or (candidate.connected and not previous.connected)
+                    or (candidate.connected == previous.connected and candidate.percent > previous.percent) then
+                    networks_by_ssid[name] = candidate
+                end
             end
         end
-        return { networks = networks, scanning = scanning }
+
+        local networks = {}
+        for _, network in pairs(networks_by_ssid) do
+            table.insert(networks, network)
+        end
+        table.sort(networks, function(a, b)
+            if a.connected ~= b.connected then
+                return a.connected
+            elseif a.percent ~= b.percent then
+                return a.percent > b.percent
+            end
+            return a.name < b.name
+        end)
+        while #networks > 12 do
+            table.remove(networks)
+        end
+        return { networks = networks, scanning = net.scanning }
     end
 
     local function connect(entry)
-        local bus, station = net.bus, net.station
-        if not bus or not station then
-            return nil, "iwd unavailable"
+        local bus, device = net.bus, net.device
+        if not bus or not device then
+            return nil, "NetworkManager unavailable"
         end
         local reply, err
         if entry.connected then
             reply, err = bus:call({
-                destination = IWD,
-                path = station,
-                interface = IWD_STATION,
+                destination = NETWORK_MANAGER,
+                path = device,
+                interface = NM_DEVICE,
                 member = "Disconnect",
                 timeout_ms = 10000,
             })
-        else
-            -- Known and open networks connect directly; secured unknown
-            -- ones need an auth agent we don't provide yet (POC).
+        elseif entry.known then
             reply, err = bus:call({
-                destination = IWD,
-                path = entry.path,
-                interface = IWD_NETWORK,
-                member = "Connect",
+                destination = NETWORK_MANAGER,
+                path = NETWORK_MANAGER_PATH,
+                interface = NETWORK_MANAGER,
+                member = "ActivateConnection",
+                args = {
+                    -- Let NetworkManager select the compatible saved profile;
+                    -- more than one profile may share this AP's SSID.
+                    dbus.object_path("/"),
+                    dbus.object_path(device),
+                    dbus.object_path(entry.path),
+                },
+                timeout_ms = 30000,
+            })
+        else
+            -- NetworkManager completes an empty profile from the selected AP.
+            -- For secured networks it can request secrets from any registered
+            -- desktop secret agent rather than making the shell own credentials.
+            reply, err = bus:call({
+                destination = NETWORK_MANAGER,
+                path = NETWORK_MANAGER_PATH,
+                interface = NETWORK_MANAGER,
+                member = "AddAndActivateConnection",
+                args = {
+                    dbus.array("{sa{sv}}", {}),
+                    dbus.object_path(device),
+                    dbus.object_path(entry.path),
+                },
                 timeout_ms = 30000,
             })
         end
-        -- The cached agent percent is stale either way; force a fresh read.
         assert(net.refresh)()
         return reply, err
     end
 
-    -- Commands ride the snapshot only while iwd is usable, so their
-    -- presence doubles as the availability check.
-    local function publish()
-        local available = net.bus ~= nil and net.station ~= nil
-        self:publish({
-            operstate = st.operstate,
-            essid = st.essid,
-            percent = st.percent,
-            scan = available and scan or nil,
-            list = available and list or nil,
-            connect = available and connect or nil,
-        })
-    end
+    commands.scan = scan
+    commands.list = list
+    commands.connect = connect
 
-    local capture_running = false
-
-    local function update_shell()
-        if capture_running then
+    local function update_network_manager_now()
+        local device = net.device
+        if not device then
             return
         end
-        capture_running = true
-        loop.spawn(function()
-            local result = process.capture({ "sh", "-c", SHELL_NETWORK_SCRIPT })
-            capture_running = false
-            if result and result.ok then
-                local lines = {}
-                for line in (result.stdout .. "\n"):gmatch("([^\n]*)\n") do
-                    table.insert(lines, line)
-                end
-                st.operstate = trim(lines[1] or "down")
-                st.essid = trim(lines[2] or "")
-                st.percent = tonumber(lines[3])
-                publish()
-            end
-        end)
-    end
 
-    local function update_iwd_now()
-        local bus = net.bus
-        if not bus or not net.station then
+        local device_props, device_err = get_all(device, NM_DEVICE, 1000)
+        if not device_props then
+            log.warn("NetworkManager device refresh failed", device_err or "unknown")
             return
         end
-        local reply = bus:call({
-            destination = IWD,
-            path = net.station,
-            interface = DBUS_PROPERTIES,
-            member = "GetAll",
-            args = { IWD_STATION },
-            timeout_ms = 1000,
-        })
-        if not reply then
-            -- Station gone (iwd restarted?); fall back to the shell path.
-            net.station = nil
-            update_shell()
+        local wireless_props, wireless_err = get_all(device, NM_WIRELESS, 1000)
+        if not wireless_props then
+            log.warn("NetworkManager wireless refresh failed", wireless_err or "unknown")
             return
         end
-        local props = (reply.args or {})[1] or {}
-        local connected_path = props.ConnectedNetwork
-        if props.State ~= "connected" or not connected_path then
+
+        local last_scan = tonumber(wireless_props.LastScan)
+        if net.scanning and net.last_scan and last_scan and last_scan ~= net.last_scan then
+            net.scanning = false
+        end
+        net.last_scan = last_scan
+
+        local active_path = wireless_props.ActiveAccessPoint
+        if tonumber(device_props.State) ~= NM_DEVICE_STATE_ACTIVATED or type(active_path) ~= "string"
+            or active_path == "/" then
             st.operstate, st.essid, st.percent = "down", "", 0
             publish()
             return
         end
-        local network_reply = bus:call({
-            destination = IWD,
-            path = connected_path,
-            interface = DBUS_PROPERTIES,
-            member = "GetAll",
-            args = { IWD_NETWORK },
-            timeout_ms = 1000,
-        })
-        local essid = ""
-        if network_reply then
-            essid = ((network_reply.args or {})[1] or {}).Name or ""
+
+        local access_point_props, access_point_err = get_all(active_path, NM_ACCESS_POINT, 1000)
+        if not access_point_props then
+            log.warn("NetworkManager access point refresh failed", access_point_err or "unknown")
+            return
         end
-        if not net.percent then
-            -- No agent report yet: read the real RSSI instead of guessing,
-            -- so the pill never flashes an optimistic level at startup.
-            local ordered_reply = bus:call({
-                destination = IWD,
-                path = net.station,
-                interface = IWD_STATION,
-                member = "GetOrderedNetworks",
-                timeout_ms = 2000,
-            })
-            if ordered_reply then
-                for _, entry in ipairs((ordered_reply.args or {})[1] or {}) do
-                    if entry[1] == connected_path then
-                        -- Signal strength arrives in units of 0.01 dBm.
-                        local dbm = (tonumber(entry[2]) or -10000) / 100
-                        net.percent = dbm_to_percent(dbm)
-                        break
-                    end
-                end
-            end
-        end
-        st.operstate, st.essid, st.percent = "up", essid, net.percent
+        st.operstate = "up"
+        st.essid = type(access_point_props.Ssid) == "string" and access_point_props.Ssid or ""
+        st.percent = math.max(0, math.min(100, tonumber(access_point_props.Strength) or 0))
         publish()
     end
 
+    local update_running = false
+    local update_pending = false
     local function update_network()
-        if net.station and net.bus then
-            loop.spawn(update_iwd_now)
-        else
-            update_shell()
+        if not net.device then
+            publish()
+            return
         end
+        if update_running then
+            update_pending = true
+            return
+        end
+        update_running = true
+        self.scope:spawn(function()
+            repeat
+                update_pending = false
+                update_network_manager_now()
+            until not update_pending
+            update_running = false
+        end)
     end
 
-    -- Widget menu operations invalidate the cached agent percent after a
-    -- connect/disconnect and force a fresh read.
     net.refresh = function()
-        net.percent = nil
         update_network()
     end
 
-    local function register_iwd_agent(bus)
-        local ok, agent = pcall(function()
-            return bus:export(IWD_AGENT_PATH, {
-                [IWD_AGENT] = {
-                    methods = {
-                        Changed = {
-                            in_signature = "oy",
-                            call = function(_, _device, level)
-                                local index = math.floor(tonumber(level) or 4) + 1
-                                net.percent = IWD_LEVEL_PERCENT[index] or 10
-                                update_network()
-                            end,
-                        },
-                        Release = {
-                            in_signature = "",
-                            call = function() end,
-                        },
-                    },
-                },
-            })
-        end)
-        if not ok or not agent then
-            log.warn("iwd signal agent export failed")
+    local discover_running = false
+    local discover_pending = false
+    local function discover_network_manager_now()
+        local bus = assert(net.bus)
+        local manager = bus:proxy(NETWORK_MANAGER, NETWORK_MANAGER_PATH, NETWORK_MANAGER, { timeout_ms = 2000 })
+        local devices, err = manager:GetDevices()
+        if not devices then
+            log.warn("NetworkManager GetDevices failed", err or "unknown")
+            net.device = nil
+            st.operstate, st.essid, st.percent = "down", "", 0
+            publish()
             return
         end
-        local reply, err = bus:call({
-            destination = IWD,
-            path = net.station,
-            interface = IWD_STATION,
-            member = "RegisterSignalLevelAgent",
-            args = {
-                dbus.object_path(IWD_AGENT_PATH),
-                dbus.array("n", IWD_SIGNAL_LEVELS),
-            },
-            timeout_ms = 2000,
-        })
-        if not reply then
-            log.warn("iwd RegisterSignalLevelAgent failed", err or "unknown")
-        end
-    end
 
-    -- iwd exposes everything on the system bus (iwctl is only a CLI over
-    -- it), so prefer that over shelling out when a station exists.
-    local function discover_iwd(bus)
-        local object_manager = bus:proxy(IWD, "/", DBUS_OBJECT_MANAGER, { timeout_ms = 2000 })
-        local managed_objects = object_manager:GetManagedObjects()
-        if not managed_objects then
-            return -- no iwd on this system; the shell fallback stays
-        end
-        for path, interfaces in pairs(managed_objects or {}) do
-            if interfaces[IWD_STATION] then
-                net.station = path
-                break
+        for _, path in ipairs(devices) do
+            local props = get_all(path, NM_DEVICE, 1000)
+            if props and tonumber(props.DeviceType) == NM_DEVICE_TYPE_WIFI then
+                if net.device ~= path then
+                    net.device = path
+                    net.last_scan = nil
+                    net.scanning = false
+                end
+                update_network()
+                return
             end
         end
-        if net.station then
-            register_iwd_agent(bus)
-            update_iwd_now()
+        if net.device then
+            net.device = nil
+            net.last_scan = nil
+            net.scanning = false
         end
+        st.operstate, st.essid, st.percent = "down", "", 0
+        publish()
     end
 
-    local ok, bus = pcall(function()
-        return dbus.system()
-    end)
-    if ok and bus then
-        net.bus = bus
-        local sub = bus:subscribe({
-            path_namespace = "/org/freedesktop/NetworkManager",
-        })
-        loop.spawn(function()
-            for signal in sub:events() do
-                if signal.member == "PropertiesChanged" or signal.member == "StateChanged"
-                    or signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" then
+    local function discover_network_manager()
+        if discover_running then
+            discover_pending = true
+            return
+        end
+        discover_running = true
+        self.scope:spawn(function()
+            repeat
+                discover_pending = false
+                discover_network_manager_now()
+            until not discover_pending
+            discover_running = false
+        end)
+    end
+
+    local bus, bus_err = dbus.system()
+    if not bus then
+        error("system D-Bus unavailable: " .. (bus_err or "unknown"))
+    end
+    net.bus = bus
+
+    local manager_observer = bus:observe({
+        destination = NETWORK_MANAGER,
+        path = NETWORK_MANAGER_PATH,
+        interface = NETWORK_MANAGER,
+        timeout_ms = 2000,
+    })
+    self.scope:spawn(function()
+        for change in manager_observer:changes() do
+            if change.available then
+                if net.device then
                     update_network()
+                else
+                    discover_network_manager()
                 end
+            else
+                net.device = nil
+                net.last_scan = nil
+                net.scanning = false
+                st.operstate, st.essid, st.percent = "down", "", 0
+                publish()
             end
-        end)
-        -- iwd systems: Station state, scanning, and connected-network changes.
-        local iwd_ok, iwd_sub = pcall(function()
-            return bus:subscribe({
-                path_namespace = "/net/connman/iwd",
-            })
-        end)
-        if iwd_ok and iwd_sub then
-            loop.spawn(function()
-                for signal in iwd_sub:events() do
-                    if signal.member == "PropertiesChanged" then
-                        update_network()
+        end
+    end)
+
+    local sub = bus:subscribe({
+        path_namespace = NETWORK_MANAGER_PATH,
+    })
+    self.scope:spawn(function()
+        for signal in sub:events() do
+            if signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" then
+                discover_network_manager()
+            elseif signal.member == "PropertiesChanged" or signal.member == "StateChanged"
+                or signal.member == "AccessPointAdded" or signal.member == "AccessPointRemoved" then
+                local args = signal.args or {}
+                if signal.member == "PropertiesChanged" and args[1] == NM_WIRELESS then
+                    local changed = args[2] or {}
+                    local last_scan = tonumber(changed.LastScan)
+                    if net.scanning and net.last_scan and last_scan and last_scan ~= net.last_scan then
+                        net.scanning = false
                     end
                 end
-            end)
+                update_network()
+            end
         end
-        -- iwd's ObjectManager lives at /, outside the namespace above. Network
-        -- objects appear and disappear there while GetOrderedNetworks grows.
-        local objects_ok, objects_sub = pcall(function()
-            return bus:subscribe({
-                path = "/",
-                interface = DBUS_OBJECT_MANAGER,
-            })
-        end)
-        if objects_ok and objects_sub then
-            loop.spawn(function()
-                for signal in objects_sub:events() do
-                    local object_path = (signal.args or {})[1]
-                    if (signal.member == "InterfacesAdded" or signal.member == "InterfacesRemoved") and type(
-                            object_path
-                        ) == "string" and object_path:sub(1, #"/net/connman/iwd/") == "/net/connman/iwd/" then
-                        -- Re-publish so open wifi menus refresh their list.
-                        publish()
-                    end
-                end
-            end)
-        end
-        loop.spawn(function()
-            discover_iwd(bus)
-        end)
-    end
+    end)
 
-    update_network()
+    publish()
+    discover_network_manager()
 
-    -- Signal strength has no change signal; refresh once a minute.
+    -- Poll as a backstop for missed device or access-point property signals.
     local timer = loop.timer({ delay = 60.0, interval = 60.0 })
     for _ in timer:ticks() do
         update_network()
@@ -559,10 +564,8 @@ local Network = kw.stateful({
         if not net or not net.scan or self.wifi_scan_inflight then
             return
         end
-        -- Show Scanning… immediately. A concurrent list fetch may still see
-        -- Station.Scanning=false before Scan starts; wifi_scan_inflight keeps
-        -- the indicator on until the Scan call returns, after which the
-        -- station property (and its PropertiesChanged) own the flag.
+        -- Show Scanning… while NetworkManager accepts the request; LastScan
+        -- then keeps the service-level indicator active until completion.
         self.wifi_scan_inflight = true
         self:set_state(function(state)
             state.wifi_scanning = true
@@ -570,15 +573,14 @@ local Network = kw.stateful({
         self.scope:spawn(function()
             net.scan()
             self.wifi_scan_inflight = false
-            -- Re-read so the header and list match post-Scan station state
-            -- (Scanning true now, or already false with a fuller list).
+            -- Re-read so the header and list match NetworkManager's scan state.
             self:refresh_wifi_list()
         end)
     end,
 
     -- Coalesces concurrent refresh requests. A fetch can still be in flight
-  -- when Scanning flips or InterfacesAdded fires; dropping those would leave
-  -- the menu stuck on a partial list until the next open.
+    -- when LastScan changes or an access point appears; dropping those would
+    -- leave the menu stuck on a partial list until the next open.
     refresh_wifi_list = function(self)
         if self.wifi_fetching then
             self.wifi_refresh_pending = true
@@ -603,7 +605,7 @@ local Network = kw.stateful({
         local net = self.net
         if not net or not net.list then
             self:set_state(function(state)
-                state.wifi_status = "iwd unavailable"
+                state.wifi_status = "NetworkManager unavailable"
             end)
             return
         end
@@ -613,8 +615,8 @@ local Network = kw.stateful({
         end
         self:set_state(function(state)
             state.wifi_networks = result.networks
-            -- Keep Scanning… while our Scan call is still in flight even if this
-            -- snapshot was taken before iwd flipped Station.Scanning.
+            -- Keep Scanning… while RequestScan itself is still in flight even
+            -- if this snapshot predates the service-level scan flag.
             state.wifi_scanning = result.scanning or self.wifi_scan_inflight
         end)
     end,
