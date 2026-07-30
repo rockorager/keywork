@@ -375,6 +375,7 @@ pub const Renderer = struct {
         const dmabuf_extension_names = [_][*:0]const u8{
             vk.extensions.khr_external_memory_fd.name,
             vk.extensions.khr_external_semaphore_fd.name,
+            vk.extensions.khr_image_format_list.name,
             vk.extensions.ext_external_memory_dma_buf.name,
             vk.extensions.ext_image_drm_format_modifier.name,
             vk.extensions.ext_queue_family_foreign.name,
@@ -402,7 +403,7 @@ pub const Renderer = struct {
         var requested_maintenance_features: vk.PhysicalDeviceSwapchainMaintenance1FeaturesEXT = .{
             .swapchain_maintenance_1 = .true,
         };
-        var device_extension_names: [7][*:0]const u8 = undefined;
+        var device_extension_names: [8][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
         device_extension_count += 1;
