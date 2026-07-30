@@ -12,6 +12,7 @@ local M = {}
 ---@field warning    keywork.Color
 ---@field danger     keywork.Color
 ---@field accent     keywork.Color
+---@field on_accent  keywork.Color
 ---@field selection  keywork.Color
 ---@field space      keywork.ThemeScale
 ---@field theme      keywork.Theme
@@ -36,6 +37,7 @@ local function palette(theme)
         warning = scheme.warning,
         danger = scheme.danger,
         accent = scheme.accent,
+        on_accent = scheme.on_accent,
         selection = scheme.accent,
 
         space = theme.space,

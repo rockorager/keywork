@@ -156,25 +156,29 @@ local function audio_settings_window_story()
     })
 end
 
-local function wifi_menu_story()
-    return menu_story("menus/wifi", "Wi-Fi networks", 300, function(palette)
+local function wifi_story_networks(connected)
+    return {
+        {
+            path = "/story/home",
+            name = "Home",
+            percent = 92,
+            secured = true,
+            known = true,
+            connected = connected == true,
+        },
+        { path = "/story/cafe", name = "Coffee Shop", percent = 68 },
+        { path = "/story/phone", name = "Phone Hotspot", percent = 44, secured = true },
+        { path = "/story/neighbor", name = "Neighbor", percent = 18, secured = true, known = true },
+    }
+end
+
+local function wifi_menu_story(id, name, wifi)
+    return menu_story(id, name, 340, function(palette)
         return network.Menu({
             colors = palette,
-            wifi = {
-                networks = {
-                    {
-                        path = "/story/home",
-                        name = "Home",
-                        percent = 92,
-                        secured = true,
-                        known = true,
-                        connected = true,
-                    },
-                    { path = "/story/cafe", name = "Coffee Shop", percent = 68 },
-                    { path = "/story/phone", name = "Phone Hotspot", percent = 44, secured = true },
-                    { path = "/story/neighbor", name = "Neighbor", percent = 18, secured = true, known = true },
-                },
-            },
+            wifi = wifi,
+            on_select = function(_) end,
+            on_scan = function() end,
         })
     end)
 end
@@ -350,7 +354,31 @@ return sb.book({
         }),
         outputs_audio_story(),
         audio_settings_window_story(),
-        wifi_menu_story(),
+        wifi_menu_story("menus/wifi", "Wi-Fi networks", {
+            networks = wifi_story_networks(true),
+        }),
+        wifi_menu_story("menus/wifi-scanning", "Wi-Fi scanning", {
+            scanning = true,
+            networks = wifi_story_networks(false),
+        }),
+        wifi_menu_story("menus/wifi-empty", "Wi-Fi empty", {
+            networks = {},
+        }),
+        wifi_menu_story("menus/wifi-error", "Wi-Fi connection error", {
+            status = "Failed to connect to Phone Hotspot",
+            networks = wifi_story_networks(false),
+        }),
+        wifi_menu_story("menus/wifi-loading", "Wi-Fi loading", {}),
+        wifi_menu_story("menus/wifi-password", "Wi-Fi password", {
+            auth = { name = "Phone Hotspot", autofocus = false },
+        }),
+        wifi_menu_story("menus/wifi-password-error", "Wi-Fi password error", {
+            auth = {
+                name = "Phone Hotspot",
+                error = "Couldn’t connect. Check the password and try again.",
+                autofocus = false,
+            },
+        }),
         workspace_story(),
         status_pills_story(),
         osd_story("osd/volume", "Volume", {

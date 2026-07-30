@@ -15,9 +15,78 @@ local NETWORK_MANAGER_PATH = "/org/freedesktop/NetworkManager"
 local NM_DEVICE = "org.freedesktop.NetworkManager.Device"
 local NM_WIRELESS = "org.freedesktop.NetworkManager.Device.Wireless"
 local NM_ACCESS_POINT = "org.freedesktop.NetworkManager.AccessPoint"
+local NM_ACTIVE = "org.freedesktop.NetworkManager.Connection.Active"
 local NM_SETTINGS_CONNECTION = "org.freedesktop.NetworkManager.Settings.Connection"
 local NM_DEVICE_TYPE_WIFI = 2
 local NM_DEVICE_STATE_ACTIVATED = 100
+local NM_ACTIVE_STATE_ACTIVATED = 2
+local NM_ACTIVE_STATE_DEACTIVATED = 4
+
+local NM_AP_FLAG_PRIVACY = 0x1
+local NM_AP_SEC_KEY_MGMT_PSK = 0x100
+local NM_AP_SEC_KEY_MGMT_802_1X = 0x200
+local NM_AP_SEC_KEY_MGMT_SAE = 0x400
+local NM_AP_SEC_KEY_MGMT_OWE = 0x800
+local NM_AP_SEC_KEY_MGMT_OWE_TM = 0x1000
+local NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192 = 0x2000
+
+local function has_flag(value, flag)
+    return math.floor((value or 0) / flag) % 2 == 1
+end
+
+local function security_kind(flags, wpa_flags, rsn_flags)
+    local function advertised(flag)
+        return has_flag(wpa_flags, flag) or has_flag(rsn_flags, flag)
+    end
+
+    if advertised(NM_AP_SEC_KEY_MGMT_PSK) then return "wpa-psk" end
+    if advertised(NM_AP_SEC_KEY_MGMT_SAE) then return "sae" end
+    if advertised(NM_AP_SEC_KEY_MGMT_OWE) or advertised(NM_AP_SEC_KEY_MGMT_OWE_TM) then
+        return "owe"
+    end
+    if advertised(NM_AP_SEC_KEY_MGMT_802_1X) or advertised(NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192) then
+        return "enterprise"
+    end
+    if has_flag(flags, NM_AP_FLAG_PRIVACY) then return "wep" end
+    return "open"
+end
+
+local function requires_password(security)
+    return security == "wpa-psk" or security == "sae" or security == "wep"
+end
+
+local function password_error(err)
+    if err == "Connection failed" then
+        return "Couldn’t connect. Check the password and try again."
+    elseif err == "Connection timed out" then
+        return "Connection timed out. Check the password and try again."
+    end
+    return err or "Couldn’t connect to this network."
+end
+
+local function connection_settings(entry, password)
+    local security
+    if entry.security == "wpa-psk" or entry.security == "sae" then
+        security = {
+            ["key-mgmt"] = dbus.variant("s", entry.security),
+            psk = dbus.variant("s", password),
+        }
+    elseif entry.security == "wep" then
+        security = {
+            ["key-mgmt"] = dbus.variant("s", "none"),
+            ["wep-key0"] = dbus.variant("s", password),
+        }
+    end
+
+    local settings = {}
+    if security then
+        settings["802-11-wireless"] = {
+            security = dbus.variant("s", "802-11-wireless-security"),
+        }
+        settings["802-11-wireless-security"] = security
+    end
+    return dbus.array("{sa{sv}}", settings)
+end
 
 local function wifi_signal_icon(percent)
     if percent >= 80 then
@@ -49,62 +118,304 @@ local function pill_from_values(palette, operstate, essid, percent, on_activate)
     })
 end
 
-local function wifi_menu(palette, wifi, on_select)
-    wifi = wifi or {}
-    on_select = on_select or function(_) end
-    local rows = {}
-
-    local header_children = { label("Wi-Fi", palette.muted), kw.spacer() }
-    if wifi.status then
-        table.insert(header_children, label(wifi.status, palette.subtle))
-    elseif wifi.scanning then
-        table.insert(header_children, label("Scanning…", palette.subtle))
-    end
-    table.insert(
-        rows,
-        kw.menu_label({
-            child = kw.row({ align = "center", children = header_children }),
+local function network_name(entry, text_color, subtle_color)
+    if entry.connected then
+        return kw.column({
+            spacing = 0,
+            children = {
+                label(entry.name, text_color),
+                kw.text("Connected", {
+                    color = subtle_color,
+                    font_size = 12,
+                    line_height = 16,
+                    max_lines = 1,
+                }),
+            },
         })
-    )
+    end
+    return label(entry.name, text_color)
+end
+
+local function network_row(palette, entry, on_select)
+    local icon_color = entry.connected and palette.selection or palette.muted
+    local text_color = entry.connected and palette.foreground or palette.muted
+    local trailing
+    if entry.connected then
+        trailing = kw.icon({ name = "object-select", color = palette.foreground })
+    elseif entry.known then
+        trailing = kw.text("Saved", {
+            color = palette.subtle,
+            font_size = 12,
+            line_height = 16,
+        })
+    elseif entry.secured and not entry.known then
+        trailing = kw.icon({ name = "network-wireless-encrypted", color = palette.subtle })
+    end
+
+    local network_icon = kw.container({
+        background = entry.connected and palette.accent or nil,
+        radius = palette.theme.radius[2],
+        min_width = 32,
+        min_height = 32,
+        horizontal_align = "center",
+        vertical_align = "center",
+        child = kw.icon({
+            name = wifi_signal_icon(entry.percent or 0),
+            size = 20,
+            color = entry.connected and palette.on_accent or icon_color,
+        }),
+    })
+
+    local children = {
+        network_icon,
+        kw.expanded({
+            child = network_name(entry, text_color, palette.subtle),
+        }),
+    }
+    if trailing then
+        children[#children + 1] = trailing
+    end
+    return kw.menu_item({
+        id = "wifi-" .. entry.path,
+        selected = entry.connected,
+        on_activate = function()
+            on_select(entry)
+        end,
+        child = kw.row({
+            spacing = palette.space[2],
+            align = "center",
+            children = children,
+        }),
+    })
+end
+
+local function wifi_status_row(palette, status)
+    local failed = status:lower():find("failed", 1, true) ~= nil
+    local color = failed and palette.error or palette.muted
+    return kw.padding({
+        x = palette.space[3],
+        y = palette.space[2],
+        child = kw.row({
+            spacing = palette.space[2],
+            align = "center",
+            children = {
+                kw.icon({ name = failed and "dialog-warning" or "dialog-information", color = color }),
+                kw.expanded({
+                    child = kw.text(status, {
+                        color = color,
+                        font_size = 12,
+                        line_height = 16,
+                        max_lines = 2,
+                    }),
+                }),
+            },
+        }),
+    })
+end
+
+local function connected_network(networks)
+    for _, entry in ipairs(networks or {}) do
+        if entry.connected then
+            return entry
+        end
+    end
+end
+
+local function wifi_auth_page(palette, auth, on_back, on_change, on_submit)
+    on_back = on_back or function() end
+    on_change = on_change or function(_) end
+    on_submit = on_submit or function(_) end
+    local theme = palette.theme
+    local helper_text = "Enter the password for this network."
+    local helper_color = palette.subtle
+    if auth.connecting then
+        helper_text = "Connecting…"
+    elseif auth.error then
+        helper_text = auth.error
+        helper_color = palette.error
+    end
+    return kw.menu_surface({
+        child = kw.column({
+            children = {
+                kw.menu_label({
+                    min_height = 40,
+                    child = kw.row({
+                        spacing = palette.space[1],
+                        align = "center",
+                        children = {
+                            kw.icon_button({
+                                id = "wifi-auth-back",
+                                icon = "go-previous",
+                                size = "small",
+                                appearance = "subtle",
+                                disabled = auth.connecting,
+                                on_activate = on_back,
+                            }),
+                            kw.text("Connect to Wi-Fi", {
+                                color = palette.foreground,
+                                font_size = 16,
+                                line_height = 22,
+                            }),
+                        },
+                    }),
+                }),
+                kw.menu_separator({}),
+                kw.padding({
+                    all = palette.space[3],
+                    child = kw.column({
+                        align = "stretch",
+                        spacing = palette.space[3],
+                        children = {
+                            kw.row({
+                                spacing = palette.space[3],
+                                align = "center",
+                                children = {
+                                    kw.container({
+                                        background = palette.accent,
+                                        radius = theme.radius[2],
+                                        min_width = 40,
+                                        min_height = 40,
+                                        horizontal_align = "center",
+                                        vertical_align = "center",
+                                        child = kw.icon({
+                                            name = "network-wireless-encrypted",
+                                            color = palette.on_accent,
+                                        }),
+                                    }),
+                                    kw.expanded({
+                                        child = kw.column({
+                                            spacing = 0,
+                                            children = {
+                                                kw.text(auth.name or "Wi-Fi network", {
+                                                    color = palette.foreground,
+                                                    font_size = 16,
+                                                    line_height = 22,
+                                                    max_lines = 1,
+                                                }),
+                                                kw.text("Password required", {
+                                                    color = palette.subtle,
+                                                    font_size = 12,
+                                                    line_height = 16,
+                                                }),
+                                            },
+                                        }),
+                                    }),
+                                },
+                            }),
+                            kw.text_field({
+                                id = "wifi-password",
+                                placeholder = "Password",
+                                value = auth.password or "",
+                                obscured = true,
+                                autofocus = auth.autofocus ~= false,
+                                on_change = on_change,
+                                on_submit = on_submit,
+                            }),
+                            kw.text(helper_text, {
+                                color = helper_color,
+                                font_size = 12,
+                                line_height = 16,
+                                max_lines = 2,
+                            }),
+                            kw.button({
+                                id = "wifi-auth-connect",
+                                label = auth.connecting and "Connecting…" or "Connect",
+                                appearance = "primary",
+                                disabled = auth.connecting,
+                                on_activate = function()
+                                    on_submit(auth.password or "")
+                                end,
+                            }),
+                        },
+                    }),
+                }),
+            },
+        }),
+    })
+end
+
+local function wifi_menu(palette, wifi, on_select, on_scan)
+    wifi = wifi or {}
+    if wifi.auth then
+        return wifi_auth_page(
+            palette,
+            wifi.auth,
+            wifi.on_auth_back,
+            wifi.on_auth_change,
+            wifi.on_auth_submit
+        )
+    end
+    on_select = on_select or function(_) end
+    local header_children = {
+        kw.text("Network", {
+            color = palette.foreground,
+            font_size = 16,
+            line_height = 22,
+        }),
+        kw.spacer(),
+    }
+    if wifi.scanning then
+        header_children[#header_children + 1] = kw.text("Scanning…", {
+            color = palette.subtle,
+            font_size = 12,
+            line_height = 16,
+        })
+    end
+    header_children[#header_children + 1] = kw.icon_button({
+        id = "wifi-refresh",
+        icon = "view-refresh",
+        size = "small",
+        appearance = "subtle",
+        disabled = wifi.scanning or on_scan == nil,
+        on_activate = on_scan,
+    })
+    local rows = {
+        kw.menu_label({
+            min_height = 40,
+            child = kw.row({
+                align = "center",
+                children = header_children,
+            }),
+        }),
+    }
+
+    local connected = connected_network(wifi.networks)
+
+    if connected then
+        rows[#rows + 1] = kw.menu_label({ text = "Connected" })
+        rows[#rows + 1] = network_row(palette, connected, on_select)
+        rows[#rows + 1] = kw.menu_separator({})
+    end
+
+    rows[#rows + 1] = kw.menu_label({ text = connected and "Available networks" or "Wi-Fi" })
+
+    if wifi.status then
+        rows[#rows + 1] = wifi_status_row(palette, wifi.status)
+    end
 
     for _, entry in ipairs(wifi.networks or {}) do
-        local icon_color = entry.connected and palette.selection or palette.muted
-        local text_color = entry.connected and palette.foreground or palette.muted
-        local children = {
-            kw.icon({ name = wifi_signal_icon(entry.percent), color = icon_color }),
-            kw.expanded({ child = label(entry.name, text_color) }),
-        }
-        if entry.secured and not entry.known then
-            table.insert(children, kw.icon({ name = "network-wireless-encrypted", color = palette.subtle }))
+        if not entry.connected then
+            rows[#rows + 1] = network_row(palette, entry, on_select)
         end
-        if entry.connected then
-            table.insert(children, kw.icon({ name = "object-select", color = palette.foreground }))
-        end
-        table.insert(
-            rows,
-            kw.menu_item({
-                id = "wifi-" .. entry.path,
-                on_activate = function()
-                    on_select(entry)
-                end,
-                child = kw.row({
-                    spacing = palette.space[2],
-                    align = "center",
-                    children = children,
-                }),
-            })
-        )
     end
 
-    if not wifi.networks or #wifi.networks == 0 then
-        table.insert(
-            rows,
-            kw.padding({
-                x = palette.space[3],
-                y = palette.space[2],
-                child = label(wifi.networks and "No networks found" or "Loading…", palette.subtle),
-            })
-        )
+    local available_count = #(wifi.networks or {}) - (connected and 1 or 0)
+    if available_count == 0 then
+        local empty_label
+        if not wifi.networks then
+            empty_label = "Loading networks…"
+        elseif wifi.scanning then
+            empty_label = "Looking for networks…"
+        elseif connected then
+            empty_label = "No other networks found"
+        else
+            empty_label = "No networks found"
+        end
+        rows[#rows + 1] = kw.padding({
+            x = palette.space[3],
+            y = palette.space[3],
+            child = label(empty_label, palette.subtle),
+        })
     end
 
     return kw.menu_surface({
@@ -116,7 +427,7 @@ local WifiMenu = kw.stateful({
     hot_id = "WifiMenu",
     hot_version = 1,
     build = function(self)
-        return wifi_menu(self.props.colors, self.props.wifi, self.props.on_select)
+        return wifi_menu(self.props.colors, self.props.wifi, self.props.on_select, self.props.on_scan)
     end,
 })
 
@@ -256,11 +567,13 @@ local network_service = service.define("shell.bar.network", function(self)
             local name = props and props.Ssid or nil
             if type(name) == "string" and name ~= "" then
                 local flags = tonumber(props.Flags) or 0
+                local security = security_kind(flags, tonumber(props.WpaFlags), tonumber(props.RsnFlags))
                 local candidate = {
                     path = path,
                     name = name,
-                    secured = flags % 2 == 1 or (tonumber(props.WpaFlags) or 0) ~= 0
-                        or (tonumber(props.RsnFlags) or 0) ~= 0,
+                    security = security,
+                    secured = security ~= "open",
+                    requires_password = requires_password(security),
                     known = known_ssids[name] == true,
                     connected = path == active_path,
                     percent = math.max(0, math.min(100, tonumber(props.Strength) or 0)),
@@ -291,12 +604,66 @@ local network_service = service.define("shell.bar.network", function(self)
         return { networks = networks, scanning = net.scanning }
     end
 
-    local function connect(entry)
+    local function wait_for_activation(active_path)
+        local deadline = loop.monotonic_ms() + 90000
+        while loop.monotonic_ms() < deadline do
+            local props = get_all(active_path, NM_ACTIVE, 2000)
+            if not props then
+                return nil, "Connection failed"
+            end
+
+            local state = tonumber(props.State)
+            if state == NM_ACTIVE_STATE_ACTIVATED then
+                return true
+            elseif state == NM_ACTIVE_STATE_DEACTIVATED then
+                return nil, "Connection failed"
+            end
+            loop.sleep(500)
+        end
+        return nil, "Connection timed out"
+    end
+
+    local function delete_connection(connection_path)
+        local _, err = assert(net.bus):call({
+            destination = NETWORK_MANAGER,
+            path = connection_path,
+            interface = NM_SETTINGS_CONNECTION,
+            member = "Delete",
+            timeout_ms = 10000,
+        })
+        if err then log.warn("NetworkManager temporary profile cleanup failed", err) end
+    end
+
+    local function save_connection(connection_path)
+        return assert(net.bus):call({
+            destination = NETWORK_MANAGER,
+            path = connection_path,
+            interface = NM_SETTINGS_CONNECTION,
+            member = "Update2",
+            args = {
+                dbus.array("{sa{sv}}", {}),
+                dbus.uint32(0x1), -- NM_SETTINGS_UPDATE2_FLAG_TO_DISK
+                dbus.array("{sv}", {}),
+            },
+            timeout_ms = 10000,
+        })
+    end
+
+    local function connect(entry, password)
         local bus, device = net.bus, net.device
         if not bus or not device then
             return nil, "NetworkManager unavailable"
         end
+        if entry.security == "enterprise" and not entry.known then
+            return nil, "Enterprise Wi-Fi isn't supported yet"
+        end
+        if entry.requires_password and not entry.known and (not password or password == "") then
+            return nil, "Enter the network password"
+        end
+
         local reply, err
+        local active_path
+        local connection_path
         if entry.connected then
             reply, err = bus:call({
                 destination = NETWORK_MANAGER,
@@ -320,25 +687,47 @@ local network_service = service.define("shell.bar.network", function(self)
                 },
                 timeout_ms = 30000,
             })
+            active_path = reply and (reply.args or {})[1] or nil
         else
-            -- NetworkManager completes an empty profile from the selected AP.
-            -- For secured networks it can request secrets from any registered
-            -- desktop secret agent rather than making the shell own credentials.
             reply, err = bus:call({
                 destination = NETWORK_MANAGER,
                 path = NETWORK_MANAGER_PATH,
                 interface = NETWORK_MANAGER,
-                member = "AddAndActivateConnection",
+                member = "AddAndActivateConnection2",
                 args = {
-                    dbus.array("{sa{sv}}", {}),
+                    connection_settings(entry, password),
                     dbus.object_path(device),
                     dbus.object_path(entry.path),
+                    dbus.array("{sv}", {
+                        persist = dbus.variant("s", "memory"),
+                    }),
                 },
                 timeout_ms = 30000,
             })
+            connection_path = reply and (reply.args or {})[1] or nil
+            active_path = reply and (reply.args or {})[2] or nil
+        end
+
+        if not reply then
+            assert(net.refresh)()
+            return nil, err
+        end
+        if active_path then
+            local activated, activation_err = wait_for_activation(active_path)
+            if not activated then
+                if connection_path then delete_connection(connection_path) end
+                assert(net.refresh)()
+                return nil, activation_err
+            end
+        end
+        if connection_path then
+            local saved, save_err = save_connection(connection_path)
+            if not saved then
+                log.warn("NetworkManager profile save failed", save_err or "unknown")
+            end
         end
         assert(net.refresh)()
-        return reply, err
+        return reply
     end
 
     commands.scan = scan
@@ -527,6 +916,11 @@ end)
 local Network = kw.stateful({
     init = function(self)
         self.wifi_menu_open = false
+        self.wifi_auth_entry = nil
+        self.wifi_auth_token = nil
+        self.wifi_password = ""
+        self.wifi_auth_error = nil
+        self.wifi_auth_connecting = false
     end,
 
     hot_id = "Network",
@@ -555,6 +949,12 @@ local Network = kw.stateful({
                 state.wifi_status = nil
                 state:refresh_wifi_list()
                 state:scan_wifi()
+            else
+                state.wifi_auth_entry = nil
+                state.wifi_auth_token = nil
+                state.wifi_password = ""
+                state.wifi_auth_error = nil
+                state.wifi_auth_connecting = false
             end
         end)
     end,
@@ -571,8 +971,13 @@ local Network = kw.stateful({
             state.wifi_scanning = true
         end)
         self.scope:spawn(function()
-            net.scan()
+            local reply, err = net.scan()
             self.wifi_scan_inflight = false
+            if not reply then
+                self:set_state(function(state)
+                    state.wifi_status = "Scan failed: " .. (err or "unknown")
+                end)
+            end
             -- Re-read so the header and list match NetworkManager's scan state.
             self:refresh_wifi_list()
         end)
@@ -638,17 +1043,103 @@ local Network = kw.stateful({
         end)
     end,
 
+    select_wifi = function(self, entry)
+        if not entry.known and entry.security == "enterprise" then
+            self:set_state(function(state)
+                state.wifi_status = "Enterprise Wi-Fi isn't supported yet"
+            end)
+        elseif not entry.known and entry.requires_password then
+            self:set_state(function(state)
+                state.wifi_auth_entry = entry
+                state.wifi_auth_token = {}
+                state.wifi_password = ""
+                state.wifi_auth_error = nil
+                state.wifi_auth_connecting = false
+            end)
+        else
+            self:connect_wifi(entry)
+        end
+    end,
+
+    submit_wifi_password = function(self, password)
+        local net = self.net
+        local entry = self.wifi_auth_entry
+        local token = self.wifi_auth_token
+        if not net or not net.connect or not entry or self.wifi_auth_connecting then
+            return
+        end
+        if password == "" then
+            self:set_state(function(state)
+                state.wifi_auth_error = "Enter the network password."
+            end)
+            return
+        end
+
+        self:set_state(function(state)
+            state.wifi_password = password
+            state.wifi_auth_error = nil
+            state.wifi_auth_connecting = true
+        end)
+        self.scope:spawn(function()
+            local reply, err = net.connect(entry, password)
+            self:set_state(function(state)
+                if state.wifi_auth_token ~= token then return end
+                state.wifi_auth_connecting = false
+                if reply then
+                    state.wifi_auth_entry = nil
+                    state.wifi_auth_token = nil
+                    state.wifi_password = ""
+                    state.wifi_auth_error = nil
+                else
+                    state.wifi_auth_error = password_error(err)
+                end
+            end)
+            self:refresh_wifi_list()
+        end)
+    end,
+
     build_wifi_menu = function(self)
         local palette = self.props.colors
+        local auth
+        if self.wifi_auth_entry then
+            auth = {
+                name = self.wifi_auth_entry.name,
+                password = self.wifi_password,
+                error = self.wifi_auth_error,
+                connecting = self.wifi_auth_connecting,
+            }
+        end
         return wifi_menu(
             palette,
             {
                 status = self.wifi_status,
                 scanning = self.wifi_scanning,
                 networks = self.wifi_networks,
+                auth = auth,
+                on_auth_back = function()
+                    self:set_state(function(state)
+                        if state.wifi_auth_connecting then return end
+                        state.wifi_auth_entry = nil
+                        state.wifi_auth_token = nil
+                        state.wifi_password = ""
+                        state.wifi_auth_error = nil
+                    end)
+                end,
+                on_auth_change = function(password)
+                    self:set_state(function(state)
+                        state.wifi_password = password
+                        state.wifi_auth_error = nil
+                    end)
+                end,
+                on_auth_submit = function(password)
+                    self:submit_wifi_password(password)
+                end,
             },
             function(entry)
-                self:connect_wifi(entry)
+                self:select_wifi(entry)
+            end,
+            function()
+                self:scan_wifi()
             end
         )
     end,
@@ -661,13 +1152,18 @@ local Network = kw.stateful({
             anchor = pill_from_values(palette, net.operstate, net.essid, net.percent, self.wifi_tap),
             open = self.wifi_menu_open,
             placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
-            width = 300,
+            width = 340,
             content = function()
                 return self:build_wifi_menu()
             end,
             on_close = function()
                 self:set_state(function(state)
                     state.wifi_menu_open = false
+                    state.wifi_auth_entry = nil
+                    state.wifi_auth_token = nil
+                    state.wifi_password = ""
+                    state.wifi_auth_error = nil
+                    state.wifi_auth_connecting = false
                 end)
             end,
         })
