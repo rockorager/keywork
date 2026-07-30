@@ -36,6 +36,10 @@ pub const LogBackend = struct {
                     "color_image x={d} y={d} w={d} h={d} pixels={d}x{d} stride={d} format={t}\n",
                     .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height, image.stride, image.format },
                 ),
+                .external_image => |image| try self.writer.print(
+                    "external_image x={d} y={d} w={d} h={d} pixels={d}x{d}\n",
+                    .{ image.rect.x, image.rect.y, image.rect.width, image.rect.height, image.width, image.height },
+                ),
                 .set_clip => |clip| if (clip) |rect| {
                     try self.writer.print(
                         "set_clip x={d} y={d} w={d} h={d}\n",

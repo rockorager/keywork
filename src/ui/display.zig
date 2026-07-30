@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const DamageRegion = @import("damage_region.zig").DamageRegion;
 
 const Color = types.Color;
 const Point = types.Point;
@@ -24,11 +25,56 @@ pub const PixelFormat = enum {
     xrgb8888,
 };
 
+/// A backend-neutral image source whose storage can require explicit access
+/// intervals. The command borrows `context` for one synchronous present.
+/// Backends that keep an access in flight must retain the source until the
+/// matching `end_read` has completed.
+pub const ExternalImageSource = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub const MappedPixels = struct {
+        pixels: []const Color,
+        stride: u32,
+        format: PixelFormat,
+    };
+
+    pub const VTable = struct {
+        retain: *const fn (*anyopaque) void,
+        release: *const fn (*anyopaque) void,
+        begin_read: *const fn (*anyopaque) anyerror!MappedPixels,
+        end_read: *const fn (*anyopaque) void,
+        damage_since: ?*const fn (*anyopaque, u64, u64, *DamageRegion) bool = null,
+    };
+
+    pub fn retain(self: ExternalImageSource) void {
+        self.vtable.retain(self.context);
+    }
+
+    pub fn release(self: ExternalImageSource) void {
+        self.vtable.release(self.context);
+    }
+
+    pub fn beginRead(self: ExternalImageSource) !MappedPixels {
+        return self.vtable.begin_read(self.context);
+    }
+
+    pub fn endRead(self: ExternalImageSource) void {
+        self.vtable.end_read(self.context);
+    }
+
+    pub fn damageSince(self: ExternalImageSource, old_revision: u64, new_revision: u64, result: *DamageRegion) bool {
+        const callback = self.vtable.damage_since orelse return false;
+        return callback(self.context, old_revision, new_revision, result);
+    }
+};
+
 pub const PaintCommand = union(enum) {
     fill_rect: FillRect,
     text: TextRun,
     alpha_image: AlphaImage,
     color_image: ColorImage,
+    external_image: ExternalImage,
     /// Clips subsequent commands to the given rect (logical coordinates)
     /// until the next set_clip; null removes clipping. The rect is already
     /// resolved against enclosing clips, so backends need no stack.
@@ -65,6 +111,18 @@ pub const PaintCommand = union(enum) {
         pixels: []const Color,
         stride: u32,
         format: PixelFormat,
+        cache_key: u64,
+        revision: u64,
+    };
+
+    /// Full-color image held by a synchronized or device-native source.
+    /// Backends may map it for CPU rendering or recognize a concrete source
+    /// vtable and retain it for an asynchronous native operation.
+    pub const ExternalImage = struct {
+        rect: Rect,
+        width: u32,
+        height: u32,
+        source: ExternalImageSource,
         cache_key: u64,
         revision: u64,
     };
@@ -398,6 +456,26 @@ pub const DisplayList = struct {
             .pixels = pixels,
             .stride = stride,
             .format = format,
+            .cache_key = cache_key,
+            .revision = revision,
+        } });
+    }
+
+    pub fn externalImage(
+        self: *DisplayList,
+        allocator: std.mem.Allocator,
+        rect: Rect,
+        width: u32,
+        height: u32,
+        source: ExternalImageSource,
+        cache_key: u64,
+        revision: u64,
+    ) !void {
+        try self.commands.append(allocator, .{ .external_image = .{
+            .rect = rect,
+            .width = width,
+            .height = height,
+            .source = source,
             .cache_key = cache_key,
             .revision = revision,
         } });

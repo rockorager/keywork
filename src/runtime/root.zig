@@ -26,6 +26,7 @@ pub const LogBackend = @import("backend/log.zig").LogBackend;
 
 pub const svgIcon = @import("graphics/svg_icon.zig").icon;
 pub const SharedPixelBuffer = @import("graphics/SharedPixelBuffer.zig");
+pub const DmaBufImage = @import("graphics/DmaBufImage.zig");
 
 const icon_theme = @import("linux/icon_theme.zig");
 pub const IconThemeCache = icon_theme.Cache;
@@ -51,6 +52,7 @@ test {
     _ = @import("backend/wayland/window.zig");
     _ = @import("graphics/raster.zig");
     _ = @import("graphics/SharedPixelBuffer.zig");
+    _ = @import("graphics/DmaBufImage.zig");
     _ = @import("graphics/svg_icon.zig");
     _ = @import("app/platform.zig");
     _ = @import("linux/SystemdEvent.zig");

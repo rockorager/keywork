@@ -1557,6 +1557,15 @@ test "present damage covers every display-list change during fast wheel scroll" 
                         .kind = .image,
                         .text = &.{},
                     },
+                    .external_image => |image| .{
+                        .clip = clip,
+                        .rect = image.rect,
+                        .color = .{ .a = 0, .r = 0, .g = 0, .b = 0 },
+                        .font_size = 0,
+                        .cache_key = image.cache_key,
+                        .kind = .image,
+                        .text = &.{},
+                    },
                 };
                 errdefer allocator.free(entry.text);
                 try entries.append(allocator, entry);

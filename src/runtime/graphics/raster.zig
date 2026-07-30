@@ -41,6 +41,7 @@ pub fn rasterize(
             .text => |text| try renderer.render(pixels, width, height, scale, text, clip),
             .alpha_image => |image| try alphaImage(target, pixels, width, height, scale, image, clip),
             .color_image => |image| try colorImage(target, pixels, width, height, scale, image, clip),
+            .external_image => |image| try externalImage(target, pixels, width, height, scale, image, clip),
             .set_clip => |rect| clip = combineClips(base_clip, rect, scale),
         }
     }
@@ -293,6 +294,29 @@ fn colorImage(
             compositeColorImagePixel(pixels, width, x, y, image.pixels[source_y * image_stride + source_x], image.format);
         }
     }
+}
+
+fn externalImage(
+    target: *c.pixman_image_t,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    scale: f32,
+    image: keywork.PaintCommand.ExternalImage,
+    clip: ?TextRenderer.PixelClip,
+) !void {
+    const mapped = try image.source.beginRead();
+    defer image.source.endRead();
+    try colorImage(target, pixels, width, height, scale, .{
+        .rect = image.rect,
+        .width = image.width,
+        .height = image.height,
+        .pixels = mapped.pixels,
+        .stride = mapped.stride,
+        .format = mapped.format,
+        .cache_key = image.cache_key,
+        .revision = image.revision,
+    }, clip);
 }
 
 fn sourceCoordinate(pixel: usize, origin: f32, destination_extent: f32, source_extent: usize) usize {
@@ -609,6 +633,58 @@ test "color image does not multiply premultiplied alpha twice" {
     }, null);
 
     try std.testing.expectEqual(@as(u32, @bitCast(keywork.Color.argb(255, 64, 0, 0))), premultiplied[0]);
+}
+
+test "external image brackets CPU fallback access" {
+    const Source = struct {
+        pixels: [1]keywork.Color = .{keywork.Color.argb(0, 12, 34, 56)},
+        begins: usize = 0,
+        ends: usize = 0,
+
+        const vtable: keywork.ExternalImageSource.VTable = .{
+            .retain = retain,
+            .release = release,
+            .begin_read = beginRead,
+            .end_read = endRead,
+        };
+
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+
+        fn beginRead(context: *anyopaque) !keywork.ExternalImageSource.MappedPixels {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.begins += 1;
+            return .{ .pixels = &self.pixels, .stride = 1, .format = .xrgb8888 };
+        }
+
+        fn endRead(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.ends += 1;
+        }
+    };
+
+    var source: Source = .{};
+    var pixels: [1]u32 = @splat(@bitCast(keywork.colors.black));
+    const target = c.pixman_image_create_bits_no_clear(
+        @intCast(c.PIXMAN_a8r8g8b8),
+        1,
+        1,
+        @ptrCast(&pixels),
+        @sizeOf(u32),
+    ).?;
+    defer _ = c.pixman_image_unref(target);
+    try externalImage(target, &pixels, 1, 1, 1, .{
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .width = 1,
+        .height = 1,
+        .source = .{ .context = &source, .vtable = &Source.vtable },
+        .cache_key = 1,
+        .revision = 1,
+    }, null);
+
+    try std.testing.expectEqual(@as(usize, 1), source.begins);
+    try std.testing.expectEqual(@as(usize, 1), source.ends);
+    try std.testing.expectEqual(@as(u32, @bitCast(keywork.Color.argb(255, 12, 34, 56))), pixels[0]);
 }
 
 test "color image clamps source coordinates before integer conversion" {

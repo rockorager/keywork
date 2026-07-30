@@ -3,6 +3,7 @@
 const std = @import("std");
 const keywork = @import("keywork-ui");
 const TextRenderer = @import("../../../graphics/text.zig");
+const DmaBufImage = @import("../../../graphics/DmaBufImage.zig");
 const wayland = @import("wayland");
 const vk = @import("vulkan");
 
@@ -36,9 +37,34 @@ const FrameResources = struct {
     command_pool: vk.CommandPool = .null_handle,
     command_buffer: vk.CommandBuffer = .null_handle,
     image_available: vk.Semaphore = .null_handle,
+    external_release: vk.Semaphore = .null_handle,
     in_flight: vk.Fence = .null_handle,
     staging_buffer: GpuBuffer = .{},
     vertex_buffer: GpuBuffer = .{},
+    external_uploads: std.ArrayList(ExternalUpload) = .empty,
+    external_keys: std.ArrayList(u64) = .empty,
+};
+
+/// A source read interval held until its GPU completion fence is attached to
+/// the DMA-BUF reservation object, or until a blocking fence fallback ends.
+const ExternalUpload = struct {
+    source: keywork.ExternalImageSource,
+};
+
+/// Vulkan owns the fd consumed while importing this persistent image.
+const ImportedDmaBuf = struct {
+    image: vk.Image,
+    memory: vk.DeviceMemory,
+    layout: DmaBufLayout,
+};
+
+const DmaBufLayout = struct {
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    offset: u32,
+    format: DmaBufImage.Format,
+    modifier: u64,
 };
 
 const SwapchainResources = struct {
@@ -71,6 +97,7 @@ const AtlasKey = union(enum) {
     // Alpha and color images can share a display-list cache key (an SVG
     // painted both tinted and untinted), so the atlas must namespace them.
     color_image: u64,
+    external_image: u64,
     alpha_image: u64,
     solid,
 
@@ -123,6 +150,72 @@ const ClipBounds = struct {
         };
     }
 };
+
+const SourcePixelBounds = struct {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+};
+
+fn sourcePixelBounds(rect: keywork.Rect, width: u32, height: u32) ?SourcePixelBounds {
+    const x0f = std.math.clamp(@floor(rect.x), 0, @as(f32, @floatFromInt(width)));
+    const y0f = std.math.clamp(@floor(rect.y), 0, @as(f32, @floatFromInt(height)));
+    const x1f = std.math.clamp(@ceil(rect.x + rect.width), 0, @as(f32, @floatFromInt(width)));
+    const y1f = std.math.clamp(@ceil(rect.y + rect.height), 0, @as(f32, @floatFromInt(height)));
+    const result: SourcePixelBounds = .{
+        .x0 = @intFromFloat(x0f),
+        .y0 = @intFromFloat(y0f),
+        .x1 = @intFromFloat(x1f),
+        .y1 = @intFromFloat(y1f),
+    };
+    return if (result.x0 < result.x1 and result.y0 < result.y1) result else null;
+}
+
+fn imageCopy(bounds: SourcePixelBounds, slot: AtlasSlot) vk.ImageCopy {
+    return .{
+        .src_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .src_offset = .{ .x = @intCast(bounds.x0), .y = @intCast(bounds.y0), .z = 0 },
+        .dst_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .dst_offset = .{
+            .x = @intCast(slot.x + bounds.x0),
+            .y = @intCast(slot.y + bounds.y0),
+            .z = 0,
+        },
+        .extent = .{
+            .width = bounds.x1 - bounds.x0,
+            .height = bounds.y1 - bounds.y0,
+            .depth = 1,
+        },
+    };
+}
+
+fn dmaBufLayout(descriptor: DmaBufImage.NativeDescriptor) DmaBufLayout {
+    return .{
+        .width = descriptor.width,
+        .height = descriptor.height,
+        .stride_bytes = descriptor.stride_bytes,
+        .offset = descriptor.offset,
+        .format = descriptor.format,
+        .modifier = descriptor.modifier,
+    };
+}
+
+fn sameDmaBufLayout(a: DmaBufLayout, b: DmaBufImage.NativeDescriptor) bool {
+    return a.width == b.width and a.height == b.height and
+        a.stride_bytes == b.stride_bytes and a.offset == b.offset and
+        a.format == b.format and a.modifier == b.modifier;
+}
 
 /// Intersects the quad with the clip and remaps its UV window
 /// proportionally, so clipping happens at vertex generation and the whole
@@ -178,6 +271,7 @@ pub const Renderer = struct {
     device: vk.Device,
     queue_family_index: u32,
     queue: vk.Queue,
+    dmabuf_import: bool,
     swapchain_maintenance: bool,
     swapchain: vk.SwapchainKHR,
     swapchain_extent: vk.Extent2D,
@@ -197,6 +291,7 @@ pub const Renderer = struct {
     atlas_sampler: vk.Sampler,
     text_pipeline_format: vk.Format,
     atlas_slots: std.AutoHashMapUnmanaged(AtlasKey, AtlasSlot),
+    imported_dmabufs: std.AutoHashMapUnmanaged(u64, ImportedDmaBuf),
     atlas_pen_x: u32,
     atlas_pen_y: u32,
     atlas_row_height: u32,
@@ -277,14 +372,48 @@ pub const Renderer = struct {
             vki.getPhysicalDeviceFeatures2(selection.physical_device, &features);
         }
         const swapchain_maintenance = has_maintenance_extension and maintenance_features.swapchain_maintenance_1 == .true;
+        const dmabuf_extension_names = [_][*:0]const u8{
+            vk.extensions.khr_external_memory_fd.name,
+            vk.extensions.khr_external_semaphore_fd.name,
+            vk.extensions.ext_external_memory_dma_buf.name,
+            vk.extensions.ext_image_drm_format_modifier.name,
+            vk.extensions.ext_queue_family_foreign.name,
+        };
+        var dmabuf_import = can_query_extended_features;
+        for (dmabuf_extension_names) |name| {
+            dmabuf_import = dmabuf_import and hasExtension(extension_properties, std.mem.span(name));
+        }
+        if (dmabuf_import) {
+            const external_semaphore_info: vk.PhysicalDeviceExternalSemaphoreInfo = .{
+                .handle_type = .{ .sync_fd_bit = true },
+            };
+            var external_semaphore_properties: vk.ExternalSemaphoreProperties = .{
+                .export_from_imported_handle_types = .{},
+                .compatible_handle_types = .{},
+            };
+            vki.getPhysicalDeviceExternalSemaphoreProperties(
+                selection.physical_device,
+                &external_semaphore_info,
+                &external_semaphore_properties,
+            );
+            dmabuf_import = external_semaphore_properties.external_semaphore_features.exportable_bit and
+                external_semaphore_properties.compatible_handle_types.sync_fd_bit;
+        }
         var requested_maintenance_features: vk.PhysicalDeviceSwapchainMaintenance1FeaturesEXT = .{
             .swapchain_maintenance_1 = .true,
         };
-        const device_extension_names = [_][*:0]const u8{
-            vk.extensions.khr_swapchain.name,
-            vk.extensions.ext_swapchain_maintenance_1.name,
+        var device_extension_names: [7][*:0]const u8 = undefined;
+        var device_extension_count: u32 = 0;
+        device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
+        device_extension_count += 1;
+        if (swapchain_maintenance) {
+            device_extension_names[device_extension_count] = vk.extensions.ext_swapchain_maintenance_1.name;
+            device_extension_count += 1;
+        }
+        if (dmabuf_import) for (dmabuf_extension_names) |name| {
+            device_extension_names[device_extension_count] = name;
+            device_extension_count += 1;
         };
-        const device_extension_count: u32 = if (swapchain_maintenance) device_extension_names.len else 1;
         const queue_priority: f32 = 1.0;
         const queue_create_info: vk.DeviceQueueCreateInfo = .{
             .queue_family_index = selection.queue_family_index,
@@ -305,6 +434,7 @@ pub const Renderer = struct {
         var frames: [frames_in_flight]FrameResources = @splat(.{});
         errdefer for (&frames) |*frame| {
             if (frame.in_flight != .null_handle) vkd.destroyFence(device, frame.in_flight, null);
+            if (frame.external_release != .null_handle) vkd.destroySemaphore(device, frame.external_release, null);
             if (frame.image_available != .null_handle) vkd.destroySemaphore(device, frame.image_available, null);
             if (frame.command_pool != .null_handle) vkd.destroyCommandPool(device, frame.command_pool, null);
         };
@@ -319,6 +449,22 @@ pub const Renderer = struct {
                 .command_buffer_count = 1,
             }, @ptrCast(&frame.command_buffer));
             frame.image_available = try vkd.createSemaphore(device, &.{}, null);
+            if (dmabuf_import) {
+                const export_info: vk.ExportSemaphoreCreateInfo = .{
+                    .handle_types = .{ .sync_fd_bit = true },
+                };
+                frame.external_release = vkd.createSemaphore(device, &.{
+                    .p_next = &export_info,
+                }, null) catch disabled: {
+                    dmabuf_import = false;
+                    for (&frames) |*created| {
+                        if (created.external_release == .null_handle) continue;
+                        vkd.destroySemaphore(device, created.external_release, null);
+                        created.external_release = .null_handle;
+                    }
+                    break :disabled .null_handle;
+                };
+            }
             frame.in_flight = try vkd.createFence(device, &.{ .flags = .{ .signaled_bit = true } }, null);
         }
 
@@ -336,6 +482,7 @@ pub const Renderer = struct {
             .device = device,
             .queue_family_index = selection.queue_family_index,
             .queue = queue,
+            .dmabuf_import = dmabuf_import,
             .swapchain_maintenance = swapchain_maintenance,
             .swapchain = .null_handle,
             .swapchain_extent = .{ .width = 0, .height = 0 },
@@ -352,6 +499,7 @@ pub const Renderer = struct {
             .atlas = .{},
             .atlas_sampler = .null_handle,
             .atlas_slots = .{},
+            .imported_dmabufs = .{},
             .atlas_size = initial_atlas_size,
             .max_atlas_size = @min(max_atlas_size_cap, device_limits.max_image_dimension_2d),
             .text_pipeline_format = .undefined,
@@ -385,10 +533,19 @@ pub const Renderer = struct {
         self.text_vertices.deinit(self.allocator);
         self.atlas_slots.deinit(self.allocator);
         for (&self.frames) |*frame| {
+            self.retireExternalFrame(frame);
+            frame.external_uploads.deinit(self.allocator);
+            frame.external_keys.deinit(self.allocator);
             self.vkd.destroyFence(self.device, frame.in_flight, null);
+            if (frame.external_release != .null_handle) {
+                self.vkd.destroySemaphore(self.device, frame.external_release, null);
+            }
             self.vkd.destroySemaphore(self.device, frame.image_available, null);
             self.vkd.destroyCommandPool(self.device, frame.command_pool, null);
         }
+        var imported_values = self.imported_dmabufs.valueIterator();
+        while (imported_values.next()) |imported| self.destroyImportedDmaBuf(imported.*);
+        self.imported_dmabufs.deinit(self.allocator);
         self.vkd.destroyDevice(self.device, null);
         self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
@@ -409,7 +566,127 @@ pub const Renderer = struct {
         }
     }
 
+    fn releaseExternalSources(_: *Self, frame: *FrameResources) void {
+        for (frame.external_uploads.items) |upload| {
+            upload.source.endRead();
+            upload.source.release();
+        }
+        frame.external_uploads.clearRetainingCapacity();
+    }
+
+    fn retireExternalFrame(self: *Self, frame: *FrameResources) void {
+        self.releaseExternalSources(frame);
+        frame.external_keys.clearRetainingCapacity();
+    }
+
+    fn retireSignaledExternalUploads(self: *Self) !void {
+        for (&self.frames) |*frame| {
+            if (frame.external_uploads.items.len == 0 and frame.external_keys.items.len == 0) continue;
+            if (try self.vkd.getFenceStatus(self.device, frame.in_flight) == .not_ready) continue;
+            self.retireExternalFrame(frame);
+        }
+    }
+
+    fn reapImportedDmaBufs(self: *Self) void {
+        while (true) {
+            var stale_key: ?u64 = null;
+            var iterator = self.imported_dmabufs.keyIterator();
+            while (iterator.next()) |key| {
+                if (self.atlas_slots.contains(.{ .external_image = key.* }) or
+                    self.externalKeyInFlight(key.*)) continue;
+                stale_key = key.*;
+                break;
+            }
+            const key = stale_key orelse return;
+            const removed = self.imported_dmabufs.fetchRemove(key).?;
+            self.destroyImportedDmaBuf(removed.value);
+        }
+    }
+
+    fn externalKeyInFlight(self: *const Self, key: u64) bool {
+        for (&self.frames) |*frame| {
+            if (std.mem.indexOfScalar(u64, frame.external_keys.items, key) != null) return true;
+        }
+        return false;
+    }
+
+    fn destroyImportedDmaBuf(self: *Self, imported: ImportedDmaBuf) void {
+        self.vkd.destroyImage(self.device, imported.image, null);
+        self.vkd.freeMemory(self.device, imported.memory, null);
+    }
+
+    fn finishExternalSources(self: *Self, frame: *FrameResources) void {
+        if (frame.external_uploads.items.len == 0) return;
+        const sync_file_fd = self.vkd.getSemaphoreFdKHR(self.device, &.{
+            .semaphore = frame.external_release,
+            .handle_type = .{ .sync_fd_bit = true },
+        }) catch |err| {
+            log.warn("Vulkan DMA-BUF release-fence export failed ({t}); waiting for GPU", .{err});
+            self.waitAndResetExternalRelease(frame);
+            self.releaseExternalSources(frame);
+            return;
+        };
+        if (sync_file_fd == -1) {
+            // SYNC_FD export uses -1 for an already-signaled payload. No
+            // reservation fence is needed because the GPU read has completed.
+            self.releaseExternalSources(frame);
+            return;
+        }
+        defer _ = std.c.close(sync_file_fd);
+
+        var synchronized = true;
+        for (frame.external_uploads.items) |upload| {
+            const buffer = DmaBufImage.fromExternalSource(upload.source) orelse {
+                synchronized = false;
+                break;
+            };
+            buffer.importReadFence(sync_file_fd) catch |err| {
+                log.warn("DMA-BUF release-fence import failed ({t}); waiting for GPU", .{err});
+                synchronized = false;
+                break;
+            };
+        }
+        if (!synchronized) {
+            self.waitForExternalFrame(frame);
+        }
+        // Exporting a sync-fd transfers the semaphore payload. The DMA-BUF
+        // reservation fence now owns GPU completion, so the CPU access bracket
+        // and object reference can end without waiting for this frame slot.
+        self.releaseExternalSources(frame);
+    }
+
+    fn waitAndResetExternalRelease(self: *Self, frame: *FrameResources) void {
+        self.waitForExternalFrame(frame);
+        self.vkd.destroySemaphore(self.device, frame.external_release, null);
+        const export_info: vk.ExportSemaphoreCreateInfo = .{
+            .handle_types = .{ .sync_fd_bit = true },
+        };
+        frame.external_release = self.vkd.createSemaphore(self.device, &.{
+            .p_next = &export_info,
+        }, null) catch disabled: {
+            self.dmabuf_import = false;
+            log.warn("Vulkan DMA-BUF release semaphore recreation failed; disabling direct import", .{});
+            break :disabled .null_handle;
+        };
+    }
+
+    fn waitForExternalFrame(self: *Self, frame: *const FrameResources) void {
+        _ = self.vkd.waitForFences(
+            self.device,
+            &.{frame.in_flight},
+            .true,
+            std.math.maxInt(u64),
+        ) catch {
+            self.vkd.deviceWaitIdle(self.device) catch {};
+            return;
+        };
+    }
+
     pub fn present(self: *Self, display_list: []const keywork.PaintCommand, scale: f32, width: u31, height: u31) !bool {
+        // Retire completed cache users even when this present cannot acquire
+        // a swapchain image, then release imports orphaned by atlas repacking.
+        try self.retireSignaledExternalUploads();
+        self.reapImportedDmaBufs();
         if (!try self.ensureSwapchain(width, height)) return false;
         const result = try self.renderAndPresent(display_list, scale);
         if (result == .stale) {
@@ -963,6 +1240,10 @@ pub const Renderer = struct {
         self.loadFrameViews();
         defer self.storeFrameViews();
         _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
+        const frame = &self.frames[self.frame_index];
+        self.retireExternalFrame(frame);
+        var submitted = false;
+        errdefer if (!submitted) self.retireExternalFrame(frame);
 
         const acquired = self.vkd.acquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.image_available, .null_handle) catch |err| switch (err) {
             error.OutOfDateKHR => return .stale,
@@ -978,14 +1259,21 @@ pub const Renderer = struct {
 
             self.prepareQuads(display_list, scale) catch |err| switch (err) {
                 error.GlyphAtlasFull => {
+                    self.retireExternalFrame(frame);
                     if (!try self.recoverAtlasCapacity(atlas_layout_before, &repacked_at_atlas_limit)) return err;
                     continue;
                 },
                 error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
+                    self.retireExternalFrame(frame);
                     try self.growStaging(atlas_layout_before);
                     continue;
                 },
-                else => return err,
+                else => {
+                    // This command buffer is abandoned, so its recorded
+                    // transition never changed the real image layout.
+                    self.atlas.layout = atlas_layout_before;
+                    return err;
+                },
             };
             break;
         }
@@ -1008,6 +1296,11 @@ pub const Renderer = struct {
         try self.vkd.endCommandBuffer(self.command_buffer);
 
         const wait_stage: vk.PipelineStageFlags = .{ .color_attachment_output_bit = true };
+        const signal_semaphores = [_]vk.Semaphore{
+            self.render_finished_semaphores[image_index],
+            frame.external_release,
+        };
+        const signal_count: u32 = if (frame.external_uploads.items.len == 0) 1 else 2;
         try self.vkd.resetFences(self.device, &.{self.in_flight});
         try self.vkd.queueSubmit(self.queue, &.{.{
             .wait_semaphore_count = 1,
@@ -1015,9 +1308,11 @@ pub const Renderer = struct {
             .p_wait_dst_stage_mask = @ptrCast(&wait_stage),
             .command_buffer_count = 1,
             .p_command_buffers = @ptrCast(&self.command_buffer),
-            .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast(&self.render_finished_semaphores[image_index]),
+            .signal_semaphore_count = signal_count,
+            .p_signal_semaphores = &signal_semaphores,
         }}, self.in_flight);
+        submitted = true;
+        self.finishExternalSources(frame);
 
         var present_fence_info: vk.SwapchainPresentFenceInfoEXT = undefined;
         var present_info: vk.PresentInfoKHR = .{
@@ -1116,6 +1411,10 @@ pub const Renderer = struct {
                 .color_image => |image| {
                     const slot = try self.ensureAtlasColorImage(image);
                     try self.appendColorImageVertices(image, slot, scale, clip);
+                },
+                .external_image => |image| {
+                    const slot = try self.ensureAtlasExternalImage(image);
+                    try self.appendExternalImageVertices(image, slot, scale, clip);
                 },
                 .set_clip => |rect| clip = if (rect) |value| ClipBounds.fromRect(value, scale) else null,
             }
@@ -1242,6 +1541,215 @@ pub const Renderer = struct {
         }
 
         self.copyStagingToAtlas(slot, image_size);
+    }
+
+    fn ensureAtlasExternalImage(self: *Self, image: keywork.PaintCommand.ExternalImage) !AtlasSlot {
+        if (image.width == 0 or image.height == 0) return error.EmptyImage;
+        const key: AtlasKey = .{ .external_image = image.cache_key };
+        if (self.atlas_slots.getPtr(key)) |slot| {
+            if (slot.width != image.width or slot.height != image.height) return error.InvalidImage;
+            if (slot.revision == image.revision) return slot.*;
+            try self.uploadAtlasExternalImage(image, slot.*, slot.revision);
+            slot.revision = image.revision;
+            return slot.*;
+        }
+
+        var slot = try self.allocateAtlasSlot(image.width, image.height);
+        slot.revision = image.revision;
+        errdefer _ = self.atlas_slots.remove(key);
+        try self.atlas_slots.put(self.allocator, key, slot);
+        try self.uploadAtlasExternalImage(image, slot, null);
+        return slot;
+    }
+
+    fn uploadAtlasExternalImage(
+        self: *Self,
+        image: keywork.PaintCommand.ExternalImage,
+        slot: AtlasSlot,
+        old_revision: ?u64,
+    ) !void {
+        const uploaded = self.uploadAtlasDmaBuf(image, slot, old_revision) catch |err| fallback: {
+            log.debug("DMA-BUF Vulkan import failed ({t}); using mapped upload", .{err});
+            break :fallback false;
+        };
+        if (uploaded) return;
+
+        const mapped = try image.source.beginRead();
+        defer image.source.endRead();
+        try self.uploadAtlasColorImage(.{
+            .rect = image.rect,
+            .width = image.width,
+            .height = image.height,
+            .pixels = mapped.pixels,
+            .stride = mapped.stride,
+            .format = mapped.format,
+            .cache_key = image.cache_key,
+            .revision = image.revision,
+        }, slot);
+    }
+
+    /// Reuses one imported premultiplied ARGB DMA-BUF and copies only changed
+    /// texels into the existing atlas slot.
+    fn uploadAtlasDmaBuf(
+        self: *Self,
+        image: keywork.PaintCommand.ExternalImage,
+        slot: AtlasSlot,
+        old_revision: ?u64,
+    ) !bool {
+        if (!self.dmabuf_import) return false;
+        const buffer = DmaBufImage.fromExternalSource(image.source) orelse return false;
+        const descriptor = buffer.nativeDescriptor();
+        if (descriptor.format != .argb8888_premultiplied or
+            descriptor.width != image.width or descriptor.height != image.height) return false;
+        const imported = (try self.ensureImportedDmaBuf(image.cache_key, descriptor)) orelse return false;
+
+        var copies: [keywork.DamageRegion.max_rects]vk.ImageCopy = undefined;
+        var copy_count: usize = 0;
+        if (old_revision) |revision| {
+            var damage: keywork.DamageRegion = .{};
+            if (image.source.damageSince(revision, image.revision, &damage)) {
+                for (damage.slice()) |rect| {
+                    const bounds = sourcePixelBounds(rect, image.width, image.height) orelse continue;
+                    copies[copy_count] = imageCopy(bounds, slot);
+                    copy_count += 1;
+                }
+            }
+        }
+        if (copy_count == 0) {
+            copies[0] = imageCopy(.{ .x0 = 0, .y0 = 0, .x1 = image.width, .y1 = image.height }, slot);
+            copy_count = 1;
+        }
+
+        const frame = &self.frames[self.frame_index];
+        try frame.external_uploads.ensureUnusedCapacity(self.allocator, 1);
+        try frame.external_keys.ensureUnusedCapacity(self.allocator, 1);
+        _ = try image.source.beginRead();
+        image.source.retain();
+        var source_owned = true;
+        errdefer if (source_owned) {
+            image.source.endRead();
+            image.source.release();
+        };
+
+        self.prepareAtlasUpload();
+        self.transitionImportedImage(
+            imported.image,
+            .general,
+            .transfer_src_optimal,
+            vk.QUEUE_FAMILY_FOREIGN_EXT,
+            self.queue_family_index,
+            .{},
+            .{ .transfer_read_bit = true },
+            .{ .all_commands_bit = true },
+            .{ .transfer_bit = true },
+        );
+        self.vkd.cmdCopyImage(
+            self.command_buffer,
+            imported.image,
+            .transfer_src_optimal,
+            self.atlas.image,
+            .transfer_dst_optimal,
+            copies[0..copy_count],
+        );
+        self.transitionImportedImage(
+            imported.image,
+            .transfer_src_optimal,
+            .general,
+            self.queue_family_index,
+            vk.QUEUE_FAMILY_FOREIGN_EXT,
+            .{ .transfer_read_bit = true },
+            .{},
+            .{ .transfer_bit = true },
+            .{ .bottom_of_pipe_bit = true },
+        );
+
+        frame.external_uploads.appendAssumeCapacity(.{ .source = image.source });
+        frame.external_keys.appendAssumeCapacity(image.cache_key);
+        source_owned = false;
+        return true;
+    }
+
+    fn ensureImportedDmaBuf(
+        self: *Self,
+        cache_key: u64,
+        descriptor: DmaBufImage.NativeDescriptor,
+    ) !?*ImportedDmaBuf {
+        if (self.imported_dmabufs.getPtr(cache_key)) |imported| {
+            if (!sameDmaBufLayout(imported.layout, descriptor)) return error.InvalidImage;
+            return imported;
+        }
+        if (!self.supportsDmaBufTransfer(descriptor)) return null;
+
+        const duplicate_fd = std.c.dup(descriptor.fd);
+        if (duplicate_fd < 0) return error.DmaBufImportFailed;
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.c.close(duplicate_fd);
+        };
+
+        const plane: vk.SubresourceLayout = .{
+            .offset = descriptor.offset,
+            .size = 0,
+            .row_pitch = descriptor.stride_bytes,
+            .array_pitch = 0,
+            .depth_pitch = 0,
+        };
+        const modifier_info: vk.ImageDrmFormatModifierExplicitCreateInfoEXT = .{
+            .drm_format_modifier = descriptor.modifier,
+            .drm_format_modifier_plane_count = 1,
+            .p_plane_layouts = @ptrCast(&plane),
+        };
+        const external_info: vk.ExternalMemoryImageCreateInfo = .{
+            .p_next = &modifier_info,
+            .handle_types = .{ .dma_buf_bit_ext = true },
+        };
+        const imported_image = try self.vkd.createImage(self.device, &.{
+            .p_next = &external_info,
+            .image_type = .@"2d",
+            .format = .b8g8r8a8_unorm,
+            .extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+            .mip_levels = 1,
+            .array_layers = 1,
+            .samples = .{ .@"1_bit" = true },
+            .tiling = .drm_format_modifier_ext,
+            .usage = .{ .transfer_src_bit = true },
+            .sharing_mode = .exclusive,
+            .initial_layout = .undefined,
+        }, null);
+        errdefer self.vkd.destroyImage(self.device, imported_image, null);
+
+        const requirements = self.vkd.getImageMemoryRequirements(self.device, imported_image);
+        var fd_properties: vk.MemoryFdPropertiesKHR = .{ .memory_type_bits = 0 };
+        try self.vkd.getMemoryFdPropertiesKHR(
+            self.device,
+            .{ .dma_buf_bit_ext = true },
+            duplicate_fd,
+            &fd_properties,
+        );
+        const dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = imported_image };
+        const import_info: vk.ImportMemoryFdInfoKHR = .{
+            .p_next = &dedicated,
+            .handle_type = .{ .dma_buf_bit_ext = true },
+            .fd = duplicate_fd,
+        };
+        const imported_memory = try self.vkd.allocateMemory(self.device, &.{
+            .p_next = &import_info,
+            .allocation_size = requirements.size,
+            .memory_type_index = try self.memoryTypeIndex(
+                requirements.memory_type_bits & fd_properties.memory_type_bits,
+                .{},
+            ),
+        }, null);
+        fd_owned = false;
+        errdefer self.vkd.freeMemory(self.device, imported_memory, null);
+        try self.vkd.bindImageMemory(self.device, imported_image, imported_memory, 0);
+
+        try self.imported_dmabufs.put(self.allocator, cache_key, .{
+            .image = imported_image,
+            .memory = imported_memory,
+            .layout = dmaBufLayout(descriptor),
+        });
+        return self.imported_dmabufs.getPtr(cache_key).?;
     }
 
     fn ensureAtlasImage(self: *Self, image: keywork.PaintCommand.AlphaImage) !AtlasSlot {
@@ -1396,6 +1904,19 @@ pub const Renderer = struct {
         }, .{ 1, 1, 1, 1 }, clip);
     }
 
+    fn appendExternalImageVertices(self: *Self, image: keywork.PaintCommand.ExternalImage, slot: AtlasSlot, scale: f32, clip: ?ClipBounds) !void {
+        try self.appendQuad(.{
+            .x0 = image.rect.x * scale,
+            .y0 = image.rect.y * scale,
+            .x1 = (image.rect.x + image.rect.width) * scale,
+            .y1 = (image.rect.y + image.rect.height) * scale,
+            .uv_left = @as(f32, @floatFromInt(slot.x)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_top = @as(f32, @floatFromInt(slot.y)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_right = @as(f32, @floatFromInt(slot.x + slot.width)) / @as(f32, @floatFromInt(self.atlas_size)),
+            .uv_bottom = @as(f32, @floatFromInt(slot.y + slot.height)) / @as(f32, @floatFromInt(self.atlas_size)),
+        }, .{ 1, 1, 1, 1 }, clip);
+    }
+
     fn appendQuad(self: *Self, bounds: QuadBounds, color: [4]f32, clip: ?ClipBounds) !void {
         if (bounds.x1 <= bounds.x0 or bounds.y1 <= bounds.y0) return;
         const quad = clipQuad(bounds, clip) orelse return;
@@ -1523,6 +2044,40 @@ pub const Renderer = struct {
         return .{ .image = image, .memory = memory, .layout = .undefined };
     }
 
+    fn supportsDmaBufTransfer(self: *Self, descriptor: DmaBufImage.NativeDescriptor) bool {
+        const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
+            .drm_format_modifier = descriptor.modifier,
+            .sharing_mode = .exclusive,
+        };
+        const external_info: vk.PhysicalDeviceExternalImageFormatInfo = .{
+            .p_next = &modifier_info,
+            .handle_type = .{ .dma_buf_bit_ext = true },
+        };
+        const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
+            .p_next = &external_info,
+            .format = .b8g8r8a8_unorm,
+            .type = .@"2d",
+            .tiling = .drm_format_modifier_ext,
+            .usage = .{ .transfer_src_bit = true },
+        };
+        var external_properties: vk.ExternalImageFormatProperties = .{
+            .external_memory_properties = undefined,
+        };
+        var properties: vk.ImageFormatProperties2 = .{
+            .p_next = &external_properties,
+            .image_format_properties = undefined,
+        };
+        self.vki.getPhysicalDeviceImageFormatProperties2(
+            self.physical_device,
+            &format_info,
+            &properties,
+        ) catch return false;
+        return external_properties.external_memory_properties.external_memory_features.importable_bit and
+            external_properties.external_memory_properties.compatible_handle_types.dma_buf_bit_ext and
+            descriptor.width <= properties.image_format_properties.max_extent.width and
+            descriptor.height <= properties.image_format_properties.max_extent.height;
+    }
+
     fn destroyImage(self: *Self, image: *GpuImage) void {
         if (image.view != .null_handle) self.vkd.destroyImageView(self.device, image.view, null);
         if (image.image != .null_handle) self.vkd.destroyImage(self.device, image.image, null);
@@ -1565,6 +2120,39 @@ pub const Renderer = struct {
             self.command_buffer,
             stageMaskForLayout(old_layout),
             stageMaskForLayout(new_layout),
+            .{},
+            null,
+            null,
+            &.{barrier},
+        );
+    }
+
+    fn transitionImportedImage(
+        self: *Self,
+        image: vk.Image,
+        old_layout: vk.ImageLayout,
+        new_layout: vk.ImageLayout,
+        source_queue: u32,
+        destination_queue: u32,
+        source_access: vk.AccessFlags,
+        destination_access: vk.AccessFlags,
+        source_stage: vk.PipelineStageFlags,
+        destination_stage: vk.PipelineStageFlags,
+    ) void {
+        const barrier: vk.ImageMemoryBarrier = .{
+            .src_access_mask = source_access,
+            .dst_access_mask = destination_access,
+            .old_layout = old_layout,
+            .new_layout = new_layout,
+            .src_queue_family_index = source_queue,
+            .dst_queue_family_index = destination_queue,
+            .image = image,
+            .subresource_range = colorSubresourceRange(),
+        };
+        self.vkd.cmdPipelineBarrier(
+            self.command_buffer,
+            source_stage,
+            destination_stage,
             .{},
             null,
             null,
@@ -1738,6 +2326,41 @@ test "clipQuad culls quads fully outside the clip" {
         .uv_bottom = 1,
     };
     try std.testing.expectEqual(@as(?QuadBounds, null), clipQuad(quad, .{ .x0 = 10, .y0 = 0, .x1 = 20, .y1 = 10 }));
+}
+
+test "DMA-BUF damage converts to source and atlas copy coordinates" {
+    const bounds = sourcePixelBounds(
+        .{ .x = 1.2, .y = 2.8, .width = 3.1, .height = 4.2 },
+        8,
+        8,
+    ).?;
+    try std.testing.expectEqual(SourcePixelBounds{ .x0 = 1, .y0 = 2, .x1 = 5, .y1 = 7 }, bounds);
+    const copy = imageCopy(bounds, .{ .x = 10, .y = 20, .width = 8, .height = 8 });
+    try std.testing.expectEqual(vk.Offset3D{ .x = 1, .y = 2, .z = 0 }, copy.src_offset);
+    try std.testing.expectEqual(vk.Offset3D{ .x = 11, .y = 22, .z = 0 }, copy.dst_offset);
+    try std.testing.expectEqual(vk.Extent3D{ .width = 4, .height = 5, .depth = 1 }, copy.extent);
+
+    try std.testing.expectEqual(
+        SourcePixelBounds{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 },
+        sourcePixelBounds(.{ .x = -10, .y = -2, .width = 40, .height = 20 }, 8, 8).?,
+    );
+}
+
+test "DMA-BUF cache layout excludes transient descriptor fd" {
+    const first: DmaBufImage.NativeDescriptor = .{
+        .fd = 10,
+        .width = 320,
+        .height = 200,
+        .stride_bytes = 1280,
+        .offset = 64,
+        .format = .argb8888_premultiplied,
+        .modifier = 0,
+    };
+    var second = first;
+    second.fd = 20;
+    try std.testing.expect(sameDmaBufLayout(dmaBufLayout(first), second));
+    second.stride_bytes += 4;
+    try std.testing.expect(!sameDmaBufLayout(dmaBufLayout(first), second));
 }
 
 test "atlas capacity grows to the device limit then resets" {

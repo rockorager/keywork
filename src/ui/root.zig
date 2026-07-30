@@ -41,6 +41,7 @@ pub const PaintCommand = display.PaintCommand;
 pub const DisplayList = display.DisplayList;
 pub const AlphaMask = display.AlphaMask;
 pub const PixelFormat = display.PixelFormat;
+pub const ExternalImageSource = display.ExternalImageSource;
 pub const PixelBuffer = @import("PixelBuffer.zig");
 pub const RasterCache = display.RasterCache;
 pub const RenderBackend = display.RenderBackend;
