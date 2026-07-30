@@ -251,6 +251,24 @@ pub fn add(
     );
     renderer_check_step.dependOn(&renderer_conformance_run.step);
     renderer_check_step.dependOn(&renderer_scene_run.step);
+
+    const cpu_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("src/compositor/cpu_benchmark_root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    cpu_benchmark_module.linkSystemLibrary("pixman-1", .{});
+    const cpu_benchmark = b.addExecutable(.{
+        .name = "cpu-renderer-benchmark",
+        .root_module = cpu_benchmark_module,
+    });
+    const benchmark_run = b.addRunArtifact(cpu_benchmark);
+    const benchmark_step = b.step(
+        "benchmark-cpu-renderer",
+        "Benchmark the ReleaseFast Pixman CPU renderer",
+    );
+    benchmark_step.dependOn(&benchmark_run.step);
 }
 
 fn addGdmSessionInstallStep(b: *std.Build) void {

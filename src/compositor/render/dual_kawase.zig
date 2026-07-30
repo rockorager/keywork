@@ -9,7 +9,27 @@ pub const Error = error{
     OutOfMemory,
 };
 
-const Color = [4]f32;
+const Color = @Vector(4, f32);
+
+const SampleAxis = struct {
+    first: usize,
+    second: usize,
+    amount: f32,
+};
+
+const DownsampleAxes = struct {
+    center: SampleAxis,
+    lower: SampleAxis,
+    upper: SampleAxis,
+};
+
+const UpsampleAxes = struct {
+    center: SampleAxis,
+    lower: SampleAxis,
+    upper: SampleAxis,
+    diagonal_lower: SampleAxis,
+    diagonal_upper: SampleAxis,
+};
 
 const Image = struct {
     size: render.Size,
@@ -78,11 +98,12 @@ pub fn blurArgb(
     const downsample_passes: usize = @max(level, 1);
     for (0..downsample_passes) |index| {
         const destination_level: u8 = if (level == 0) 0 else @intCast(index + 1);
-        const destination = try Image.init(
+        var destination = try Image.init(
             allocator,
             blur_geometry.levelSize(sample_size, destination_level),
         );
-        downsample(current, destination, offset);
+        errdefer destination.deinit(allocator);
+        try downsample(allocator, current, destination, offset);
         current.deinit(allocator);
         current = destination;
     }
@@ -94,11 +115,12 @@ pub fn blurArgb(
             0
         else
             @intCast(source_level - 1);
-        const destination = try Image.init(
+        var destination = try Image.init(
             allocator,
             blur_geometry.levelSize(sample_size, destination_level),
         );
-        upsample(current, destination, offset, level == 0);
+        errdefer destination.deinit(allocator);
+        try upsample(allocator, current, destination, offset, level == 0);
         current.deinit(allocator);
         current = destination;
         if (level > 0) source_level -= 1;
@@ -107,76 +129,112 @@ pub fn blurArgb(
     return packImage(allocator, current);
 }
 
-fn downsample(source: Image, destination: Image, offset: f32) void {
+fn downsample(
+    allocator: std.mem.Allocator,
+    source: Image,
+    destination: Image,
+    offset: f32,
+) Error!void {
+    const x_axes = allocator.alloc(DownsampleAxes, destination.size.width) catch
+        return error.OutOfMemory;
+    defer allocator.free(x_axes);
+    for (x_axes, 0..) |*axes, x| {
+        const coordinate = (@as(f32, @floatFromInt(x)) + 0.5) *
+            @as(f32, @floatFromInt(source.size.width)) /
+            @as(f32, @floatFromInt(destination.size.width));
+        axes.* = .{
+            .center = sampleAxis(coordinate, source.size.width),
+            .lower = sampleAxis(coordinate - offset, source.size.width),
+            .upper = sampleAxis(coordinate + offset, source.size.width),
+        };
+    }
     for (0..destination.size.height) |y| {
         const coordinate_y = (@as(f32, @floatFromInt(y)) + 0.5) *
             @as(f32, @floatFromInt(source.size.height)) /
             @as(f32, @floatFromInt(destination.size.height));
-        for (0..destination.size.width) |x| {
-            const coordinate_x = (@as(f32, @floatFromInt(x)) + 0.5) *
-                @as(f32, @floatFromInt(source.size.width)) /
-                @as(f32, @floatFromInt(destination.size.width));
+        const center_y = sampleAxis(coordinate_y, source.size.height);
+        const top = sampleAxis(coordinate_y - offset, source.size.height);
+        const bottom = sampleAxis(coordinate_y + offset, source.size.height);
+        for (x_axes, 0..) |axes, x| {
             var color: Color = @splat(0);
-            addColor(&color, sample(source, coordinate_x, coordinate_y), 4);
-            addColor(&color, sample(source, coordinate_x - offset, coordinate_y - offset), 1);
-            addColor(&color, sample(source, coordinate_x + offset, coordinate_y - offset), 1);
-            addColor(&color, sample(source, coordinate_x - offset, coordinate_y + offset), 1);
-            addColor(&color, sample(source, coordinate_x + offset, coordinate_y + offset), 1);
-            inline for (0..4) |component| color[component] /= 8;
+            addColor(&color, sample(source, axes.center, center_y), 4);
+            addColor(&color, sample(source, axes.lower, top), 1);
+            addColor(&color, sample(source, axes.upper, top), 1);
+            addColor(&color, sample(source, axes.lower, bottom), 1);
+            addColor(&color, sample(source, axes.upper, bottom), 1);
+            color /= @splat(8);
             destination.pixels[y * destination.size.width + x] = color;
         }
     }
 }
 
 fn upsample(
+    allocator: std.mem.Allocator,
     source: Image,
     destination: Image,
     offset: f32,
     same_size: bool,
-) void {
+) Error!void {
     const divisor: f32 = if (same_size) 1 else 2;
     const diagonal = offset * 0.5;
+    const x_axes = allocator.alloc(UpsampleAxes, destination.size.width) catch
+        return error.OutOfMemory;
+    defer allocator.free(x_axes);
+    for (x_axes, 0..) |*axes, x| {
+        const coordinate = (@as(f32, @floatFromInt(x)) + 0.5) / divisor;
+        axes.* = .{
+            .center = sampleAxis(coordinate, source.size.width),
+            .lower = sampleAxis(coordinate - offset, source.size.width),
+            .upper = sampleAxis(coordinate + offset, source.size.width),
+            .diagonal_lower = sampleAxis(coordinate - diagonal, source.size.width),
+            .diagonal_upper = sampleAxis(coordinate + diagonal, source.size.width),
+        };
+    }
     for (0..destination.size.height) |y| {
         const coordinate_y = (@as(f32, @floatFromInt(y)) + 0.5) / divisor;
-        for (0..destination.size.width) |x| {
-            const coordinate_x = (@as(f32, @floatFromInt(x)) + 0.5) / divisor;
+        const center_y = sampleAxis(coordinate_y, source.size.height);
+        const top = sampleAxis(coordinate_y - offset, source.size.height);
+        const bottom = sampleAxis(coordinate_y + offset, source.size.height);
+        const diagonal_top = sampleAxis(coordinate_y - diagonal, source.size.height);
+        const diagonal_bottom = sampleAxis(coordinate_y + diagonal, source.size.height);
+        for (x_axes, 0..) |axes, x| {
             var color: Color = @splat(0);
-            addColor(&color, sample(source, coordinate_x - offset, coordinate_y), 1);
-            addColor(&color, sample(source, coordinate_x + offset, coordinate_y), 1);
-            addColor(&color, sample(source, coordinate_x, coordinate_y - offset), 1);
-            addColor(&color, sample(source, coordinate_x, coordinate_y + offset), 1);
-            addColor(&color, sample(source, coordinate_x - diagonal, coordinate_y - diagonal), 2);
-            addColor(&color, sample(source, coordinate_x + diagonal, coordinate_y - diagonal), 2);
-            addColor(&color, sample(source, coordinate_x - diagonal, coordinate_y + diagonal), 2);
-            addColor(&color, sample(source, coordinate_x + diagonal, coordinate_y + diagonal), 2);
-            inline for (0..4) |component| color[component] /= 12;
+            addColor(&color, sample(source, axes.lower, center_y), 1);
+            addColor(&color, sample(source, axes.upper, center_y), 1);
+            addColor(&color, sample(source, axes.center, top), 1);
+            addColor(&color, sample(source, axes.center, bottom), 1);
+            addColor(&color, sample(source, axes.diagonal_lower, diagonal_top), 2);
+            addColor(&color, sample(source, axes.diagonal_upper, diagonal_top), 2);
+            addColor(&color, sample(source, axes.diagonal_lower, diagonal_bottom), 2);
+            addColor(&color, sample(source, axes.diagonal_upper, diagonal_bottom), 2);
+            color /= @splat(12);
             destination.pixels[y * destination.size.width + x] = color;
         }
     }
 }
 
-fn sample(image: Image, coordinate_x: f32, coordinate_y: f32) Color {
-    const texel_x = coordinate_x - 0.5;
-    const texel_y = coordinate_y - 0.5;
-    const base_x: i64 = @intFromFloat(@floor(texel_x));
-    const base_y: i64 = @intFromFloat(@floor(texel_y));
-    const fraction_x = texel_x - @as(f32, @floatFromInt(base_x));
-    const fraction_y = texel_y - @as(f32, @floatFromInt(base_y));
-    const x0 = clampedIndex(base_x, image.size.width);
-    const x1 = clampedIndex(base_x + 1, image.size.width);
-    const y0 = clampedIndex(base_y, image.size.height);
-    const y1 = clampedIndex(base_y + 1, image.size.height);
+fn sample(image: Image, x: SampleAxis, y: SampleAxis) Color {
     const top = mixColor(
-        image.pixels[y0 * image.size.width + x0],
-        image.pixels[y0 * image.size.width + x1],
-        fraction_x,
+        image.pixels[y.first * image.size.width + x.first],
+        image.pixels[y.first * image.size.width + x.second],
+        x.amount,
     );
     const bottom = mixColor(
-        image.pixels[y1 * image.size.width + x0],
-        image.pixels[y1 * image.size.width + x1],
-        fraction_x,
+        image.pixels[y.second * image.size.width + x.first],
+        image.pixels[y.second * image.size.width + x.second],
+        x.amount,
     );
-    return mixColor(top, bottom, fraction_y);
+    return mixColor(top, bottom, y.amount);
+}
+
+fn sampleAxis(coordinate: f32, limit: u32) SampleAxis {
+    const texel = coordinate - 0.5;
+    const base: i64 = @intFromFloat(@floor(texel));
+    return .{
+        .first = clampedIndex(base, limit),
+        .second = clampedIndex(base + 1, limit),
+        .amount = texel - @as(f32, @floatFromInt(base)),
+    };
 }
 
 fn clampedIndex(value: i64, limit: u32) usize {
@@ -187,15 +245,11 @@ fn clampedIndex(value: i64, limit: u32) usize {
 }
 
 fn mixColor(a: Color, b: Color, amount: f32) Color {
-    var result: Color = undefined;
-    inline for (0..4) |component| {
-        result[component] = a[component] + (b[component] - a[component]) * amount;
-    }
-    return result;
+    return a + (b - a) * @as(Color, @splat(amount));
 }
 
 fn addColor(sum: *Color, color: Color, weight: f32) void {
-    inline for (0..4) |component| sum[component] += color[component] * weight;
+    sum.* += color * @as(Color, @splat(weight));
 }
 
 fn applyFinish(
@@ -213,19 +267,17 @@ fn applyFinish(
                 color.* = @splat(0);
                 continue;
             }
-            var straight: [3]f32 = undefined;
-            inline for (0..3) |component| straight[component] = color[component] * 255 / alpha;
-            const luminance = straight[0] * 0.0722 + straight[1] * 0.7152 + straight[2] * 0.2126;
+            const luminance = color[0] * 0.0722 + color[1] * 0.7152 + color[2] * 0.2126;
             const grain = noise(
                 @intCast(@as(i64, sample_rect.x) + @as(i64, @intCast(x))),
                 @intCast(@as(i64, sample_rect.y) + @as(i64, @intCast(y))),
-            ) * finish.noise * 255;
+            ) * finish.noise * alpha;
+            const midpoint = alpha * 0.5;
             inline for (0..3) |component| {
-                var value = luminance + (straight[component] - luminance) * finish.saturation;
-                value += (finish.brightness - 1) * 255;
-                value = (value - 127.5) * finish.contrast + 127.5;
-                value = @max(value + grain, 0);
-                color[component] = value * alpha / 255;
+                var value = luminance + (color[component] - luminance) * finish.saturation;
+                value += (finish.brightness - 1) * alpha;
+                value = (value - midpoint) * finish.contrast + midpoint;
+                color[component] = @max(value + grain, 0);
             }
         }
     }
@@ -366,4 +418,35 @@ test "CPU backdrop blur finish is stable across scoped captures" {
     }
     try std.testing.expect(full[0] != 0xff806040);
     try std.testing.expect(full[0] != full[1]);
+}
+
+test "CPU backdrop finish preserves straight-alpha semantics in premultiplied space" {
+    const finish: render.BackdropBlurFinish = .{
+        .brightness = 0.83,
+        .contrast = 0.91,
+        .saturation = 0.72,
+    };
+    var pixels = [_]Color{.{ 16, 32, 64, 128 }};
+    const image: Image = .{
+        .size = .{ .width = 1, .height = 1 },
+        .pixels = &pixels,
+    };
+
+    var expected: [3]f32 = undefined;
+    const alpha = pixels[0][3];
+    var straight: [3]f32 = undefined;
+    inline for (0..3) |component| straight[component] = pixels[0][component] * 255 / alpha;
+    const luminance = straight[0] * 0.0722 + straight[1] * 0.7152 + straight[2] * 0.2126;
+    inline for (0..3) |component| {
+        var value = luminance + (straight[component] - luminance) * finish.saturation;
+        value += (finish.brightness - 1) * 255;
+        value = (value - 127.5) * finish.contrast + 127.5;
+        expected[component] = @max(value, 0) * alpha / 255;
+    }
+
+    applyFinish(image, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, finish);
+    inline for (0..3) |component| {
+        try std.testing.expectApproxEqAbs(expected[component], pixels[0][component], 0.0001);
+    }
+    try std.testing.expectEqual(alpha, pixels[0][3]);
 }

@@ -14,6 +14,7 @@ const pixman = @cImport({
 });
 
 allocator: std.mem.Allocator,
+rounded_masks: RoundedMaskCache,
 
 pub const Error = error{
     InvalidTarget,
@@ -21,10 +22,14 @@ pub const Error = error{
 };
 
 pub fn init(allocator: std.mem.Allocator) Self {
-    return .{ .allocator = allocator };
+    return .{
+        .allocator = allocator,
+        .rounded_masks = .init(allocator),
+    };
 }
 
 pub fn deinit(self: *Self) void {
+    self.rounded_masks.deinit();
     self.* = undefined;
 }
 
@@ -38,7 +43,7 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
         for (captures.items) |snapshot| self.allocator.free(snapshot.pixels);
         captures.deinit(self.allocator);
     }
-    for (frame.commands) |command| {
+    for (frame.commands, 0..) |command, command_index| {
         switch (command) {
             .clear => |color| try fill(
                 destination,
@@ -53,8 +58,14 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 }
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
-            .shadow => |shadow| try drawShadow(destination, frame.size, shadow),
+            .shadow => |shadow| try drawShadow(destination, frame.size, shadow, frame.damage),
             .backdrop_capture => |marker| {
+                if (!backdropCaptureRequired(
+                    frame.commands[command_index + 1 ..],
+                    marker.id,
+                    frame.size,
+                    frame.damage,
+                )) continue;
                 if (try self.captureBackdrop(target, marker)) |snapshot| {
                     captures.append(self.allocator, snapshot) catch |err| {
                         self.allocator.free(snapshot.pixels);
@@ -68,14 +79,38 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 frame.damage,
                 backdropSnapshot(captures.items, blur.capture_id),
             ),
-            .image => |image| try composite(destination, frame.size, image),
+            .image => |image| try composite(destination, frame.size, image, &self.rounded_masks),
             .crossfade => |crossfade| try self.compositeCrossfade(
                 destination,
                 frame.size,
                 crossfade,
+                &self.rounded_masks,
+                frame.damage,
             ),
         }
     }
+}
+
+/// A later capture with the same ID supersedes this one for subsequent blur
+/// commands, matching backdropSnapshot's nearest-preceding lookup.
+fn backdropCaptureRequired(
+    commands: []const render_types.Command,
+    id: u32,
+    frame_size: render_types.Size,
+    damage: ?[]const render_types.Rect,
+) bool {
+    for (commands) |command| switch (command) {
+        .backdrop_capture => |capture| if (capture.id == id) return false,
+        .backdrop_blur => |blur| {
+            if (blur.capture_id != id or blur.radius == 0 or
+                blur.rect.width == 0 or blur.rect.height == 0) continue;
+            var clipped = blur.rect.clipTo(frame_size) orelse continue;
+            if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
+            if (rect_region.damageBounds(damage, clipped) != null) return true;
+        },
+        else => {},
+    };
+    return false;
 }
 
 fn compositeCrossfade(
@@ -83,6 +118,8 @@ fn compositeCrossfade(
     destination: *pixman.pixman_image_t,
     destination_size: render_types.Size,
     fade: render_types.Crossfade,
+    rounded_masks: *RoundedMaskCache,
+    damage: ?[]const render_types.Rect,
 ) Error!void {
     const old = switch (fade.old) {
         .pixels => |pixels| pixels,
@@ -93,57 +130,92 @@ fn compositeCrossfade(
         .offscreen => return error.InvalidTarget,
     };
     if (fade.destination.width == 0 or fade.destination.height == 0) return error.InvalidTarget;
+    if (fade.factor == 0 or fade.factor == std.math.maxInt(u32)) {
+        return composite(destination, destination_size, .{
+            .x = fade.destination.x,
+            .y = fade.destination.y,
+            .size = .{
+                .width = fade.destination.width,
+                .height = fade.destination.height,
+            },
+            .buffer = if (fade.factor == 0) old else new,
+            .source = if (fade.factor == 0) fade.old_source else fade.new_source,
+            .rounded_clip = fade.rounded_clip,
+            .clip = fade.clip,
+        }, rounded_masks);
+    }
     var clipped = fade.destination.clipTo(destination_size) orelse return;
     if (fade.clip) |clip| clipped = clipped.intersection(clip) orelse return;
     if (fade.rounded_clip) |clip| clipped = clipped.intersection(clip.rect) orelse return;
+    if (damage) |rectangles| {
+        for (rectangles) |rectangle| {
+            const damaged = clipped.intersection(rectangle) orelse continue;
+            try self.compositeCrossfadeRect(
+                destination,
+                destination_size,
+                fade,
+                old,
+                new,
+                damaged,
+                rounded_masks,
+            );
+        }
+    } else {
+        try self.compositeCrossfadeRect(
+            destination,
+            destination_size,
+            fade,
+            old,
+            new,
+            clipped,
+            rounded_masks,
+        );
+    }
+}
+
+fn compositeCrossfadeRect(
+    self: *Self,
+    destination: *pixman.pixman_image_t,
+    destination_size: render_types.Size,
+    fade: render_types.Crossfade,
+    old: render_types.PixelBuffer,
+    new: render_types.PixelBuffer,
+    clipped: render_types.Rect,
+    rounded_masks: *RoundedMaskCache,
+) Error!void {
     const count = std.math.mul(usize, clipped.width, clipped.height) catch
         return error.InvalidTarget;
-    const old_pixels = self.allocator.alloc(u32, count) catch return error.OutOfMemory;
-    defer self.allocator.free(old_pixels);
-    const new_pixels = self.allocator.alloc(u32, count) catch return error.OutOfMemory;
-    defer self.allocator.free(new_pixels);
-    @memset(old_pixels, 0);
-    @memset(new_pixels, 0);
+    const mixed_pixels = self.allocator.alloc(u32, count) catch return error.OutOfMemory;
+    defer self.allocator.free(mixed_pixels);
+    @memset(mixed_pixels, 0);
     const local_size: render_types.Size = .{ .width = clipped.width, .height = clipped.height };
-    const old_target = try createImage(.{ .size = local_size, .stride_pixels = local_size.width, .pixels = old_pixels }, false, false);
-    defer _ = pixman.pixman_image_unref(old_target);
-    const new_target = try createImage(.{ .size = local_size, .stride_pixels = local_size.width, .pixels = new_pixels }, false, false);
-    defer _ = pixman.pixman_image_unref(new_target);
+    const mixed_target = try createImage(.{ .size = local_size, .stride_pixels = local_size.width, .pixels = mixed_pixels }, false, false);
+    defer _ = pixman.pixman_image_unref(mixed_target);
     const local_x = fade.destination.x -| clipped.x;
     const local_y = fade.destination.y -| clipped.y;
-    try composite(old_target, local_size, .{
+    try compositeWithOperator(mixed_target, local_size, .{
         .x = local_x,
         .y = local_y,
         .size = .{ .width = fade.destination.width, .height = fade.destination.height },
         .buffer = old,
         .source = fade.old_source,
-    });
-    try composite(new_target, local_size, .{
+        .alpha_multiplier = std.math.maxInt(u32) - fade.factor,
+    }, rounded_masks, pixman.PIXMAN_OP_SRC);
+    try compositeWithOperator(mixed_target, local_size, .{
         .x = local_x,
         .y = local_y,
         .size = .{ .width = fade.destination.width, .height = fade.destination.height },
         .buffer = new,
         .source = fade.new_source,
-    });
-    const t: u64 = fade.factor;
-    for (old_pixels, new_pixels) |*a, b| {
-        var mixed: u32 = 0;
-        inline for (0..4) |component| {
-            const shift: u5 = @intCast(component * 8);
-            const av = (a.* >> shift) & 0xff;
-            const bv = (b >> shift) & 0xff;
-            const value = (@as(u64, av) * (std.math.maxInt(u32) - t) + @as(u64, bv) * t + std.math.maxInt(u32) / 2) / std.math.maxInt(u32);
-            mixed |= @as(u32, @intCast(value)) << shift;
-        }
-        a.* = mixed;
-    }
+        .alpha_multiplier = fade.factor,
+    }, rounded_masks, pixman.PIXMAN_OP_ADD);
     try compositePixels(destination, destination_size, .{
         .x = clipped.x,
         .y = clipped.y,
         .size = local_size,
-        .buffer = .{ .size = local_size, .stride_pixels = local_size.width, .pixels = old_pixels },
+        .buffer = .{ .size = local_size, .stride_pixels = local_size.width, .pixels = mixed_pixels },
         .rounded_clip = fade.rounded_clip,
-    }, false, false, false);
+    }, false, false, false, rounded_masks, null);
 }
 
 test "CPU renderer crossfades premultiplied sources before source-over" {
@@ -168,6 +240,31 @@ test "CPU renderer crossfades premultiplied sources before source-over" {
         try renderer.render(.{ .size = source_size, .commands = &commands }, .{ .size = source_size, .stride_pixels = 1, .pixels = &pixel });
         try std.testing.expectEqual(wanted, pixel[0]);
     }
+}
+
+test "CPU renderer does not allocate an unreferenced backdrop capture" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var renderer = init(failing_allocator.allocator());
+    defer renderer.deinit();
+    var pixel = [_]u32{0xff112233};
+    const commands = [_]render_types.Command{.{ .backdrop_capture = .{
+        .id = 1,
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .radius = 1,
+        .base = true,
+    } }};
+
+    try renderer.render(.{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &commands,
+    }, .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &pixel,
+    });
+    try std.testing.expect(!failing_allocator.has_induced_failure);
 }
 
 const BackdropSnapshot = struct {
@@ -261,6 +358,7 @@ fn drawShadow(
     destination: *pixman.pixman_image_t,
     destination_size: render_types.Size,
     shadow: render_types.Shadow,
+    damage: ?[]const render_types.Rect,
 ) Error!void {
     if (shadow.rect.width == 0 or shadow.rect.height == 0 or shadow.color.alpha == 0) return;
 
@@ -293,81 +391,32 @@ fn drawShadow(
         composite_rect = composite_rect.intersection(clip) orelse return;
     }
 
-    const width = composite_rect.width;
-    const height = composite_rect.height;
-    const mask = pixman.pixman_image_create_bits(
-        pixman.PIXMAN_a8,
-        @intCast(width),
-        @intCast(height),
-        null,
-        0,
-    ) orelse return error.OutOfMemory;
-    defer _ = pixman.pixman_image_unref(mask);
-
-    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
-    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
     const radius_value = @max(@as(i64, shadow.corner_radius) + spread, 0);
-    const radius: f64 = @floatFromInt(@min(
-        radius_value,
-        @divTrunc(@min(shape_width, shape_height), 2),
-    ));
-    const shape_left: f64 = @floatFromInt(shape_x);
-    const shape_top: f64 = @floatFromInt(shape_y);
-    const shape_size_x: f64 = @floatFromInt(shape_width);
-    const shape_size_y: f64 = @floatFromInt(shape_height);
-    var cutout_left: f64 = 0;
-    var cutout_top: f64 = 0;
-    var cutout_width: f64 = 0;
-    var cutout_height: f64 = 0;
-    var cutout_radius: f64 = 0;
-    if (shadow.cutout) |cutout| {
-        cutout_left = @floatFromInt(cutout.rect.x);
-        cutout_top = @floatFromInt(cutout.rect.y);
-        cutout_width = @floatFromInt(cutout.rect.width);
-        cutout_height = @floatFromInt(cutout.rect.height);
-        cutout_radius = @floatFromInt(@min(
+    const cutout_radius = if (shadow.cutout) |cutout|
+        @min(
             cutout.radius,
             @min(cutout.rect.width, cutout.rect.height) / 2,
-        ));
-    }
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const pixel_x: f64 = @as(f64, @floatFromInt(composite_rect.x)) +
-                @as(f64, @floatFromInt(x)) + 0.5;
-            const pixel_y: f64 = @as(f64, @floatFromInt(composite_rect.y)) +
-                @as(f64, @floatFromInt(y)) + 0.5;
-            var cutout_alpha: f64 = 1;
-            if (shadow.cutout != null) {
-                cutout_alpha -= roundedRectCoverage(
-                    pixel_x,
-                    pixel_y,
-                    cutout_left,
-                    cutout_top,
-                    cutout_width,
-                    cutout_height,
-                    cutout_radius,
-                );
-                if (cutout_alpha == 0) {
-                    data[y * stride + x] = 0;
-                    continue;
-                }
-            }
-            const coverage = roundedBoxShadowCoverage(
-                pixel_x,
-                pixel_y,
-                shape_left,
-                shape_top,
-                shape_size_x,
-                shape_size_y,
-                radius,
-                @floatFromInt(shadow.blur_radius),
-            ) * cutout_alpha;
-            data[y * stride + x] = @intFromFloat(
-                std.math.clamp(coverage, 0.0, 1.0) * 255.0 + 0.5,
-            );
-        }
-    }
-
+        )
+    else
+        0;
+    const raster: ShadowRaster = .{
+        .shape_left = @floatFromInt(shape_x),
+        .shape_top = @floatFromInt(shape_y),
+        .shape_width = @floatFromInt(shape_width),
+        .shape_height = @floatFromInt(shape_height),
+        .radius = @floatFromInt(@min(
+            radius_value,
+            @divTrunc(@min(shape_width, shape_height), 2),
+        )),
+        .blur_radius = @floatFromInt(shadow.blur_radius),
+        .cutout = if (shadow.cutout) |cutout| .{
+            .left = @floatFromInt(cutout.rect.x),
+            .top = @floatFromInt(cutout.rect.y),
+            .width = @floatFromInt(cutout.rect.width),
+            .height = @floatFromInt(cutout.rect.height),
+            .radius = @floatFromInt(cutout_radius),
+        } else null,
+    };
     const color: pixman.pixman_color_t = .{
         .red = expand(shadow.color.red),
         .green = expand(shadow.color.green),
@@ -377,6 +426,108 @@ fn drawShadow(
     const source = pixman.pixman_image_create_solid_fill(&color) orelse
         return error.OutOfMemory;
     defer _ = pixman.pixman_image_unref(source);
+    const cutout_interior = if (shadow.cutout) |cutout|
+        rect_region.roundedRectInterior(cutout.rect, cutout_radius)
+    else
+        null;
+    if (damage) |rectangles| {
+        for (rectangles) |rectangle| {
+            const damaged = composite_rect.intersection(rectangle) orelse continue;
+            try drawShadowDamage(destination, source, raster, damaged, cutout_interior);
+        }
+    } else {
+        try drawShadowDamage(destination, source, raster, composite_rect, cutout_interior);
+    }
+}
+
+const ShadowRaster = struct {
+    const Rounded = struct {
+        left: f64,
+        top: f64,
+        width: f64,
+        height: f64,
+        radius: f64,
+    };
+
+    shape_left: f64,
+    shape_top: f64,
+    shape_width: f64,
+    shape_height: f64,
+    radius: f64,
+    blur_radius: f64,
+    cutout: ?Rounded,
+};
+
+fn drawShadowDamage(
+    destination: *pixman.pixman_image_t,
+    source: *pixman.pixman_image_t,
+    raster: ShadowRaster,
+    rect: render_types.Rect,
+    cutout_interior: ?render_types.Rect,
+) Error!void {
+    if (cutout_interior) |interior| {
+        for (rect_region.differenceStrips(rect, interior)) |strip| {
+            try drawShadowRect(destination, source, raster, strip orelse continue);
+        }
+    } else {
+        try drawShadowRect(destination, source, raster, rect);
+    }
+}
+
+fn drawShadowRect(
+    destination: *pixman.pixman_image_t,
+    source: *pixman.pixman_image_t,
+    raster: ShadowRaster,
+    rect: render_types.Rect,
+) Error!void {
+    const mask = pixman.pixman_image_create_bits(
+        pixman.PIXMAN_a8,
+        @intCast(rect.width),
+        @intCast(rect.height),
+        null,
+        0,
+    ) orelse return error.OutOfMemory;
+    defer _ = pixman.pixman_image_unref(mask);
+
+    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
+    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
+    for (0..rect.height) |y| {
+        for (0..rect.width) |x| {
+            const pixel_x: f64 = @as(f64, @floatFromInt(rect.x)) +
+                @as(f64, @floatFromInt(x)) + 0.5;
+            const pixel_y: f64 = @as(f64, @floatFromInt(rect.y)) +
+                @as(f64, @floatFromInt(y)) + 0.5;
+            var cutout_alpha: f64 = 1;
+            if (raster.cutout) |cutout| {
+                cutout_alpha -= roundedRectCoverage(
+                    pixel_x,
+                    pixel_y,
+                    cutout.left,
+                    cutout.top,
+                    cutout.width,
+                    cutout.height,
+                    cutout.radius,
+                );
+                if (cutout_alpha == 0) {
+                    data[y * stride + x] = 0;
+                    continue;
+                }
+            }
+            const coverage = roundedBoxShadowCoverage(
+                pixel_x,
+                pixel_y,
+                raster.shape_left,
+                raster.shape_top,
+                raster.shape_width,
+                raster.shape_height,
+                raster.radius,
+                raster.blur_radius,
+            ) * cutout_alpha;
+            data[y * stride + x] = @intFromFloat(
+                std.math.clamp(coverage, 0.0, 1.0) * 255.0 + 0.5,
+            );
+        }
+    }
     pixman.pixman_image_composite32(
         pixman.PIXMAN_OP_OVER,
         source,
@@ -386,10 +537,10 @@ fn drawShadow(
         0,
         0,
         0,
-        composite_rect.x,
-        composite_rect.y,
-        @intCast(composite_rect.width),
-        @intCast(composite_rect.height),
+        rect.x,
+        rect.y,
+        @intCast(rect.width),
+        @intCast(rect.height),
     );
 }
 
@@ -426,13 +577,12 @@ fn drawBackdropBlur(
     if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
     var clipped = blur.rect.clipTo(target.size) orelse return;
     if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
+    _ = rect_region.damageBounds(damage, clipped) orelse return;
     const snapshot = capture orelse return error.InvalidTarget;
     if (blur.radius != snapshot.marker.radius or
         blur.downsample_level != snapshot.marker.downsample_level or
         !std.meta.eql(blur.finish, snapshot.marker.finish) or
         !snapshot.marker.rect.contains(clipped)) return error.InvalidTarget;
-    _ = rect_region.damageBounds(damage, clipped) orelse return;
-
     if (damage) |rectangles| {
         for (rectangles) |rectangle| {
             const composite_rect = clipped.intersection(rectangle) orelse continue;
@@ -515,6 +665,89 @@ fn blendArgb(source: u32, destination: u32, coverage: u8) u32 {
     }
     return result;
 }
+
+const RoundedMaskCache = struct {
+    const maximum_entries = 8;
+    const maximum_bytes = 32 * 1024 * 1024;
+
+    const Entry = struct {
+        size: render_types.Size,
+        radius: u32,
+        factor: u32,
+        image: *pixman.pixman_image_t,
+        bytes: usize,
+        last_used: u64,
+    };
+
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    bytes: usize = 0,
+    epoch: u64 = 0,
+
+    fn init(allocator: std.mem.Allocator) RoundedMaskCache {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RoundedMaskCache) void {
+        for (self.entries.items) |entry| _ = pixman.pixman_image_unref(entry.image);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn advance(self: *RoundedMaskCache) u64 {
+        self.epoch +%= 1;
+        if (self.epoch == 0) self.epoch = 1;
+        return self.epoch;
+    }
+
+    fn get(
+        self: *RoundedMaskCache,
+        size: render_types.Size,
+        requested_radius: u32,
+        factor: u32,
+    ) Error!*pixman.pixman_image_t {
+        const radius = @min(requested_radius, @min(size.width, size.height) / 2);
+        const epoch = self.advance();
+        for (self.entries.items) |*entry| {
+            if (std.meta.eql(entry.size, size) and entry.radius == radius and
+                entry.factor == factor)
+            {
+                entry.last_used = epoch;
+                return entry.image;
+            }
+        }
+
+        const image = try createRoundedMask(size, radius, factor);
+        errdefer _ = pixman.pixman_image_unref(image);
+        const stride: usize = @intCast(pixman.pixman_image_get_stride(image));
+        const bytes = std.math.mul(usize, stride, size.height) catch
+            return error.InvalidTarget;
+        while (self.entries.items.len > 0 and
+            (self.entries.items.len >= maximum_entries or
+                self.bytes +| bytes > maximum_bytes))
+        {
+            var oldest_index: usize = 0;
+            for (self.entries.items[1..], 1..) |entry, index| {
+                if (entry.last_used < self.entries.items[oldest_index].last_used) {
+                    oldest_index = index;
+                }
+            }
+            const oldest = self.entries.swapRemove(oldest_index);
+            self.bytes -= oldest.bytes;
+            _ = pixman.pixman_image_unref(oldest.image);
+        }
+        try self.entries.append(self.allocator, .{
+            .size = size,
+            .radius = radius,
+            .factor = factor,
+            .image = image,
+            .bytes = bytes,
+            .last_used = epoch,
+        });
+        self.bytes += bytes;
+        return image;
+    }
+};
 
 fn roundedRectCoverage(
     pixel_x: f64,
@@ -615,9 +848,20 @@ fn composite(
     destination: *pixman.pixman_image_t,
     destination_size: render_types.Size,
     image: render_types.Image,
+    rounded_masks: *RoundedMaskCache,
+) Error!void {
+    return compositeWithOperator(destination, destination_size, image, rounded_masks, null);
+}
+
+fn compositeWithOperator(
+    destination: *pixman.pixman_image_t,
+    destination_size: render_types.Size,
+    image: render_types.Image,
+    rounded_masks: *RoundedMaskCache,
+    operator: ?pixman.pixman_op_t,
 ) Error!void {
     const dmabuf = image.buffer.dmabuf orelse
-        return compositePixels(destination, destination_size, image, false, false, false);
+        return compositePixels(destination, destination_size, image, false, false, false, rounded_masks, operator);
     if (dmabuf.modifier != 0) return error.InvalidTarget;
     const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
         return error.InvalidTarget;
@@ -649,6 +893,8 @@ fn composite(
         dmabuf.y_inverted,
         dmabuf.force_opaque,
         format.redBlueSwapped(),
+        rounded_masks,
+        operator,
     );
 }
 
@@ -659,6 +905,8 @@ fn compositePixels(
     y_inverted: bool,
     force_opaque: bool,
     red_blue_swapped: bool,
+    rounded_masks: *RoundedMaskCache,
+    operator: ?pixman.pixman_op_t,
 ) Error!void {
     const source = try createImage(image.buffer, force_opaque, red_blue_swapped);
     defer _ = pixman.pixman_image_unref(source);
@@ -671,10 +919,12 @@ fn compositePixels(
         .height = @floatFromInt(transformed_size.height),
     };
     if (!validSourceRect(source_rect, transformed_size)) return error.InvalidTarget;
-    if (y_inverted or image.transform != .normal or image.source != null or
+    const can_replace = image.is_opaque and
+        image.alpha_multiplier == std.math.maxInt(u32);
+    const transformed = y_inverted or image.transform != .normal or image.source != null or
         source_rect.width != @as(f64, @floatFromInt(image.size.width)) or
-        source_rect.height != @as(f64, @floatFromInt(image.size.height)))
-    {
+        source_rect.height != @as(f64, @floatFromInt(image.size.height));
+    if (transformed) {
         const floating_transform = sourceTransform(image, source_rect, y_inverted);
         var transform: pixman.pixman_transform_t = undefined;
         if (pixman.pixman_transform_from_pixman_f_transform(
@@ -693,6 +943,10 @@ fn compositePixels(
         {
             return error.OutOfMemory;
         }
+        // Vulkan's replacement path samples with clamp-to-edge. Without the
+        // equivalent Pixman repeat mode, bilinear taps outside an opaque
+        // source produce a translucent fringe that PIXMAN_OP_SRC exposes.
+        if (can_replace) pixman.pixman_image_set_repeat(source, pixman.PIXMAN_REPEAT_PAD);
     }
 
     const destination_rect: render_types.Rect = .{
@@ -704,35 +958,88 @@ fn compositePixels(
     var clipped = destination_rect.clipTo(destination_size) orelse return;
     if (image.clip) |clip| clipped = clipped.intersection(clip) orelse return;
     if (image.rounded_clip) |clip| clipped = clipped.intersection(clip.rect) orelse return;
-    const source_x: i32 = clipped.x - image.x;
-    const source_y: i32 = clipped.y - image.y;
-    const mask = if (image.rounded_clip) |clip| rounded: {
-        const rounded_mask = try createRoundedMask(
+    var owned_mask: ?*pixman.pixman_image_t = null;
+    const mask = if (image.rounded_clip) |clip|
+        try rounded_masks.get(
             .{ .width = clip.rect.width, .height = clip.rect.height },
             clip.radius,
-        );
-        scaleMask(rounded_mask, image.alpha_multiplier);
-        break :rounded rounded_mask;
-    } else if (image.alpha_multiplier != std.math.maxInt(u32))
-        try createAlphaMask(image.alpha_multiplier)
-    else
-        null;
-    defer if (mask) |rounded_mask| {
-        _ = pixman.pixman_image_unref(rounded_mask);
+            image.alpha_multiplier,
+        )
+    else if (image.alpha_multiplier != std.math.maxInt(u32)) owned: {
+        owned_mask = try createAlphaMask(image.alpha_multiplier);
+        break :owned owned_mask;
+    } else null;
+    defer if (owned_mask) |alpha_mask| {
+        _ = pixman.pixman_image_unref(alpha_mask);
     };
-    pixman.pixman_image_composite32(
-        pixman.PIXMAN_OP_OVER,
+    if (operator) |selected| {
+        compositeImageRect(selected, source, mask, destination, image, clipped);
+        return;
+    }
+    if (can_replace and image.rounded_clip != null) {
+        const rounded = image.rounded_clip.?;
+        const radius = @min(
+            rounded.radius,
+            @min(rounded.rect.width, rounded.rect.height) / 2,
+        );
+        if (rect_region.roundedRectInterior(rounded.rect, radius)) |interior| {
+            if (interior.intersection(clipped)) |opaque_rect| {
+                compositeImageRect(
+                    pixman.PIXMAN_OP_SRC,
+                    source,
+                    null,
+                    destination,
+                    image,
+                    opaque_rect,
+                );
+                for (rect_region.differenceStrips(clipped, opaque_rect)) |strip| {
+                    compositeImageRect(
+                        pixman.PIXMAN_OP_OVER,
+                        source,
+                        mask,
+                        destination,
+                        image,
+                        strip orelse continue,
+                    );
+                }
+                return;
+            }
+        }
+    }
+    compositeImageRect(
+        if (can_replace and image.rounded_clip == null)
+            pixman.PIXMAN_OP_SRC
+        else
+            pixman.PIXMAN_OP_OVER,
         source,
         mask,
         destination,
-        source_x,
-        source_y,
-        if (image.rounded_clip) |clip| clipped.x - clip.rect.x else 0,
-        if (image.rounded_clip) |clip| clipped.y - clip.rect.y else 0,
-        clipped.x,
-        clipped.y,
-        @intCast(clipped.width),
-        @intCast(clipped.height),
+        image,
+        clipped,
+    );
+}
+
+fn compositeImageRect(
+    operator: pixman.pixman_op_t,
+    source: *pixman.pixman_image_t,
+    mask: ?*pixman.pixman_image_t,
+    destination: *pixman.pixman_image_t,
+    image: render_types.Image,
+    rect: render_types.Rect,
+) void {
+    pixman.pixman_image_composite32(
+        operator,
+        source,
+        mask,
+        destination,
+        rect.x - image.x,
+        rect.y - image.y,
+        if (image.rounded_clip) |clip| rect.x - clip.rect.x else 0,
+        if (image.rounded_clip) |clip| rect.y - clip.rect.y else 0,
+        rect.x,
+        rect.y,
+        @intCast(rect.width),
+        @intCast(rect.height),
     );
 }
 
@@ -740,17 +1047,6 @@ fn createAlphaMask(factor: u32) Error!*pixman.pixman_image_t {
     const alpha: u16 = @intCast((@as(u64, factor) * std.math.maxInt(u16) + std.math.maxInt(u32) / 2) / std.math.maxInt(u32));
     const color: pixman.pixman_color_t = .{ .red = 0, .green = 0, .blue = 0, .alpha = alpha };
     return pixman.pixman_image_create_solid_fill(&color) orelse error.OutOfMemory;
-}
-
-fn scaleMask(mask: *pixman.pixman_image_t, factor: u32) void {
-    if (factor == std.math.maxInt(u32)) return;
-    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
-    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
-    const width: usize = @intCast(pixman.pixman_image_get_width(mask));
-    const height: usize = @intCast(pixman.pixman_image_get_height(mask));
-    for (0..height) |y| for (data[y * stride ..][0..width]) |*value| {
-        value.* = @intCast((@as(u64, value.*) * factor + std.math.maxInt(u32) / 2) / std.math.maxInt(u32));
-    };
 }
 
 fn sourceTransform(
@@ -822,7 +1118,8 @@ fn validSourceRect(source: render_types.SourceRect, buffer_size: render_types.Si
 
 fn createRoundedMask(
     size: render_types.Size,
-    requested_radius: u32,
+    radius: u32,
+    factor: u32,
 ) Error!*pixman.pixman_image_t {
     const mask = pixman.pixman_image_create_bits(
         pixman.PIXMAN_a8,
@@ -835,38 +1132,39 @@ fn createRoundedMask(
 
     const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
     const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
-    const radius = @min(requested_radius, @min(size.width, size.height) / 2);
+    std.debug.assert(radius <= @min(size.width, size.height) / 2);
+    const interior_alpha = scaleMaskValue(255, factor);
+    for (0..size.height) |y| @memset(data[y * stride ..][0..size.width], interior_alpha);
     if (radius == 0) {
-        for (0..size.height) |y| @memset(data[y * stride ..][0..size.width], 255);
         return mask;
     }
 
     const radius_float: f32 = @floatFromInt(radius);
-    for (0..size.height) |y| {
-        for (0..size.width) |x| {
+    for (0..radius) |y| {
+        for (0..radius) |x| {
             const pixel_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
             const pixel_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
-            const center_x: f32 = if (x < radius)
-                radius_float
-            else if (x >= size.width - radius)
-                @floatFromInt(size.width - radius)
-            else
-                pixel_x;
-            const center_y: f32 = if (y < radius)
-                radius_float
-            else if (y >= size.height - radius)
-                @floatFromInt(size.height - radius)
-            else
-                pixel_y;
             const distance = @sqrt(
-                (pixel_x - center_x) * (pixel_x - center_x) +
-                    (pixel_y - center_y) * (pixel_y - center_y),
+                (pixel_x - radius_float) * (pixel_x - radius_float) +
+                    (pixel_y - radius_float) * (pixel_y - radius_float),
             );
             const coverage = std.math.clamp(radius_float + 0.5 - distance, 0.0, 1.0);
-            data[y * stride + x] = @intFromFloat(coverage * 255.0);
+            const alpha = scaleMaskValue(@intFromFloat(coverage * 255.0), factor);
+            const opposite_x = size.width - 1 - x;
+            const opposite_y = size.height - 1 - y;
+            data[y * stride + x] = alpha;
+            data[y * stride + opposite_x] = alpha;
+            data[opposite_y * stride + x] = alpha;
+            data[opposite_y * stride + opposite_x] = alpha;
         }
     }
     return mask;
+}
+
+fn scaleMaskValue(value: u8, factor: u32) u8 {
+    if (factor == std.math.maxInt(u32)) return value;
+    return @intCast((@as(u64, value) * factor + std.math.maxInt(u32) / 2) /
+        std.math.maxInt(u32));
 }
 
 fn fill(
@@ -1236,6 +1534,111 @@ test "CPU renderer positions rounded clips independently from images" {
     try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(3, 1));
 }
 
+test "CPU renderer blends opaque image antialiasing outside replaceable interiors" {
+    const Case = struct {
+        size: render_types.Size,
+        rounded: render_types.RoundedClip,
+        clip: ?render_types.Rect = null,
+    };
+    const cases = [_]Case{
+        .{
+            .size = .{ .width = 2, .height = 2 },
+            .rounded = .{
+                .rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+                .radius = 1,
+            },
+        },
+        .{
+            .size = .{ .width = 6, .height = 6 },
+            .rounded = .{
+                .rect = .{ .x = 0, .y = 0, .width = 6, .height = 6 },
+                .radius = 2,
+            },
+            .clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    for (cases) |case| {
+        const pixel_count = try case.size.pixelCount();
+        const source = try std.testing.allocator.alloc(u32, pixel_count);
+        defer std.testing.allocator.free(source);
+        @memset(source, 0xffffffff);
+        var expected = try headless.init(std.testing.allocator, case.size);
+        defer expected.deinit();
+        var actual = try headless.init(std.testing.allocator, case.size);
+        defer actual.deinit();
+        const base_image: render_types.Image = .{
+            .x = 0,
+            .y = 0,
+            .size = case.size,
+            .buffer = .{
+                .size = case.size,
+                .stride_pixels = case.size.width,
+                .pixels = source,
+            },
+            .rounded_clip = case.rounded,
+            .clip = case.clip,
+        };
+        var opaque_image = base_image;
+        opaque_image.is_opaque = true;
+        const expected_commands = [_]render_types.Command{
+            .{ .clear = render_types.Color.rgba(20, 40, 80, 255) },
+            .{ .image = base_image },
+        };
+        const actual_commands = [_]render_types.Command{
+            .{ .clear = render_types.Color.rgba(20, 40, 80, 255) },
+            .{ .image = opaque_image },
+        };
+        try renderer.render(.{
+            .size = case.size,
+            .commands = &expected_commands,
+        }, expected.target());
+        try renderer.render(.{
+            .size = case.size,
+            .commands = &actual_commands,
+        }, actual.target());
+        try std.testing.expectEqualSlices(
+            u32,
+            expected.target().pixels[0..pixel_count],
+            actual.target().pixels[0..pixel_count],
+        );
+    }
+}
+
+test "CPU renderer keeps fractionally scaled opaque image edges opaque" {
+    const source_size: render_types.Size = .{ .width = 2, .height = 2 };
+    const output_size: render_types.Size = .{ .width = 3, .height = 3 };
+    var source = [_]u32{
+        0xffff0000, 0xff00ff00,
+        0xff0000ff, 0xffffffff,
+    };
+    var output = try headless.init(std.testing.allocator, output_size);
+    defer output.deinit();
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(20, 40, 80, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = output_size,
+            .buffer = .{
+                .size = source_size,
+                .stride_pixels = source_size.width,
+                .pixels = &source,
+            },
+            .is_opaque = true,
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = output_size, .commands = &commands }, output.target());
+    for (output.target().pixels[0 .. output_size.width * output_size.height]) |pixel| {
+        try std.testing.expectEqual(@as(u8, 255), @as(u8, @truncate(pixel >> 24)));
+    }
+}
+
 test "CPU renderer draws blurred rounded shadows" {
     const size: render_types.Size = .{ .width = 9, .height = 9 };
     var output = try headless.init(std.testing.allocator, size);
@@ -1528,4 +1931,79 @@ test "CPU renderer clips writes to frame damage and preserves stride padding" {
         },
         &pixels,
     );
+}
+
+test "CPU renderer damage-scoped crossfade matches a full render" {
+    const size: render_types.Size = .{ .width = 4, .height = 1 };
+    var old = [_]u32{ 0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff };
+    var new = [_]u32{ 0xff000000, 0xffffffff, 0xffff0000, 0xff00ff00 };
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(12, 24, 48, 255) },
+        .{ .crossfade = .{
+            .destination = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .old = .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &old } },
+            .new = .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &new } },
+            .factor = std.math.maxInt(u32) / 3,
+        } },
+    };
+    var expected = try headless.init(std.testing.allocator, size);
+    defer expected.deinit();
+    var actual = try headless.init(std.testing.allocator, size);
+    defer actual.deinit();
+    @memset(actual.target().pixels[0..size.width], 0xff123456);
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, expected.target());
+    const damage = [_]render_types.Rect{.{ .x = 1, .y = 0, .width = 2, .height = 1 }};
+    try renderer.render(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &damage,
+    }, actual.target());
+
+    try std.testing.expectEqual(@as(u32, 0xff123456), actual.pixel(0, 0));
+    try std.testing.expectEqual(expected.pixel(1, 0), actual.pixel(1, 0));
+    try std.testing.expectEqual(expected.pixel(2, 0), actual.pixel(2, 0));
+    try std.testing.expectEqual(@as(u32, 0xff123456), actual.pixel(3, 0));
+}
+
+test "CPU renderer damage-scoped shadows match a full render" {
+    const size: render_types.Size = .{ .width = 11, .height = 9 };
+    const commands = [_]render_types.Command{.{ .shadow = .{
+        .rect = .{ .x = 3, .y = 2, .width = 5, .height = 5 },
+        .corner_radius = 2,
+        .blur_radius = 2,
+        .spread = 0,
+        .color = render_types.Color.rgba(0, 0, 0, 192),
+        .cutout = .{
+            .rect = .{ .x = 3, .y = 2, .width = 5, .height = 5 },
+            .radius = 2,
+        },
+    } }};
+    var expected = try headless.init(std.testing.allocator, size);
+    defer expected.deinit();
+    var actual = try headless.init(std.testing.allocator, size);
+    defer actual.deinit();
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, expected.target());
+    const damage = [_]render_types.Rect{
+        .{ .x = 1, .y = 1, .width = 2, .height = 3 },
+        .{ .x = 8, .y = 5, .width = 2, .height = 3 },
+    };
+    try renderer.render(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &damage,
+    }, actual.target());
+
+    for (0..size.height) |y| for (0..size.width) |x| {
+        const damaged = (x >= 1 and x < 3 and y >= 1 and y < 4) or
+            (x >= 8 and x < 10 and y >= 5 and y < 8);
+        if (damaged) {
+            try std.testing.expectEqual(expected.pixel(x, y), actual.pixel(x, y));
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), actual.pixel(x, y));
+        }
+    };
 }
