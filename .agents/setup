@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+native_changed=false
+
+ensure_dns() {
+    if [[ -s /etc/resolv.conf ]] \
+        && [[ "$(tail -c 1 /etc/resolv.conf | od -An -tuC | tr -d ' ')" != 10 ]]; then
+        printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
+    fi
+
+    if getent ahostsv4 deb.debian.org >/dev/null \
+        && getent ahostsv4 ziglang.org >/dev/null \
+        && getent ahostsv4 github.com >/dev/null \
+        && getent ahostsv4 codeberg.org >/dev/null \
+        && getent ahostsv4 registry.npmjs.org >/dev/null; then
+        return
+    fi
+
+    echo "Repairing DNS resolver configuration"
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee /etc/resolv.conf >/dev/null
+    getent ahostsv4 deb.debian.org >/dev/null
+    getent ahostsv4 ziglang.org >/dev/null
+    getent ahostsv4 github.com >/dev/null
+    getent ahostsv4 codeberg.org >/dev/null
+    getent ahostsv4 registry.npmjs.org >/dev/null
+}
+
+download() {
+    local url=$1
+    local sha256=$2
+    local output=$3
+
+    curl --fail --location --silent --show-error \
+        --retry 5 --retry-all-errors --connect-timeout 10 \
+        --output "$output" "$url"
+    printf '%s  %s\n' "$sha256" "$output" | sha256sum --check --status
+}
+
+install_tar_binary() {
+    local name=$1
+    local url=$2
+    local sha256=$3
+    local temporary archive binary
+
+    temporary="$(mktemp -d)"
+    archive="$temporary/archive.tar.gz"
+    download "$url" "$sha256" "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    binary="$(find "$temporary" -type f -name "$name" -print -quit)"
+    test -n "$binary"
+    sudo install -Dm0755 "$binary" "/usr/local/bin/$name"
+    rm -rf "$temporary"
+}
+
+ensure_dns
+
+package_stamp=/var/lib/keywork-orb/packages-v8
+if [[ ! -e "$package_stamp" ]]; then
+    echo "Installing native build dependencies"
+    sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/keywork-orb.sources <<'EOF'
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    sudo install -Dm0644 /dev/stdin /etc/apt/preferences.d/keywork-orb <<'EOF'
+Package: *
+Pin: release n=trixie
+Pin-Priority: 100
+EOF
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bison build-essential ca-certificates curl dbus-daemon git gperf meson ninja-build pkg-config \
+        python3 python3-jinja2 xz-utils \
+        glslc libcurl4-openssl-dev libfontconfig1-dev \
+        libcap-dev libexpat1-dev libffi-dev libfreetype-dev libgbm-dev \
+        libharfbuzz-dev libpam0g-dev libpixman-1-dev \
+        libseat-dev libunwind-dev libvulkan-dev libwayland-bin libwayland-dev \
+        libxml2-dev \
+        libxcb-composite0-dev libxcb-icccm4-dev libxcb-res0-dev \
+        libxcb-xfixes0-dev libxcb1-dev libxcursor-dev luajit
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
+        libbz2-dev libdisplay-info-dev libdrm-dev libinput-dev libpipewire-0.3-dev \
+        libsystemd-dev libudev-dev wayland-protocols
+    sudo install -Dm0644 /dev/null "$package_stamp"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=1.26.0 wayland-client wayland-server 2>/dev/null; then
+    echo "Building Wayland 1.26.0"
+    temporary="$(mktemp -d)"
+    archive="$temporary/wayland.tar.xz"
+    download \
+        https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz \
+        64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3 \
+        "$archive"
+    tar -xJf "$archive" -C "$temporary"
+    meson setup "$temporary/build" "$temporary/wayland-1.26.0" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Ddocumentation=false -Dtests=false
+    ninja -C "$temporary/build"
+    sudo ninja -C "$temporary/build" install
+    sudo ldconfig
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=1.11.0 xkbcommon 2>/dev/null; then
+    echo "Building libxkbcommon 1.11.0"
+    temporary="$(mktemp -d)"
+    archive="$temporary/libxkbcommon.tar.gz"
+    download \
+        https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-1.11.0.tar.gz \
+        78a6b14f16e9a55025978c252e53ce9e16a02bfdb929550b9a0db5af87db7e02 \
+        "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    meson setup "$temporary/build" "$temporary/libxkbcommon-xkbcommon-1.11.0" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Denable-tools=false -Denable-x11=false -Denable-docs=false \
+        -Denable-wayland=false -Denable-xkbregistry=false \
+        -Denable-bash-completion=false
+    ninja -C "$temporary/build"
+    sudo ninja -C "$temporary/build" install
+    sudo ldconfig
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=2.19 lcms2 2>/dev/null; then
+    echo "Building Little CMS 2.19.1"
+    temporary="$(mktemp -d)"
+    archive="$temporary/lcms2.tar.gz"
+    download \
+        https://github.com/mm2/Little-CMS/archive/refs/tags/lcms2.19.1.tar.gz \
+        267705e278e2f7c2fb886c259dadcbaeb2be52748bcbc71c79f08aacacb7a709 \
+        "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    meson setup "$temporary/build" "$temporary/Little-CMS-lcms2.19.1" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Dtests=disabled -Dutils=false
+    ninja -C "$temporary/build"
+    sudo ninja -C "$temporary/build" install
+    sudo ldconfig
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=258 libsystemd 2>/dev/null; then
+    echo "Building libsystemd 258"
+    temporary="$(mktemp -d)"
+    archive="$temporary/systemd.tar.gz"
+    download \
+        https://github.com/systemd/systemd/archive/refs/tags/v258.tar.gz \
+        07a580cf21856f468f82b77b82973a926f42ccc696462459b53f8b88893dff8e \
+        "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    env PATH=/usr/bin:/bin meson setup "$temporary/build" "$temporary/systemd-258" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Dmode=release -Dtests=false -Dman=disabled -Dhtml=disabled \
+        -Dtranslations=false
+    env PATH=/usr/bin:/bin ninja -C "$temporary/build" \
+        libsystemd src/libsystemd/libsystemd.pc
+    DESTDIR="$temporary/stage" PATH=/usr/bin:/bin meson install -C "$temporary/build" \
+        --no-rebuild --tags libsystemd
+    sudo cp -a "$temporary/stage/usr/local/lib/." /usr/local/lib/
+    sudo install -Dm0644 "$temporary/build/src/libsystemd/libsystemd.pc" \
+        /usr/local/lib/pkgconfig/libsystemd.pc
+    sudo install -d /usr/local/include/systemd
+    sudo install -m0644 "$temporary/systemd-258/src/systemd/"*.h \
+        /usr/local/include/systemd/
+    sudo ldconfig
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=1.49 wayland-protocols 2>/dev/null; then
+    echo "Installing Wayland Protocols 1.49"
+    temporary="$(mktemp -d)"
+    archive="$temporary/wayland-protocols.tar.xz"
+    download \
+        https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz \
+        ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14 \
+        "$archive"
+    tar -xJf "$archive" -C "$temporary"
+    sudo rm -rf /usr/local/share/wayland-protocols
+    sudo install -d /usr/local/share/wayland-protocols
+    sudo cp -a \
+        "$temporary/wayland-protocols-1.49/stable" \
+        "$temporary/wayland-protocols-1.49/staging" \
+        "$temporary/wayland-protocols-1.49/unstable" \
+        /usr/local/share/wayland-protocols/
+    sudo install -Dm0644 /dev/stdin /usr/local/share/pkgconfig/wayland-protocols.pc <<'EOF'
+prefix=/usr/local
+datarootdir=${prefix}/share
+pkgdatadir=${datarootdir}/wayland-protocols
+
+Name: Wayland Protocols
+Description: Wayland protocol files
+Version: 1.49
+EOF
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if [[ "$(zig version 2>/dev/null || true)" != 0.16.0 ]]; then
+    echo "Installing Zig 0.16.0"
+    temporary="$(mktemp -d)"
+    archive="$temporary/zig.tar.xz"
+    download \
+        https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+        70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 \
+        "$archive"
+    tar -xJf "$archive" -C "$temporary"
+    sudo rm -rf /opt/zig-0.16.0
+    sudo mv "$temporary/zig-x86_64-linux-0.16.0" /opt/zig-0.16.0
+    sudo ln -sfn /opt/zig-0.16.0/zig /usr/local/bin/zig
+    rm -rf "$temporary"
+fi
+
+if ! command -v zigdoc >/dev/null || ! zigdoc --help >/dev/null 2>&1; then
+    echo "Installing zigdoc 0.5.1"
+    install_tar_binary \
+        zigdoc \
+        https://github.com/rockorager/zigdoc/releases/download/v0.5.1/zigdoc-v0.5.1-linux-x64.tar.gz \
+        5bf35ad1dbd60ee0eaa6edb83b8ef950796b3348879b1f1df3d0719ffc9d0df2
+fi
+
+if ! command -v emmylua_check >/dev/null; then
+    echo "Installing emmylua_check 0.24.0"
+    install_tar_binary \
+        emmylua_check \
+        https://github.com/EmmyLuaLs/emmylua-analyzer-rust/releases/download/0.24.0/emmylua_check-linux-x64-glibc.2.17.tar.gz \
+        6e9f8a5b43e4f2de0695a99c7c894364748960c92a19f969abf0807f5a6b3403
+fi
+
+if ! command -v luafmt >/dev/null; then
+    echo "Installing luafmt 0.24.0"
+    install_tar_binary \
+        luafmt \
+        https://github.com/EmmyLuaLs/emmylua-analyzer-rust/releases/download/0.24.0/luafmt-linux-x64-glibc.2.17.tar.gz \
+        c6a0028a79213d153968c1babd90be3957ce9b997076d117e1b35e90f99692a8
+fi
+
+if ! pkg-config --atleast-version=0.47.0 resvg 2>/dev/null; then
+    echo "Building resvg C API 0.47.0"
+    if [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+        temporary="$(mktemp -d)"
+        download \
+            https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+            20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c \
+            "$temporary/rustup-init"
+        chmod +x "$temporary/rustup-init"
+        "$temporary/rustup-init" -y --profile minimal --default-toolchain 1.87.0
+        rm -rf "$temporary"
+    else
+        "$HOME/.cargo/bin/rustup" toolchain install 1.87.0 --profile minimal
+    fi
+
+    temporary="$(mktemp -d)"
+    archive="$temporary/resvg.tar.xz"
+    download \
+        https://github.com/linebender/resvg/releases/download/v0.47.0/resvg-0.47.0.tar.xz \
+        22d12bf638479688f3762ac951446f51ca75cb24c6853b23384f96fda02096c5 \
+        "$archive"
+    tar -xJf "$archive" -C "$temporary"
+    "$HOME/.cargo/bin/cargo" +1.87.0 build --release \
+        --manifest-path "$temporary/resvg-0.47.0/crates/c-api/Cargo.toml"
+    sudo install -Dm0755 "$temporary/resvg-0.47.0/target/release/libresvg.so" /usr/local/lib/libresvg.so
+    sudo install -Dm0644 "$temporary/resvg-0.47.0/crates/c-api/resvg.h" /usr/local/include/resvg.h
+    sudo install -Dm0644 /dev/stdin /usr/local/lib/pkgconfig/resvg.pc <<'EOF'
+prefix=/usr/local
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: resvg
+Description: SVG rendering library C API
+Version: 0.47.0
+Libs: -L${libdir} -lresvg
+Cflags: -I${includedir}
+EOF
+    sudo ldconfig
+    rm -rf "$temporary"
+fi
+
+# Zig treats /usr/local/include as a built-in system path after /usr/include,
+# even when pkg-config emits it explicitly. Mirror locally built headers under
+# a distinct path so translate-c consistently sees them before distro headers.
+if [[ ! -d /opt/keywork/include ]] \
+    || ! diff -qr /usr/local/include /opt/keywork/include >/dev/null; then
+    sudo rm -rf /opt/keywork/include
+    sudo install -d /opt/keywork
+    sudo cp -a /usr/local/include /opt/keywork/include
+    native_changed=true
+fi
+while IFS= read -r pkg_config; do
+    if grep -Eq '^includedir=(\$\{prefix\}/include|/usr/local/include)$' "$pkg_config"; then
+        sudo sed -i 's|^includedir=.*|includedir=/opt/keywork/include|' "$pkg_config"
+        native_changed=true
+    fi
+done < <(find /usr/local/lib/pkgconfig -maxdepth 1 -type f -name '*.pc' -print)
+
+if [[ "$native_changed" == true ]]; then
+    echo "Invalidating Zig caches after native dependency changes"
+    rm -rf .zig-cache "$HOME/.cache/zig"
+fi
+
+echo "Prefetching Zig package dependencies"
+zig build --fetch
+
+echo "Orb setup complete"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -s /etc/resolv.conf ]] \
+    && [[ "$(tail -c 1 /etc/resolv.conf | od -An -tuC | tr -d ' ')" != 10 ]]; then
+    printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
+fi
+
+if getent ahostsv4 github.com >/dev/null \
+    && getent ahostsv4 codeberg.org >/dev/null \
+    && getent ahostsv4 ziglang.org >/dev/null \
+    && getent ahostsv4 registry.npmjs.org >/dev/null; then
+    exit 0
+fi
+
+echo "Repairing DNS resolver configuration"
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee /etc/resolv.conf >/dev/null
+getent ahostsv4 github.com >/dev/null
+getent ahostsv4 codeberg.org >/dev/null
+getent ahostsv4 ziglang.org >/dev/null
+getent ahostsv4 registry.npmjs.org >/dev/null

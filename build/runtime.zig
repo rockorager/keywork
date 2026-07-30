@@ -83,7 +83,7 @@ pub fn add(
         .target = target,
         .optimize = optimize,
     });
-    systemd_c.step.dependOn(&requirePkgConfigVersion(b, "libsystemd", "257").step);
+    systemd_c.step.dependOn(&requirePkgConfigVersion(b, "libsystemd", "258").step);
     systemd_c.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
     const systemd_c_module = systemd_c.createModule();
 

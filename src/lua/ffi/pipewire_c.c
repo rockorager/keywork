@@ -794,7 +794,7 @@ static int set_node_props(
         spa_pod_builder_bool(&builder, muted != 0);
     }
     const struct spa_pod *param = spa_pod_builder_pop(&builder, &frame);
-    if (param == NULL || spa_pod_builder_corrupted(&builder))
+    if (param == NULL || builder.state.offset > builder.size)
         return -ENOSPC;
     return pw_node_set_param(node->proxy, SPA_PARAM_Props, 0, param);
 }
@@ -851,7 +851,7 @@ static int set_route_props(
     spa_pod_builder_prop(&builder, SPA_PARAM_ROUTE_save, 0);
     spa_pod_builder_bool(&builder, true);
     const struct spa_pod *param = spa_pod_builder_pop(&builder, &route_frame);
-    if (param == NULL || spa_pod_builder_corrupted(&builder))
+    if (param == NULL || builder.state.offset > builder.size)
         return -ENOSPC;
     return pw_device_set_param(device->proxy, SPA_PARAM_Route, 0, param);
 }
