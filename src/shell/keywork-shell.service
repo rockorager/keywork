@@ -5,8 +5,9 @@ After=graphical-session.target
 Requisite=graphical-session.target
 
 [Service]
-Type=dbus
-BusName=dev.rockorager.keywork
+# Reload replaces generation-owned D-Bus resources. Type=dbus would terminate
+# the shell as soon as its well-known name is released between generations.
+Type=exec
 ExecStart=%h/.local/bin/keywork-shell
 Restart=on-failure
 
