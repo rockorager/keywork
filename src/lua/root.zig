@@ -89,8 +89,11 @@ pub const App = struct {
     start_ref: c_int = -1,
     stop_ref: c_int = -1,
     script_dirty: bool = true,
+    reload_generation: u64 = 0,
+    reload_observer: ?native_runtime.ReloadObserver = null,
     lifecycle_started: bool = false,
     quit_requested: bool = false,
+    hot_states: std.StringHashMapUnmanaged(HotState) = .empty,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
     fs_events: std.ArrayList(*FsEvent) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
@@ -130,9 +133,13 @@ pub const App = struct {
     /// Registry refs of `kw.window` close callbacks from the last window-set
     /// build, keyed by window id (keys owned by `allocator`).
     window_close_callbacks: std.StringHashMapUnmanaged(c_int) = .empty,
-    script_watch: ?*event_loop.EventLoop.FileWatch = null,
     icon_cache: native_runtime.IconThemeCache,
     png_dims: lua_image.DimsCache,
+
+    const HotState = struct {
+        version: i64,
+        ref: c_int,
+    };
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !App {
         const path_z = try allocator.dupeZ(u8, path);
@@ -224,6 +231,12 @@ pub const App = struct {
         if (self.browser_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.browser_ref);
         if (self.start_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.start_ref);
         if (self.stop_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.stop_ref);
+        var hot_states = self.hot_states.iterator();
+        while (hot_states.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, entry.value_ptr.ref);
+        }
+        self.hot_states.deinit(self.allocator);
         c.lua_close(self.state);
         self.icon_cache.deinit();
         self.png_dims.deinit();
@@ -239,10 +252,6 @@ pub const App = struct {
         self.event_loop = loop;
         errdefer self.unbindEventLoop();
 
-        self.script_watch = loop.addFileWatch(self.path, self, scriptChanged) catch |err| blk: {
-            if (err != error.FileWatchNotFound) std.log.scoped(.keywork_luajit).warn("{s} watch not installed: {}", .{ self.path, err });
-            break :blk null;
-        };
         for (self.fd_watches.items) |watch| try watch.register();
         // A watched path may have vanished since the fs_event was created;
         // cancel just that watch instead of failing the whole bind.
@@ -294,8 +303,6 @@ pub const App = struct {
     pub fn unbindEventLoop(self: *App) void {
         const loop = self.event_loop orelse return;
         self.stopLifecycleLog();
-        if (self.script_watch) |watch| loop.removeFileWatch(watch);
-        self.script_watch = null;
         if (self.scope_cancel_timer) |timer| loop.removeTimer(timer);
         self.scope_cancel_timer = null;
         for (self.fd_watches.items) |watch| watch.unregister(loop);
@@ -331,11 +338,38 @@ pub const App = struct {
         return .{ .ptr = self, .vtable = &.{ .build_widget = buildWidgetHost } };
     }
 
+    pub fn reloadHost(self: *App) native_runtime.ReloadHost {
+        return .{ .ptr = self, .request_fn = requestReloadHost };
+    }
+
+    pub fn setReloadObserver(self: *App, observer: ?native_runtime.ReloadObserver) void {
+        self.reload_observer = observer;
+    }
+
+    pub fn requestReload(self: *App) !void {
+        self.script_dirty = true;
+        if (self.invalidator) |invalidator| try invalidator.invalidate();
+        if (self.event_loop) |loop| try loop.wake();
+    }
+
     /// Run the script if it has not executed yet (or is dirty). Called
     /// before app/runner.zig starts the backend so the returned app root can
     /// shape the window, and again on every rebuild.
     pub fn ensureLoaded(self: *App) !void {
-        if (self.script_dirty or self.script_ref < 0) try self.reloadScript();
+        if (self.script_ref < 0) return self.reloadScript();
+        if (!self.script_dirty) return;
+        self.reloadScript() catch |err| {
+            const message = self.lastLuaError() orelse @errorName(err);
+            if (self.reload_observer) |observer| observer.completed(false, message);
+            std.log.scoped(.keywork_luajit).warn("keeping generation {d} after reload failed: {s}", .{
+                self.reload_generation,
+                message,
+            });
+            self.script_dirty = false;
+            c.lua_settop(self.state, 0);
+            return;
+        };
+        if (self.reload_observer) |observer| observer.completed(true, "");
     }
 
     pub fn hasLiveAsyncResources(self: *const App) bool {
@@ -710,14 +744,22 @@ pub const App = struct {
     }
 
     fn reloadScript(self: *App) !void {
-        self.stopLifecycleLog();
-        self.cancelScriptResources();
+        const replacing_generation = self.script_ref >= 0;
         c.lua_settop(self.state, 0);
         installKeyworkModule(self.state, self);
         const source = try self.readScriptFile();
         defer self.allocator.free(source);
         const chunk = scriptChunk(source);
         if (c.luaL_loadbuffer(self.state, chunk.ptr, chunk.len, self.chunk_name.ptr) != 0) return self.failWithLuaError(error.ScriptLoadFailed);
+        const candidate_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
+        defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, candidate_ref);
+
+        // Compilation is the validation boundary: a malformed candidate must
+        // not tear down the resources that keep the current generation live.
+        self.stopLifecycleLog();
+        self.cancelScriptResources();
+        c.lua_settop(self.state, 0);
+        c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, candidate_ref);
         if (self.root_kind == .test_script) {
             if (c.lua_pcall(self.state, 0, 0, 0) != 0) return self.failWithLuaError(error.ScriptRunFailed);
             c.lua_pushboolean(self.state, 1);
@@ -725,6 +767,7 @@ pub const App = struct {
             if (self.script_ref >= 0) c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, self.script_ref);
             self.script_ref = script_ref;
             self.script_dirty = false;
+            self.reload_generation += 1;
             _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
             return;
         }
@@ -765,9 +808,20 @@ pub const App = struct {
         self.start_ref = start_ref;
         self.stop_ref = stop_ref;
         self.script_dirty = false;
+        self.reload_generation += 1;
         committed = true;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
-        if (self.event_loop != null and self.invalidator != null) try self.startLifecycle();
+        if (self.event_loop != null and self.invalidator != null) {
+            self.startLifecycle() catch |err| {
+                if (!replacing_generation) return err;
+                const message = self.lastLuaError() orelse @errorName(err);
+                std.log.scoped(.keywork_luajit).warn(
+                    "generation {d} committed but start callback failed: {s}",
+                    .{ self.reload_generation, message },
+                );
+                c.lua_settop(self.state, 0);
+            };
+        }
     }
 
     fn createStorybookBrowserRef(self: *App, script_ref: c_int) !c_int {
@@ -866,6 +920,7 @@ pub const App = struct {
             .state_invalidator = state_invalidator orelse .{ .ptr = self, .call_fn = invalidateWidgetState },
             .create_scope_fn = createWidgetScope,
             .dispose_scope_fn = disposeWidgetScope,
+            .reload_generation_fn = widgetReloadGeneration,
         };
     }
 
@@ -883,6 +938,11 @@ pub const App = struct {
     fn disposeWidgetScope(ptr: *anyopaque, scope: *LuaScope) void {
         const self: *App = @ptrCast(@alignCast(ptr));
         self.scheduleScopeCancel(scope);
+    }
+
+    fn widgetReloadGeneration(ptr: *anyopaque) u64 {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.reload_generation;
     }
 
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
@@ -1314,12 +1374,9 @@ fn varlinkHostAddClient(ptr: *anyopaque, address: []const u8) anyerror!*VarlinkC
     return app.addVarlinkClient(address);
 }
 
-fn scriptChanged(ctx: *anyopaque, _: *event_loop.EventLoop, path: []const u8, mask: u32, _: ?[]const u8) !void {
-    const app: *App = @ptrCast(@alignCast(ctx));
-    std.log.scoped(.keywork_luajit).info("reload requested for {s} mask=0x{x}", .{ path, mask });
-    app.script_dirty = true;
-    const invalidator = app.invalidator orelse return;
-    try invalidator.invalidate();
+fn requestReloadHost(ptr: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    try app.requestReload();
 }
 
 /// First byte of a LuaJIT (and PUC Lua) bytecode dump.
@@ -1711,7 +1768,7 @@ fn logModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
-    c.lua_createtable(lua_state, 0, 4);
+    c.lua_createtable(lua_state, 0, 5);
     const app_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "quit", luaQuit, 1);
@@ -1721,6 +1778,10 @@ fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
     lua_value.setClosureField(lua_state, app_table, "invalidate", luaInvalidate, 1);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "reconcile", luaReconcile, 1);
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, -2, "state", luaHotState, 1);
+    c.lua_setfield(lua_state, app_table, "hot");
 
     c.lua_createtable(lua_state, 0, 1);
     lua_value.setClosureField(lua_state, -1, "__call", luaAppCall, 0);
@@ -1748,13 +1809,127 @@ fn luaQuit(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn luaReload(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    app.script_dirty = true;
-    if (app.invalidator) |invalidator| invalidator.invalidate() catch |err| {
+    app.requestReload() catch |err| {
         std.log.scoped(.keywork_luajit).warn("reload invalidate failed: {}", .{err});
         return c.luaL_error(lua_state, "reload failed");
     };
-    if (app.event_loop) |loop| loop.wake() catch {};
     return 0;
+}
+
+fn luaHotState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const key = lua_value.checkString(lua_state, 1);
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    const version = hotStateVersion(lua_state, 2) catch
+        return c.luaL_error(lua_state, "hot state version must be a positive integer");
+
+    if (app.hot_states.get(key)) |existing| {
+        if (existing.version == version) {
+            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, existing.ref);
+            validateHotStateValue(lua_state, app.allocator, -1) catch
+                return c.luaL_error(lua_state, "hot state must contain only plain Lua data");
+            return 1;
+        }
+        pushHotStateCandidate(lua_state, 2, existing) catch
+            return c.luaL_error(lua_state, "hot state migration failed");
+        validateHotStateValue(lua_state, app.allocator, -1) catch
+            return c.luaL_error(lua_state, "hot state must contain only plain Lua data");
+        const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+        const entry = app.hot_states.getPtr(key).?;
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, entry.ref);
+        entry.* = .{ .version = version, .ref = ref };
+        c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
+        return 1;
+    }
+
+    pushHotStateCandidate(lua_state, 2, null) catch
+        return c.luaL_error(lua_state, "hot state init failed");
+    validateHotStateValue(lua_state, app.allocator, -1) catch
+        return c.luaL_error(lua_state, "hot state must contain only plain Lua data");
+    const ref = c.luaL_ref(lua_state, c.LUA_REGISTRYINDEX);
+    const owned_key = app.allocator.dupe(u8, key) catch {
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        return c.luaL_error(lua_state, "out of memory");
+    };
+    app.hot_states.putNoClobber(app.allocator, owned_key, .{ .version = version, .ref = ref }) catch {
+        app.allocator.free(owned_key);
+        c.luaL_unref(lua_state, c.LUA_REGISTRYINDEX, ref);
+        return c.luaL_error(lua_state, "out of memory");
+    };
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, ref);
+    return 1;
+}
+
+fn hotStateVersion(lua_state: *c.lua_State, options: c_int) !i64 {
+    c.lua_getfield(lua_state, options, "version");
+    defer pop(lua_state, 1);
+    if (c.lua_isnil(lua_state, -1)) return 1;
+    if (c.lua_isnumber(lua_state, -1) == 0) return error.InvalidHotStateVersion;
+    const version: i64 = @intCast(c.lua_tointeger(lua_state, -1));
+    if (version < 1 or @as(c.lua_Number, @floatFromInt(version)) != c.lua_tonumber(lua_state, -1)) {
+        return error.InvalidHotStateVersion;
+    }
+    return version;
+}
+
+fn pushHotStateCandidate(lua_state: *c.lua_State, options: c_int, previous: ?App.HotState) !void {
+    if (previous) |value| {
+        c.lua_getfield(lua_state, options, "migrate");
+        if (!c.lua_isnil(lua_state, -1)) {
+            if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.InvalidHotStateMigrate;
+            c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, value.ref);
+            c.lua_pushinteger(lua_state, @intCast(value.version));
+            if (c.lua_pcall(lua_state, 2, 1, 0) != 0) return error.HotStateMigrationFailed;
+            return;
+        }
+        pop(lua_state, 1);
+    }
+
+    c.lua_getfield(lua_state, options, "init");
+    if (c.lua_type(lua_state, -1) != c.LUA_TFUNCTION) return error.InvalidHotStateInit;
+    if (c.lua_pcall(lua_state, 0, 1, 0) != 0) return error.HotStateInitFailed;
+}
+
+fn validateHotStateValue(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !void {
+    if (c.lua_type(lua_state, index) != c.LUA_TTABLE) return error.HotStateMustBeTable;
+    var active: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer active.deinit(allocator);
+    try validatePlainLuaValue(lua_state, allocator, &active, index);
+}
+
+fn validatePlainLuaValue(
+    lua_state: *c.lua_State,
+    allocator: std.mem.Allocator,
+    active: *std.AutoHashMapUnmanaged(usize, void),
+    index: c_int,
+) !void {
+    const value = lua_value.absoluteIndex(lua_state, index);
+    switch (c.lua_type(lua_state, value)) {
+        c.LUA_TNIL, c.LUA_TBOOLEAN, c.LUA_TNUMBER, c.LUA_TSTRING => return,
+        c.LUA_TTABLE => {},
+        else => return error.HotStateNotPlain,
+    }
+    if (c.lua_getmetatable(lua_state, value) != 0) {
+        pop(lua_state, 1);
+        return error.HotStateHasMetatable;
+    }
+    const identity = @intFromPtr(c.lua_topointer(lua_state, value).?);
+    if (active.contains(identity)) return error.HotStateCycle;
+    try active.put(allocator, identity, {});
+    defer _ = active.remove(identity);
+
+    const original_top = c.lua_gettop(lua_state);
+    defer c.lua_settop(lua_state, original_top);
+    c.lua_pushnil(lua_state);
+    while (c.lua_next(lua_state, value) != 0) {
+        switch (c.lua_type(lua_state, -2)) {
+            c.LUA_TNUMBER, c.LUA_TSTRING => {},
+            else => return error.HotStateKeyNotPlain,
+        }
+        try validatePlainLuaValue(lua_state, allocator, active, -1);
+        pop(lua_state, 1);
+    }
 }
 
 fn luaLogDebug(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -2193,6 +2368,156 @@ test "reload cancels resources from the previous script load" {
     try std.testing.expect(previous_timer.canceled);
     try std.testing.expectEqual(@as(usize, 2), app.timers.items.len);
     try std.testing.expect(!app.timers.items[1].canceled);
+}
+
+test "syntax-invalid reload keeps the current generation and resources" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\loop.timer({ interval = 60 })
+        \\return kw.app({ child = kw.text("working") })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "safe-reload.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    const script_ref = app.script_ref;
+    const timer = app.timers.items[0];
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "safe-reload.lua",
+        .data = "local this is not valid Lua\n",
+    });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+    try std.testing.expectEqual(script_ref, app.script_ref);
+    try std.testing.expect(!timer.canceled);
+}
+
+test "hot state retains, migrates, and versions plain application data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first =
+        \\local kw = require("keywork")
+        \\local state = kw.app.hot.state("main", { version = 1, init = function() return { count = 0 } end })
+        \\state.count = state.count + 1
+        \\hot_count = state.count
+        \\return kw.app({ child = kw.text(tostring(state.count)) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "hot-state.lua", first);
+    defer app.deinit();
+    try app.ensureLoaded();
+    c.lua_getglobal(app.state, "hot_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-state.lua", .data = first });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    c.lua_getglobal(app.state, "hot_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 2), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+
+    const migrated =
+        \\local kw = require("keywork")
+        \\local state = kw.app.hot.state("main", {
+        \\  version = 2,
+        \\  init = function() return { count = 100 } end,
+        \\  migrate = function(previous, previous_version)
+        \\    assert(previous_version == 1)
+        \\    previous.count = previous.count + 10
+        \\    return previous
+        \\  end,
+        \\})
+        \\hot_count = state.count
+        \\return kw.app({ child = kw.text(tostring(state.count)) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-state.lua", .data = migrated });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    c.lua_getglobal(app.state, "hot_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 12), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+}
+
+test "hot state rejects non-plain data before crossing a generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local state = kw.app.hot.state("main", {
+        \\  init = function() return {} end,
+        \\})
+        \\state.callback = function() end
+        \\return kw.app({ child = kw.text("hot state") })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "hot-state-plain.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+}
+
+test "stateful hot family token survives compatible reload and changes with version" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script_v1 =
+        \\local kw = require("keywork")
+        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\  build = function() return kw.text("one") end,
+        \\})
+        \\return kw.app({ child = Counter({}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "hot-family.lua", script_v1);
+    defer app.deinit();
+    var first_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer first_arena.deinit();
+    const first = try app.buildWidget(first_arena.allocator(), .{}, 1);
+    const first_token = first.stateful.type_token.?;
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-family.lua", .data = script_v1 });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    var second_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer second_arena.deinit();
+    const second = try app.buildWidget(second_arena.allocator(), .{}, 1);
+    try std.testing.expectEqual(first_token, second.stateful.type_token.?);
+
+    const script_v2 =
+        \\local kw = require("keywork")
+        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 2,
+        \\  build = function() return kw.text("two") end,
+        \\})
+        \\return kw.app({ child = Counter({}) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-family.lua", .data = script_v2 });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    var third_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer third_arena.deinit();
+    const third = try app.buildWidget(third_arena.allocator(), .{}, 1);
+    try std.testing.expect(first_token != third.stateful.type_token.?);
 }
 
 test "stale handles from a previous script load are inert" {

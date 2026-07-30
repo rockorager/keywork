@@ -39,7 +39,12 @@ pub fn deinit(self: *Application) void {
     self.loop.deinit();
 }
 
-pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void {
+pub fn run(
+    self: *Application,
+    init_io: std.Io,
+    runtime_directory: []const u8,
+    run_options: cli.Options,
+) !void {
     try self.systemd_event.register(&self.loop);
     defer self.systemd_event.unregister();
     self.lua.setScriptArgs(run_options.app_args);
@@ -52,6 +57,19 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         if (layer_shell != null or window.has_windows or window.session_lock) native_runtime.BackendKind.wayland_shm else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
+    const app_id = window.app_id orelse "dev.keywork.Keywork";
+
+    const control = try native_runtime.ApplicationControl.create(
+        self.allocator,
+        init_io,
+        self.systemd_event,
+        runtime_directory,
+        app_id,
+        self.lua.reloadHost(),
+    );
+    defer control.destroy();
+    self.lua.setReloadObserver(control.observer());
+    defer self.lua.setReloadObserver(null);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init_io, &stdout_buffer);
@@ -59,7 +77,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
 
     try native_runtime.run(self.allocator, &self.loop, self.lua.host(), .{
         .title = title,
-        .app_id = window.app_id orelse "dev.keywork.Keywork",
+        .app_id = app_id,
         .width = run_options.width orelse window.width orelse 640,
         .height = run_options.height orelse window.height orelse 480,
         .backend = backend,
@@ -70,6 +88,7 @@ pub fn run(self: *Application, init_io: std.Io, run_options: cli.Options) !void 
         .log_writer = &stdout_writer.interface,
         .systemd_event = self.systemd_event,
         .host_bindings = self.lua.hostBindings(),
+        .keep_alive = true,
         .windows_host = self.lua.windowsHost(),
     });
 }

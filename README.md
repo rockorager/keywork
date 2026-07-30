@@ -12,7 +12,8 @@ modules and coordinated changes without erasing component ownership.
 | `src/ui/` | The platform-neutral retained UI model and engine |
 | `src/runtime/` | The native Wayland application runtime and platform backends |
 | `src/lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
-| `src/compositor/` | The Wayland compositor, `keyworkctl`, and compositor-owned session integration |
+| `src/compositor/` | The Wayland compositor, its control adapter, and compositor-owned session integration |
+| `src/keyworkctl/` | The umbrella `keyworkctl` CLI and application-control commands |
 | `src/shell/` | The Lua desktop shell and its native C helpers |
 | `protocols/` | All checked-in Wayland protocol XML and its provenance metadata |
 | `build/` | Helpers used only by the root Zig build graph |
@@ -76,6 +77,73 @@ Additional focused steps such as `zig build run`, `zig build
 run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
 are available from the repository root. The native example opens a Wayland
 window without compiling or linking LuaJIT.
+
+## Application control and explicit reload
+
+Every hosted Lua application automatically exposes the runtime-owned
+`dev.rockorager.keywork.application` Varlink interface. Per-instance sockets
+live under `$XDG_RUNTIME_DIR/keywork/apps/`; applications do not need to create
+or manage a server in Lua. `keyworkctl` discovers and verifies those endpoints:
+
+```sh
+keyworkctl app list
+keyworkctl app status [INSTANCE]
+keyworkctl app reload [INSTANCE]
+```
+
+When exactly one application is running, `status` and `reload` may omit the
+instance. `--address ADDRESS` targets an endpoint directly. Compositor commands
+are namespaced as `keyworkctl compositor ...`; their original unnamespaced
+forms remain compatibility aliases.
+
+Reload is explicit rather than file-watch driven. A request compiles the entry
+script before replacing the current generation, so a syntax-invalid edit is
+reported to the caller without tearing down the running generation. On a
+successful reload, the entry script and lifecycle callbacks are replaced and
+generation-owned scopes, effects, tasks, and IPC resources restart.
+Compilation is the preservation boundary: a candidate that compiles but then
+fails while executing can already have stopped the previous generation's
+resources, even though its generation number is not committed.
+
+Lua applications can opt specific state into Fast Refresh. Retained
+application data must be plain Lua tables containing only nil, booleans,
+numbers, strings, and other plain acyclic tables:
+
+```lua
+local kw = require("keywork")
+
+local state = kw.app.hot.state("settings", {
+    version = 1,
+    init = function()
+        return { count = 0 }
+    end,
+    migrate = function(previous, previous_version)
+        return previous
+    end,
+})
+```
+
+Changing `version` runs `migrate(previous, previous_version)` when provided,
+or resets through `init`. Stateful widgets retain their state when the source
+file, `hot_id`, and `hot_version` identify the same family:
+
+```lua
+local Counter = kw.stateful({
+    hot_id = "Counter",
+    hot_version = 1,
+    init = function(self)
+        self.count = 0
+    end,
+    build = function(self)
+        return kw.text(tostring(self.count))
+    end,
+})
+```
+
+Changing `hot_id` or `hot_version` intentionally remounts the widget. Widget
+state can survive a compatible refresh, but its lifecycle scope is recreated
+so effects always run against the new implementation. Arbitrary closures,
+userdata, coroutine stacks, and Lua heaps are not patched or retained.
 
 GDM discovers session definitions only from system data directories and does
 not expand `$HOME` in `Exec`. The `install-gdm-session` step therefore runs the

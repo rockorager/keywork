@@ -5,6 +5,7 @@ const ui = @import("ui.zig");
 
 pub const Output = struct {
     module: *std.Build.Module,
+    application_control: *std.Build.Module,
     image_c: *std.Build.Module,
     systemd_c: *std.Build.Module,
 };
@@ -105,6 +106,12 @@ pub fn add(
     pixman_c.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
     const pixman_c_module = pixman_c.createModule();
 
+    const application_control = b.addModule("keywork-application-control", .{
+        .root_source_file = b.path("src/runtime/app/control_protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const keywork_runtime_module = b.addModule("keywork-runtime", .{
         .root_source_file = b.path("src/runtime/root.zig"),
         .target = target,
@@ -115,6 +122,7 @@ pub fn add(
     keywork_runtime_module.addImport("varlink", varlink_module);
     keywork_runtime_module.addImport("keywork-ui", ui_output.module);
     keywork_runtime_module.addImport("keywork-ui-engine", ui_output.engine_module);
+    keywork_runtime_module.addImport("keywork-application-control", application_control);
     keywork_runtime_module.addImport("wayland", wayland_mod);
     keywork_runtime_module.addImport("image_c", image_c_module);
     keywork_runtime_module.linkLibrary(stb_lib.library);
@@ -125,6 +133,11 @@ pub fn add(
     keywork_runtime_module.addImport("systemd_c", systemd_c_module);
     keywork_runtime_module.addImport("text_c", text_c_module);
     keywork_runtime_module.addImport("pixman_c", pixman_c_module);
+    keywork_runtime_module.addCSourceFile(.{
+        .file = b.path("src/runtime/ffi/application_varlink.c"),
+        .flags = &.{"-std=gnu23"},
+    });
+    keywork_runtime_module.addIncludePath(b.path("src/runtime/ffi"));
     linkKeyworkNativeSystemLibraries(keywork_runtime_module);
 
     const native_example_module = b.createModule(.{
@@ -163,6 +176,7 @@ pub fn add(
 
     return .{
         .module = keywork_runtime_module,
+        .application_control = application_control,
         .image_c = image_c_module,
         .systemd_c = systemd_c_module,
     };

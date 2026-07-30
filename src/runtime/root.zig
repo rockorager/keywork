@@ -11,6 +11,10 @@ pub const run = runner.run;
 pub const RunOptions = runner.Options;
 
 pub const HostBindings = @import("app/HostBindings.zig");
+pub const ApplicationControl = @import("app/ApplicationControl.zig");
+pub const ReloadHost = ApplicationControl.ReloadHost;
+pub const ReloadObserver = ApplicationControl.ReloadObserver;
+pub const application_control = @import("keywork-application-control");
 
 const windows = @import("app/windows.zig");
 pub const WindowsHost = windows.WindowsHost;
@@ -45,6 +49,7 @@ pub const linux = struct {
 test {
     _ = @import("app/runner.zig");
     _ = @import("app/HostBindings.zig");
+    _ = @import("app/ApplicationControl.zig");
     _ = @import("backend/memory.zig");
     _ = @import("backend/wayland/input.zig");
     _ = @import("backend/wayland/shm.zig");

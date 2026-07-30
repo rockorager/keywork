@@ -1,6 +1,11 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
+pub const Output = struct {
+    keyworkctl_adapter: *std.Build.Module,
+    keyworkctl_tests: *std.Build.Step,
+};
+
 pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -9,7 +14,7 @@ pub fn add(
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
-) void {
+) Output {
     const scanner = Scanner.create(b, .{
         .wayland_xml = wayland_xml,
         .wayland_protocols = wayland_protocols,
@@ -178,20 +183,15 @@ pub fn add(
         .name = "keywork-compositor",
         .root_module = compositor,
     });
-    const keyworkctl_module = b.createModule(.{
-        .root_source_file = b.path("src/compositor/keyworkctl/main.zig"),
+    const keyworkctl_adapter = b.addModule("keyworkctl-compositor", .{
+        .root_source_file = b.path("src/compositor/keyworkctl/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    keyworkctl_module.addImport("varlink", varlink);
-    keyworkctl_module.addImport("keywork-control", control);
-    const keyworkctl = b.addExecutable(.{
-        .name = "keyworkctl",
-        .root_module = keyworkctl_module,
-    });
+    keyworkctl_adapter.addImport("varlink", varlink);
+    keyworkctl_adapter.addImport("keywork-control", control);
 
     b.installArtifact(exe);
-    b.installArtifact(keyworkctl);
     b.installFile(
         "src/compositor/resources/keywork-session.target",
         "share/systemd/user/keywork-session.target",
@@ -230,8 +230,9 @@ pub fn add(
         .root_module = compositor,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-    const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_module });
-    test_step.dependOn(&b.addRunArtifact(keyworkctl_tests).step);
+    const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_adapter });
+    const run_keyworkctl_tests = b.addRunArtifact(keyworkctl_tests);
+    test_step.dependOn(&run_keyworkctl_tests.step);
 
     const renderer_conformance_tests = b.addTest(.{
         .root_module = compositor,
@@ -269,6 +270,10 @@ pub fn add(
         "Benchmark the ReleaseFast Pixman CPU renderer",
     );
     benchmark_step.dependOn(&benchmark_run.step);
+    return .{
+        .keyworkctl_adapter = keyworkctl_adapter,
+        .keyworkctl_tests = &run_keyworkctl_tests.step,
+    };
 }
 
 fn addGdmSessionInstallStep(b: *std.Build) void {

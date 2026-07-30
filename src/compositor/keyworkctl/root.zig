@@ -5,8 +5,8 @@ const control = @import("keywork-control");
 const varlink = @import("varlink");
 const Empty = struct {};
 
-const usage =
-    \\usage: keyworkctl COMMAND [ARGUMENT...]
+pub const usage =
+    \\usage: keyworkctl compositor COMMAND [ARGUMENT...]
     \\
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          close TARGET
@@ -56,37 +56,9 @@ const WindowParameters = struct {
 
 const StatisticsParameters = control.PerformanceStatistics;
 
-pub fn main(init: std.process.Init) void {
-    run(init) catch |err| {
-        if (err == error.Reported) std.process.exit(2);
-        if (err == error.RemoteError) std.process.exit(1);
-        var buffer: [1024]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(init.io, &buffer);
-        stderr.interface.print("keyworkctl: {t}\n", .{err}) catch {};
-        stderr.interface.flush() catch {};
-        std.process.exit(1);
-    };
-}
-
-fn run(init: std.process.Init) !void {
-    var iterator = try init.minimal.args.iterateAllocator(init.gpa);
-    defer iterator.deinit();
-    _ = iterator.next();
-    var arguments: [3][]const u8 = undefined;
-    var count: usize = 0;
-    while (iterator.next()) |argument| {
-        if (count == arguments.len) return printUsage(init.io, error.InvalidArguments);
-        arguments[count] = argument;
-        count += 1;
-    }
-    if (count == 1 and std.mem.eql(u8, arguments[0], "--help")) {
-        var buffer: [2048]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(init.io, &buffer);
-        defer stdout.interface.flush() catch {};
-        try stdout.interface.writeAll(usage);
-        return;
-    }
-    const command = parse(arguments[0..count]) catch |err| return printUsage(init.io, err);
+/// Executes one compositor command from arguments sliced by the umbrella CLI.
+pub fn run(init: std.process.Init, arguments: []const []const u8) !void {
+    const command = try parse(arguments);
 
     const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
         return error.MissingRuntimeDirectory;
@@ -584,14 +556,6 @@ fn remoteErrorMessage(name: []const u8, parameters: ?std.json.Value) ?[]const u8
         .string => |string| string,
         else => null,
     };
-}
-
-fn printUsage(io: std.Io, err: anyerror) anyerror {
-    var buffer: [2048]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(io, &buffer);
-    defer stderr.interface.flush() catch {};
-    stderr.interface.print("keyworkctl: {t}\n{s}", .{ err, usage }) catch {};
-    return error.Reported;
 }
 
 fn parse(arguments: []const []const u8) !Command {

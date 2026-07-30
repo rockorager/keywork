@@ -79,7 +79,9 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(run_options.app_args);
             var app = try Application.init(allocator, run_options.script_path);
             defer app.deinit();
-            try app.run(init.io, run_options);
+            const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
+                return error.MissingRuntimeDirectory;
+            try app.run(init.io, runtime_directory, run_options);
             log.debug("frame rendered", .{});
         },
         .storybook => |storybook_options| {

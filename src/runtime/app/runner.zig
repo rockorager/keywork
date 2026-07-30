@@ -52,6 +52,9 @@ pub const Options = struct {
     /// Optional lifecycle integration for an embedding language or native
     /// host. The runner remains usable without host bindings.
     host_bindings: ?HostBindings = null,
+    /// Keep a log-backend application in the event loop even when its host
+    /// has no generation-scoped asynchronous resources.
+    keep_alive: bool = false,
     /// Declarative window-set host; when present the Wayland backends run
     /// one runtime per declared window instead of a single main window.
     windows_host: ?app_windows.WindowsHost = null,
@@ -110,14 +113,18 @@ fn runHeadlessRuntime(
     if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
     defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
     try runtime.repaint();
-    if (options.host_bindings) |bindings| {
-        if (bindings.shouldRunHeadless()) {
-            var headless_loop: HeadlessLoop = .{ .runtime = &runtime, .options = &options };
-            loop.setEndTurnHook(&headless_loop, HeadlessLoop.endTurn);
-            defer loop.clearEndTurnHook();
-            try loop.run();
-        }
+    if (shouldRunHeadless(options)) {
+        var headless_loop: HeadlessLoop = .{ .runtime = &runtime, .options = &options };
+        loop.setEndTurnHook(&headless_loop, HeadlessLoop.endTurn);
+        defer loop.clearEndTurnHook();
+        try loop.run();
     }
+}
+
+fn shouldRunHeadless(options: Options) bool {
+    if (options.keep_alive) return true;
+    const bindings = options.host_bindings orelse return false;
+    return bindings.shouldRunHeadless();
 }
 
 const HeadlessLoop = struct {
@@ -127,8 +134,7 @@ const HeadlessLoop = struct {
     fn endTurn(ctx: *anyopaque, loop: *event_loop.EventLoop) !void {
         const self: *HeadlessLoop = @ptrCast(@alignCast(ctx));
         try self.runtime.flushPendingRepaint();
-        const bindings = self.options.host_bindings orelse return;
-        if (!bindings.shouldRunHeadless()) loop.quit();
+        if (!shouldRunHeadless(self.options.*)) loop.quit();
     }
 };
 

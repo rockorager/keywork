@@ -1,0 +1,16 @@
+# Process-lifetime control interface implemented by every hosted Keywork application.
+interface dev.rockorager.keywork.application
+
+type Status (
+    appId: string,
+    instanceId: string,
+    generation: int,
+    reloading: bool,
+    reloadSupported: bool
+)
+
+method GetStatus() -> (status: Status)
+method Reload() -> (generation: int)
+
+error ReloadUnsupported()
+error ReloadFailed(message: string)

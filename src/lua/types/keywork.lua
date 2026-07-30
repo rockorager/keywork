@@ -506,6 +506,8 @@
 ---@field theme keywork.Theme
 
 ---@class keywork.StatefulSpec<P: table>
+---@field hot_id?      string Stable family identifier, scoped to the defining source file.
+---@field hot_version? integer Changing the version remounts this widget instead of retaining state.
 ---@field init?    fun(self: keywork.StatefulState<P>, props: P)
 ---@field update?  fun(self: keywork.StatefulState<P>, props: P)
 ---@field build    fun(self: keywork.StatefulState<P>, context: keywork.StatefulBuildContext): keywork.Widget
@@ -834,11 +836,20 @@ function PixelBuffer:commit(options) end
 ---@class keywork.ActivationTokenOptions
 ---@field app_id? string
 
+---@class keywork.HotStateOptions<T: table>
+---@field version? integer Version of the retained shape; defaults to 1.
+---@field init fun(): T Creates state when the key is new or its version changes without a migrator.
+---@field migrate? fun(previous: T, previous_version: integer): T Migrates state when `version` changes.
+
+---@class keywork.HotNamespace
+---@field state fun(key: string, options: keywork.HotStateOptions): table Retain a plain, acyclic Lua data table across reload generations.
+
 ---@class keywork.AppNamespace
 ---@field quit       fun()
 ---@field reload     fun()
 ---@field invalidate fun() Rebuild the window set and all retained window content.
 ---@field reconcile  fun() Rebuild only the window set, preserving retained content in existing windows.
+---@field hot        keywork.HotNamespace
 ---@operator call(keywork.AppOptions): keywork.App
 
 ---@class keywork.WindowNamespace

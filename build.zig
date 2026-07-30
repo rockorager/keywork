@@ -1,5 +1,6 @@
 const std = @import("std");
 const compositor = @import("build/compositor.zig");
+const keyworkctl = @import("build/keyworkctl.zig");
 const lua_host = @import("build/lua.zig");
 const luajit = @import("build/luajit.zig");
 const runtime = @import("build/runtime.zig");
@@ -61,13 +62,23 @@ pub fn build(b: *std.Build) void {
         lua_jit,
         test_step,
     );
-    compositor.add(
+    const compositor_output = compositor.add(
         b,
         target,
         optimize,
         varlink,
         wayland_sources.wayland_xml,
         wayland_sources.protocols,
+        test_step,
+    );
+    keyworkctl.add(
+        b,
+        target,
+        optimize,
+        compositor_output.keyworkctl_adapter,
+        runtime_output.application_control,
+        varlink,
+        compositor_output.keyworkctl_tests,
         test_step,
     );
 

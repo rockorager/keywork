@@ -37,6 +37,7 @@ pub const Host = struct {
     state_invalidator: keywork.Widget.Callback,
     create_scope_fn: *const fn (*anyopaque) anyerror!*lua_task.LuaScope,
     dispose_scope_fn: *const fn (*anyopaque, *lua_task.LuaScope) void,
+    reload_generation_fn: *const fn (*anyopaque) u64 = noReloadGeneration,
 
     pub fn invalidateState(self: Host) !void {
         try self.state_invalidator.call();
@@ -55,7 +56,15 @@ pub const Host = struct {
     pub fn disposeScope(self: Host, scope: *lua_task.LuaScope) void {
         self.dispose_scope_fn(self.ptr, scope);
     }
+
+    pub fn reloadGeneration(self: Host) u64 {
+        return self.reload_generation_fn(self.ptr);
+    }
 };
+
+fn noReloadGeneration(_: *anyopaque) u64 {
+    return 0;
+}
 
 fn luaSetState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
@@ -463,7 +472,12 @@ const LuaStatefulWidget = struct {
         const self: *const LuaStatefulWidget = @ptrCast(@alignCast(ptr));
         const state = try allocator.create(LuaStatefulState);
         errdefer allocator.destroy(state);
-        state.* = .{ .host = self.host, .lua_state = self.lua_state, .state_ref = -1 };
+        state.* = .{
+            .host = self.host,
+            .lua_state = self.lua_state,
+            .state_ref = -1,
+            .reload_generation = self.host.reloadGeneration(),
+        };
 
         c.lua_createtable(self.lua_state, 0, 0);
         const state_table = c.lua_gettop(self.lua_state);
@@ -474,11 +488,7 @@ const LuaStatefulWidget = struct {
 
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         const spec = c.lua_gettop(self.lua_state);
-        c.lua_createtable(self.lua_state, 0, 1);
-        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, state.slot_ref);
-        c.lua_pushvalue(self.lua_state, spec);
-        lua_value.setClosureField(self.lua_state, -3, "__index", luaStateIndex, 2);
-        _ = c.lua_setmetatable(self.lua_state, state_table);
+        installStateSpec(self.lua_state, state, state_table, spec);
         c.lua_getfield(self.lua_state, spec, "init");
         if (c.lua_isnil(self.lua_state, -1)) {
             pop(self.lua_state, 1);
@@ -505,6 +515,17 @@ const LuaStatefulWidget = struct {
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.spec_ref);
         const spec = c.lua_gettop(self.lua_state);
         defer pop(self.lua_state, 1);
+        installStateSpec(self.lua_state, state, state_table, spec);
+        const reload_generation = self.host.reloadGeneration();
+        if (state.reload_generation != reload_generation) {
+            // Script-owned effects are generation-scoped. The reload pass
+            // canceled the old scope; clear its cached Lua handle so the new
+            // implementation lazily receives a fresh scope.
+            state.scope = null;
+            c.lua_pushnil(self.lua_state);
+            c.lua_setfield(self.lua_state, state_table, "scope");
+            state.reload_generation = reload_generation;
+        }
         c.lua_getfield(self.lua_state, spec, "update");
         if (c.lua_isnil(self.lua_state, -1)) {
             pop(self.lua_state, 1);
@@ -612,6 +633,7 @@ const LuaStatefulState = struct {
     slot_ref: c_int = -1,
     rebuild_generation: u64 = 0,
     built_generation: u64 = 0,
+    reload_generation: u64,
     /// Lazily created on first self.scope access; canceled on dispose.
     scope: ?*lua_task.LuaScope = null,
 };
@@ -743,8 +765,13 @@ pub fn parse(
         var owned_parse_context = try parse_context.cloneOwned(lua_state);
         errdefer owned_parse_context.deinitOwned(lua_state);
         c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, spec_ref);
-        const spec_token = c.lua_topointer(lua_state, -1);
-        pop(lua_state, 1);
+        const spec = c.lua_gettop(lua_state);
+        c.lua_getfield(lua_state, spec, "__hot_token");
+        const spec_token = if (c.lua_type(lua_state, -1) == c.LUA_TTABLE)
+            c.lua_topointer(lua_state, -1)
+        else
+            c.lua_topointer(lua_state, spec);
+        pop(lua_state, 2);
         stateful.* = .{
             .allocator = allocator,
             .host = host,
@@ -1427,6 +1454,14 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
 fn installStateMethods(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int) void {
     state.slot_ref = lua_handle.createSlot(lua_state, state);
     lua_value.setClosureField(lua_state, state_table, "set_state", luaSetState, 1);
+}
+
+fn installStateSpec(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int, spec: c_int) void {
+    c.lua_createtable(lua_state, 0, 1);
+    c.lua_rawgeti(lua_state, c.LUA_REGISTRYINDEX, state.slot_ref);
+    c.lua_pushvalue(lua_state, spec);
+    lua_value.setClosureField(lua_state, -3, "__index", luaStateIndex, 2);
+    _ = c.lua_setmetatable(lua_state, state_table);
 }
 
 /// __index for stateful widget state tables. Resolves "scope" to the

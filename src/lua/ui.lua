@@ -271,7 +271,30 @@ function ui.keyed(key, child)
     }
 end
 
+local hot_stateful_families = {}
+
 function ui.stateful(spec)
+    if spec.hot_id ~= nil then
+        if type(spec.hot_id) ~= "string" or spec.hot_id == "" then
+            error("stateful hot_id must be a non-empty string", 2)
+        end
+        local version = spec.hot_version or 1
+        if type(version) ~= "number" or version < 1 or version % 1 ~= 0 then
+            error("stateful hot_version must be a positive integer", 2)
+        end
+        local info = debug.getinfo(2, "S")
+        local source = info and info.source or "?"
+        local family = source .. "\0" .. spec.hot_id .. "\0" .. tostring(version)
+        local token = hot_stateful_families[family]
+        if token == nil then
+            token = {}
+            hot_stateful_families[family] = token
+        end
+        spec.__hot_token = token
+    elseif spec.hot_version ~= nil then
+        error("stateful hot_version requires hot_id", 2)
+    end
+
     local build = spec.build
     if build then
         spec = setmetatable({

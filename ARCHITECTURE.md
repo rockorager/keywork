@@ -39,6 +39,9 @@ Wayland, or a concrete rendering backend.
 Owns `keywork-runtime`: the general Wayland application platform, including
 application lifecycle, window declarations, platform services, Wayland
 backends, CPU and Vulkan renderers, Linux integration, and event-loop adapters.
+It also owns the process-lifetime application control Varlink interface and
+per-instance server. Language hosts provide reload behavior through the
+runtime's typed callback contract; the server itself remains language-neutral.
 
 The native runtime depends on the UI and loop modules. It must compile and link
 without LuaJIT and must not acquire shell or compositor policy. Native Zig
@@ -57,12 +60,22 @@ those modules must never depend on it.
 ### Compositor (`src/compositor/`)
 
 Owns the Wayland compositor, window-management policy, renderer integration,
-the compositor Varlink interface and server, `keyworkctl`, and session assets
+the compositor Varlink interface and server, the compositor control CLI
+adapter, and session assets
 that start or configure the compositor.
 
 Its control implementation is compositor-private. User-facing commands must
 remain synchronized across configuration keybindings, Varlink declarations
 and dispatch, and `keyworkctl` parsing and help.
+
+### Keywork control CLI (`src/keyworkctl/`)
+
+Owns the `keyworkctl` executable's top-level namespace, help, and error
+routing. It depends on compositor commands through the named
+`keyworkctl-compositor` adapter module and on the runtime-owned application
+control protocol for app discovery, status, and reload. Those protocol types
+remain with their product owners; the umbrella CLI does not own or duplicate
+Varlink contracts.
 
 ### Shell (`src/shell/`)
 
@@ -116,6 +129,14 @@ Arrows mean "depends on":
                 ┌───────┴────────┐
                 │ native runtime │
                 └────────────────┘
+
+                         ┌────────────────────────┐
+                    ┌───▶│ compositor CLI adapter │
+┌────────────┐      │    └────────────────────────┘
+│ keyworkctl │──────┤
+└────────────┘      │    ┌────────────────────────┐
+                    └───▶│ app control protocol   │
+                         └────────────────────────┘
 ```
 
 The native runtime consumes `keywork-ui-engine`, `keywork-ui`, and
@@ -147,10 +168,10 @@ creates each module and wires dependencies explicitly.
   import them.
 
 The `varlink` module owns only generic wire types, framing, encoding, and its
-synchronous client. Compositor interfaces and dispatch remain compositor-owned;
-runtime consumers retain their own event-loop integration and product policy.
-The Lua host continues to use its libsystemd-backed adapter for asynchronous
-Varlink clients and servers.
+synchronous client. Compositor and application-control interfaces and dispatch
+remain product-owned. The native runtime owns its libsystemd-backed,
+process-lifetime application server; the Lua host separately owns
+generation-scoped asynchronous Varlink clients and application-defined servers.
 
 Module names and roots are part of the architecture. Add or change them in the
 root build and document non-obvious dependency direction changes here.
@@ -163,10 +184,17 @@ Current source module roots are:
 | `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
+| `keywork-application-control` | `src/runtime/app/control_protocol.zig` | none |
 | `keywork-lua` | `src/lua/root.zig` | public native modules |
 | `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |
 | `varlink` | `src/varlink/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
+| `keyworkctl-compositor` | `src/compositor/keyworkctl/root.zig` | `keywork-control`, `varlink` |
+
+The `keyworkctl` executable root is `src/keyworkctl/main.zig`. It imports the
+compositor adapter through the named `keyworkctl-compositor` module and the
+runtime contract through `keywork-application-control`; neither product
+depends back on the umbrella CLI.
 
 The `keywork` executable root is `src/lua/main.zig`. It consumes the adapter
 through `keywork-lua`, and the adapter consumes native runtime source through
