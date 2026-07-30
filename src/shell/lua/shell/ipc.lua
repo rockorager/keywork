@@ -7,6 +7,13 @@ M.name = "dev.rockorager.keywork"
 M.path = "/dev/rockorager/keywork"
 M.interface = "dev.rockorager.keywork"
 
+---@class ShellIpcHandle
+---@field bus      keywork.dbus.Bus
+---@field name     keywork.dbus.OwnedName
+---@field exported keywork.dbus.ExportedObject
+---@field closed   boolean
+---@field close    fun(self: ShellIpcHandle)
+
 -- Owns dev.rockorager.keywork on the session bus and exports the shell's
 -- control interface so keybindings can reach the running instance:
 --   keywork-shell launcher   (dbus-send under the hood)
@@ -16,6 +23,7 @@ M.interface = "dev.rockorager.keywork"
 -- Owning the name also makes the shell single-instance. Returns nil plus
 -- "no-bus" when the session bus is unavailable, or nil plus "name-taken"
 -- when another shell already owns the name.
+---@return ShellIpcHandle? handle, string? error
 function M.serve(handlers)
     local ok, bus = pcall(function()
         return dbus.session()
@@ -26,7 +34,8 @@ function M.serve(handlers)
     end
 
     local name_ok, name = pcall(function()
-        return bus:request_name(M.name, { do_not_queue = true })
+        local owned_name = bus:request_name(M.name, { do_not_queue = true })
+        return owned_name
     end)
     if not name_ok or not name then
         bus:close()
@@ -71,11 +80,22 @@ function M.serve(handlers)
         },
     })
 
-    return {
+    ---@type ShellIpcHandle
+    ---@diagnostic disable-next-line: missing-fields
+    local handle = {
         bus = bus,
         name = name,
         exported = exported,
+        closed = false,
     }
+    function handle:close()
+        if self.closed then return end
+        self.closed = true
+        self.name:release()
+        self.exported:unexport()
+        self.bus:close()
+    end
+    return handle
 end
 
 return M

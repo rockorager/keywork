@@ -152,7 +152,9 @@ local function WorkspaceSwitcher(props)
 end
 
 local Workspaces = kw.stateful({
-    init = function(self)
+    hot_id = "Workspaces",
+    hot_version = 1,
+    start = function(self)
         self.workspace_state = workspace_service:use(self.scope, function(next_snapshot)
             self.workspace_state = next_snapshot
             self:set_state()

@@ -16,6 +16,18 @@ local CLOSE_BY_CALL = 3
 local MAX_ID = 4294967295
 local MAX_VISIBLE = 4
 
+local retained = kw.app.hot.state("shell.notifications", {
+    init = function()
+        return {
+            by_id = {},
+            order = {},
+            next_id = 1,
+            generation = 0,
+        }
+    end,
+})
+---@cast retained { by_id: table<integer, ShellNotification>, order: integer[], next_id: integer, generation: integer }
+
 M.width = 380
 M.gap = 16
 M.horizontal_offset = 20
@@ -178,18 +190,23 @@ Server.__index = Server
 ---@field resident       boolean
 
 ---@class NotificationServer
----@field by_id      table<integer, ShellNotification>
----@field next_id    integer
----@field generation integer
----@field exported?  keywork.dbus.ExportedObject
----@field notify     function
----@field remove     function
----@field visible    fun(self: NotificationServer, limit?: integer): ShellNotification[]
+---@field bus             keywork.dbus.Bus
+---@field name            keywork.dbus.OwnedName
+---@field exported        keywork.dbus.ExportedObject
+---@field by_id           table<integer, ShellNotification>
+---@field order           integer[]
+---@field next_id         integer
+---@field generation      integer
+---@field on_change       fun()
+---@field closed          boolean
+---@field close           fun(self: NotificationServer)
+---@field notify          function
+---@field remove          function
+---@field schedule_expiry fun(self: NotificationServer, notification: ShellNotification)
+---@field visible         fun(self: NotificationServer, limit?: integer): ShellNotification[]
 
 function Server:changed()
-    if self.on_change then
-        self.on_change()
-    end
+    self.on_change()
 end
 
 function Server:emit(member, args)
@@ -206,6 +223,7 @@ function Server:allocate_id()
     while true do
         local id = self.next_id
         self.next_id = id >= MAX_ID and 1 or id + 1
+        retained.next_id = self.next_id
         if not self.by_id[id] then
             return id
         end
@@ -267,6 +285,7 @@ function Server:invoke(id, key, activation_token)
         -- Resident notifications stay until the user or sender removes them;
         -- changing the generation makes an already-running expiry task stale.
         self.generation = self.generation + 1
+        retained.generation = self.generation
         notification.generation = self.generation
         notification.timeout_ms = nil
         notification.remaining_ms = nil
@@ -316,6 +335,7 @@ function Server:set_hovered(id, hovered)
 
     notification.hovered = hovered
     self.generation = self.generation + 1
+    retained.generation = self.generation
     notification.generation = self.generation
     if hovered then
         if notification.expires_at_ms then
@@ -338,6 +358,7 @@ function Server:notify(app_name, replaces_id, app_icon, summary, body, actions, 
         and hints["desktop-entry"] or nil
 
     self.generation = self.generation + 1
+    retained.generation = self.generation
     local image = image_data(hints["image-data"] or hints.image_data)
     local icon = icon_value(hints["image-path"] or hints.image_path) or icon_value(app_icon)
     if not image and not icon then
@@ -374,11 +395,23 @@ function Server:notify(app_name, replaces_id, app_icon, summary, body, actions, 
 end
 
 function Server:close()
-    if self.name then self.name:release() end
-    if self.exported then self.exported:unexport() end
-    if self.bus then self.bus:close() end
+    ---@diagnostic disable-next-line: unnecessary-if
+    if self.closed then return end
+    self.closed = true
+    local now = loop.monotonic_ms()
+    for _, notification in pairs(self.by_id) do
+        if notification.expires_at_ms then
+            notification.remaining_ms = math.max(0, notification.expires_at_ms - now)
+            notification.expires_at_ms = nil
+        end
+    end
+    self.name:release()
+    self.exported:unexport()
+    self.bus:close()
 end
 
+---@param on_change fun()
+---@return NotificationServer?
 function M.serve(on_change)
     local ok, bus = pcall(function()
         return dbus.session()
@@ -389,7 +422,8 @@ function M.serve(on_change)
     end
 
     local name_ok, name = pcall(function()
-        return bus:request_name(BUS_NAME, { replace_existing = true, do_not_queue = true })
+        local owned_name = bus:request_name(BUS_NAME, { replace_existing = true, do_not_queue = true })
+        return owned_name
     end)
     if not name_ok or not name then
         log.warn("notifications disabled: org.freedesktop.Notifications is already owned")
@@ -401,11 +435,12 @@ function M.serve(on_change)
     local server = setmetatable({
         bus = bus,
         name = name,
-        by_id = {},
-        order = {},
-        next_id = 1,
-        generation = 0,
+        by_id = retained.by_id,
+        order = retained.order,
+        next_id = retained.next_id,
+        generation = retained.generation,
         on_change = on_change,
+        closed = false,
     }, Server)
 
     server.exported = bus:export(OBJECT_PATH, {
@@ -459,6 +494,20 @@ function M.serve(on_change)
         },
     })
 
+    -- Keep scalar counters synchronized with the retained container.
+    retained.by_id, retained.order = server.by_id, server.order
+    for _, notification in pairs(server.by_id) do
+        server.generation = server.generation + 1
+        notification.generation = server.generation
+        notification.hovered = false
+        if notification.remaining_ms and notification.remaining_ms > 0 then
+            server:schedule_expiry(notification)
+        elseif notification.timeout_ms then
+            server:remove(notification.id, CLOSE_EXPIRED)
+        end
+    end
+    retained.next_id, retained.generation = server.next_id, server.generation
+
     log.info("notifications enabled: owning org.freedesktop.Notifications")
     return server
 end
@@ -504,6 +553,8 @@ local function action_buttons(server, notification, on_hover)
 end
 
 local NotificationCard = kw.stateful({
+    hot_id = "NotificationCard",
+    hot_version = 1,
     build = function(self, context)
         local server = self.props.server
         local notification = self.props.notification
@@ -630,6 +681,8 @@ local NotificationCard = kw.stateful({
 M.Card = NotificationCard
 
 local NotificationStack = kw.stateful({
+    hot_id = "NotificationStack",
+    hot_version = 1,
     build = function(self)
         local children = {}
         for _, notification in ipairs(self.props.server:visible(MAX_VISIBLE)) do

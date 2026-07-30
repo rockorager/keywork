@@ -16,7 +16,9 @@ local function avatar(theme, path)
 end
 
 M.View = kw.stateful({
-    init = function(self)
+    hot_id = "View",
+    hot_version = 1,
+    start = function(self)
         if self.props.time and self.props.date then
             return
         end

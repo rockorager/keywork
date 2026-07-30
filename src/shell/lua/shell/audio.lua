@@ -249,6 +249,8 @@ local function settings_menu(palette, audio, on_select)
 end
 
 local AudioMenu = kw.stateful({
+    hot_id = "AudioMenu",
+    hot_version = 1,
     build = function(self)
         return audio_menu(
             self.props.colors,
@@ -261,6 +263,12 @@ local AudioMenu = kw.stateful({
 
 local Audio = kw.stateful({
     init = function(self)
+        self.menu_open = false
+    end,
+
+    hot_id = "Audio",
+    hot_version = 1,
+    start = function(self)
         self.audio_tap = function()
             self:set_state(function(state)
                 state.menu_open = not state.menu_open
@@ -314,7 +322,9 @@ local Audio = kw.stateful({
 })
 
 local Settings = kw.stateful({
-    init = function(self)
+    hot_id = "Settings",
+    hot_version = 1,
+    start = function(self)
         if not self.props.audio then
             self.audio = M.use(self.scope, function(snapshot)
                 self.audio = snapshot

@@ -509,6 +509,7 @@
 ---@field hot_id?      string Stable family identifier, scoped to the defining source file.
 ---@field hot_version? integer Changing the version remounts this widget instead of retaining state.
 ---@field init?    fun(self: keywork.StatefulState<P>, props: P)
+---@field start?   fun(self: keywork.StatefulState<P>, props: P) Runs after init and after every compatible reload with a fresh lifecycle scope.
 ---@field update?  fun(self: keywork.StatefulState<P>, props: P)
 ---@field build    fun(self: keywork.StatefulState<P>, context: keywork.StatefulBuildContext): keywork.Widget
 ---@field dispose? fun(self: keywork.StatefulState<P>)

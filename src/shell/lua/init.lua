@@ -13,11 +13,15 @@ local session = require("shell.session")
 -- App-level state shared by the window set. Anything that decides which
 -- windows exist lives here and flips via kw.app.reconcile(); widget
 -- state (kw.stateful) is per-window runtime.
----@type { audio_settings_open: boolean, launcher_open: boolean }
-local shell = {
-    audio_settings_open = false,
-    launcher_open = false,
-}
+local shell = kw.app.hot.state("shell.root", {
+    init = function()
+        return {
+            audio_settings_open = false,
+            launcher_open = false,
+        }
+    end,
+})
+---@cast shell { audio_settings_open: boolean, launcher_open: boolean }
 
 local function set_audio_settings_open(open)
     if shell.audio_settings_open == open then
@@ -35,59 +39,73 @@ local function set_launcher_open(open)
     kw.app.reconcile()
 end
 
-local osd_controller = osd.new(function()
-    kw.app.reconcile()
-end)
+---@type OsdController?
+local osd_controller = nil
+---@type SessionController?
+local session_controller = nil
+---@type IdleController?
+local idle_controller = nil
+---@type ShellIpcHandle?
+local ipc_handle = nil
+---@type NotificationServer?
+local notification_server = nil
 
-local session_controller = session.start()
-local idle_controller = idle.start({
-    lock = function()
-        session_controller:lock()
-    end,
-})
-
--- Keybindings reach the running shell over the session bus:
---   bindsym $mod+Return exec keywork-shell launcher
-local ipc_handle, ipc_err = ipc.serve({
-    toggle_launcher = function()
-        set_launcher_open(not shell.launcher_open)
-    end,
-    lock = function()
-        session_controller:lock()
-    end,
-    adjust_audio = function(kind, action)
-        return osd_controller:adjust_audio(kind, action)
-    end,
-    adjust_brightness = function(action)
-        return osd_controller:adjust_brightness(action)
-    end,
-    configure_background = function(payload)
-        local ok, err = background.configure(payload)
-        if not ok then
-            return false, err
-        end
-        kw.app.invalidate()
-        return true
-    end,
-})
-if not ipc_handle and ipc_err == "name-taken" then
-    io.stderr:write("keywork-shell: another instance already owns " .. ipc.name .. "\n")
-    os.exit(1)
+local function stop()
+    if ipc_handle then ipc_handle:close() end
+    if notification_server then notification_server:close() end
+    if osd_controller then osd_controller:close() end
+    if idle_controller then idle_controller:stop() end
+    if session_controller then session_controller:stop() end
+    ipc_handle, notification_server, osd_controller = nil, nil, nil
+    idle_controller, session_controller = nil, nil
 end
 
-local notification_server = notifications.serve(function()
-    kw.app.invalidate()
-end)
+local function start()
+    stop()
+    osd_controller = osd.new(function()
+        kw.app.reconcile()
+    end)
+    session_controller = session.start()
+    idle_controller = idle.start({
+        lock = function()
+            session_controller:lock()
+        end,
+    })
+    local ipc_err
+    ipc_handle, ipc_err = ipc.serve({
+        toggle_launcher = function()
+            set_launcher_open(not shell.launcher_open)
+        end,
+        lock = function()
+            session_controller:lock()
+        end,
+        adjust_audio = function(kind, action)
+            return osd_controller:adjust_audio(kind, action)
+        end,
+        adjust_brightness = function(action)
+            return osd_controller:adjust_brightness(action)
+        end,
+        configure_background = function(payload)
+            local ok, err = background.configure(payload)
+            if not ok then return false, err end
+            kw.app.invalidate()
+            return true
+        end,
+    })
+    if not ipc_handle and ipc_err == "name-taken" then
+        io.stderr:write("keywork-shell: another instance already owns " .. ipc.name .. "\n")
+        os.exit(1)
+    end
+    notification_server = notifications.serve(function()
+        kw.app.invalidate()
+    end)
+end
 
 return kw.app({
     app_id = "dev.rockorager.keywork.Shell",
     backend = "vulkan",
-    stop = function()
-        if idle_controller then
-            idle_controller:stop()
-        end
-        session_controller:stop()
-    end,
+    start = start,
+    stop = stop,
     windows = function(ctx)
         local windows = {}
         local has_output = ctx.outputs[1] ~= nil
@@ -153,7 +171,7 @@ return kw.app({
             })
         end
 
-        local level = osd_controller:visible()
+        local level = osd_controller and osd_controller:visible()
         if level and has_output then
             windows[#windows + 1] = kw.window({
                 id = "osd",

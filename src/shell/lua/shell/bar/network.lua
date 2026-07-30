@@ -120,6 +120,8 @@ local function wifi_menu(palette, wifi, on_select)
 end
 
 local WifiMenu = kw.stateful({
+    hot_id = "WifiMenu",
+    hot_version = 1,
     build = function(self)
         return wifi_menu(self.props.colors, self.props.wifi, self.props.on_select)
     end,
@@ -519,7 +521,15 @@ end)
 
 local Network = kw.stateful({
     init = function(self)
+        self.wifi_menu_open = false
+    end,
+
+    hot_id = "Network",
+    hot_version = 1,
+    start = function(self)
         self.wifi_refresh_pending = false --[[@as boolean]]
+        self.wifi_fetching = false
+        self.wifi_scan_inflight = false
         self.wifi_tap = function()
             self:toggle_wifi_menu()
         end

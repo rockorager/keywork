@@ -63,7 +63,13 @@ local function level_bar(theme, value, muted)
 end
 
 local Level = kw.stateful({
+    hot_id = "Level",
+    hot_version = 1,
     init = function(self)
+        self.level = self.props.controller and self.props.controller:visible() or self.level
+    end,
+
+    start = function(self)
         local controller = self.props.controller
         if not controller then
             return
@@ -120,6 +126,8 @@ Controller.__index = Controller
 ---@field running           boolean
 ---@field backlight_name?   string
 ---@field system_bus?       keywork.dbus.Bus
+---@field closed            boolean
+---@field close             fun(self: OsdController)
 ---@field visible           fun(self: OsdController): table?
 ---@field adjust_audio      fun(self: OsdController, kind: string, action: string): boolean
 ---@field adjust_brightness fun(self: OsdController, action: string): boolean
@@ -145,6 +153,20 @@ end
 
 function Controller:visible()
     return self.current
+end
+
+function Controller:close()
+    ---@diagnostic disable-next-line: unnecessary-if
+    if self.closed then return end
+    self.closed = true
+    ---@diagnostic disable-next-line: unnecessary-if
+    if self.hide_timer then self.hide_timer:cancel() end
+    ---@diagnostic disable-next-line: unnecessary-if
+    if self.system_bus then self.system_bus:close() end
+    self.hide_timer, self.system_bus = nil, nil
+    self.jobs = {}
+    self.running = false
+    self.subscribers = {}
 end
 
 function Controller:show(kind, value, muted)
@@ -322,7 +344,7 @@ function Controller:adjust_brightness(action)
                 args = {
                     dbus.string("backlight"),
                     dbus.string(current.name),
-                    dbus.uint32(target),
+                    dbus.uint32(math.floor(target)),
                 },
                 timeout_ms = 1000,
             })
@@ -343,6 +365,7 @@ function M.new(on_change)
         subscribers = {},
         jobs = {},
         running = false,
+        closed = false,
     }, Controller)
     return controller
 end

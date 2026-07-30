@@ -97,13 +97,14 @@ are namespaced as `keyworkctl compositor ...`; their original unnamespaced
 forms remain compatibility aliases.
 
 Reload is explicit rather than file-watch driven. A request compiles the entry
-script before replacing the current generation, so a syntax-invalid edit is
-reported to the caller without tearing down the running generation. On a
-successful reload, the entry script and lifecycle callbacks are replaced and
-generation-owned scopes, effects, tasks, and IPC resources restart.
-Compilation is the preservation boundary: a candidate that compiles but then
-fails while executing can already have stopped the previous generation's
-resources, even though its generation number is not committed.
+script and previously loaded application-local Lua modules before replacing
+the current generation, so a syntax-invalid edit is reported to the caller
+without tearing down the running generation. Application-local modules loaded
+with `require` are evicted and evaluated again on a successful reload. The
+entry script and lifecycle callbacks are then replaced and generation-owned
+scopes, effects, tasks, and IPC resources restart. Compilation is the
+preservation boundary; if candidate execution fails after teardown, Keywork
+restarts the previous generation's lifecycle and reports the reload failure.
 
 Lua applications can opt specific state into Fast Refresh. Retained
 application data must be plain Lua tables containing only nil, booleans,
@@ -128,11 +129,20 @@ or resets through `init`. Stateful widgets retain their state when the source
 file, `hot_id`, and `hot_version` identify the same family:
 
 ```lua
+local kw = require("keywork")
+local service = require("counter.service")
+
 local Counter = kw.stateful({
     hot_id = "Counter",
     hot_version = 1,
     init = function(self)
         self.count = 0
+    end,
+    start = function(self)
+        self.subscription = service:use(self.scope, function(value)
+            self.value = value
+            self:set_state()
+        end)
     end,
     build = function(self)
         return kw.text(tostring(self.count))
@@ -141,9 +151,11 @@ local Counter = kw.stateful({
 ```
 
 Changing `hot_id` or `hot_version` intentionally remounts the widget. Widget
-state can survive a compatible refresh, but its lifecycle scope is recreated
-so effects always run against the new implementation. Arbitrary closures,
-userdata, coroutine stacks, and Lua heaps are not patched or retained.
+`init` creates durable widget state only on mount. `start` runs after `init` and
+again after every compatible reload with a fresh `self.scope`; subscriptions,
+tasks, timers, and other generation-owned effects belong there. Arbitrary
+closures, userdata, coroutine stacks, and Lua heaps are not patched or
+retained.
 
 GDM discovers session definitions only from system data directories and does
 not expand `$HOME` in `Exec`. The `install-gdm-session` step therefore runs the

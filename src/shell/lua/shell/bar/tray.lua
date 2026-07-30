@@ -141,6 +141,7 @@ local function create_tray_host(on_change)
     ---@field read_menu          function
     ---@field menu_event         function
     ---@field close              function
+    ---@field closed             boolean
     ---@type TrayHost
     -- Methods are attached immediately below; EmmyLua 0.24 checks this table before those assignments.
     ---@diagnostic disable-next-line: missing-fields
@@ -150,6 +151,7 @@ local function create_tray_host(on_change)
         item_order = {},
         host_registered = true,
         on_change = on_change,
+        closed = false,
     }
 
     function host:emit(member, id)
@@ -369,6 +371,8 @@ local function create_tray_host(on_change)
     end
 
     function host:close()
+        if self.closed then return end
+        self.closed = true
         for _, id in ipairs({ unpack(self.item_order) }) do
             self:remove_item(id)
         end
@@ -378,7 +382,8 @@ local function create_tray_host(on_change)
     end
 
     local name_ok, name = pcall(function()
-        return bus:request_name(SNI_WATCHER, { replace_existing = true, do_not_queue = true })
+        local owned_name = bus:request_name(SNI_WATCHER, { replace_existing = true, do_not_queue = true })
+        return owned_name
     end)
     if not name_ok or not name then
         log.warn("tray disabled: org.kde.StatusNotifierWatcher is already owned")
@@ -439,10 +444,22 @@ local function create_tray_host(on_change)
 end
 
 local TrayItems = kw.stateful({
+    hot_id = "TrayItems",
+    hot_version = 1,
     init = function(self)
         self.menu_generation = 0
         self.menu_pages = {}
+    end,
+
+    start = function(self)
+        if self.host then self.host:close() end
+        self.menu_generation = self.menu_generation + 1
+        self.menu_item = nil
+        self.menu_pages = {}
+        self.menu_open = false
+        self.menu_loading = false
         self.host = create_tray_host(function()
+            ---@diagnostic disable-next-line: unnecessary-if
             if self.menu_item
                 and (self.host.items[self.menu_item.id] ~= self.menu_item or self.menu_item.status == "Passive") then
                 self.menu_generation = self.menu_generation + 1

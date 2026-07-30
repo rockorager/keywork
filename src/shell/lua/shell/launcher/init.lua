@@ -302,14 +302,24 @@ end
 -- Launcher view hosted inside the shell's launcher window. The window's
 -- existence is app state; props.on_dismiss asks the shell to drop it.
 local Launcher = kw.stateful({
+    hot_id = "Launcher",
+    hot_version = 1,
     init = function(self)
-        self.entries = providers.load()
         self.counts = history.load()
         self.query = ""
         self.selected = 1
-        self.results = rank(self.entries, self.counts, "")
         self.actions_open = false
         self.action_selected = 1
+    end,
+
+    start = function(self)
+        self.entries = providers.load()
+        self.results = rank(self.entries, self.counts, self.query)
+        self.selected = math.max(1, math.min(self.selected, #self.results))
+        if self.actions_open and not self.results[self.selected] then
+            self.actions_open = false
+            self.action_selected = 1
+        end
     end,
 
     build = function(self, context)

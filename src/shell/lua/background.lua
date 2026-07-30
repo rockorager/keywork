@@ -26,9 +26,16 @@ local fit_by_mode = {
 ---@field mode?  BackgroundMode
 ---@field color? integer
 
----@type table<string, BackgroundProfile>
-local profiles = { ["*"] = {} }
-local enabled = false
+local retained = kw.app.hot.state("shell.background", {
+    init = function()
+        return {
+            profiles = { ["*"] = {} },
+            enabled = false,
+        }
+    end,
+})
+---@cast retained { profiles: table<string, BackgroundProfile>, enabled: boolean }
+local profiles = retained.profiles
 
 local function arguments(payload)
     local args = {}
@@ -131,7 +138,8 @@ function M.configure(payload)
     local parsed, err = parse(payload)
     if not parsed then return false, err end
     profiles = parsed
-    enabled = true
+    retained.profiles = parsed
+    retained.enabled = true
     return true
 end
 
@@ -144,6 +152,8 @@ local function setting(output_name, key, fallback)
 end
 
 local Background = kw.stateful({
+    hot_id = "Background",
+    hot_version = 1,
     build = function(self, context)
         local output = self.props.output
         local width = math.max(1, math.floor(context.window_width))
@@ -174,7 +184,7 @@ local Background = kw.stateful({
 })
 
 function M.append_windows(windows, outputs)
-    if not enabled then return end
+    if not retained.enabled then return end
     for _, output in ipairs(outputs) do
         windows[#windows + 1] = kw.window({
             id = "background:" .. output.name,

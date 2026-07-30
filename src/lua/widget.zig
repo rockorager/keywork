@@ -497,6 +497,14 @@ const LuaStatefulWidget = struct {
             c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
             if (c.lua_pcall(self.lua_state, 2, 0, 0) != 0) return failLuaCall(self.lua_state, "stateful init failed");
         }
+        c.lua_getfield(self.lua_state, spec, "start");
+        if (c.lua_isnil(self.lua_state, -1)) {
+            pop(self.lua_state, 1);
+        } else {
+            c.lua_pushvalue(self.lua_state, state_table);
+            c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+            if (c.lua_pcall(self.lua_state, 2, 0, 0) != 0) return failLuaCall(self.lua_state, "stateful start failed");
+        }
         pop(self.lua_state, 1);
 
         state.state_ref = c.luaL_ref(self.lua_state, c.LUA_REGISTRYINDEX);
@@ -517,7 +525,8 @@ const LuaStatefulWidget = struct {
         defer pop(self.lua_state, 1);
         installStateSpec(self.lua_state, state, state_table, spec);
         const reload_generation = self.host.reloadGeneration();
-        if (state.reload_generation != reload_generation) {
+        const generation_changed = state.reload_generation != reload_generation;
+        if (generation_changed) {
             // Script-owned effects are generation-scoped. The reload pass
             // canceled the old scope; clear its cached Lua handle so the new
             // implementation lazily receives a fresh scope.
@@ -525,6 +534,16 @@ const LuaStatefulWidget = struct {
             c.lua_pushnil(self.lua_state);
             c.lua_setfield(self.lua_state, state_table, "scope");
             state.reload_generation = reload_generation;
+        }
+        if (generation_changed) {
+            c.lua_getfield(self.lua_state, spec, "start");
+            if (c.lua_isnil(self.lua_state, -1)) {
+                pop(self.lua_state, 1);
+            } else {
+                c.lua_pushvalue(self.lua_state, state_table);
+                c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.props_ref);
+                if (c.lua_pcall(self.lua_state, 2, 0, 0) != 0) return failLuaCall(self.lua_state, "stateful start failed");
+            }
         }
         c.lua_getfield(self.lua_state, spec, "update");
         if (c.lua_isnil(self.lua_state, -1)) {

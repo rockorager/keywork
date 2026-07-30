@@ -42,6 +42,8 @@ end
 -- One bar per output. props: output and show_tray (SNI hosts register on
 -- D-Bus, so only one bar carries it).
 local Bar = kw.stateful({
+    hot_id = "Bar",
+    hot_version = 1,
     build = function(self, context)
         local theme = context.theme
         local palette = palette_for(theme)

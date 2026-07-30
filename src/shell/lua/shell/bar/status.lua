@@ -88,7 +88,9 @@ local battery_service = service.define("shell.bar.battery", function(self)
 end)
 
 local StatusItems = kw.stateful({
-    init = function(self)
+    hot_id = "StatusItems",
+    hot_version = 1,
+    start = function(self)
         self.battery = battery_service:use(self.scope, function(battery)
             self.battery = battery
             self:set_state()

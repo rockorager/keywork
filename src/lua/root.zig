@@ -90,10 +90,13 @@ pub const App = struct {
     stop_ref: c_int = -1,
     script_dirty: bool = true,
     reload_generation: u64 = 0,
+    lifecycle_generation: u64 = 0,
     reload_observer: ?native_runtime.ReloadObserver = null,
     lifecycle_started: bool = false,
     quit_requested: bool = false,
     hot_states: std.StringHashMapUnmanaged(HotState) = .empty,
+    local_modules: std.StringHashMapUnmanaged(void) = .empty,
+    local_module_loader_installed: bool = false,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
     fs_events: std.ArrayList(*FsEvent) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
@@ -237,6 +240,7 @@ pub const App = struct {
             c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, entry.value_ptr.ref);
         }
         self.hot_states.deinit(self.allocator);
+        self.resetLocalModules();
         c.lua_close(self.state);
         self.icon_cache.deinit();
         self.png_dims.deinit();
@@ -745,8 +749,19 @@ pub const App = struct {
 
     fn reloadScript(self: *App) !void {
         const replacing_generation = self.script_ref >= 0;
+        var recover_previous_generation = false;
+        errdefer if (recover_previous_generation) {
+            self.lifecycle_generation += 1;
+            self.startLifecycle() catch |err| {
+                const message = self.lastLuaError() orelse @errorName(err);
+                std.log.scoped(.keywork_luajit).warn(
+                    "previous generation could not restart after reload failed: {s}",
+                    .{message},
+                );
+            };
+        };
         c.lua_settop(self.state, 0);
-        installKeyworkModule(self.state, self);
+        try installKeyworkModule(self.state, self);
         const source = try self.readScriptFile();
         defer self.allocator.free(source);
         const chunk = scriptChunk(source);
@@ -754,10 +769,14 @@ pub const App = struct {
         const candidate_ref = c.luaL_ref(self.state, c.LUA_REGISTRYINDEX);
         defer c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, candidate_ref);
 
-        // Compilation is the validation boundary: a malformed candidate must
-        // not tear down the resources that keep the current generation live.
+        // Compilation is the validation boundary: malformed entry points and
+        // previously loaded app-local modules must not tear down the resources
+        // that keep the current generation live.
+        try self.validateLocalModules();
         self.stopLifecycleLog();
         self.cancelScriptResources();
+        recover_previous_generation = replacing_generation;
+        self.clearLocalModules();
         c.lua_settop(self.state, 0);
         c.lua_rawgeti(self.state, c.LUA_REGISTRYINDEX, candidate_ref);
         if (self.root_kind == .test_script) {
@@ -768,6 +787,8 @@ pub const App = struct {
             self.script_ref = script_ref;
             self.script_dirty = false;
             self.reload_generation += 1;
+            self.lifecycle_generation += 1;
+            recover_previous_generation = false;
             _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
             return;
         }
@@ -809,7 +830,9 @@ pub const App = struct {
         self.stop_ref = stop_ref;
         self.script_dirty = false;
         self.reload_generation += 1;
+        self.lifecycle_generation += 1;
         committed = true;
+        recover_previous_generation = false;
         _ = c.lua_gc(self.state, c.LUA_GCCOLLECT, 0);
         if (self.event_loop != null and self.invalidator != null) {
             self.startLifecycle() catch |err| {
@@ -895,6 +918,74 @@ pub const App = struct {
         };
     }
 
+    fn rememberLocalModule(self: *App, name: []const u8) !void {
+        if (self.local_modules.contains(name)) return;
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.local_modules.putNoClobber(self.allocator, owned_name, {});
+    }
+
+    fn validateLocalModules(self: *App) !void {
+        var modules = self.local_modules.keyIterator();
+        while (modules.next()) |name| {
+            const path = try self.localModulePath(name.*) orelse continue;
+            defer self.allocator.free(path);
+            if (c.luaL_loadfile(self.state, path.ptr) != 0) {
+                return self.failWithLuaError(error.LocalModuleLoadFailed);
+            }
+            pop(self.state, 1);
+        }
+    }
+
+    fn clearLocalModules(self: *App) void {
+        defer self.resetLocalModules();
+        c.lua_getfield(self.state, c.LUA_GLOBALSINDEX, "package");
+        c.lua_getfield(self.state, -1, "loaded");
+        if (c.lua_type(self.state, -1) == c.LUA_TTABLE) {
+            var modules = self.local_modules.keyIterator();
+            while (modules.next()) |name| {
+                c.lua_pushlstring(self.state, name.ptr, name.len);
+                c.lua_pushnil(self.state);
+                c.lua_settable(self.state, -3);
+            }
+        }
+        pop(self.state, 2);
+    }
+
+    fn resetLocalModules(self: *App) void {
+        var modules = self.local_modules.keyIterator();
+        while (modules.next()) |name| self.allocator.free(name.*);
+        self.local_modules.deinit(self.allocator);
+        self.local_modules = .empty;
+    }
+
+    fn localModulePath(self: *App, name: []const u8) !?[:0]u8 {
+        const relative = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(relative);
+        for (relative) |*byte| if (byte.* == '.') {
+            byte.* = '/';
+        };
+        const directory = std.fs.path.dirname(self.path) orelse ".";
+        const candidates = [_][]const u8{ ".lua", "/init.lua" };
+        for (candidates) |suffix| {
+            const path = try std.fmt.allocPrintSentinel(
+                self.allocator,
+                "{s}/{s}{s}",
+                .{ directory, relative, suffix },
+                0,
+            );
+            switch (linux.errno(linux.access(path.ptr, 0))) {
+                .SUCCESS => return path,
+                .NOENT, .NOTDIR => self.allocator.free(path),
+                else => {
+                    self.allocator.free(path);
+                    return error.LocalModuleAccessFailed;
+                },
+            }
+        }
+        return null;
+    }
+
     /// Expose the standard Lua `arg` table: arg[0] is the script path,
     /// arg[1..] are the arguments forwarded to the application.
     pub fn setScriptArgs(self: *App, args: []const [:0]const u8) void {
@@ -942,7 +1033,7 @@ pub const App = struct {
 
     fn widgetReloadGeneration(ptr: *anyopaque) u64 {
         const self: *App = @ptrCast(@alignCast(ptr));
-        return self.reload_generation;
+        return self.lifecycle_generation;
     }
 
     fn failWithLuaError(self: *App, err: anyerror) anyerror {
@@ -1434,6 +1525,46 @@ fn installScriptModuleRoots(lua_state: *c.lua_State, allocator: std.mem.Allocato
     pop(lua_state, 2);
 }
 
+fn installLocalModuleLoader(lua_state: *c.lua_State, app: *App) !void {
+    if (app.local_module_loader_installed) return;
+    c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return error.NoPackageTable;
+    c.lua_getfield(lua_state, -1, "loaders");
+    defer pop(lua_state, 1);
+    if (c.lua_type(lua_state, -1) != c.LUA_TTABLE) return error.NoPackageLoaders;
+
+    const loaders = c.lua_gettop(lua_state);
+    var index: c_int = @intCast(c.lua_objlen(lua_state, loaders) + 1);
+    while (index > 2) : (index -= 1) {
+        c.lua_rawgeti(lua_state, loaders, index - 1);
+        c.lua_rawseti(lua_state, loaders, index);
+    }
+    c.lua_pushlightuserdata(lua_state, app);
+    c.lua_pushcclosure(lua_state, localModuleLoader, 1);
+    c.lua_rawseti(lua_state, loaders, 2);
+    app.local_module_loader_installed = true;
+}
+
+fn localModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const name = lua_value.checkString(lua_state, 1);
+    const path = app.localModulePath(name) catch
+        return c.luaL_error(lua_state, "failed to resolve app-local module");
+    const local_path = path orelse {
+        c.lua_pushliteral(lua_state, "\n\tno app-local Lua module");
+        return 1;
+    };
+
+    const load_status = c.luaL_loadfile(lua_state, local_path.ptr);
+    app.allocator.free(local_path);
+    if (load_status != 0) return c.lua_error(lua_state);
+    app.rememberLocalModule(name) catch
+        return c.luaL_error(lua_state, "out of memory tracking app-local module");
+    return 1;
+}
+
 const embedded_ui_source = @embedFile("ui.lua");
 const embedded_fluent_source = @embedFile("design/fluent.lua");
 const embedded_audio_source = @embedFile("audio.lua");
@@ -1447,7 +1578,8 @@ const embedded_xdg_applications_source = @embedFile("xdg_applications.lua");
 const embedded_notify_source = @embedFile("notify.lua");
 const embedded_portal_source = @embedFile("portal.lua");
 
-fn installKeyworkModule(lua_state: *c.lua_State, app: *App) void {
+fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
+    try installLocalModuleLoader(lua_state, app);
     c.lua_getfield(lua_state, c.LUA_GLOBALSINDEX, "package");
     const package_table = c.lua_gettop(lua_state);
     c.lua_getfield(lua_state, package_table, "preload");
@@ -2343,6 +2475,99 @@ test "script directory is a module root for require" {
     c.lua_getglobal(app.state, "answer");
     try std.testing.expectEqual(@as(c.lua_Integer, 42), c.lua_tointeger(app.state, -1));
     pop(app.state, 1);
+
+    try std.testing.expect(app.local_modules.contains("sibling"));
+    try std.testing.expect(app.local_modules.contains("nested"));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling.lua", .data = "return { value = 50 }\n" });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    c.lua_getglobal(app.state, "answer");
+    try std.testing.expectEqual(@as(c.lua_Integer, 51), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+}
+
+test "syntax-invalid app-local module keeps current generation resources" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "component.lua", .data = "return { label = 'working' }\n" });
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\local component = require("component")
+        \\loop.timer({ interval = 60 })
+        \\return kw.app({ child = kw.text(component.label) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "module-reload.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    const script_ref = app.script_ref;
+    const timer = app.timers.items[0];
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "component.lua",
+        .data = "local this is not valid Lua\n",
+    });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+    try std.testing.expectEqual(script_ref, app.script_ref);
+    try std.testing.expect(!timer.canceled);
+}
+
+test "reload failure after teardown restarts the previous generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local loop = require("keywork.loop")
+        \\starts, stops = 0, 0
+        \\return kw.app({
+        \\  child = kw.text("working"),
+        \\  start = function()
+        \\    starts = starts + 1
+        \\    loop.timer({ interval = 60 })
+        \\  end,
+        \\  stop = function() stops = stops + 1 end,
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "recover-reload.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+    try app.startLifecycle();
+    const previous_timer = app.timers.items[0];
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "broken.lua",
+        .data = "local this is not valid Lua\n",
+    });
+    const candidate =
+        \\local kw = require("keywork")
+        \\local broken = require("broken")
+        \\return kw.app({ child = kw.text(broken.label) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "recover-reload.lua", .data = candidate });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+
+    try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
+    try std.testing.expectEqual(@as(u64, 2), app.lifecycle_generation);
+    c.lua_getglobal(app.state, "starts");
+    try std.testing.expectEqual(@as(c.lua_Integer, 2), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "stops");
+    try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+    try std.testing.expect(previous_timer.canceled);
+    try std.testing.expectEqual(@as(usize, 2), app.timers.items.len);
+    try std.testing.expect(!app.timers.items[1].canceled);
 }
 
 test "reload cancels resources from the previous script load" {
@@ -3737,6 +3962,70 @@ test "lua stateful widget set_state rebuilds retained subtree" {
 
     try runtime.click(.{ .x = 2, .y = 2 });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"1\"") != null);
+}
+
+test "stateful start reruns with new code and scope while init state survives reload" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first =
+        \\local kw = require("keywork")
+        \\init_count = init_count or 0
+        \\start_count = start_count or 0
+        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\  init = function(self)
+        \\    init_count = init_count + 1
+        \\    self.count = 7
+        \\  end,
+        \\  start = function(self)
+        \\    start_count = start_count + 1
+        \\    first_scope = self.scope
+        \\  end,
+        \\  build = function(self) return kw.text("old:" .. self.count) end,
+        \\})
+        \\return kw.app({ child = Counter({ key = "counter" }) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "stateful-start.lua", first);
+    defer app.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 100, .max_height = 40 }, .no_preference);
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+    try runtime.repaint();
+
+    const second =
+        \\local kw = require("keywork")
+        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\  init = function(self)
+        \\    init_count = init_count + 100
+        \\    self.count = 99
+        \\  end,
+        \\  start = function(self)
+        \\    start_count = start_count + 10
+        \\    second_scope_fresh = self.scope ~= first_scope
+        \\  end,
+        \\  build = function(self) return kw.text("new:" .. self.count) end,
+        \\})
+        \\return kw.app({ child = Counter({ key = "counter" }) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stateful-start.lua", .data = second });
+    try app.requestReload();
+    try runtime.repaint();
+
+    c.lua_getglobal(app.state, "init_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 1), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "start_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 11), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+    try expectLuaBoolean(&app, "second_scope_fresh", true);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"new:7\"") != null);
 }
 
 test "lua stateful widget prefers its build scope invalidator" {
