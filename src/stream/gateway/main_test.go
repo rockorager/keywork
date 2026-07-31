@@ -314,6 +314,62 @@ func TestHubBootstrapsIdleSubscriberFromLatestGOP(t *testing.T) {
 	}
 }
 
+func TestVideoPublisherTracksCachedKeyframeReadiness(t *testing.T) {
+	hub := newHub()
+	writer := &keyframeAcknowledgementWriter{hub: hub}
+	input := &inputBridge{}
+	input.attach(writer)
+	defer input.detach()
+	publisher := &videoPublisher{hub: hub, input: input}
+
+	for _, frame := range []sample{
+		{generation: 4},
+		{key: true, generation: 4, sequence: 1},
+		{key: true, generation: 4, sequence: 2},
+		{discontinuity: true, generation: 4, sequence: 3},
+		{key: true, generation: 4, sequence: 4},
+		{key: true, generation: 5, sequence: 5},
+	} {
+		if err := publisher.publish(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(writer.records) != 4 {
+		t.Fatalf("readiness transitions = %d, want 4", len(writer.records))
+	}
+	for index, expected := range []struct {
+		generation uint32
+		ready      byte
+	}{{4, 1}, {4, 0}, {4, 1}, {5, 1}} {
+		record := writer.records[index]
+		if len(record) != controlSize || record[0] != protocolVersion ||
+			record[1] != controlKeyframeReady ||
+			record[2] != expected.ready ||
+			binary.LittleEndian.Uint32(record[4:8]) != expected.generation {
+			t.Fatalf("readiness transition %d = %v", index, record)
+		}
+	}
+}
+
+type keyframeAcknowledgementWriter struct {
+	hub     *hub
+	records [][]byte
+}
+
+func (writer *keyframeAcknowledgementWriter) Write(record []byte) (int, error) {
+	writer.hub.mu.Lock()
+	cached := len(writer.hub.latestGOP) > 0 && writer.hub.latestGOP[0].key &&
+		writer.hub.latestGOP[0].generation == binary.LittleEndian.Uint32(record[4:8])
+	writer.hub.mu.Unlock()
+	if cached != (record[2] == 1) {
+		return 0, errors.New("keyframe readiness disagrees with GOP cache")
+	}
+	writer.records = append(writer.records, append([]byte(nil), record...))
+	return len(record), nil
+}
+
+func (writer *keyframeAcknowledgementWriter) Close() error { return nil }
+
 func TestQualityPolicyIgnoresDamageDrivenIdle(t *testing.T) {
 	now := time.Now()
 	policy := qualityPolicy{bitrate: 6000, fps: 60, scale: 100, maxBitrate: 6000, maxFPS: 60, last: now.Add(-time.Hour)}
@@ -418,6 +474,7 @@ func TestValidControlRecord(t *testing.T) {
 		{"nan scroll", makeControlRecord(controlPointerScroll, false, math.Float32bits(float32(math.NaN())), 0, 0), false},
 		{"zero key", makeControlRecord(controlKeyboardKey, true, 0, 0, 0), false},
 		{"release with flag", makeControlRecord(controlReleaseAll, true, 0, 0, 0), false},
+		{"private keyframe acknowledgement", encodeKeyframeReadiness(7, true), false},
 	}
 	tests[7].record[0] = 1
 	for _, test := range tests {

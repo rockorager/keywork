@@ -18,6 +18,7 @@ const clipboard_command = 7;
 const relative_pointer_command = 8;
 const quality_command = 9;
 const text_command = 10;
+const keyframe_acknowledgement_command = 11;
 const stream_frame_metadata = 2;
 const stream_resize_applied = 3;
 const maximum_text_bytes = 4000;
@@ -87,6 +88,7 @@ height: u32 = 0,
 stride: u32 = 0,
 constraints_received: bool = false,
 captured_once: bool = false,
+acknowledged_keyframe_generation: u32 = 0,
 video_encoder: VideoEncoder,
 audio_encoder: ?std.process.Child = null,
 audio_pidfd: ?std.posix.fd_t = null,
@@ -299,6 +301,12 @@ fn readControl(self: *Stream) !void {
                 continue;
             };
             try self.writeResizeApplied(request_id);
+        } else if (record[1] == keyframe_acknowledgement_command) {
+            if (applyKeyframeReadiness(
+                self.generation,
+                &self.acknowledged_keyframe_generation,
+                try decodeKeyframeAcknowledgement(&record),
+            )) try self.rearmCapture();
         } else if (record[1] == quality_command) {
             const quality = try decodeQuality(&record);
             if (quality.bitrate != self.options.bitrate_kbps or quality.fps != self.options.frame_rate or
@@ -307,8 +315,7 @@ fn readControl(self: *Stream) !void {
                 self.options.bitrate_kbps = quality.bitrate;
                 self.options.frame_rate = quality.fps;
                 self.options.encoded_scale = quality.scale;
-                self.generation +%= 1;
-                if (self.generation == 0) self.generation = 1;
+                try self.advanceVideoGeneration();
             }
         } else if (record[1] == text_command) {
             const payload_length = try decodeTextLength(&record);
@@ -366,6 +373,46 @@ fn modeRequiresVideoGeneration(
         (captured_width != mode.width or captured_height != mode.height);
 }
 
+fn waitForDamage(captured_once: bool, generation: u32, acknowledged_generation: u32) bool {
+    return captured_once and generation == acknowledged_generation;
+}
+
+const KeyframeReadiness = struct {
+    generation: u32,
+    ready: bool,
+};
+
+fn applyKeyframeReadiness(
+    generation: u32,
+    acknowledged_generation: *u32,
+    readiness: KeyframeReadiness,
+) bool {
+    if (readiness.generation != generation) return false;
+    if (readiness.ready) {
+        acknowledged_generation.* = generation;
+        return false;
+    }
+    const rearm = acknowledged_generation.* == generation;
+    acknowledged_generation.* = 0;
+    return rearm;
+}
+
+fn advanceVideoGeneration(self: *Stream) !void {
+    self.generation +%= 1;
+    if (self.generation == 0) self.generation = 1;
+    self.acknowledged_keyframe_generation = 0;
+    try self.rearmCapture();
+}
+
+fn rearmCapture(self: *Stream) !void {
+    const frame = self.frame orelse return;
+    frame.destroy();
+    self.frame = null;
+    self.constraints_received = false;
+    if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
+    try self.requestFrame();
+}
+
 fn setOutputMode(self: *Stream, mode: OutputMode) !void {
     if (self.output_mode) |current| {
         if (std.meta.eql(current, mode)) return;
@@ -399,6 +446,7 @@ fn setOutputMode(self: *Stream, mode: OutputMode) !void {
     if (new_video_generation) {
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
+        self.acknowledged_keyframe_generation = 0;
     }
     // The resized output has no capture baseline. Bootstrap it immediately;
     // later frames can wait for output damage.
@@ -613,8 +661,7 @@ fn handleVideoEncoderNotification(self: *Stream) !void {
                 return;
             }
             if (restart.increment_generation) {
-                self.generation +%= 1;
-                if (self.generation == 0) self.generation = 1;
+                try self.advanceVideoGeneration();
             }
             self.video_encoder.completeNotification(.{
                 .generation = self.generation,
@@ -772,7 +819,11 @@ fn frameListener(
         },
         .buffer_done => {
             if (!self.constraints_received) return self.fail(error.MissingBufferConstraints);
-            if (self.captured_once) {
+            if (waitForDamage(
+                self.captured_once,
+                self.generation,
+                self.acknowledged_keyframe_generation,
+            )) {
                 self.frame.?.copyWithDamage(self.buffer.?);
             } else {
                 self.frame.?.copy(self.buffer.?);
@@ -818,6 +869,19 @@ fn decodeQuality(record: *const [16]u8) !Quality {
     if (bitrate < 300 or bitrate > 50_000 or fps < 10 or fps > 120 or scale < 50 or scale > 100)
         return error.InvalidQualityRecord;
     return .{ .bitrate = bitrate, .fps = fps, .scale = scale };
+}
+
+fn decodeKeyframeAcknowledgement(
+    record: *const [RemoteInput.record_size]u8,
+) !KeyframeReadiness {
+    if (record[0] != 2 or record[1] != keyframe_acknowledgement_command or
+        record[2] > 1 or record[3] != 0 or !std.mem.allEqual(u8, record[8..16], 0))
+    {
+        return error.InvalidKeyframeAcknowledgement;
+    }
+    const generation = std.mem.readInt(u32, record[4..8], .little);
+    if (generation == 0) return error.InvalidKeyframeAcknowledgement;
+    return .{ .generation = generation, .ready = record[2] == 1 };
 }
 
 fn decodeTextLength(record: *const [16]u8) !usize {
@@ -980,6 +1044,58 @@ test "only captured pixel-size changes require a new video generation" {
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, current));
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, scaled));
     try std.testing.expect(modeRequiresVideoGeneration(true, 1280, 720, resized));
+}
+
+test "capture waits for damage only after current generation keyframe acknowledgement" {
+    var acknowledged_generation: u32 = 0;
+    const generation: u32 = 7;
+
+    try std.testing.expect(!waitForDamage(false, generation, acknowledged_generation));
+    try std.testing.expect(!waitForDamage(true, generation, acknowledged_generation));
+
+    try std.testing.expect(!applyKeyframeReadiness(
+        generation,
+        &acknowledged_generation,
+        .{ .generation = generation - 1, .ready = true },
+    ));
+    try std.testing.expectEqual(@as(u32, 0), acknowledged_generation);
+    try std.testing.expect(!waitForDamage(true, generation, acknowledged_generation));
+
+    try std.testing.expect(!applyKeyframeReadiness(
+        generation,
+        &acknowledged_generation,
+        .{ .generation = generation, .ready = true },
+    ));
+    try std.testing.expect(waitForDamage(true, generation, acknowledged_generation));
+
+    try std.testing.expect(applyKeyframeReadiness(
+        generation,
+        &acknowledged_generation,
+        .{ .generation = generation, .ready = false },
+    ));
+    try std.testing.expect(!waitForDamage(true, generation, acknowledged_generation));
+
+    const next_generation = generation + 1;
+    acknowledged_generation = generation;
+    try std.testing.expect(!waitForDamage(true, next_generation, acknowledged_generation));
+}
+
+test "keyframe acknowledgement records are private fixed-size controls" {
+    var record: [RemoteInput.record_size]u8 = @splat(0);
+    record[0] = 2;
+    record[1] = keyframe_acknowledgement_command;
+    record[2] = 1;
+    std.mem.writeInt(u32, record[4..8], 9, .little);
+    try std.testing.expectEqual(
+        KeyframeReadiness{ .generation = 9, .ready = true },
+        try decodeKeyframeAcknowledgement(&record),
+    );
+
+    record[8] = 1;
+    try std.testing.expectError(
+        error.InvalidKeyframeAcknowledgement,
+        decodeKeyframeAcknowledgement(&record),
+    );
 }
 
 test "clipboard records decode a bounded payload length" {

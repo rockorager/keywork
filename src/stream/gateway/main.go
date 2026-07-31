@@ -60,6 +60,7 @@ const (
 	controlPointerRelative = 8
 	controlQuality         = 9
 	controlText            = 10
+	controlKeyframeReady   = 11
 	streamClipboard        = 1
 	streamFrameMetadata    = 2
 	streamResizeApplied    = 3
@@ -182,7 +183,7 @@ func (h *hub) unsubscribe(subscriber *subscriber) {
 	h.mu.Unlock()
 }
 
-func (h *hub) broadcast(frame sample) {
+func (h *hub) broadcast(frame sample) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if frame.discontinuity || len(h.latestGOP) > 0 && h.latestGOP[0].generation != frame.generation {
@@ -219,6 +220,7 @@ func (h *hub) broadcast(frame sample) {
 			subscriber.waitingForKeyframe = true
 		}
 	}
+	return len(h.latestGOP) > 0 && h.latestGOP[0].generation == frame.generation
 }
 
 func drainFrames(frames chan sample) {
@@ -478,6 +480,34 @@ func (g *gateway) streamAudio(w http.ResponseWriter, r *http.Request) {
 type inputBridge struct {
 	mu     sync.Mutex
 	writer io.WriteCloser
+}
+
+type videoPublisher struct {
+	hub             *hub
+	input           *inputBridge
+	readyGeneration uint32
+}
+
+func (publisher *videoPublisher) publish(frame sample) error {
+	ready := publisher.hub.broadcast(frame)
+	if ready && frame.generation == publisher.readyGeneration {
+		return nil
+	}
+	if ready {
+		if err := publisher.input.write(encodeKeyframeReadiness(frame.generation, true)); err != nil {
+			return err
+		}
+		publisher.readyGeneration = frame.generation
+		return nil
+	}
+	if publisher.readyGeneration == 0 {
+		return nil
+	}
+	if err := publisher.input.write(encodeKeyframeReadiness(publisher.readyGeneration, false)); err != nil {
+		return err
+	}
+	publisher.readyGeneration = 0
+	return nil
 }
 
 type clipboardBridge struct {
@@ -753,6 +783,18 @@ func encodeQuality(p qualityPolicy) []byte {
 	binary.LittleEndian.PutUint32(r[12:16], p.scale)
 	return r
 }
+
+func encodeKeyframeReadiness(generation uint32, ready bool) []byte {
+	record := make([]byte, controlSize)
+	record[0] = protocolVersion
+	record[1] = controlKeyframeReady
+	if ready {
+		record[2] = 1
+	}
+	binary.LittleEndian.PutUint32(record[4:8], generation)
+	return record
+}
+
 func encodeTextInput(action, text string, sequence uint32) ([]byte, error) {
 	if action != "preedit" && action != "commit" || len(text) > maximumTextBytes || !utf8.ValidString(text) || strings.IndexByte(text, 0) >= 0 {
 		return nil, errors.New("invalid text")
@@ -1101,8 +1143,9 @@ func runEncoder(
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	metadata := make(chan frameMetadata, 120)
+	publisher := &videoPublisher{hub: hub, input: input}
 	go func() {
-		parseError <- receiveRTP(runContext, rtp, metadata, hub.broadcast)
+		parseError <- receiveRTP(runContext, rtp, metadata, publisher.publish)
 	}()
 	if audioRTP != nil {
 		go func() {
@@ -1357,7 +1400,7 @@ func receiveAudioRTP(ctx context.Context, connection *net.UDPConn, emit func(aud
 	}
 }
 
-func receiveRTP(ctx context.Context, connection *net.UDPConn, metadata <-chan frameMetadata, emit func(sample)) error {
+func receiveRTP(ctx context.Context, connection *net.UDPConn, metadata <-chan frameMetadata, emit func(sample) error) error {
 	buffer := make([]byte, 64<<10)
 	var assembler rtpH264Assembler
 	var lastTimestamp uint32
@@ -1406,7 +1449,7 @@ func receiveRTP(ctx context.Context, connection *net.UDPConn, metadata <-chan fr
 		}
 		discontinuity := unit.discontinuity || consumeCount > 1 || lastGeneration != 0 && meta.generation != lastGeneration
 		lastGeneration = meta.generation
-		emit(sample{
+		if err := emit(sample{
 			data:          unit.data,
 			key:           unit.key,
 			discontinuity: discontinuity,
@@ -1414,7 +1457,9 @@ func receiveRTP(ctx context.Context, connection *net.UDPConn, metadata <-chan fr
 			timestamp:     meta.captureNanos / 1000,
 			generation:    meta.generation, width: meta.width, height: meta.height,
 			captureNanos: meta.captureNanos, inputSequence: meta.inputSequence,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 }
 
