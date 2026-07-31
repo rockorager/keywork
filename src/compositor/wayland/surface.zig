@@ -1376,6 +1376,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            surface_state.role == .cursor,
         ) catch |err| {
             postBufferError(self, err);
             return;
@@ -1472,6 +1473,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
                 surface_state.pending_scale,
                 surface_state.pending_transform,
                 surface_state.pending_viewport,
+                surface_state.role == .cursor,
             ) catch |err| {
                 postBufferError(self, err);
                 return false;
@@ -1621,6 +1623,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
             cached.scale,
             cached.transform,
             cached.viewport,
+            surface_state.role == .cursor,
         ) catch unreachable;
         current.color_description = cached.color_description;
         current.color_representation = cached.color_representation.toRender(current.bufferFormat());
@@ -1703,6 +1706,7 @@ fn snapshotPendingAttachment(
     reusable: ?*BufferSnapshot,
 ) BufferSnapshot.Error!?BufferSnapshot {
     const surface_state = self.state();
+    const allow_non_divisible_scale = surface_state.role == .cursor;
     const source_cache: render_types.SourceCache = .{
         .id = surface_state.source_cache_id,
         .version = surface_state.next_source_version,
@@ -1714,6 +1718,7 @@ fn snapshotPendingAttachment(
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            allow_non_divisible_scale,
             reusable,
             &surface_state.pending_surface_damage,
             &surface_state.pending_buffer_damage,
@@ -1725,6 +1730,7 @@ fn snapshotPendingAttachment(
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            allow_non_divisible_scale,
             if (self.explicit_sync_handler) |handler|
                 handler.take_pending(handler.context)
             else
@@ -1737,6 +1743,7 @@ fn snapshotPendingAttachment(
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            allow_non_divisible_scale,
             reusable,
             source_cache,
         )
@@ -2336,6 +2343,7 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        allow_non_divisible_scale: bool,
         reusable: ?*BufferSnapshot,
         surface_damage: *const Region,
         buffer_damage: *const Region,
@@ -2350,8 +2358,13 @@ pub const BufferSnapshot = struct {
             .width = @intCast(width),
             .height = @intCast(height),
         };
-        const geometry = surface_geometry.calculate(buffer_size, scale, transform, viewport) catch |err|
-            return err;
+        const geometry = surface_geometry.calculate(
+            buffer_size,
+            scale,
+            transform,
+            viewport,
+            allow_non_divisible_scale,
+        ) catch |err| return err;
         const row_bytes = std.math.mul(usize, buffer_size.width, @sizeOf(u32)) catch
             return error.InvalidBuffer;
         if (stride < row_bytes) return error.InvalidBuffer;
@@ -2417,12 +2430,19 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        allow_non_divisible_scale: bool,
         synchronization: ?DrmSyncobj.Commit,
     ) Error!BufferSnapshot {
         var owned_synchronization = synchronization;
         errdefer if (owned_synchronization) |*sync| sync.deinit();
         const buffer_size = buffer.size();
-        const geometry = try surface_geometry.calculate(buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(
+            buffer_size,
+            scale,
+            transform,
+            viewport,
+            allow_non_divisible_scale,
+        );
         const dmabuf = try DmabufUse.create(buffer, owned_synchronization);
         owned_synchronization = null;
 
@@ -2447,11 +2467,18 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        allow_non_divisible_scale: bool,
         reusable: ?*BufferSnapshot,
         source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const buffer_size: render_types.Size = .{ .width = 1, .height = 1 };
-        const geometry = try surface_geometry.calculate(buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(
+            buffer_size,
+            scale,
+            transform,
+            viewport,
+            allow_non_divisible_scale,
+        );
         const pixels = if (reusable) |snapshot|
             snapshot.takePixels(1) orelse
                 allocator.alloc(u32, 1) catch return error.OutOfMemory
@@ -2478,8 +2505,15 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        allow_non_divisible_scale: bool,
     ) Error!void {
-        const geometry = try surface_geometry.calculate(self.buffer_size, scale, transform, viewport);
+        const geometry = try surface_geometry.calculate(
+            self.buffer_size,
+            scale,
+            transform,
+            viewport,
+            allow_non_divisible_scale,
+        );
         self.logical_size = geometry.logical_size;
         self.scale = scale;
         self.transform = transform;
@@ -2743,6 +2777,7 @@ test "single pixel snapshots use viewporter destination without changing color" 
         1,
         .normal,
         .{ .destination = .{ .width = 320, .height = 180 } },
+        false,
         null,
         .{ .id = 1, .version = 1 },
     );
@@ -2766,6 +2801,7 @@ test "same-size snapshots recycle pixel storage" {
         1,
         .normal,
         .{},
+        false,
         null,
         .{ .id = 1, .version = 1 },
     );
@@ -2778,6 +2814,7 @@ test "same-size snapshots recycle pixel storage" {
         1,
         .normal,
         .{},
+        false,
         &first,
         .{ .id = 1, .version = 2 },
     );
