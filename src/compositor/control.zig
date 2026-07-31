@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const build_options = @import("build-options");
 const command = @import("command.zig");
 const control = @import("keywork-control");
 const varlink = @import("varlink");
@@ -52,6 +53,12 @@ pub const Executor = struct {
     reset_statistics: *const fn (*anyopaque) void,
     set_unfocused_border: *const fn (*anyopaque, control.Border) void,
     set_log_level: *const fn (*anyopaque, control.LogLevel) void,
+    set_headless_output_mode: *const fn (
+        *anyopaque,
+        u32,
+        u32,
+        u32,
+    ) control.HeadlessOutputModeResult,
     reload: *const fn (*anyopaque) ?[]const u8,
     quit: *const fn (*anyopaque) void,
 };
@@ -410,7 +417,7 @@ fn handleMessage(
         if (!call.oneway) try writeMessage(allocator, output, .{ .parameters = .{
             .vendor = "rockorager",
             .product = "Keywork compositor",
-            .version = "0.0.0",
+            .version = build_options.version,
             .url = "https://github.com/rockorager/keywork",
             .interfaces = [_][]const u8{ service_interface_name, interface_name },
         } });
@@ -590,6 +597,43 @@ fn handleMessage(
         executor.set_log_level(executor.context, parameters.value.level);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.set_headless_output_mode_method)) {
+        const Parameters = struct { width: i64, height: i64, scale: i64 };
+        const parameters = parseParameters(Parameters, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
+            return;
+        };
+        defer parameters.deinit();
+        if (!control.validHeadlessOutputMode(
+            parameters.value.width,
+            parameters.value.height,
+            parameters.value.scale,
+        )) {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "mode");
+            return;
+        }
+        const result = executor.set_headless_output_mode(
+            executor.context,
+            @intCast(parameters.value.width),
+            @intCast(parameters.value.height),
+            @intCast(parameters.value.scale),
+        );
+        if (call.oneway) return;
+        switch (result) {
+            .applied => try writeSuccess(allocator, output),
+            .unsupported => try writeEmptyError(
+                allocator,
+                output,
+                control.unsupported_output_backend_error,
+            ),
+            .failed => try writeEmptyError(
+                allocator,
+                output,
+                control.output_configuration_failed_error,
+            ),
+        }
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.reload_configuration_method)) {
         if (!emptyParameters(call.parameters)) {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
@@ -682,6 +726,17 @@ fn writeInvalidWorkspace(
     });
 }
 
+fn writeEmptyError(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    name: []const u8,
+) !void {
+    try writeMessage(allocator, output, .{
+        .@"error" = name,
+        .parameters = Empty{},
+    });
+}
+
 fn writeConfigurationReloadFailed(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -714,6 +769,8 @@ const Recorder = struct {
     statistics_reset_count: usize = 0,
     unfocused_border: ?control.Border = null,
     log_level: ?control.LogLevel = null,
+    headless_output_mode: ?struct { width: u32, height: u32, scale: u32 } = null,
+    headless_output_mode_result: control.HeadlessOutputModeResult = .applied,
     reload_count: usize = 0,
     reload_failure: ?[]const u8 = null,
     quit_count: usize = 0,
@@ -731,6 +788,7 @@ const Recorder = struct {
             .reset_statistics = resetStatistics,
             .set_unfocused_border = setUnfocusedBorder,
             .set_log_level = setLogLevel,
+            .set_headless_output_mode = setHeadlessOutputMode,
             .reload = reload,
             .quit = quit,
         };
@@ -889,6 +947,17 @@ const Recorder = struct {
     fn setLogLevel(context: *anyopaque, level: control.LogLevel) void {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.log_level = level;
+    }
+
+    fn setHeadlessOutputMode(
+        context: *anyopaque,
+        width: u32,
+        height: u32,
+        scale: u32,
+    ) control.HeadlessOutputModeResult {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.headless_output_mode = .{ .width = width, .height = height, .scale = scale };
+        return self.headless_output_mode_result;
     }
 
     fn reload(context: *anyopaque) ?[]const u8 {
@@ -1134,6 +1203,45 @@ test "log level calls forward the typed level" {
     );
     try std.testing.expectEqual(control.LogLevel.debug, recorder.log_level.?);
     try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+}
+
+test "headless output mode calls validate and return typed results" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+    const call =
+        \\{"method":"dev.rockorager.keywork.compositor.SetHeadlessOutputMode","parameters":{"width":1920,"height":1080,"scale":180}}
+    ;
+
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output, &quit_requested);
+    const mode = recorder.headless_output_mode.?;
+    try std.testing.expectEqual(@as(u32, 1920), mode.width);
+    try std.testing.expectEqual(@as(u32, 1080), mode.height);
+    try std.testing.expectEqual(@as(u32, 180), mode.scale);
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+
+    output.clearRetainingCapacity();
+    recorder.headless_output_mode_result = .unsupported;
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output, &quit_requested);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"dev.rockorager.keywork.compositor.UnsupportedOutputBackend\",\"parameters\":{}}\x00",
+        output.items,
+    );
+
+    output.clearRetainingCapacity();
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetHeadlessOutputMode\",\"parameters\":{\"width\":0,\"height\":1080,\"scale\":180}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"org.varlink.service.InvalidParameter\",\"parameters\":{\"parameter\":\"mode\"}}\x00",
+        output.items,
+    );
 }
 
 test "unfocused border calls validate and forward the typed border" {

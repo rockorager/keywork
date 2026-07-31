@@ -80,6 +80,35 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+/// Atomically replaces the render storage and fractional scale for this output.
+/// Existing storage remains valid if allocating the replacement fails.
+pub fn resize(self: *Self, size: render.Size, scale: render.Scale) !bool {
+    if (size.width == 0 or size.height == 0) return error.InvalidDimensions;
+    _ = scale.logicalSize(size) catch return error.InvalidDimensions;
+    const size_changed = !std.meta.eql(self.size, size);
+    const scale_changed = self.scale.numerator != scale.numerator;
+    if (!size_changed and !scale_changed) return false;
+
+    if (size_changed) {
+        if (self.offscreen_renderer) |renderer| {
+            const replacement = try renderer.create_target(renderer.context, size);
+            std.debug.assert(replacement.id != 0 and std.meta.eql(replacement.size, size));
+            renderer.release_target(renderer.context, self.offscreen_target.?.id);
+            self.offscreen_target = replacement;
+        } else {
+            const pixel_count = size.pixelCount() catch return error.Overflow;
+            const replacement = try self.allocator.alloc(u32, pixel_count);
+            @memset(replacement, 0);
+            self.allocator.free(self.pixels);
+            self.pixels = replacement;
+        }
+        self.size = size;
+        log.info("resized output storage to {}x{}", .{ size.width, size.height });
+    }
+    self.scale = scale;
+    return true;
+}
+
 pub fn logicalSize(self: *const Self) render.Size {
     return self.scale.logicalSize(self.size) catch unreachable;
 }
@@ -123,6 +152,25 @@ test "headless output starts transparent" {
     try std.testing.expectEqual(@as(usize, 6), output.pixels.len);
     try std.testing.expectEqual(@as(u32, 0), output.pixel(1, 2));
     try std.testing.expectEqual(@as(i32, 60_000), output.refreshMillihertz());
+}
+
+test "headless output resize replaces storage and applies fractional scale" {
+    var output = try Self.init(std.testing.allocator, .{ .width = 2, .height = 3 });
+    defer output.deinit();
+    output.pixels[0] = 0xff00ff00;
+
+    try std.testing.expect(try output.resize(
+        .{ .width = 6, .height = 4 },
+        .{ .numerator = 180 },
+    ));
+    try std.testing.expectEqual(render.Size{ .width = 6, .height = 4 }, output.size);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, output.logicalSize());
+    try std.testing.expectEqual(@as(usize, 24), output.pixels.len);
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(0, 0));
+    try std.testing.expect(!try output.resize(
+        .{ .width = 6, .height = 4 },
+        .{ .numerator = 180 },
+    ));
 }
 
 test "headless output uses configured refresh timing" {

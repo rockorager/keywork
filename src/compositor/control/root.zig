@@ -8,6 +8,7 @@ pub const Direction = enum { next, previous, left, down, up, right };
 pub const WindowTarget = enum { focused };
 pub const Layout = enum { tiled };
 pub const LogLevel = enum(u8) { @"error", warning, info, debug };
+pub const HeadlessOutputModeResult = enum { applied, unsupported, failed };
 
 pub const Color = struct {
     red: i64,
@@ -216,12 +217,19 @@ pub const get_windows_method = interface_name ++ ".GetWindows";
 pub const get_performance_statistics_method = interface_name ++ ".GetPerformanceStatistics";
 pub const set_unfocused_border_method = interface_name ++ ".SetUnfocusedBorder";
 pub const set_log_level_method = interface_name ++ ".SetLogLevel";
+pub const set_headless_output_mode_method = interface_name ++ ".SetHeadlessOutputMode";
 pub const reload_configuration_method = interface_name ++ ".ReloadConfiguration";
 pub const quit_method = interface_name ++ ".Quit";
+pub const unsupported_output_backend_error = interface_name ++ ".UnsupportedOutputBackend";
+pub const output_configuration_failed_error = interface_name ++ ".OutputConfigurationFailed";
 pub const configuration_reload_failed_error = interface_name ++ ".ConfigurationReloadFailed";
 
 pub const minimum_workspace = 1;
 pub const maximum_workspace = 10;
+pub const maximum_virtual_output_dimension = 16_384;
+pub const maximum_virtual_output_pixels = 32 * 1024 * 1024;
+pub const minimum_virtual_output_scale = 30;
+pub const maximum_virtual_output_scale = 960;
 
 pub fn validWorkspace(workspace: i64) bool {
     return workspace >= minimum_workspace and workspace <= maximum_workspace;
@@ -233,6 +241,13 @@ pub fn validBorder(border: Border) bool {
         validColorChannel(border.color.green) and
         validColorChannel(border.color.blue) and
         validColorChannel(border.color.alpha);
+}
+
+pub fn validHeadlessOutputMode(width: i64, height: i64, scale: i64) bool {
+    return width > 0 and width <= maximum_virtual_output_dimension and
+        height > 0 and height <= maximum_virtual_output_dimension and
+        width * height <= maximum_virtual_output_pixels and
+        scale >= minimum_virtual_output_scale and scale <= maximum_virtual_output_scale;
 }
 
 fn validColorChannel(channel: i64) bool {

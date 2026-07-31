@@ -3,9 +3,12 @@ const compositor = @import("build/compositor.zig");
 const keyworkctl = @import("build/keyworkctl.zig");
 const lua_host = @import("build/lua.zig");
 const luajit = @import("build/luajit.zig");
+const release = @import("build/release.zig");
 const runtime = @import("build/runtime.zig");
 const shell = @import("build/shell.zig");
+const stream = @import("build/stream.zig");
 const ui = @import("build/ui.zig");
+const version = @import("build/version.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -24,6 +27,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const keywork_control = b.addModule("keywork-control", .{
+        .root_source_file = b.path("src/compositor/control/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    keywork_control.addAnonymousImport("control-interface", .{
+        .root_source_file = b.path("src/compositor/protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
+    });
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version.string);
 
     const test_step = b.step("test", "Run all unit tests and formatting checks");
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
@@ -37,6 +50,17 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(lint_step);
 
     const wayland_sources = stageWaylandSources(b);
+    const stream_output = stream.add(
+        b,
+        target,
+        optimize,
+        build_options,
+        varlink,
+        keywork_control,
+        wayland_sources.wayland_xml,
+        wayland_sources.protocols,
+        test_step,
+    );
     const ui_output = ui.add(b, target, optimize, test_step);
     const runtime_output = runtime.add(
         b,
@@ -66,10 +90,20 @@ pub fn build(b: *std.Build) void {
         b,
         target,
         optimize,
+        build_options,
         varlink,
+        keywork_control,
         wayland_sources.wayland_xml,
         wayland_sources.protocols,
         test_step,
+    );
+    release.add(
+        b,
+        target,
+        optimize,
+        version.string,
+        compositor_output.executable,
+        stream_output,
     );
     keyworkctl.add(
         b,

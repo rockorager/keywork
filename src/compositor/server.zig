@@ -289,6 +289,10 @@ const RenderOutput = struct {
     frame_callback_timer: ?*wl.EventSource,
     damage: Region,
     damage_rectangles: std.ArrayList(render.Rect),
+    /// Surfaces whose image commands survived occlusion pruning in the last
+    /// output frame. Unlike wl_output membership, this tracks pixel contribution.
+    sampled_surfaces: std.ArrayList(Surface.Id),
+    sampled_surfaces_valid: bool,
     repaint_needed: bool,
     render_scheduled: bool,
     frame_callback_scheduled: bool,
@@ -1127,6 +1131,8 @@ pub fn createWithVirtualOutput(
     errdefer self.alpha_modifier.deinit();
     try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
+    // Headless outputs have no parent window that can deliver keyboard enter.
+    if (output_kind == .headless) self.seat.ensureParentKeyboardEnter();
     try self.transient_seat.init(
         allocator,
         io,
@@ -1921,6 +1927,8 @@ fn addRenderOutput(
         .frame_callback_timer = null,
         .damage = Region.init(),
         .damage_rectangles = .empty,
+        .sampled_surfaces = .empty,
+        .sampled_surfaces_valid = false,
         .repaint_needed = false,
         .render_scheduled = false,
         .frame_callback_scheduled = false,
@@ -1938,6 +1946,7 @@ fn addRenderOutput(
     };
     errdefer render_output.damage.deinit();
     errdefer render_output.damage_rectangles.deinit(self.allocator);
+    errdefer render_output.sampled_surfaces.deinit(self.allocator);
     try render_output.backend.init(
         self.allocator,
         io,
@@ -2216,6 +2225,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     render_output.backend.deinit();
     render_output.damage.deinit();
     render_output.damage_rectangles.deinit(self.allocator);
+    render_output.sampled_surfaces.deinit(self.allocator);
     self.allocator.destroy(render_output);
     return true;
 }
@@ -2403,6 +2413,52 @@ fn setDrmOutputConfiguration(
         self.layer_shell.refresh();
         self.session_lock.refreshOutputs();
     }
+}
+
+fn setHeadlessOutputMode(
+    self: *Self,
+    size: render.Size,
+    scale: render.Scale,
+) !void {
+    const render_output = self.primaryRenderOutput();
+    const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    const old_logical_size = protocol_output.logicalSize();
+    if (!try render_output.backend.resizeHeadless(size, scale)) return;
+
+    _ = protocol_output.configure(
+        protocol_output.logicalPosition(),
+        render_output.backend.size(),
+        render_output.backend.modeSize(),
+        render_output.backend.refreshMillihertz(),
+        render_output.backend.modePreferred(),
+        render_output.backend.clientScale(),
+        render_output.backend.renderScale(),
+    );
+    const logical_size = protocol_output.logicalSize();
+    const dimensions_changed = !std.meta.eql(old_logical_size, logical_size);
+    self.xdg_output.refresh(protocol_output);
+    protocol_output.sendDone();
+    self.window_manager.outputStateChanged(
+        render_output.protocol_id,
+        false,
+        dimensions_changed,
+    );
+    if (dimensions_changed) {
+        self.layer_shell.refresh();
+        self.session_lock.refreshOutputs();
+    }
+    self.damageFullOutput(render_output);
+    log.info(
+        "configured headless output: mode {d}x{d}, logical {d}x{d}, scale {d}/{d}",
+        .{
+            size.width,
+            size.height,
+            logical_size.width,
+            logical_size.height,
+            scale.numerator,
+            render.Scale.denominator,
+        },
+    );
 }
 
 fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
@@ -2918,6 +2974,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
             .reset_statistics = resetControlPerformanceStatistics,
             .set_unfocused_border = setControlUnfocusedBorder,
             .set_log_level = setControlLogLevel,
+            .set_headless_output_mode = setControlHeadlessOutputMode,
             .reload = reloadControlConfiguration,
             .quit = quitControlSession,
         },
@@ -3115,6 +3172,24 @@ fn setControlUnfocusedBorder(context: *anyopaque, border: ControlProtocol.Border
         .alpha = @intCast(border.color.alpha),
     };
     self.applyWindowBorders(general.*);
+}
+
+fn setControlHeadlessOutputMode(
+    context: *anyopaque,
+    width: u32,
+    height: u32,
+    scale: u32,
+) ControlProtocol.HeadlessOutputModeResult {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.setHeadlessOutputMode(
+        .{ .width = width, .height = height },
+        .{ .numerator = scale },
+    ) catch |err| {
+        if (err == error.UnsupportedOutputBackend) return .unsupported;
+        log.warn("failed to configure headless output: {t}", .{err});
+        return .failed;
+    };
+    return .applied;
 }
 
 fn collectGpuTimings(self: *Self) void {
@@ -3390,13 +3465,14 @@ pub fn setXwaylandDisplayListener(self: *Self, listener: XwaylandDisplayListener
 pub fn startXwayland(
     self: *Self,
     environ_map: *std.process.Environ.Map,
-) void {
+) ?[]const u8 {
     self.xwayland_server.start(environ_map) catch |err| {
         log.warn("Xwayland is unavailable: {t}", .{err});
-        return;
+        return null;
     };
     if (self.xwayland_display_listener) |listener|
         listener.available(listener.context, self.xwayland_server.displayName());
+    return self.xwayland_server.displayName();
 }
 
 pub fn eventLoop(self: *Self) *wl.EventLoop {
@@ -3683,7 +3759,7 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
                 },
             );
         }
-        self.damageGlobalRect(global, root);
+        self.damageGlobalRect(global, root, surface_id);
     }
 }
 
@@ -3730,7 +3806,7 @@ fn sceneNodeDamage(context: *anyopaque, node: Scene.DamageNode) void {
         .layer_surface => |id| if (self.scene.layerSurface(id)) |layer| layer.surface_id else null,
         .popup => |id| if (self.scene.popupFor(id)) |popup| popup.surface_id else null,
     };
-    self.damageGlobalRect(bounds, root);
+    self.damageGlobalRect(bounds, root, null);
 }
 
 /// Conservative global bounds of everything a scene node currently paints:
@@ -4645,14 +4721,22 @@ fn damageGlobalRect(
     self: *Self,
     rectangle: render.Rect,
     source_root: ?Surface.Id,
+    committed_surface: ?Surface.Id,
 ) void {
     // Surface commits carry their root for source-aware capture invalidation.
+    // Their exact surface also restricts damage to outputs where its image
+    // survived occlusion pruning in the previous frame. Scene-node changes
+    // remain unfiltered so mapping, movement, and exposure still repaint.
     // Cursors are painted after backdrop captures and only damage their bounds.
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
         if (!render_output.backend.powered()) continue;
         const output = self.outputs.get(render_output.protocol_id).?;
+        if (committed_surface) |surface_id| {
+            if (render_output.sampled_surfaces_valid and
+                !surfaceWasSampled(render_output, surface_id)) continue;
+        }
         const output_rect = output.logicalRect();
         const intersection = rectangle.intersection(output_rect) orelse continue;
         const physical = damage_geometry.scaleRect(
@@ -4746,6 +4830,32 @@ fn preservePromotedDamage(damage: *Region, destination: render.Rect, output_size
         @intCast(destination.width),
         @intCast(destination.height),
     ) catch damage.setRectangle(0, 0, output_size.width, output_size.height);
+}
+
+fn surfaceWasSampled(output: *const RenderOutput, surface_id: Surface.Id) bool {
+    for (output.sampled_surfaces.items) |candidate| {
+        if (std.meta.eql(candidate, surface_id)) return true;
+    }
+    return false;
+}
+
+fn rememberSampledSurfaces(self: *Self, output: *RenderOutput) void {
+    const surfaces = self.compositor.surfaceStore();
+    output.sampled_surfaces.ensureTotalCapacity(self.allocator, surfaces.len()) catch {
+        // Allocation failure disables this optimization rather than risking
+        // missed damage from an incomplete contribution set.
+        output.sampled_surfaces.clearRetainingCapacity();
+        output.sampled_surfaces_valid = false;
+        return;
+    };
+    output.sampled_surfaces.clearRetainingCapacity();
+    var iterator = surfaces.iterator();
+    while (iterator.next()) |entry| {
+        if (self.renderer.wasSampled(surfaceSampleTag(entry.id))) {
+            output.sampled_surfaces.appendAssumeCapacity(entry.id);
+        }
+    }
+    output.sampled_surfaces_valid = true;
 }
 
 fn outputDamageRectangles(
@@ -8473,6 +8583,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
             render_fence_fd,
         );
     }
+    self.rememberSampledSurfaces(render_output);
     output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
@@ -8753,6 +8864,7 @@ fn presentSessionLockFrame(
         render_fence_fd,
     );
     frame.render_output.lock_frame_pending = true;
+    self.rememberSampledSurfaces(frame.render_output);
     frame.output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);

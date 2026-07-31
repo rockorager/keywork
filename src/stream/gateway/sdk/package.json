@@ -1,0 +1,38 @@
+{
+  "name": "@rockorager/keywork-stream",
+  "version": "0.1.0-dev.0",
+  "description": "Framework-free browser SDK for Keywork compositor streaming",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./keywork-stream.d.ts",
+      "default": "./keywork-stream.js"
+    },
+    "./audio-player.js": "./audio-player.js"
+  },
+  "types": "./keywork-stream.d.ts",
+  "files": [
+    "audio-player.js",
+    "keywork-stream.d.ts",
+    "keywork-stream.js",
+    "README.md"
+  ],
+  "sideEffects": [
+    "./audio-player.js"
+  ],
+  "keywords": [
+    "keywork",
+    "wayland",
+    "streaming",
+    "webcodecs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rockorager/keywork.git",
+    "directory": "src/stream/gateway/sdk"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

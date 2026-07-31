@@ -160,6 +160,13 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn resizeHeadless(self: *Self, output_size: render.Size, scale: render.Scale) !bool {
+    return switch (self.backend) {
+        .headless => |*output| try output.resize(output_size, scale),
+        .drm, .nested => error.UnsupportedOutputBackend,
+    };
+}
+
 pub fn startInput(self: *Self) !void {
     switch (self.backend) {
         .drm, .headless => {},

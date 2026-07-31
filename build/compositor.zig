@@ -2,6 +2,7 @@ const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
 pub const Output = struct {
+    executable: *std.Build.Step.Compile,
     keyworkctl_adapter: *std.Build.Module,
     keyworkctl_tests: *std.Build.Step,
 };
@@ -10,7 +11,9 @@ pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Step.Options,
     varlink: *std.Build.Module,
+    control: *std.Build.Module,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -154,21 +157,13 @@ pub fn add(
         .optimize = optimize,
     });
 
-    const control = b.addModule("keywork-control", .{
-        .root_source_file = b.path("src/compositor/control/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    control.addAnonymousImport("control-interface", .{
-        .root_source_file = b.path("src/compositor/protocol/varlink/dev.rockorager.keywork.compositor.varlink"),
-    });
-
     const compositor = b.createModule(.{
         .root_source_file = b.path("src/compositor/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    compositor.addOptions("build-options", build_options);
     compositor.addImport("keywork-control", control);
     compositor.addImport("varlink", varlink);
     compositor.addImport("wayland", wayland);
@@ -271,6 +266,7 @@ pub fn add(
     );
     benchmark_step.dependOn(&benchmark_run.step);
     return .{
+        .executable = exe,
         .keyworkctl_adapter = keyworkctl_adapter,
         .keyworkctl_tests = &run_keyworkctl_tests.step,
     };

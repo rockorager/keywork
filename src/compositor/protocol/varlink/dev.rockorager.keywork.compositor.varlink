@@ -255,6 +255,9 @@ method SetUnfocusedBorder (border: Border) -> ()
 # Change the maximum log level without restarting the compositor.
 method SetLogLevel (level: LogLevel) -> ()
 
+# Resize the single headless output and set its fractional scale in 120ths.
+method SetHeadlessOutputMode (width: int, height: int, scale: int) -> ()
+
 # Parse and atomically apply the selected configuration.
 method ReloadConfiguration () -> ()
 
@@ -263,6 +266,12 @@ method Quit () -> ()
 
 # The requested workspace number is outside Keywork's supported range.
 error InvalidWorkspace (workspace: int)
+
+# The selected output backend cannot apply a headless output mode.
+error UnsupportedOutputBackend ()
+
+# The compositor could not allocate or publish the requested output mode.
+error OutputConfigurationFailed ()
 
 # The selected configuration could not be read or validated.
 error ConfigurationReloadFailed (message: string)

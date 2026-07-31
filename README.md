@@ -43,8 +43,10 @@ The bundled Keywork icon theme is generated in the Zig cache from the pinned
 Fluent package dependency and installed under `share/icons`; generated SVGs
 are not checked into the repository.
 
-Zig 0.16 and the native development libraries used by both products are
-developer prerequisites. Shell linting and formatting additionally require
+Zig 0.16, Go 1.26, and the native development libraries used by the products
+are developer prerequisites. Node.js and npm are required for browser SDK
+package validation and release packaging. The software streaming backend uses
+FFmpeg at runtime. Shell linting and formatting additionally require
 `emmylua_check` and `luafmt`; this repository does not install or select tools
 or system packages.
 
@@ -58,6 +60,7 @@ Common commands:
 | `zig build lint` | Run shell static analysis |
 | `zig build fmt` | Check Zig, Lua, and Lua type formatting |
 | `zig build format` | Format Zig, Lua, and Lua type sources |
+| `zig build release -Doptimize=ReleaseSafe` | Package a versioned Linux bundle and npm SDK preview under `zig-out/release` |
 | `zig build run-shell` | Build, validate, and run the desktop shell |
 | `zig build -p ~/.local` | Install all artifacts and service assets under `~/.local` |
 | `zig build install-gdm-session -p ~/.local` | Install a system-visible GDM entry targeting the user-local compositor |

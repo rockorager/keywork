@@ -22,6 +22,7 @@ linux_dmabuf: *LinuxDmabuf,
 listener: Listener,
 managers: std.ArrayList(*Manager),
 frames: std.ArrayList(*Frame),
+output_generations: std.ArrayList(OutputGeneration),
 
 pub const Target = struct {
     output: OutputLayout.Id,
@@ -75,11 +76,21 @@ const Destination = union(enum) {
     }
 };
 
+const OutputGeneration = struct {
+    output: OutputLayout.Id,
+    generation: u64 = 0,
+};
+
 const Manager = struct {
     owner: *Self,
     resource: ?*zwlr.ScreencopyManagerV1,
     reference_count: usize = 1,
-    captured: bool = false,
+    baselines: std.ArrayList(Baseline) = .empty,
+
+    const Baseline = struct {
+        output: OutputLayout.Id,
+        generation: ?u64 = null,
+    };
 
     fn create(owner: *Self, client: *wl.Client, version: u32, id: u32) !void {
         const resource = try zwlr.ScreencopyManagerV1.create(client, version, id);
@@ -139,7 +150,35 @@ const Manager = struct {
     fn unreference(self: *Manager) void {
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
-        if (self.reference_count == 0) self.owner.allocator.destroy(self);
+        if (self.reference_count == 0) {
+            self.baselines.deinit(self.owner.allocator);
+            self.owner.allocator.destroy(self);
+        }
+    }
+
+    fn ensureBaseline(self: *Manager, output: OutputLayout.Id) !void {
+        if (self.baseline(output) != null) return;
+        try self.baselines.append(self.owner.allocator, .{ .output = output });
+    }
+
+    fn baseline(self: *Manager, output: OutputLayout.Id) ?*Baseline {
+        for (self.baselines.items) |*candidate| {
+            if (std.meta.eql(candidate.output, output)) return candidate;
+        }
+        return null;
+    }
+
+    fn removeOutput(self: *Manager, output: OutputLayout.Id) void {
+        for (self.baselines.items, 0..) |candidate, index| {
+            if (!std.meta.eql(candidate.output, output)) continue;
+            _ = self.baselines.swapRemove(index);
+            return;
+        }
+    }
+
+    fn invalidateOutput(self: *Manager, output: OutputLayout.Id) void {
+        const current = self.baseline(output) orelse return;
+        current.generation = null;
     }
 };
 
@@ -154,6 +193,7 @@ const Frame = struct {
     finished: bool = false,
     destination: ?Destination = null,
     with_damage: bool = false,
+    capture_generation: ?u64 = null,
     pending: ?PendingCapture = null,
 
     const PendingCapture = struct {
@@ -184,6 +224,10 @@ const Frame = struct {
             owner.listener.context,
             value,
         ) else null;
+        if (target) |value| {
+            try owner.ensureOutputGeneration(value.output);
+            try manager.ensureBaseline(value.output);
+        }
         manager.reference();
         errdefer manager.unreference();
         self.* = .{
@@ -253,18 +297,21 @@ const Frame = struct {
         self.with_damage = with_damage;
         self.used = true;
         const target = self.target orelse return self.fail();
+        const generation = self.owner.outputGeneration(target.output) orelse return self.fail();
+        const baseline = self.manager.baseline(target.output) orelse return self.fail();
         if (!self.owner.listener.schedule(
             self.owner.listener.context,
             target,
-            with_damage and self.manager.captured,
+            shouldWaitForDamage(with_damage, generation, baseline.generation),
         )) self.fail();
     }
 
-    fn capture(self: *Frame) void {
+    fn capture(self: *Frame, generation: u64) void {
         if (self.finished or !self.used or self.pending != null) return;
         const size = self.size orelse return self.fail();
         const target = self.target orelse return self.fail();
         const destination = self.destination orelse return self.fail();
+        self.capture_generation = generation;
         const result: ?CaptureResult = switch (destination) {
             .shm => |shm| capture: {
                 shm.beginAccess();
@@ -410,6 +457,10 @@ const Frame = struct {
         if (self.finished) return;
         const size = self.size orelse return self.fail();
         const destination = self.destination orelse return self.fail();
+        const target = self.target orelse return self.fail();
+        const generation = self.capture_generation orelse return self.fail();
+        const baseline = self.manager.baseline(target.output) orelse return self.fail();
+        baseline.generation = generation;
 
         self.resource.sendFlags(.{
             .y_invert = switch (destination) {
@@ -426,7 +477,6 @@ const Frame = struct {
             timestamp.nanoseconds,
         );
         self.finished = true;
-        self.manager.captured = true;
         self.releaseDestination();
     }
 
@@ -479,9 +529,11 @@ pub fn init(
         .listener = listener,
         .managers = .empty,
         .frames = .empty,
+        .output_generations = .empty,
     };
     errdefer self.managers.deinit(allocator);
     errdefer self.frames.deinit(allocator);
+    errdefer self.output_generations.deinit(allocator);
     self.global = try wl.Global.create(
         display,
         zwlr.ScreencopyManagerV1,
@@ -501,6 +553,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.frames.items.len == 0);
     self.frames.deinit(self.allocator);
     self.managers.deinit(self.allocator);
+    self.output_generations.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -521,14 +574,48 @@ pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
         const target = frame.target orelse continue;
         if (std.meta.eql(target.output, output)) frame.fail();
     }
+    for (self.managers.items) |manager| manager.removeOutput(output);
+    for (self.output_generations.items, 0..) |state, index| {
+        if (!std.meta.eql(state.output, output)) continue;
+        _ = self.output_generations.swapRemove(index);
+        break;
+    }
 }
 
 pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
+    const state = self.outputGenerationState(output) orelse return;
+    if (state.generation == std.math.maxInt(u64)) {
+        state.generation = 1;
+        for (self.frames.items) |frame| frame.manager.invalidateOutput(output);
+        for (self.managers.items) |manager| manager.invalidateOutput(output);
+    } else {
+        state.generation += 1;
+    }
     for (self.frames.items) |frame| {
         const target = frame.target orelse continue;
         if (!std.meta.eql(target.output, output)) continue;
-        frame.capture();
+        frame.capture(state.generation);
     }
+}
+
+fn ensureOutputGeneration(self: *Self, output: OutputLayout.Id) !void {
+    if (self.outputGenerationState(output) != null) return;
+    try self.output_generations.append(self.allocator, .{ .output = output });
+}
+
+fn outputGeneration(self: *Self, output: OutputLayout.Id) ?u64 {
+    return (self.outputGenerationState(output) orelse return null).generation;
+}
+
+fn outputGenerationState(self: *Self, output: OutputLayout.Id) ?*OutputGeneration {
+    for (self.output_generations.items) |*state| {
+        if (std.meta.eql(state.output, output)) return state;
+    }
+    return null;
+}
+
+fn shouldWaitForDamage(with_damage: bool, current: u64, baseline: ?u64) bool {
+    return with_damage and baseline != null and baseline.? == current;
 }
 
 pub fn needsComposedCursorFrame(
@@ -648,4 +735,11 @@ test "screencopy region only forces cursor composition when cursor intersects" {
         .height = 32,
     }));
     try std.testing.expect(captureRegionIntersectsCursor(region, null));
+}
+
+test "damage capture does not wait when output changed while client rearmed" {
+    try std.testing.expect(!shouldWaitForDamage(false, 4, 4));
+    try std.testing.expect(!shouldWaitForDamage(true, 4, null));
+    try std.testing.expect(shouldWaitForDamage(true, 4, 4));
+    try std.testing.expect(!shouldWaitForDamage(true, 5, 4));
 }

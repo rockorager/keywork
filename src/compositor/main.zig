@@ -1,6 +1,7 @@
 //! Application entry point.
 
 const std = @import("std");
+const build_options = @import("build-options");
 const ControlProtocol = @import("keywork-control");
 const OutputBackend = @import("backend/output.zig");
 const Config = @import("config.zig");
@@ -31,12 +32,14 @@ const usage =
     \\  --headless-refresh HZ
     \\  --drm-device PATH         use an explicit DRM device
     \\  --log-level LEVEL         select error, warning, info, or debug logging
+    \\  --version                 show the Keywork version
     \\  --help                    show this help
     \\
 ;
 
 const StartupOptions = struct {
     help: bool = false,
+    version: bool = false,
     config_path: ?[]const u8 = null,
     output: ?OutputBackend.Kind = null,
     renderer: ?Renderer.Kind = null,
@@ -71,6 +74,13 @@ pub fn main(init: std.process.Init) !void {
         var writer = std.Io.File.stdout().writer(init.io, &buffer);
         defer writer.interface.flush() catch {};
         try writer.interface.writeAll(usage);
+        return;
+    }
+    if (options.version) {
+        var buffer: [128]u8 = undefined;
+        var writer = std.Io.File.stdout().writer(init.io, &buffer);
+        defer writer.interface.flush() catch {};
+        try writer.interface.print("keywork-compositor {s}\n", .{build_options.version});
         return;
     }
     Logging.setLevel(options.log_level orelse Logging.defaultLevel());
@@ -170,11 +180,13 @@ pub fn main(init: std.process.Init) !void {
         .available = xwaylandDisplayAvailable,
         .unavailable = xwaylandDisplayUnavailable,
     });
+    const xwayland_display = server.startXwayland(init.environ_map);
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
+    if (xwayland_display) |display_name|
+        try writer.interface.print("DISPLAY={s}\n", .{display_name});
     try writer.interface.flush();
-    server.startXwayland(init.environ_map);
     systemd.ready(socket_name, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
         systemd.shutdown() catch |shutdown_err| {
             log.warn("failed to roll back graphical session startup: {t}", .{shutdown_err});
@@ -194,6 +206,9 @@ fn parseArguments(arguments: anytype) !StartupOptions {
         if (std.mem.eql(u8, argument, "--help")) {
             if (options.help) return error.DuplicateArgument;
             options.help = true;
+        } else if (std.mem.eql(u8, argument, "--version")) {
+            if (options.version) return error.DuplicateArgument;
+            options.version = true;
         } else if (std.mem.eql(u8, argument, "--config")) {
             if (options.config_path != null) return error.DuplicateArgument;
             options.config_path = arguments.next() orelse return error.MissingArgument;
@@ -238,7 +253,7 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             return error.InvalidArgument;
         }
     }
-    if (options.help) return options;
+    if (options.help or options.version) return options;
     const output = options.outputKind();
     if (output != .headless and
         (options.headless_size != null or options.headless_scale != null or
@@ -386,6 +401,9 @@ test "startup options replace environment backend controls" {
 
     var help: TestArguments = .{ .values = &.{ "--help", "--headless-size", "1920x1080" } };
     try std.testing.expect((try parseArguments(&help)).help);
+
+    var version: TestArguments = .{ .values = &.{"--version"} };
+    try std.testing.expect((try parseArguments(&version)).version);
 }
 
 test "startup options reject duplicates and backend-specific misuse" {
