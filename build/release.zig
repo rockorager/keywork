@@ -25,6 +25,7 @@ pub fn add(
     package.addFileArg(b.path("LICENSE"));
     package.addFileArg(b.path("src/stream/README.md"));
     package.addFileArg(b.path("build.zig.zon"));
+    package.addFileArg(b.path("licenses/wayland.txt"));
     const archives = package.addOutputDirectoryArg("release");
 
     const install = b.addInstallDirectory(.{

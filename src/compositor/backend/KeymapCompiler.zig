@@ -60,10 +60,12 @@ pub fn deinit(self: *KeymapCompiler) void {
 
 /// Compiles the default XKB rules and returns one owned reference.
 pub fn defaultKeymap(self: *KeymapCompiler) !*Keymap {
-    const native = xkb.xkb_keymap_new_from_names2(
+    // Keep the runtime contract compatible with Debian 13's libxkbcommon.
+    // We serialize the result explicitly below, so the newer format-selecting
+    // convenience API provides no benefit here.
+    const native = xkb.xkb_keymap_new_from_names(
         self.context,
         null,
-        xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
         xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
     ) orelse return error.XkbKeymapFailed;
     return self.wrap(native);

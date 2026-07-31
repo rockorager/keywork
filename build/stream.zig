@@ -52,12 +52,19 @@ pub fn add(
     capture_module.addImport("keywork-control", control);
     capture_module.addImport("varlink", varlink);
     capture_module.addImport("wayland", wayland);
-    capture_module.linkSystemLibrary("wayland-client", .{});
+    capture_module.linkSystemLibrary("wayland-client", .{
+        .use_pkg_config = .no,
+        .preferred_link_mode = .static,
+        .search_strategy = .no_fallback,
+    });
+    capture_module.linkSystemLibrary("ffi", .{});
+    capture_module.linkSystemLibrary("m", .{});
     capture_module.linkSystemLibrary("xkbcommon", .{});
     const capture = b.addExecutable(.{
         .name = "keywork-streamd",
         .root_module = capture_module,
     });
+    capture.each_lib_rpath = false;
     b.installArtifact(capture);
 
     const capture_tests = b.addTest(.{ .root_module = capture_module });

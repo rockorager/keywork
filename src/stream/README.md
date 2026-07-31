@@ -43,7 +43,8 @@ observe mode to retain its responsive smart-size behavior.
 
 Create the current Linux bundle, npm SDK package, and checksum manifest from
 the repository root. The Linux tarball contains the compositor, native stream
-client, and static gateway together:
+client, and static gateway together. Wayland 1.26 is statically linked into the
+native binaries so they run against Debian 13's older system Wayland:
 
 ```sh
 zig build release -Doptimize=ReleaseSafe

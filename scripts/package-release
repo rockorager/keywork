@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 11 ]]; then
-    echo "usage: package-release VERSION TARGET OPTIMIZE COMPOSITOR STREAMD GATEWAY SDK_DIR LICENSE STREAM_README BUILD_ZON OUTPUT_DIR" >&2
+if [[ $# -ne 12 ]]; then
+    echo "usage: package-release VERSION TARGET OPTIMIZE COMPOSITOR STREAMD GATEWAY SDK_DIR LICENSE STREAM_README BUILD_ZON WAYLAND_LICENSE OUTPUT_DIR" >&2
     exit 2
 fi
 
@@ -16,7 +16,8 @@ sdk_dir=$7
 license=$8
 stream_readme=$9
 build_zon=${10}
-output=${11}
+wayland_license=${11}
+output=${12}
 
 if [[ "$optimize" != ReleaseSafe ]]; then
     echo "release packages require -Doptimize=ReleaseSafe" >&2
@@ -36,10 +37,12 @@ mkdir -p "$output"
 
 bundle_name="keywork-$version-$target"
 mkdir -p "$temporary/$bundle_name/bin"
+mkdir -p "$temporary/$bundle_name/LICENSES"
 install -m0755 "$compositor" "$temporary/$bundle_name/bin/keywork-compositor"
 install -m0755 "$streamd" "$temporary/$bundle_name/bin/keywork-streamd"
 install -m0755 "$gateway" "$temporary/$bundle_name/bin/keywork-stream-gateway"
 install -m0644 "$license" "$temporary/$bundle_name/LICENSE"
+install -m0644 "$wayland_license" "$temporary/$bundle_name/LICENSES/wayland.txt"
 install -m0644 "$stream_readme" "$temporary/$bundle_name/README.md"
 
 archive() {

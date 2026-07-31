@@ -178,6 +178,7 @@ pub fn add(
         .name = "keywork-compositor",
         .root_module = compositor,
     });
+    exe.each_lib_rpath = false;
     const keyworkctl_adapter = b.addModule("keyworkctl-compositor", .{
         .root_source_file = b.path("src/compositor/keyworkctl/root.zig"),
         .target = target,
@@ -340,8 +341,18 @@ fn linkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("libseat", .{});
     module.linkSystemLibrary("libsystemd", .{});
     module.linkSystemLibrary("libudev", .{});
-    module.linkSystemLibrary("wayland-client", .{});
-    module.linkSystemLibrary("wayland-server", .{});
+    module.linkSystemLibrary("wayland-client", .{
+        .use_pkg_config = .no,
+        .preferred_link_mode = .static,
+        .search_strategy = .no_fallback,
+    });
+    module.linkSystemLibrary("wayland-server", .{
+        .use_pkg_config = .no,
+        .preferred_link_mode = .static,
+        .search_strategy = .no_fallback,
+    });
+    module.linkSystemLibrary("ffi", .{});
+    module.linkSystemLibrary("m", .{});
     module.linkSystemLibrary("xkbcommon", .{});
     module.linkSystemLibrary("xcb", .{});
     module.linkSystemLibrary("xcb-composite", .{});

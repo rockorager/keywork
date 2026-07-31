@@ -91,7 +91,10 @@ EOF
     native_changed=true
 fi
 
-if ! pkg-config --atleast-version=1.26.0 wayland-client wayland-server 2>/dev/null; then
+wayland_libdir="$(pkg-config --variable=libdir wayland-server 2>/dev/null || true)"
+if ! pkg-config --atleast-version=1.26.0 wayland-client wayland-server 2>/dev/null \
+    || [[ ! -f "$wayland_libdir/libwayland-client.a" ]] \
+    || [[ ! -f "$wayland_libdir/libwayland-server.a" ]]; then
     echo "Building Wayland 1.26.0"
     temporary="$(mktemp -d)"
     archive="$temporary/wayland.tar.xz"
@@ -102,6 +105,7 @@ if ! pkg-config --atleast-version=1.26.0 wayland-client wayland-server 2>/dev/nu
     tar -xJf "$archive" -C "$temporary"
     meson setup "$temporary/build" "$temporary/wayland-1.26.0" \
         --prefix=/usr/local --libdir=lib --buildtype=release \
+        --default-library=both \
         -Ddocumentation=false -Dtests=false
     ninja -C "$temporary/build"
     sudo ninja -C "$temporary/build" install
