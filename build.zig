@@ -55,8 +55,6 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         build_options,
-        varlink,
-        keywork_control,
         wayland_sources.wayland_xml,
         wayland_sources.protocols,
         test_step,

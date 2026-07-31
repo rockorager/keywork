@@ -24,7 +24,7 @@ configurations: std.ArrayList(*Configuration),
 listener: Listener,
 
 pub const Change = struct {
-    output: *DrmOutput,
+    target: Target,
     was_enabled: bool,
     enabled: bool,
     old_x: i32,
@@ -35,6 +35,28 @@ pub const Change = struct {
     y: i32,
     scale: render.Scale,
     mode_index: usize,
+    custom_mode: ?CustomMode,
+};
+
+pub const Target = union(enum) {
+    drm: *DrmOutput,
+    virtual: *Output,
+};
+
+pub const CustomMode = struct {
+    width: u32,
+    height: u32,
+    refresh_millihertz: i32,
+};
+
+pub const VirtualHeadConfig = struct {
+    output: *Output,
+    mode_size: render.Size,
+    refresh_millihertz: i32,
+    physical_size: render.Size,
+    make: []const u8,
+    model: []const u8,
+    serial: []const u8 = "",
 };
 
 pub const Listener = struct {
@@ -44,7 +66,7 @@ pub const Listener = struct {
 };
 
 const Head = struct {
-    output: ?*DrmOutput,
+    target: ?Target,
     connected: bool,
     name: [:0]u8,
     description: [:0]u8,
@@ -55,9 +77,15 @@ const Head = struct {
     x: i32,
     y: i32,
     scale: render.Scale,
-    modes: []DrmOutput.Mode,
+    modes: []Mode,
     current_mode_index: usize,
     physical_size: struct { width: u32, height: u32 },
+};
+
+const Mode = struct {
+    size: render.Size,
+    refresh_millihertz: i32,
+    preferred: bool,
 };
 
 const ManagerResource = struct {
@@ -95,7 +123,7 @@ const ConfiguredHead = struct {
     resource: ?*zwlr.OutputConfigurationHeadV1,
     mode_set: bool = false,
     mode_index: ?usize = null,
-    custom_mode_set: bool = false,
+    custom_mode: ?CustomMode = null,
     position: ?struct { x: i32, y: i32 } = null,
     transform: ?wl.Output.Transform = null,
     scale: ?wl.Fixed = null,
@@ -123,7 +151,7 @@ pub fn init(
         .listener = listener,
     };
     errdefer self.deinitStorage();
-    for (outputs) |output| _ = try self.addHeadStorage(output);
+    for (outputs) |output| _ = try self.addDrmHeadStorage(output);
     self.global = try wl.Global.create(
         display,
         zwlr.OutputManagerV1,
@@ -161,8 +189,18 @@ fn deinitStorage(self: *Self) void {
 }
 
 pub fn addHead(self: *Self, output: *DrmOutput) !void {
-    std.debug.assert(self.findHead(output) == null);
-    const head = try self.addHeadStorage(output);
+    std.debug.assert(self.findHead(.{ .drm = output }) == null);
+    const head = try self.addDrmHeadStorage(output);
+    try self.advertiseAddedHead(head);
+}
+
+pub fn addVirtualHead(self: *Self, config: VirtualHeadConfig) !void {
+    std.debug.assert(self.findHead(.{ .virtual = config.output }) == null);
+    const head = try self.addVirtualHeadStorage(config);
+    try self.advertiseAddedHead(head);
+}
+
+fn advertiseAddedHead(self: *Self, head: *Head) !void {
     for (self.managers.items) |manager| {
         if (manager.resource == null or manager.stopped) continue;
         self.createHeadResource(manager, head) catch {
@@ -173,41 +211,108 @@ pub fn addHead(self: *Self, output: *DrmOutput) !void {
     self.changed();
 }
 
-fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
-    const name = try self.allocator.dupeSentinel(u8, output.name(), 0);
-    errdefer self.allocator.free(name);
-    const description = try self.allocator.dupeSentinel(u8, output.description(), 0);
-    errdefer self.allocator.free(description);
-    const make = try self.allocator.dupeSentinel(u8, output.make() orelse "Unknown", 0);
-    errdefer self.allocator.free(make);
-    const model = try self.allocator.dupeSentinel(u8, output.model() orelse output.name(), 0);
-    errdefer self.allocator.free(model);
-    const serial = try self.allocator.dupeSentinel(u8, output.serial() orelse "", 0);
-    errdefer self.allocator.free(serial);
-    const modes = try self.allocator.dupe(DrmOutput.Mode, output.availableModes());
+fn addDrmHeadStorage(self: *Self, output: *DrmOutput) !*Head {
+    const drm_modes = output.availableModes();
+    const modes = try self.allocator.alloc(Mode, drm_modes.len);
+    for (drm_modes, modes) |drm_mode, *mode| {
+        mode.* = .{
+            .size = drm_mode.size(),
+            .refresh_millihertz = drm_mode.refreshMillihertz(),
+            .preferred = drm_mode.preferred,
+        };
+    }
+    return self.addHeadStorage(.{
+        .target = .{ .drm = output },
+        .name = output.name(),
+        .description = output.description(),
+        .make = output.make() orelse "Unknown",
+        .model = output.model() orelse output.name(),
+        .serial = output.serial() orelse "",
+        .enabled = output.enabled,
+        .x = output.logical_x,
+        .y = output.logical_y,
+        .scale = output.scale,
+        .modes = modes,
+        .current_mode_index = output.currentModeIndex(),
+        .physical_size = output.physical_size,
+    });
+}
+
+fn addVirtualHeadStorage(self: *Self, config: VirtualHeadConfig) !*Head {
+    const modes = try self.allocator.alloc(Mode, 1);
+    modes[0] = .{
+        .size = config.mode_size,
+        .refresh_millihertz = config.refresh_millihertz,
+        .preferred = true,
+    };
+    const position = config.output.logicalPosition();
+    return self.addHeadStorage(.{
+        .target = .{ .virtual = config.output },
+        .name = config.output.name(),
+        .description = config.output.description(),
+        .make = config.make,
+        .model = config.model,
+        .serial = config.serial,
+        .enabled = true,
+        .x = position.x,
+        .y = position.y,
+        .scale = config.output.preferredScale(),
+        .modes = modes,
+        .current_mode_index = 0,
+        .physical_size = config.physical_size,
+    });
+}
+
+const HeadStorageConfig = struct {
+    target: Target,
+    name: []const u8,
+    description: []const u8,
+    make: []const u8,
+    model: []const u8,
+    serial: []const u8,
+    enabled: bool,
+    x: i32,
+    y: i32,
+    scale: render.Scale,
+    modes: []Mode,
+    current_mode_index: usize,
+    physical_size: render.Size,
+};
+
+fn addHeadStorage(self: *Self, config: HeadStorageConfig) !*Head {
+    const modes = config.modes;
     errdefer self.allocator.free(modes);
     std.debug.assert(modes.len > 0);
-    const current_mode_index = output.currentModeIndex();
-    std.debug.assert(current_mode_index < modes.len);
+    std.debug.assert(config.current_mode_index < modes.len);
+    const name = try self.allocator.dupeSentinel(u8, config.name, 0);
+    errdefer self.allocator.free(name);
+    const description = try self.allocator.dupeSentinel(u8, config.description, 0);
+    errdefer self.allocator.free(description);
+    const make = try self.allocator.dupeSentinel(u8, config.make, 0);
+    errdefer self.allocator.free(make);
+    const model = try self.allocator.dupeSentinel(u8, config.model, 0);
+    errdefer self.allocator.free(model);
+    const serial = try self.allocator.dupeSentinel(u8, config.serial, 0);
+    errdefer self.allocator.free(serial);
     const head = try self.allocator.create(Head);
     errdefer self.allocator.destroy(head);
     head.* = .{
-        .output = output,
+        .target = config.target,
         .connected = true,
         .name = name,
         .description = description,
         .make = make,
         .model = model,
         .serial = serial,
-        .enabled = output.enabled,
-        .x = output.logical_x,
-        .y = output.logical_y,
-        .scale = output.scale,
+        .enabled = config.enabled,
+        .x = config.x,
+        .y = config.y,
+        .scale = config.scale,
         .modes = modes,
-        .current_mode_index = current_mode_index,
+        .current_mode_index = config.current_mode_index,
         .physical_size = .{
-            .width = output.physical_size.width,
-            .height = output.physical_size.height,
+            .width = config.physical_size.width,
+            .height = config.physical_size.height,
         },
     };
     try self.heads.append(self.allocator, head);
@@ -215,8 +320,8 @@ fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
 }
 
 pub fn removeHead(self: *Self, output: *DrmOutput) void {
-    const head = self.findHead(output) orelse return;
-    head.output = null;
+    const head = self.findHead(.{ .drm = output }) orelse return;
+    head.target = null;
     head.connected = false;
     for (self.mode_resources.items) |mode| {
         if (mode.owner.head != head or mode.resource == null or mode.finished) continue;
@@ -233,7 +338,7 @@ pub fn removeHead(self: *Self, output: *DrmOutput) void {
 }
 
 pub fn syncHead(self: *Self, output: *DrmOutput) void {
-    const head = self.findHead(output) orelse return;
+    const head = self.findHead(.{ .drm = output }) orelse return;
     const enabled_changed = head.enabled != output.enabled;
     const position_changed = head.x != output.logical_x or head.y != output.logical_y;
     const scale_changed = head.scale.numerator != output.scale.numerator;
@@ -271,11 +376,56 @@ pub fn syncHead(self: *Self, output: *DrmOutput) void {
     self.changed();
 }
 
-fn findHead(self: *Self, output: *DrmOutput) ?*Head {
+pub fn syncVirtualHead(
+    self: *Self,
+    output: *Output,
+    mode_size: render.Size,
+    refresh_millihertz: i32,
+    scale: render.Scale,
+) void {
+    const head = self.findHead(.{ .virtual = output }) orelse return;
+    std.debug.assert(head.modes.len == 1);
+    const mode = &head.modes[0];
+    const mode_changed = !std.meta.eql(mode.size, mode_size) or
+        mode.refresh_millihertz != refresh_millihertz;
+    const scale_changed = head.scale.numerator != scale.numerator;
+    if (!mode_changed and !scale_changed) return;
+    mode.size = mode_size;
+    mode.refresh_millihertz = refresh_millihertz;
+    head.scale = scale;
+    for (self.head_resources.items) |advertised| {
+        if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
+        const resource = advertised.resource.?;
+        if (mode_changed) {
+            if (self.modeResource(advertised, 0)) |mode_resource| {
+                mode_resource.sendSize(@intCast(mode_size.width), @intCast(mode_size.height));
+                if (refresh_millihertz > 0) mode_resource.sendRefresh(refresh_millihertz);
+                resource.sendCurrentMode(mode_resource);
+            }
+        }
+        if (scale_changed) resource.sendScale(scaleToFixed(scale));
+    }
+    self.changed();
+}
+
+fn findHead(self: *Self, target: Target) ?*Head {
     for (self.heads.items) |head| {
-        if (head.connected and head.output == output) return head;
+        if (head.connected and head.target != null and targetsEqual(head.target.?, target)) return head;
     }
     return null;
+}
+
+fn targetsEqual(a: Target, b: Target) bool {
+    return switch (a) {
+        .drm => |output| switch (b) {
+            .drm => |candidate| output == candidate,
+            .virtual => false,
+        },
+        .virtual => |output| switch (b) {
+            .drm => false,
+            .virtual => |candidate| output == candidate,
+        },
+    };
 }
 
 fn changed(self: *Self) void {
@@ -406,10 +556,8 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
     for (head.modes, modes) |mode, advertised| {
         const resource = advertised.resource.?;
         head_resource.sendMode(resource);
-        const size = mode.size();
-        resource.sendSize(@intCast(size.width), @intCast(size.height));
-        const refresh = mode.refreshMillihertz();
-        if (refresh > 0) resource.sendRefresh(refresh);
+        resource.sendSize(@intCast(mode.size.width), @intCast(mode.size.height));
+        if (mode.refresh_millihertz > 0) resource.sendRefresh(mode.refresh_millihertz);
         if (mode.preferred) resource.sendPreferred();
     }
     head_resource.sendEnabled(@intFromBool(head.enabled));
@@ -666,7 +814,7 @@ fn configuredHeadRequest(
     }
     switch (request) {
         .set_mode => |set| {
-            if (configured.mode_set or configured.custom_mode_set) {
+            if (configured.mode_set or configured.custom_mode != null) {
                 resource.postError(.already_set, "output mode has already been set");
                 return;
             }
@@ -682,14 +830,19 @@ fn configuredHeadRequest(
             configured.mode_index = mode.mode_index;
         },
         .set_custom_mode => |set| {
-            if (configured.mode_set or configured.custom_mode_set) {
+            if (configured.mode_set or configured.custom_mode != null) {
                 resource.postError(.already_set, "output mode has already been set");
                 return;
             }
-            configured.custom_mode_set = true;
             if (set.width <= 0 or set.height <= 0 or set.refresh < 0) {
                 resource.postError(.invalid_custom_mode, "invalid custom output mode");
+                return;
             }
+            configured.custom_mode = .{
+                .width = @intCast(set.width),
+                .height = @intCast(set.height),
+                .refresh_millihertz = set.refresh,
+            };
         },
         .set_position => |set| {
             if (configured.position != null) {
@@ -780,8 +933,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
         }
         if (!configured.enabled) continue;
         enabled_count += 1;
-        if (configured.custom_mode_set or
-            (configured.transform != null and configured.transform.? != .normal) or
+        if ((configured.transform != null and configured.transform.? != .normal) or
             (configured.adaptive_sync != null and configured.adaptive_sync.? != .disabled))
         {
             configuration.resource.sendFailed();
@@ -794,7 +946,11 @@ fn finish(configuration: *Configuration, apply: bool) void {
             configured.head.scale;
         const x = if (configured.position) |position| position.x else configured.head.x;
         const y = if (configured.position) |position| position.y else configured.head.y;
-        if (!modeGeometryValid(configured.head.modes[mode_index], scale, x, y)) {
+        const mode_size = if (configured.custom_mode) |custom|
+            render.Size{ .width = custom.width, .height = custom.height }
+        else
+            configured.head.modes[mode_index].size;
+        if (!modeGeometryValid(mode_size, scale, x, y)) {
             configuration.resource.sendFailed();
             return;
         }
@@ -813,7 +969,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
         const scale = if (configured.scale) |value| scaleFromFixed(value) catch unreachable else head.scale;
         const mode_index = configured.mode_index orelse head.current_mode_index;
         changes.append(manager.allocator, .{
-            .output = head.output.?,
+            .target = head.target.?,
             .was_enabled = head.enabled,
             .enabled = configured.enabled,
             .old_x = head.x,
@@ -824,6 +980,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
             .y = y,
             .scale = scale,
             .mode_index = mode_index,
+            .custom_mode = configured.custom_mode,
         }) catch {
             configuration.resource.postNoMemory();
             return;
@@ -844,7 +1001,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
 
     var state_changed = false;
     for (changes.items) |change| {
-        const head = manager.findHead(change.output) orelse continue;
+        const head = manager.findHead(change.target) orelse continue;
         const enabled_changed = head.enabled != change.enabled;
         const position_changed = head.x != change.x or head.y != change.y;
         const scale_changed = head.scale.numerator != change.scale.numerator;
@@ -905,9 +1062,9 @@ fn scaleToFixed(scale: render.Scale) wl.Fixed {
     return @enumFromInt(@as(i32, @intCast(raw)));
 }
 
-fn modeGeometryValid(mode: DrmOutput.Mode, scale: render.Scale, x: i32, y: i32) bool {
-    const size = scale.logicalSize(mode.size()) catch return false;
-    return Output.logicalGeometryValid(.{ .x = x, .y = y }, size);
+fn modeGeometryValid(mode_size: render.Size, scale: render.Scale, x: i32, y: i32) bool {
+    const logical_size = scale.logicalSize(mode_size) catch return false;
+    return Output.logicalGeometryValid(.{ .x = x, .y = y }, logical_size);
 }
 
 fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
@@ -946,14 +1103,72 @@ test "output geometry validation uses the selected mode and scale" {
     selected.value.vdisplay = 480;
     const scale: render.Scale = .{ .numerator = 120_000 };
 
-    try std.testing.expect(modeGeometryValid(current, scale, 0, 0));
-    try std.testing.expect(!modeGeometryValid(selected, scale, 0, 0));
+    try std.testing.expect(modeGeometryValid(current.size(), scale, 0, 0));
+    try std.testing.expect(!modeGeometryValid(selected.size(), scale, 0, 0));
     try std.testing.expect(!modeGeometryValid(
-        current,
+        current.size(),
         .{},
         std.math.maxInt(i32) - 3839,
         0,
     ));
+}
+
+test "virtual head mode and scale stay synchronized" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var surfaces: @import("surface.zig").Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+    var output: Output = undefined;
+    try output.init(
+        std.testing.allocator,
+        display,
+        .{
+            .size = .{ .width = 1280, .height = 720 },
+            .physical_size = .{ .width = 1280, .height = 720 },
+            .scale = 1,
+            .name = "HEADLESS-1",
+            .description = "Keywork headless output",
+            .model = "headless",
+        },
+        &surfaces,
+    );
+    defer output.deinit();
+
+    var security_context: SecurityContext = undefined;
+    try security_context.init(std.testing.allocator, display);
+    defer security_context.deinit();
+
+    var context: u8 = 0;
+    var manager: Self = undefined;
+    try manager.init(
+        std.testing.allocator,
+        display,
+        &.{},
+        &security_context,
+        .{ .context = &context, .test_configuration = testApply, .apply = testApply },
+    );
+    defer manager.deinit();
+    try manager.addVirtualHead(.{
+        .output = &output,
+        .mode_size = .{ .width = 1280, .height = 720 },
+        .refresh_millihertz = 60_000,
+        .physical_size = .{ .width = 1280, .height = 720 },
+        .make = "keywork",
+        .model = "headless",
+    });
+
+    const initial_serial = manager.serial;
+    manager.syncVirtualHead(
+        &output,
+        .{ .width = 1920, .height = 1080 },
+        30_000,
+        .{ .numerator = 180 },
+    );
+    try std.testing.expect(manager.serial != initial_serial);
+    try std.testing.expectEqual(render.Size{ .width = 1920, .height = 1080 }, manager.heads.items[0].modes[0].size);
+    try std.testing.expectEqual(@as(i32, 30_000), manager.heads.items[0].modes[0].refresh_millihertz);
+    try std.testing.expectEqual(@as(u32, 180), manager.heads.items[0].scale.numerator);
 }
 
 test "disconnected head storage is reclaimed across reconnects" {

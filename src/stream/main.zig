@@ -4,10 +4,9 @@ const Stream = @This();
 
 const std = @import("std");
 const build_options = @import("build-options");
-const control = @import("keywork-control");
-const varlink = @import("varlink");
 const wayland = @import("wayland");
 const Clipboard = @import("Clipboard.zig");
+const OutputManager = @import("OutputManager.zig");
 const RemoteInput = @import("RemoteInput.zig");
 const VideoEncoder = @import("VideoEncoder.zig");
 
@@ -72,12 +71,13 @@ const Options = struct {
 allocator: std.mem.Allocator,
 io: std.Io,
 options: Options,
-control_address: []const u8,
 output_mode: ?OutputMode = null,
 display: ?*wl.Display = null,
 registry: ?*wl.Registry = null,
 shm: ?*wl.Shm = null,
 output: ?*wl.Output = null,
+output_name: ?[]u8 = null,
+output_management: OutputManager,
 manager: ?*zwlr.ScreencopyManagerV1 = null,
 frame: ?*zwlr.ScreencopyFrameV1 = null,
 buffer: ?*wl.Buffer = null,
@@ -126,20 +126,11 @@ pub fn main(init: std.process.Init) !void {
         try writer.interface.print("keywork-streamd {s} (protocol 2)\n", .{build_options.version});
         return;
     }
-    const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
-        return error.MissingRuntimeDirectory;
-    const control_address = try std.fmt.allocPrint(
-        init.gpa,
-        "unix:{s}/{s}",
-        .{ runtime_directory, control.socket_name },
-    );
-    defer init.gpa.free(control_address);
-
     var stream: Stream = .{
         .allocator = init.gpa,
         .io = init.io,
         .options = options,
-        .control_address = control_address,
+        .output_management = .init(init.gpa),
         .video_encoder = try .init(init.gpa, init.io, .{
             .ffmpeg_path = options.ffmpeg_path,
             .rtp_port = options.rtp_port,
@@ -163,6 +154,9 @@ fn connect(self: *Stream) !void {
     if (self.shm == null or self.output == null or self.manager == null) {
         return error.MissingWaylandGlobal;
     }
+    // Object globals bound by the registry listener advertise their initial
+    // state after the registry roundtrip's sync request.
+    if (display.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
     try self.remote_input.start(self.output.?);
     // Without RTP, stdout is the H.264 media stream and cannot also carry
     // framed clipboard events for the gateway.
@@ -193,6 +187,8 @@ fn deinit(self: *Stream) void {
     self.clipboard.deinit();
     self.remote_input.deinit();
     if (self.manager) |manager| manager.destroy();
+    self.output_management.deinit();
+    if (self.output_name) |name| self.allocator.free(name);
     if (self.output) |output| {
         if (output.getVersion() >= wl.Output.release_since_version) {
             output.release();
@@ -296,7 +292,12 @@ fn readControl(self: *Stream) !void {
         @memcpy(&record, self.control_buffer.items[consumed..][0..RemoteInput.record_size]);
         if (record[1] == resize_command) {
             const request_id = std.mem.readInt(u16, record[14..16], .little);
-            try self.setOutputMode(try decodeOutputMode(&record));
+            const mode = try decodeOutputMode(&record);
+            self.setOutputMode(mode) catch |err| {
+                log.warn("output resize rejected: {t}", .{err});
+                consumed += RemoteInput.record_size;
+                continue;
+            };
             try self.writeResizeApplied(request_id);
         } else if (record[1] == quality_command) {
             const quality = try decodeQuality(&record);
@@ -369,6 +370,7 @@ fn setOutputMode(self: *Stream, mode: OutputMode) !void {
     if (self.output_mode) |current| {
         if (std.meta.eql(current, mode)) return;
     }
+    if (!self.output_management.available()) return error.OutputManagementUnavailable;
     const new_video_generation = modeRequiresVideoGeneration(
         self.captured_once,
         self.width,
@@ -382,16 +384,16 @@ fn setOutputMode(self: *Stream, mode: OutputMode) !void {
         if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
     }
 
-    var client = try varlink.Client.connect(self.allocator, self.io, self.control_address);
-    defer client.deinit();
-    var reply = try client.call(control.set_headless_output_mode_method, .{
-        .width = mode.width,
-        .height = mode.height,
-        .scale = mode.scale,
-    });
-    defer reply.deinit();
-    if (reply.value.@"error" != null) return error.OutputConfigurationRejected;
-    if (reply.value.continues) return error.UnexpectedContinuation;
+    self.output_management.apply(
+        self.display.?,
+        self.output_name,
+        mode.width,
+        mode.height,
+        mode.scale,
+    ) catch |err| {
+        try self.requestFrame();
+        return err;
+    };
 
     self.output_mode = mode;
     if (new_video_generation) {
@@ -708,6 +710,7 @@ fn registryListener(_: *wl.Registry, event: wl.Registry.Event, self: *Stream) vo
                         self.fail(err);
                         return;
                     };
+                    self.output.?.setListener(*Stream, outputListener, self);
                 }
             } else if (std.mem.eql(
                 u8,
@@ -725,8 +728,31 @@ fn registryListener(_: *wl.Registry, event: wl.Registry.Event, self: *Stream) vo
                     };
                 }
             }
+            self.output_management.bindGlobal(
+                self.registry.?,
+                global.name,
+                interface,
+                global.version,
+            ) catch |err| {
+                self.fail(err);
+                return;
+            };
         },
         .global_remove => {},
+    }
+}
+
+fn outputListener(_: *wl.Output, event: wl.Output.Event, self: *Stream) void {
+    switch (event) {
+        .name => |name| {
+            const duplicate = self.allocator.dupe(u8, std.mem.span(name.name)) catch |err| {
+                self.fail(err);
+                return;
+            };
+            if (self.output_name) |old| self.allocator.free(old);
+            self.output_name = duplicate;
+        },
+        .geometry, .mode, .done, .scale, .description => {},
     }
 }
 

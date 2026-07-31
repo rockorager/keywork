@@ -77,7 +77,7 @@ browser pointer/keyboard/viewport events
   -> bounded control WebSocket
   -> validated records on keywork-streamd stdin
   -> input through Wayland virtual pointer and virtual keyboard protocols
-  -> headless sizing through the same-UID compositor control socket
+  -> output sizing through wlr-output-management-v1
 
 browser text clipboard <-> controller-only WebSocket messages
   <-> bounded gateway/streamd frames
@@ -128,7 +128,10 @@ target instead of allowing latency to grow beyond 200 ms.
 `keywork-streamd` is an ordinary privileged Wayland client. It imports no
 compositor implementation source. The gateway receives only Annex-B H.264 and
 is the sole internet-facing process. Input follows public Wayland protocols;
-validated output modes use the compositor-owned Varlink contract.
+validated output modes use `wlr-output-management-v1`. Stream capture and input
+remain available at the compositor's existing fixed size when output management
+is not advertised. Output creation remains a session-launcher or
+compositor-specific responsibility.
 
 ## Run in an Amp orb
 

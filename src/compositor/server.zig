@@ -1176,11 +1176,11 @@ pub fn createWithVirtualOutput(
         self.xdg_output.deinit();
         self.xdg_output_initialized = false;
     }
-    if (output_kind == .drm) {
+    if (output_kind != .nested) {
         try self.output_management.init(
             allocator,
             display,
-            self.drm_device.outputs(),
+            if (output_kind == .drm) self.drm_device.outputs() else &.{},
             &self.security_context,
             .{
                 .context = self,
@@ -1193,6 +1193,19 @@ pub fn createWithVirtualOutput(
             self.output_management.deinit();
             self.output_management_initialized = false;
         }
+        if (output_kind == .headless) {
+            const protocol_output = self.outputs.get(render_output.protocol_id).?;
+            try self.output_management.addVirtualHead(.{
+                .output = protocol_output,
+                .mode_size = render_output.backend.modeSize(),
+                .refresh_millihertz = render_output.backend.refreshMillihertz(),
+                .physical_size = render_output.backend.physicalSize(),
+                .make = "keywork",
+                .model = "headless",
+            });
+        }
+    }
+    if (output_kind == .drm) {
         try self.output_power.init(
             allocator,
             display,
@@ -2447,6 +2460,14 @@ fn setHeadlessOutputMode(
         self.layer_shell.refresh();
         self.session_lock.refreshOutputs();
     }
+    if (self.output_management_initialized) {
+        self.output_management.syncVirtualHead(
+            protocol_output,
+            render_output.backend.modeSize(),
+            render_output.backend.refreshMillihertz(),
+            render_output.backend.renderScale(),
+        );
+    }
     self.damageFullOutput(render_output);
     log.info(
         "configured headless output: mode {d}x{d}, logical {d}x{d}, scale {d}/{d}",
@@ -2569,21 +2590,38 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
 
 fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.applyOutputChanges(changes);
+    if (changes.len == 0) return false;
+    return switch (changes[0].target) {
+        .drm => self.applyDrmOutputChanges(changes),
+        .virtual => self.applyVirtualOutputChanges(changes),
+    };
 }
 
 fn testOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.outputChangesAvailable(changes);
+    if (changes.len == 0) return false;
+    return switch (changes[0].target) {
+        .drm => self.drmOutputChangesAvailable(changes),
+        .virtual => self.virtualOutputChangesAvailable(changes),
+    };
 }
 
-fn outputChangesAvailable(self: *Self, changes: []const OutputManagement.Change) bool {
+fn drmOutputChangesAvailable(self: *Self, changes: []const OutputManagement.Change) bool {
     if (self.drm_lease_initialized) for (changes) |change| {
-        if (self.drm_lease.outputLeased(change.output)) return false;
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => return false,
+        };
+        if (self.drm_lease.outputLeased(output)) return false;
     };
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => return false,
+        };
+        if (change.custom_mode != null) return false;
         if (change.enabled and !drmOutputGeometryValid(
-            change.output,
+            output,
             change.mode_index,
             .{ .x = change.x, .y = change.y },
             change.scale,
@@ -2592,45 +2630,104 @@ fn outputChangesAvailable(self: *Self, changes: []const OutputManagement.Change)
     return true;
 }
 
-fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
-    if (!self.outputChangesAvailable(changes)) return false;
+fn applyDrmOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
+    if (!self.drmOutputChangesAvailable(changes)) return false;
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (change.old_mode_index == change.mode_index) continue;
-        self.drm_device.setOutputMode(change.output, change.mode_index) catch {
+        self.drm_device.setOutputMode(output, change.mode_index) catch {
             rollbackOutputConfiguration(self, changes);
             return false;
         };
     }
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (change.was_enabled or !change.enabled) continue;
-        change.output.scale = change.scale;
-        self.enableDrmOutput(change.output, .{ .x = change.x, .y = change.y }) catch {
+        output.scale = change.scale;
+        self.enableDrmOutput(output, .{ .x = change.x, .y = change.y }) catch {
             rollbackOutputConfiguration(self, changes);
             return false;
         };
     }
 
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (change.enabled) self.setDrmOutputConfiguration(
-            change.output,
+            output,
             .{ .x = change.x, .y = change.y },
             change.scale,
         );
     }
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (!change.was_enabled or change.enabled) continue;
-        self.disableDrmOutput(change.output) catch {
+        self.disableDrmOutput(output) catch {
             rollbackOutputConfiguration(self, changes);
             return false;
         };
     }
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (change.enabled) continue;
-        change.output.logical_x = change.x;
-        change.output.logical_y = change.y;
-        change.output.scale = change.scale;
+        output.logical_x = change.x;
+        output.logical_y = change.y;
+        output.scale = change.scale;
     }
     requestRepaint(self);
+    return true;
+}
+
+fn virtualOutputChangesAvailable(self: *Self, changes: []const OutputManagement.Change) bool {
+    if (changes.len != 1) return false;
+    const change = changes[0];
+    const output = switch (change.target) {
+        .virtual => |value| value,
+        .drm => return false,
+    };
+    const render_output = self.primaryRenderOutput();
+    if (self.outputs.get(render_output.protocol_id).? != output or
+        !change.was_enabled or !change.enabled or change.old_mode_index != 0 or
+        change.mode_index != 0 or change.x != change.old_x or change.y != change.old_y)
+    {
+        return false;
+    }
+    const size = if (change.custom_mode) |mode|
+        render.Size{ .width = mode.width, .height = mode.height }
+    else
+        render_output.backend.modeSize();
+    return ControlProtocol.validHeadlessOutputMode(
+        size.width,
+        size.height,
+        change.scale.numerator,
+    );
+}
+
+fn applyVirtualOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
+    if (!self.virtualOutputChangesAvailable(changes)) return false;
+    const change = changes[0];
+    const size = if (change.custom_mode) |mode|
+        render.Size{ .width = mode.width, .height = mode.height }
+    else
+        self.primaryRenderOutput().backend.modeSize();
+    self.setHeadlessOutputMode(size, change.scale) catch |err| {
+        log.warn("failed to apply output-management headless mode: {t}", .{err});
+        return false;
+    };
     return true;
 }
 
@@ -2657,7 +2754,7 @@ fn configuredOutputChange(
         settings.x == output.logical_x and settings.y == output.logical_y and
         settings.scale.numerator == output.scale.numerator) return null;
     return .{
-        .output = output,
+        .target = .{ .drm = output },
         .was_enabled = output.enabled,
         .enabled = settings.enabled,
         .old_x = output.logical_x,
@@ -2668,6 +2765,7 @@ fn configuredOutputChange(
         .y = settings.y,
         .scale = settings.scale,
         .mode_index = settings.mode_index,
+        .custom_mode = null,
     };
 }
 
@@ -2753,9 +2851,12 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
         }
     }
     if (changes.items.len != 0) {
-        if (!self.applyOutputChanges(changes.items)) return error.OutputConfigurationFailed;
+        if (!self.applyDrmOutputChanges(changes.items)) return error.OutputConfigurationFailed;
         if (self.output_management_initialized) {
-            for (changes.items) |change| self.output_management.syncHead(change.output);
+            for (changes.items) |change| self.output_management.syncHead(switch (change.target) {
+                .drm => |output| output,
+                .virtual => unreachable,
+            });
         }
     }
     for (profiles.items) |*prepared| {
@@ -2780,34 +2881,54 @@ fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Ch
     // Restore previously enabled heads first so rolling back a newly enabled
     // head never violates the compositor's one-enabled-output invariant.
     for (changes) |change| {
-        if (!change.was_enabled or change.output.enabled) continue;
-        change.output.scale = change.old_scale;
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
+        if (!change.was_enabled or output.enabled) continue;
+        output.scale = change.old_scale;
         self.enableDrmOutput(
-            change.output,
+            output,
             .{ .x = change.old_x, .y = change.old_y },
         ) catch return self.terminate();
     }
     for (changes) |change| {
-        if (change.output.currentModeIndex() == change.old_mode_index) continue;
-        self.drm_device.setOutputMode(change.output, change.old_mode_index) catch
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
+        if (output.currentModeIndex() == change.old_mode_index) continue;
+        self.drm_device.setOutputMode(output, change.old_mode_index) catch
             return self.terminate();
     }
     for (changes) |change| {
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
         if (change.was_enabled) self.setDrmOutputConfiguration(
-            change.output,
+            output,
             .{ .x = change.old_x, .y = change.old_y },
             change.old_scale,
         );
     }
     for (changes) |change| {
-        if (change.was_enabled or !change.output.enabled) continue;
-        self.disableDrmOutput(change.output) catch return self.terminate();
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
+        if (change.was_enabled or !output.enabled) continue;
+        self.disableDrmOutput(output) catch return self.terminate();
     }
     for (changes) |change| {
-        if (change.output.enabled) continue;
-        change.output.logical_x = change.old_x;
-        change.output.logical_y = change.old_y;
-        change.output.scale = change.old_scale;
+        const output = switch (change.target) {
+            .drm => |value| value,
+            .virtual => unreachable,
+        };
+        if (output.enabled) continue;
+        output.logical_x = change.old_x;
+        output.logical_y = change.old_y;
+        output.scale = change.old_scale;
     }
     requestRepaint(self);
 }

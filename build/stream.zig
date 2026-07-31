@@ -11,8 +11,6 @@ pub fn add(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Step.Options,
-    varlink: *std.Build.Module,
-    control: *std.Build.Module,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -22,6 +20,7 @@ pub fn add(
         .wayland_protocols = wayland_protocols,
     });
     scanner.addSystemProtocol("staging/ext-data-control/ext-data-control-v1.xml");
+    scanner.addCustomProtocol(b.path("protocols/wayland/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wayland/wlr-screencopy-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wayland/virtual-keyboard-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocols/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
@@ -31,6 +30,7 @@ pub fn add(
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 9);
     scanner.generate("ext_data_control_manager_v1", 1);
+    scanner.generate("zwlr_output_manager_v1", 4);
     scanner.generate("zwlr_screencopy_manager_v1", 3);
     scanner.generate("zwlr_virtual_pointer_manager_v1", 2);
     scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
@@ -49,8 +49,6 @@ pub fn add(
         .link_libc = true,
     });
     capture_module.addOptions("build-options", build_options);
-    capture_module.addImport("keywork-control", control);
-    capture_module.addImport("varlink", varlink);
     capture_module.addImport("wayland", wayland);
     capture_module.linkSystemLibrary("wayland-client", .{
         .use_pkg_config = .no,

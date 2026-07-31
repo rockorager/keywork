@@ -164,9 +164,10 @@ The stream component is likewise a deployed Wayland client of the compositor,
 not a consumer of compositor implementation source. Its browser gateway
 depends only on the encoded media and fixed-size control transport contracts
 exposed by `keywork-streamd`; the stream client captures and injects input
-through public Wayland protocols. It consumes the compositor-owned Varlink
-contract only to resize a headless output to a validated browser viewport.
-Internet-facing parsers and connections never run in the compositor process.
+through public Wayland protocols and configures an existing output through
+`wlr-output-management-v1`. Creating that virtual or headless output remains a
+session-launcher and compositor responsibility. Internet-facing parsers and
+connections never run in the compositor process.
 
 There is intentionally no general-purpose `common/` directory. Shared code is
 promoted only when it has a stable responsibility and a clear owner.
@@ -208,7 +209,7 @@ Current source module roots are:
 | `varlink` | `src/varlink/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 | `keyworkctl-compositor` | `src/compositor/keyworkctl/root.zig` | `keywork-control`, `varlink` |
-| `keywork-stream` | `src/stream/main.zig` | `keywork-control`, `varlink`, generated Wayland bindings |
+| `keywork-stream` | `src/stream/main.zig` | generated Wayland bindings |
 
 The `keyworkctl` executable root is `src/keyworkctl/main.zig`. It imports the
 compositor adapter through the named `keyworkctl-compositor` module and the
