@@ -9,6 +9,8 @@ const std = @import("std");
 const keywork = @import("keywork-ui");
 
 const c = @cImport({
+    // Zig cannot translate glibc's optimized variadic open wrappers.
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("fcntl.h");
     @cInclude("linux/dma-buf.h");
     @cInclude("sys/ioctl.h");
