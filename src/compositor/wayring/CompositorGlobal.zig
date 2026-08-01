@@ -97,6 +97,9 @@ pub const Surface = struct {
     resource: wayring.ObjectHandle,
     references: usize = 1,
     resource_alive: bool = true,
+    role_owner: ?*const anyopaque = null,
+    role_context: ?*anyopaque = null,
+    role_destroyed: ?*const fn (*anyopaque) void = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -109,6 +112,25 @@ pub const Surface = struct {
     pending_offset_y: i32 = 0,
     current_offset_x: i32 = 0,
     current_offset_y: i32 = 0,
+
+    pub fn setRole(
+        self: *Surface,
+        owner: *const anyopaque,
+        context: *anyopaque,
+        destroyed: *const fn (*anyopaque) void,
+    ) !void {
+        if (self.role_context != null) return error.RoleAlreadyAssigned;
+        self.role_owner = owner;
+        self.role_context = context;
+        self.role_destroyed = destroyed;
+    }
+
+    pub fn clearRole(self: *Surface, context: *anyopaque) void {
+        std.debug.assert(self.role_context == context);
+        self.role_owner = null;
+        self.role_context = null;
+        self.role_destroyed = null;
+    }
 
     pub fn reference(self: *Surface) !void {
         if (self.references == std.math.maxInt(usize)) return error.ReferenceOverflow;
@@ -414,6 +436,7 @@ fn destroySurface(
 ) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
     surface.resource_alive = false;
+    if (surface.role_destroyed) |destroyed| destroyed(surface.role_context.?);
     surface.unreference();
 }
 

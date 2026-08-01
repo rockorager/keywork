@@ -445,7 +445,7 @@ fn findGlobal(self: *Server, name: u32) ?*Global {
     return &self.globals.items[index];
 }
 
-fn nextSerial(self: *Server) u32 {
+pub fn nextSerial(self: *Server) u32 {
     self.serial +%= 1;
     if (self.serial == 0) self.serial = 1;
     return self.serial;
