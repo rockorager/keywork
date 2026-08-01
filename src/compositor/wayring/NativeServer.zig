@@ -136,10 +136,14 @@ const SurfaceState = struct {
     y: i32 = 0,
     full_damage: bool = false,
     viewport: surface_geometry.ViewportState = .{},
+    opaque_region: Region,
+    input_region: CompositorGlobal.InputRegion,
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
         if (self.dmabuf) |*dmabuf| dmabuf.deinit(self.surface.client, true);
+        self.opaque_region.deinit();
+        self.input_region.deinit();
         self.surface.unreference();
         allocator.destroy(self);
     }
@@ -1468,13 +1472,16 @@ fn hitTest(self: *NativeServer, x: f64, y: f64) !?Hit {
         {
             continue;
         }
+        const local_x = x - @as(f64, @floatFromInt(entry.x));
+        const local_y = y - @as(f64, @floatFromInt(entry.y));
+        if (!state.input_region.accepts(local_x, local_y)) continue;
         const node = self.surface_tree.find(state.surface) orelse continue;
         return .{
             .surface = state.surface,
             .root = SurfaceTree.root(node).surface,
             // Attach offsets move buffer bounds, not the wl_surface coordinate origin.
-            .local_x = x - @as(f64, @floatFromInt(entry.x)),
-            .local_y = y - @as(f64, @floatFromInt(entry.y)),
+            .local_x = local_x,
+            .local_y = local_y,
         };
     }
     return null;
@@ -1634,6 +1641,14 @@ fn applyEntry(
     pending_entry: *PendingEntry,
 ) !void {
     const state = self.findState(commit.surface) orelse unreachable;
+    // Apply allocation-free while leaving the previous state owned by the
+    // commit, whose transaction teardown will release it.
+    std.mem.swap(Region, &state.opaque_region, &commit.opaque_region);
+    std.mem.swap(
+        CompositorGlobal.InputRegion,
+        &state.input_region,
+        &commit.input_region,
+    );
     state.full_damage = state.full_damage or
         state.scale != commit.scale or
         state.transform != commit.transform or
@@ -2082,14 +2097,40 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             state.viewport,
             false,
         ) catch continue;
+        const image_x = paint_entry.x +| state.x;
+        const image_y = paint_entry.y +| state.y;
+        const force_opaque = if (pixel_buffer.dmabuf) |source|
+            source.force_opaque
+        else
+            state.snapshot.?.force_opaque;
+        const region_covers_buffer = state.opaque_region.coversRectangle(
+            state.x,
+            state.y,
+            geometry.logical_size.width,
+            geometry.logical_size.height,
+        );
         try commands.append(self.allocator, .{ .image = .{
-            .x = paint_entry.x +| state.x,
-            .y = paint_entry.y +| state.y,
+            .x = image_x,
+            .y = image_y,
             .size = geometry.logical_size,
             .buffer = pixel_buffer,
             .source = geometry.source,
             .transform = transform,
-            .is_opaque = if (pixel_buffer.dmabuf) |source| source.force_opaque else state.snapshot.?.force_opaque,
+            .is_opaque = force_opaque or region_covers_buffer,
+            .opaque_region = if (force_opaque or region_covers_buffer)
+                .{}
+            else
+                surfaceOpaqueRegion(
+                    &state.opaque_region,
+                    .{
+                        .x = state.x,
+                        .y = state.y,
+                        .width = geometry.logical_size.width,
+                        .height = geometry.logical_size.height,
+                    },
+                    paint_entry.x,
+                    paint_entry.y,
+                ),
         } });
     }
     var damage_storage: [1]render.Rect = undefined;
@@ -2258,9 +2299,35 @@ fn stateFor(self: *NativeServer, surface: *CompositorGlobal.Surface) !*SurfaceSt
     errdefer self.allocator.destroy(state);
     try surface.reference();
     errdefer surface.unreference();
-    state.* = .{ .surface = surface };
+    state.* = .{
+        .surface = surface,
+        .opaque_region = Region.init(),
+        .input_region = CompositorGlobal.InputRegion.init(),
+    };
+    errdefer state.opaque_region.deinit();
+    errdefer state.input_region.deinit();
     try self.surfaces.append(self.allocator, state);
     return state;
+}
+
+fn surfaceOpaqueRegion(
+    region: *const Region,
+    buffer_bounds: render.Rect,
+    surface_x: i32,
+    surface_y: i32,
+) render.OpaqueRegion {
+    var result: render.OpaqueRegion = .{};
+    var rectangles = region.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        const clipped = (render.Rect{
+            .x = rectangle.x,
+            .y = rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        }).intersection(buffer_bounds) orelse continue;
+        if (!result.append(clipped.translated(surface_x, surface_y))) break;
+    }
+    return result;
 }
 
 fn findState(self: *const NativeServer, surface: *const CompositorGlobal.Surface) ?*SurfaceState {
@@ -2454,6 +2521,25 @@ test "native input coordinates respect fractional scale and protocol bounds" {
     try std.testing.expectEqual(@as(i32, 384), fixedFromDouble(1.5));
     try std.testing.expectEqual(std.math.minInt(i32), fixedFromDouble(-1.0e20));
     try std.testing.expectEqual(std.math.maxInt(i32), fixedFromDouble(1.0e20));
+}
+
+test "surface opaque hints clip to offset buffer bounds and translate globally" {
+    var region = Region.init();
+    defer region.deinit();
+    try region.add(-2, 1, 6, 4);
+    try region.add(8, 8, 2, 2);
+
+    const opaque_hint = surfaceOpaqueRegion(
+        &region,
+        .{ .x = 2, .y = 3, .width = 4, .height = 3 },
+        10,
+        20,
+    );
+    try std.testing.expectEqualSlices(
+        render.Rect,
+        &.{.{ .x = 12, .y = 23, .width = 2, .height = 2 }},
+        opaque_hint.slice(),
+    );
 }
 
 test "native compositor owns and drains its io_uring listener" {

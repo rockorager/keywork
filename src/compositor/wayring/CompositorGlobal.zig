@@ -6,6 +6,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
+const Region = @import("../region.zig");
 const render = @import("../render/types.zig");
 const DrmSyncobj = @import("../drm_syncobj.zig");
 const surface_geometry = @import("../surface_geometry.zig");
@@ -72,6 +73,8 @@ pub const Commit = struct {
     offset_x: i32,
     offset_y: i32,
     viewport: surface_geometry.ViewportState,
+    opaque_region: Region,
+    input_region: InputRegion,
     synchronization: ?DrmSyncobj.Commit = null,
 
     pub fn deinit(self: *Commit) void {
@@ -83,6 +86,8 @@ pub const Commit = struct {
         self.allocator.free(self.surface_damage);
         self.allocator.free(self.buffer_damage);
         self.allocator.free(self.frame_callbacks);
+        self.opaque_region.deinit();
+        self.input_region.deinit();
         self.surface.unreference();
         self.* = undefined;
     }
@@ -220,6 +225,8 @@ pub const Surface = struct {
     current_offset_y: i32 = 0,
     pending_viewport: surface_geometry.ViewportState = .{},
     current_viewport: surface_geometry.ViewportState = .{},
+    pending_opaque: Region,
+    pending_input: InputRegion,
 
     pub fn setRole(
         self: *Surface,
@@ -272,17 +279,52 @@ pub const Surface = struct {
         self.pending_callbacks.deinit(self.allocator);
         self.pending_buffer_damage.deinit(self.allocator);
         self.pending_surface_damage.deinit(self.allocator);
+        self.pending_opaque.deinit();
+        self.pending_input.deinit();
         self.allocator.destroy(self);
         client.unreference();
     }
 };
 
-const Region = struct {
-    allocator: std.mem.Allocator,
-    rectangles: std.ArrayList(render.Rect) = .empty,
+pub const InputRegion = struct {
+    infinite: bool,
+    value: Region,
 
-    fn deinit(self: *Region) void {
-        self.rectangles.deinit(self.allocator);
+    pub fn init() InputRegion {
+        return .{ .infinite = true, .value = Region.init() };
+    }
+
+    pub fn deinit(self: *InputRegion) void {
+        self.value.deinit();
+        self.* = undefined;
+    }
+
+    fn set(self: *InputRegion, region: *const Region) Region.Error!void {
+        try self.value.copyFrom(region);
+        self.infinite = false;
+    }
+
+    fn setInfinite(self: *InputRegion) void {
+        self.value.clear();
+        self.infinite = true;
+    }
+
+    pub fn copyFrom(self: *InputRegion, other: *const InputRegion) Region.Error!void {
+        try self.value.copyFrom(&other.value);
+        self.infinite = other.infinite;
+    }
+
+    pub fn accepts(self: *const InputRegion, x: f64, y: f64) bool {
+        return self.infinite or self.value.containsPoint(.{ .x = x, .y = y });
+    }
+};
+
+const RegionResource = struct {
+    allocator: std.mem.Allocator,
+    value: Region,
+
+    fn deinit(self: *RegionResource) void {
+        self.value.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -371,7 +413,11 @@ fn dispatchCompositor(
                 .owner = self,
                 .client = client,
                 .resource = undefined,
+                .pending_opaque = Region.init(),
+                .pending_input = InputRegion.init(),
             };
+            errdefer surface.pending_opaque.deinit();
+            errdefer surface.pending_input.deinit();
             const version = @min(
                 try client.resourceVersion(resource, &generated.wl_compositor),
                 generated.wl_surface.version,
@@ -388,10 +434,14 @@ fn dispatchCompositor(
             ) catch return client.postNoMemory();
         },
         .create_region => |request| {
-            const region = self.allocator.create(Region) catch
+            const region = self.allocator.create(RegionResource) catch
                 return client.postNoMemory();
             errdefer self.allocator.destroy(region);
-            region.* = .{ .allocator = self.allocator };
+            region.* = .{
+                .allocator = self.allocator,
+                .value = Region.init(),
+            };
+            errdefer region.value.deinit();
             const version = @min(
                 try client.resourceVersion(resource, &generated.wl_compositor),
                 generated.wl_region.version,
@@ -468,7 +518,24 @@ fn dispatchSurface(
             ) catch return client.postNoMemory();
             surface.pending_callbacks.appendAssumeCapacity(callback);
         },
-        .set_opaque_region, .set_input_region => {},
+        .set_opaque_region => |request| {
+            if (request.region) |region_id| {
+                const region = try regionFor(client, region_id);
+                surface.pending_opaque.copyFrom(&region.value) catch
+                    return client.postNoMemory();
+            } else {
+                surface.pending_opaque.clear();
+            }
+        },
+        .set_input_region => |request| {
+            if (request.region) |region_id| {
+                const region = try regionFor(client, region_id);
+                surface.pending_input.set(&region.value) catch
+                    return client.postNoMemory();
+            } else {
+                surface.pending_input.setInfinite();
+            }
+        },
         .commit => try queueCommit(surface),
         .set_buffer_transform => |request| {
             if (request.transform < 0 or request.transform > 7) return client.postError(
@@ -573,6 +640,12 @@ fn queueCommit(surface: *Surface) !void {
 
 fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     const owner = surface.owner;
+    var opaque_region = Region.init();
+    errdefer opaque_region.deinit();
+    try opaque_region.copyFrom(&surface.pending_opaque);
+    var input = InputRegion.init();
+    errdefer input.deinit();
+    try input.copyFrom(&surface.pending_input);
     const surface_damage = owner.allocator.dupe(
         render.Rect,
         surface.pending_surface_damage.items,
@@ -617,6 +690,8 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .offset_x = surface.current_offset_x,
         .offset_y = surface.current_offset_y,
         .viewport = surface.current_viewport,
+        .opaque_region = opaque_region,
+        .input_region = input,
         .synchronization = synchronization,
     };
 }
@@ -655,23 +730,34 @@ fn dispatchRegion(
     resource: wayring.ObjectHandle,
     message: *wayring.Message,
 ) !void {
-    const region: *Region = @ptrCast(@alignCast(context));
+    const region: *RegionResource = @ptrCast(@alignCast(context));
     switch (try generated.wl_region_types.decodeRequest(
         &client.connection,
         resource,
         message,
     )) {
         .destroy => {},
-        .add => |request| if (request.width > 0 and request.height > 0) {
-            region.rectangles.append(region.allocator, .{
-                .x = request.x,
-                .y = request.y,
-                .width = @intCast(request.width),
-                .height = @intCast(request.height),
-            }) catch return client.postNoMemory();
-        },
-        .subtract => {},
+        .add => |request| region.value.add(
+            request.x,
+            request.y,
+            request.width,
+            request.height,
+        ) catch return client.postNoMemory(),
+        .subtract => |request| region.value.subtract(
+            request.x,
+            request.y,
+            request.width,
+            request.height,
+        ) catch return client.postNoMemory(),
     }
+}
+
+fn regionFor(client: *const Server.Client, id: u32) !*RegionResource {
+    const object = client.connection.object(id) orelse return error.UnknownRegion;
+    return @ptrCast(@alignCast(try client.resourceContext(
+        .{ .id = id, .generation = object.generation },
+        &generated.wl_region,
+    )));
 }
 
 fn destroyRegion(
@@ -679,7 +765,7 @@ fn destroyRegion(
     _: *Server.Client,
     _: wayring.ObjectHandle,
 ) void {
-    const region: *Region = @ptrCast(@alignCast(context));
+    const region: *RegionResource = @ptrCast(@alignCast(context));
     region.deinit();
 }
 
@@ -776,6 +862,17 @@ test "native surfaces queue atomic damage-aware SHM commits" {
         &peer,
         compositor_resource,
     );
+    const region = try generated.wl_compositor_types.requests.create_region(
+        &peer,
+        compositor_resource,
+    );
+    try generated.wl_region_types.requests.add(&peer, region, 0, 0, 4, 4);
+    try generated.wl_region_types.requests.subtract(&peer, region, 1, 1, 2, 2);
+    try generated.wl_surface_types.requests.set_opaque_region(&peer, surface, region);
+    try generated.wl_surface_types.requests.set_input_region(&peer, surface, region);
+    // Surface setters snapshot region state immediately; later mutations do
+    // not alter already-pending state.
+    try generated.wl_region_types.requests.add(&peer, region, 1, 1, 2, 2);
     try generated.wl_surface_types.requests.attach(&peer, surface, buffer, 0, 0);
     try generated.wl_surface_types.requests.damage_buffer(&peer, surface, 1, 2, 2, 1);
     const callback = try generated.wl_surface_types.requests.frame(&peer, surface);
@@ -792,6 +889,10 @@ test "native surfaces queue atomic damage-aware SHM commits" {
         commit.buffer_damage,
     );
     try std.testing.expectEqual(callback.id, commit.frame_callbacks[0].id);
+    try std.testing.expect(commit.opaque_region.contains(0, 0));
+    try std.testing.expect(!commit.opaque_region.contains(1, 1));
+    try std.testing.expect(commit.input_region.accepts(0.5, 0.5));
+    try std.testing.expect(!commit.input_region.accepts(1.5, 1.5));
     try commit.releaseBuffer();
     var callbacks = (try commit.takeFrameCallbacks()).?;
     defer callbacks.deinit();
@@ -814,6 +915,17 @@ test "native surfaces queue atomic damage-aware SHM commits" {
     }
     try std.testing.expect(got_release);
     try std.testing.expect(got_frame);
+
+    try generated.wl_surface_types.requests.set_opaque_region(&peer, surface, null);
+    try generated.wl_surface_types.requests.set_input_region(&peer, surface, null);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToServer(&peer, client);
+    var reset_transaction = compositor.popTransaction() orelse
+        return error.MissingCommit;
+    defer reset_transaction.deinit();
+    const reset = &reset_transaction.entries[0];
+    try std.testing.expect(reset.opaque_region.isEmpty());
+    try std.testing.expect(reset.input_region.accepts(-100, -100));
 }
 
 fn transferToServer(connection: *wayring.Connection, client: *Server.Client) !void {
