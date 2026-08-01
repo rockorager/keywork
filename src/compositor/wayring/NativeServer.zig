@@ -13,6 +13,7 @@ const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
 const ShmGlobal = @import("ShmGlobal.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
+const OutputGlobal = @import("OutputGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
@@ -29,6 +30,7 @@ event_loop: EventLoop,
 server: Server,
 shm_global: ShmGlobal,
 compositor_global: CompositorGlobal,
+output_global: OutputGlobal,
 xdg_shell: XdgShell,
 transport: IoUringServer,
 renderer: Renderer,
@@ -113,6 +115,16 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         null,
     );
     errdefer self.output.deinit();
+    try self.output_global.init(allocator, &self.server, .{
+        .mode_size = self.output.size,
+        .physical_size = self.output.size,
+        .refresh_millihertz = self.output.refreshMillihertz(),
+        .scale = self.output.scale.ceil() catch return error.InvalidScale,
+        .name = "HEADLESS-1",
+        .description = "Keywork headless output",
+        .model = "headless",
+    });
+    errdefer self.output_global.deinit();
 
     const selection = try selectSocket(allocator, options);
     errdefer {
@@ -252,8 +264,12 @@ pub fn destroy(self: *NativeServer) void {
         commit.releaseBuffer() catch {};
         commit.deinit();
     }
-    for (self.surfaces.items) |state| state.deinit(self.allocator);
+    for (self.surfaces.items) |state| {
+        self.output_global.setSurfaceVisible(state.surface, false) catch {};
+        state.deinit(self.allocator);
+    }
     self.surfaces.deinit(self.allocator);
+    self.output_global.deinit();
     self.xdg_shell.deinit();
     self.compositor_global.deinit();
     self.shm_global.deinit();
@@ -335,6 +351,7 @@ fn applyCommits(self: *NativeServer) !void {
             .removed => {
                 if (state.snapshot) |*snapshot| snapshot.deinit();
                 state.snapshot = null;
+                try self.output_global.setSurfaceVisible(state.surface, false);
                 const present_result = self.present(&commit);
                 commit.deinit();
                 try present_result;
@@ -361,10 +378,12 @@ fn finishCopy(self: *NativeServer, present_frame: bool) !void {
     if (active.copy.takeSnapshot()) |snapshot| {
         if (active.state.snapshot) |*old| old.deinit();
         active.state.snapshot = snapshot;
+        try self.output_global.setSurfaceVisible(active.state.surface, true);
     } else |_| {
         // Invalid mappings and short reads affect only this attachment.
         if (active.state.snapshot) |*old| old.deinit();
         active.state.snapshot = null;
+        try self.output_global.setSurfaceVisible(active.state.surface, false);
     }
     active.copy.deinit();
     active.commit.releaseBuffer() catch {};
@@ -540,6 +559,7 @@ fn pruneSurfaces(self: *NativeServer) bool {
             index += 1;
             continue;
         }
+        self.output_global.setSurfaceVisible(state.surface, false) catch {};
         state.deinit(self.allocator);
         _ = self.surfaces.swapRemove(index);
         removed = true;
