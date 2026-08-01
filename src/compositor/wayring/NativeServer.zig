@@ -12,6 +12,7 @@ const keywork_loop = @import("keywork-loop");
 const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
 const ShmGlobal = @import("ShmGlobal.zig");
+const SinglePixelBufferGlobal = @import("SinglePixelBufferGlobal.zig");
 const LinuxDmabufGlobal = @import("LinuxDmabufGlobal.zig");
 const LinuxDrmSyncobjGlobal = @import("LinuxDrmSyncobjGlobal.zig");
 const BufferResource = @import("BufferResource.zig");
@@ -52,6 +53,7 @@ event_loop: EventLoop,
 repaint_timer: *EventLoop.Timer,
 server: Server,
 shm_global: ShmGlobal,
+single_pixel_buffer_global: SinglePixelBufferGlobal,
 linux_dmabuf_global: LinuxDmabufGlobal,
 linux_drm_syncobj_global: LinuxDrmSyncobjGlobal,
 compositor_global: CompositorGlobal,
@@ -370,6 +372,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.server.deinit();
     try self.shm_global.init(allocator, &self.server);
     errdefer self.shm_global.deinit();
+    try self.single_pixel_buffer_global.init(allocator, &self.server);
+    errdefer self.single_pixel_buffer_global.deinit();
     try self.compositor_global.init(allocator, &self.server);
     errdefer self.compositor_global.deinit();
     self.surface_tree = SurfaceTree.init(allocator);
@@ -683,6 +687,7 @@ pub fn destroy(self: *NativeServer) void {
     self.subcompositor_global.deinit();
     self.surface_tree.deinit();
     self.compositor_global.deinit();
+    self.single_pixel_buffer_global.deinit();
     self.shm_global.deinit();
     self.linux_drm_syncobj_global.deinit();
     self.linux_dmabuf_global.deinit();
@@ -1775,6 +1780,7 @@ fn prepareApplication(self: *NativeServer, pending: *PendingTransaction) !void {
                     null
                 else
                     (entry.snapshot orelse return error.MissingStagedSnapshot).size,
+                .single_pixel => (entry.snapshot orelse return error.MissingStagedSnapshot).size,
             },
             .removed => null,
             .unchanged => if (state.dmabuf) |dmabuf|
@@ -1908,14 +1914,24 @@ fn progressTransactions(self: *NativeServer) !void {
                     ready = false;
                     break;
                 }
-                if (commit.attachment == .buffer and commit.attachment.buffer.buffer.content == .shm) {
-                    self.startShmCopy(entry, commit) catch |err| {
+                if (commit.attachment == .buffer) switch (commit.attachment.buffer.buffer.content) {
+                    .shm => self.startShmCopy(entry, commit) catch |err| {
                         pending.discarded = true;
                         self.cancelPending(pending) catch {};
                         if (pendingIoTerminal(pending)) self.destroyPending(index);
                         return err;
-                    };
-                }
+                    },
+                    .single_pixel => |pixel_value| entry.snapshot = shm.Snapshot.initSinglePixel(
+                        self.allocator,
+                        pixel_value,
+                    ) catch |err| {
+                        pending.discarded = true;
+                        self.cancelPending(pending) catch {};
+                        if (pendingIoTerminal(pending)) self.destroyPending(index);
+                        return err;
+                    },
+                    .dmabuf => {},
+                };
                 if (commit.synchronization) |synchronization| {
                     if (!synchronization.acquire.signaled()) self.armSyncWait(entry, commit) catch |err| {
                         pending.discarded = true;

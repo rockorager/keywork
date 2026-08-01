@@ -325,6 +325,18 @@ pub const Snapshot = struct {
     force_opaque: bool,
     source_damage: ?[]render.Rect,
 
+    pub fn initSinglePixel(allocator: std.mem.Allocator, pixel: u32) !Snapshot {
+        const pixels = try allocator.alloc(u32, 1);
+        pixels[0] = pixel;
+        return .{
+            .allocator = allocator,
+            .size = .{ .width = 1, .height = 1 },
+            .pixels = pixels,
+            .force_opaque = pixel >> 24 == 0xff,
+            .source_damage = null,
+        };
+    }
+
     pub fn deinit(self: *Snapshot) void {
         if (self.pixels.len != 0) self.allocator.free(self.pixels);
         if (self.source_damage) |damage| self.allocator.free(damage);
@@ -419,6 +431,18 @@ test "buffer geometry and pool growth are validated" {
     try std.testing.expectError(error.InvalidPool, pool.resize(64));
     try pool.resize(128);
     try std.testing.expectEqual(@as(usize, 128), pool.size);
+}
+
+test "single pixel snapshots preserve color and opacity" {
+    var translucent = try Snapshot.initSinglePixel(std.testing.allocator, 0x8040_2000);
+    defer translucent.deinit();
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, translucent.size);
+    try std.testing.expectEqualSlices(u32, &.{0x8040_2000}, translucent.pixels);
+    try std.testing.expect(!translucent.force_opaque);
+
+    var opaque_snapshot = try Snapshot.initSinglePixel(std.testing.allocator, 0xff40_2000);
+    defer opaque_snapshot.deinit();
+    try std.testing.expect(opaque_snapshot.force_opaque);
 }
 
 test "copy coalesces tight full rows and updates only damaged pixels" {

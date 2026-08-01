@@ -13,6 +13,7 @@ content: Content,
 pub const Content = union(enum) {
     shm: shm.Buffer,
     dmabuf: Dmabuf,
+    single_pixel: u32,
 };
 
 pub const Dmabuf = struct {
@@ -51,6 +52,7 @@ pub fn unreference(self: *BufferResource) void {
     switch (self.content) {
         .shm => |*buffer| buffer.deinit(),
         .dmabuf => |dmabuf| dmabuf.source.release(dmabuf.source.context),
+        .single_pixel => {},
     }
     self.allocator.destroy(self);
 }

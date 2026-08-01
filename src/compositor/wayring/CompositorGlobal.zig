@@ -824,7 +824,7 @@ fn pendingAttachment(attachment: Attachment) PendingAttachment {
         .removed => .null_buffer,
         .buffer => |buffer| switch (buffer.buffer.content) {
             .dmabuf => .dmabuf,
-            .shm => .unsupported,
+            .shm, .single_pixel => .unsupported,
         },
     };
 }
