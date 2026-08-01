@@ -93,6 +93,13 @@ pub fn bufferCount(self: *const DmaBufPresenter) usize {
     return self.buffers.items.len;
 }
 
+pub fn hasGeneration(self: *const DmaBufPresenter, generation: u64) bool {
+    for (self.buffers.items) |buffer| {
+        if (buffer.generation == generation) return true;
+    }
+    return false;
+}
+
 pub fn candidates(self: *const DmaBufPresenter) []const Candidate {
     return self.compositor_candidates.items;
 }

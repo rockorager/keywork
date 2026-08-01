@@ -149,6 +149,8 @@ pub fn build(b: *std.Build) void {
         optimize,
         use_llvm,
         keywork_loop,
+        wayring,
+        wayring_protocols,
         varlink,
         ui_output,
         wayland_sources.wayland_xml,

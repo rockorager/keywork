@@ -57,6 +57,7 @@ test {
     _ = @import("backend/wayland/vulkan/DmaBufTargetSet.zig");
     _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");
+    _ = @import("backend/wayring/VulkanWindow.zig");
     _ = @import("graphics/raster.zig");
     _ = @import("graphics/RasterImage.zig");
     _ = @import("graphics/SharedPixelBuffer.zig");

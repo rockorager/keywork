@@ -15,6 +15,8 @@ pub fn add(
     optimize: std.builtin.OptimizeMode,
     use_llvm: ?bool,
     keywork_loop_module: *std.Build.Module,
+    wayring_module: *std.Build.Module,
+    wayring_protocols_module: *std.Build.Module,
     varlink_module: *std.Build.Module,
     ui_output: ui.Output,
     wayland_xml: std.Build.LazyPath,
@@ -121,6 +123,8 @@ pub fn add(
         .link_libc = true,
     });
     keywork_runtime_module.addImport("keywork-loop", keywork_loop_module);
+    keywork_runtime_module.addImport("wayring", wayring_module);
+    keywork_runtime_module.addImport("wayring-protocols", wayring_protocols_module);
     keywork_runtime_module.addImport("varlink", varlink_module);
     keywork_runtime_module.addImport("keywork-ui", ui_output.module);
     keywork_runtime_module.addImport("keywork-ui-engine", ui_output.engine_module);
