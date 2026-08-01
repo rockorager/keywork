@@ -15,6 +15,7 @@ const IoUringLoop = keywork_loop.IoUringLoop;
 
 pub const State = enum { connecting, configuring, running, closing, closed, disconnected, fatal };
 pub const Size = struct { width: u32, height: u32 };
+pub const ResizeEdge = Window.ResizeEdge;
 pub const Event = union(enum) {
     configured: Size,
     repaint,
@@ -171,6 +172,20 @@ pub fn clipboardWrite(self: *Backend, text: []const u8) !void {
     const input = if (self.input) |*value| value else return error.NoInputSerial;
     const serial = input.lastInputSerial() orelse return error.NoInputSerial;
     try clipboard.write(text, serial);
+}
+
+pub fn startMove(self: *Backend) !void {
+    const input = if (self.input) |*value| value else return error.NoSeat;
+    const serial = input.lastButtonPressSerial() orelse return error.NoRecentPress;
+    const window = if (self.window) |*value| value else return error.WindowNotReady;
+    try window.startMove(input.seatHandle(), serial);
+}
+
+pub fn startResize(self: *Backend, edge: ResizeEdge) !void {
+    const input = if (self.input) |*value| value else return error.NoSeat;
+    const serial = input.lastButtonPressSerial() orelse return error.NoRecentPress;
+    const window = if (self.window) |*value| value else return error.WindowNotReady;
+    try window.startResize(input.seatHandle(), serial, edge);
 }
 
 pub fn installEventTimers(self: *Backend, loop: *keywork_loop.EventLoop) !void {

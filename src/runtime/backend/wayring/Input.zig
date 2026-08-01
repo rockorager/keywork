@@ -52,6 +52,7 @@ keyboard_enabled: bool = false,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
 last_input_serial: ?u32 = null,
+last_button_press_serial: ?u32 = null,
 cursor_shape: ?keywork.CursorShape = null,
 pending_pointer: PendingPointer = .{},
 shift_down: bool = false,
@@ -106,6 +107,14 @@ pub fn setSurface(self: *Input, surface_id: u32) void {
 
 pub fn lastInputSerial(self: *const Input) ?u32 {
     return self.last_input_serial;
+}
+
+pub fn seatHandle(self: *const Input) wayring.ObjectHandle {
+    return self.seat;
+}
+
+pub fn lastButtonPressSerial(self: *const Input) ?u32 {
+    return self.last_button_press_serial;
 }
 
 pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
@@ -233,8 +242,10 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
         },
         .button => |button| {
             if (!self.pointer_focused) return;
-            if (button.state == @intFromEnum(protocol.wl_pointer_types.button_state.pressed))
+            if (button.state == @intFromEnum(protocol.wl_pointer_types.button_state.pressed)) {
                 self.last_input_serial = button.serial;
+                self.last_button_press_serial = button.serial;
+            }
             const mapped_button: keywork.PointerButton = switch (button.button) {
                 272 => .left,
                 273 => .right,

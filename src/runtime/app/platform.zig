@@ -177,12 +177,23 @@ pub fn WayringPlatform(comptime Backend: type) type {
             return null;
         }
 
-        fn startMove(_: *anyopaque) anyerror!void {
-            return error.UnsupportedWayringOperation;
+        fn startMove(ptr: *anyopaque) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.startMove();
         }
 
-        fn startResize(_: *anyopaque, _: ResizeEdge) anyerror!void {
-            return error.UnsupportedWayringOperation;
+        fn startResize(ptr: *anyopaque, edge: ResizeEdge) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.startResize(switch (edge) {
+                .top => .top,
+                .bottom => .bottom,
+                .left => .left,
+                .right => .right,
+                .top_left => .top_left,
+                .top_right => .top_right,
+                .bottom_left => .bottom_left,
+                .bottom_right => .bottom_right,
+            });
         }
 
         fn unlockSession(_: *anyopaque) anyerror!void {

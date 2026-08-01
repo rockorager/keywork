@@ -10,6 +10,7 @@ const Client = @import("Client.zig");
 const VulkanWindow = @import("VulkanWindow.zig");
 
 pub const Event = enum { configured, repaint, close };
+pub const ResizeEdge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
 
 allocator: std.mem.Allocator,
 client: *Client,
@@ -227,6 +228,37 @@ pub fn size(self: *const Window) struct { width: u32, height: u32 } {
 
 pub fn surfaceId(self: *const Window) u32 {
     return self.handles.surface.id;
+}
+
+pub fn startMove(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
+    try protocol.xdg_toplevel_types.requests.move(
+        self.client.connectionPtr(),
+        self.handles.toplevel,
+        seat,
+        serial,
+    );
+    try self.client.flush();
+}
+
+pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge: ResizeEdge) !void {
+    const protocol_edge: protocol.xdg_toplevel_types.resize_edge = switch (edge) {
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+        .top_left => .top_left,
+        .top_right => .top_right,
+        .bottom_left => .bottom_left,
+        .bottom_right => .bottom_right,
+    };
+    try protocol.xdg_toplevel_types.requests.resize(
+        self.client.connectionPtr(),
+        self.handles.toplevel,
+        seat,
+        serial,
+        @intFromEnum(protocol_edge),
+    );
+    try self.client.flush();
 }
 
 pub fn outputScaleChanged(self: *Window) !?Event {
