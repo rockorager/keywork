@@ -9,12 +9,26 @@ const IoUringLoop = @import("IoUringLoop.zig");
 allocator: std.mem.Allocator,
 io: IoUringLoop,
 wake_fd: i32,
+wall_timer_fd: i32,
 sources: std.ArrayList(Slot) = .empty,
 free_slots: std.ArrayList(u32) = .empty,
 pending_ready: std.ArrayList(Ready) = .empty,
+pending_timers: std.ArrayList(PendingTimer) = .empty,
 timers: std.ArrayList(*Timer) = .empty,
+monotonic_timers: std.ArrayList(*Timer) = .empty,
+wall_timers: std.ArrayList(*Timer) = .empty,
 file_watches: std.ArrayList(*FileWatch) = .empty,
 retired: ?*Registration = null,
+retired_timers: ?*Timer = null,
+monotonic_alarm: ?*MonotonicAlarm = null,
+monotonic_due: bool = false,
+wall_read_value: u64 = 0,
+wall_read_operation: ?IoUringLoop.Handle = null,
+wall_read_cancel_requested: bool = false,
+wall_read_cancel_retry: bool = false,
+wall_armed_deadline_ns: ?u64 = null,
+wall_due: bool = false,
+wall_clock_changed: bool = false,
 wayland: ?WaylandState = null,
 pre_poll: ?PrePollSource = null,
 after_platform_hook: ?PhaseHook = null,
@@ -28,6 +42,14 @@ wake_handle: ?SourceHandle = null,
 
 const Slot = struct { generation: u32 = 0, registration: ?*Registration = null };
 const Ready = struct { handle: SourceHandle, events: u32 };
+const PendingTimer = struct { timer: *Timer, generation: u32, expirations: u64 };
+const TimerDomain = enum { monotonic, realtime };
+const MonotonicAlarm = struct {
+    loop: *EventLoop,
+    deadline_ns: u64,
+    timeout: linux.kernel_timespec,
+    operation: IoUringLoop.Handle,
+};
 const Registration = struct {
     loop: *EventLoop,
     source: Source,
@@ -73,28 +95,37 @@ pub const WaylandPrepare = struct { events: u32, dispatched_pending: bool = fals
 pub const PrePollSource = struct { ctx: *anyopaque, prepare: *const fn (*anyopaque) anyerror!bool };
 
 pub const Timer = struct {
-    fd: i32,
-    source_handle: ?SourceHandle,
+    loop: *EventLoop,
+    domain: TimerDomain,
     ctx: *anyopaque,
     callback: TimerCallback,
-    wall_interval_ms: u64 = 0,
+    deadline_ns: u64 = 0,
+    interval_ns: u64 = 0,
+    heap_index: ?usize = null,
+    generation: u32 = 0,
+    pending_count: usize = 0,
+    wall_aligned: bool = false,
     destroy_ctx: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
     removed: bool = false,
+    retired_next: ?*Timer = null,
+
     pub fn arm(self: *Timer, delay_ms: u64, interval_ms: u64) !void {
-        const spec: linux.itimerspec = .{ .it_interval = try millisecondsAllowZero(interval_ms), .it_value = try milliseconds(delay_ms) };
-        try linuxVoid(linux.timerfd_settime(self.fd, .{ .ABSTIME = false }, &spec, null));
+        const delay_ns = try millisecondsNs(delay_ms, false);
+        const interval_ns = try millisecondsNs(interval_ms, true);
+        const now_ns = try clockNowNs(self.domain);
+        if (delay_ns > std.math.maxInt(u64) - now_ns) return error.InvalidTimerInterval;
+        try self.loop.armTimerAt(self, now_ns + delay_ns, interval_ns, false);
     }
+
     pub fn armWall(self: *Timer, interval_ms: u64) !void {
-        var now: linux.timespec = undefined;
-        try linuxVoid(linux.clock_gettime(.REALTIME, &now));
-        const spec: linux.itimerspec = .{ .it_interval = try milliseconds(interval_ms), .it_value = try nextAlignedExpiration(now, interval_ms) };
-        try linuxVoid(linux.timerfd_settime(self.fd, .{ .ABSTIME = true, .CANCEL_ON_SET = true }, &spec, null));
-        self.wall_interval_ms = interval_ms;
+        if (self.domain != .realtime) return error.InvalidTimerClock;
+        const interval_ns = try millisecondsNs(interval_ms, false);
+        const now_ns = try clockNowNs(.realtime);
+        try self.loop.armTimerAt(self, try nextAlignedNs(now_ns, interval_ns), interval_ns, true);
     }
+
     pub fn disarm(self: *Timer) void {
-        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
-        const spec: linux.itimerspec = .{ .it_interval = zero, .it_value = zero };
-        linuxVoid(linux.timerfd_settime(self.fd, .{ .ABSTIME = false }, &spec, null)) catch {};
+        self.loop.disarmTimer(self);
     }
 };
 pub const FileWatch = struct {
@@ -110,7 +141,14 @@ pub const FileWatch = struct {
 pub fn init(allocator: std.mem.Allocator) !EventLoop {
     const wake_fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
     errdefer _ = linux.close(wake_fd);
-    return .{ .allocator = allocator, .io = try IoUringLoop.init(allocator), .wake_fd = wake_fd };
+    const wall_timer_fd = try linuxFd(linux.timerfd_create(.REALTIME, .{ .CLOEXEC = true, .NONBLOCK = true }));
+    errdefer _ = linux.close(wall_timer_fd);
+    return .{
+        .allocator = allocator,
+        .io = try IoUringLoop.init(allocator),
+        .wake_fd = wake_fd,
+        .wall_timer_fd = wall_timer_fd,
+    };
 }
 
 /// Borrowers must terminate all operations they queued before calling deinit.
@@ -122,18 +160,26 @@ pub fn deinit(self: *EventLoop) void {
     self.clearWayland();
     while (self.file_watches.items.len != 0) self.removeFileWatch(self.file_watches.items[self.file_watches.items.len - 1]);
     while (self.timers.items.len != 0) self.removeTimer(self.timers.items[self.timers.items.len - 1]);
+    self.discardPendingTimers();
+    self.reapRetiredTimers();
     var index: usize = 0;
     while (index < self.sources.items.len) : (index += 1) if (self.sources.items[index].registration) |reg| self.removeSource(reg.handle);
+    self.reconcileTimers() catch @panic("failed to cancel event-loop timers");
     while (self.retired != null or self.wayland != null or self.io.hasActiveOperations()) {
         self.retryCancels();
+        self.reconcileTimers() catch @panic("failed to drain event-loop timer cancellations");
         self.drive(true) catch @panic("failed to drain event-loop cancellations");
     }
     self.io.deinit();
     self.sources.deinit(self.allocator);
     self.free_slots.deinit(self.allocator);
     self.pending_ready.deinit(self.allocator);
+    self.pending_timers.deinit(self.allocator);
     self.timers.deinit(self.allocator);
+    self.monotonic_timers.deinit(self.allocator);
+    self.wall_timers.deinit(self.allocator);
     self.file_watches.deinit(self.allocator);
+    _ = linux.close(self.wall_timer_fd);
     _ = linux.close(self.wake_fd);
 }
 
@@ -215,6 +261,7 @@ fn retryCancels(self: *EventLoop) void {
     while (reg) |item| : (reg = item.retired_next) if (item.cancel_retry) self.requestCancel(item);
     for (self.sources.items) |slot| if (slot.registration) |item| if (item.cancel_retry) self.requestCancel(item);
     if (self.wayland) |*state| if (state.cancel_retry) self.requestWaylandCancel(state);
+    if (self.wall_read_cancel_retry) self.requestWallReadCancel();
 }
 
 fn reapRetired(self: *EventLoop) void {
@@ -232,38 +279,331 @@ fn reapRetired(self: *EventLoop) void {
 }
 
 pub fn addTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
-    return self.addTimerWithClock(.MONOTONIC, ctx, callback);
+    return self.addTimerWithClock(.monotonic, ctx, callback);
 }
 pub fn addWallTimer(self: *EventLoop, ctx: *anyopaque, callback: TimerCallback) !*Timer {
-    return self.addTimerWithClock(.REALTIME, ctx, callback);
+    return self.addTimerWithClock(.realtime, ctx, callback);
 }
-fn addTimerWithClock(self: *EventLoop, clock: linux.timerfd_clockid_t, ctx: *anyopaque, callback: TimerCallback) !*Timer {
-    const fd = try linuxFd(linux.timerfd_create(clock, .{ .CLOEXEC = true, .NONBLOCK = true }));
-    errdefer _ = linux.close(fd);
+fn addTimerWithClock(self: *EventLoop, domain: TimerDomain, ctx: *anyopaque, callback: TimerCallback) !*Timer {
     const timer = try self.allocator.create(Timer);
     errdefer self.allocator.destroy(timer);
-    timer.* = .{ .fd = fd, .source_handle = null, .ctx = ctx, .callback = callback };
+    timer.* = .{ .loop = self, .domain = domain, .ctx = ctx, .callback = callback };
     try self.timers.append(self.allocator, timer);
-    errdefer _ = self.timers.pop();
-    timer.source_handle = try self.addFd(.{ .fd = fd, .events = linux.POLL.IN, .ctx = timer, .callback = timerSourceCallback, .destroy_ctx = destroyTimerContext });
     return timer;
 }
 pub fn removeTimer(self: *EventLoop, timer: *Timer) void {
     if (timer.removed) return;
+    self.disarmTimer(timer);
     timer.removed = true;
-    if (timer.source_handle) |handle| self.removeSource(handle);
-    timer.source_handle = null;
     removePointer(Timer, &self.timers, timer);
+    timer.retired_next = self.retired_timers;
+    self.retired_timers = timer;
+    self.reapRetiredTimers();
 }
 pub fn addRepeatingTimer(self: *EventLoop, interval_ms: u64, ctx: *anyopaque, callback: TimerCallback) !void {
     const timer = try self.addTimer(ctx, callback);
+    errdefer self.removeTimer(timer);
     try timer.arm(interval_ms, interval_ms);
 }
-fn destroyTimerContext(allocator: std.mem.Allocator, context: *anyopaque) void {
-    const timer: *Timer = @ptrCast(@alignCast(context));
-    _ = linux.close(timer.fd);
-    if (timer.destroy_ctx) |destroy| destroy(allocator, timer.ctx);
-    allocator.destroy(timer);
+
+fn armTimerAt(self: *EventLoop, timer: *Timer, deadline_ns: u64, interval_ns: u64, wall_aligned: bool) !void {
+    if (timer.removed) return error.TimerRemoved;
+    self.removeTimerFromHeap(timer);
+    timer.generation +%= 1;
+    timer.deadline_ns = deadline_ns;
+    timer.interval_ns = interval_ns;
+    timer.wall_aligned = wall_aligned;
+    try self.insertTimer(timer);
+}
+
+fn disarmTimer(self: *EventLoop, timer: *Timer) void {
+    if (timer.removed) return;
+    self.removeTimerFromHeap(timer);
+    timer.generation +%= 1;
+    timer.interval_ns = 0;
+    timer.wall_aligned = false;
+}
+
+fn timerHeap(self: *EventLoop, domain: TimerDomain) *std.ArrayList(*Timer) {
+    return switch (domain) {
+        .monotonic => &self.monotonic_timers,
+        .realtime => &self.wall_timers,
+    };
+}
+
+fn timerLessThan(a: *const Timer, b: *const Timer) bool {
+    return a.deadline_ns < b.deadline_ns or
+        (a.deadline_ns == b.deadline_ns and @intFromPtr(a) < @intFromPtr(b));
+}
+
+fn insertTimer(self: *EventLoop, timer: *Timer) !void {
+    std.debug.assert(timer.heap_index == null);
+    const heap = self.timerHeap(timer.domain);
+    timer.heap_index = heap.items.len;
+    try heap.append(self.allocator, timer);
+    self.siftTimerUp(heap, timer.heap_index.?);
+}
+
+fn removeTimerFromHeap(self: *EventLoop, timer: *Timer) void {
+    const index = timer.heap_index orelse return;
+    const heap = self.timerHeap(timer.domain);
+    std.debug.assert(index < heap.items.len and heap.items[index] == timer);
+    const last = heap.pop().?;
+    timer.heap_index = null;
+    if (index == heap.items.len) return;
+    heap.items[index] = last;
+    last.heap_index = index;
+    if (index > 0 and timerLessThan(last, heap.items[(index - 1) / 2]))
+        self.siftTimerUp(heap, index)
+    else
+        self.siftTimerDown(heap, index);
+}
+
+fn siftTimerUp(_: *EventLoop, heap: *std.ArrayList(*Timer), start: usize) void {
+    var index = start;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!timerLessThan(heap.items[index], heap.items[parent])) return;
+        swapTimers(heap, index, parent);
+        index = parent;
+    }
+}
+
+fn siftTimerDown(_: *EventLoop, heap: *std.ArrayList(*Timer), start: usize) void {
+    var index = start;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= heap.items.len) return;
+        const right = left + 1;
+        const child = if (right < heap.items.len and timerLessThan(heap.items[right], heap.items[left])) right else left;
+        if (!timerLessThan(heap.items[child], heap.items[index])) return;
+        swapTimers(heap, index, child);
+        index = child;
+    }
+}
+
+fn swapTimers(heap: *std.ArrayList(*Timer), a: usize, b: usize) void {
+    const temporary = heap.items[a];
+    heap.items[a] = heap.items[b];
+    heap.items[b] = temporary;
+    heap.items[a].heap_index = a;
+    heap.items[b].heap_index = b;
+}
+
+fn rebuildTimerHeap(self: *EventLoop, heap: *std.ArrayList(*Timer)) void {
+    for (heap.items, 0..) |timer, index| timer.heap_index = index;
+    var index = heap.items.len / 2;
+    while (index > 0) {
+        index -= 1;
+        self.siftTimerDown(heap, index);
+    }
+}
+
+fn reapRetiredTimers(self: *EventLoop) void {
+    if (self.dispatching) return;
+    var link = &self.retired_timers;
+    while (link.*) |timer| {
+        if (timer.pending_count != 0) {
+            link = &timer.retired_next;
+            continue;
+        }
+        link.* = timer.retired_next;
+        if (timer.destroy_ctx) |destroy| destroy(self.allocator, timer.ctx);
+        self.allocator.destroy(timer);
+    }
+}
+
+fn reconcileTimers(self: *EventLoop) !void {
+    try self.reconcileMonotonicAlarm();
+    try self.reconcileWallAlarm();
+}
+
+fn reconcileMonotonicAlarm(self: *EventLoop) !void {
+    const deadline_ns = if (self.monotonic_timers.items.len == 0)
+        null
+    else
+        self.monotonic_timers.items[0].deadline_ns;
+    if (self.monotonic_alarm) |alarm| {
+        if (deadline_ns != null and alarm.deadline_ns == deadline_ns.?) return;
+        try self.io.cancel(alarm.operation);
+        self.monotonic_alarm = null;
+    }
+    const deadline = deadline_ns orelse return;
+    const alarm = try self.allocator.create(MonotonicAlarm);
+    errdefer self.allocator.destroy(alarm);
+    alarm.* = .{
+        .loop = self,
+        .deadline_ns = deadline,
+        .timeout = kernelTimespecFromNs(deadline),
+        .operation = undefined,
+    };
+    alarm.operation = try self.io.queue(alarm, monotonicAlarmComplete, alarm, prepareMonotonicAlarm);
+    self.monotonic_alarm = alarm;
+}
+
+fn prepareMonotonicAlarm(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const alarm: *MonotonicAlarm = @ptrCast(@alignCast(context));
+    sqe.prep_timeout(&alarm.timeout, 0, linux.IORING_TIMEOUT_ABS);
+}
+
+fn monotonicAlarmComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
+    const alarm: *MonotonicAlarm = @ptrCast(@alignCast(context));
+    const self = alarm.loop;
+    if (self.monotonic_alarm == alarm) self.monotonic_alarm = null;
+    defer self.allocator.destroy(alarm);
+    if (completion.result == -@as(i32, @intFromEnum(linux.E.TIME))) {
+        self.monotonic_due = true;
+    } else if (completion.result != -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+        return error.MonotonicTimerFailed;
+    }
+}
+
+fn reconcileWallAlarm(self: *EventLoop) !void {
+    const deadline_ns = if (self.wall_timers.items.len == 0)
+        null
+    else
+        self.wall_timers.items[0].deadline_ns;
+    if (deadline_ns == null) {
+        if (self.wall_armed_deadline_ns != null) {
+            const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+            const spec: linux.itimerspec = .{ .it_interval = zero, .it_value = zero };
+            try linuxVoid(linux.timerfd_settime(self.wall_timer_fd, .{}, &spec, null));
+            self.wall_armed_deadline_ns = null;
+        }
+        self.requestWallReadCancel();
+        return;
+    }
+    if (self.wall_armed_deadline_ns == null or self.wall_armed_deadline_ns.? != deadline_ns.?) {
+        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        const spec: linux.itimerspec = .{
+            .it_interval = zero,
+            .it_value = try timespecFromNs(deadline_ns.?),
+        };
+        try linuxVoid(linux.timerfd_settime(
+            self.wall_timer_fd,
+            .{ .ABSTIME = true, .CANCEL_ON_SET = true },
+            &spec,
+            null,
+        ));
+        self.wall_armed_deadline_ns = deadline_ns;
+    }
+    if (self.wall_read_operation == null) {
+        self.wall_read_value = 0;
+        self.wall_read_operation = try self.io.queue(self, wallReadComplete, self, prepareWallRead);
+        self.wall_read_cancel_requested = false;
+        self.wall_read_cancel_retry = false;
+    }
+}
+
+fn prepareWallRead(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const self: *EventLoop = @ptrCast(@alignCast(context));
+    sqe.prep_read(
+        self.wall_timer_fd,
+        std.mem.asBytes(&self.wall_read_value),
+        std.math.maxInt(u64),
+    );
+}
+
+fn wallReadComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
+    const self: *EventLoop = @ptrCast(@alignCast(context));
+    const canceled_by_loop = self.wall_read_cancel_requested;
+    self.wall_read_operation = null;
+    self.wall_read_cancel_requested = false;
+    self.wall_read_cancel_retry = false;
+    if (completion.result == @sizeOf(u64)) {
+        self.wall_armed_deadline_ns = null;
+        self.wall_due = true;
+    } else if (completion.result == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+        if (!canceled_by_loop) {
+            self.wall_armed_deadline_ns = null;
+            self.wall_clock_changed = true;
+        }
+    } else {
+        return error.WallTimerReadFailed;
+    }
+}
+
+fn requestWallReadCancel(self: *EventLoop) void {
+    if (self.wall_read_cancel_requested or self.wall_read_operation == null) return;
+    self.io.cancel(self.wall_read_operation.?) catch {
+        self.wall_read_cancel_retry = true;
+        return;
+    };
+    self.wall_read_cancel_requested = true;
+    self.wall_read_cancel_retry = false;
+}
+
+fn collectReadyTimers(self: *EventLoop) !void {
+    if (self.monotonic_due) {
+        self.monotonic_due = false;
+        try self.collectExpiredTimers(.monotonic, try clockNowNs(.monotonic));
+    }
+    if (self.wall_due or self.wall_clock_changed) {
+        const now_ns = try clockNowNs(.realtime);
+        self.wall_due = false;
+        if (self.wall_clock_changed) {
+            try self.realignWallTimers(now_ns);
+            self.wall_clock_changed = false;
+        }
+        try self.collectExpiredTimers(.realtime, now_ns);
+    }
+}
+
+fn realignWallTimers(self: *EventLoop, now_ns: u64) !void {
+    var aligned_count: usize = 0;
+    for (self.wall_timers.items) |timer| {
+        if (!timer.wall_aligned) continue;
+        _ = try nextAlignedNs(now_ns, timer.interval_ns);
+        aligned_count += 1;
+    }
+    try self.pending_timers.ensureUnusedCapacity(self.allocator, aligned_count);
+    for (self.wall_timers.items) |timer| {
+        if (!timer.wall_aligned) continue;
+        self.pending_timers.appendAssumeCapacity(.{
+            .timer = timer,
+            .generation = timer.generation,
+            .expirations = 1,
+        });
+        timer.pending_count += 1;
+        timer.deadline_ns = nextAlignedNs(now_ns, timer.interval_ns) catch unreachable;
+    }
+    self.rebuildTimerHeap(&self.wall_timers);
+}
+
+fn collectExpiredTimers(self: *EventLoop, domain: TimerDomain, now_ns: u64) !void {
+    const heap = self.timerHeap(domain);
+    while (heap.items.len != 0 and heap.items[0].deadline_ns <= now_ns) {
+        const timer = heap.items[0];
+        const deadline_ns = timer.deadline_ns;
+        self.removeTimerFromHeap(timer);
+        var expirations: u64 = 1;
+        if (timer.interval_ns != 0) {
+            const count = @as(u128, now_ns - deadline_ns) / timer.interval_ns + 1;
+            const next = @as(u128, deadline_ns) + count * timer.interval_ns;
+            if (count > std.math.maxInt(u64) or next > std.math.maxInt(u64)) return error.InvalidTimerInterval;
+            expirations = @intCast(count);
+            timer.deadline_ns = @intCast(next);
+            try self.insertTimer(timer);
+        }
+        try self.queuePendingTimer(timer, expirations);
+    }
+}
+
+fn queuePendingTimer(self: *EventLoop, timer: *Timer, expirations: u64) !void {
+    try self.pending_timers.append(self.allocator, .{
+        .timer = timer,
+        .generation = timer.generation,
+        .expirations = expirations,
+    });
+    timer.pending_count += 1;
+}
+
+fn discardPendingTimers(self: *EventLoop) void {
+    for (self.pending_timers.items) |pending| {
+        std.debug.assert(pending.timer.pending_count > 0);
+        pending.timer.pending_count -= 1;
+    }
+    self.pending_timers.clearRetainingCapacity();
 }
 
 pub fn addFileWatch(self: *EventLoop, path: []const u8, ctx: *anyopaque, callback: FileWatchCallback) !*FileWatch {
@@ -419,12 +759,14 @@ fn turn(self: *EventLoop, wait: bool) !void {
     }
     if (self.pre_poll) |source| userspace_work = (try source.prepare(source.ctx)) or userspace_work;
     self.retryCancels();
+    try self.reconcileTimers();
     try self.drive(wait and !userspace_work);
     if (prepared_wayland) if (self.wayland) |*state| {
         const readiness = state.readiness;
         state.readiness = 0;
         if (!try state.source.finish(state.source.ctx, readiness)) self.running = false;
     };
+    try self.collectReadyTimers();
     try self.dispatchPhases();
 }
 fn drive(self: *EventLoop, wait: bool) !void {
@@ -434,9 +776,16 @@ fn drive(self: *EventLoop, wait: bool) !void {
 fn dispatchPhases(self: *EventLoop) !void {
     std.debug.assert(!self.dispatching);
     self.dispatching = true;
+    var timer_index: usize = 0;
     defer {
+        for (self.pending_timers.items[timer_index..]) |pending| {
+            std.debug.assert(pending.timer.pending_count > 0);
+            pending.timer.pending_count -= 1;
+        }
+        self.pending_timers.clearRetainingCapacity();
         self.dispatching = false;
         self.reapRetired();
+        self.reapRetiredTimers();
     }
     if (self.after_platform_hook) |hook| try hook(self.after_platform_context.?, self);
     var index: usize = 0;
@@ -447,22 +796,17 @@ fn dispatchPhases(self: *EventLoop) !void {
         if (self.lookup(ready.handle)) |current| if (current.operation == null) try self.arm(current);
     }
     self.pending_ready.clearRetainingCapacity();
+    while (timer_index < self.pending_timers.items.len) {
+        const pending = self.pending_timers.items[timer_index];
+        timer_index += 1;
+        std.debug.assert(pending.timer.pending_count > 0);
+        pending.timer.pending_count -= 1;
+        if (pending.timer.removed or pending.timer.generation != pending.generation) continue;
+        try pending.timer.callback(pending.timer.ctx, self, pending.expirations);
+    }
     if (self.end_turn_hook) |hook| try hook(self.end_turn_context.?, self);
 }
 
-fn timerSourceCallback(context: *anyopaque, loop: *EventLoop, _: u32) !void {
-    const timer: *Timer = @ptrCast(@alignCast(context));
-    if (timer.removed) return;
-    const expirations = drainTimer(timer.fd) catch |err| switch (err) {
-        error.TimerCanceled => blk: {
-            if (timer.wall_interval_ms == 0) return err;
-            try timer.armWall(timer.wall_interval_ms);
-            break :blk 1;
-        },
-        else => return err,
-    };
-    if (expirations > 0 and !timer.removed) try timer.callback(timer.ctx, loop, expirations);
-}
 fn fileWatchSourceCallback(context: *anyopaque, loop: *EventLoop, _: u32) !void {
     const watch: *FileWatch = @ptrCast(@alignCast(context));
     if (watch.removed) return;
@@ -489,17 +833,6 @@ fn dispatchFileWatchEvents(watch: *FileWatch, loop: *EventLoop, bytes: []align(@
         if (watch.removed) return;
         offset += @sizeOf(linux.inotify_event) + event.len;
     }
-}
-fn drainTimer(fd: i32) !u64 {
-    var value: u64 = 0;
-    const bytes = std.mem.asBytes(&value);
-    const result = linux.read(fd, bytes.ptr, bytes.len);
-    return switch (linux.errno(result)) {
-        .SUCCESS => if (result == bytes.len) value else error.ShortTimerRead,
-        .AGAIN => 0,
-        .CANCELED => error.TimerCanceled,
-        else => error.TimerReadFailed,
-    };
 }
 fn drainWake(fd: i32) void {
     var value: u64 = 0;
@@ -532,30 +865,50 @@ fn linuxVoid(result: usize) !void {
         else => error.LinuxSyscallFailed,
     };
 }
-fn milliseconds(value: u64) !linux.timespec {
-    if (value == 0) return error.InvalidTimerInterval;
-    return millisecondsAllowZero(value);
+fn millisecondsNs(value: u64, allow_zero: bool) !u64 {
+    if (!allow_zero and value == 0) return error.InvalidTimerInterval;
+    if (value > std.math.maxInt(u64) / std.time.ns_per_ms) return error.InvalidTimerInterval;
+    return value * std.time.ns_per_ms;
 }
-fn millisecondsAllowZero(value: u64) !linux.timespec {
-    const seconds = value / 1000;
-    const millis = value % 1000;
+fn clockNowNs(domain: TimerDomain) !u64 {
+    var now: linux.timespec = undefined;
+    try linuxVoid(linux.clock_gettime(switch (domain) {
+        .monotonic => .MONOTONIC,
+        .realtime => .REALTIME,
+    }, &now));
+    return timespecToNs(now);
+}
+fn timespecToNs(value: linux.timespec) !u64 {
+    if (value.sec < 0 or value.nsec < 0 or value.nsec >= std.time.ns_per_s) return error.InvalidTimerInterval;
+    const nanoseconds = @as(u128, @intCast(value.sec)) * std.time.ns_per_s + @as(u128, @intCast(value.nsec));
+    if (nanoseconds > std.math.maxInt(u64)) return error.InvalidTimerInterval;
+    return @intCast(nanoseconds);
+}
+fn timespecFromNs(value: u64) !linux.timespec {
+    const seconds = value / std.time.ns_per_s;
     if (seconds > @as(u64, @intCast(std.math.maxInt(isize)))) return error.InvalidTimerInterval;
     return .{
         .sec = @intCast(seconds),
-        .nsec = @intCast(millis * std.time.ns_per_ms),
+        .nsec = @intCast(value % std.time.ns_per_s),
     };
 }
-fn nextAlignedExpiration(now: linux.timespec, interval_ms: u64) !linux.timespec {
-    if (interval_ms == 0 or now.sec < 0 or now.nsec < 0) return error.InvalidTimerInterval;
-    const interval_ns = @as(u128, interval_ms) * std.time.ns_per_ms;
-    const now_ns = @as(u128, @intCast(now.sec)) * std.time.ns_per_s + @as(u128, @intCast(now.nsec));
-    const next_ns = (now_ns / interval_ns + 1) * interval_ns;
-    const next_sec = next_ns / std.time.ns_per_s;
-    if (next_sec > std.math.maxInt(isize)) return error.InvalidTimerInterval;
+fn kernelTimespecFromNs(value: u64) linux.kernel_timespec {
     return .{
-        .sec = @intCast(next_sec),
-        .nsec = @intCast(next_ns % std.time.ns_per_s),
+        .sec = @intCast(value / std.time.ns_per_s),
+        .nsec = @intCast(value % std.time.ns_per_s),
     };
+}
+fn nextAlignedNs(now_ns: u64, interval_ns: u64) !u64 {
+    if (interval_ns == 0) return error.InvalidTimerInterval;
+    const next_ns = (@as(u128, now_ns) / interval_ns + 1) * interval_ns;
+    if (next_ns > std.math.maxInt(u64)) return error.InvalidTimerInterval;
+    return @intCast(next_ns);
+}
+fn nextAlignedExpiration(now: linux.timespec, interval_ms: u64) !linux.timespec {
+    return timespecFromNs(try nextAlignedNs(
+        try timespecToNs(now),
+        try millisecondsNs(interval_ms, false),
+    ));
 }
 
 test "completion-native timer fires and can remove itself" {
@@ -579,6 +932,160 @@ test "completion-native timer fires and can remove itself" {
     try context.timer.?.arm(1, 0);
     try loop.run();
     try std.testing.expect(context.fired);
+}
+
+test "shared wall timer read fires and can remove itself" {
+    const Context = struct {
+        timer: ?*Timer = null,
+        fired: bool = false,
+
+        fn callback(context: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.fired = true;
+            loop.removeTimer(self.timer.?);
+            self.timer = null;
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    context.timer = try loop.addWallTimer(&context, Context.callback);
+    try context.timer.?.arm(1, 0);
+    try loop.run();
+    try std.testing.expect(context.fired);
+}
+
+test "repeating timer reports missed expirations without deadline drift" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: u8 = 0;
+    const timer = try loop.addTimer(&context, Noop.callback);
+    try loop.armTimerAt(timer, 100, 100, false);
+    try loop.collectExpiredTimers(.monotonic, 350);
+
+    try std.testing.expectEqual(@as(usize, 1), loop.pending_timers.items.len);
+    try std.testing.expectEqual(@as(u64, 3), loop.pending_timers.items[0].expirations);
+    try std.testing.expectEqual(@as(u64, 400), timer.deadline_ns);
+    try std.testing.expectEqual(timer, loop.monotonic_timers.items[0]);
+}
+
+test "rearming a timer suppresses an already queued expiration" {
+    const Context = struct {
+        fired: bool = false,
+        fn callback(context: *anyopaque, _: *EventLoop, _: u64) !void {
+            (@as(*@This(), @ptrCast(@alignCast(context)))).fired = true;
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    const timer = try loop.addTimer(&context, Context.callback);
+    try loop.armTimerAt(timer, 100, 0, false);
+    try loop.collectExpiredTimers(.monotonic, 100);
+    try loop.armTimerAt(timer, 200, 0, false);
+    try loop.dispatchPhases();
+
+    try std.testing.expect(!context.fired);
+    try std.testing.expectEqual(@as(usize, 0), timer.pending_count);
+}
+
+test "wall timer can be retargeted while its shared read is active" {
+    const Context = struct {
+        fired: usize = 0,
+        fn callback(context: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.fired += 1;
+            loop.quit();
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    const timer = try loop.addWallTimer(&context, Context.callback);
+    try timer.arm(100, 0);
+    try loop.reconcileTimers();
+    _ = try loop.io.submit();
+    timer.disarm();
+    try timer.arm(1, 0);
+    try loop.run();
+
+    try std.testing.expectEqual(@as(usize, 1), context.fired);
+}
+
+test "timer callback can remove another pending timer" {
+    const Victim = struct {
+        fired: bool = false,
+        fn callback(context: *anyopaque, _: *EventLoop, _: u64) !void {
+            (@as(*@This(), @ptrCast(@alignCast(context)))).fired = true;
+        }
+    };
+    const Remover = struct {
+        victim: *Timer,
+        fn callback(context: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            loop.removeTimer(self.victim);
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var victim_context: Victim = .{};
+    const victim = try loop.addTimer(&victim_context, Victim.callback);
+    var remover_context: Remover = .{ .victim = victim };
+    const remover = try loop.addTimer(&remover_context, Remover.callback);
+    try loop.armTimerAt(remover, 100, 0, false);
+    try loop.armTimerAt(victim, 101, 0, false);
+    try loop.collectExpiredTimers(.monotonic, 101);
+    try loop.dispatchPhases();
+
+    try std.testing.expect(!victim_context.fired);
+}
+
+test "deinit cancels submitted monotonic and wall timer operations" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    var context: u8 = 0;
+    const monotonic = try loop.addTimer(&context, Noop.callback);
+    const wall = try loop.addWallTimer(&context, Noop.callback);
+    try monotonic.arm(10_000, 0);
+    try wall.arm(10_000, 0);
+    try loop.reconcileTimers();
+    _ = try loop.io.submit();
+    loop.deinit();
+}
+
+test "wall clock change realigns only aligned timers" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: u8 = 0;
+    const first = try loop.addWallTimer(&context, Noop.callback);
+    const second = try loop.addWallTimer(&context, Noop.callback);
+    const relative = try loop.addWallTimer(&context, Noop.callback);
+    try loop.armTimerAt(first, 100, 50, true);
+    try loop.armTimerAt(second, 200, 50, true);
+    try loop.armTimerAt(relative, 75, 0, false);
+    try loop.realignWallTimers(225);
+
+    try std.testing.expectEqual(@as(u64, 250), first.deadline_ns);
+    try std.testing.expectEqual(@as(u64, 250), second.deadline_ns);
+    try std.testing.expectEqual(@as(u64, 75), relative.deadline_ns);
+    try std.testing.expectEqual(@as(usize, 2), loop.pending_timers.items.len);
+    try std.testing.expectEqual(relative, loop.wall_timers.items[0]);
 }
 
 test "wall timer expiration aligns to the next epoch interval" {
