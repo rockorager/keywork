@@ -467,6 +467,7 @@ test "cursor size defaults when missing or empty" {
 }
 
 test {
+    _ = @import("wayring/shm.zig");
     _ = @import("render/types.zig");
     _ = @import("render/backdrop_cache_key.zig");
     _ = @import("render/blur_geometry.zig");
