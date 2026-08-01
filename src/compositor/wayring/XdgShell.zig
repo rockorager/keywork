@@ -7,14 +7,30 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
+const SurfaceTree = @import("SurfaceTree.zig");
+const popup_placement = @import("../xdg_popup_placement.zig");
+const render = @import("../render/types.zig");
 
 const advertised_version: u32 = 6;
 
 allocator: std.mem.Allocator,
 server: *Server,
 global_name: u32,
+tree: *SurfaceTree,
+geometry_provider: GeometryProvider,
+popups: std.ArrayList(*Popup) = .empty,
+next_popup_order: u64 = 1,
 
-pub const CommitDisposition = enum { configure_only, render };
+pub const GeometryProvider = struct {
+    context: *anyopaque,
+    surface_size: *const fn (*anyopaque, *const CompositorGlobal.Surface) ?render.Size,
+    output_bounds: *const fn (*anyopaque) render.Rect,
+};
+
+pub const CommitResult = struct {
+    disposition: enum { configure_only, render } = .render,
+    direct_update: ?SurfaceTree.DirectUpdate = null,
+};
 
 const Binding = struct {
     allocator: std.mem.Allocator,
@@ -51,11 +67,13 @@ const XdgSurface = struct {
     references: usize = 1,
     resource_alive: bool = true,
     surface_alive: bool = true,
-    toplevel: ?*Toplevel = null,
-    configures: std.ArrayList(u32) = .empty,
+    role: union(enum) { none, toplevel: *Toplevel, popup: *Popup } = .none,
+    configures: std.ArrayList(Configure) = .empty,
     initial_configure_sent: bool = false,
     configured: bool = false,
     pending_geometry: ?Geometry = null,
+    current_geometry: ?Geometry = null,
+    mapped: bool = false,
 
     fn reference(self: *XdgSurface) !void {
         if (self.references == std.math.maxInt(usize)) return error.ReferenceOverflow;
@@ -95,6 +113,41 @@ const Toplevel = struct {
 
 const Positioner = struct {
     allocator: std.mem.Allocator,
+    rules: popup_placement.Rules = .{},
+};
+
+const PopupConfigure = struct {
+    rules: popup_placement.Rules,
+    placement: popup_placement.Placement,
+};
+
+const Configure = struct {
+    serial: u32,
+    popup: ?PopupConfigure = null,
+};
+
+const Popup = struct {
+    allocator: std.mem.Allocator,
+    xdg_surface: *XdgSurface,
+    parent: *XdgSurface,
+    resource: wayring.ObjectHandle,
+    rules: popup_placement.Rules,
+    pending: ?PopupConfigure = null,
+    current: ?PopupConfigure = null,
+    mapped: bool = false,
+    dismissed: bool = false,
+    order: u64,
+
+    fn deinit(self: *Popup) void {
+        const owner = self.xdg_surface.binding.owner;
+        dismissChildren(owner, self.xdg_surface);
+        if (std.mem.indexOfScalar(*Popup, owner.popups.items, self)) |index|
+            _ = owner.popups.swapRemove(index);
+        if (owner.tree.find(self.xdg_surface.surface)) |node| owner.tree.detach(node);
+        self.parent.unreference();
+        self.xdg_surface.unreference();
+        self.allocator.destroy(self);
+    }
 };
 
 const Geometry = struct {
@@ -104,11 +157,19 @@ const Geometry = struct {
     height: i32,
 };
 
-pub fn init(self: *XdgShell, allocator: std.mem.Allocator, server: *Server) !void {
+pub fn init(
+    self: *XdgShell,
+    allocator: std.mem.Allocator,
+    server: *Server,
+    tree: *SurfaceTree,
+    geometry_provider: GeometryProvider,
+) !void {
     self.* = .{
         .allocator = allocator,
         .server = server,
         .global_name = undefined,
+        .tree = tree,
+        .geometry_provider = geometry_provider,
     };
     self.global_name = try server.createGlobal(
         &generated.xdg_wm_base,
@@ -119,23 +180,38 @@ pub fn init(self: *XdgShell, allocator: std.mem.Allocator, server: *Server) !voi
 
 pub fn deinit(self: *XdgShell) void {
     self.server.removeGlobal(self.global_name) catch unreachable;
+    std.debug.assert(self.popups.items.len == 0);
+    self.popups.deinit(self.allocator);
     self.* = undefined;
 }
 
 /// Applies xdg-shell's configure barrier to one atomic surface commit. This
 /// is called after request dispatch and before any buffer I/O is submitted.
-pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitDisposition {
-    if (commit.surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return .render;
-    const context = commit.surface.role_context orelse return .render;
+pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitResult {
+    if (commit.surface.role_owner != @as(*const anyopaque, @ptrCast(self))) {
+        const node = try self.tree.nodeFor(commit.surface);
+        if (node.parent != null) return .{};
+        const active = switch (commit.attachment) {
+            .buffer => true,
+            .removed => false,
+            .unchanged => node.current_active,
+        };
+        return .{ .direct_update = try self.tree.captureDirect(node, .{}, active) };
+    }
+    const context = commit.surface.role_context orelse return .{};
     const xdg_surface: *XdgSurface = @ptrCast(@alignCast(context));
-    if (!xdg_surface.resource_alive) return .render;
-    if (xdg_surface.toplevel == null) {
+    if (!xdg_surface.resource_alive) return .{};
+    if (xdg_surface.role == .none) {
         try xdg_surface.surface.client.postError(
             xdg_surface.resource,
             @intFromEnum(generated.xdg_surface_types.@"error".not_constructed),
             "xdg_surface has no role object",
         );
-        return .render;
+        return .{};
+    }
+    if (xdg_surface.pending_geometry) |geometry| {
+        xdg_surface.current_geometry = geometry;
+        xdg_surface.pending_geometry = null;
     }
     if (!xdg_surface.initial_configure_sent) {
         if (commit.attachment == .buffer) {
@@ -144,10 +220,14 @@ pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitDi
                 @intFromEnum(generated.xdg_surface_types.@"error".unconfigured_buffer),
                 "buffer committed before initial xdg configure",
             );
-            return .render;
+            return .{};
+        }
+        if (xdg_surface.role == .popup and !parentMapped(xdg_surface.role.popup)) {
+            try invalidPopupParent(xdg_surface, "xdg_popup parent is not mapped");
+            return .{};
         }
         try sendInitialConfigure(xdg_surface);
-        return .configure_only;
+        return .{ .disposition = .configure_only };
     }
     if (commit.attachment == .buffer and !xdg_surface.configured) {
         try xdg_surface.surface.client.postError(
@@ -155,9 +235,112 @@ pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitDi
             @intFromEnum(generated.xdg_surface_types.@"error".unconfigured_buffer),
             "buffer committed before acknowledging xdg configure",
         );
-        return .render;
+        return .{};
     }
-    return .render;
+    const node = try self.tree.nodeFor(commit.surface);
+    var position: SurfaceTree.Position = .{};
+    switch (xdg_surface.role) {
+        .toplevel => switch (commit.attachment) {
+            .buffer => xdg_surface.mapped = true,
+            .removed => {
+                dismissChildren(self, xdg_surface);
+                xdg_surface.mapped = false;
+                resetConfigureState(xdg_surface);
+            },
+            .unchanged => {},
+        },
+        .popup => |popup| {
+            if (popup.dismissed) {
+                xdg_surface.mapped = false;
+                popup.mapped = false;
+            } else switch (commit.attachment) {
+                .buffer => {
+                    if (!parentMapped(popup)) {
+                        try invalidPopupParent(xdg_surface, "xdg_popup parent is not mapped");
+                        return .{};
+                    }
+                    if (popup.pending) |pending| {
+                        popup.current = pending;
+                        popup.rules = pending.rules;
+                        popup.pending = null;
+                    }
+                    if (popup.current == null) return clientProtocolError(
+                        xdg_surface,
+                        generated.xdg_surface_types.@"error".unconfigured_buffer,
+                        "popup buffer committed without an acknowledged configure",
+                    );
+                    popup.mapped = true;
+                    xdg_surface.mapped = true;
+                },
+                .removed => {
+                    dismissChildren(self, xdg_surface);
+                    popup.mapped = false;
+                    popup.dismissed = false;
+                    popup.pending = null;
+                    popup.current = null;
+                    xdg_surface.mapped = false;
+                    resetConfigureState(xdg_surface);
+                },
+                .unchanged => if (popup.pending) |pending| {
+                    popup.current = pending;
+                    popup.rules = pending.rules;
+                    popup.pending = null;
+                },
+            }
+            position = popupTreePosition(popup);
+        },
+        .none => unreachable,
+    }
+    return .{ .direct_update = try self.tree.captureDirect(
+        node,
+        position,
+        xdg_surface.mapped,
+    ) };
+}
+
+/// Keeps retained hierarchy visibility consistent when a staged SHM copy
+/// cannot produce the buffer that an xdg commit attempted to map.
+pub fn deactivateFailedBuffer(self: *XdgShell, surface: *CompositorGlobal.Surface) void {
+    if (surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return;
+    const context = surface.role_context orelse return;
+    const xdg_surface: *XdgSurface = @ptrCast(@alignCast(context));
+    xdg_surface.mapped = false;
+    if (xdg_surface.role == .popup) xdg_surface.role.popup.mapped = false;
+}
+
+fn clientProtocolError(
+    xdg_surface: *XdgSurface,
+    code: generated.xdg_surface_types.@"error",
+    text: []const u8,
+) !CommitResult {
+    try xdg_surface.surface.client.postError(xdg_surface.resource, @intFromEnum(code), text);
+    return .{};
+}
+
+fn resetConfigureState(xdg_surface: *XdgSurface) void {
+    xdg_surface.configures.clearRetainingCapacity();
+    xdg_surface.initial_configure_sent = false;
+    xdg_surface.configured = false;
+}
+
+fn popupTreePosition(popup: *const Popup) SurfaceTree.Position {
+    const placement = (popup.current orelse return .{}).placement.position;
+    const parent_geometry = popup.parent.current_geometry orelse Geometry{
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+    };
+    const popup_geometry = popup.xdg_surface.current_geometry orelse Geometry{
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+    };
+    return .{
+        .x = parent_geometry.x +| placement.x -| popup_geometry.x,
+        .y = parent_geometry.y +| placement.y -| popup_geometry.y,
+    };
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
@@ -264,16 +447,53 @@ fn destroyBinding(
 }
 
 fn dispatchPositioner(
-    _: *anyopaque,
+    context: *anyopaque,
     client: *Server.Client,
     resource: wayring.ObjectHandle,
     message: *wayring.Message,
 ) !void {
-    _ = try generated.xdg_positioner_types.decodeRequest(
+    const positioner: *Positioner = @ptrCast(@alignCast(context));
+    switch (try generated.xdg_positioner_types.decodeRequest(
         &client.connection,
         resource,
         message,
-    );
+    )) {
+        .destroy => {},
+        .set_size => |request| {
+            if (request.width <= 0 or request.height <= 0) return invalidPositioner(client, resource, "positioner size must be positive");
+            positioner.rules.size = .{ .width = request.width, .height = request.height };
+        },
+        .set_anchor_rect => |request| {
+            if (request.width < 0 or request.height < 0) return invalidPositioner(client, resource, "anchor rectangle size must not be negative");
+            positioner.rules.anchor_rect = .{ .x = request.x, .y = request.y, .width = request.width, .height = request.height };
+        },
+        .set_anchor => |request| {
+            const value = request.anchor;
+            if (value > 8) return invalidPositioner(client, resource, "invalid anchor");
+            positioner.rules.anchor = @enumFromInt(value);
+        },
+        .set_gravity => |request| {
+            const value = request.gravity;
+            if (value > 8) return invalidPositioner(client, resource, "invalid gravity");
+            positioner.rules.gravity = @enumFromInt(value);
+        },
+        .set_constraint_adjustment => |request| {
+            const value: u32 = @bitCast(request.constraint_adjustment);
+            if (value & ~@as(u32, 0x3f) != 0) return invalidPositioner(client, resource, "invalid constraint adjustment");
+            positioner.rules.adjustment = @bitCast(value);
+        },
+        .set_offset => |request| positioner.rules.offset = .{ .x = request.x, .y = request.y },
+        .set_reactive => positioner.rules.reactive = true,
+        .set_parent_size => |request| {
+            if (request.parent_width <= 0 or request.parent_height <= 0) return invalidPositioner(client, resource, "parent size must be positive");
+            positioner.rules.parent_size = .{ .width = request.parent_width, .height = request.parent_height };
+        },
+        .set_parent_configure => |request| positioner.rules.parent_configure = request.serial,
+    }
+}
+
+fn invalidPositioner(client: *Server.Client, resource: wayring.ObjectHandle, text: []const u8) !void {
+    return client.postError(resource, @intFromEnum(generated.xdg_positioner_types.@"error".invalid_input), text);
 }
 
 fn destroyPositioner(
@@ -283,6 +503,237 @@ fn destroyPositioner(
 ) void {
     const positioner: *Positioner = @ptrCast(@alignCast(context));
     positioner.allocator.destroy(positioner);
+}
+
+fn createPopup(xdg_surface: *XdgSurface, client: *Server.Client, resource: wayring.ObjectHandle, id: u32, parent_id: ?u32, positioner_id: u32) !void {
+    if (xdg_surface.role != .none) return client.postError(resource, @intFromEnum(generated.xdg_surface_types.@"error".already_constructed), "xdg_surface already has a role object");
+    const parent_object_id = parent_id orelse return invalidPopupParent(xdg_surface, "null popup parent requires layer-shell policy");
+    const parent_object = client.connection.object(parent_object_id) orelse return invalidPopupParent(xdg_surface, "unknown xdg_popup parent");
+    const parent: *XdgSurface = @ptrCast(@alignCast(client.resourceContext(
+        .{ .id = parent_object_id, .generation = parent_object.generation },
+        &generated.xdg_surface,
+    ) catch return invalidPopupParent(xdg_surface, "invalid xdg_popup parent")));
+    if (parent == xdg_surface or parent.surface.client != xdg_surface.surface.client or
+        parent.role == .none or !parent.surface_alive or !parent.resource_alive)
+    {
+        return invalidPopupParent(xdg_surface, "invalid xdg_popup parent");
+    }
+    const positioner_object = client.connection.object(positioner_id) orelse
+        return invalidPopupPositioner(xdg_surface, "unknown xdg_positioner");
+    const positioner: *Positioner = @ptrCast(@alignCast(client.resourceContext(
+        .{ .id = positioner_id, .generation = positioner_object.generation },
+        &generated.xdg_positioner,
+    ) catch return invalidPopupPositioner(xdg_surface, "invalid xdg_positioner")));
+    if (!positioner.rules.complete()) return invalidPopupPositioner(xdg_surface, "incomplete xdg_positioner");
+    const shell = xdg_surface.binding.owner;
+    shell.popups.ensureUnusedCapacity(shell.allocator, 1) catch return client.postNoMemory();
+    const popup = xdg_surface.allocator.create(Popup) catch return client.postNoMemory();
+    errdefer xdg_surface.allocator.destroy(popup);
+    try xdg_surface.reference();
+    errdefer xdg_surface.unreference();
+    try parent.reference();
+    errdefer parent.unreference();
+    const tree = shell.tree;
+    const node = tree.nodeFor(xdg_surface.surface) catch return client.postNoMemory();
+    const parent_node = tree.nodeFor(parent.surface) catch return client.postNoMemory();
+    tree.attach(node, parent_node, .own) catch |err| switch (err) {
+        error.OutOfMemory => return client.postNoMemory(),
+        error.InvalidParent => return invalidPopupParent(xdg_surface, "invalid xdg_popup hierarchy"),
+    };
+    errdefer tree.detach(node);
+    popup.* = .{
+        .allocator = xdg_surface.allocator,
+        .xdg_surface = xdg_surface,
+        .parent = parent,
+        .resource = undefined,
+        .rules = positioner.rules,
+        .order = shell.next_popup_order,
+    };
+    const version = @min(try client.resourceVersion(resource, &generated.xdg_surface), generated.xdg_popup.version);
+    popup.resource = client.createResource(id, &generated.xdg_popup, version, .{ .context = popup, .dispatch = dispatchPopup, .destroy = destroyPopup }) catch return client.postNoMemory();
+    xdg_surface.role = .{ .popup = popup };
+    shell.popups.appendAssumeCapacity(popup);
+    shell.next_popup_order +%= 1;
+}
+
+fn invalidPopupParent(xdg_surface: *XdgSurface, text: []const u8) !void {
+    return xdg_surface.surface.client.postError(
+        xdg_surface.binding.resource,
+        @intFromEnum(generated.xdg_wm_base_types.@"error".invalid_popup_parent),
+        text,
+    );
+}
+
+fn invalidPopupPositioner(xdg_surface: *XdgSurface, text: []const u8) !void {
+    return xdg_surface.surface.client.postError(
+        xdg_surface.binding.resource,
+        @intFromEnum(generated.xdg_wm_base_types.@"error".invalid_positioner),
+        text,
+    );
+}
+
+fn popupForSurface(shell: *const XdgShell, xdg_surface: *const XdgSurface) ?*Popup {
+    for (shell.popups.items) |popup| if (popup.xdg_surface == xdg_surface) return popup;
+    return null;
+}
+
+fn isTopmostPopup(popup: *const Popup) bool {
+    for (popup.xdg_surface.binding.owner.popups.items) |candidate|
+        if (candidate != popup and candidate.parent == popup.xdg_surface) return false;
+    return true;
+}
+
+fn popupDescendsFrom(popup: *const Popup, ancestor: *const XdgSurface) bool {
+    const shell = popup.xdg_surface.binding.owner;
+    var parent: ?*XdgSurface = popup.parent;
+    while (parent) |xdg_surface| {
+        if (xdg_surface == ancestor) return true;
+        const parent_popup = popupForSurface(shell, xdg_surface) orelse return false;
+        parent = parent_popup.parent;
+    }
+    return false;
+}
+
+fn dismissChildren(shell: *XdgShell, parent: *XdgSurface) void {
+    while (true) {
+        var selected: ?*Popup = null;
+        for (shell.popups.items) |popup| {
+            if (popup.dismissed or !popupDescendsFrom(popup, parent)) continue;
+            if (selected == null or popup.order > selected.?.order) selected = popup;
+        }
+        const popup = selected orelse return;
+        dismissPopup(popup);
+    }
+}
+
+fn dismissPopup(popup: *Popup) void {
+    if (popup.dismissed) return;
+    const shell = popup.xdg_surface.binding.owner;
+    dismissChildren(shell, popup.xdg_surface);
+    popup.dismissed = true;
+    popup.mapped = false;
+    popup.xdg_surface.mapped = false;
+    if (shell.tree.find(popup.xdg_surface.surface)) |node| shell.tree.deactivateNow(node);
+    if (popup.xdg_surface.resource_alive and popup.xdg_surface.surface.client.state == .active)
+        generated.xdg_popup_types.events.popup_done(
+            &popup.xdg_surface.surface.client.connection,
+            popup.resource,
+        ) catch {};
+}
+
+fn parentMapped(popup: *const Popup) bool {
+    if (!popup.parent.mapped) return false;
+    if (popupForSurface(popup.xdg_surface.binding.owner, popup.parent)) |parent_popup|
+        return !parent_popup.dismissed;
+    return true;
+}
+
+fn parentGeometry(popup: *const Popup, rules: popup_placement.Rules) ?Geometry {
+    if (popup.parent.current_geometry) |geometry| return geometry;
+    const provider = popup.xdg_surface.binding.owner.geometry_provider;
+    if (provider.surface_size(provider.context, popup.parent.surface)) |size| return .{
+        .x = 0,
+        .y = 0,
+        .width = @intCast(@min(size.width, std.math.maxInt(i32))),
+        .height = @intCast(@min(size.height, std.math.maxInt(i32))),
+    };
+    if (rules.parent_size) |size| return .{
+        .x = 0,
+        .y = 0,
+        .width = size.width,
+        .height = size.height,
+    };
+    const bounds = provider.output_bounds(provider.context);
+    if (bounds.width == 0 or bounds.height == 0) return null;
+    return .{
+        .x = 0,
+        .y = 0,
+        .width = @intCast(@min(bounds.width, std.math.maxInt(i32))),
+        .height = @intCast(@min(bounds.height, std.math.maxInt(i32))),
+    };
+}
+
+fn popupPlacement(
+    popup: *const Popup,
+    rules: popup_placement.Rules,
+) error{ InvalidParent, InvalidPositioner }!popup_placement.Placement {
+    if (!rules.complete()) return error.InvalidPositioner;
+    const geometry = parentGeometry(popup, rules) orelse return error.InvalidParent;
+    const anchor = rules.anchor_rect.?;
+    const anchor_right = @as(i64, anchor.x) + anchor.width;
+    const anchor_bottom = @as(i64, anchor.y) + anchor.height;
+    if (anchor.x < 0 or anchor.y < 0 or
+        anchor_right > geometry.width or anchor_bottom > geometry.height)
+    {
+        return error.InvalidPositioner;
+    }
+    const shell = popup.xdg_surface.binding.owner;
+    const parent_node = shell.tree.find(popup.parent.surface) orelse return error.InvalidParent;
+    const parent_position = SurfaceTree.globalPosition(parent_node);
+    return popup_placement.place(
+        rules,
+        .{
+            .x = parent_position.x +| geometry.x,
+            .y = parent_position.y +| geometry.y,
+        },
+        shell.geometry_provider.output_bounds(shell.geometry_provider.context),
+    );
+}
+
+fn dispatchPopup(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
+    const popup: *Popup = @ptrCast(@alignCast(context));
+    switch (try generated.xdg_popup_types.decodeRequest(&client.connection, resource, message)) {
+        .destroy => if (!isTopmostPopup(popup)) return client.postError(
+            popup.xdg_surface.binding.resource,
+            @intFromEnum(generated.xdg_wm_base_types.@"error".not_the_topmost_popup),
+            "destroy the topmost xdg_popup first",
+        ),
+        .grab => return client.postError(resource, @intFromEnum(generated.xdg_popup_types.@"error".invalid_grab), "popup grabs are not available without a validated seat serial"),
+        .reposition => |request| {
+            if (popup.dismissed) return;
+            const object = client.connection.object(request.positioner) orelse
+                return invalidPopupPositioner(popup.xdg_surface, "unknown reposition xdg_positioner");
+            const positioner: *Positioner = @ptrCast(@alignCast(client.resourceContext(
+                .{ .id = request.positioner, .generation = object.generation },
+                &generated.xdg_positioner,
+            ) catch return invalidPopupPositioner(popup.xdg_surface, "invalid reposition xdg_positioner")));
+            if (!positioner.rules.complete()) return invalidPopupPositioner(popup.xdg_surface, "incomplete reposition xdg_positioner");
+            sendPopupConfigure(popup, positioner.rules, request.token) catch |err| switch (err) {
+                error.InvalidParent => return invalidPopupParent(popup.xdg_surface, "invalid xdg_popup parent geometry"),
+                error.InvalidPositioner => return invalidPopupPositioner(popup.xdg_surface, "xdg_positioner anchor rectangle is outside its parent"),
+                error.OutOfMemory => return client.postNoMemory(),
+                else => return err,
+            };
+        },
+    }
+}
+
+fn sendPopupConfigure(popup: *Popup, rules: popup_placement.Rules, reposition_token: ?u32) !void {
+    const xdg_surface = popup.xdg_surface;
+    const client = xdg_surface.surface.client;
+    xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch return client.postNoMemory();
+    const placement = try popupPlacement(popup, rules);
+    if (reposition_token) |token|
+        generated.xdg_popup_types.events.repositioned(&client.connection, popup.resource, token) catch return client.postNoMemory();
+    generated.xdg_popup_types.events.configure(&client.connection, popup.resource, placement.position.x, placement.position.y, placement.dimensions.width, placement.dimensions.height) catch return client.postNoMemory();
+    const serial = xdg_surface.surface.owner.server.nextSerial();
+    generated.xdg_surface_types.events.configure(&client.connection, xdg_surface.resource, serial) catch return client.postNoMemory();
+    xdg_surface.configures.appendAssumeCapacity(.{
+        .serial = serial,
+        .popup = .{ .rules = rules, .placement = placement },
+    });
+    xdg_surface.initial_configure_sent = true;
+}
+
+fn destroyPopup(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
+    const popup: *Popup = @ptrCast(@alignCast(context));
+    dismissChildren(popup.xdg_surface.binding.owner, popup.xdg_surface);
+    if (popup.xdg_surface.role == .popup and popup.xdg_surface.role.popup == popup) {
+        popup.xdg_surface.role = .none;
+        popup.xdg_surface.mapped = false;
+        resetConfigureState(popup.xdg_surface);
+    }
+    popup.deinit();
 }
 
 fn dispatchXdgSurface(
@@ -297,13 +748,13 @@ fn dispatchXdgSurface(
         resource,
         message,
     )) {
-        .destroy => if (xdg_surface.toplevel != null) return client.postError(
+        .destroy => if (xdg_surface.role != .none) return client.postError(
             resource,
             @intFromEnum(generated.xdg_surface_types.@"error".defunct_role_object),
             "xdg_surface destroyed before its toplevel",
         ),
         .get_toplevel => |request| {
-            if (xdg_surface.toplevel != null) return client.postError(
+            if (xdg_surface.role != .none) return client.postError(
                 resource,
                 @intFromEnum(generated.xdg_surface_types.@"error".already_constructed),
                 "xdg_surface already has a role object",
@@ -332,13 +783,9 @@ fn dispatchXdgSurface(
                     .destroy = destroyToplevel,
                 },
             ) catch return client.postNoMemory();
-            xdg_surface.toplevel = toplevel;
+            xdg_surface.role = .{ .toplevel = toplevel };
         },
-        .get_popup => return client.postError(
-            resource,
-            @intFromEnum(generated.xdg_wm_base_types.@"error".invalid_surface_state),
-            "native popup policy is not installed",
-        ),
+        .get_popup => |request| try createPopup(xdg_surface, client, resource, request.id, request.parent, request.positioner),
         .set_window_geometry => |request| {
             if (request.width <= 0 or request.height <= 0) return client.postError(
                 resource,
@@ -353,13 +800,27 @@ fn dispatchXdgSurface(
             };
         },
         .ack_configure => |request| {
-            const index = std.mem.indexOfScalar(u32, xdg_surface.configures.items, request.serial) orelse
+            var index: ?usize = null;
+            for (xdg_surface.configures.items, 0..) |configure, i| if (configure.serial == request.serial) {
+                index = i;
+                break;
+            };
+            const found = index orelse
                 return client.postError(
                     resource,
                     @intFromEnum(generated.xdg_surface_types.@"error".invalid_serial),
                     "unknown xdg configure serial",
                 );
-            xdg_surface.configures.replaceRangeAssumeCapacity(0, index + 1, &.{});
+            const configure = xdg_surface.configures.items[found];
+            xdg_surface.configures.replaceRangeAssumeCapacity(0, found + 1, &.{});
+            if (xdg_surface.role == .popup) {
+                const popup = xdg_surface.role.popup;
+                popup.pending = configure.popup orelse return client.postError(
+                    resource,
+                    @intFromEnum(generated.xdg_surface_types.@"error".invalid_serial),
+                    "configure does not belong to this xdg_popup",
+                );
+            }
             xdg_surface.configured = true;
         },
     }
@@ -379,6 +840,8 @@ fn destroyXdgSurface(
 fn surfaceDestroyed(context: *anyopaque) void {
     const xdg_surface: *XdgSurface = @ptrCast(@alignCast(context));
     xdg_surface.surface_alive = false;
+    dismissChildren(xdg_surface.binding.owner, xdg_surface);
+    if (xdg_surface.role == .popup) dismissPopup(xdg_surface.role.popup);
     if (!xdg_surface.resource_alive) return;
     xdg_surface.surface.client.postError(
         xdg_surface.resource,
@@ -460,38 +923,70 @@ fn destroyToplevel(
     _: wayring.ObjectHandle,
 ) void {
     const toplevel: *Toplevel = @ptrCast(@alignCast(context));
-    if (toplevel.xdg_surface.toplevel == toplevel)
-        toplevel.xdg_surface.toplevel = null;
+    const shell = toplevel.xdg_surface.binding.owner;
+    dismissChildren(shell, toplevel.xdg_surface);
+    if (toplevel.xdg_surface.role == .toplevel and toplevel.xdg_surface.role.toplevel == toplevel) {
+        toplevel.xdg_surface.role = .none;
+        toplevel.xdg_surface.mapped = false;
+        resetConfigureState(toplevel.xdg_surface);
+        if (shell.tree.find(toplevel.xdg_surface.surface)) |node| shell.tree.deactivateNow(node);
+    }
     toplevel.deinit();
 }
 
 fn sendInitialConfigure(xdg_surface: *XdgSurface) !void {
-    const toplevel = xdg_surface.toplevel.?;
     const client = xdg_surface.surface.client;
-    xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch
-        return client.postNoMemory();
-    const version = try client.resourceVersion(toplevel.resource, &generated.xdg_toplevel);
-    if (version >= 5) generated.xdg_toplevel_types.events.wm_capabilities(
-        &client.connection,
-        toplevel.resource,
-        &.{},
-    ) catch return client.postNoMemory();
-    generated.xdg_toplevel_types.events.configure(
-        &client.connection,
-        toplevel.resource,
-        0,
-        0,
-        &.{},
-    ) catch return client.postNoMemory();
-    const serial = xdg_surface.surface.owner.server.nextSerial();
-    generated.xdg_surface_types.events.configure(
-        &client.connection,
-        xdg_surface.resource,
-        serial,
-    ) catch return client.postNoMemory();
-    xdg_surface.configures.appendAssumeCapacity(serial);
-    xdg_surface.initial_configure_sent = true;
+    switch (xdg_surface.role) {
+        .toplevel => |toplevel| {
+            xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch
+                return client.postNoMemory();
+            const version = try client.resourceVersion(toplevel.resource, &generated.xdg_toplevel);
+            if (version >= 5) generated.xdg_toplevel_types.events.wm_capabilities(&client.connection, toplevel.resource, &.{}) catch return client.postNoMemory();
+            generated.xdg_toplevel_types.events.configure(&client.connection, toplevel.resource, 0, 0, &.{}) catch return client.postNoMemory();
+            const serial = xdg_surface.surface.owner.server.nextSerial();
+            generated.xdg_surface_types.events.configure(
+                &client.connection,
+                xdg_surface.resource,
+                serial,
+            ) catch return client.postNoMemory();
+            xdg_surface.configures.appendAssumeCapacity(.{ .serial = serial });
+            xdg_surface.initial_configure_sent = true;
+        },
+        .popup => |popup| {
+            if (!parentMapped(popup)) return invalidPopupParent(xdg_surface, "xdg_popup parent is not mapped");
+            sendPopupConfigure(popup, popup.rules, null) catch |err| switch (err) {
+                error.InvalidParent => return invalidPopupParent(xdg_surface, "invalid xdg_popup parent geometry"),
+                error.InvalidPositioner => return invalidPopupPositioner(xdg_surface, "xdg_positioner anchor rectangle is outside its parent"),
+                error.OutOfMemory => return client.postNoMemory(),
+                else => return err,
+            };
+        },
+        .none => unreachable,
+    }
 }
+
+const TestGeometryProvider = struct {
+    surface_size: ?render.Size = .{ .width = 1280, .height = 720 },
+    bounds: render.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 },
+
+    fn provider(self: *TestGeometryProvider) GeometryProvider {
+        return .{
+            .context = self,
+            .surface_size = testSurfaceSize,
+            .output_bounds = testOutputBounds,
+        };
+    }
+
+    fn testSurfaceSize(context: *anyopaque, _: *const CompositorGlobal.Surface) ?render.Size {
+        const self: *TestGeometryProvider = @ptrCast(@alignCast(context));
+        return self.surface_size;
+    }
+
+    fn testOutputBounds(context: *anyopaque) render.Rect {
+        const self: *TestGeometryProvider = @ptrCast(@alignCast(context));
+        return self.bounds;
+    }
+};
 
 test "native xdg toplevel enforces the initial configure barrier" {
     const core = @import("wayring-core");
@@ -501,9 +996,13 @@ test "native xdg toplevel enforces the initial configure barrier" {
     try compositor.init(std.testing.allocator, &server);
     defer compositor.deinit();
     var shell: XdgShell = undefined;
-    try shell.init(std.testing.allocator, &server);
+    var tree = SurfaceTree.init(std.testing.allocator);
+    defer tree.deinit();
+    var geometry_provider: TestGeometryProvider = .{};
+    try shell.init(std.testing.allocator, &server, &tree, geometry_provider.provider());
     defer shell.deinit();
     const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
 
     var peer = wayring.Connection.init(
         std.testing.allocator,
@@ -574,8 +1073,8 @@ test "native xdg toplevel enforces the initial configure barrier" {
     defer initial_transaction.deinit();
     const initial = &initial_transaction.entries[0];
     try std.testing.expectEqual(
-        CommitDisposition.configure_only,
-        try shell.handleCommit(initial),
+        .configure_only,
+        (try shell.handleCommit(initial)).disposition,
     );
     try transferFromServer(&peer, client);
     var configure_serial: ?u32 = null;
@@ -602,9 +1101,447 @@ test "native xdg toplevel enforces the initial configure barrier" {
     var configured_transaction = compositor.popTransaction() orelse return error.MissingCommit;
     defer configured_transaction.deinit();
     try std.testing.expectEqual(
-        CommitDisposition.render,
-        try shell.handleCommit(&configured_transaction.entries[0]),
+        .render,
+        (try shell.handleCommit(&configured_transaction.entries[0])).disposition,
     );
+}
+
+test "native xdg popups map nested trees and apply reposition on acked commit" {
+    const core = @import("wayring-core");
+    const linux = std.os.linux;
+    const ShmGlobal = @import("ShmGlobal.zig");
+    const shm = @import("shm.zig");
+
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var shm_global: ShmGlobal = undefined;
+    try shm_global.init(std.testing.allocator, &server);
+    defer shm_global.deinit();
+    var compositor: CompositorGlobal = undefined;
+    try compositor.init(std.testing.allocator, &server);
+    defer compositor.deinit();
+    var tree = SurfaceTree.init(std.testing.allocator);
+    defer tree.deinit();
+    var geometry_provider: TestGeometryProvider = .{};
+    var shell: XdgShell = undefined;
+    try shell.init(std.testing.allocator, &server, &tree, geometry_provider.provider());
+    defer shell.deinit();
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var compositor_name: u32 = 0;
+    var shm_name: u32 = 0;
+    var shell_name: u32 = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const global = (try core.decodeRegistryEvent(&message, registry.id)).global;
+        if (std.mem.eql(u8, global.interface, generated.wl_compositor.name))
+            compositor_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_shm.name))
+            shm_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.xdg_wm_base.name))
+            shell_name = global.name;
+    }
+    const compositor_resource: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            compositor_name,
+            generated.wl_compositor.name,
+            6,
+            3,
+            &generated.wl_compositor,
+        ),
+    };
+    const shm_resource: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shm_name,
+            generated.wl_shm.name,
+            2,
+            4,
+            &generated.wl_shm,
+        ),
+    };
+    const wm_base: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shell_name,
+            generated.xdg_wm_base.name,
+            6,
+            5,
+            &generated.xdg_wm_base,
+        ),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    const fd = try std.posix.memfd_create("keywork-xdg-popup-test", linux.MFD.CLOEXEC);
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = linux.close(fd);
+    };
+    if (linux.errno(linux.ftruncate(fd, 192)) != .SUCCESS) return error.TruncateFailed;
+    const pool = try generated.wl_shm_types.requests.create_pool(&peer, shm_resource, fd, 192);
+    fd_owned = false;
+    const parent_buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        0,
+        4,
+        4,
+        16,
+        @intFromEnum(shm.Format.argb8888),
+    );
+    const popup_buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        64,
+        4,
+        4,
+        16,
+        @intFromEnum(shm.Format.argb8888),
+    );
+    const nested_buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        128,
+        4,
+        4,
+        16,
+        @intFromEnum(shm.Format.argb8888),
+    );
+    try transferToServer(&peer, client);
+
+    const parent_surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor_resource,
+    );
+    const parent_xdg = try generated.xdg_wm_base_types.requests.get_xdg_surface(
+        &peer,
+        wm_base,
+        parent_surface,
+    );
+    const parent_toplevel = try generated.xdg_surface_types.requests.get_toplevel(
+        &peer,
+        parent_xdg,
+    );
+    try generated.xdg_surface_types.requests.set_window_geometry(
+        &peer,
+        parent_xdg,
+        10,
+        20,
+        200,
+        150,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, parent_surface);
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(
+        .configure_only,
+        (try applyNextCommit(&shell, &compositor)).disposition,
+    );
+    try transferFromServer(&peer, client);
+    var parent_serial: ?u32 = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == parent_toplevel.id) {
+            _ = try generated.xdg_toplevel_types.decodeEvent(&peer, parent_toplevel, &message);
+        } else if (message.object_id == parent_xdg.id) {
+            parent_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                parent_xdg,
+                &message,
+            )).configure.serial;
+        }
+    }
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        parent_xdg,
+        parent_serial orelse return error.MissingConfigure,
+    );
+    try generated.wl_surface_types.requests.attach(&peer, parent_surface, parent_buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, parent_surface);
+    try transferToServer(&peer, client);
+    const parent_map = try applyNextCommit(&shell, &compositor);
+    try std.testing.expectEqual(.render, parent_map.disposition);
+    const parent_server_surface = try serverSurface(client, parent_surface.id);
+    const parent_node = tree.find(parent_server_surface) orelse return error.MissingParentNode;
+    try std.testing.expect(parent_node.current_active);
+
+    const positioner = try generated.xdg_wm_base_types.requests.create_positioner(&peer, wm_base);
+    try generated.xdg_positioner_types.requests.set_size(&peer, positioner, 40, 30);
+    try generated.xdg_positioner_types.requests.set_anchor_rect(&peer, positioner, 30, 40, 10, 10);
+    try generated.xdg_positioner_types.requests.set_anchor(&peer, positioner, 8);
+    try generated.xdg_positioner_types.requests.set_gravity(&peer, positioner, 8);
+    const popup_surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor_resource,
+    );
+    const popup_xdg = try generated.xdg_wm_base_types.requests.get_xdg_surface(
+        &peer,
+        wm_base,
+        popup_surface,
+    );
+    const popup_resource = try generated.xdg_surface_types.requests.get_popup(
+        &peer,
+        popup_xdg,
+        parent_xdg,
+        positioner,
+    );
+    try generated.xdg_surface_types.requests.set_window_geometry(
+        &peer,
+        popup_xdg,
+        2,
+        3,
+        40,
+        30,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, popup_surface);
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(
+        .configure_only,
+        (try applyNextCommit(&shell, &compositor)).disposition,
+    );
+    try transferFromServer(&peer, client);
+    var popup_serial: ?u32 = null;
+    var popup_configure_order: ?usize = null;
+    var popup_surface_configure_order: ?usize = null;
+    var event_order: usize = 0;
+    while (peer.popMessage()) |popped| : (event_order += 1) {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == popup_resource.id) {
+            const event = try generated.xdg_popup_types.decodeEvent(&peer, popup_resource, &message);
+            switch (event) {
+                .configure => |configure| {
+                    try std.testing.expectEqual(@as(i32, 40), configure.x);
+                    try std.testing.expectEqual(@as(i32, 50), configure.y);
+                    try std.testing.expectEqual(@as(i32, 40), configure.width);
+                    try std.testing.expectEqual(@as(i32, 30), configure.height);
+                    popup_configure_order = event_order;
+                },
+                else => {},
+            }
+        } else if (message.object_id == popup_xdg.id) {
+            popup_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                popup_xdg,
+                &message,
+            )).configure.serial;
+            popup_surface_configure_order = event_order;
+        }
+    }
+    try std.testing.expect(popup_configure_order.? < popup_surface_configure_order.?);
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        popup_xdg,
+        popup_serial orelse return error.MissingConfigure,
+    );
+    try generated.wl_surface_types.requests.attach(&peer, popup_surface, popup_buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, popup_surface);
+    try transferToServer(&peer, client);
+    _ = try applyNextCommit(&shell, &compositor);
+    const popup_server_surface = try serverSurface(client, popup_surface.id);
+    const popup_node = tree.find(popup_server_surface) orelse return error.MissingPopupNode;
+    try std.testing.expect(popup_node.current_active);
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 48, .y = 67 }, popup_node.current_position);
+
+    const nested_positioner = try generated.xdg_wm_base_types.requests.create_positioner(&peer, wm_base);
+    try generated.xdg_positioner_types.requests.set_size(&peer, nested_positioner, 10, 8);
+    try generated.xdg_positioner_types.requests.set_anchor_rect(&peer, nested_positioner, 5, 6, 4, 4);
+    try generated.xdg_positioner_types.requests.set_anchor(&peer, nested_positioner, 8);
+    try generated.xdg_positioner_types.requests.set_gravity(&peer, nested_positioner, 8);
+    const nested_surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor_resource,
+    );
+    const nested_xdg = try generated.xdg_wm_base_types.requests.get_xdg_surface(
+        &peer,
+        wm_base,
+        nested_surface,
+    );
+    const nested_popup = try generated.xdg_surface_types.requests.get_popup(
+        &peer,
+        nested_xdg,
+        popup_xdg,
+        nested_positioner,
+    );
+    try generated.xdg_surface_types.requests.set_window_geometry(
+        &peer,
+        nested_xdg,
+        1,
+        1,
+        10,
+        8,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, nested_surface);
+    try transferToServer(&peer, client);
+    _ = try applyNextCommit(&shell, &compositor);
+    try transferFromServer(&peer, client);
+    var nested_serial: ?u32 = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == nested_popup.id) {
+            const configure = (try generated.xdg_popup_types.decodeEvent(
+                &peer,
+                nested_popup,
+                &message,
+            )).configure;
+            try std.testing.expectEqual(@as(i32, 9), configure.x);
+            try std.testing.expectEqual(@as(i32, 10), configure.y);
+        } else if (message.object_id == nested_xdg.id) {
+            nested_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                nested_xdg,
+                &message,
+            )).configure.serial;
+        }
+    }
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        nested_xdg,
+        nested_serial orelse return error.MissingConfigure,
+    );
+    try generated.wl_surface_types.requests.attach(&peer, nested_surface, nested_buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, nested_surface);
+    try transferToServer(&peer, client);
+    _ = try applyNextCommit(&shell, &compositor);
+    const nested_server_surface = try serverSurface(client, nested_surface.id);
+    const nested_node = tree.find(nested_server_surface) orelse return error.MissingNestedNode;
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 10, .y = 12 }, nested_node.current_position);
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 58, .y = 79 }, SurfaceTree.globalPosition(nested_node));
+
+    const repositioner = try generated.xdg_wm_base_types.requests.create_positioner(&peer, wm_base);
+    try generated.xdg_positioner_types.requests.set_size(&peer, repositioner, 40, 30);
+    try generated.xdg_positioner_types.requests.set_anchor_rect(&peer, repositioner, 60, 70, 10, 10);
+    try generated.xdg_positioner_types.requests.set_anchor(&peer, repositioner, 8);
+    try generated.xdg_positioner_types.requests.set_gravity(&peer, repositioner, 8);
+    try generated.xdg_popup_types.requests.reposition(&peer, popup_resource, repositioner, 77);
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var reposition_serial: ?u32 = null;
+    var got_repositioned = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == popup_resource.id) switch (try generated.xdg_popup_types.decodeEvent(
+            &peer,
+            popup_resource,
+            &message,
+        )) {
+            .repositioned => |event| {
+                try std.testing.expectEqual(@as(u32, 77), event.token);
+                got_repositioned = true;
+            },
+            .configure => |configure| {
+                try std.testing.expectEqual(@as(i32, 70), configure.x);
+                try std.testing.expectEqual(@as(i32, 80), configure.y);
+            },
+            else => {},
+        } else if (message.object_id == popup_xdg.id) {
+            reposition_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                popup_xdg,
+                &message,
+            )).configure.serial;
+        }
+    }
+    try std.testing.expect(got_repositioned);
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 48, .y = 67 }, popup_node.current_position);
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        popup_xdg,
+        reposition_serial orelse return error.MissingConfigure,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, popup_surface);
+    try transferToServer(&peer, client);
+    _ = try applyNextCommit(&shell, &compositor);
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 78, .y = 97 }, popup_node.current_position);
+    try std.testing.expectEqual(SurfaceTree.Position{ .x = 88, .y = 109 }, SurfaceTree.globalPosition(nested_node));
+
+    try generated.wl_surface_types.requests.attach(&peer, parent_surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, parent_surface);
+    try transferToServer(&peer, client);
+    _ = try applyNextCommit(&shell, &compositor);
+    try std.testing.expect(!parent_node.current_active);
+    try std.testing.expect(!popup_node.current_active);
+    try std.testing.expect(!nested_node.current_active);
+    try transferFromServer(&peer, client);
+    var done_order: [2]u32 = undefined;
+    var done_count: usize = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != nested_popup.id and message.object_id != popup_resource.id) continue;
+        switch (try generated.xdg_popup_types.decodeEvent(
+            &peer,
+            if (message.object_id == nested_popup.id) nested_popup else popup_resource,
+            &message,
+        )) {
+            .popup_done => {
+                if (done_count < done_order.len) done_order[done_count] = message.object_id;
+                done_count += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), done_count);
+    try std.testing.expectEqual(nested_popup.id, done_order[0]);
+    try std.testing.expectEqual(popup_resource.id, done_order[1]);
+
+    try generated.xdg_popup_types.requests.destroy(&peer, nested_popup);
+    try generated.xdg_surface_types.requests.destroy(&peer, nested_xdg);
+    try generated.wl_surface_types.requests.destroy(&peer, nested_surface);
+    try generated.xdg_popup_types.requests.destroy(&peer, popup_resource);
+    try generated.xdg_surface_types.requests.destroy(&peer, popup_xdg);
+    try generated.wl_surface_types.requests.destroy(&peer, popup_surface);
+    try generated.xdg_toplevel_types.requests.destroy(&peer, parent_toplevel);
+    try generated.xdg_surface_types.requests.destroy(&peer, parent_xdg);
+    try generated.wl_surface_types.requests.destroy(&peer, parent_surface);
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(@as(usize, 0), shell.popups.items.len);
+}
+
+fn applyNextCommit(shell: *XdgShell, compositor: *CompositorGlobal) !CommitResult {
+    var transaction = compositor.popTransaction() orelse return error.MissingCommit;
+    defer {
+        transaction.releaseBuffers();
+        transaction.deinit();
+    }
+    if (transaction.entries.len != 1) return error.UnexpectedTransaction;
+    const result = try shell.handleCommit(&transaction.entries[0]);
+    if (result.direct_update) |update| update.apply();
+    return result;
+}
+
+fn serverSurface(client: *Server.Client, id: u32) !*CompositorGlobal.Surface {
+    const object = client.connection.object(id) orelse return error.MissingSurface;
+    return CompositorGlobal.surfaceFor(client, .{ .id = id, .generation = object.generation });
 }
 
 fn transferToServer(connection: *wayring.Connection, client: *Server.Client) !void {

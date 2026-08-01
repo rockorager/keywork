@@ -86,7 +86,7 @@ fn dispatchSubcompositor(context: *anyopaque, client: *Server.Client, resource: 
             subsurface.* = .{ .owner = self, .resource = undefined, .node = child_node };
             child.setRole(self, subsurface, childRoleDestroyed) catch return badSurface(client, resource, "surface already has a role");
             errdefer child.clearRole(subsurface);
-            self.tree.attach(child_node, parent_node) catch return badParent(client, resource, "invalid subsurface parent");
+            self.tree.attach(child_node, parent_node, .parent) catch return badParent(client, resource, "invalid subsurface parent");
             errdefer self.tree.detach(child_node);
             self.subsurfaces.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
             subsurface.resource = client.createResource(request.id, &generated.wl_subsurface, 1, .{ .context = subsurface, .dispatch = dispatchSubsurface, .destroy = destroySubsurface }) catch return client.postNoMemory();
@@ -151,7 +151,6 @@ fn handleCommit(context: *anyopaque, commit_value: CompositorGlobal.Commit) !voi
         commit.deinit();
     };
     const node = self.tree.nodeFor(commit.surface) catch return error.OutOfMemory;
-    SurfaceTree.activateRoot(node);
     var fragment: Fragment = .{ .allocator = self.allocator };
     var fragment_owned = true;
     defer if (fragment_owned) fragment.deinit();

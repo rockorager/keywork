@@ -142,6 +142,8 @@ const PendingEntry = struct {
     completed: bool = false,
     result: i32 = 0,
     cancel_requested: bool = false,
+    direct_update: ?SurfaceTree.DirectUpdate = null,
+    configure_only: bool = false,
 };
 
 /// Allocates the owner before installing callback contexts, so its address is
@@ -163,7 +165,11 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.surface_tree.deinit();
     try self.subcompositor_global.init(allocator, &self.server, &self.compositor_global, &self.surface_tree);
     errdefer self.subcompositor_global.deinit();
-    try self.xdg_shell.init(allocator, &self.server);
+    try self.xdg_shell.init(allocator, &self.server, &self.surface_tree, .{
+        .context = self,
+        .surface_size = xdgSurfaceSize,
+        .output_bounds = xdgOutputBounds,
+    });
     errdefer self.xdg_shell.deinit();
     self.renderer = try Renderer.init(allocator, options.renderer_kind);
     errdefer self.renderer.deinit();
@@ -422,15 +428,22 @@ fn intakeTransactions(self: *NativeServer) !void {
 }
 
 fn isRootHead(self: *const NativeServer, index: usize) bool {
-    const root = self.pending.items[index].transaction.root;
+    const root = self.retainedRoot(self.pending.items[index].transaction.root);
     for (self.pending.items[0..index]) |earlier|
-        if (earlier.transaction.root == root) return false;
+        if (self.retainedRoot(earlier.transaction.root) == root) return false;
     return true;
 }
 
-fn prepareCommit(self: *NativeServer, commit: *CompositorGlobal.Commit) !bool {
-    const disposition = try self.xdg_shell.handleCommit(commit);
-    return disposition != .configure_only and commit.surface.client.state == .active;
+fn retainedRoot(self: *const NativeServer, surface: *CompositorGlobal.Surface) *CompositorGlobal.Surface {
+    const node = self.surface_tree.find(surface) orelse return surface;
+    return SurfaceTree.root(node).surface;
+}
+
+fn prepareCommit(self: *NativeServer, commit: *CompositorGlobal.Commit, entry: *PendingEntry) !bool {
+    const result = try self.xdg_shell.handleCommit(commit);
+    entry.direct_update = result.direct_update;
+    entry.configure_only = result.disposition == .configure_only;
+    return commit.surface.client.state == .active;
 }
 
 fn isProtocolError(err: anyerror) bool {
@@ -642,7 +655,7 @@ fn progressTransactions(self: *NativeServer) !void {
         var ready = true;
         for (pending.transaction.entries, pending.entries) |*commit, *entry| {
             if (!entry.prepared) {
-                const applicable = self.prepareCommit(commit) catch |err| {
+                const applicable = self.prepareCommit(commit, entry) catch |err| {
                     pending.discarded = true;
                     self.cancelPending(pending) catch {};
                     if (isProtocolError(err)) {
@@ -762,11 +775,22 @@ fn startShmCopy(
 fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+        if (entry.configure_only) continue;
         try self.applyEntry(commit, entry);
     }
     for (pending.transaction.hierarchy_updates) |update| update.apply(update.context);
+    var has_direct_update = false;
+    for (pending.transaction.entries, pending.entries) |*commit, *entry| if (entry.direct_update) |captured| {
+        var update = captured;
+        if (entry.copy_failed and commit.attachment == .buffer) {
+            update.active = false;
+            self.xdg_shell.deactivateFailedBuffer(commit.surface);
+        }
+        update.apply();
+        has_direct_update = true;
+    };
     const damage_state = if (pending.transaction.entries.len == 1 and
-        pending.transaction.hierarchy_updates.len == 0 and
+        pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
         (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
         self.findState(pending.transaction.entries[0].surface)
     else
@@ -978,6 +1002,30 @@ fn findState(self: *const NativeServer, surface: *const CompositorGlobal.Surface
     return null;
 }
 
+fn xdgSurfaceSize(context: *anyopaque, surface: *const CompositorGlobal.Surface) ?render.Size {
+    const self: *const NativeServer = @ptrCast(@alignCast(context));
+    const state = self.findState(surface) orelse return null;
+    const buffer_size = if (state.dmabuf) |dmabuf|
+        dmabuf.buffer.content.dmabuf.size
+    else if (state.snapshot) |*snapshot|
+        snapshot.size
+    else
+        return null;
+    return (surface_geometry.calculate(
+        buffer_size,
+        state.scale,
+        @intCast(state.transform),
+        state.viewport,
+        false,
+    ) catch return null).logical_size;
+}
+
+fn xdgOutputBounds(context: *anyopaque) render.Rect {
+    const self: *const NativeServer = @ptrCast(@alignCast(context));
+    const size = self.output.logicalSize();
+    return .{ .x = 0, .y = 0, .width = size.width, .height = size.height };
+}
+
 fn pruneSurfaces(self: *NativeServer) bool {
     var removed = false;
     var index: usize = 0;
@@ -1083,17 +1131,23 @@ test "buffer damage maps through every surface transform" {
 test "root-head scheduler preserves per-root FIFO and unrelated progress" {
     const root_a: *CompositorGlobal.Surface = @ptrFromInt(0x1000);
     const root_b: *CompositorGlobal.Surface = @ptrFromInt(0x2000);
+    const popup_a: *CompositorGlobal.Surface = @ptrFromInt(0x3000);
     var pending_entries: [3][0]PendingEntry = .{ .{}, .{}, .{} };
     var transaction_entries: [3][0]CompositorGlobal.Commit = .{ .{}, .{}, .{} };
     var transactions = [_]PendingTransaction{
         .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[0], .hierarchy_updates = &.{} }, .entries = &pending_entries[0] },
-        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[1], .hierarchy_updates = &.{} }, .entries = &pending_entries[1] },
+        .{ .transaction = .{ .allocator = std.testing.allocator, .root = popup_a, .entries = &transaction_entries[1], .hierarchy_updates = &.{} }, .entries = &pending_entries[1] },
         .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_b, .entries = &transaction_entries[2], .hierarchy_updates = &.{} }, .entries = &pending_entries[2] },
     };
     var pointers = [_]*PendingTransaction{ &transactions[0], &transactions[1], &transactions[2] };
+    var root_node: SurfaceTree.Node = .{ .surface = root_a };
+    var popup_node: SurfaceTree.Node = .{ .surface = popup_a, .parent = &root_node };
+    var tree_nodes = [_]*SurfaceTree.Node{ &root_node, &popup_node };
     var server: NativeServer = undefined;
     server.pending = .empty;
     server.pending.items = &pointers;
+    server.surface_tree = SurfaceTree.init(std.testing.allocator);
+    server.surface_tree.nodes.items = &tree_nodes;
 
     try std.testing.expect(server.isRootHead(0));
     try std.testing.expect(!server.isRootHead(1));

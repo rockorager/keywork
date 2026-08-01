@@ -12,6 +12,7 @@ nodes: std.ArrayList(*Node) = .empty,
 redraw_needed: bool = false,
 
 pub const Position = struct { x: i32 = 0, y: i32 = 0 };
+pub const CommitMode = enum { parent, own };
 
 pub const Node = struct {
     surface: *Surface,
@@ -25,6 +26,7 @@ pub const Node = struct {
     current_active: bool = false,
     pending_active: bool = false,
     link_serial: u64 = 0,
+    commit_mode: CommitMode = .own,
 };
 
 pub const CapturedRelation = struct {
@@ -65,6 +67,24 @@ pub const Update = struct {
 
 pub const PaintEntry = struct { surface: *Surface, x: i32, y: i32 };
 
+pub const DirectUpdate = struct {
+    node: *Node,
+    parent: ?*Node,
+    link_serial: u64,
+    position: Position,
+    active: bool,
+
+    pub fn apply(self: DirectUpdate) void {
+        if (self.node.parent != self.parent or self.node.link_serial != self.link_serial) return;
+        if (self.parent) |parent| {
+            if (std.mem.indexOfScalar(*Node, parent.current_children.items, self.node) == null)
+                parent.current_children.appendAssumeCapacity(self.node);
+        }
+        self.node.current_position = self.position;
+        self.node.current_active = self.active;
+    }
+};
+
 pub fn init(allocator: std.mem.Allocator) SurfaceTree {
     return .{ .allocator = allocator };
 }
@@ -102,18 +122,29 @@ pub fn root(node: *Node) *Node {
     return result;
 }
 
+pub fn globalPosition(node: *const Node) Position {
+    var position: Position = .{};
+    var cursor: ?*const Node = node;
+    while (cursor) |current| : (cursor = current.parent) {
+        position.x +|= current.current_position.x;
+        position.y +|= current.current_position.y;
+    }
+    return position;
+}
+
 pub fn wouldCycle(child: *Node, parent: *Node) bool {
     var cursor: ?*Node = parent;
     while (cursor) |node| : (cursor = node.parent) if (node == child) return true;
     return false;
 }
 
-pub fn attach(self: *SurfaceTree, child: *Node, parent: *Node) !void {
+pub fn attach(self: *SurfaceTree, child: *Node, parent: *Node, commit_mode: CommitMode) !void {
     if (child == parent or child.parent != null or wouldCycle(child, parent)) return error.InvalidParent;
     try parent.pending_children.append(self.allocator, child);
     self.redraw_needed = self.redraw_needed or child.current_active;
     child.link_serial +%= 1;
     child.parent = parent;
+    child.commit_mode = commit_mode;
     child.pending_active = false;
     child.current_active = false;
 }
@@ -160,14 +191,29 @@ pub fn capture(self: *SurfaceTree, parent: *Node) !Update {
     for (children, relations) |child, *relation| {
         relation.* = .{
             .node = child,
-            .position = child.pending_position,
-            .active = true,
+            .position = if (child.commit_mode == .parent)
+                child.pending_position
+            else
+                child.current_position,
+            .active = if (child.commit_mode == .parent) true else child.current_active,
             .link_serial = child.link_serial,
         };
-        child.pending_active = true;
+        if (child.commit_mode == .parent) child.pending_active = true;
     }
     try parent.current_children.ensureTotalCapacity(self.allocator, children.len);
     return .{ .allocator = self.allocator, .parent = parent, .children = children, .marker = parent.pending_marker, .relations = relations };
+}
+
+pub fn captureDirect(self: *SurfaceTree, node: *Node, position: Position, active: bool) !DirectUpdate {
+    if (node.parent) |parent|
+        try parent.current_children.ensureTotalCapacity(self.allocator, parent.pending_children.items.len);
+    return .{
+        .node = node,
+        .parent = node.parent,
+        .link_serial = node.link_serial,
+        .position = position,
+        .active = active,
+    };
 }
 
 pub fn detach(self: *SurfaceTree, node: *Node) void {
@@ -178,6 +224,7 @@ pub fn detach(self: *SurfaceTree, node: *Node) void {
     }
     node.link_serial +%= 1;
     node.parent = null;
+    node.commit_mode = .own;
     node.current_position = .{};
     node.pending_position = .{};
     self.deactivate(node);
@@ -189,6 +236,12 @@ pub fn needsRedraw(self: *const SurfaceTree) bool {
 
 pub fn redrawHandled(self: *SurfaceTree) void {
     self.redraw_needed = false;
+}
+
+pub fn deactivateNow(self: *SurfaceTree, node: *Node) void {
+    self.redraw_needed = self.redraw_needed or node.current_active;
+    node.link_serial +%= 1;
+    self.deactivate(node);
 }
 
 fn deactivate(self: *SurfaceTree, node: *Node) void {
@@ -262,7 +315,13 @@ test "capture is immediate allocation-free apply and nested paint accumulates co
     var tree = init(std.testing.allocator);
     defer tree.nodes.deinit(std.testing.allocator);
     var parent: Node = .{ .surface = surface, .current_active = true };
-    var child: Node = .{ .surface = @ptrFromInt(0x2000), .parent = &parent, .pending_position = .{ .x = 3, .y = 5 }, .current_active = false };
+    var child: Node = .{
+        .surface = @ptrFromInt(0x2000),
+        .parent = &parent,
+        .pending_position = .{ .x = 3, .y = 5 },
+        .current_active = false,
+        .commit_mode = .parent,
+    };
     var grandchild: Node = .{ .surface = @ptrFromInt(0x3000), .parent = &child, .current_position = .{ .x = 7, .y = 11 }, .current_active = true };
     defer parent.pending_children.deinit(std.testing.allocator);
     defer parent.current_children.deinit(std.testing.allocator);
@@ -288,4 +347,101 @@ test "root and cycle detection follow pending ancestry" {
     try std.testing.expect(root(&grandchild) == &parent);
     try std.testing.expect(wouldCycle(&parent, &grandchild));
     try std.testing.expect(!wouldCycle(&grandchild, &parent));
+}
+
+test "parent capture applies subsurfaces without disturbing own-commit popups" {
+    var tree = init(std.testing.allocator);
+    defer tree.nodes.deinit(std.testing.allocator);
+    var parent: Node = .{ .surface = @ptrFromInt(0x1000), .current_active = true };
+    var subsurface: Node = .{
+        .surface = @ptrFromInt(0x2000),
+        .parent = &parent,
+        .pending_position = .{ .x = 7, .y = 9 },
+        .commit_mode = .parent,
+    };
+    var popup: Node = .{
+        .surface = @ptrFromInt(0x3000),
+        .parent = &parent,
+        .current_position = .{ .x = 11, .y = 13 },
+        .pending_position = .{ .x = 101, .y = 103 },
+        .current_active = true,
+        .commit_mode = .own,
+    };
+    defer parent.pending_children.deinit(std.testing.allocator);
+    defer parent.current_children.deinit(std.testing.allocator);
+    try parent.pending_children.append(std.testing.allocator, &subsurface);
+    try parent.pending_children.append(std.testing.allocator, &popup);
+
+    var update = try tree.capture(&parent);
+    defer update.deinit();
+    update.apply();
+
+    try std.testing.expectEqual(Position{ .x = 7, .y = 9 }, subsurface.current_position);
+    try std.testing.expect(subsurface.current_active);
+    try std.testing.expectEqual(Position{ .x = 11, .y = 13 }, popup.current_position);
+    try std.testing.expect(popup.current_active);
+}
+
+test "direct updates reserve shared capacity and reject stale hierarchy generations" {
+    var tree = init(std.testing.allocator);
+    defer tree.nodes.deinit(std.testing.allocator);
+    var parent: Node = .{ .surface = @ptrFromInt(0x1000), .current_active = true };
+    var first: Node = .{ .surface = @ptrFromInt(0x2000), .parent = &parent, .link_serial = 1 };
+    var second: Node = .{ .surface = @ptrFromInt(0x3000), .parent = &parent, .link_serial = 1 };
+    defer parent.pending_children.deinit(std.testing.allocator);
+    defer parent.current_children.deinit(std.testing.allocator);
+    try parent.pending_children.append(std.testing.allocator, &first);
+    try parent.pending_children.append(std.testing.allocator, &second);
+
+    const first_update = try tree.captureDirect(&first, .{ .x = 2, .y = 3 }, true);
+    const second_update = try tree.captureDirect(&second, .{ .x = 5, .y = 7 }, true);
+    first_update.apply();
+    second_update.apply();
+    try std.testing.expectEqualSlices(*Node, &.{ &first, &second }, parent.current_children.items);
+
+    const stale = try tree.captureDirect(&first, .{ .x = 17, .y = 19 }, false);
+    tree.deactivateNow(&first);
+    stale.apply();
+    try std.testing.expectEqual(Position{ .x = 2, .y = 3 }, first.current_position);
+    try std.testing.expect(!first.current_active);
+}
+
+test "captured parent updates cannot reactivate invalidated own-commit children" {
+    var tree = init(std.testing.allocator);
+    defer tree.nodes.deinit(std.testing.allocator);
+    var parent: Node = .{ .surface = @ptrFromInt(0x1000), .current_active = true };
+    var popup: Node = .{
+        .surface = @ptrFromInt(0x2000),
+        .parent = &parent,
+        .current_active = true,
+        .commit_mode = .own,
+        .link_serial = 1,
+    };
+    defer parent.pending_children.deinit(std.testing.allocator);
+    defer parent.current_children.deinit(std.testing.allocator);
+    try parent.pending_children.append(std.testing.allocator, &popup);
+    try parent.current_children.append(std.testing.allocator, &popup);
+
+    var update = try tree.capture(&parent);
+    defer update.deinit();
+    tree.deactivateNow(&popup);
+    update.apply();
+
+    try std.testing.expect(!popup.current_active);
+    try std.testing.expectEqual(@as(usize, 0), parent.current_children.items.len);
+}
+
+test "inactive roots suppress active descendants" {
+    var root_node: Node = .{ .surface = @ptrFromInt(0x1000), .current_active = false };
+    var child: Node = .{
+        .surface = @ptrFromInt(0x2000),
+        .parent = &root_node,
+        .current_active = true,
+    };
+    defer root_node.current_children.deinit(std.testing.allocator);
+    try root_node.current_children.append(std.testing.allocator, &child);
+    var entries: std.ArrayList(PaintEntry) = .empty;
+    defer entries.deinit(std.testing.allocator);
+    try paintRecursive(&root_node, 0, 0, &entries, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), entries.items.len);
 }
