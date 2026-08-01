@@ -163,9 +163,6 @@ const SurfaceState = struct {
     // remains vsync-only while retaining this future policy input.
     presentation_hint: CompositorGlobal.PresentationHint = .vsync,
     fifo_barrier: bool = false,
-    // Native currently owns one output, so this is the barrier's output
-    // association rather than a separate output pointer.
-    fifo_barrier_visible: bool = false,
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -2025,11 +2022,10 @@ fn fifoWaitReady(
     return !state.fifo_barrier;
 }
 
-fn clearVisibleFifoBarriers(self: *NativeServer) void {
+fn clearFifoBarriers(self: *NativeServer) void {
     for (self.surfaces.items) |state| {
-        if (!state.fifo_barrier or !state.fifo_barrier_visible) continue;
+        if (!state.fifo_barrier) continue;
         state.fifo_barrier = false;
-        state.fifo_barrier_visible = false;
         self.fifo_progress_needed = true;
     }
 }
@@ -2091,7 +2087,6 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         if (commit.fifo_set) {
             const state = self.findState(commit.surface) orelse unreachable;
             state.fifo_barrier = true;
-            state.fifo_barrier_visible = false;
         }
         if (entry.configure_only) continue;
         try self.applyEntry(commit, entry);
@@ -2288,7 +2283,6 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             state.viewport,
             false,
         ) catch continue;
-        if (state.fifo_barrier) state.fifo_barrier_visible = true;
         const image_x = paint_entry.x +| state.x;
         const image_y = paint_entry.y +| state.y;
         const force_opaque = if (pixel_buffer.dmabuf) |source|
@@ -2382,7 +2376,9 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             self.output_busy_retries = 0;
         },
     }
-    self.clearVisibleFifoBarriers();
+    // Ignoring barriers for surfaces absent from this frame prevents an
+    // unmapped set->wait sequence from blocking its first buffer forever.
+    self.clearFifoBarriers();
     self.submitPendingPresentation();
     self.repaint_needed = false;
     self.surface_tree.redrawHandled();
@@ -2697,34 +2693,31 @@ test "root-head scheduler preserves per-root FIFO and unrelated progress" {
     try std.testing.expect(server.isRootHead(2));
 }
 
-test "native FIFO barriers gate waits and wake progress only after visible clear" {
-    var blocked_surface: CompositorGlobal.Surface = undefined;
-    var unrelated_surface: CompositorGlobal.Surface = undefined;
+test "native accepted frames clear mapped and configure-only FIFO barriers" {
+    var mapped_surface: CompositorGlobal.Surface = undefined;
+    var configure_only_surface: CompositorGlobal.Surface = undefined;
     var missing_surface: CompositorGlobal.Surface = undefined;
-    var blocked_state: SurfaceState = undefined;
-    blocked_state.surface = &blocked_surface;
-    blocked_state.fifo_barrier = true;
-    blocked_state.fifo_barrier_visible = false;
-    var unrelated_state: SurfaceState = undefined;
-    unrelated_state.surface = &unrelated_surface;
-    unrelated_state.fifo_barrier = true;
-    unrelated_state.fifo_barrier_visible = false;
+    var mapped_state: SurfaceState = undefined;
+    mapped_state.surface = &mapped_surface;
+    mapped_state.fifo_barrier = true;
+    var configure_only_state: SurfaceState = undefined;
+    configure_only_state.surface = &configure_only_surface;
+    configure_only_state.fifo_barrier = true;
 
     var server: NativeServer = undefined;
     server.surfaces = .empty;
     defer server.surfaces.deinit(std.testing.allocator);
-    try server.surfaces.append(std.testing.allocator, &blocked_state);
-    try server.surfaces.append(std.testing.allocator, &unrelated_state);
+    try server.surfaces.append(std.testing.allocator, &mapped_state);
+    try server.surfaces.append(std.testing.allocator, &configure_only_state);
     server.fifo_progress_needed = false;
 
-    try std.testing.expect(!server.fifoWaitReady(&blocked_surface));
-    try std.testing.expect(!server.fifoWaitReady(&unrelated_surface));
+    try std.testing.expect(!server.fifoWaitReady(&mapped_surface));
+    try std.testing.expect(!server.fifoWaitReady(&configure_only_surface));
     try std.testing.expect(server.fifoWaitReady(&missing_surface));
 
-    blocked_state.fifo_barrier_visible = true;
-    server.clearVisibleFifoBarriers();
-    try std.testing.expect(server.fifoWaitReady(&blocked_surface));
-    try std.testing.expect(!server.fifoWaitReady(&unrelated_surface));
+    server.clearFifoBarriers();
+    try std.testing.expect(server.fifoWaitReady(&mapped_surface));
+    try std.testing.expect(server.fifoWaitReady(&configure_only_surface));
     try std.testing.expect(server.fifo_progress_needed);
 }
 
