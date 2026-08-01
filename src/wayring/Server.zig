@@ -266,6 +266,17 @@ pub const Client = struct {
         return resource.implementation.context;
     }
 
+    pub fn resourceVersion(
+        self: *const Client,
+        handle: wayring.ObjectHandle,
+        interface: *const wayring.Interface,
+    ) !u32 {
+        const resource = self.resources.get(handle.id) orelse return error.UnknownResource;
+        if (resource.handle.generation != handle.generation) return error.StaleObject;
+        if (resource.interface != interface) return error.WrongInterface;
+        return resource.version;
+    }
+
     /// Queues a protocol-defined error and marks the client for deferred
     /// disconnect once the transport has flushed pending output.
     pub fn postError(
@@ -277,6 +288,10 @@ pub const Client = struct {
         const registered = self.resources.get(resource.id) orelse return error.UnknownResource;
         if (registered.handle.generation != resource.generation) return error.StaleObject;
         return self.protocolError(resource.id, code, text);
+    }
+
+    pub fn postNoMemory(self: *Client) anyerror!void {
+        return self.protocolError(1, 2, "out of memory");
     }
 
     pub fn destroyResource(self: *Client, handle: wayring.ObjectHandle) !void {

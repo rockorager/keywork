@@ -122,6 +122,11 @@ pub const Buffer = struct {
         self.* = undefined;
     }
 
+    pub fn clone(self: Buffer) !Buffer {
+        try self.pool.reference();
+        return self;
+    }
+
     pub fn size(self: Buffer) render.Size {
         return .{ .width = self.width, .height = self.height };
     }
