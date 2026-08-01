@@ -151,8 +151,9 @@ pub const Buffer = struct {
 };
 
 /// Owns a validated destination and the positional byte ranges needed to
-/// produce one snapshot. Adapters may submit every range independently, but
-/// must call `finish` only after each range was read in full.
+/// produce one snapshot. Physically contiguous rows are coalesced so adapters
+/// can submit them as one operation, but `finish` remains valid only after
+/// every range was read in full.
 pub const CopyPlan = struct {
     allocator: std.mem.Allocator,
     buffer: Buffer,
@@ -191,11 +192,18 @@ pub const CopyPlan = struct {
 
         const read_count: usize = if (partial) blk: {
             var count: usize = 0;
-            for (source_damage.?) |rectangle|
-                count = std.math.add(usize, count, rectangle.height) catch
+            for (source_damage.?) |rectangle| {
+                const rectangle_reads: usize = if (contiguousRectangle(self, rectangle)) 1 else rectangle.height;
+                count = std.math.add(usize, count, rectangle_reads) catch
                     return error.InvalidBuffer;
+            }
             break :blk count;
-        } else self.height;
+        } else if (contiguousRectangle(self, .{
+            .x = 0,
+            .y = 0,
+            .width = self.width,
+            .height = self.height,
+        })) 1 else self.height;
         const reads = try allocator.alloc(Read, read_count);
         errdefer allocator.free(reads);
         var index: usize = 0;
@@ -264,6 +272,23 @@ fn appendRectangleReads(
     std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
     const x: usize = @intCast(rectangle.x);
     const y: usize = @intCast(rectangle.y);
+    if (contiguousRectangle(buffer, rectangle)) {
+        const source_row = std.math.mul(usize, y, buffer.stride) catch
+            return error.InvalidBuffer;
+        const source_offset = std.math.add(usize, buffer.offset, source_row) catch
+            return error.InvalidBuffer;
+        const destination_offset = std.math.mul(usize, y, buffer.width) catch
+            return error.InvalidBuffer;
+        const pixel_count = std.math.mul(usize, rectangle.width, rectangle.height) catch
+            return error.InvalidBuffer;
+        reads[start_index] = .{
+            .offset = source_offset,
+            .destination = std.mem.sliceAsBytes(
+                pixels[destination_offset..][0..pixel_count],
+            ),
+        };
+        return start_index + 1;
+    }
     var index = start_index;
     for (0..rectangle.height) |row| {
         const source_row = std.math.mul(usize, y + row, buffer.stride) catch
@@ -284,6 +309,13 @@ fn appendRectangleReads(
         index += 1;
     }
     return index;
+}
+
+fn contiguousRectangle(buffer: Buffer, rectangle: render.Rect) bool {
+    if (rectangle.x != 0 or rectangle.width != buffer.width) return false;
+    const byte_count = std.math.mul(usize, rectangle.height, buffer.stride) catch return false;
+    return buffer.stride == @as(usize, buffer.width) * @sizeOf(u32) and
+        byte_count <= std.math.maxInt(u32);
 }
 
 pub const Snapshot = struct {
@@ -389,7 +421,7 @@ test "buffer geometry and pool growth are validated" {
     try std.testing.expectEqual(@as(usize, 128), pool.size);
 }
 
-test "copy updates only damaged pixels and reports source damage" {
+test "copy coalesces tight full rows and updates only damaged pixels" {
     const ReadContext = struct {
         bytes: []const u8,
         calls: usize = 0,
@@ -434,7 +466,7 @@ test "copy updates only damaged pixels and reports source damage" {
     defer updated.deinit();
     try std.testing.expectEqualSlices(u32, &source, updated.pixels);
     try std.testing.expectEqualSlices(render.Rect, &damage, updated.source_damage.?);
-    try std.testing.expectEqual(@as(usize, 4), reader_context.calls);
+    try std.testing.expectEqual(@as(usize, 3), reader_context.calls);
 }
 
 test "short backing reads fail without memory mapping" {
