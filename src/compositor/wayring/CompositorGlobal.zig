@@ -18,7 +18,7 @@ const advertised_version: u32 = 6;
 allocator: std.mem.Allocator,
 server: *Server,
 global_name: u32,
-commits: std.ArrayList(Commit) = .empty,
+transactions: std.ArrayList(Transaction) = .empty,
 
 pub const BufferAttachment = struct {
     resource: wayring.ObjectHandle,
@@ -104,6 +104,24 @@ pub const Commit = struct {
 
     pub fn releaseBuffer(self: *Commit) !void {
         try self.attachment.releaseBuffer(self.surface.client);
+    }
+};
+
+/// An owned atomic surface-state update. Entries are independently prepared,
+/// but are applied and presented together.
+pub const Transaction = struct {
+    allocator: std.mem.Allocator,
+    root: *Surface,
+    entries: []Commit,
+
+    pub fn deinit(self: *Transaction) void {
+        for (self.entries) |*commit| commit.deinit();
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    pub fn releaseBuffers(self: *Transaction) void {
+        for (self.entries) |*commit| commit.releaseBuffer() catch {};
     }
 };
 
@@ -228,14 +246,14 @@ pub fn init(self: *CompositorGlobal, allocator: std.mem.Allocator, server: *Serv
 
 pub fn deinit(self: *CompositorGlobal) void {
     self.server.removeGlobal(self.global_name) catch unreachable;
-    for (self.commits.items) |*commit| commit.deinit();
-    self.commits.deinit(self.allocator);
+    for (self.transactions.items) |*transaction| transaction.deinit();
+    self.transactions.deinit(self.allocator);
     self.* = undefined;
 }
 
-pub fn popCommit(self: *CompositorGlobal) ?Commit {
-    if (self.commits.items.len == 0) return null;
-    return self.commits.orderedRemove(0);
+pub fn popTransaction(self: *CompositorGlobal) ?Transaction {
+    if (self.transactions.items.len == 0) return null;
+    return self.transactions.orderedRemove(0);
 }
 
 pub fn surfaceFor(
@@ -445,8 +463,11 @@ fn queueCommit(surface: *Surface) !void {
     if (surface.explicit_sync_handler) |handler| {
         if (!handler.validate_commit(handler.context, attachment_kind)) return;
     }
-    owner.commits.ensureUnusedCapacity(owner.allocator, 1) catch
+    owner.transactions.ensureUnusedCapacity(owner.allocator, 1) catch
         return surface.client.postNoMemory();
+    const entries = owner.allocator.alloc(Commit, 1) catch
+        return surface.client.postNoMemory();
+    errdefer owner.allocator.free(entries);
     const surface_damage = owner.allocator.dupe(
         render.Rect,
         surface.pending_surface_damage.items,
@@ -479,7 +500,7 @@ fn queueCommit(surface: *Surface) !void {
         if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
     else
         null;
-    owner.commits.appendAssumeCapacity(.{
+    entries[0] = .{
         .allocator = owner.allocator,
         .surface = surface,
         .attachment = attachment,
@@ -492,6 +513,11 @@ fn queueCommit(surface: *Surface) !void {
         .offset_y = surface.current_offset_y,
         .viewport = surface.current_viewport,
         .synchronization = synchronization,
+    };
+    owner.transactions.appendAssumeCapacity(.{
+        .allocator = owner.allocator,
+        .root = surface,
+        .entries = entries,
     });
 }
 
@@ -654,8 +680,9 @@ test "native surfaces queue atomic damage-aware SHM commits" {
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToServer(&peer, client);
 
-    var commit = compositor.popCommit() orelse return error.MissingCommit;
-    defer commit.deinit();
+    var transaction = compositor.popTransaction() orelse return error.MissingCommit;
+    defer transaction.deinit();
+    const commit = &transaction.entries[0];
     try std.testing.expectEqual(surface.id, commit.surface.resource.id);
     try std.testing.expectEqualSlices(
         render.Rect,

@@ -570,11 +570,12 @@ test "native xdg toplevel enforces the initial configure barrier" {
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToServer(&peer, client);
 
-    var initial = compositor.popCommit() orelse return error.MissingCommit;
-    defer initial.deinit();
+    var initial_transaction = compositor.popTransaction() orelse return error.MissingCommit;
+    defer initial_transaction.deinit();
+    const initial = &initial_transaction.entries[0];
     try std.testing.expectEqual(
         CommitDisposition.configure_only,
-        try shell.handleCommit(&initial),
+        try shell.handleCommit(initial),
     );
     try transferFromServer(&peer, client);
     var configure_serial: ?u32 = null;
@@ -598,9 +599,12 @@ test "native xdg toplevel enforces the initial configure barrier" {
     );
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToServer(&peer, client);
-    var configured = compositor.popCommit() orelse return error.MissingCommit;
-    defer configured.deinit();
-    try std.testing.expectEqual(CommitDisposition.render, try shell.handleCommit(&configured));
+    var configured_transaction = compositor.popTransaction() orelse return error.MissingCommit;
+    defer configured_transaction.deinit();
+    try std.testing.expectEqual(
+        CommitDisposition.render,
+        try shell.handleCommit(&configured_transaction.entries[0]),
+    );
 }
 
 fn transferToServer(connection: *wayring.Connection, client: *Server.Client) !void {
