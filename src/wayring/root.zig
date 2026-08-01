@@ -23,6 +23,9 @@ pub const ArgumentSpec = struct {
     /// XML declaration metadata. These do not affect wire encoding.
     name: ?[]const u8 = null,
     interface_name: ?[]const u8 = null,
+    /// Resolved target for generated `new_id` arguments. This lets a client
+    /// retain wire metadata for children announced to a destroyed object.
+    new_id_interface: ?*const Interface = null,
     enum_name: ?[]const u8 = null,
     /// Wayland strings are normally protocol text and therefore UTF-8. Set
     /// false only for a protocol contract which explicitly carries bytes.
@@ -140,6 +143,7 @@ pub const Connection = struct {
     role: Role,
     max_frame_size: usize,
     objects: std.AutoHashMapUnmanaged(u32, Object) = .empty,
+    zombies: std.AutoHashMapUnmanaged(u32, Object) = .empty,
     next_generation: u64 = 1,
     next_client_object_id: u32 = first_client_object_id,
     free_client_object_ids: std.ArrayList(u32) = .empty,
@@ -167,6 +171,7 @@ pub const Connection = struct {
         }
         self.outbound.deinit(self.allocator);
         self.free_client_object_ids.deinit(self.allocator);
+        self.zombies.deinit(self.allocator);
         self.objects.deinit(self.allocator);
         self.* = undefined;
     }
@@ -180,7 +185,7 @@ pub const Connection = struct {
         while (self.free_client_object_ids.pop()) |id| {
             // Manual registration may have occupied an ID after it was
             // released. Such an ID leaves allocator ownership permanently.
-            if (self.objects.contains(id)) continue;
+            if (self.objects.contains(id) or self.zombies.contains(id)) continue;
             const generation = self.registerObject(id, interface, version) catch |err| {
                 self.free_client_object_ids.appendAssumeCapacity(id);
                 return err;
@@ -190,7 +195,7 @@ pub const Connection = struct {
 
         while (self.next_client_object_id < server_object_id_start) {
             const id = self.next_client_object_id;
-            if (self.objects.contains(id)) {
+            if (self.objects.contains(id) or self.zombies.contains(id)) {
                 self.next_client_object_id += 1;
                 continue;
             }
@@ -215,25 +220,35 @@ pub const Connection = struct {
         self.free_client_object_ids.appendAssumeCapacity(handle.id);
     }
 
-    /// Makes a destroyed client-created ID reusable after the server confirms
-    /// it with `wl_display.delete_id`. The object must already have been
-    /// removed by its destructor request or event.
+    /// Makes a client-created ID reusable after authoritative confirmation
+    /// from `wl_display.delete_id`. Active and zombie metadata are both
+    /// retired here because the event may race with local teardown.
     pub fn releaseClientObjectId(self: *Connection, id: u32) !void {
         if (self.role != .client) return error.InvalidRole;
         if (id < first_client_object_id or id >= self.next_client_object_id)
             return error.InvalidObject;
-        if (self.objects.contains(id)) return error.ObjectStillRegistered;
         if (std.mem.indexOfScalar(u32, self.free_client_object_ids.items, id) != null)
             return error.ObjectIdAlreadyReleased;
-        try self.free_client_object_ids.append(self.allocator, id);
+        try self.free_client_object_ids.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.objects.remove(id);
+        _ = self.zombies.remove(id);
+        self.free_client_object_ids.appendAssumeCapacity(id);
     }
 
     pub fn registerObject(self: *Connection, id: u32, interface: *const Interface, version: u32) !u64 {
         if (id == 0 or version == 0 or version > interface.version) return error.InvalidObject;
-        if (self.objects.contains(id)) return error.ObjectExists;
         if (self.next_generation == std.math.maxInt(u64)) return error.GenerationExhausted;
+        if (self.objects.contains(id)) return error.ObjectExists;
+        const replaces_server_zombie = self.role == .client and id >= server_object_id_start;
+        if (self.zombies.contains(id) and !replaces_server_zombie) return error.ObjectExists;
+        try self.objects.ensureUnusedCapacity(self.allocator, 1);
+        if (replaces_server_zombie) _ = self.zombies.remove(id);
         const generation = self.next_generation;
-        try self.objects.put(self.allocator, id, .{ .interface = interface, .version = version, .generation = generation });
+        self.objects.putAssumeCapacity(id, .{
+            .interface = interface,
+            .version = version,
+            .generation = generation,
+        });
         self.next_generation += 1;
         return generation;
     }
@@ -242,6 +257,15 @@ pub const Connection = struct {
         const registered = self.objects.get(id) orelse return error.UnknownObject;
         if (generation) |expected| if (expected != registered.generation) return error.StaleObject;
         _ = self.objects.remove(id);
+    }
+
+    /// Stops exposing a server-known client object while retaining enough
+    /// protocol metadata to parse and discard events until `delete_id`.
+    pub fn retireObject(self: *Connection, handle: ObjectHandle) !void {
+        if (self.role != .client) return error.InvalidRole;
+        const registered = try self.objectForHandleAny(handle);
+        try self.prepareRetirement(handle.id);
+        self.finishRetirement(handle.id, registered);
     }
 
     pub fn object(self: *const Connection, id: u32) ?Object {
@@ -279,8 +303,12 @@ pub const Connection = struct {
     }
 
     pub fn popMessage(self: *Connection) ?Message {
-        if (self.messages.items.len == 0) return null;
-        return self.messages.orderedRemove(0);
+        while (self.messages.items.len != 0) {
+            var message = self.messages.orderedRemove(0);
+            if (!self.zombies.contains(message.object_id)) return message;
+            message.deinit();
+        }
+        return null;
     }
 
     /// Resumes parsing after a consumer registers every object introduced by
@@ -299,7 +327,9 @@ pub const Connection = struct {
             if (size < 8) return error.InvalidFrameSize;
             if (size & 3 != 0) return error.UnalignedFrame;
             if (size > self.max_frame_size or size > std.math.maxInt(u16)) return error.FrameTooLarge;
-            const registered = self.objects.get(object_id) orelse return error.UnknownObject;
+            const registered = self.objects.get(object_id) orelse
+                self.zombies.get(object_id) orelse return error.UnknownObject;
+            const zombie = self.zombies.contains(object_id);
             const descriptor = registered.interface.incoming(self.role, opcode) orelse return error.UnknownOpcode;
             if (descriptor.since > registered.version) return error.UnsupportedVersion;
             if (self.input.items.len < size) return;
@@ -308,6 +338,22 @@ pub const Connection = struct {
             // lets a later feed supply descriptors without desynchronization.
             try validatePayload(descriptor, self.input.items[8..size]);
             if (self.input_fds.items.len < fd_count) return;
+
+            if (zombie) {
+                const values = try decodePayload(
+                    self.allocator,
+                    descriptor,
+                    self.input.items[8..size],
+                );
+                defer self.allocator.free(values);
+                try self.registerZombieChildren(registered, descriptor, values);
+                closeAll(self.input_fds.items[0..fd_count]);
+                consumeFront(u8, &self.input, size);
+                consumeFront(i32, &self.input_fds, fd_count);
+                if (descriptor.destructor and object_id >= server_object_id_start)
+                    _ = self.zombies.remove(object_id);
+                continue;
+            }
 
             const payload = try self.allocator.dupe(u8, self.input.items[8..size]);
             errdefer self.allocator.free(payload);
@@ -361,6 +407,102 @@ pub const Connection = struct {
     pub fn queueObject(self: *Connection, handle: ObjectHandle, interface: *const Interface, opcode: u16, values: []const OutValue) !void {
         _ = try self.objectForHandle(handle, interface);
         try self.queue(handle.id, opcode, values);
+    }
+
+    /// Queues a client destructor and atomically moves its target to the
+    /// zombie table. Capacity is reserved before descriptor ownership can
+    /// transfer to the outbound queue.
+    pub fn queueDestructorObject(self: *Connection, handle: ObjectHandle, interface: *const Interface, opcode: u16, values: []const OutValue) !void {
+        if (self.role != .client) return error.InvalidRole;
+        const registered = try self.objectForHandle(handle, interface);
+        try self.prepareRetirement(handle.id);
+        try self.queue(handle.id, opcode, values);
+        self.finishRetirement(handle.id, registered);
+    }
+
+    fn retireObjectAssumeCapacity(self: *Connection, id: u32, object_value: Object) void {
+        std.debug.assert(!self.zombies.contains(id));
+        _ = self.objects.remove(id);
+        self.zombies.putAssumeCapacity(id, object_value);
+    }
+
+    fn prepareRetirement(self: *Connection, id: u32) !void {
+        var child_count: u32 = 0;
+        for (self.messages.items) |message| {
+            if (message.object_id != id) continue;
+            child_count = std.math.add(
+                u32,
+                child_count,
+                try self.validateZombieChildren(message.descriptor, message.values),
+            ) catch return error.TooManyObjects;
+        }
+        if (@as(u64, child_count) > std.math.maxInt(u64) - self.next_generation)
+            return error.GenerationExhausted;
+        const capacity = std.math.add(u32, child_count, 1) catch
+            return error.TooManyObjects;
+        try self.zombies.ensureUnusedCapacity(self.allocator, capacity);
+    }
+
+    fn finishRetirement(self: *Connection, id: u32, parent: Object) void {
+        var index: usize = 0;
+        while (index < self.messages.items.len) {
+            if (self.messages.items[index].object_id != id) {
+                index += 1;
+                continue;
+            }
+            self.insertZombieChildren(
+                parent,
+                self.messages.items[index].descriptor,
+                self.messages.items[index].values,
+            );
+            var message = self.messages.orderedRemove(index);
+            message.deinit();
+        }
+        self.retireObjectAssumeCapacity(id, parent);
+    }
+
+    fn registerZombieChildren(self: *Connection, parent: Object, descriptor: *const MessageDescriptor, values: []const Value) !void {
+        const count = try self.validateZombieChildren(descriptor, values);
+        if (count == 0) return;
+        if (@as(u64, count) > std.math.maxInt(u64) - self.next_generation)
+            return error.GenerationExhausted;
+        try self.zombies.ensureUnusedCapacity(self.allocator, count);
+        self.insertZombieChildren(parent, descriptor, values);
+    }
+
+    fn validateZombieChildren(self: *const Connection, descriptor: *const MessageDescriptor, values: []const Value) !u32 {
+        var count: u32 = 0;
+        for (descriptor.args, values, 0..) |argument, value, index| {
+            if (argument.kind != .new_id) continue;
+            const id = value.new_id;
+            if (argument.new_id_interface == null) return error.UnresolvedZombieConstructor;
+            if (self.objects.contains(id)) return error.ObjectExists;
+            if (self.zombies.contains(id) and
+                !(self.role == .client and id >= server_object_id_start))
+            {
+                return error.ObjectExists;
+            }
+            for (descriptor.args[0..index], values[0..index]) |prior_argument, prior_value| {
+                if (prior_argument.kind == .new_id and prior_value.new_id == id)
+                    return error.ObjectExists;
+            }
+            count = std.math.add(u32, count, 1) catch return error.TooManyObjects;
+        }
+        return count;
+    }
+
+    fn insertZombieChildren(self: *Connection, parent: Object, descriptor: *const MessageDescriptor, values: []const Value) void {
+        for (descriptor.args, values) |argument, value| {
+            if (argument.kind != .new_id) continue;
+            const interface = argument.new_id_interface.?;
+            if (value.new_id >= server_object_id_start) _ = self.zombies.remove(value.new_id);
+            self.zombies.putAssumeCapacity(value.new_id, .{
+                .interface = interface,
+                .version = @min(parent.version, interface.version),
+                .generation = self.next_generation,
+            });
+            self.next_generation += 1;
+        }
     }
 
     pub fn hasPendingOutput(self: *const Connection) bool {
@@ -607,8 +749,7 @@ test "client IDs are reused only after delete-id release" {
     var c = Connection.init(std.testing.allocator, .client, 4096);
     defer c.deinit();
     const original = try c.allocateObject(&test_interface, 1);
-    try std.testing.expectError(error.ObjectStillRegistered, c.releaseClientObjectId(original.id));
-    try c.removeObject(original.id, original.generation);
+    try c.retireObject(original);
 
     const next = try c.allocateObject(&test_interface, 1);
     try std.testing.expect(next.id != original.id);
@@ -617,6 +758,165 @@ test "client IDs are reused only after delete-id release" {
     const reused = try c.allocateObject(&test_interface, 1);
     try std.testing.expectEqual(original.id, reused.id);
     try std.testing.expect(reused.generation != original.generation);
+}
+
+test "client zombies discard late events until authoritative delete-id" {
+    const delete_args = [_]ArgumentSpec{.{ .kind = .uint }};
+    const display_events = [_]MessageDescriptor{.{
+        .name = "delete_id",
+        .opcode = 0,
+        .args = &delete_args,
+    }};
+    const display: Interface = .{
+        .name = "display",
+        .version = 1,
+        .events = &display_events,
+    };
+
+    var connection = Connection.init(std.testing.allocator, .client, 4096);
+    defer connection.deinit();
+    _ = try connection.registerObject(1, &display, 1);
+    const retired = try connection.allocateObject(&test_interface, 1);
+    try connection.retireObject(retired);
+
+    var frames: [24]u8 = undefined;
+    writeU32(frames[0..4], retired.id);
+    writeU32(frames[4..8], 12 << 16);
+    writeU32(frames[8..12], 77);
+    writeU32(frames[12..16], 1);
+    writeU32(frames[16..20], 12 << 16);
+    writeU32(frames[20..24], retired.id);
+    try connection.feed(&frames, &.{});
+
+    var deleted = connection.popMessage().?;
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), deleted.values.len);
+    try std.testing.expectEqual(retired.id, deleted.values[0].uint);
+    try std.testing.expect(connection.popMessage() == null);
+    try connection.releaseClientObjectId(deleted.values[0].uint);
+    const reused = try connection.allocateObject(&test_interface, 1);
+    try std.testing.expectEqual(retired.id, reused.id);
+    try std.testing.expect(reused.generation != retired.generation);
+}
+
+test "zombie constructors retain child metadata without parse barriers" {
+    const Child = struct {
+        const requests = [_]MessageDescriptor{.{
+            .name = "destroy",
+            .opcode = 0,
+            .destructor = true,
+        }};
+        const done_args = [_]ArgumentSpec{.{ .kind = .uint }};
+        const events = [_]MessageDescriptor{.{
+            .name = "done",
+            .opcode = 0,
+            .args = &done_args,
+        }};
+        const interface: Interface = .{
+            .name = "child",
+            .version = 1,
+            .requests = &@This().requests,
+            .events = &@This().events,
+        };
+    };
+    const Parent = struct {
+        const child_args = [_]ArgumentSpec{.{
+            .kind = .new_id,
+            .new_id_interface = &Child.interface,
+        }};
+        const events = [_]MessageDescriptor{.{
+            .name = "child",
+            .opcode = 0,
+            .args = &child_args,
+        }};
+        const interface: Interface = .{
+            .name = "parent",
+            .version = 1,
+            .events = &@This().events,
+        };
+    };
+
+    var connection = Connection.init(std.testing.allocator, .client, 4096);
+    defer connection.deinit();
+    const old_child: ObjectHandle = .{
+        .id = server_object_id_start,
+        .generation = try connection.registerObject(
+            server_object_id_start,
+            &Child.interface,
+            1,
+        ),
+    };
+    try connection.queueDestructorObject(old_child, &Child.interface, 0, &.{});
+    const parent = try connection.allocateObject(&Parent.interface, 1);
+    try connection.retireObject(parent);
+
+    var frames: [24]u8 = undefined;
+    writeU32(frames[0..4], parent.id);
+    writeU32(frames[4..8], 12 << 16);
+    writeU32(frames[8..12], server_object_id_start);
+    writeU32(frames[12..16], server_object_id_start);
+    writeU32(frames[16..20], 12 << 16);
+    writeU32(frames[20..24], 99);
+    try connection.feed(&frames, &.{});
+
+    try std.testing.expect(connection.popMessage() == null);
+    const child = connection.zombies.get(server_object_id_start).?;
+    try std.testing.expectEqual(&Child.interface, child.interface);
+    try std.testing.expect(child.generation != old_child.generation);
+    try std.testing.expectEqual(@as(usize, 0), connection.input.items.len);
+}
+
+test "retiring an object adopts already queued constructor children" {
+    const Child = struct {
+        const done_args = [_]ArgumentSpec{.{ .kind = .uint }};
+        const events = [_]MessageDescriptor{.{
+            .name = "done",
+            .opcode = 0,
+            .args = &done_args,
+        }};
+        const interface: Interface = .{
+            .name = "queued_child",
+            .version = 1,
+            .events = &@This().events,
+        };
+    };
+    const Parent = struct {
+        const child_args = [_]ArgumentSpec{.{
+            .kind = .new_id,
+            .new_id_interface = &Child.interface,
+        }};
+        const events = [_]MessageDescriptor{.{
+            .name = "child",
+            .opcode = 0,
+            .args = &child_args,
+        }};
+        const interface: Interface = .{
+            .name = "queued_parent",
+            .version = 1,
+            .events = &@This().events,
+        };
+    };
+
+    var connection = Connection.init(std.testing.allocator, .client, 4096);
+    defer connection.deinit();
+    const parent = try connection.allocateObject(&Parent.interface, 1);
+    var constructor: [12]u8 = undefined;
+    writeU32(constructor[0..4], parent.id);
+    writeU32(constructor[4..8], 12 << 16);
+    writeU32(constructor[8..12], server_object_id_start);
+    try connection.feed(&constructor, &.{});
+    try std.testing.expectEqual(@as(usize, 1), connection.messages.items.len);
+
+    try connection.retireObject(parent);
+    try std.testing.expectEqual(@as(usize, 0), connection.messages.items.len);
+    try std.testing.expect(connection.zombies.contains(server_object_id_start));
+
+    var child_event: [12]u8 = undefined;
+    writeU32(child_event[0..4], server_object_id_start);
+    writeU32(child_event[4..8], 12 << 16);
+    writeU32(child_event[8..12], 42);
+    try connection.feed(&child_event, &.{});
+    try std.testing.expect(connection.popMessage() == null);
 }
 
 test "outbound frames queue behind a live completion batch" {

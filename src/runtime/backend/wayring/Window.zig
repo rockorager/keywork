@@ -785,6 +785,10 @@ fn destroyProtocol(client: *Client, handles: Client.Window) void {
 
 fn finishClose(self: *Window) !void {
     if (self.protocol_destroyed or !try self.renderer.retireAll()) return;
+    if (self.frame_callback) |callback| {
+        try self.client.connectionPtr().retireObject(callback);
+        self.frame_callback = null;
+    }
     if (self.fractional_scale) |fractional_scale| {
         try protocol.wp_fractional_scale_v1_types.requests.destroy(
             self.client.connectionPtr(),

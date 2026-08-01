@@ -306,7 +306,10 @@ fn writeRequest(set: ProtocolSet, writer: *std.Io.Writer, interface: Interface, 
         } else try writer.writeAll("new_version");
         try writer.writeAll(");\n            errdefer connection.abandonObject(allocated_object) catch unreachable;\n");
     }
-    try writer.writeAll("            try connection.queueObject(handle, &");
+    try writer.writeAll(if (message.destructor)
+        "            try connection.queueDestructorObject(handle, &"
+    else
+        "            try connection.queueObject(handle, &");
     try ident(writer, interface.name);
     try writer.print(", {d}, &.{{\n", .{opcode});
     for (message.args) |arg_value| {
@@ -331,7 +334,6 @@ fn writeRequest(set: ProtocolSet, writer: *std.Io.Writer, interface: Interface, 
         try writer.writeAll(" },\n");
     }
     try writer.writeAll("            });\n");
-    if (message.destructor) try writer.writeAll("            connection.removeObject(handle.id, handle.generation) catch unreachable;\n");
     if (allocated) try writer.writeAll("            return allocated_object;\n");
     try writer.writeAll("        }\n");
 }
@@ -455,6 +457,12 @@ pub fn generate(set: ProtocolSet, writer: *std.Io.Writer) !void {
                     if (arg_value.interface_name) |v| {
                         try writer.writeAll(", .interface_name = ");
                         try writeString(writer, v);
+                        if (std.mem.eql(u8, arg_value.kind, "new_id") and
+                            findInterface(set, v) != null)
+                        {
+                            try writer.writeAll(", .new_id_interface = &");
+                            try ident(writer, v);
+                        }
                     }
                     if (arg_value.enum_name) |v| {
                         try writer.writeAll(", .enum_name = ");
@@ -577,7 +585,9 @@ test "parse and generate complete descriptor fixture" {
     try std.testing.expect(std.mem.indexOf(u8, text, "connection.allocateObject(&@\"wl_present\", @min(registered_parent.version, @\"wl_present\".version))") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pub const Request = union(enum)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pub fn decodeEvent(connection: *wayring.Connection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "try connection.queueDestructorObject(handle, &@\"wl_sample\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.removeObject(handle.id, handle.generation);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".new_id_interface = &@\"wl_present\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, ".@\"fd\" = 6,") != null);
 }
 
