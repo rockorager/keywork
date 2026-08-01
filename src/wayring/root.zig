@@ -235,9 +235,14 @@ pub const Connection = struct {
         return self.objects.get(id);
     }
 
-    pub fn objectForHandle(self: *const Connection, handle: ObjectHandle, interface: *const Interface) !Object {
+    pub fn objectForHandleAny(self: *const Connection, handle: ObjectHandle) !Object {
         const registered = self.objects.get(handle.id) orelse return error.UnknownObject;
         if (registered.generation != handle.generation) return error.StaleObject;
+        return registered;
+    }
+
+    pub fn objectForHandle(self: *const Connection, handle: ObjectHandle, interface: *const Interface) !Object {
+        const registered = try self.objectForHandleAny(handle);
         if (registered.interface != interface) return error.WrongInterface;
         return registered;
     }
