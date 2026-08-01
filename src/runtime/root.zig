@@ -60,6 +60,7 @@ test {
     _ = @import("backend/wayring/Backend.zig");
     _ = @import("backend/wayring/Client.zig");
     _ = @import("backend/wayring/Input.zig");
+    _ = @import("backend/wayring/ShmWindow.zig");
     _ = @import("backend/wayring/VulkanWindow.zig");
     _ = @import("backend/wayring/Window.zig");
     _ = @import("graphics/raster.zig");

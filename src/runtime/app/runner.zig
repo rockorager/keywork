@@ -80,9 +80,13 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
         else
             runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
         .wayring => if (options.windows_host) |windows_host|
-            runWayringWindowed(allocator, loop, windows_host, options)
+            runWayringWindowed(allocator, loop, windows_host, options, .dma_buf)
         else
-            runWayring(allocator, loop, app, options),
+            runWayring(allocator, loop, app, options, .dma_buf),
+        .wayring_shm => if (options.windows_host) |windows_host|
+            runWayringWindowed(allocator, loop, windows_host, options, .shm)
+        else
+            runWayring(allocator, loop, app, options, .shm),
     };
 }
 
@@ -91,9 +95,10 @@ fn runWayringWindowed(
     compatibility_loop: *event_loop.EventLoop,
     windows_host: app_windows.WindowsHost,
     options: Options,
+    presentation: WayringBackend.Presentation,
 ) !void {
     const Manager = WindowManager(WayringBackend);
-    const backend = try WayringBackend.create(allocator);
+    const backend = try WayringBackend.createWithOptions(allocator, .{ .presentation = presentation });
     defer backend.destroy();
     if (options.session_lock) try backend.beginSessionLock();
 
@@ -147,6 +152,7 @@ fn runWayring(
     compatibility_loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     options: Options,
+    presentation: WayringBackend.Presentation,
 ) !void {
     if (options.layer_shell != null or options.session_lock)
         return error.UnsupportedWayringWindowMode;
@@ -173,6 +179,7 @@ fn runWayring(
             .app_id = options.app_id,
             .width = try wayland_window.frameDimension(options.width),
             .height = try wayland_window.frameDimension(options.height),
+            .presentation = presentation,
         },
         &run_context,
         WayringRunContext.backendEvent,

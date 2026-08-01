@@ -380,7 +380,8 @@ fn dispatchMessages(self: *Client) !void {
                     &message,
                 );
                 self.sync_callback = null;
-                if (self.compositor == null or self.wm_base == null or self.dmabuf == null)
+                if (self.compositor == null or self.wm_base == null or
+                    (self.dmabuf == null and self.shm == null))
                     return error.MissingRequiredGlobal;
                 switch (self.sync_phase) {
                     .globals => {

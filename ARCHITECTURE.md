@@ -65,10 +65,11 @@ runtime's typed callback contract; the server itself remains language-neutral.
 The native runtime depends on the UI and loop modules. It must compile and link
 without LuaJIT and must not acquire shell or compositor policy. Native Zig
 applications and language adapters consume the same public runtime contract.
-Its primary Wayring Vulkan backend owns protocol policy and presentation while
-using `wayring-uring` for transport. The libwayland CPU and Vulkan backends
-remain explicit compatibility fallbacks. The sans-I/O engine remains
-independent of both runtime and Vulkan ownership.
+Its primary Wayring backend owns protocol policy and supports both Vulkan
+DMA-BUF and CPU `wl_shm` presentation while using `wayring-uring` for
+transport. The libwayland CPU and Vulkan backends remain explicit
+compatibility fallbacks. The sans-I/O engine remains independent of runtime
+and renderer ownership.
 
 ### Lua host (`src/lua/`)
 

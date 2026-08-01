@@ -41,7 +41,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
 
     if (try checkStringField(lua_state, table_index, "backend")) |name| {
         config.backend = backendFromName(name) orelse
-            return invalidAppRoot("unknown backend '{s}' (expected wayring, cpu, vulkan, or log)", .{name});
+            return invalidAppRoot("unknown backend '{s}' (expected wayring, wayring-cpu, cpu, vulkan, or log)", .{name});
     }
     if (try checkNumberField(lua_state, table_index, "width")) |value| config.width = @floatCast(value);
     if (try checkNumberField(lua_state, table_index, "height")) |value| config.height = @floatCast(value);
@@ -213,6 +213,7 @@ fn backendFromName(name: []const u8) ?native_runtime.BackendKind {
     if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
     if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
     if (std.mem.eql(u8, name, "wayring")) return .wayring;
+    if (std.mem.eql(u8, name, "wayring-cpu")) return .wayring_shm;
     if (std.mem.eql(u8, name, "log")) return .log;
     return null;
 }

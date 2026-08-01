@@ -1,4 +1,4 @@
-//! XDG window state and frame pacing for the Wayring Vulkan path.
+//! Wayring surface roles, presentation selection, scaling, and frame pacing.
 
 const Window = @This();
 
@@ -7,12 +7,14 @@ const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
 const Client = @import("Client.zig");
+const ShmWindow = @import("ShmWindow.zig");
 const VulkanWindow = @import("VulkanWindow.zig");
 const wayland_options = @import("../wayland/options.zig");
 const wayland_window = @import("../wayland/window.zig");
 
 pub const Event = enum { configured, repaint, close };
 pub const ResizeEdge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
+pub const Presentation = enum { dma_buf, shm };
 
 const Role = union(enum) {
     toplevel: struct {
@@ -27,13 +29,83 @@ const Role = union(enum) {
     session_lock: wayring.ObjectHandle,
 };
 
+const Renderer = union(Presentation) {
+    dma_buf: VulkanWindow,
+    shm: ShmWindow,
+
+    fn deinit(self: *Renderer) void {
+        switch (self.*) {
+            .dma_buf => |*renderer| renderer.deinit(),
+            .shm => |*renderer| renderer.deinit(),
+        }
+    }
+
+    fn configure(self: *Renderer, width: u32, height: u32) !void {
+        switch (self.*) {
+            .dma_buf => |*renderer| try renderer.configure(width, height),
+            .shm => |*renderer| try renderer.configure(width, height),
+        }
+    }
+
+    fn ownsObject(self: *const Renderer, id: u32) bool {
+        return switch (self.*) {
+            .dma_buf => |*renderer| renderer.ownsObject(id),
+            .shm => |*renderer| renderer.ownsObject(id),
+        };
+    }
+
+    fn handleMessage(self: *Renderer, message: *const wayring.Message) !void {
+        switch (self.*) {
+            .dma_buf => |*renderer| try renderer.handleMessage(message),
+            .shm => |*renderer| try renderer.handleMessage(message),
+        }
+    }
+
+    fn presentWithFrame(
+        self: *Renderer,
+        display_list: []const keywork.PaintCommand,
+        scale: f32,
+    ) !?wayring.ObjectHandle {
+        return switch (self.*) {
+            .dma_buf => |*renderer| renderer.presentWithFrame(display_list, scale),
+            .shm => |*renderer| renderer.presentWithFrame(display_list, scale),
+        };
+    }
+
+    fn retireAll(self: *Renderer) !bool {
+        return switch (self.*) {
+            .dma_buf => |*renderer| renderer.retireAll(),
+            .shm => |*renderer| renderer.retireAll(),
+        };
+    }
+
+    fn measureText(
+        self: *Renderer,
+        scale: f32,
+        value: []const u8,
+        style: keywork.ResolvedTextStyle,
+    ) !keywork.Size {
+        return switch (self.*) {
+            .dma_buf => |*renderer| renderer.measureText(scale, value, style),
+            .shm => |*renderer| renderer.measureText(scale, value, style),
+        };
+    }
+
+    fn textMetrics(self: *Renderer, scale: f32, font_size: f32) !keywork.TextMetrics {
+        return switch (self.*) {
+            .dma_buf => |*renderer| renderer.textMetrics(scale, font_size),
+            .shm => |*renderer| renderer.textMetrics(scale, font_size),
+        };
+    }
+};
+
 allocator: std.mem.Allocator,
 client: *Client,
 surface: wayring.ObjectHandle,
 viewport: ?wayring.ObjectHandle,
 fractional_scale: ?wayring.ObjectHandle,
 role: Role,
-renderer: VulkanWindow,
+renderer: Renderer,
 frame_callback: ?wayring.ObjectHandle = null,
 width: u32,
 height: u32,
@@ -57,6 +129,7 @@ pub fn init(
     app_id: []const u8,
     default_width: u32,
     default_height: u32,
+    presentation: Presentation,
 ) !Window {
     if (default_width == 0 or default_height == 0) return error.EmptyWindow;
     const handles = try client.createXdgWindow(title, app_id);
@@ -78,6 +151,7 @@ pub fn init(
         default_height,
         .{},
         null,
+        presentation,
     );
 }
 
@@ -88,6 +162,7 @@ pub fn initLayer(
     output: ?wayring.ObjectHandle,
     default_width: u32,
     default_height: u32,
+    presentation: Presentation,
 ) !Window {
     const shell = client.layerShell() orelse return error.MissingLayerShell;
     const base = try client.createSurface();
@@ -145,6 +220,7 @@ pub fn initLayer(
         default_height,
         .{},
         options.keyboard_interactivity,
+        presentation,
     );
 }
 
@@ -153,6 +229,7 @@ pub fn initPopup(
     client: *Client,
     parent: *Window,
     options: wayland_window.PopupOptions,
+    presentation: Presentation,
 ) !Window {
     const wm_base = client.wmBaseHandle() orelse return error.MissingXdgWmBase;
     const parent_xdg_surface = switch (parent.role) {
@@ -202,6 +279,7 @@ pub fn initPopup(
         height,
         options.insets,
         null,
+        presentation,
     );
 }
 
@@ -212,6 +290,7 @@ pub fn initSessionLock(
     output: wayring.ObjectHandle,
     default_width: u32,
     default_height: u32,
+    presentation: Presentation,
 ) !Window {
     const base = try client.createSurface();
     errdefer client.destroySurface(base);
@@ -235,6 +314,7 @@ pub fn initSessionLock(
         default_height,
         .{},
         null,
+        presentation,
     );
 }
 
@@ -247,28 +327,9 @@ fn initSurface(
     default_height: u32,
     popup_insets: wayland_window.SurfaceInsets,
     layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity,
+    presentation: Presentation,
 ) !Window {
-    const raw_candidates = client.dmaBufCandidates();
-    const candidates = try allocator.alloc(VulkanWindow.Candidate, raw_candidates.len);
-    defer allocator.free(candidates);
-    var candidate_count: usize = 0;
-    for (raw_candidates) |candidate| {
-        const format: @FieldType(VulkanWindow.Candidate, "format") = switch (candidate.format) {
-            0x34325241 => .argb8888,
-            0x34325258 => .xrgb8888,
-            else => continue,
-        };
-        candidates[candidate_count] = .{ .format = format, .modifier = candidate.modifier };
-        candidate_count += 1;
-    }
-
-    var renderer = try VulkanWindow.init(
-        allocator,
-        client.connectionPtr(),
-        base.surface,
-        client.dmaBufFactory() orelse return error.MissingDmaBufFactory,
-        candidates[0..candidate_count],
-    );
+    var renderer = try initRenderer(allocator, client, base.surface, presentation);
     errdefer renderer.deinit();
     return .{
         .allocator = allocator,
@@ -285,6 +346,44 @@ fn initSurface(
         .popup_insets = popup_insets,
         .layer_keyboard_interactivity = layer_keyboard_interactivity,
     };
+}
+
+fn initRenderer(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    surface: wayring.ObjectHandle,
+    presentation: Presentation,
+) !Renderer {
+    if (presentation == .shm) {
+        return .{ .shm = try ShmWindow.init(
+            allocator,
+            client.connectionPtr(),
+            surface,
+            client.shmHandle() orelse return error.MissingShm,
+        ) };
+    }
+
+    const raw_candidates = client.dmaBufCandidates();
+    const candidates = try allocator.alloc(VulkanWindow.Candidate, raw_candidates.len);
+    defer allocator.free(candidates);
+    var candidate_count: usize = 0;
+    for (raw_candidates) |candidate| {
+        const format: @FieldType(VulkanWindow.Candidate, "format") = switch (candidate.format) {
+            0x34325241 => .argb8888,
+            0x34325258 => .xrgb8888,
+            else => continue,
+        };
+        candidates[candidate_count] = .{ .format = format, .modifier = candidate.modifier };
+        candidate_count += 1;
+    }
+
+    return .{ .dma_buf = try VulkanWindow.init(
+        allocator,
+        client.connectionPtr(),
+        surface,
+        client.dmaBufFactory() orelse return error.MissingDmaBufFactory,
+        candidates[0..candidate_count],
+    ) };
 }
 
 /// Call after disconnect or after `readyToDeinit` reports true.

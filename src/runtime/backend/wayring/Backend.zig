@@ -20,6 +20,7 @@ const IoUringLoop = keywork_loop.IoUringLoop;
 pub const State = enum { connecting, configuring, running, closing, closed, disconnected, fatal };
 pub const Size = struct { width: u32, height: u32 };
 pub const ResizeEdge = ProtocolWindow.ResizeEdge;
+pub const Presentation = ProtocolWindow.Presentation;
 pub const PointerButtonHandler = *const fn (context: *anyopaque, event: keywork.PointerButtonEvent) void;
 pub const PointerMoveHandler = *const fn (context: *anyopaque, point: ?keywork.Point) void;
 pub const CursorShapeHandler = *const fn (context: *anyopaque, point: keywork.Point) keywork.CursorShape;
@@ -45,6 +46,7 @@ pub const Options = struct {
     app_id: []const u8 = "dev.keywork.Keywork",
     width: u32 = 640,
     height: u32 = 480,
+    presentation: Presentation = .dma_buf,
 };
 
 pub const WindowOptions = struct {
@@ -241,6 +243,10 @@ fn initConnection(
 /// Creates a managed Wayring connection with an internally owned io_uring.
 /// Windows are created explicitly through `createWindow`.
 pub fn create(allocator: std.mem.Allocator) !*Backend {
+    return createWithOptions(allocator, .{});
+}
+
+pub fn createWithOptions(allocator: std.mem.Allocator, options: Options) !*Backend {
     const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";
     const socket_path = try wayring_transport.waylandSocketPathFrom(
         allocator,
@@ -262,7 +268,7 @@ pub fn create(allocator: std.mem.Allocator) !*Backend {
         allocator,
         socket_path,
         loop,
-        .{},
+        options,
         self,
         noopEvent,
         false,
@@ -400,6 +406,7 @@ pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
                 output,
                 window_options.width,
                 window_options.height,
+                self.options.presentation,
             ),
         };
         self.windows.appendAssumeCapacity(window);
@@ -418,6 +425,7 @@ pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
                 window_options.output,
                 window_options.width,
                 window_options.height,
+                self.options.presentation,
             ),
         };
         self.windows.appendAssumeCapacity(window);
@@ -544,6 +552,7 @@ pub fn createPopup(
             &self.client,
             &parent.protocol,
             popup_options,
+            self.options.presentation,
         ),
     };
     if (self.input) |*input| if (input.lastButtonPressSerial()) |serial| {
@@ -984,6 +993,7 @@ fn createXdgWindow(self: *Backend, window_options: Options) !*Window {
             window_options.app_id,
             window_options.width,
             window_options.height,
+            self.options.presentation,
         ),
     };
     self.windows.appendAssumeCapacity(window);
