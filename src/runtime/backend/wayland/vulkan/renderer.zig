@@ -324,6 +324,18 @@ pub const Renderer = struct {
     retired_swapchains: std.ArrayList(SwapchainResources),
 
     pub fn init(allocator: std.mem.Allocator, display: *wl.Display, surface: *wl.Surface) !Self {
+        return initInternal(allocator, display, surface);
+    }
+
+    /// Initializes the renderer without Vulkan WSI. Frames are exported
+    /// through `DmaBufTargets` and presented by the Wayring protocol path.
+    pub fn initDmaBuf(allocator: std.mem.Allocator) !Self {
+        return initInternal(allocator, null, null);
+    }
+
+    fn initInternal(allocator: std.mem.Allocator, display: ?*wl.Display, surface: ?*wl.Surface) !Self {
+        std.debug.assert((display == null) == (surface == null));
+        const uses_wsi = display != null;
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
 
@@ -335,7 +347,7 @@ pub const Renderer = struct {
         const instance_api_version = @min(loader_api_version, vk.API_VERSION_1_1.toU32());
         const instance_extension_properties = try vkb.enumerateInstanceExtensionPropertiesAlloc(null, allocator);
         defer allocator.free(instance_extension_properties);
-        const surface_maintenance =
+        const surface_maintenance = uses_wsi and
             hasExtension(instance_extension_properties, vk.extensions.khr_get_surface_capabilities_2.name) and
             hasExtension(instance_extension_properties, vk.extensions.ext_surface_maintenance_1.name);
         const instance_extensions = [_][*:0]const u8{
@@ -344,7 +356,12 @@ pub const Renderer = struct {
             vk.extensions.khr_get_surface_capabilities_2.name,
             vk.extensions.ext_surface_maintenance_1.name,
         };
-        const instance_extension_count: u32 = if (surface_maintenance) instance_extensions.len else 2;
+        const instance_extension_count: u32 = if (!uses_wsi)
+            0
+        else if (surface_maintenance)
+            instance_extensions.len
+        else
+            2;
         const app_info: vk.ApplicationInfo = .{
             .p_application_name = "Keywork",
             .application_version = vk.makeApiVersion(0, 0, 0, 0).toU32(),
@@ -360,13 +377,21 @@ pub const Renderer = struct {
 
         const vki = vk.InstanceWrapper.load(instance, vkb.dispatch.vkGetInstanceProcAddr.?);
         errdefer vki.destroyInstance(instance, null);
-        const surface_khr = try vki.createWaylandSurfaceKHR(instance, &.{
-            .display = @ptrCast(display),
-            .surface = @ptrCast(surface),
-        }, null);
-        errdefer vki.destroySurfaceKHR(instance, surface_khr, null);
+        const surface_khr: vk.SurfaceKHR = if (uses_wsi)
+            try vki.createWaylandSurfaceKHR(instance, &.{
+                .display = @ptrCast(display.?),
+                .surface = @ptrCast(surface.?),
+            }, null)
+        else
+            .null_handle;
+        errdefer if (surface_khr != .null_handle) vki.destroySurfaceKHR(instance, surface_khr, null);
 
-        const selection = try selectPhysicalDevice(allocator, vki, instance, surface_khr);
+        const selection = try selectPhysicalDevice(
+            allocator,
+            vki,
+            instance,
+            if (uses_wsi) surface_khr else null,
+        );
         const memory_properties = vki.getPhysicalDeviceMemoryProperties(selection.physical_device);
         const physical_device_properties = vki.getPhysicalDeviceProperties(selection.physical_device);
         const device_limits = physical_device_properties.limits;
@@ -396,6 +421,7 @@ pub const Renderer = struct {
         }
         var dmabuf_import = dmabuf_export and
             hasExtension(extension_properties, vk.extensions.khr_external_semaphore_fd.name);
+        if (!uses_wsi and !dmabuf_export) return error.DmaBufExportUnavailable;
         if (dmabuf_import) {
             const external_semaphore_info: vk.PhysicalDeviceExternalSemaphoreInfo = .{
                 .handle_type = .{ .sync_fd_bit = true },
@@ -417,8 +443,10 @@ pub const Renderer = struct {
         };
         var device_extension_names: [8][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
-        device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
-        device_extension_count += 1;
+        if (uses_wsi) {
+            device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
+            device_extension_count += 1;
+        }
         if (swapchain_maintenance) {
             device_extension_names[device_extension_count] = vk.extensions.ext_swapchain_maintenance_1.name;
             device_extension_count += 1;
@@ -565,7 +593,7 @@ pub const Renderer = struct {
         while (imported_values.next()) |imported| self.destroyImportedDmaBuf(imported.*);
         self.imported_dmabufs.deinit(self.allocator);
         self.vkd.destroyDevice(self.device, null);
-        self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
+        if (self.surface_khr != .null_handle) self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
         self.text_renderer.deinit();
     }
@@ -2274,7 +2302,12 @@ const DeviceSelection = struct {
     queue_family_index: u32,
 };
 
-fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, instance: vk.Instance, surface: vk.SurfaceKHR) !DeviceSelection {
+fn selectPhysicalDevice(
+    allocator: std.mem.Allocator,
+    vki: vk.InstanceWrapper,
+    instance: vk.Instance,
+    surface: ?vk.SurfaceKHR,
+) !DeviceSelection {
     const devices = try vki.enumeratePhysicalDevicesAlloc(instance, allocator);
     defer allocator.free(devices);
     for (devices) |physical_device| {
@@ -2282,8 +2315,15 @@ fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, i
         defer allocator.free(families);
         for (families, 0..) |family, index| {
             if (!family.queue_flags.graphics_bit) continue;
-            const supported = try vki.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(index), surface);
-            if (supported == .true) return .{ .physical_device = physical_device, .queue_family_index = @intCast(index) };
+            if (surface) |surface_khr| {
+                const supported = try vki.getPhysicalDeviceSurfaceSupportKHR(
+                    physical_device,
+                    @intCast(index),
+                    surface_khr,
+                );
+                if (supported != .true) continue;
+            }
+            return .{ .physical_device = physical_device, .queue_family_index = @intCast(index) };
         }
     }
     return error.NoSuitableVulkanDevice;
