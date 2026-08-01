@@ -4,6 +4,10 @@ const std = @import("std");
 
 const linux = std.os.linux;
 
+/// Completion-native reactor under development alongside the existing epoll
+/// loop. Consumers may adopt its managed-operation API incrementally.
+pub const IoUringLoop = @import("IoUringLoop.zig");
+
 pub const EventLoop = struct {
     allocator: std.mem.Allocator,
     epoll_fd: i32,
@@ -1047,4 +1051,8 @@ test "Wayland events dispatched during prepare run without polling" {
     try loop.run();
 
     try std.testing.expectEqualStrings("pfae", context.order[0..context.len]);
+}
+
+test {
+    _ = @import("IoUringLoop.zig");
 }
