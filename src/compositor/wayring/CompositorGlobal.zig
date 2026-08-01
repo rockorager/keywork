@@ -70,6 +70,7 @@ pub const Commit = struct {
     buffer_damage: []render.Rect,
     frame_callbacks: []wayring.ObjectHandle,
     presentation_feedbacks: []*PresentationFeedback,
+    content_type: ContentType,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -259,6 +260,13 @@ pub const ExplicitSyncHandler = struct {
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
+pub const ContentTypeHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub const ContentType = generated.wp_content_type_v1_types.type;
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -270,11 +278,14 @@ pub const Surface = struct {
     role_context: ?*anyopaque = null,
     role_destroyed: ?*const fn (*anyopaque) void = null,
     explicit_sync_handler: ?ExplicitSyncHandler = null,
+    content_type_handler: ?ContentTypeHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
     pending_callbacks: std.ArrayList(wayring.ObjectHandle) = .empty,
     pending_presentation_feedbacks: std.ArrayList(*PresentationFeedback) = .empty,
+    pending_content_type: ContentType = .none,
+    current_content_type: ContentType = .none,
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -320,6 +331,18 @@ pub const Surface = struct {
         const handler = self.explicit_sync_handler orelse unreachable;
         std.debug.assert(handler.context == context);
         self.explicit_sync_handler = null;
+    }
+
+    pub fn setContentTypeHandler(self: *Surface, handler: ContentTypeHandler) !void {
+        if (self.content_type_handler != null) return error.AlreadyExists;
+        self.content_type_handler = handler;
+    }
+
+    pub fn clearContentTypeHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.content_type_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.content_type_handler = null;
+        self.pending_content_type = .none;
     }
 
     pub fn reference(self: *Surface) !void {
@@ -737,6 +760,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     }
 
     surface.current_scale = surface.pending_scale;
+    surface.current_content_type = surface.pending_content_type;
     surface.current_transform = surface.pending_transform;
     surface.current_offset_x = surface.pending_offset_x;
     surface.current_offset_y = surface.pending_offset_y;
@@ -759,6 +783,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .buffer_damage = buffer_damage,
         .frame_callbacks = frame_callbacks,
         .presentation_feedbacks = presentation_feedbacks,
+        .content_type = surface.current_content_type,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
@@ -794,6 +819,10 @@ fn destroySurface(
     if (surface.explicit_sync_handler) |handler| {
         handler.surface_destroyed(handler.context);
         surface.explicit_sync_handler = null;
+    }
+    if (surface.content_type_handler) |handler| {
+        handler.surface_destroyed(handler.context);
+        surface.content_type_handler = null;
     }
     surface.unreference();
 }

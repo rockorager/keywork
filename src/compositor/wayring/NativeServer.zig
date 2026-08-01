@@ -18,6 +18,7 @@ const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
+const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -57,6 +58,7 @@ surface_tree: SurfaceTree,
 subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 presentation_global: PresentationGlobal,
+content_type_global: ContentTypeGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -142,6 +144,7 @@ const SurfaceState = struct {
     viewport: surface_geometry.ViewportState = .{},
     opaque_region: Region,
     input_region: CompositorGlobal.InputRegion,
+    content_type: CompositorGlobal.ContentType = .none,
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -418,6 +421,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.output.presentationClockId(),
     );
     errdefer self.presentation_global.deinit();
+    try self.content_type_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.content_type_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
@@ -662,6 +667,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
+    self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.output_global.deinit();
     self.xdg_shell.deinit();
@@ -1682,6 +1688,7 @@ fn applyEntry(
         state.y != commit.offset_y or
         !std.meta.eql(state.viewport, commit.viewport);
     state.scale = commit.scale;
+    state.content_type = commit.content_type;
     state.transform = commit.transform;
     state.x = commit.offset_x;
     state.y = commit.offset_y;
