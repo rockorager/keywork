@@ -54,6 +54,21 @@ pub fn build(b: *std.Build) void {
         .name = "wayring-scanner",
         .root_module = wayring_scanner_module,
     });
+    const wayland_sources = stageWaylandSources(b);
+    const generate_wayring_protocols = b.addRunArtifact(wayring_scanner);
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland_sources.wayland_xml);
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/xdg-shell/xdg-shell.xml"));
+    generate_wayring_protocols.addArg("-o");
+    const wayring_protocol_source = generate_wayring_protocols.addOutputFileArg("wayring-protocols.zig");
+    const wayring_protocols = b.addModule("wayring-protocols", .{
+        .root_source_file = wayring_protocol_source,
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_protocols.addImport("wayring", wayring);
+    wayring_core.addImport("wayring-protocols", wayring_protocols);
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -86,6 +101,7 @@ pub fn build(b: *std.Build) void {
     wayring_core_test_module.addImport("wayring", wayring);
     wayring_core_test_module.addImport("wayring-uring", wayring_uring);
     wayring_core_test_module.addImport("keywork-loop", keywork_loop);
+    wayring_core_test_module.addImport("wayring-protocols", wayring_protocols);
     const wayring_core_tests = b.addTest(.{ .root_module = wayring_core_test_module });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_core_tests).step);
     const wayring_scanner_test_module = b.createModule(.{
@@ -104,18 +120,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(test_step);
     check_step.dependOn(lint_step);
 
-    const wayland_sources = stageWaylandSources(b);
-    const generate_wayring_protocols = b.addRunArtifact(wayring_scanner);
-    generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.wayland_xml);
-    generate_wayring_protocols.addArg("-o");
-    const wayring_protocol_source = generate_wayring_protocols.addOutputFileArg("wayring-protocols.zig");
-    const wayring_protocols = b.addModule("wayring-protocols", .{
-        .root_source_file = wayring_protocol_source,
-        .target = target,
-        .optimize = optimize,
-    });
-    wayring_protocols.addImport("wayring", wayring);
     const wayring_protocol_tests = b.addTest(.{ .root_module = wayring_protocols });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_protocol_tests).step);
     const stream_output = stream.add(

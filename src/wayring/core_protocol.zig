@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
+const generated = @import("wayring-protocols");
 
 const display_sync_args = [_]wayring.ArgumentSpec{.{ .kind = .new_id }};
 const display_get_registry_args = [_]wayring.ArgumentSpec{.{ .kind = .new_id }};
@@ -336,4 +337,187 @@ test "io_uring synthetic registry and sync round trip" {
     try std.testing.expect(server.readyToDeinit());
     client.deinit();
     server.deinit();
+}
+
+test "generated client builds and commits an SHM xdg surface" {
+    const linux = std.os.linux;
+    const Pair = struct {
+        client: wayring.ObjectHandle,
+        server: wayring.ObjectHandle,
+    };
+    const Harness = struct {
+        client: *wayring.Connection,
+        server: *wayring.Connection,
+        client_registry: wayring.ObjectHandle,
+        server_registry: wayring.ObjectHandle,
+
+        fn transfer(sender: *wayring.Connection, receiver: *wayring.Connection) !void {
+            const batch = sender.nextBatch() orelse return error.MissingBatch;
+            var duplicated: [wayring.max_fds_per_batch]i32 = undefined;
+            var count: usize = 0;
+            errdefer {
+                for (duplicated[0..count]) |fd| _ = linux.close(fd);
+            }
+            for (batch.fds) |fd| {
+                const result = linux.dup(fd);
+                if (linux.errno(result) != .SUCCESS) return error.DuplicateFdFailed;
+                duplicated[count] = @intCast(result);
+                count += 1;
+            }
+            try receiver.feed(batch.bytes, duplicated[0..count]);
+            count = 0; // receiver owns every duplicate, including on feed errors
+            try sender.acknowledge(batch.token, batch.bytes.len);
+        }
+
+        fn register(connection: *wayring.Connection, id: u32, interface: *const wayring.Interface, version: u32) !wayring.ObjectHandle {
+            return .{ .id = id, .generation = try connection.registerObject(id, interface, version) };
+        }
+
+        fn bind(self: *@This(), name: u32, interface: *const wayring.Interface, version: u32) !Pair {
+            const client_object = try generated.wl_registry_types.requests.bind(
+                self.client,
+                self.client_registry,
+                name,
+                interface,
+                version,
+            );
+            try transfer(self.client, self.server);
+            var message = self.server.popMessage() orelse return error.MissingMessage;
+            defer message.deinit();
+            const request = (try generated.wl_registry_types.decodeRequest(
+                self.server,
+                self.server_registry,
+                &message,
+            )).bind;
+            try std.testing.expectEqual(name, request.name);
+            try std.testing.expectEqualStrings(interface.name, request.new_interface.?);
+            try std.testing.expectEqual(version, request.new_version);
+            try std.testing.expectEqual(client_object.id, request.id);
+            return .{
+                .client = client_object,
+                .server = try register(self.server, request.id, interface, version),
+            };
+        }
+    };
+
+    var client = wayring.Connection.init(std.testing.allocator, .client, 64 * 1024);
+    defer client.deinit();
+    var server = wayring.Connection.init(std.testing.allocator, .server, 64 * 1024);
+    defer server.deinit();
+
+    const client_display = try Harness.register(&client, 1, &generated.wl_display, 1);
+    const server_display = try Harness.register(&server, 1, &generated.wl_display, 1);
+    const client_registry = try generated.wl_display_types.requests.get_registry(&client, client_display);
+    try Harness.transfer(&client, &server);
+    var registry_message = server.popMessage() orelse return error.MissingMessage;
+    defer registry_message.deinit();
+    const registry_id = (try generated.wl_display_types.decodeRequest(&server, server_display, &registry_message)).get_registry.registry;
+    const server_registry = try Harness.register(&server, registry_id, &generated.wl_registry, 1);
+    var harness: Harness = .{
+        .client = &client,
+        .server = &server,
+        .client_registry = client_registry,
+        .server_registry = server_registry,
+    };
+
+    const compositor = try harness.bind(1, &generated.wl_compositor, generated.wl_compositor.version);
+    const shm = try harness.bind(2, &generated.wl_shm, generated.wl_shm.version);
+    const wm_base = try harness.bind(3, &generated.xdg_wm_base, generated.xdg_wm_base.version);
+
+    const client_surface = try generated.wl_compositor_types.requests.create_surface(&client, compositor.client);
+    try Harness.transfer(&client, &server);
+    var create_surface_message = server.popMessage() orelse return error.MissingMessage;
+    defer create_surface_message.deinit();
+    const surface_id = (try generated.wl_compositor_types.decodeRequest(&server, compositor.server, &create_surface_message)).create_surface.id;
+    try std.testing.expectEqual(client_surface.id, surface_id);
+    const server_surface = try Harness.register(&server, surface_id, &generated.wl_surface, generated.wl_surface.version);
+
+    const shm_size: i32 = 64 * 64 * 4;
+    const shm_fd = try std.posix.memfd_create("wayring-shm-test", linux.MFD.CLOEXEC);
+    var shm_fd_owned = true;
+    defer if (shm_fd_owned) {
+        _ = linux.close(shm_fd);
+    };
+    if (linux.errno(linux.ftruncate(shm_fd, shm_size)) != .SUCCESS) return error.TruncateFailed;
+    const client_pool = try generated.wl_shm_types.requests.create_pool(&client, shm.client, shm_fd, shm_size);
+    shm_fd_owned = false;
+    try Harness.transfer(&client, &server);
+    var create_pool_message = server.popMessage() orelse return error.MissingMessage;
+    defer create_pool_message.deinit();
+    const create_pool = (try generated.wl_shm_types.decodeRequest(&server, shm.server, &create_pool_message)).create_pool;
+    try std.testing.expectEqual(client_pool.id, create_pool.id);
+    try std.testing.expectEqual(@as(usize, 0), create_pool.fd);
+    try std.testing.expectEqual(shm_size, create_pool.size);
+    const received_shm_fd = try create_pool_message.takeFd(1);
+    defer _ = linux.close(received_shm_fd);
+    const server_pool = try Harness.register(&server, create_pool.id, &generated.wl_shm_pool, generated.wl_shm_pool.version);
+
+    const xrgb8888: u32 = @intFromEnum(generated.wl_shm_types.format.xrgb8888);
+    const client_buffer = try generated.wl_shm_pool_types.requests.create_buffer(&client, client_pool, 0, 64, 64, 64 * 4, xrgb8888);
+    try Harness.transfer(&client, &server);
+    var create_buffer_message = server.popMessage() orelse return error.MissingMessage;
+    defer create_buffer_message.deinit();
+    const create_buffer = (try generated.wl_shm_pool_types.decodeRequest(&server, server_pool, &create_buffer_message)).create_buffer;
+    try std.testing.expectEqual(client_buffer.id, create_buffer.id);
+    const server_buffer = try Harness.register(&server, create_buffer.id, &generated.wl_buffer, generated.wl_buffer.version);
+
+    const client_xdg_surface = try generated.xdg_wm_base_types.requests.get_xdg_surface(&client, wm_base.client, client_surface);
+    try Harness.transfer(&client, &server);
+    var get_xdg_surface_message = server.popMessage() orelse return error.MissingMessage;
+    defer get_xdg_surface_message.deinit();
+    const get_xdg_surface = (try generated.xdg_wm_base_types.decodeRequest(&server, wm_base.server, &get_xdg_surface_message)).get_xdg_surface;
+    try std.testing.expectEqual(client_surface.id, get_xdg_surface.surface);
+    const server_xdg_surface = try Harness.register(&server, get_xdg_surface.id, &generated.xdg_surface, generated.xdg_surface.version);
+
+    const client_toplevel = try generated.xdg_surface_types.requests.get_toplevel(&client, client_xdg_surface);
+    try Harness.transfer(&client, &server);
+    var get_toplevel_message = server.popMessage() orelse return error.MissingMessage;
+    defer get_toplevel_message.deinit();
+    const toplevel_id = (try generated.xdg_surface_types.decodeRequest(&server, server_xdg_surface, &get_toplevel_message)).get_toplevel.id;
+    try std.testing.expectEqual(client_toplevel.id, toplevel_id);
+    _ = try Harness.register(&server, toplevel_id, &generated.xdg_toplevel, generated.xdg_toplevel.version);
+
+    try generated.wl_surface_types.requests.commit(&client, client_surface);
+    try Harness.transfer(&client, &server);
+    var initial_commit_message = server.popMessage() orelse return error.MissingMessage;
+    defer initial_commit_message.deinit();
+    _ = (try generated.wl_surface_types.decodeRequest(&server, server_surface, &initial_commit_message)).commit;
+
+    const configure_serial: u32 = 42;
+    try server.queue(server_xdg_surface.id, 0, &.{.{ .uint = configure_serial }});
+    try Harness.transfer(&server, &client);
+    var configure_message = client.popMessage() orelse return error.MissingMessage;
+    defer configure_message.deinit();
+    const configure = (try generated.xdg_surface_types.decodeEvent(&client, client_xdg_surface, &configure_message)).configure;
+    try std.testing.expectEqual(configure_serial, configure.serial);
+
+    try generated.xdg_surface_types.requests.ack_configure(&client, client_xdg_surface, configure.serial);
+    try Harness.transfer(&client, &server);
+    var ack_message = server.popMessage() orelse return error.MissingMessage;
+    defer ack_message.deinit();
+    const ack = (try generated.xdg_surface_types.decodeRequest(&server, server_xdg_surface, &ack_message)).ack_configure;
+    try std.testing.expectEqual(configure_serial, ack.serial);
+
+    try generated.wl_surface_types.requests.attach(&client, client_surface, client_buffer, 0, 0);
+    try Harness.transfer(&client, &server);
+    var attach_message = server.popMessage() orelse return error.MissingMessage;
+    defer attach_message.deinit();
+    const attach = (try generated.wl_surface_types.decodeRequest(&server, server_surface, &attach_message)).attach;
+    try std.testing.expectEqual(server_buffer.id, attach.buffer.?);
+
+    try generated.wl_surface_types.requests.damage_buffer(&client, client_surface, 0, 0, 64, 64);
+    try Harness.transfer(&client, &server);
+    var damage_message = server.popMessage() orelse return error.MissingMessage;
+    defer damage_message.deinit();
+    const damage = (try generated.wl_surface_types.decodeRequest(&server, server_surface, &damage_message)).damage_buffer;
+    try std.testing.expectEqual(@as(i32, 64), damage.width);
+    try std.testing.expectEqual(@as(i32, 64), damage.height);
+
+    try generated.wl_surface_types.requests.commit(&client, client_surface);
+    try Harness.transfer(&client, &server);
+    var final_commit_message = server.popMessage() orelse return error.MissingMessage;
+    defer final_commit_message.deinit();
+    _ = (try generated.wl_surface_types.decodeRequest(&server, server_surface, &final_commit_message)).commit;
+    try std.testing.expect(client.popMessage() == null);
+    try std.testing.expect(server.popMessage() == null);
 }
