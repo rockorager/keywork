@@ -48,11 +48,29 @@ pub fn init(
     {
         return error.InvalidOutput;
     }
+    const name = try allocator.dupe(u8, config.name);
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, config.description);
+    errdefer allocator.free(description);
+    const make = try allocator.dupe(u8, config.make);
+    errdefer allocator.free(make);
+    const model = try allocator.dupe(u8, config.model);
+    errdefer allocator.free(model);
     self.* = .{
         .allocator = allocator,
         .server = server,
         .global_name = undefined,
-        .config = config,
+        .config = .{
+            .position = config.position,
+            .mode_size = config.mode_size,
+            .physical_size = config.physical_size,
+            .refresh_millihertz = config.refresh_millihertz,
+            .scale = config.scale,
+            .name = name,
+            .description = description,
+            .make = make,
+            .model = model,
+        },
     };
     self.global_name = try server.createGlobal(
         &generated.wl_output,
@@ -67,7 +85,15 @@ pub fn deinit(self: *OutputGlobal) void {
     for (self.memberships.items) |surface| surface.unreference();
     self.memberships.deinit(self.allocator);
     self.resources.deinit(self.allocator);
+    self.deinitConfig();
     self.* = undefined;
+}
+
+fn deinitConfig(self: *OutputGlobal) void {
+    self.allocator.free(self.config.model);
+    self.allocator.free(self.config.make);
+    self.allocator.free(self.config.description);
+    self.allocator.free(self.config.name);
 }
 
 /// Updates membership in this output. A membership owns one surface reference
@@ -230,6 +256,26 @@ fn destroyBinding(
         return;
     }
     unreachable;
+}
+
+test "native output owns advertised identity" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var name = [_]u8{ 'D', 'P', '-', '1' };
+    var output: OutputGlobal = undefined;
+    try output.init(std.testing.allocator, &server, .{
+        .mode_size = .{ .width = 1920, .height = 1080 },
+        .physical_size = .{ .width = 300, .height = 170 },
+        .refresh_millihertz = 60_000,
+        .scale = 1,
+        .name = &name,
+        .description = "Display",
+        .make = "Keywork",
+        .model = "native",
+    });
+    defer output.deinit();
+    name[0] = 'X';
+    try std.testing.expectEqualStrings("DP-1", output.config.name);
 }
 
 test "native output advertises complete version four state" {
