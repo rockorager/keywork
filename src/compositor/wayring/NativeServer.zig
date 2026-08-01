@@ -15,6 +15,7 @@ const ShmGlobal = @import("ShmGlobal.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
@@ -33,6 +34,7 @@ shm_global: ShmGlobal,
 compositor_global: CompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
+fractional_scale_global: FractionalScaleGlobal,
 xdg_shell: XdgShell,
 transport: IoUringServer,
 renderer: Renderer,
@@ -129,6 +131,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.output_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
+    try self.fractional_scale_global.init(
+        allocator,
+        &self.server,
+        self.output.scale.numerator,
+    );
+    errdefer self.fractional_scale_global.deinit();
 
     const selection = try selectSocket(allocator, options);
     errdefer {
@@ -273,6 +281,7 @@ pub fn destroy(self: *NativeServer) void {
         state.deinit(self.allocator);
     }
     self.surfaces.deinit(self.allocator);
+    self.fractional_scale_global.deinit();
     self.seat_global.deinit();
     self.output_global.deinit();
     self.xdg_shell.deinit();
