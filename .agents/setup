@@ -57,7 +57,7 @@ install_tar_binary() {
 
 ensure_dns
 
-package_stamp=/var/lib/keywork-orb/packages-v8
+package_stamp=/var/lib/keywork-orb/packages-v9
 if [[ ! -e "$package_stamp" ]]; then
     echo "Installing native build dependencies"
     sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/keywork-orb.sources <<'EOF'
@@ -86,31 +86,8 @@ EOF
         libxcb-xfixes0-dev libxcb1-dev libxcursor-dev luajit
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
         libbz2-dev libdisplay-info-dev libdrm-dev libinput-dev libpipewire-0.3-dev \
-        libsystemd-dev libudev-dev wayland-protocols
+        libsystemd-dev libudev-dev
     sudo install -Dm0644 /dev/null "$package_stamp"
-    native_changed=true
-fi
-
-wayland_libdir="$(pkg-config --variable=libdir wayland-server 2>/dev/null || true)"
-if ! pkg-config --atleast-version=1.26.0 wayland-client wayland-server 2>/dev/null \
-    || [[ ! -f "$wayland_libdir/libwayland-client.a" ]] \
-    || [[ ! -f "$wayland_libdir/libwayland-server.a" ]]; then
-    echo "Building Wayland 1.26.0"
-    temporary="$(mktemp -d)"
-    archive="$temporary/wayland.tar.xz"
-    download \
-        https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz \
-        64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3 \
-        "$archive"
-    tar -xJf "$archive" -C "$temporary"
-    meson setup "$temporary/build" "$temporary/wayland-1.26.0" \
-        --prefix=/usr/local --libdir=lib --buildtype=release \
-        --default-library=both \
-        -Ddocumentation=false -Dtests=false
-    ninja -C "$temporary/build"
-    sudo ninja -C "$temporary/build" install
-    sudo ldconfig
-    rm -rf "$temporary"
     native_changed=true
 fi
 
@@ -178,35 +155,6 @@ if ! pkg-config --atleast-version=258 libsystemd 2>/dev/null; then
     sudo install -m0644 "$temporary/systemd-258/src/systemd/"*.h \
         /usr/local/include/systemd/
     sudo ldconfig
-    rm -rf "$temporary"
-    native_changed=true
-fi
-
-if ! pkg-config --atleast-version=1.49 wayland-protocols 2>/dev/null; then
-    echo "Installing Wayland Protocols 1.49"
-    temporary="$(mktemp -d)"
-    archive="$temporary/wayland-protocols.tar.xz"
-    download \
-        https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz \
-        ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14 \
-        "$archive"
-    tar -xJf "$archive" -C "$temporary"
-    sudo rm -rf /usr/local/share/wayland-protocols
-    sudo install -d /usr/local/share/wayland-protocols
-    sudo cp -a \
-        "$temporary/wayland-protocols-1.49/stable" \
-        "$temporary/wayland-protocols-1.49/staging" \
-        "$temporary/wayland-protocols-1.49/unstable" \
-        /usr/local/share/wayland-protocols/
-    sudo install -Dm0644 /dev/stdin /usr/local/share/pkgconfig/wayland-protocols.pc <<'EOF'
-prefix=/usr/local
-datarootdir=${prefix}/share
-pkgdatadir=${datarootdir}/wayland-protocols
-
-Name: Wayland Protocols
-Description: Wayland protocol files
-Version: 1.49
-EOF
     rm -rf "$temporary"
     native_changed=true
 fi

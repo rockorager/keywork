@@ -1,4 +1,5 @@
 const std = @import("std");
+const static_wayland = @import("static_wayland.zig");
 const Scanner = @import("wayland").Scanner;
 
 pub const Output = struct {
@@ -14,6 +15,7 @@ pub fn add(
     build_options: *std.Build.Step.Options,
     varlink: *std.Build.Module,
     control: *std.Build.Module,
+    wayland_libraries: static_wayland.Output,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -173,6 +175,7 @@ pub fn add(
     });
     addRendererShaders(b, compositor);
     linkSystemLibraries(compositor);
+    wayland_libraries.linkClientAndServer(compositor);
 
     const exe = b.addExecutable(.{
         .name = "keywork-compositor",
@@ -341,16 +344,6 @@ fn linkSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("libseat", .{});
     module.linkSystemLibrary("libsystemd", .{});
     module.linkSystemLibrary("libudev", .{});
-    module.linkSystemLibrary("wayland-client", .{
-        .use_pkg_config = .no,
-        .preferred_link_mode = .static,
-        .search_strategy = .no_fallback,
-    });
-    module.linkSystemLibrary("wayland-server", .{
-        .use_pkg_config = .no,
-        .preferred_link_mode = .static,
-        .search_strategy = .no_fallback,
-    });
     module.linkSystemLibrary("ffi", .{});
     module.linkSystemLibrary("m", .{});
     module.linkSystemLibrary("xkbcommon", .{});

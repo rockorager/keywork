@@ -6,6 +6,7 @@ const luajit = @import("build/luajit.zig");
 const release = @import("build/release.zig");
 const runtime = @import("build/runtime.zig");
 const shell = @import("build/shell.zig");
+const static_wayland = @import("build/static_wayland.zig");
 const stream = @import("build/stream.zig");
 const ui = @import("build/ui.zig");
 const version = @import("build/version.zig");
@@ -49,14 +50,15 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(test_step);
     check_step.dependOn(lint_step);
 
-    const wayland_sources = stageWaylandSources(b);
+    const wayland = static_wayland.add(b, target, optimize);
     const stream_output = stream.add(
         b,
         target,
         optimize,
         build_options,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     const ui_output = ui.add(b, target, optimize, test_step);
@@ -68,8 +70,8 @@ pub fn build(b: *std.Build) void {
         keywork_loop,
         varlink,
         ui_output,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     const lua_jit = luajit.add(b, target, optimize);
@@ -91,8 +93,9 @@ pub fn build(b: *std.Build) void {
         build_options,
         varlink,
         keywork_control,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     release.add(
@@ -136,28 +139,10 @@ pub fn build(b: *std.Build) void {
         use_llvm,
         lua_jit,
         lua_output.executable,
-        wayland_sources.protocols,
+        wayland.protocols,
         test_step,
         lint_step,
         fmt_step,
         format_step,
     );
-}
-
-const WaylandSources = struct {
-    wayland_xml: std.Build.LazyPath,
-    protocols: std.Build.LazyPath,
-};
-
-fn stageWaylandSources(b: *std.Build) WaylandSources {
-    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
-    const stage = b.addSystemCommand(&.{"sh"});
-    stage.addFileArg(b.path("scripts/stage-wayland-sources"));
-    stage.addArg(pkg_config);
-    const output = stage.addOutputDirectoryArg("wayland-sources");
-    stage.has_side_effects = true;
-    return .{
-        .wayland_xml = output.path(b, "wayland.xml"),
-        .protocols = output.path(b, "wayland-protocols"),
-    };
 }
