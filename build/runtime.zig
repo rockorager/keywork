@@ -192,6 +192,7 @@ pub fn add(
 fn linkKeyworkNativeSystemLibraries(module: *std.Build.Module) void {
     module.linkSystemLibrary("wayland-client", .{});
     module.linkSystemLibrary("wayland-cursor", .{});
+    module.linkSystemLibrary("xcursor", .{});
     module.linkSystemLibrary("vulkan", .{});
     module.linkSystemLibrary("xkbcommon", .{});
     module.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });

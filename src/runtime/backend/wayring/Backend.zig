@@ -279,8 +279,11 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
                 }
                 var input: Input = undefined;
                 try input.init(
+                    self.allocator,
                     self.client.connectionPtr(),
                     seat,
+                    self.client.compositorHandle(),
+                    self.client.shmHandle(),
                     self.client.cursorShapeManager(),
                     self,
                     inputEvent,
@@ -300,6 +303,7 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
         },
         .outputs_changed => if (self.window) |*window| {
             if (try window.outputScaleChanged()) |_| {
+                if (self.input) |*input| try input.setCursorScale(window.cursorScale());
                 const size = window.size();
                 try self.event_notify(self.event_context, self, .{ .configured = .{
                     .width = size.width,
@@ -371,6 +375,7 @@ fn clientMessage(
                 return;
             }
             self.state = .running;
+            if (self.input) |*input| try input.setCursorScale(window.cursorScale());
             const size = window.size();
             try self.event_notify(self.event_context, self, .{ .configured = .{
                 .width = size.width,

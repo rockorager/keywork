@@ -9,6 +9,7 @@ const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
 const xkb = @import("xkb_c");
 const Client = @import("Client.zig");
+const LegacyCursor = @import("LegacyCursor.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -42,6 +43,8 @@ connection: *wayring.Connection,
 seat: wayring.ObjectHandle,
 cursor_shape_manager: ?wayring.ObjectHandle,
 cursor_shape_device: ?wayring.ObjectHandle = null,
+legacy_cursor: ?LegacyCursor,
+cursor_scale: u32 = 1,
 pointer: ?wayring.ObjectHandle = null,
 keyboard: ?wayring.ObjectHandle = null,
 surface_id: ?u32 = null,
@@ -72,18 +75,26 @@ notify: Notify,
 
 pub fn init(
     self: *Input,
+    allocator: std.mem.Allocator,
     connection: *wayring.Connection,
     seat: Client.Seat,
+    compositor: ?wayring.ObjectHandle,
+    shm: ?wayring.ObjectHandle,
     cursor_shape_manager: ?wayring.ObjectHandle,
     notify_context: *anyopaque,
     notify: Notify,
 ) !void {
+    const legacy_cursor = if (compositor != null and shm != null)
+        try LegacyCursor.init(allocator, connection, compositor.?, shm.?)
+    else
+        null;
     const xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
         return error.XkbContextFailed;
     self.* = .{
         .connection = connection,
         .seat = seat.handle,
         .cursor_shape_manager = cursor_shape_manager,
+        .legacy_cursor = legacy_cursor,
         .xkb_context = xkb_context,
         .notify_context = notify_context,
         .notify = notify,
@@ -96,6 +107,7 @@ pub fn init(
 /// safe to release after transport shutdown or disconnect.
 pub fn deinit(self: *Input) void {
     self.uninstallEventTimer();
+    if (self.legacy_cursor) |*cursor| cursor.deinit();
     self.clearXkbKeymap();
     xkb.xkb_context_unref(self.xkb_context);
     self.* = undefined;
@@ -119,20 +131,35 @@ pub fn lastButtonPressSerial(self: *const Input) ?u32 {
 
 pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
     if (self.cursor_shape == shape) return;
-    const device = self.cursor_shape_device orelse return;
     const serial = self.pointer_enter_serial orelse return;
-    const protocol_shape: protocol.wp_cursor_shape_device_v1_types.shape = switch (shape) {
-        .default => .default,
-        .pointer => .pointer,
-        .text => .text,
-    };
-    try protocol.wp_cursor_shape_device_v1_types.requests.set_shape(
-        self.connection,
-        device,
-        serial,
-        @intFromEnum(protocol_shape),
-    );
+    if (self.cursor_shape_device) |device| {
+        const protocol_shape: protocol.wp_cursor_shape_device_v1_types.shape = switch (shape) {
+            .default => .default,
+            .pointer => .pointer,
+            .text => .text,
+        };
+        try protocol.wp_cursor_shape_device_v1_types.requests.set_shape(
+            self.connection,
+            device,
+            serial,
+            @intFromEnum(protocol_shape),
+        );
+    } else {
+        const pointer = self.pointer orelse return;
+        const cursor = if (self.legacy_cursor) |*value| value else return;
+        if (!try cursor.apply(pointer, serial, shape, self.cursor_scale)) return;
+    }
     self.cursor_shape = shape;
+}
+
+pub fn setCursorScale(self: *Input, scale: u32) !void {
+    if (scale == 0) return error.InvalidCursorScale;
+    if (scale == self.cursor_scale) return;
+    self.cursor_scale = scale;
+    if (self.cursor_shape_device != null) return;
+    const shape = self.cursor_shape orelse return;
+    self.cursor_shape = null;
+    try self.setCursorShape(shape);
 }
 
 pub fn installEventTimer(self: *Input, loop: *event_loop.EventLoop) !void {
@@ -152,7 +179,8 @@ pub fn uninstallEventTimer(self: *Input) void {
 pub fn ownsObject(self: *const Input, id: u32) bool {
     return id == self.seat.id or
         (self.pointer != null and id == self.pointer.?.id) or
-        (self.keyboard != null and id == self.keyboard.?.id);
+        (self.keyboard != null and id == self.keyboard.?.id) or
+        (self.legacy_cursor != null and self.legacy_cursor.?.ownsObject(id));
 }
 
 pub fn handleMessage(self: *Input, message: *wayring.Message) !void {
@@ -184,6 +212,12 @@ pub fn handleMessage(self: *Input, message: *wayring.Message) !void {
             return;
         }
     }
+    if (self.legacy_cursor) |*cursor| {
+        if (cursor.ownsObject(message.object_id)) {
+            try cursor.handleMessage(message);
+            return;
+        }
+    }
     return error.UnknownInputObject;
 }
 
@@ -193,11 +227,14 @@ fn applyCapabilities(self: *Input, capabilities: u32) !void {
     if (self.pointer_enabled and self.pointer == null) {
         self.pointer = try protocol.wl_seat_types.requests.get_pointer(self.connection, self.seat);
         if (self.cursor_shape_manager) |manager| {
-            self.cursor_shape_device = try protocol.wp_cursor_shape_manager_v1_types.requests.get_pointer(
+            self.cursor_shape_device = protocol.wp_cursor_shape_manager_v1_types.requests.get_pointer(
                 self.connection,
                 manager,
                 self.pointer.?,
-            );
+            ) catch |err| device: {
+                log.warn("failed to create Wayring cursor-shape device: {}", .{err});
+                break :device null;
+            };
         }
     } else if (!self.pointer_enabled) {
         if (self.pointer_focused) try self.notify(self.notify_context, self, .{ .pointer_move = null });

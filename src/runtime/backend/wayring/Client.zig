@@ -58,6 +58,7 @@ sync_callback: ?wayring.ObjectHandle,
 compositor: ?Global = null,
 wm_base: ?Global = null,
 dmabuf: ?Global = null,
+shm: ?Global = null,
 seat: ?Global = null,
 data_device_manager: ?Global = null,
 cursor_shape_manager: ?Global = null,
@@ -174,6 +175,14 @@ pub fn dmaBufFactory(self: *const Client) ?wayring.ObjectHandle {
 
 pub fn dmaBufCandidates(self: *const Client) []const DmaBufCandidate {
     return self.dmabuf_candidates.items;
+}
+
+pub fn compositorHandle(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.compositor) |global| global.handle else null;
+}
+
+pub fn shmHandle(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.shm) |global| global.handle else null;
 }
 
 pub fn takeSeat(self: *Client) ?Seat {
@@ -341,6 +350,16 @@ fn dispatchApplicationMessage(self: *Client, message: *wayring.Message) !void {
             return;
         }
     }
+    if (self.shm) |global| {
+        if (message.object_id == global.handle.id) {
+            _ = try protocol.wl_shm_types.decodeEvent(
+                &self.connection,
+                global.handle,
+                message,
+            );
+            return;
+        }
+    }
     if (self.wm_base) |global| {
         if (message.object_id == global.handle.id) {
             const ping = (try protocol.xdg_wm_base_types.decodeEvent(
@@ -411,6 +430,8 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
             if (self.seat != null and self.seat.?.name == event.name) self.seat = null;
             if (self.data_device_manager != null and self.data_device_manager.?.name == event.name)
                 self.data_device_manager = null;
+            if (self.shm != null and self.shm.?.name == event.name)
+                self.shm = null;
             if (self.activation != null and self.activation.?.name == event.name)
                 self.activation = null;
             if (self.viewporter != null and self.viewporter.?.name == event.name)
@@ -443,6 +464,11 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
         self.dmabuf = .{
             .name = name,
             .handle = try self.bind(name, advertised_version, &protocol.zwp_linux_dmabuf_v1, 3),
+        };
+    } else if (std.mem.eql(u8, interface_name, protocol.wl_shm.name) and self.shm == null) {
+        self.shm = .{
+            .name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.wl_shm, 1),
         };
     } else if (std.mem.eql(u8, interface_name, protocol.wl_seat.name) and self.seat == null) {
         self.seat = .{
@@ -521,7 +547,7 @@ test "io_uring client discovers and binds required globals" {
             if (notification == .outputs_changed) return;
             if (notification != .ready) return;
             self.ready = true;
-            if (self.bind_count == 9) {
+            if (self.bind_count == 10) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -585,6 +611,9 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 18 }, .{ .string = protocol.wp_fractional_scale_manager_v1.name }, .{ .uint = 1 },
                             });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 19 }, .{ .string = protocol.wl_shm.name }, .{ .uint = 1 },
+                            });
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -627,6 +656,8 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.wp_viewporter
                     else if (std.mem.eql(u8, request.new_interface.?, protocol.wp_fractional_scale_manager_v1.name))
                         &protocol.wp_fractional_scale_manager_v1
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_shm.name))
+                        &protocol.wl_shm
                     else
                         return error.UnexpectedBind;
                     const bound = try registerServerObject(
@@ -644,12 +675,16 @@ test "io_uring client discovers and binds required globals" {
                             protocol.wl_seat_types.capability.keyboard }});
                     } else if (interface == &protocol.wl_output) {
                         try transport.connection.queue(bound.id, 3, &.{.{ .int = 2 }});
+                    } else if (interface == &protocol.wl_shm) {
+                        try transport.connection.queue(bound.id, 0, &.{.{
+                            .uint = @intFromEnum(protocol.wl_shm_types.format.argb8888),
+                        }});
                     }
                     self.bind_count += 1;
                 }
             }
             try transport.flush();
-            if (self.ready and self.bind_count == 9) {
+            if (self.ready and self.bind_count == 10) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -696,7 +731,7 @@ test "io_uring client discovers and binds required globals" {
     while (loop.hasActiveOperations()) try loop.runOnce();
 
     try std.testing.expect(context.ready);
-    try std.testing.expectEqual(@as(usize, 9), context.bind_count);
+    try std.testing.expectEqual(@as(usize, 10), context.bind_count);
     try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
         .format = 0x34325241,
         .modifier = 7,
@@ -711,6 +746,7 @@ test "io_uring client discovers and binds required globals" {
     try std.testing.expect(client.activationManager() != null);
     try std.testing.expect(client.viewporter != null);
     try std.testing.expect(client.fractional_scale_manager != null);
+    try std.testing.expect(client.shmHandle() != null);
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();

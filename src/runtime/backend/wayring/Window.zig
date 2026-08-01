@@ -245,6 +245,10 @@ pub fn surfaceHandle(self: *const Window) wayring.ObjectHandle {
     return self.handles.surface;
 }
 
+pub fn cursorScale(self: *const Window) u32 {
+    return self.scale_120 / 120 + @intFromBool(self.scale_120 % 120 != 0);
+}
+
 pub fn startMove(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
     try protocol.xdg_toplevel_types.requests.move(
         self.client.connectionPtr(),
