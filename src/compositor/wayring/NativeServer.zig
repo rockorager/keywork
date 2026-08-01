@@ -14,6 +14,7 @@ const IoUringServer = @import("wayring-server-uring");
 const ShmGlobal = @import("ShmGlobal.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
+const SeatGlobal = @import("SeatGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
@@ -31,6 +32,7 @@ server: Server,
 shm_global: ShmGlobal,
 compositor_global: CompositorGlobal,
 output_global: OutputGlobal,
+seat_global: SeatGlobal,
 xdg_shell: XdgShell,
 transport: IoUringServer,
 renderer: Renderer,
@@ -125,6 +127,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .model = "headless",
     });
     errdefer self.output_global.deinit();
+    try self.seat_global.init(allocator, &self.server, "default", 0, null);
+    errdefer self.seat_global.deinit();
 
     const selection = try selectSocket(allocator, options);
     errdefer {
@@ -269,6 +273,7 @@ pub fn destroy(self: *NativeServer) void {
         state.deinit(self.allocator);
     }
     self.surfaces.deinit(self.allocator);
+    self.seat_global.deinit();
     self.output_global.deinit();
     self.xdg_shell.deinit();
     self.compositor_global.deinit();
