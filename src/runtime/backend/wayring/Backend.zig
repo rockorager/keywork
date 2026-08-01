@@ -250,12 +250,14 @@ pub fn create(allocator: std.mem.Allocator) !*Backend {
     defer allocator.free(socket_path);
 
     const loop = try allocator.create(IoUringLoop);
-    errdefer allocator.destroy(loop);
+    var loop_owned = true;
+    errdefer if (loop_owned) allocator.destroy(loop);
     loop.* = try IoUringLoop.init(allocator);
-    errdefer loop.deinit();
+    errdefer if (loop_owned) loop.deinit();
 
     const self = try allocator.create(Backend);
-    errdefer allocator.destroy(self);
+    var self_owned = true;
+    errdefer if (self_owned) allocator.destroy(self);
     try self.initConnection(
         allocator,
         socket_path,
@@ -266,11 +268,9 @@ pub fn create(allocator: std.mem.Allocator) !*Backend {
         false,
     );
     self.owned_loop = loop;
-    errdefer {
-        self.beginClose() catch {};
-        while (!self.readyToDeinit() and loop.hasActiveOperations()) self.runOnce() catch break;
-        if (self.readyToDeinit()) self.deinit();
-    }
+    loop_owned = false;
+    self_owned = false;
+    errdefer self.destroy();
     try self.waitConfigured();
     return self;
 }
@@ -354,14 +354,32 @@ pub fn deinit(self: *Backend) void {
 pub fn destroy(self: *Backend) void {
     const allocator = self.allocator;
     const loop = self.owned_loop orelse @panic("destroy requires Backend.create");
-    self.beginClose() catch {};
-    while (!self.readyToDeinit() and loop.hasActiveOperations()) self.runOnce() catch break;
-    std.debug.assert(self.readyToDeinit());
-    while (loop.hasActiveOperations()) loop.runOnce() catch break;
+    if (!self.finishOwnedClose(loop)) return;
     self.deinit();
+    while (loop.hasActiveOperations()) loop.runOnce() catch continue;
     loop.deinit();
     allocator.destroy(loop);
     allocator.destroy(self);
+}
+
+fn finishOwnedClose(self: *Backend, loop: *IoUringLoop) bool {
+    self.beginClose() catch self.client.shutdown() catch {};
+    while (!self.readyToDeinit()) {
+        if (!loop.hasActiveOperations()) {
+            self.client.shutdown() catch {};
+            self.updateClosed();
+            // No completion can still reference this backend, but an invalid
+            // lifecycle state must not be hidden by freeing it as if closed.
+            if (!self.readyToDeinit()) return false;
+            break;
+        }
+        self.runOnce() catch {
+            // Callback errors release their operation slot. Cancel all other
+            // transport I/O and continue until every terminal CQE arrives.
+            self.client.shutdown() catch {};
+        };
+    }
+    return true;
 }
 
 pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
