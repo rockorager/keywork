@@ -133,6 +133,14 @@ pub fn lastButtonPressSurfaceId(self: *const Input) ?u32 {
     return self.last_button_press_surface_id;
 }
 
+pub fn pointerSurfaceId(self: *const Input) ?u32 {
+    return self.pointer_surface_id;
+}
+
+pub fn keyboardSurfaceId(self: *const Input) ?u32 {
+    return self.keyboard_surface_id;
+}
+
 pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
     if (self.cursor_shape == shape) return;
     const serial = self.pointer_enter_serial orelse return;
