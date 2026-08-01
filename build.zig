@@ -27,6 +27,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const wayring_uring = b.addModule("wayring-uring", .{
+        .root_source_file = b.path("src/wayring/IoUringTransport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_uring.addImport("wayring", wayring);
+    wayring_uring.addImport("keywork-loop", keywork_loop);
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -48,6 +55,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
     const wayring_tests = b.addTest(.{ .root_module = wayring });
     test_step.dependOn(&b.addRunArtifact(wayring_tests).step);
+    const wayring_uring_tests = b.addTest(.{ .root_module = wayring_uring });
+    test_step.dependOn(&b.addRunArtifact(wayring_uring_tests).step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
 

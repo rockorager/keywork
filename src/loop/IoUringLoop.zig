@@ -100,6 +100,16 @@ pub fn remove(self: *IoUringLoop, handle: Handle) !void {
     self.operation(handle).?.removed = true;
 }
 
+/// Reports whether an operation still owns a slot. A removed operation stays
+/// active until its terminal CQE, so callers can safely retain SQE buffers.
+pub fn isActive(self: *IoUringLoop, handle: Handle) bool {
+    return self.operation(handle) != null;
+}
+
+pub fn hasActiveOperations(self: *const IoUringLoop) bool {
+    return self.active_count != 0;
+}
+
 pub fn quit(self: *IoUringLoop) void {
     self.running = false;
 }
