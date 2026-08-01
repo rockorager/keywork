@@ -59,6 +59,7 @@ test {
     _ = @import("backend/wayland/window.zig");
     _ = @import("backend/wayring/Client.zig");
     _ = @import("backend/wayring/VulkanWindow.zig");
+    _ = @import("backend/wayring/Window.zig");
     _ = @import("graphics/raster.zig");
     _ = @import("graphics/RasterImage.zig");
     _ = @import("graphics/SharedPixelBuffer.zig");

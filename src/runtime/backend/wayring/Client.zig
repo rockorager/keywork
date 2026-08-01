@@ -129,6 +129,10 @@ pub fn isReady(self: *const Client) bool {
     return self.ready;
 }
 
+pub fn connectionPtr(self: *Client) *wayring.Connection {
+    return &self.connection;
+}
+
 pub fn dmaBufFactory(self: *const Client) ?wayring.ObjectHandle {
     return if (self.dmabuf) |global| global.handle else null;
 }

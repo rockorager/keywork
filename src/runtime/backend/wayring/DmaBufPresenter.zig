@@ -93,6 +93,10 @@ pub fn bufferCount(self: *const DmaBufPresenter) usize {
     return self.buffers.items.len;
 }
 
+pub fn ownsObject(self: *const DmaBufPresenter, id: u32) bool {
+    return id == self.factory.id or self.findBufferById(id) != null;
+}
+
 pub fn hasGeneration(self: *const DmaBufPresenter, generation: u64) bool {
     for (self.buffers.items) |buffer| {
         if (buffer.generation == generation) return true;
@@ -221,6 +225,10 @@ pub fn acquire(self: *DmaBufPresenter) !?Lease {
 pub fn cancel(self: *DmaBufPresenter, lease: Lease) !void {
     const buffer = try self.renderingBuffer(lease);
     buffer.state = .available;
+}
+
+pub fn frameCallback(self: *DmaBufPresenter) !wayring.ObjectHandle {
+    return protocol.wl_surface_types.requests.frame(self.connection, self.surface);
 }
 
 /// Starts final retirement. Returns true when no compositor-held buffers

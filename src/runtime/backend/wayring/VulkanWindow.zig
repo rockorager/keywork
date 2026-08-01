@@ -78,6 +78,10 @@ pub fn handleMessage(self: *VulkanWindow, message: *const wayring.Message) !void
     self.reapRetiredGenerations();
 }
 
+pub fn ownsObject(self: *const VulkanWindow, id: u32) bool {
+    return self.presenter.ownsObject(id);
+}
+
 pub fn configure(self: *VulkanWindow, width: u32, height: u32) !void {
     if (width == 0 or height == 0) return error.EmptyTarget;
     if (self.currentGeneration()) |current| {
@@ -123,7 +127,28 @@ pub fn present(
     display_list: []const keywork.PaintCommand,
     scale: f32,
 ) !bool {
-    const lease = (try self.presenter.acquire()) orelse return false;
+    const lease = (try self.renderLease(display_list, scale)) orelse return false;
+    try self.presenter.present(lease);
+    return true;
+}
+
+pub fn presentWithFrame(
+    self: *VulkanWindow,
+    display_list: []const keywork.PaintCommand,
+    scale: f32,
+) !?wayring.ObjectHandle {
+    const lease = (try self.renderLease(display_list, scale)) orelse return null;
+    const callback = try self.presenter.frameCallback();
+    try self.presenter.present(lease);
+    return callback;
+}
+
+fn renderLease(
+    self: *VulkanWindow,
+    display_list: []const keywork.PaintCommand,
+    scale: f32,
+) !?DmaBufPresenter.Lease {
+    const lease = (try self.presenter.acquire()) orelse return null;
     const generation = self.findGeneration(lease.generation) orelse {
         self.presenter.cancel(lease) catch {};
         return error.MissingTargetGeneration;
@@ -137,8 +162,7 @@ pub fn present(
         self.presenter.cancel(lease) catch {};
         return err;
     };
-    try self.presenter.present(lease);
-    return true;
+    return lease;
 }
 
 pub fn retireAll(self: *VulkanWindow) !bool {
