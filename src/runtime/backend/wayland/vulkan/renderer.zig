@@ -4,6 +4,7 @@ const std = @import("std");
 const keywork = @import("keywork-ui");
 const TextRenderer = @import("../../../graphics/text.zig");
 const DmaBufImage = @import("../../../graphics/DmaBufImage.zig");
+pub const DmaBufTargets = @import("DmaBufTargetSet.zig");
 const wayland = @import("wayland");
 const vk = @import("vulkan");
 
@@ -80,11 +81,11 @@ const SwapchainResources = struct {
 
 /// Attachment state needed to record one UI frame. WSI acquisition and
 /// presentation deliberately remain outside this target description.
-const RenderTarget = struct {
-    framebuffer: vk.Framebuffer,
-    render_pass: vk.RenderPass,
-    format: vk.Format,
-    extent: vk.Extent2D,
+const RenderTarget = DmaBufTargets.RenderTarget;
+
+const ForeignRelease = struct {
+    targets: *const DmaBufTargets,
+    target_index: usize,
 };
 
 const GpuBuffer = struct {
@@ -280,6 +281,7 @@ pub const Renderer = struct {
     device: vk.Device,
     queue_family_index: u32,
     queue: vk.Queue,
+    dmabuf_export: bool,
     dmabuf_import: bool,
     swapchain_maintenance: bool,
     swapchain: vk.SwapchainKHR,
@@ -381,18 +383,19 @@ pub const Renderer = struct {
             vki.getPhysicalDeviceFeatures2(selection.physical_device, &features);
         }
         const swapchain_maintenance = has_maintenance_extension and maintenance_features.swapchain_maintenance_1 == .true;
-        const dmabuf_extension_names = [_][*:0]const u8{
+        const dmabuf_export_extension_names = [_][*:0]const u8{
             vk.extensions.khr_external_memory_fd.name,
-            vk.extensions.khr_external_semaphore_fd.name,
             vk.extensions.khr_image_format_list.name,
             vk.extensions.ext_external_memory_dma_buf.name,
             vk.extensions.ext_image_drm_format_modifier.name,
             vk.extensions.ext_queue_family_foreign.name,
         };
-        var dmabuf_import = can_query_extended_features;
-        for (dmabuf_extension_names) |name| {
-            dmabuf_import = dmabuf_import and hasExtension(extension_properties, std.mem.span(name));
+        var dmabuf_export = can_query_extended_features;
+        for (dmabuf_export_extension_names) |name| {
+            dmabuf_export = dmabuf_export and hasExtension(extension_properties, std.mem.span(name));
         }
+        var dmabuf_import = dmabuf_export and
+            hasExtension(extension_properties, vk.extensions.khr_external_semaphore_fd.name);
         if (dmabuf_import) {
             const external_semaphore_info: vk.PhysicalDeviceExternalSemaphoreInfo = .{
                 .handle_type = .{ .sync_fd_bit = true },
@@ -420,10 +423,14 @@ pub const Renderer = struct {
             device_extension_names[device_extension_count] = vk.extensions.ext_swapchain_maintenance_1.name;
             device_extension_count += 1;
         }
-        if (dmabuf_import) for (dmabuf_extension_names) |name| {
+        if (dmabuf_export) for (dmabuf_export_extension_names) |name| {
             device_extension_names[device_extension_count] = name;
             device_extension_count += 1;
         };
+        if (dmabuf_import) {
+            device_extension_names[device_extension_count] = vk.extensions.khr_external_semaphore_fd.name;
+            device_extension_count += 1;
+        }
         const queue_priority: f32 = 1.0;
         const queue_create_info: vk.DeviceQueueCreateInfo = .{
             .queue_family_index = selection.queue_family_index,
@@ -492,6 +499,7 @@ pub const Renderer = struct {
             .device = device,
             .queue_family_index = selection.queue_family_index,
             .queue = queue,
+            .dmabuf_export = dmabuf_export,
             .dmabuf_import = dmabuf_import,
             .swapchain_maintenance = swapchain_maintenance,
             .swapchain = .null_handle,
@@ -707,6 +715,73 @@ pub const Renderer = struct {
         return true;
     }
 
+    pub fn dmaBufModifiers(self: *Self, allocator: std.mem.Allocator) ![]u64 {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        return DmaBufTargets.queryModifiers(allocator, self.vki, self.physical_device);
+    }
+
+    pub fn createDmaBufTargets(self: *Self, width: u32, height: u32, modifier: u64) !DmaBufTargets {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        return DmaBufTargets.init(
+            self.allocator,
+            self.vkd,
+            self.device,
+            self.memory_properties,
+            .{ .width = width, .height = height },
+            modifier,
+        );
+    }
+
+    /// Records, submits, and host-waits one exported target before it may be
+    /// attached to a Wayland surface. Compositor-to-client synchronization is
+    /// handled separately by `wl_buffer.release` and the DMA-BUF reservation.
+    pub fn renderDmaBuf(
+        self: *Self,
+        targets: *const DmaBufTargets,
+        target_index: usize,
+        display_list: []const keywork.PaintCommand,
+        scale: f32,
+    ) !void {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        if (target_index >= targets.len()) return error.InvalidTarget;
+
+        try self.retireSignaledExternalUploads();
+        self.reapImportedDmaBufs();
+        self.loadFrameViews();
+        defer self.storeFrameViews();
+        _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
+        const frame = &self.frames[self.frame_index];
+        self.retireExternalFrame(frame);
+        var submitted = false;
+        errdefer if (!submitted) self.retireExternalFrame(frame);
+
+        const target = targets.renderTarget(target_index);
+        try self.ensureTextResources();
+        try self.ensureTextPipeline(target.format, target.render_pass);
+        try self.recordFrame(display_list, scale, frame, target, .{
+            .targets = targets,
+            .target_index = target_index,
+        });
+
+        const target_fence = targets.fence(target_index);
+        _ = try self.vkd.waitForFences(self.device, &.{target_fence}, .true, std.math.maxInt(u64));
+        try self.vkd.resetFences(self.device, &.{target_fence});
+        const signal_count: u32 = if (frame.external_uploads.items.len == 0) 0 else 1;
+        try self.vkd.queueSubmit(self.queue, &.{.{
+            .command_buffer_count = 1,
+            .p_command_buffers = @ptrCast(&self.command_buffer),
+            .signal_semaphore_count = signal_count,
+            .p_signal_semaphores = @ptrCast(&frame.external_release),
+        }}, target_fence);
+        submitted = true;
+        _ = try self.vkd.waitForFences(self.device, &.{target_fence}, .true, std.math.maxInt(u64));
+        self.finishExternalSources(frame);
+
+        self.storeFrameViews();
+        self.frame_index = (self.frame_index + 1) % frames_in_flight;
+        self.loadFrameViews();
+    }
+
     pub fn measureText(self: *Self, scale: f32, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
         return self.text_renderer.measure(scale, value, style);
     }
@@ -774,7 +849,7 @@ pub const Renderer = struct {
         }
         try self.createRenderTargets();
         try self.ensureTextResources();
-        try self.ensureTextPipeline();
+        try self.ensureTextPipeline(self.swapchain_format, self.render_pass);
         self.swapchain_dirty = false;
         try self.reapRetiredSwapchains();
         log.info("Vulkan swapchain {d}x{d} images={d}", .{ extent.width, extent.height, self.swapchain_images.len });
@@ -1044,14 +1119,14 @@ pub const Renderer = struct {
         }}, null);
     }
 
-    fn ensureTextPipeline(self: *Self) !void {
-        if (self.text_pipeline != .null_handle and self.text_pipeline_format == self.swapchain_format) return;
+    fn ensureTextPipeline(self: *Self, format_value: vk.Format, render_pass: vk.RenderPass) !void {
+        if (self.text_pipeline != .null_handle and self.text_pipeline_format == format_value) return;
         if (self.text_pipeline != .null_handle) {
             self.vkd.destroyPipeline(self.device, self.text_pipeline, null);
             self.text_pipeline = .null_handle;
         }
-        try self.createTextPipeline();
-        self.text_pipeline_format = self.swapchain_format;
+        try self.createTextPipeline(render_pass);
+        self.text_pipeline_format = format_value;
     }
 
     fn resetAtlasPacking(self: *Self) void {
@@ -1141,7 +1216,7 @@ pub const Renderer = struct {
         self.text_vertices.clearRetainingCapacity();
     }
 
-    fn createTextPipeline(self: *Self) !void {
+    fn createTextPipeline(self: *Self, render_pass: vk.RenderPass) !void {
         const vert_module = try self.createShaderModule(@embedFile("../shaders/text.vert.spv"));
         defer self.vkd.destroyShaderModule(self.device, vert_module, null);
         const frag_module = try self.createShaderModule(@embedFile("../shaders/text.frag.spv"));
@@ -1233,7 +1308,7 @@ pub const Renderer = struct {
             .p_color_blend_state = &color_blend,
             .p_dynamic_state = &dynamic_state,
             .layout = self.text_pipeline_layout,
-            .render_pass = self.render_pass,
+            .render_pass = render_pass,
             .subpass = 0,
             .base_pipeline_handle = .null_handle,
             .base_pipeline_index = -1,
@@ -1266,7 +1341,7 @@ pub const Renderer = struct {
             .render_pass = self.render_pass,
             .format = self.swapchain_format,
             .extent = self.swapchain_extent,
-        });
+        }, null);
 
         const wait_stage: vk.PipelineStageFlags = .{ .color_attachment_output_bit = true };
         const signal_semaphores = [_]vk.Semaphore{
@@ -1321,7 +1396,14 @@ pub const Renderer = struct {
         return .presented;
     }
 
-    fn recordFrame(self: *Self, display_list: []const keywork.PaintCommand, scale: f32, frame: *FrameResources, target: RenderTarget) !void {
+    fn recordFrame(
+        self: *Self,
+        display_list: []const keywork.PaintCommand,
+        scale: f32,
+        frame: *FrameResources,
+        target: RenderTarget,
+        foreign_release: ?ForeignRelease,
+    ) !void {
         var repacked_at_atlas_limit = false;
         while (true) {
             const atlas_layout_before = self.atlas.layout;
@@ -1364,6 +1446,13 @@ pub const Renderer = struct {
         self.drawQuads(target.extent);
 
         self.vkd.cmdEndRenderPass(self.command_buffer);
+        if (foreign_release) |release| {
+            release.targets.recordForeignRelease(
+                self.command_buffer,
+                release.target_index,
+                self.queue_family_index,
+            );
+        }
         try self.vkd.endCommandBuffer(self.command_buffer);
     }
 
