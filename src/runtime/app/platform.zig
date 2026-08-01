@@ -82,17 +82,17 @@ pub fn WaylandPlatform(comptime Backend: type) type {
 
         fn clipboardRead(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
             const backend: *Backend = @ptrCast(@alignCast(ptr));
-            const clipboard = backend.clipboard orelse return null;
-            return clipboard.read(allocator);
+            const clipboard = if (backend.clipboard) |*value| value else return null;
+            return clipboard.*.read(allocator);
         }
 
         fn clipboardWrite(ptr: *anyopaque, text: []const u8) anyerror!void {
             const backend: *Backend = @ptrCast(@alignCast(ptr));
-            const clipboard = backend.clipboard orelse return error.ClipboardUnavailable;
+            const clipboard = if (backend.clipboard) |*value| value else return error.ClipboardUnavailable;
             // Compositors validate the selection claim against a recent
             // input serial, so writing before any user input fails.
             const serial = backend.input.last_input_serial orelse return error.NoInputSerial;
-            try clipboard.write(text, serial);
+            try clipboard.*.write(text, serial);
         }
 
         fn activationToken(ptr: *anyopaque, allocator: std.mem.Allocator, app_id: ?[*:0]const u8) anyerror!?[]u8 {

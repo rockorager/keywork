@@ -35,7 +35,10 @@ fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorS
 
 fn setRuntimeClipboard(runtime: *runtime_mod.Runtime, backend: anytype) void {
     const Backend = @TypeOf(backend.*);
-    const platform = platform_mod.WaylandPlatform(Backend).platform(backend);
+    const platform = if (Backend == WayringBackend)
+        platform_mod.WayringPlatform(Backend).platform(backend)
+    else
+        platform_mod.WaylandPlatform(Backend).platform(backend);
     runtime.setClipboardReader(platform.ptr, platform.vtable.clipboard_read);
 }
 
@@ -293,11 +296,11 @@ const WayringRunContext = struct {
                     .width = @floatFromInt(size.width),
                     .height = @floatFromInt(size.height),
                 }),
-                .repaint => try runtime.frameDone(),
+                .repaint => runtime_mod.Runtime.waylandFrameDone(runtime),
                 .close, .disconnected, .fatal => self.stop = true,
                 .pointer_move => |point| {
                     try runtime.pointerMove(point);
-                    if (point) |position| try backend.setCursorShape(runtime.waylandCursorShape(position));
+                    if (point) |position| try backend.setCursorShape(runtime_mod.Runtime.waylandCursorShape(runtime, position));
                 },
                 .pointer_button => |button| try runtime.pointerButton(button),
                 .scroll => |scroll| try runtime.scrollBy(scroll),
