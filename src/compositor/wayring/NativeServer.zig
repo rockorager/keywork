@@ -22,6 +22,7 @@ const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
 const TearingControlGlobal = @import("TearingControlGlobal.zig");
+const FifoGlobal = @import("FifoGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -66,6 +67,7 @@ presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
 alpha_modifier_global: AlphaModifierGlobal,
 tearing_control_global: TearingControlGlobal,
+fifo_global: FifoGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -110,6 +112,7 @@ last_keyboard_serial: u32 = 0,
 next_touch_id: u32 = 1,
 frame_count: u64 = 0,
 repaint_needed: bool = false,
+fifo_progress_needed: bool = false,
 output_busy_retries: u8 = 0,
 terminating: bool = false,
 signal_fd: i32 = -1,
@@ -159,6 +162,10 @@ const SurfaceState = struct {
     // Native XdgShell cannot yet represent fullscreen, so output submission
     // remains vsync-only while retaining this future policy input.
     presentation_hint: CompositorGlobal.PresentationHint = .vsync,
+    fifo_barrier: bool = false,
+    // Native currently owns one output, so this is the barrier's output
+    // association rather than a separate output pointer.
+    fifo_barrier_visible: bool = false,
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -445,6 +452,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.alpha_modifier_global.deinit();
     try self.tearing_control_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.tearing_control_global.deinit();
+    try self.fifo_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.fifo_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
@@ -524,6 +533,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.socket_path = selection.path;
     self.frame_count = 0;
     self.repaint_needed = options.output_kind == .drm;
+    self.fifo_progress_needed = false;
     self.output_busy_retries = 0;
     self.terminating = false;
     self.event_loop.setAfterPlatformHook(self, afterPlatform);
@@ -690,6 +700,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
+    self.fifo_global.deinit();
     self.tearing_control_global.deinit();
     self.alpha_modifier_global.deinit();
     self.content_type_global.deinit();
@@ -745,6 +756,11 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     if (pruned) try self.refreshInputFocus(inputTime(self));
     if (pruned or self.surface_tree.needsRedraw() or self.repaint_needed)
         try self.renderScene(null);
+    // A successful latch may be the only event that releases a blocked wait.
+    while (self.fifo_progress_needed) {
+        self.fifo_progress_needed = false;
+        try self.progressTransactions();
+    }
 }
 
 fn drmOutputListener(self: *NativeServer) DrmOutput.Listener {
@@ -1978,6 +1994,7 @@ fn progressTransactions(self: *NativeServer) !void {
                 entry.copy = null;
             }
             if (entry.handle != null) ready = false;
+            if (commit.fifo_wait and !self.fifoWaitReady(commit.surface)) ready = false;
         }
         if (pending.discarded) {
             if (pendingIoTerminal(pending)) {
@@ -1997,6 +2014,23 @@ fn progressTransactions(self: *NativeServer) !void {
             return err;
         };
         self.destroyPending(index);
+    }
+}
+
+fn fifoWaitReady(
+    self: *const NativeServer,
+    surface: *const CompositorGlobal.Surface,
+) bool {
+    const state = self.findState(surface) orelse return true;
+    return !state.fifo_barrier;
+}
+
+fn clearVisibleFifoBarriers(self: *NativeServer) void {
+    for (self.surfaces.items) |state| {
+        if (!state.fifo_barrier or !state.fifo_barrier_visible) continue;
+        state.fifo_barrier = false;
+        state.fifo_barrier_visible = false;
+        self.fifo_progress_needed = true;
     }
 }
 
@@ -2054,6 +2088,11 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     try self.presentation_pending.ensureUnusedCapacity(self.allocator, feedback_batch_count);
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+        if (commit.fifo_set) {
+            const state = self.findState(commit.surface) orelse unreachable;
+            state.fifo_barrier = true;
+            state.fifo_barrier_visible = false;
+        }
         if (entry.configure_only) continue;
         try self.applyEntry(commit, entry);
     }
@@ -2249,6 +2288,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             state.viewport,
             false,
         ) catch continue;
+        if (state.fifo_barrier) state.fifo_barrier_visible = true;
         const image_x = paint_entry.x +| state.x;
         const image_y = paint_entry.y +| state.y;
         const force_opaque = if (pixel_buffer.dmabuf) |source|
@@ -2342,6 +2382,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             self.output_busy_retries = 0;
         },
     }
+    self.clearVisibleFifoBarriers();
     self.submitPendingPresentation();
     self.repaint_needed = false;
     self.surface_tree.redrawHandled();
@@ -2654,6 +2695,37 @@ test "root-head scheduler preserves per-root FIFO and unrelated progress" {
     try std.testing.expect(server.isRootHead(0));
     try std.testing.expect(!server.isRootHead(1));
     try std.testing.expect(server.isRootHead(2));
+}
+
+test "native FIFO barriers gate waits and wake progress only after visible clear" {
+    var blocked_surface: CompositorGlobal.Surface = undefined;
+    var unrelated_surface: CompositorGlobal.Surface = undefined;
+    var missing_surface: CompositorGlobal.Surface = undefined;
+    var blocked_state: SurfaceState = undefined;
+    blocked_state.surface = &blocked_surface;
+    blocked_state.fifo_barrier = true;
+    blocked_state.fifo_barrier_visible = false;
+    var unrelated_state: SurfaceState = undefined;
+    unrelated_state.surface = &unrelated_surface;
+    unrelated_state.fifo_barrier = true;
+    unrelated_state.fifo_barrier_visible = false;
+
+    var server: NativeServer = undefined;
+    server.surfaces = .empty;
+    defer server.surfaces.deinit(std.testing.allocator);
+    try server.surfaces.append(std.testing.allocator, &blocked_state);
+    try server.surfaces.append(std.testing.allocator, &unrelated_state);
+    server.fifo_progress_needed = false;
+
+    try std.testing.expect(!server.fifoWaitReady(&blocked_surface));
+    try std.testing.expect(!server.fifoWaitReady(&unrelated_surface));
+    try std.testing.expect(server.fifoWaitReady(&missing_surface));
+
+    blocked_state.fifo_barrier_visible = true;
+    server.clearVisibleFifoBarriers();
+    try std.testing.expect(server.fifoWaitReady(&blocked_surface));
+    try std.testing.expect(!server.fifoWaitReady(&unrelated_surface));
+    try std.testing.expect(server.fifo_progress_needed);
 }
 
 test "buffer damage maps scales positions and output clipping conservatively" {

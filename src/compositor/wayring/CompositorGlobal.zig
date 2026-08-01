@@ -73,6 +73,8 @@ pub const Commit = struct {
     content_type: ContentType,
     alpha_multiplier: u32,
     presentation_hint: PresentationHint,
+    fifo_set: bool,
+    fifo_wait: bool,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -281,6 +283,11 @@ pub const TearingControlHandler = struct {
 
 pub const PresentationHint = generated.wp_tearing_control_v1_types.presentation_hint;
 
+pub const FifoHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -295,6 +302,7 @@ pub const Surface = struct {
     content_type_handler: ?ContentTypeHandler = null,
     alpha_modifier_handler: ?AlphaModifierHandler = null,
     tearing_control_handler: ?TearingControlHandler = null,
+    fifo_handler: ?FifoHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -306,6 +314,8 @@ pub const Surface = struct {
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
     pending_presentation_hint: PresentationHint = .vsync,
     current_presentation_hint: PresentationHint = .vsync,
+    pending_fifo_set: bool = false,
+    pending_fifo_wait: bool = false,
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -387,6 +397,27 @@ pub const Surface = struct {
         std.debug.assert(handler.context == context);
         self.tearing_control_handler = null;
         self.pending_presentation_hint = .vsync;
+    }
+
+    pub fn setFifoHandler(self: *Surface, handler: FifoHandler) !void {
+        if (self.fifo_handler != null) return error.AlreadyExists;
+        self.fifo_handler = handler;
+    }
+
+    pub fn clearFifoHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.fifo_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.fifo_handler = null;
+    }
+
+    pub fn setPendingFifoBarrier(self: *Surface) void {
+        std.debug.assert(self.fifo_handler != null);
+        self.pending_fifo_set = true;
+    }
+
+    pub fn setPendingFifoWait(self: *Surface) void {
+        std.debug.assert(self.fifo_handler != null);
+        self.pending_fifo_wait = true;
     }
 
     pub fn reference(self: *Surface) !void {
@@ -817,6 +848,10 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     surface.pending_buffer_damage.clearRetainingCapacity();
     surface.pending_callbacks.clearRetainingCapacity();
     surface.pending_presentation_feedbacks.clearRetainingCapacity();
+    const fifo_set = surface.pending_fifo_set;
+    const fifo_wait = surface.pending_fifo_wait;
+    surface.pending_fifo_set = false;
+    surface.pending_fifo_wait = false;
     const synchronization = if (attachment_kind == .dmabuf)
         if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
     else
@@ -832,6 +867,8 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .content_type = surface.current_content_type,
         .alpha_multiplier = surface.current_alpha_multiplier,
         .presentation_hint = surface.current_presentation_hint,
+        .fifo_set = fifo_set,
+        .fifo_wait = fifo_wait,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
@@ -878,6 +915,10 @@ fn destroySurface(
     }
     if (surface.tearing_control_handler) |handler| {
         surface.tearing_control_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.fifo_handler) |handler| {
+        surface.fifo_handler = null;
         handler.surface_destroyed(handler.context);
     }
     surface.unreference();
