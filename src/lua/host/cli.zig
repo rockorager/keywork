@@ -99,9 +99,9 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
             result.script_path = arg;
             script_seen = true;
         } else if (std.mem.eql(u8, arg, "--wayland")) {
-            result.backend = .wayland_shm;
+            result.backend = .wayring_shm;
         } else if (std.mem.eql(u8, arg, "--backend=cpu")) {
-            result.backend = .wayland_shm;
+            result.backend = .wayring_shm;
         } else if (std.mem.eql(u8, arg, "--backend=vulkan")) {
             result.backend = .vulkan;
         } else if (std.mem.eql(u8, arg, "--backend=wayring")) {

@@ -85,7 +85,7 @@ fn runInteractive(allocator: std.mem.Allocator, options: cli.StorybookOptions, w
         .app_id = "dev.keywork.Storybook",
         .width = 1200,
         .height = 800,
-        .backend = .wayland_shm,
+        .backend = .wayring_shm,
         .log_writer = writer,
         .systemd_event = try app.systemdEvent(),
         .host_bindings = app.hostBindings(),

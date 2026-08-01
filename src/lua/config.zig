@@ -210,12 +210,17 @@ fn checkBoolField(lua_state: *c.lua_State, table_index: c_int, name: [:0]const u
 }
 
 fn backendFromName(name: []const u8) ?native_runtime.BackendKind {
-    if (std.mem.eql(u8, name, "cpu")) return .wayland_shm;
+    if (std.mem.eql(u8, name, "cpu")) return .wayring_shm;
     if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
     if (std.mem.eql(u8, name, "wayring")) return .wayring;
     if (std.mem.eql(u8, name, "wayring-cpu")) return .wayring_shm;
     if (std.mem.eql(u8, name, "log")) return .log;
     return null;
+}
+
+test "CPU application backend uses Wayring SHM" {
+    try std.testing.expectEqual(native_runtime.BackendKind.wayring_shm, backendFromName("cpu").?);
+    try std.testing.expectEqual(native_runtime.BackendKind.wayring_shm, backendFromName("wayring-cpu").?);
 }
 
 fn isWidgetTable(lua_state: *c.lua_State, table: c_int) bool {
