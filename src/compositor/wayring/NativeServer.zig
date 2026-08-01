@@ -71,6 +71,7 @@ const SurfaceState = struct {
     transform: u32 = 0,
     x: i32 = 0,
     y: i32 = 0,
+    full_damage: bool = false,
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -273,7 +274,7 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     try self.transport.dispatch();
     try self.finishCopy(true);
     if (self.active == null) try self.applyCommits();
-    if (self.pruneSurfaces()) try self.renderScene();
+    if (self.pruneSurfaces()) try self.renderScene(null);
 }
 
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
@@ -296,6 +297,11 @@ fn applyCommits(self: *NativeServer) !void {
         }
 
         const state = try self.stateFor(commit.surface);
+        state.full_damage = state.full_damage or
+            state.scale != commit.scale or
+            state.transform != commit.transform or
+            state.x != commit.offset_x or
+            state.y != commit.offset_y;
         state.scale = commit.scale;
         state.transform = commit.transform;
         state.x = commit.offset_x;
@@ -368,30 +374,21 @@ fn finishCopy(self: *NativeServer, present_frame: bool) !void {
 }
 
 fn present(self: *NativeServer, commit: *CompositorGlobal.Commit) !void {
-    try self.renderScene();
+    const state = self.findState(commit.surface) orelse return error.SurfaceStateMissing;
+    try self.renderScene(state);
     if (commit.surface.client.state != .active) return;
     const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
     try commit.finishFrame(@truncate(@as(u64, @intCast(@max(now, 0)))));
 }
 
-fn renderScene(self: *NativeServer) !void {
+fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     var commands: std.ArrayList(render.Command) = .empty;
     defer commands.deinit(self.allocator);
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
     for (self.surfaces.items) |state| {
         if (!state.surface.resource_alive) continue;
         const snapshot = if (state.snapshot) |*value| value else continue;
-        const transform: render.BufferTransform = switch (state.transform) {
-            0 => .normal,
-            1 => .rotate_90,
-            2 => .rotate_180,
-            3 => .rotate_270,
-            4 => .flipped,
-            5 => .flipped_90,
-            6 => .flipped_180,
-            7 => .flipped_270,
-            else => .normal,
-        };
+        const transform = bufferTransform(state.transform);
         const transformed = transform.applyToSize(snapshot.size);
         const divisor: u32 = @intCast(@max(state.scale, 1));
         try commands.append(self.allocator, .{ .image = .{
@@ -406,14 +403,119 @@ fn renderScene(self: *NativeServer) !void {
             .is_opaque = snapshot.force_opaque,
         } });
     }
-    try self.renderer.beginFrame(self.output.renderTarget(), self.output.scale, .{}, null, .{});
+    var damage_storage: [1]render.Rect = undefined;
+    const damage = if (damage_state) |state| self.frameDamage(state, &damage_storage) else null;
+    try self.renderer.beginFrame(self.output.renderTarget(), self.output.scale, .{}, damage, .{});
     try self.renderer.append(commands.items);
     try self.renderer.finishFrame();
+    if (damage_state) |state| state.full_damage = false;
     self.frame_count +%= 1;
 }
 
+fn frameDamage(
+    self: *const NativeServer,
+    state: *const SurfaceState,
+    storage: *[1]render.Rect,
+) ?[]const render.Rect {
+    if (state.full_damage) return null;
+    const snapshot = if (state.snapshot) |*value| value else return null;
+    const source_damage = snapshot.source_damage orelse return null;
+    const transform = bufferTransform(state.transform);
+    var bounds: ?render.Rect = null;
+    for (source_damage) |rectangle| {
+        const mapped = mapBufferDamage(
+            rectangle,
+            snapshot.size,
+            transform,
+            @intCast(state.scale),
+            .{ .x = state.x, .y = state.y },
+            self.output.scale,
+            self.output.size,
+        ) orelse continue;
+        bounds = if (bounds) |existing| existing.unionWith(mapped) else mapped;
+    }
+    if (bounds) |rectangle| {
+        storage[0] = rectangle;
+        return storage[0..1];
+    }
+    return &.{};
+}
+
+fn mapBufferDamage(
+    rectangle: render.Rect,
+    buffer_size: render.Size,
+    transform: render.BufferTransform,
+    buffer_scale: u32,
+    position: render.Position,
+    output_scale: render.Scale,
+    output_size: render.Size,
+) ?render.Rect {
+    std.debug.assert(buffer_scale > 0 and output_scale.numerator > 0);
+    const width: i128 = buffer_size.width;
+    const height: i128 = buffer_size.height;
+    const transformed_size = transform.applyToSize(buffer_size);
+    const logical_width = @max(transformed_size.width / buffer_scale, 1);
+    const logical_height = @max(transformed_size.height / buffer_scale, 1);
+    const numerator: i128 = output_scale.numerator;
+    const denominator: i128 = render.Scale.denominator;
+    const output_width = @divTrunc(@as(i128, logical_width) * numerator + denominator / 2, denominator);
+    const output_height = @divTrunc(@as(i128, logical_height) * numerator + denominator / 2, denominator);
+    const filter_margin: i128 = if (output_width != transformed_size.width or
+        output_height != transformed_size.height) 1 else 0;
+    const x0 = @max(@as(i128, rectangle.x) - filter_margin, 0);
+    const y0 = @max(@as(i128, rectangle.y) - filter_margin, 0);
+    const x1 = @min(@as(i128, rectangle.x) + rectangle.width + filter_margin, width);
+    const y1 = @min(@as(i128, rectangle.y) + rectangle.height + filter_margin, height);
+    const transformed = switch (transform) {
+        .normal => .{ x0, y0, x1, y1 },
+        .rotate_90 => .{ height - y1, x0, height - y0, x1 },
+        .rotate_180 => .{ width - x1, height - y1, width - x0, height - y0 },
+        .rotate_270 => .{ y0, width - x1, y1, width - x0 },
+        .flipped => .{ width - x1, y0, width - x0, y1 },
+        .flipped_90 => .{ height - y1, width - x1, height - y0, width - x0 },
+        .flipped_180 => .{ x0, height - y1, x1, height - y0 },
+        .flipped_270 => .{ y0, x0, y1, x1 },
+    };
+    const scale: i128 = buffer_scale;
+    const logical_left = @divFloor(transformed[0], scale) + position.x;
+    const logical_top = @divFloor(transformed[1], scale) + position.y;
+    const logical_right = -@divFloor(-transformed[2], scale) + position.x;
+    const logical_bottom = -@divFloor(-transformed[3], scale) + position.y;
+    const left = @max(@divFloor(logical_left * numerator, denominator), 0);
+    const top = @max(@divFloor(logical_top * numerator, denominator), 0);
+    const right = @min(
+        -@divFloor(-(logical_right * numerator), denominator),
+        output_size.width,
+    );
+    const bottom = @min(
+        -@divFloor(-(logical_bottom * numerator), denominator),
+        output_size.height,
+    );
+    if (left >= right or top >= bottom) return null;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn bufferTransform(value: u32) render.BufferTransform {
+    return switch (value) {
+        0 => .normal,
+        1 => .rotate_90,
+        2 => .rotate_180,
+        3 => .rotate_270,
+        4 => .flipped,
+        5 => .flipped_90,
+        6 => .flipped_180,
+        7 => .flipped_270,
+        else => unreachable,
+    };
+}
+
 fn stateFor(self: *NativeServer, surface: *CompositorGlobal.Surface) !*SurfaceState {
-    for (self.surfaces.items) |state| if (state.surface == surface) return state;
+    if (self.findState(surface)) |state| return state;
     const state = try self.allocator.create(SurfaceState);
     errdefer self.allocator.destroy(state);
     try surface.reference();
@@ -421,6 +523,11 @@ fn stateFor(self: *NativeServer, surface: *CompositorGlobal.Surface) !*SurfaceSt
     state.* = .{ .surface = surface };
     try self.surfaces.append(self.allocator, state);
     return state;
+}
+
+fn findState(self: *const NativeServer, surface: *const CompositorGlobal.Surface) ?*SurfaceState {
+    for (self.surfaces.items) |state| if (state.surface == surface) return state;
+    return null;
 }
 
 fn pruneSurfaces(self: *NativeServer) bool {
@@ -494,6 +601,56 @@ fn bindListener(path: [:0]const u8, backlog: u31) !i32 {
 fn processEnvironment(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
+}
+
+test "buffer damage maps through every surface transform" {
+    const source: render.Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const size: render.Size = .{ .width = 2, .height = 3 };
+    const Case = struct {
+        transform: render.BufferTransform,
+        expected: render.Rect,
+    };
+    const cases = [_]Case{
+        .{ .transform = .normal, .expected = .{ .x = 0, .y = 0, .width = 1, .height = 1 } },
+        .{ .transform = .rotate_90, .expected = .{ .x = 2, .y = 0, .width = 1, .height = 1 } },
+        .{ .transform = .rotate_180, .expected = .{ .x = 1, .y = 2, .width = 1, .height = 1 } },
+        .{ .transform = .rotate_270, .expected = .{ .x = 0, .y = 1, .width = 1, .height = 1 } },
+        .{ .transform = .flipped, .expected = .{ .x = 1, .y = 0, .width = 1, .height = 1 } },
+        .{ .transform = .flipped_90, .expected = .{ .x = 2, .y = 1, .width = 1, .height = 1 } },
+        .{ .transform = .flipped_180, .expected = .{ .x = 0, .y = 2, .width = 1, .height = 1 } },
+        .{ .transform = .flipped_270, .expected = .{ .x = 0, .y = 0, .width = 1, .height = 1 } },
+    };
+    for (cases) |case| try std.testing.expectEqual(
+        case.expected,
+        mapBufferDamage(source, size, case.transform, 1, .{}, .{}, .{ .width = 3, .height = 3 }).?,
+    );
+}
+
+test "buffer damage maps scales positions and output clipping conservatively" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = 1, .width = 4, .height = 4 },
+        mapBufferDamage(
+            .{ .x = 2, .y = 2, .width = 4, .height = 4 },
+            .{ .width = 8, .height = 8 },
+            .normal,
+            2,
+            .{ .x = -1, .y = 1 },
+            .{ .numerator = 180 },
+            .{ .width = 4, .height = 5 },
+        ).?,
+    );
+    try std.testing.expectEqual(
+        null,
+        mapBufferDamage(
+            .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .{ .width = 1, .height = 1 },
+            .normal,
+            1,
+            .{ .x = -2, .y = -2 },
+            .{},
+            .{ .width = 1, .height = 1 },
+        ),
+    );
 }
 
 test "native compositor owns and drains its io_uring listener" {
