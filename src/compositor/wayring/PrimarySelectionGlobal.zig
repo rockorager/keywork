@@ -22,7 +22,7 @@ sources: std.ArrayList(*Source) = .empty,
 devices: std.ArrayList(*Device) = .empty,
 offers: std.ArrayList(*Offer) = .empty,
 selection: ?*Source = null,
-selection_serial: u32 = 0,
+selection_serial: ?u32 = null,
 focused_client: ?*Server.Client = null,
 
 const Source = struct {
@@ -329,8 +329,9 @@ fn setSelection(
     serial: u32,
     requester: *Server.Client,
 ) !void {
-    if (self.selection != null and serialIsOlder(serial, self.selection_serial))
-        return;
+    if (self.selection_serial) |current| {
+        if (serialIsOlder(serial, current)) return;
+    }
     if (self.selection == source) {
         self.selection_serial = serial;
         return;
@@ -1072,10 +1073,39 @@ test "native primary selection follows focus and relays transfer FDs" {
     try sender.fromServer(sender_client);
     try expectNullSelection(&sender, sender_device);
     try std.testing.expect(primary_selection.selection == null);
+    const cleared_serial = primary_selection.selection_serial.?;
     while (sender.connection.popMessage()) |popped| {
         var message = popped;
         message.deinit();
     }
+
+    const stale_source = try generated.zwp_primary_selection_device_manager_v1_types.requests.create_source(
+        &sender.connection,
+        sender_globals.manager,
+    );
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        stale_source,
+        "application/stale",
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        stale_source,
+        first_serial,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        null,
+        first_serial,
+    );
+    try sender.toServer(sender_client);
+    try std.testing.expect(primary_selection.selection == null);
+    try std.testing.expectEqual(
+        cleared_serial,
+        primary_selection.selection_serial.?,
+    );
 
     try primary_selection.setKeyboardFocus(null);
     try sender.fromServer(sender_client);

@@ -22,7 +22,7 @@ sources: std.ArrayList(*Source) = .empty,
 devices: std.ArrayList(*Device) = .empty,
 offers: std.ArrayList(*Offer) = .empty,
 selection: ?*Source = null,
-selection_serial: u32 = 0,
+selection_serial: ?u32 = null,
 focused_client: ?*Server.Client = null,
 
 const Source = struct {
@@ -348,8 +348,9 @@ fn setSelection(
     serial: u32,
     requester: *Server.Client,
 ) !void {
-    if (self.selection != null and serialIsOlder(serial, self.selection_serial))
-        return;
+    if (self.selection_serial) |current| {
+        if (serialIsOlder(serial, current)) return;
+    }
     if (self.selection == source) {
         self.selection_serial = serial;
         return;
@@ -1145,5 +1146,31 @@ test "native data device relays focused selections and transfer FDs" {
         else => return error.UnexpectedDataDeviceEvent,
     }
     try std.testing.expect(data_device.selection == null);
+    const cleared_serial = data_device.selection_serial.?;
+
+    const stale_source = try generated.wl_data_device_manager_types.requests.create_data_source(
+        &sender.connection,
+        sender_globals.manager,
+    );
+    try generated.wl_data_source_types.requests.offer(
+        &sender.connection,
+        stale_source,
+        "application/stale",
+    );
+    try generated.wl_data_device_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        stale_source,
+        first_serial,
+    );
+    try generated.wl_data_device_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        null,
+        first_serial,
+    );
+    try sender.toServer(sender_client);
+    try std.testing.expect(data_device.selection == null);
+    try std.testing.expectEqual(cleared_serial, data_device.selection_serial.?);
     try data_device.setKeyboardFocus(null);
 }
