@@ -359,6 +359,7 @@ fn transportNotify(
     switch (notification) {
         .connected => {},
         .messages => try self.dispatchMessages(),
+        .output_drained => {},
         .eof => try self.notify(self.notify_context, self, .eof),
         .fatal => try self.notify(self.notify_context, self, .fatal),
     }

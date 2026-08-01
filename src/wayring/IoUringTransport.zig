@@ -18,7 +18,7 @@ const fd_bytes = wayring.max_fds_per_batch * @sizeOf(i32);
 const control_size = std.mem.alignForward(usize, @sizeOf(linux.cmsghdr), control_alignment) +
     std.mem.alignForward(usize, fd_bytes, control_alignment);
 
-pub const Notification = enum { connected, messages, eof, fatal };
+pub const Notification = enum { connected, messages, output_drained, eof, fatal };
 pub const Notify = *const fn (context: *anyopaque, transport: *IoUringTransport, notification: Notification) anyerror!void;
 
 loop: *IoUringLoop,
@@ -263,6 +263,8 @@ fn sendComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Co
         return self.fail();
     }
     try self.connection.acknowledge(self.send_token, @intCast(completion.result));
+    if (!self.connection.hasPendingOutput())
+        self.notify(self.notify_context, self, .output_drained) catch return self.fail();
     if (!self.closing) self.flush() catch return self.fail();
 }
 
