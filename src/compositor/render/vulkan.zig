@@ -2315,7 +2315,6 @@ fn validateSourceCallback(
     descriptor: render.DmabufSourceDescriptor,
 ) anyerror!void {
     const self: *Self = @ptrCast(@alignCast(context));
-    std.debug.assert(descriptor.modifier != 0);
     const source_format = render.DmabufFormat.fromFourcc(descriptor.format) orelse
         return error.InvalidTarget;
     const Noop = struct {

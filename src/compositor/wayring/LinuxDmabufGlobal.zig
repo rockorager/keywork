@@ -214,21 +214,24 @@ fn createBuffer(
         if (err == error.ImportFailed and immediate_id == null) return generated.zwp_linux_buffer_params_v1_types.events.failed(&client.connection, params_resource);
         return paramsError(client, params_resource, code, "invalid DMA-BUF descriptor");
     };
-    if ((descriptor.modifier != linear_modifier or !descriptor.info.isPackedRgb()) and params.owner.validator == null) {
+    const requires_direct_import = requiresDirectImport(descriptor.info, descriptor.modifier);
+    if (requires_direct_import and params.owner.validator == null) {
         if (immediate_id == null) return generated.zwp_linux_buffer_params_v1_types.events.failed(&client.connection, params_resource);
         return paramsError(client, params_resource, .invalid_wl_buffer, "DMA-BUF import failed");
     }
-    if (params.owner.validator) |validator| validator.validate(validator.context, .{
-        .size = descriptor.size,
-        .format = format,
-        .modifier = descriptor.modifier,
-        .planes = descriptor.planes,
-        .plane_count = descriptor.plane_count,
-        .force_opaque = !descriptor.info.hasAlpha(),
-    }) catch {
-        if (immediate_id == null) return generated.zwp_linux_buffer_params_v1_types.events.failed(&client.connection, params_resource);
-        return paramsError(client, params_resource, .invalid_wl_buffer, "DMA-BUF import failed");
-    };
+    if (requires_direct_import) {
+        if (params.owner.validator) |validator| validator.validate(validator.context, .{
+            .size = descriptor.size,
+            .format = format,
+            .modifier = descriptor.modifier,
+            .planes = descriptor.planes,
+            .plane_count = descriptor.plane_count,
+            .force_opaque = !descriptor.info.hasAlpha(),
+        }) catch {
+            if (immediate_id == null) return generated.zwp_linux_buffer_params_v1_types.events.failed(&client.connection, params_resource);
+            return paramsError(client, params_resource, .invalid_wl_buffer, "DMA-BUF import failed");
+        };
+    }
     const holder = params.owner.allocator.create(BufferResource) catch return client.postNoMemory();
     const source_owner = params.owner.allocator.create(SourceOwner) catch {
         params.owner.allocator.destroy(holder);
@@ -287,6 +290,11 @@ const Validated = struct {
     info: render.DmabufFormat,
 };
 const ValidationError = error{ Incomplete, InvalidFormat, InvalidDimensions, OutOfBounds, ImportFailed };
+
+fn requiresDirectImport(format: render.DmabufFormat, modifier: u64) bool {
+    return modifier != linear_modifier or !format.isPackedRgb();
+}
+
 fn validate(
     planes: [max_planes]?Plane,
     width: i32,
@@ -500,6 +508,12 @@ test "DMA-BUF descriptors reject malformed planes and implicit v3 modifiers" {
         validate(planes, 2, 2, format, 0, false, &formats),
     );
     _ = try validate(planes, 2, 2, format, 0, true, &formats);
+}
+
+test "linear packed DMA-BUF sources use the renderer fallback path" {
+    try std.testing.expect(!requiresDirectImport(.argb8888, linear_modifier));
+    try std.testing.expect(requiresDirectImport(.argb8888, 1));
+    try std.testing.expect(requiresDirectImport(.nv12, linear_modifier));
 }
 
 test "native DMA-BUF async create allocates and retires a server wl_buffer" {
