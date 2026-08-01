@@ -545,6 +545,20 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 self.session_lock_manager = null;
             for (self.outputs.items, 0..) |output, index| {
                 if (output.global_name != event.name) continue;
+                const registered = try self.connection.objectForHandle(
+                    output.handle,
+                    &protocol.wl_output,
+                );
+                if (registered.version >= 3) {
+                    try protocol.wl_output_types.requests.release(
+                        &self.connection,
+                        output.handle,
+                    );
+                } else {
+                    // wl_output.release was added in version 3. Older
+                    // resources can only be retired locally until disconnect.
+                    try self.connection.retireObject(output.handle);
+                }
                 if (output.name) |name| self.allocator.free(name);
                 _ = self.outputs.orderedRemove(index);
                 if (self.ready) try self.notify(self.notify_context, self, .outputs_changed);
