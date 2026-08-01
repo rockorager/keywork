@@ -323,7 +323,6 @@ pub const Connection = struct {
     }
 
     pub fn queue(self: *Connection, object_id: u32, opcode: u16, values: []const OutValue) !void {
-        if (self.batch_live) return error.BatchLive;
         const registered = self.objects.get(object_id) orelse return error.UnknownObject;
         const descriptor = registered.interface.outgoing(self.role, opcode) orelse return error.UnknownOpcode;
         if (descriptor.since > registered.version) return error.UnsupportedVersion;
@@ -604,6 +603,21 @@ test "client IDs are reused only after delete-id release" {
     const reused = try c.allocateObject(&test_interface, 1);
     try std.testing.expectEqual(original.id, reused.id);
     try std.testing.expect(reused.generation != original.generation);
+}
+
+test "outbound frames queue behind a live completion batch" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+    _ = try c.registerObject(2, &test_interface, 1);
+    try c.queue(2, 2, &.{.{ .string = "first" }});
+    const first = c.nextBatch().?;
+    const first_ptr = first.bytes.ptr;
+    try c.queue(2, 2, &.{.{ .string = "second" }});
+    try std.testing.expect(c.nextBatch() == null);
+    try c.acknowledge(first.token, first.bytes.len);
+    const second = c.nextBatch().?;
+    try std.testing.expect(first_ptr != second.bytes.ptr);
+    try c.acknowledge(second.token, second.bytes.len);
 }
 
 test "stale and double client object releases do not duplicate reusable IDs" {
