@@ -204,9 +204,9 @@ const ParseContext = struct {
     icon_cache: ?*native_runtime.IconThemeCache = null,
     /// Render scale used to select icon files at physical resolution.
     icon_scale: f32 = 1,
-    /// Intrinsic image dimensions per path, so raster icons skip the
-    /// stbi_info header read on every rebuild.
-    png_dims: ?*lua_image.DimsCache = null,
+    /// Intrinsic image dimensions per path, so raster icons skip the image
+    /// header read on every rebuild.
+    raster_dims: ?*native_runtime.RasterImage.DimsCache = null,
     /// Lexically enclosing Lua theme. Borrowed during recursive parsing;
     /// deferred builders and stateful widgets clone it for their lifetime.
     theme_ref: c_int = -1,
@@ -230,7 +230,7 @@ const ParseContext = struct {
             },
             .icon_cache = self.icon_cache,
             .icon_scale = self.icon_scale,
-            .png_dims = self.png_dims,
+            .raster_dims = self.raster_dims,
             .theme_ref = self.theme_ref,
         };
     }
@@ -1055,7 +1055,7 @@ pub fn parse(
         );
     }
     if (std.mem.eql(u8, kind, "image")) {
-        return try lua_image.parse(lua_state, allocator, parse_context.png_dims, table);
+        return try lua_image.parse(lua_state, allocator, parse_context.raster_dims, table);
     }
     if (std.mem.eql(u8, kind, "pixel_buffer")) {
         return try lua_pixel_buffer.parseWidget(lua_state, allocator, table);
@@ -1068,10 +1068,10 @@ pub fn parse(
         const name = blk: {
             if (isAbsolutePath(raw_name)) {
                 // Desktop entries may name absolute icon files: .svg goes
-                // to the SVG rasterizer; anything else is probed by stb,
-                // which decodes supported rasters regardless of extension.
+                // to the SVG rasterizer; anything else is probed by the
+                // runtime raster decoder regardless of extension.
                 if (std.ascii.endsWithIgnoreCase(raw_name, ".svg")) return svg_icon.icon(allocator, raw_name, icon.size, icon.color);
-                if (lua_image.pngIcon(allocator, parse_context.png_dims, raw_name, icon.size)) |widget| {
+                if (native_runtime.RasterImage.icon(allocator, parse_context.raster_dims, raw_name, icon.size)) |widget| {
                     return widget;
                 } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
                 // Unsupported format (XPM etc.): fall back to a theme
@@ -1093,7 +1093,7 @@ pub fn parse(
             const icon_file = try cache.lookupPreferred(name, lookup_size, icon.symbolic) orelse return missingIconWidget(allocator, fallback_color);
             return switch (icon_file.format) {
                 .svg => svg_icon.icon(allocator, icon_file.path, icon.size, icon.color),
-                .png => pngIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
+                .png => rasterIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
             };
         }
         const icon_file = try icon_theme.lookupIconSizedPreferred(allocator, name, lookup_size, icon.symbolic) orelse {
@@ -1108,7 +1108,7 @@ pub fn parse(
                 icon.size,
                 icon.color,
             ),
-            .png => pngIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
+            .png => rasterIconOrMissing(allocator, parse_context, icon_file.path, icon.size, fallback_color),
         };
     }
     if (std.mem.eql(u8, kind, "row")) {
@@ -1358,14 +1358,14 @@ fn missingIconWidget(allocator: std.mem.Allocator, color: keywork.Color) !keywor
 /// Raster icon or the missing-icon glyph: a broken or oversized file
 /// degrades to □ instead of failing the whole widget build. The dims
 /// cache warns once per path; only OOM propagates.
-fn pngIconOrMissing(
+fn rasterIconOrMissing(
     allocator: std.mem.Allocator,
     parse_context: ParseContext,
     path: []const u8,
     size: f32,
     fallback_color: keywork.Color,
 ) !keywork.Widget {
-    return lua_image.pngIcon(allocator, parse_context.png_dims, path, size) catch |err| switch (err) {
+    return native_runtime.RasterImage.icon(allocator, parse_context.raster_dims, path, size) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => missingIconWidget(allocator, fallback_color),
     };

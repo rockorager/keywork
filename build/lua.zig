@@ -44,7 +44,6 @@ pub fn add(
     keywork_lua_module.addImport("keywork-loop", keywork_loop_module);
     keywork_lua_module.addImport("keywork-ui", ui_output.module);
     keywork_lua_module.addImport("keywork-ui-engine", ui_output.engine_module);
-    keywork_lua_module.addImport("image_c", runtime_output.image_c);
     keywork_lua_module.addImport("systemd_c", runtime_output.systemd_c);
     keywork_lua_module.addImport("curl_c", curl_c_module);
     keywork_lua_module.addImport("pipewire_c", pipewire_c_module);

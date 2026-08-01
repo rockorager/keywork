@@ -6,7 +6,6 @@ const ui = @import("ui.zig");
 pub const Output = struct {
     module: *std.Build.Module,
     application_control: *std.Build.Module,
-    image_c: *std.Build.Module,
     systemd_c: *std.Build.Module,
 };
 
@@ -180,7 +179,6 @@ pub fn add(
     return .{
         .module = keywork_runtime_module,
         .application_control = application_control,
-        .image_c = image_c_module,
         .systemd_c = systemd_c_module,
     };
 }

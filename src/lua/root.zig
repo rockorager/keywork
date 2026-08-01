@@ -137,7 +137,7 @@ pub const App = struct {
     /// build, keyed by window id (keys owned by `allocator`).
     window_close_callbacks: std.StringHashMapUnmanaged(c_int) = .empty,
     icon_cache: native_runtime.IconThemeCache,
-    png_dims: lua_image.DimsCache,
+    raster_dims: native_runtime.RasterImage.DimsCache,
 
     const HotState = struct {
         version: i64,
@@ -169,7 +169,7 @@ pub const App = struct {
             .chunk_name = chunk_name,
             .state = lua_state,
             .icon_cache = .init(allocator),
-            .png_dims = .init(allocator),
+            .raster_dims = .init(allocator),
         };
     }
 
@@ -243,7 +243,7 @@ pub const App = struct {
         self.resetLocalModules();
         c.lua_close(self.state);
         self.icon_cache.deinit();
-        self.png_dims.deinit();
+        self.raster_dims.deinit();
         if (self.storybook_catalog) |*catalog| catalog.deinit(self.allocator);
         if (self.selected_story_id) |id| self.allocator.free(id);
         self.window_config.deinit(self.allocator);
@@ -483,7 +483,7 @@ pub const App = struct {
         const widget = try lua_widget.parse(self.widgetHost(state_invalidator), self.state, allocator, allocator, runtime_state, .{
             .icon_cache = &self.icon_cache,
             .icon_scale = icon_scale,
-            .png_dims = &self.png_dims,
+            .raster_dims = &self.raster_dims,
         }, -1);
         // Keep garbage from widget-table churn paced across builds; full
         // collections here would stall in proportion to the whole Lua heap.

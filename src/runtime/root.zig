@@ -29,6 +29,7 @@ pub const MemoryBackend = @import("backend/memory.zig");
 pub const LogBackend = @import("backend/log.zig").LogBackend;
 
 pub const svgIcon = @import("graphics/svg_icon.zig").icon;
+pub const RasterImage = @import("graphics/RasterImage.zig");
 pub const SharedPixelBuffer = @import("graphics/SharedPixelBuffer.zig");
 pub const DmaBufImage = @import("graphics/DmaBufImage.zig");
 
@@ -56,6 +57,7 @@ test {
     _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");
     _ = @import("graphics/raster.zig");
+    _ = @import("graphics/RasterImage.zig");
     _ = @import("graphics/SharedPixelBuffer.zig");
     _ = @import("graphics/DmaBufImage.zig");
     _ = @import("graphics/svg_icon.zig");
