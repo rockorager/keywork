@@ -32,6 +32,7 @@ pub const ReloadObserver = struct {
 allocator: std.mem.Allocator,
 io: std.Io,
 native: *systemd.sd_varlink_server,
+bridge: *SystemdEvent,
 reload_host: ReloadHost,
 app_id: [:0]u8,
 address: [:0]u8,
@@ -84,6 +85,7 @@ pub fn create(
         .allocator = allocator,
         .io = io,
         .native = native.?,
+        .bridge = bridge,
         .reload_host = reload_host,
         .app_id = app_id_z,
         .address = address,
@@ -105,6 +107,7 @@ pub fn create(
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.get_status_method, statusCallback));
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.reload_method, reloadCallback));
     try check(systemd.sd_varlink_server_attach_event(self.native, bridge.sdEvent(), 0));
+    bridge.notify();
     errdefer _ = systemd.sd_varlink_server_detach_event(self.native);
     // sd-varlink's server API accepts a filesystem path; `unix:` is the
     // client-facing Varlink service-reference syntax.
@@ -219,6 +222,7 @@ fn complete(self: *ApplicationControl, success: bool, message: []const u8) void 
         }
         _ = systemd.sd_varlink_unref(link);
     }
+    self.bridge.notify();
 }
 
 fn check(result: c_int) !void {

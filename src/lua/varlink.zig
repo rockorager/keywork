@@ -55,7 +55,7 @@ pub const ServeOptions = struct {
 pub const Client = struct {
     host: Host,
     native: *systemd.sd_varlink,
-    event: *systemd.sd_event,
+    bridge: *SystemdEvent,
     handle_ref: c_int = -1,
     requests: std.ArrayList(*Request) = .empty,
     deferred_replies: std.ArrayList(*DeferredReply) = .empty,
@@ -72,10 +72,11 @@ pub const Client = struct {
         try checkOperation("connect address", systemd.sd_varlink_connect_address(&native, address_z.ptr));
         errdefer _ = systemd.sd_varlink_unref(native.?);
         const bridge = try host.systemdEvent();
-        self.* = .{ .host = host, .native = native.?, .event = bridge.sdEvent() };
+        self.* = .{ .host = host, .native = native.?, .bridge = bridge };
         _ = systemd.sd_varlink_set_userdata(self.native, self);
         try check(systemd.sd_varlink_bind_reply(self.native, replyCallback));
         try check(systemd.sd_varlink_attach_event(self.native, bridge.sdEvent(), 0));
+        bridge.notify();
         return self;
     }
 
@@ -91,6 +92,7 @@ pub const Client = struct {
         if (self.current) |request| request.finish(lua_state, mode);
         while (self.deferred_replies.pop()) |reply| reply.destroy();
         _ = systemd.sd_varlink_close(self.native);
+        self.bridge.notify();
     }
 
     pub fn destroy(self: *Client, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -125,6 +127,7 @@ pub const Client = struct {
         } else {
             try check(systemd.sd_varlink_invoke(self.native, method_z.ptr, variant));
         }
+        self.bridge.notify();
         return request;
     }
 
@@ -172,8 +175,9 @@ pub const Client = struct {
         errdefer reply.destroy();
         try self.deferred_replies.append(allocator, reply);
         errdefer _ = self.deferred_replies.pop();
-        try check(systemd.sd_event_add_defer(self.event, &reply.source, DeferredReply.callback, reply));
+        try check(systemd.sd_event_add_defer(self.bridge.sdEvent(), &reply.source, DeferredReply.callback, reply));
         try check(systemd.sd_event_source_set_enabled(reply.source, systemd.SD_EVENT_ONESHOT));
+        self.bridge.notify();
     }
 
     fn removeDeferredReply(self: *Client, reply: *DeferredReply) void {
@@ -268,6 +272,7 @@ const PendingCall = struct {
 pub const Server = struct {
     host: Host,
     native: *systemd.sd_varlink_server,
+    bridge: *SystemdEvent,
     methods_ref: c_int,
     handle_ref: c_int = -1,
     pending: std.ArrayList(*PendingCall) = .empty,
@@ -286,13 +291,14 @@ pub const Server = struct {
         self.* = .{
             .host = host,
             .native = native.?,
+            .bridge = try host.systemdEvent(),
             .methods_ref = options.methods_ref,
         };
         _ = systemd.sd_varlink_server_set_userdata(self.native, self);
 
         try self.bindMethods();
-        const bridge = try host.systemdEvent();
-        try checkOperation("server attach event", systemd.sd_varlink_server_attach_event(self.native, bridge.sdEvent(), 0));
+        try checkOperation("server attach event", systemd.sd_varlink_server_attach_event(self.native, self.bridge.sdEvent(), 0));
+        self.bridge.notify();
         errdefer _ = systemd.sd_varlink_server_detach_event(self.native);
 
         if (options.address) |address| {
@@ -335,6 +341,7 @@ pub const Server = struct {
         self.handle_ref = -1;
         while (self.pending.pop()) |pending| pending.destroy(lua_state);
         _ = systemd.sd_varlink_server_shutdown(self.native);
+        self.bridge.notify();
     }
 
     pub fn destroy(self: *Server, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
@@ -416,6 +423,7 @@ pub const Server = struct {
             .reply => try check(systemd.sd_varlink_reply(pending.link, variant)),
             .notify => try check(systemd.sd_varlink_notify(pending.link, variant)),
         }
+        self.bridge.notify();
     }
 
     fn sendErrorValue(self: *Server, pending: *PendingCall, lua_state: *c.lua_State, name: []const u8, value_index: c_int) !void {
@@ -428,6 +436,7 @@ pub const Server = struct {
         // errno even after successfully queueing it. Application-defined
         // error names normally produce -EBADR, so this is not a send status.
         _ = systemd.sd_varlink_error(pending.link, name_z.ptr, variant);
+        self.bridge.notify();
     }
 
     fn sendError(self: *Server, pending: *PendingCall, name: []const u8, message: []const u8) !void {
