@@ -22,6 +22,13 @@ pointer_focus: ?*CompositorGlobal.Surface = null,
 keyboard_focus: ?*CompositorGlobal.Surface = null,
 touch_focus: ?*CompositorGlobal.Surface = null,
 cursor_handler: ?CursorHandler = null,
+pointer_enter_serial: u32 = 0,
+keymap_format: u32 = 0,
+keymap_fd: std.posix.fd_t = -1,
+keymap_size: u32 = 0,
+repeat_rate: i32 = 0,
+repeat_delay: i32 = 0,
+repeat_info_set: bool = false,
 
 pub const Capability = generated.wl_seat_types.capability;
 
@@ -92,6 +99,7 @@ pub fn deinit(self: *SeatGlobal) void {
     clearFocus(&self.pointer_focus);
     clearFocus(&self.keyboard_focus);
     clearFocus(&self.touch_focus);
+    if (self.keymap_fd >= 0) _ = linux.close(self.keymap_fd);
     self.server.removeGlobal(self.global_name) catch unreachable;
     self.children.deinit(self.allocator);
     self.bindings.deinit(self.allocator);
@@ -117,8 +125,10 @@ pub fn pointerEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, x: i3
         _ = try self.pointerLeave();
     try setFocus(&self.pointer_focus, surface);
     const serial = self.server.nextSerial();
+    self.pointer_enter_serial = serial;
     for (self.children.items) |child| if (matches(child, .pointer, surface))
         try generated.wl_pointer_types.events.enter(&child.client.connection, child.resource, serial, surface.resource, x, y);
+    try self.pointerFrame();
     return serial;
 }
 
@@ -127,7 +137,9 @@ pub fn pointerLeave(self: *SeatGlobal) !?u32 {
     const serial = self.server.nextSerial();
     for (self.children.items) |child| if (matches(child, .pointer, surface))
         try generated.wl_pointer_types.events.leave(&child.client.connection, child.resource, serial, surface.resource);
+    try self.pointerFrame();
     clearFocus(&self.pointer_focus);
+    self.pointer_enter_serial = 0;
     return serial;
 }
 
@@ -145,7 +157,15 @@ pub fn pointerButton(self: *SeatGlobal, time: u32, button: u32, state: u32) !?u3
     return serial;
 }
 
-/// Delivers one logical axis frame. Fixed-point values use Wayland's 24.8 representation.
+pub fn pointerFrame(self: *SeatGlobal) !void {
+    const surface = self.pointer_focus orelse return;
+    for (self.children.items) |child| if (matches(child, .pointer, surface) and
+        try child.client.resourceVersion(child.resource, &generated.wl_pointer) >= 5)
+        try generated.wl_pointer_types.events.frame(&child.client.connection, child.resource);
+}
+
+/// Delivers one axis in the current logical pointer frame. Fixed-point values
+/// use Wayland's 24.8 representation; callers end the group with pointerFrame.
 pub fn pointerAxisFrame(self: *SeatGlobal, frame: AxisFrame) !void {
     const surface = self.pointer_focus orelse return;
     for (self.children.items) |child| {
@@ -156,27 +176,23 @@ pub fn pointerAxisFrame(self: *SeatGlobal, frame: AxisFrame) !void {
         }
         if (frame.value) |value| try generated.wl_pointer_types.events.axis(&child.client.connection, child.resource, frame.time_milliseconds, frame.axis, value);
         if (version >= 5) {
-            if (frame.discrete) |value| try generated.wl_pointer_types.events.axis_discrete(&child.client.connection, child.resource, frame.axis, value);
+            if (version < 8) if (frame.discrete) |value| try generated.wl_pointer_types.events.axis_discrete(&child.client.connection, child.resource, frame.axis, value);
             if (frame.stopped) try generated.wl_pointer_types.events.axis_stop(&child.client.connection, child.resource, frame.time_milliseconds, frame.axis);
         }
         if (version >= 8) if (frame.value120) |value| try generated.wl_pointer_types.events.axis_value120(&child.client.connection, child.resource, frame.axis, value);
-        if (version >= 5) try generated.wl_pointer_types.events.frame(&child.client.connection, child.resource);
     }
 }
 
-/// Queues a keymap for every keyboard resource. On each successful queue call,
-/// Wayring owns that descriptor and closes it after the output batch is acknowledged.
-/// Callers must therefore pass a separately duplicated descriptor for each resource.
-pub fn keyboardKeymap(self: *SeatGlobal, format: u32, fd_for: *const fn (*Server.Client) anyerror!i32, size: u32) !void {
+/// Takes ownership of fd and retains it as the source for current and future
+/// keyboard resources. Every queued protocol event receives its own duplicate.
+pub fn keyboardKeymap(self: *SeatGlobal, format: u32, fd: std.posix.fd_t, size: u32) !void {
+    if (self.keymap_fd >= 0) _ = linux.close(self.keymap_fd);
+    self.keymap_format = format;
+    self.keymap_fd = fd;
+    self.keymap_size = size;
     for (self.children.items) |child| {
         if (child.kind != .keyboard) continue;
-        const fd = try fd_for(child.client);
-        var fd_owned = true;
-        defer if (fd_owned) {
-            _ = linux.close(fd);
-        };
-        try generated.wl_keyboard_types.events.keymap(&child.client.connection, child.resource, format, fd, size);
-        fd_owned = false;
+        try self.sendKeymap(child);
     }
 }
 
@@ -214,11 +230,24 @@ pub fn keyboardModifiers(self: *SeatGlobal, serial: u32, depressed: u32, latched
 }
 
 pub fn keyboardRepeatInfo(self: *SeatGlobal, rate: i32, delay: i32) !void {
+    self.repeat_rate = rate;
+    self.repeat_delay = delay;
+    self.repeat_info_set = true;
     for (self.children.items) |child| {
         if (child.kind != .keyboard) continue;
         if (try child.client.resourceVersion(child.resource, &generated.wl_keyboard) >= 4)
             try generated.wl_keyboard_types.events.repeat_info(&child.client.connection, child.resource, rate, delay);
     }
+}
+
+/// Returns a borrowed focus retained until the next focus or capability change.
+pub fn pointerFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
+    return self.pointer_focus;
+}
+
+/// Returns a borrowed focus retained until the next focus or capability change.
+pub fn keyboardFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
+    return self.keyboard_focus;
 }
 
 pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u32, id: i32, x: i32, y: i32) !u32 {
@@ -253,6 +282,10 @@ pub fn touchCancel(self: *SeatGlobal) !void {
     clearFocus(&self.touch_focus);
 }
 
+pub fn touchFinish(self: *SeatGlobal) void {
+    clearFocus(&self.touch_focus);
+}
+
 pub fn touchShape(self: *SeatGlobal, id: i32, major: i32, minor: i32) !void {
     const surface = self.touch_focus orelse return;
     for (self.children.items) |child| if (matches(child, .touch, surface) and
@@ -270,7 +303,8 @@ pub fn touchOrientation(self: *SeatGlobal, id: i32, orientation: i32) !void {
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
     const self: *SeatGlobal = @ptrCast(@alignCast(context));
     const binding = self.allocator.create(Binding) catch return client.postNoMemory();
-    errdefer self.allocator.destroy(binding);
+    var registered = false;
+    errdefer if (!registered) self.allocator.destroy(binding);
     self.bindings.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
     binding.* = .{ .owner = self, .client = client, .resource = undefined };
     binding.resource = client.createResource(id, &generated.wl_seat, version, .{
@@ -279,6 +313,7 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
         .destroy = destroyBinding,
     }) catch return client.postNoMemory();
     self.bindings.appendAssumeCapacity(binding);
+    registered = true;
     try generated.wl_seat_types.events.capabilities(&client.connection, binding.resource, self.capabilities);
     if (version >= 2) try generated.wl_seat_types.events.name(&client.connection, binding.resource, self.name);
 }
@@ -301,7 +336,8 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
     };
     if (self.capabilities & capability == 0) return client.postError(seat, @intFromEnum(generated.wl_seat_types.@"error".missing_capability), "requested wl_seat capability is unavailable");
     const child = self.allocator.create(Child) catch return client.postNoMemory();
-    errdefer self.allocator.destroy(child);
+    var registered = false;
+    errdefer if (!registered) self.allocator.destroy(child);
     self.children.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
     const interface = switch (kind) {
         .pointer => &generated.wl_pointer,
@@ -320,12 +356,48 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
         .destroy = destroyChild,
     }) catch return client.postNoMemory();
     self.children.appendAssumeCapacity(child);
+    registered = true;
+    if (kind == .keyboard) {
+        if (self.keymap_fd >= 0) self.sendKeymap(child) catch return client.postNoMemory();
+        if (self.repeat_info_set and version >= 4) try generated.wl_keyboard_types.events.repeat_info(
+            &client.connection,
+            child.resource,
+            self.repeat_rate,
+            self.repeat_delay,
+        );
+    }
+}
+
+fn sendKeymap(self: *SeatGlobal, child: *Child) !void {
+    std.debug.assert(child.kind == .keyboard and self.keymap_fd >= 0);
+    const duplicate = std.c.fcntl(
+        self.keymap_fd,
+        linux.F.DUPFD_CLOEXEC,
+        @as(c_int, 0),
+    );
+    if (duplicate < 0) return error.DuplicateKeymapFailed;
+    var duplicate_owned = true;
+    defer if (duplicate_owned) {
+        _ = linux.close(duplicate);
+    };
+    try generated.wl_keyboard_types.events.keymap(
+        &child.client.connection,
+        child.resource,
+        self.keymap_format,
+        duplicate,
+        self.keymap_size,
+    );
+    duplicate_owned = false;
 }
 
 fn dispatchPointer(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
     const child: *Child = @ptrCast(@alignCast(context));
     switch (try generated.wl_pointer_types.decodeRequest(&client.connection, resource, message)) {
         .set_cursor => |r| {
+            const focused = child.owner.pointer_focus orelse return;
+            if (!focused.resource_alive or
+                focused.client != client or
+                child.owner.pointer_enter_serial != r.serial) return;
             const surface = if (r.surface) |id| blk: {
                 const object = client.connection.object(id) orelse return error.UnknownSurface;
                 break :blk try CompositorGlobal.surfaceFor(client, .{ .id = id, .generation = object.generation });
@@ -398,6 +470,17 @@ test "seat capability constants match core protocol" {
     try std.testing.expectEqual(@as(u32, 4), Capability.touch);
 }
 
+const CursorTestContext = struct {
+    calls: usize = 0,
+    serial: u32 = 0,
+};
+
+fn captureCursor(context: *anyopaque, intent: CursorIntent) !void {
+    const capture: *CursorTestContext = @ptrCast(@alignCast(context));
+    capture.calls += 1;
+    capture.serial = intent.serial;
+}
+
 test "native seat binds child resources and routes focused input" {
     const core = @import("wayring-core");
     var server = Server.init(std.testing.allocator);
@@ -405,13 +488,14 @@ test "native seat binds child resources and routes focused input" {
     var compositor: CompositorGlobal = undefined;
     try compositor.init(std.testing.allocator, &server);
     defer compositor.deinit();
+    var cursor_capture: CursorTestContext = .{};
     var seat: SeatGlobal = undefined;
     try seat.init(
         std.testing.allocator,
         &server,
         "default",
         Capability.pointer | Capability.keyboard,
-        null,
+        .{ .context = &cursor_capture, .handle = captureCursor },
     );
     defer seat.deinit();
     const client = try server.createClient();
@@ -482,18 +566,33 @@ test "native seat binds child resources and routes focused input" {
     try std.testing.expect(got_capabilities);
     try std.testing.expect(got_name);
 
+    const keymap_fd = try std.posix.memfd_create("keywork-native-seat-keymap", linux.MFD.CLOEXEC);
+    try seat.keyboardKeymap(
+        @intFromEnum(generated.wl_keyboard_types.keymap_format.xkb_v1),
+        keymap_fd,
+        4,
+    );
+    try seat.keyboardRepeatInfo(25, 600);
     const surface_handle = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor_resource,
+    );
+    const cursor_surface = try generated.wl_compositor_types.requests.create_surface(
         &peer,
         compositor_resource,
     );
     const pointer = try generated.wl_seat_types.requests.get_pointer(&peer, seat_resource);
     const keyboard = try generated.wl_seat_types.requests.get_keyboard(&peer, seat_resource);
     try transferToServer(&peer, client);
+    try std.testing.expectEqual(
+        @as(u32, 10),
+        try client.resourceVersion(seat.children.items[0].resource, &generated.wl_pointer),
+    );
     const surface = try CompositorGlobal.surfaceFor(client, .{
         .id = surface_handle.id,
         .generation = client.connection.object(surface_handle.id).?.generation,
     });
-    _ = try seat.pointerEnter(surface, 3 * 256, 4 * 256);
+    const pointer_serial = try seat.pointerEnter(surface, 3 * 256, 4 * 256);
     try seat.pointerMotion(11, 5 * 256, 6 * 256);
     _ = try seat.pointerButton(
         12,
@@ -506,10 +605,31 @@ test "native seat binds child resources and routes focused input" {
         30,
         @intFromEnum(generated.wl_keyboard_types.key_state.pressed),
     );
+    try generated.wl_pointer_types.requests.set_cursor(
+        &peer,
+        pointer,
+        pointer_serial - 1,
+        cursor_surface,
+        1,
+        2,
+    );
+    try generated.wl_pointer_types.requests.set_cursor(
+        &peer,
+        pointer,
+        pointer_serial,
+        cursor_surface,
+        3,
+        4,
+    );
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(@as(usize, 1), cursor_capture.calls);
+    try std.testing.expectEqual(pointer_serial, cursor_capture.serial);
     try transferFromServer(&peer, client);
 
     var pointer_events: usize = 0;
     var keyboard_events: usize = 0;
+    var got_keymap = false;
+    var got_repeat = false;
     while (peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
@@ -517,12 +637,24 @@ test "native seat binds child resources and routes focused input" {
             _ = try generated.wl_pointer_types.decodeEvent(&peer, pointer, &message);
             pointer_events += 1;
         } else if (message.object_id == keyboard.id) {
-            _ = try generated.wl_keyboard_types.decodeEvent(&peer, keyboard, &message);
+            switch (try generated.wl_keyboard_types.decodeEvent(&peer, keyboard, &message)) {
+                .keymap => |event| {
+                    const fd = try message.takeFd(event.fd);
+                    defer _ = linux.close(fd);
+                    got_keymap = event.format ==
+                        @intFromEnum(generated.wl_keyboard_types.keymap_format.xkb_v1) and
+                        event.size == 4;
+                },
+                .repeat_info => |event| got_repeat = event.rate == 25 and event.delay == 600,
+                else => {},
+            }
             keyboard_events += 1;
         } else return error.UnexpectedSeatEvent;
     }
-    try std.testing.expectEqual(@as(usize, 3), pointer_events);
-    try std.testing.expectEqual(@as(usize, 2), keyboard_events);
+    try std.testing.expectEqual(@as(usize, 4), pointer_events);
+    try std.testing.expectEqual(@as(usize, 4), keyboard_events);
+    try std.testing.expect(got_keymap);
+    try std.testing.expect(got_repeat);
 }
 
 fn transferToServer(connection: *wayring.Connection, client: *Server.Client) !void {

@@ -30,6 +30,7 @@ const Renderer = @import("../render/Renderer.zig");
 const HeadlessOutput = @import("../backend/headless.zig");
 const DrmOutput = @import("../backend/drm.zig");
 const DrmDevice = @import("../backend/drm_device.zig");
+const NativeInput = @import("../backend/native_input.zig");
 const Session = @import("../backend/session.zig");
 const Region = @import("../region.zig");
 const presentation = @import("../presentation.zig");
@@ -64,11 +65,30 @@ session_initialized: bool,
 drm_device: DrmDevice,
 drm_device_initialized: bool,
 drm_listener_installed: bool,
+native_input: NativeInput,
+native_input_initialized: bool,
+native_input_device_listener_installed: bool,
 display_name: []u8,
 socket_path: [:0]u8,
 surfaces: std.ArrayList(*SurfaceState) = .empty,
 pending: std.ArrayList(*PendingTransaction) = .empty,
 frame_callbacks: std.ArrayList(CompositorGlobal.FrameCallbacks) = .empty,
+input_paint_entries: std.ArrayList(SurfaceTree.PaintEntry) = .empty,
+routed_keys: std.ArrayList(RoutedKey) = .empty,
+routed_buttons: std.ArrayList(RoutedButton) = .empty,
+unattributed_keys: std.ArrayList(u32) = .empty,
+keyboard_enter_keys: std.ArrayList(u32) = .empty,
+touch_routes: std.ArrayList(TouchRoute) = .empty,
+pointer_axes: [2]PendingAxis = .{ .{}, .{} },
+pointer_axis_source: ?u32 = null,
+keyboard_available: bool = false,
+pointer_available: bool = false,
+touch_available: bool = false,
+pointer_physical_x: f64 = 0,
+pointer_physical_y: f64 = 0,
+keyboard_modifiers: NativeInput.Modifiers = .{},
+last_keyboard_serial: u32 = 0,
+next_touch_id: u32 = 1,
 frame_count: u64 = 0,
 repaint_needed: bool = false,
 output_busy_retries: u8 = 0,
@@ -233,6 +253,39 @@ const PendingEntry = struct {
     configure_only: bool = false,
 };
 
+const RoutedKey = struct {
+    device_id: NativeInput.DeviceId,
+    key: u32,
+};
+
+const RoutedButton = struct {
+    device_id: NativeInput.DeviceId,
+    button: u32,
+};
+
+const PendingAxis = struct {
+    active: bool = false,
+    time_milliseconds: u32 = 0,
+    value: ?i32 = null,
+    stopped: bool = false,
+    discrete: ?i32 = null,
+    value120: ?i32 = null,
+};
+
+const TouchRoute = struct {
+    device_id: NativeInput.DeviceId,
+    native_id: i32,
+    protocol_id: i32,
+    surface: *CompositorGlobal.Surface,
+};
+
+const Hit = struct {
+    surface: *CompositorGlobal.Surface,
+    root: *CompositorGlobal.Surface,
+    local_x: f64,
+    local_y: f64,
+};
+
 /// Allocates the owner before installing callback contexts, so its address is
 /// stable until destroy. The returned server exclusively owns its socket.
 pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*NativeServer {
@@ -247,6 +300,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.session_initialized = false;
     self.drm_device_initialized = false;
     self.drm_listener_installed = false;
+    self.native_input_initialized = false;
+    self.native_input_device_listener_installed = false;
     var renderer_initialized = false;
     var output_initialized = false;
     errdefer {
@@ -339,6 +394,49 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.output_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
+    self.input_paint_entries = .empty;
+    self.routed_keys = .empty;
+    self.routed_buttons = .empty;
+    self.unattributed_keys = .empty;
+    self.keyboard_enter_keys = .empty;
+    self.touch_routes = .empty;
+    self.pointer_axes = .{ .{}, .{} };
+    self.pointer_axis_source = null;
+    self.keyboard_available = false;
+    self.pointer_available = false;
+    self.touch_available = false;
+    const mode_size = self.output.modeSize();
+    self.pointer_physical_x = @as(f64, @floatFromInt(mode_size.width)) / 2;
+    self.pointer_physical_y = @as(f64, @floatFromInt(mode_size.height)) / 2;
+    self.keyboard_modifiers = .{};
+    self.last_keyboard_serial = 0;
+    self.next_touch_id = 1;
+    self.surfaces = .empty;
+    self.pending = .empty;
+    self.frame_callbacks = .empty;
+    errdefer self.deinitInputState();
+    errdefer if (self.native_input_initialized) {
+        if (self.native_input_device_listener_installed) {
+            self.native_input.clearDeviceListener();
+            self.native_input_device_listener_installed = false;
+        }
+        self.native_input.deinit();
+        self.native_input_initialized = false;
+    };
+    if (options.output_kind == .drm) {
+        try self.native_input.init(
+            allocator,
+            io,
+            .{ .io_uring = &self.event_loop },
+            &self.session,
+            mode_size,
+            nativeInputListener(self),
+        );
+        self.native_input_initialized = true;
+        self.native_input.setDeviceListener(nativeInputDeviceListener(self));
+        self.native_input_device_listener_installed = true;
+        self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    }
     try self.fractional_scale_global.init(
         allocator,
         &self.server,
@@ -364,9 +462,6 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
 
     self.display_name = selection.name;
     self.socket_path = selection.path;
-    self.surfaces = .empty;
-    self.pending = .empty;
-    self.frame_callbacks = .empty;
     self.frame_count = 0;
     self.repaint_needed = options.output_kind == .drm;
     self.output_busy_retries = 0;
@@ -486,6 +581,14 @@ pub fn destroy(self: *NativeServer) void {
         self.drm_device.clearListener();
         self.drm_listener_installed = false;
     }
+    if (self.native_input_initialized) {
+        if (self.native_input_device_listener_installed) {
+            self.native_input.clearDeviceListener();
+            self.native_input_device_listener_installed = false;
+        }
+        self.native_input.deinit();
+        self.native_input_initialized = false;
+    }
     switch (self.output) {
         .headless => {},
         .drm => |*output| if (output.*) |drm_output| {
@@ -509,6 +612,7 @@ pub fn destroy(self: *NativeServer) void {
     while (self.pending.items.len != 0) self.destroyPending(0);
     self.pending.deinit(self.allocator);
     self.discardFrameCallbacks();
+    self.deinitInputState();
 
     while (self.compositor_global.popTransaction()) |transaction_value| {
         var transaction = transaction_value;
@@ -569,6 +673,7 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     try self.progressTransactions();
     self.discardDeadFrameCallbacks();
     const pruned = self.pruneSurfaces();
+    if (pruned) try self.refreshInputFocus(inputTime(self));
     if (pruned or self.surface_tree.needsRedraw() or self.repaint_needed)
         try self.renderScene(null);
 }
@@ -638,6 +743,341 @@ fn drmDeviceDeactivating(context: *anyopaque) void {
 
 fn drmOutputChanged(_: *anyopaque, _: *DrmOutput) void {}
 
+fn nativeInputListener(self: *NativeServer) NativeInput.Listener {
+    return .{
+        .context = self,
+        .close = nativeInputClose,
+        .keyboard_available = nativeKeyboardAvailable,
+        .keyboard_keymap = nativeKeyboardKeymap,
+        .keyboard_enter = nativeKeyboardEnter,
+        .keyboard_key = nativeKeyboardKey,
+        .keyboard_modifiers = nativeKeyboardModifiers,
+        .keyboard_repeat_info = nativeKeyboardRepeatInfo,
+        .pointer_available = nativePointerAvailable,
+        .pointer_motion = nativePointerMotion,
+        .pointer_relative_motion = nativePointerRelativeMotion,
+        .pointer_button = nativePointerButton,
+        .pointer_axis = nativePointerAxis,
+        .pointer_frame = nativePointerFrame,
+        .pointer_axis_source = nativePointerAxisSource,
+        .pointer_axis_stop = nativePointerAxisStop,
+        .pointer_axis_discrete = nativePointerAxisDiscrete,
+        .pointer_axis_value120 = nativePointerAxisValue120,
+        .swipe_begin = ignoreSwipeBegin,
+        .swipe_update = ignoreSwipeUpdate,
+        .swipe_end = ignoreSwipeEnd,
+        .pinch_begin = ignorePinchBegin,
+        .pinch_update = ignorePinchUpdate,
+        .pinch_end = ignorePinchEnd,
+        .hold_begin = ignoreHoldBegin,
+        .hold_end = ignoreHoldEnd,
+        .tablet_tool_proximity = ignoreTabletToolProximity,
+        .tablet_tool_axis = ignoreTabletToolAxis,
+        .tablet_tool_tip = ignoreTabletToolTip,
+        .tablet_tool_button = ignoreTabletToolButton,
+        .tablet_pad_button = ignoreTabletPadButton,
+        .tablet_pad_ring = ignoreTabletPadRing,
+        .tablet_pad_strip = ignoreTabletPadStrip,
+        .tablet_pad_dial = ignoreTabletPadDial,
+        .touch_available = nativeTouchAvailable,
+        .touch_down = nativeTouchDown,
+        .touch_up = nativeTouchUp,
+        .touch_motion = nativeTouchMotion,
+        .touch_frame = nativeTouchFrame,
+        .touch_cancel = nativeTouchCancel,
+    };
+}
+
+fn nativeInputDeviceListener(self: *NativeServer) NativeInput.DeviceListener {
+    return .{
+        .context = self,
+        .added = nativeInputDeviceAdded,
+        .removed = nativeInputDeviceRemoved,
+    };
+}
+
+fn nativeInputClose(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
+fn nativeKeyboardAvailable(context: *anyopaque, available: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.keyboard_available = available;
+    if (!available) {
+        self.routed_keys.clearRetainingCapacity();
+        self.unattributed_keys.clearRetainingCapacity();
+        self.last_keyboard_serial = 0;
+    }
+    self.refreshSeatCapabilities() catch self.terminate();
+    if (available) self.refreshKeyboardFocus(null) catch self.terminate();
+}
+
+fn nativeKeyboardKeymap(
+    context: *anyopaque,
+    _: ?NativeInput.DeviceId,
+    format: NativeInput.KeyboardKeymapFormat,
+    fd: std.posix.fd_t,
+    size: u32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.seat_global.keyboardKeymap(@intFromEnum(format), fd, size) catch self.terminate();
+}
+
+fn nativeKeyboardEnter(context: *anyopaque, keys: []const u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.unattributed_keys.clearRetainingCapacity();
+    self.unattributed_keys.appendSlice(self.allocator, keys) catch return self.terminate();
+    self.reenterKeyboardFocus() catch self.terminate();
+}
+
+fn nativeKeyboardKey(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    key: u32,
+    state: NativeInput.KeyState,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.routeKeyboardKey(device_id, time, key, state) catch self.terminate();
+}
+
+fn nativeKeyboardModifiers(
+    context: *anyopaque,
+    _: ?NativeInput.DeviceId,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.keyboard_modifiers = .{
+        .depressed = depressed,
+        .latched = latched,
+        .locked = locked,
+        .group = group,
+    };
+    if (self.last_keyboard_serial != 0) self.seat_global.keyboardModifiers(
+        self.last_keyboard_serial,
+        depressed,
+        latched,
+        locked,
+        group,
+    ) catch self.terminate();
+}
+
+fn nativeKeyboardRepeatInfo(
+    context: *anyopaque,
+    _: ?NativeInput.DeviceId,
+    rate: i32,
+    delay: i32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.seat_global.keyboardRepeatInfo(rate, delay) catch self.terminate();
+}
+
+fn nativePointerAvailable(context: *anyopaque, available: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.pointer_available = available;
+    if (!available) {
+        self.routed_buttons.clearRetainingCapacity();
+        self.pointer_axes = .{ .{}, .{} };
+        self.pointer_axis_source = null;
+    }
+    self.refreshSeatCapabilities() catch self.terminate();
+    if (available) self.refreshPointerFocus(0) catch self.terminate();
+}
+
+fn nativePointerMotion(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    time: u32,
+    x: f64,
+    y: f64,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const size = self.output.modeSize();
+    self.pointer_physical_x = clampPointerCoordinate(x, size.width);
+    self.pointer_physical_y = clampPointerCoordinate(y, size.height);
+    if (self.native_input_initialized)
+        self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.refreshPointerFocus(time) catch self.terminate();
+}
+
+fn nativePointerRelativeMotion(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    time_microseconds: u64,
+    dx: f64,
+    dy: f64,
+    _: f64,
+    _: f64,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const size = self.output.modeSize();
+    self.pointer_physical_x = clampPointerCoordinate(self.pointer_physical_x + dx, size.width);
+    self.pointer_physical_y = clampPointerCoordinate(self.pointer_physical_y + dy, size.height);
+    if (self.native_input_initialized)
+        self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.refreshPointerFocus(@truncate(time_microseconds / std.time.us_per_ms)) catch self.terminate();
+}
+
+fn nativePointerButton(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    button: u32,
+    state: NativeInput.ButtonState,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.routePointerButton(device_id, time, button, state) catch self.terminate();
+}
+
+fn nativePointerAxis(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    time: u32,
+    axis: NativeInput.Axis,
+    value: i32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const pending = self.pendingAxis(axis) orelse return;
+    pending.active = true;
+    pending.time_milliseconds = time;
+    pending.value = value;
+}
+
+fn nativePointerAxisSource(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    source: NativeInput.AxisSource,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.pointer_axis_source = @intFromEnum(source);
+}
+
+fn nativePointerAxisStop(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    time: u32,
+    axis: NativeInput.Axis,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const pending = self.pendingAxis(axis) orelse return;
+    pending.active = true;
+    pending.time_milliseconds = time;
+    pending.stopped = true;
+}
+
+fn nativePointerAxisDiscrete(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    axis: NativeInput.Axis,
+    value: i32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const pending = self.pendingAxis(axis) orelse return;
+    pending.active = true;
+    pending.discrete = value;
+}
+
+fn nativePointerAxisValue120(
+    context: *anyopaque,
+    _: NativeInput.DeviceId,
+    axis: NativeInput.Axis,
+    value: i32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const pending = self.pendingAxis(axis) orelse return;
+    pending.active = true;
+    pending.value120 = value;
+}
+
+fn nativePointerFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.flushPointerFrame() catch self.terminate();
+}
+
+fn nativeTouchAvailable(context: *anyopaque, available: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.touch_available = available;
+    if (!available) self.cancelTouches() catch self.terminate();
+    self.refreshSeatCapabilities() catch self.terminate();
+}
+
+fn nativeTouchDown(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    x: f64,
+    y: f64,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.routeTouchDown(device_id, time, native_id, x, y) catch self.terminate();
+}
+
+fn nativeTouchUp(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.routeTouchUp(device_id, time, native_id) catch self.terminate();
+}
+
+fn nativeTouchMotion(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    x: f64,
+    y: f64,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.routeTouchMotion(device_id, time, native_id, x, y) catch self.terminate();
+}
+
+fn nativeTouchFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.seat_global.touchFrame() catch self.terminate();
+}
+
+fn nativeTouchCancel(context: *anyopaque, _: NativeInput.DeviceId) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.cancelTouches() catch self.terminate();
+}
+
+fn nativeInputDeviceAdded(_: *anyopaque, _: NativeInput.DeviceInfo) void {}
+
+fn nativeInputDeviceRemoved(context: *anyopaque, device_id: NativeInput.DeviceId) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.releaseDeviceKeys(device_id) catch return self.terminate();
+    self.releaseDeviceButtons(device_id) catch return self.terminate();
+    for (self.touch_routes.items) |route| if (route.device_id == device_id) {
+        self.cancelTouches() catch self.terminate();
+        return;
+    };
+}
+
+fn ignoreSwipeBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
+fn ignoreSwipeUpdate(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: f64, _: f64) void {}
+fn ignoreSwipeEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
+fn ignorePinchBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
+fn ignorePinchUpdate(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: f64, _: f64, _: f64, _: f64) void {}
+fn ignorePinchEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
+fn ignoreHoldBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
+fn ignoreHoldEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
+fn ignoreTabletToolProximity(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: f64, _: f64, _: bool, _: NativeInput.TabletToolAxes) void {}
+fn ignoreTabletToolAxis(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes) void {}
+fn ignoreTabletToolTip(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes, _: bool) void {}
+fn ignoreTabletToolButton(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes, _: u32, _: bool) void {}
+fn ignoreTabletPadButton(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: bool, _: u32, _: u32) void {}
+fn ignoreTabletPadRing(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: f64, _: bool, _: u32, _: u32) void {}
+fn ignoreTabletPadStrip(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: f64, _: bool, _: u32, _: u32) void {}
+fn ignoreTabletPadDial(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: i32, _: u32, _: u32) void {}
+
 fn repaintTimer(_: *anyopaque, _: *EventLoop, _: u64) !void {}
 
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
@@ -648,6 +1088,467 @@ fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     try self.transport.flush();
+}
+
+fn refreshSeatCapabilities(self: *NativeServer) !void {
+    var capabilities: u32 = 0;
+    if (self.pointer_available) capabilities |= SeatGlobal.Capability.pointer;
+    if (self.keyboard_available) capabilities |= SeatGlobal.Capability.keyboard;
+    if (self.touch_available) capabilities |= SeatGlobal.Capability.touch;
+    try self.seat_global.setCapabilities(capabilities);
+}
+
+fn pendingAxis(self: *NativeServer, axis: NativeInput.Axis) ?*PendingAxis {
+    return switch (axis) {
+        .vertical_scroll => &self.pointer_axes[0],
+        .horizontal_scroll => &self.pointer_axes[1],
+        else => null,
+    };
+}
+
+fn flushPointerFrame(self: *NativeServer) !void {
+    var source = self.pointer_axis_source;
+    for (&self.pointer_axes, 0..) |*pending, index| {
+        if (!pending.active) continue;
+        try self.seat_global.pointerAxisFrame(.{
+            .time_milliseconds = pending.time_milliseconds,
+            .axis = @intCast(index),
+            .value = pending.value,
+            .source = source,
+            .stopped = pending.stopped,
+            .discrete = pending.discrete,
+            .value120 = pending.value120,
+        });
+        source = null;
+    }
+    try self.seat_global.pointerFrame();
+    self.pointer_axes = .{ .{}, .{} };
+    self.pointer_axis_source = null;
+}
+
+fn routeKeyboardKey(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    key: u32,
+    state: NativeInput.KeyState,
+) !void {
+    switch (state) {
+        .pressed => {
+            for (self.routed_keys.items) |routed|
+                if (routed.device_id == device_id and routed.key == key) return;
+            const already_held = self.keyHeld(key);
+            try self.routed_keys.append(self.allocator, .{ .device_id = device_id, .key = key });
+            if (already_held) return;
+        },
+        .released => {
+            var found: ?usize = null;
+            for (self.routed_keys.items, 0..) |routed, index| {
+                if (routed.device_id == device_id and routed.key == key) {
+                    found = index;
+                    break;
+                }
+            }
+            const unattributed = self.removeUnattributedKey(key);
+            if (found) |index| {
+                _ = self.routed_keys.orderedRemove(index);
+            } else if (!unattributed) return;
+            if (self.keyHeld(key)) return;
+        },
+        else => return,
+    }
+    if (try self.seat_global.keyboardKey(time, key, @intFromEnum(state))) |serial|
+        self.last_keyboard_serial = serial;
+}
+
+fn releaseDeviceKeys(self: *NativeServer, device_id: NativeInput.DeviceId) !void {
+    var index: usize = 0;
+    while (index < self.routed_keys.items.len) {
+        const routed = self.routed_keys.items[index];
+        if (routed.device_id != device_id) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_keys.orderedRemove(index);
+        if (self.keyHeld(routed.key)) continue;
+        if (try self.seat_global.keyboardKey(
+            0,
+            routed.key,
+            @intFromEnum(NativeInput.KeyState.released),
+        )) |serial| self.last_keyboard_serial = serial;
+    }
+}
+
+fn keyHeld(self: *const NativeServer, key: u32) bool {
+    if (std.mem.indexOfScalar(u32, self.unattributed_keys.items, key) != null) return true;
+    for (self.routed_keys.items) |routed| if (routed.key == key) return true;
+    return false;
+}
+
+fn removeUnattributedKey(self: *NativeServer, key: u32) bool {
+    const index = std.mem.indexOfScalar(u32, self.unattributed_keys.items, key) orelse return false;
+    _ = self.unattributed_keys.orderedRemove(index);
+    return true;
+}
+
+fn refreshKeyboardFocus(
+    self: *NativeServer,
+    preferred: ?*CompositorGlobal.Surface,
+) !void {
+    if (!self.keyboard_available) return;
+    const target = if (preferred) |surface|
+        if (self.surfaceActive(surface)) surface else try self.topmostRoot()
+    else
+        try self.topmostRoot();
+    if (self.seat_global.keyboardFocus() == target) return;
+    if (target == null) {
+        _ = try self.seat_global.keyboardLeave();
+        self.last_keyboard_serial = 0;
+        return;
+    }
+    self.keyboard_enter_keys.clearRetainingCapacity();
+    for (self.unattributed_keys.items) |key|
+        if (std.mem.indexOfScalar(u32, self.keyboard_enter_keys.items, key) == null)
+            try self.keyboard_enter_keys.append(self.allocator, key);
+    for (self.routed_keys.items) |routed|
+        if (std.mem.indexOfScalar(u32, self.keyboard_enter_keys.items, routed.key) == null)
+            try self.keyboard_enter_keys.append(self.allocator, routed.key);
+    const serial = try self.seat_global.keyboardEnter(
+        target.?,
+        std.mem.sliceAsBytes(self.keyboard_enter_keys.items),
+    );
+    self.last_keyboard_serial = serial;
+    try self.seat_global.keyboardModifiers(
+        serial,
+        self.keyboard_modifiers.depressed,
+        self.keyboard_modifiers.latched,
+        self.keyboard_modifiers.locked,
+        self.keyboard_modifiers.group,
+    );
+}
+
+fn reenterKeyboardFocus(self: *NativeServer) !void {
+    const current = self.seat_global.keyboardFocus() orelse
+        return self.refreshKeyboardFocus(null);
+    try current.reference();
+    defer current.unreference();
+    _ = try self.seat_global.keyboardLeave();
+    self.last_keyboard_serial = 0;
+    try self.refreshKeyboardFocus(current);
+}
+
+fn routePointerButton(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    button: u32,
+    state: NativeInput.ButtonState,
+) !void {
+    switch (state) {
+        .pressed => {
+            try self.refreshPointerFocus(time);
+            for (self.routed_buttons.items) |routed|
+                if (routed.device_id == device_id and routed.button == button) return;
+            const already_held = self.buttonHeld(button);
+            try self.routed_buttons.append(self.allocator, .{ .device_id = device_id, .button = button });
+            if (already_held) return;
+            if (try self.hitTestPointer()) |hit| try self.refreshKeyboardFocus(hit.root);
+        },
+        .released => {
+            var found: ?usize = null;
+            for (self.routed_buttons.items, 0..) |routed, index| {
+                if (routed.device_id == device_id and routed.button == button) {
+                    found = index;
+                    break;
+                }
+            }
+            const index = found orelse return;
+            _ = self.routed_buttons.orderedRemove(index);
+            if (self.buttonHeld(button)) return;
+        },
+        else => return,
+    }
+    _ = try self.seat_global.pointerButton(time, button, @intFromEnum(state));
+    if (state == .released and self.routed_buttons.items.len == 0)
+        try self.refreshPointerFocus(time);
+}
+
+fn releaseDeviceButtons(self: *NativeServer, device_id: NativeInput.DeviceId) !void {
+    var sent = false;
+    var index: usize = 0;
+    while (index < self.routed_buttons.items.len) {
+        const routed = self.routed_buttons.items[index];
+        if (routed.device_id != device_id) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_buttons.orderedRemove(index);
+        if (self.buttonHeld(routed.button)) continue;
+        _ = try self.seat_global.pointerButton(
+            0,
+            routed.button,
+            @intFromEnum(NativeInput.ButtonState.released),
+        );
+        sent = true;
+    }
+    if (self.routed_buttons.items.len == 0) try self.refreshPointerFocus(0);
+    if (sent) try self.seat_global.pointerFrame();
+}
+
+fn buttonHeld(self: *const NativeServer, button: u32) bool {
+    for (self.routed_buttons.items) |routed| if (routed.button == button) return true;
+    return false;
+}
+
+fn refreshPointerFocus(self: *NativeServer, time: u32) !void {
+    if (!self.pointer_available) return;
+    if (self.routed_buttons.items.len != 0) {
+        if (self.seat_global.pointerFocus()) |surface| {
+            if (self.surfaceLocal(surface, self.pointerLogicalX(), self.pointerLogicalY())) |local|
+                return self.seat_global.pointerMotion(
+                    time,
+                    fixedFromDouble(local.x),
+                    fixedFromDouble(local.y),
+                );
+        }
+        self.routed_buttons.clearRetainingCapacity();
+    }
+    const hit = try self.hitTestPointer();
+    if (hit) |target| {
+        const x = fixedFromDouble(target.local_x);
+        const y = fixedFromDouble(target.local_y);
+        if (self.seat_global.pointerFocus() == target.surface) {
+            try self.seat_global.pointerMotion(time, x, y);
+        } else {
+            _ = try self.seat_global.pointerEnter(target.surface, x, y);
+        }
+    } else {
+        _ = try self.seat_global.pointerLeave();
+    }
+}
+
+fn routeTouchDown(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    physical_x: f64,
+    physical_y: f64,
+) !void {
+    const x = self.physicalToLogical(physical_x);
+    const y = self.physicalToLogical(physical_y);
+    const hit = (try self.hitTest(x, y)) orelse return;
+    if (self.touch_routes.items.len != 0 and self.touch_routes.items[0].surface != hit.surface)
+        try self.cancelTouches();
+    try self.touch_routes.ensureUnusedCapacity(self.allocator, 1);
+    try hit.surface.reference();
+    errdefer hit.surface.unreference();
+    const protocol_id = self.allocateTouchId();
+    _ = try self.seat_global.touchDown(
+        hit.surface,
+        time,
+        protocol_id,
+        fixedFromDouble(hit.local_x),
+        fixedFromDouble(hit.local_y),
+    );
+    self.touch_routes.appendAssumeCapacity(.{
+        .device_id = device_id,
+        .native_id = native_id,
+        .protocol_id = protocol_id,
+        .surface = hit.surface,
+    });
+}
+
+fn routeTouchUp(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+) !void {
+    const index = self.touchRouteIndex(device_id, native_id) orelse return;
+    const route = self.touch_routes.orderedRemove(index);
+    defer route.surface.unreference();
+    _ = try self.seat_global.touchUp(time, route.protocol_id);
+    if (self.touch_routes.items.len == 0) self.seat_global.touchFinish();
+}
+
+fn routeTouchMotion(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    physical_x: f64,
+    physical_y: f64,
+) !void {
+    const index = self.touchRouteIndex(device_id, native_id) orelse return;
+    const route = self.touch_routes.items[index];
+    const local = self.surfaceLocal(
+        route.surface,
+        self.physicalToLogical(physical_x),
+        self.physicalToLogical(physical_y),
+    ) orelse return self.cancelTouches();
+    try self.seat_global.touchMotion(
+        time,
+        route.protocol_id,
+        fixedFromDouble(local.x),
+        fixedFromDouble(local.y),
+    );
+}
+
+fn cancelTouches(self: *NativeServer) !void {
+    try self.seat_global.touchCancel();
+    for (self.touch_routes.items) |route| route.surface.unreference();
+    self.touch_routes.clearRetainingCapacity();
+}
+
+fn touchRouteIndex(
+    self: *const NativeServer,
+    device_id: NativeInput.DeviceId,
+    native_id: i32,
+) ?usize {
+    for (self.touch_routes.items, 0..) |route, index|
+        if (route.device_id == device_id and route.native_id == native_id) return index;
+    return null;
+}
+
+fn allocateTouchId(self: *NativeServer) i32 {
+    const result: i32 = @intCast(self.next_touch_id);
+    self.next_touch_id = if (self.next_touch_id == std.math.maxInt(i32))
+        1
+    else
+        self.next_touch_id + 1;
+    return result;
+}
+
+fn hitTestPointer(self: *NativeServer) !?Hit {
+    return self.hitTest(self.pointerLogicalX(), self.pointerLogicalY());
+}
+
+fn hitTest(self: *NativeServer, x: f64, y: f64) !?Hit {
+    try self.collectInputPaintEntries();
+    var index = self.input_paint_entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = self.input_paint_entries.items[index];
+        const state = self.findState(entry.surface) orelse continue;
+        if (!state.surface.resource_alive) continue;
+        const size = xdgSurfaceSize(self, state.surface) orelse continue;
+        const buffer_x = entry.x +| state.x;
+        const buffer_y = entry.y +| state.y;
+        if (x < @as(f64, @floatFromInt(buffer_x)) or
+            y < @as(f64, @floatFromInt(buffer_y)) or
+            x >= @as(f64, @floatFromInt(buffer_x)) + @as(f64, @floatFromInt(size.width)) or
+            y >= @as(f64, @floatFromInt(buffer_y)) + @as(f64, @floatFromInt(size.height)))
+        {
+            continue;
+        }
+        const node = self.surface_tree.find(state.surface) orelse continue;
+        return .{
+            .surface = state.surface,
+            .root = SurfaceTree.root(node).surface,
+            // Attach offsets move buffer bounds, not the wl_surface coordinate origin.
+            .local_x = x - @as(f64, @floatFromInt(entry.x)),
+            .local_y = y - @as(f64, @floatFromInt(entry.y)),
+        };
+    }
+    return null;
+}
+
+fn topmostRoot(self: *NativeServer) !?*CompositorGlobal.Surface {
+    try self.collectInputPaintEntries();
+    var index = self.input_paint_entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const surface = self.input_paint_entries.items[index].surface;
+        if (!surface.resource_alive or self.findState(surface) == null) continue;
+        const node = self.surface_tree.find(surface) orelse continue;
+        return SurfaceTree.root(node).surface;
+    }
+    return null;
+}
+
+fn collectInputPaintEntries(self: *NativeServer) !void {
+    self.input_paint_entries.clearRetainingCapacity();
+    for (self.surfaces.items) |state| {
+        const node = self.surface_tree.find(state.surface) orelse continue;
+        if (node.parent == null) try self.surface_tree.paint(node, &self.input_paint_entries);
+    }
+}
+
+fn surfaceLocal(
+    self: *const NativeServer,
+    surface: *const CompositorGlobal.Surface,
+    x: f64,
+    y: f64,
+) ?struct { x: f64, y: f64 } {
+    if (!surface.resource_alive or self.findState(surface) == null) return null;
+    const node = self.surface_tree.find(surface) orelse return null;
+    if (!node.current_active) return null;
+    const position = SurfaceTree.globalPosition(node);
+    return .{
+        .x = x - @as(f64, @floatFromInt(position.x)),
+        .y = y - @as(f64, @floatFromInt(position.y)),
+    };
+}
+
+fn surfaceActive(self: *const NativeServer, surface: *const CompositorGlobal.Surface) bool {
+    if (!surface.resource_alive or self.findState(surface) == null) return false;
+    const node = self.surface_tree.find(surface) orelse return false;
+    return node.current_active;
+}
+
+fn pointerLogicalX(self: *const NativeServer) f64 {
+    return self.physicalToLogical(self.pointer_physical_x);
+}
+
+fn pointerLogicalY(self: *const NativeServer) f64 {
+    return self.physicalToLogical(self.pointer_physical_y);
+}
+
+fn physicalToLogical(self: *const NativeServer, value: f64) f64 {
+    return physicalToLogicalScale(value, self.output.scale());
+}
+
+fn physicalToLogicalScale(value: f64, scale: render.Scale) f64 {
+    std.debug.assert(scale.numerator > 0);
+    return value * render.Scale.denominator / @as(f64, @floatFromInt(scale.numerator));
+}
+
+fn clampPointerCoordinate(value: f64, dimension: u32) f64 {
+    std.debug.assert(dimension > 0);
+    return std.math.clamp(value, 0, @as(f64, @floatFromInt(dimension - 1)));
+}
+
+fn fixedFromDouble(value: f64) i32 {
+    const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
+    const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
+    return @intFromFloat(std.math.clamp(value, minimum, maximum) * 256.0);
+}
+
+fn inputTime(self: *const NativeServer) u32 {
+    const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
+    return @truncate(@as(u64, @intCast(@max(now, 0))));
+}
+
+fn refreshInputFocus(self: *NativeServer, time: u32) !void {
+    if (self.pointer_available) try self.refreshPointerFocus(time);
+    if (self.keyboard_available) try self.refreshKeyboardFocus(null);
+    for (self.touch_routes.items) |route| {
+        if (!self.surfaceActive(route.surface)) {
+            try self.cancelTouches();
+            break;
+        }
+    }
+}
+
+fn deinitInputState(self: *NativeServer) void {
+    for (self.touch_routes.items) |route| route.surface.unreference();
+    self.touch_routes.deinit(self.allocator);
+    self.keyboard_enter_keys.deinit(self.allocator);
+    self.unattributed_keys.deinit(self.allocator);
+    self.routed_buttons.deinit(self.allocator);
+    self.routed_keys.deinit(self.allocator);
+    self.input_paint_entries.deinit(self.allocator);
 }
 
 fn intakeTransactions(self: *NativeServer) !void {
@@ -1045,6 +1946,7 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         update.apply();
         has_direct_update = true;
     };
+    try self.refreshInputFocus(inputTime(self));
     const damage_state = if (pending.transaction.entries.len == 1 and
         pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
         (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
@@ -1516,6 +2418,15 @@ test "buffer damage maps scales positions and output clipping conservatively" {
             .{ .width = 1, .height = 1 },
         ),
     );
+}
+
+test "native input coordinates respect fractional scale and protocol bounds" {
+    try std.testing.expectEqual(@as(f64, 80), physicalToLogicalScale(120, .{ .numerator = 180 }));
+    try std.testing.expectEqual(@as(f64, 0), clampPointerCoordinate(-1, 64));
+    try std.testing.expectEqual(@as(f64, 63), clampPointerCoordinate(80, 64));
+    try std.testing.expectEqual(@as(i32, 384), fixedFromDouble(1.5));
+    try std.testing.expectEqual(std.math.minInt(i32), fixedFromDouble(-1.0e20));
+    try std.testing.expectEqual(std.math.maxInt(i32), fixedFromDouble(1.0e20));
 }
 
 test "native compositor owns and drains its io_uring listener" {
