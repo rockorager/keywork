@@ -9,7 +9,7 @@ const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
-const surface_geometry = @import("surface_geometry.zig");
+const surface_geometry = @import("../surface_geometry.zig");
 const WaylandRegion = @import("region.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
 const SinglePixelBuffer = @import("single_pixel_buffer.zig");
@@ -1183,7 +1183,7 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
         },
         .commit => commit(self),
         .set_buffer_transform => |set| {
-            if (!surface_geometry.validTransform(set.transform)) {
+            if (!surface_geometry.validTransform(@intFromEnum(set.transform))) {
                 resource.postError(.invalid_transform, "invalid buffer transform");
                 return;
             }
@@ -1471,7 +1471,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
             _ = surface_geometry.calculate(
                 existing.buffer_size,
                 surface_state.pending_scale,
-                surface_state.pending_transform,
+                @intFromEnum(surface_state.pending_transform),
                 surface_state.pending_viewport,
                 surface_state.role == .cursor,
             ) catch |err| {
@@ -2361,7 +2361,7 @@ pub const BufferSnapshot = struct {
         const geometry = surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            @intFromEnum(transform),
             viewport,
             allow_non_divisible_scale,
         ) catch |err| return err;
@@ -2439,7 +2439,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            @intFromEnum(transform),
             viewport,
             allow_non_divisible_scale,
         );
@@ -2475,7 +2475,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            @intFromEnum(transform),
             viewport,
             allow_non_divisible_scale,
         );
@@ -2510,7 +2510,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             self.buffer_size,
             scale,
-            transform,
+            @intFromEnum(transform),
             viewport,
             allow_non_divisible_scale,
         );
