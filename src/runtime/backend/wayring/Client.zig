@@ -57,6 +57,7 @@ compositor: ?Global = null,
 wm_base: ?Global = null,
 dmabuf: ?Global = null,
 seat: ?Global = null,
+data_device_manager: ?Global = null,
 cursor_shape_manager: ?Global = null,
 outputs: std.ArrayList(Output) = .empty,
 seat_capabilities: u32 = 0,
@@ -167,6 +168,10 @@ pub fn takeSeat(self: *Client) ?Seat {
 
 pub fn cursorShapeManager(self: *const Client) ?wayring.ObjectHandle {
     return if (self.cursor_shape_manager) |global| global.handle else null;
+}
+
+pub fn dataDeviceManager(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.data_device_manager) |global| global.handle else null;
 }
 
 pub fn outputScale(self: *const Client, object_id: u32) ?u32 {
@@ -354,6 +359,8 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 return error.RequiredGlobalRemoved;
             }
             if (self.seat != null and self.seat.?.name == event.name) self.seat = null;
+            if (self.data_device_manager != null and self.data_device_manager.?.name == event.name)
+                self.data_device_manager = null;
             for (self.outputs.items, 0..) |output, index| {
                 if (output.global_name != event.name) continue;
                 _ = self.outputs.orderedRemove(index);
@@ -385,6 +392,16 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
         self.seat = .{
             .name = name,
             .handle = try self.bind(name, advertised_version, &protocol.wl_seat, 8),
+        };
+    } else if (std.mem.eql(u8, interface_name, protocol.wl_data_device_manager.name) and self.data_device_manager == null) {
+        self.data_device_manager = .{
+            .name = name,
+            .handle = try self.bind(
+                name,
+                advertised_version,
+                &protocol.wl_data_device_manager,
+                protocol.wl_data_device_manager.version,
+            ),
         };
     } else if (std.mem.eql(u8, interface_name, protocol.wp_cursor_shape_manager_v1.name) and self.cursor_shape_manager == null) {
         self.cursor_shape_manager = .{
@@ -433,7 +450,7 @@ test "io_uring client discovers and binds required globals" {
             if (notification == .outputs_changed) return;
             if (notification != .ready) return;
             self.ready = true;
-            if (self.bind_count == 5) {
+            if (self.bind_count == 6) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -485,6 +502,9 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 14 }, .{ .string = protocol.wl_output.name }, .{ .uint = 4 },
                             });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 15 }, .{ .string = protocol.wl_data_device_manager.name }, .{ .uint = 4 },
+                            });
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -519,6 +539,8 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.wl_seat
                     else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_output.name))
                         &protocol.wl_output
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_data_device_manager.name))
+                        &protocol.wl_data_device_manager
                     else
                         return error.UnexpectedBind;
                     const bound = try registerServerObject(
@@ -541,7 +563,7 @@ test "io_uring client discovers and binds required globals" {
                 }
             }
             try transport.flush();
-            if (self.ready and self.bind_count == 5) {
+            if (self.ready and self.bind_count == 6) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -588,7 +610,7 @@ test "io_uring client discovers and binds required globals" {
     while (loop.hasActiveOperations()) try loop.runOnce();
 
     try std.testing.expect(context.ready);
-    try std.testing.expectEqual(@as(usize, 5), context.bind_count);
+    try std.testing.expectEqual(@as(usize, 6), context.bind_count);
     try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
         .format = 0x34325241,
         .modifier = 7,
@@ -599,6 +621,7 @@ test "io_uring client discovers and binds required globals" {
         seat.capabilities,
     );
     try std.testing.expectEqual(@as(u32, 2), client.outputScale(client.outputs.items[0].handle.id).?);
+    try std.testing.expect(client.dataDeviceManager() != null);
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();
