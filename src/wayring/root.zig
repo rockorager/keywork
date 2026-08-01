@@ -235,6 +235,13 @@ pub const Connection = struct {
         return self.objects.get(id);
     }
 
+    pub fn objectForHandle(self: *const Connection, handle: ObjectHandle, interface: *const Interface) !Object {
+        const registered = self.objects.get(handle.id) orelse return error.UnknownObject;
+        if (registered.generation != handle.generation) return error.StaleObject;
+        if (registered.interface != interface) return error.WrongInterface;
+        return registered;
+    }
+
     /// The connection consumes every descriptor in `fds` on every return path.
     /// Protocol errors are connection-fatal, but already accepted descriptors
     /// remain owned here so callers never need to distinguish parse failures
@@ -322,6 +329,11 @@ pub const Connection = struct {
         const owned_fds = try self.allocator.dupe(i32, fds.items);
         errdefer self.allocator.free(owned_fds);
         try self.outbound.append(self.allocator, .{ .bytes = bytes, .fds = owned_fds });
+    }
+
+    pub fn queueObject(self: *Connection, handle: ObjectHandle, interface: *const Interface, opcode: u16, values: []const OutValue) !void {
+        _ = try self.objectForHandle(handle, interface);
+        try self.queue(handle.id, opcode, values);
     }
 
     pub fn nextBatch(self: *Connection) ?OutboundBatch {
@@ -554,6 +566,10 @@ test "client object IDs increase and released IDs get new generations" {
     const reused = try c.allocateObject(&test_interface, 1);
     try std.testing.expectEqual(first.id, reused.id);
     try std.testing.expect(reused.generation != first.generation);
+    try std.testing.expectError(error.StaleObject, c.queueObject(first, &test_interface, 0, &.{
+        .{ .int = 1 },    .{ .uint = 2 },   .{ .fixed = 3 },    .{ .string = null },
+        .{ .object = 0 }, .{ .new_id = 4 }, .{ .array = null }, .{ .fd = -1 },
+    }));
 }
 
 test "stale and double client object releases do not duplicate reusable IDs" {
@@ -581,6 +597,8 @@ test "client object allocation is role restricted and skips manual collisions" {
     _ = try client.registerObject(2, &test_interface, 1);
     const allocated = try client.allocateObject(&test_interface, 1);
     try std.testing.expectEqual(@as(u32, 3), allocated.id);
+    const other_interface: Interface = .{ .name = "other", .version = 1 };
+    try std.testing.expectError(error.WrongInterface, client.objectForHandle(allocated, &other_interface));
     try std.testing.expectError(error.InvalidObject, client.abandonObject(.{ .id = 1, .generation = 1 }));
     try std.testing.expectError(error.InvalidObject, client.abandonObject(.{ .id = server_object_id_start, .generation = 1 }));
 }
