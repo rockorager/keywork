@@ -427,16 +427,18 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
             message,
         )) {
             .configure => |configure| {
-                if (configure.width == 0 or configure.height == 0) return error.EmptyLayerConfigure;
+                const width = if (configure.width == 0) self.pending_width else configure.width;
+                const height = if (configure.height == 0) self.pending_height else configure.height;
+                if (width == 0 or height == 0) return error.EmptyLayerConfigure;
                 try protocol.zwlr_layer_surface_v1_types.requests.ack_configure(
                     self.client.connectionPtr(),
                     self.role.layer,
                     configure.serial,
                 );
-                self.width = configure.width;
-                self.height = configure.height;
-                self.pending_width = configure.width;
-                self.pending_height = configure.height;
+                self.width = width;
+                self.height = height;
+                self.pending_width = width;
+                self.pending_height = height;
                 try self.configureScale();
                 self.configured = true;
                 self.configure_generation +%= 1;
