@@ -7,7 +7,6 @@ const BufferDamageTracker = @import("BufferDamageTracker.zig");
 const cursor_resample = @import("cursor_resample.zig");
 const display_color = @import("display_color.zig");
 const Gbm = @import("gbm.zig");
-const NestedOutput = @import("nested_wayland.zig");
 const ScanoutFramebufferCache = @import("ScanoutFramebufferCache.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
@@ -115,7 +114,12 @@ powered: bool,
 mode_set: bool,
 retired: bool,
 
-pub const Listener = NestedOutput.Listener;
+pub const Listener = struct {
+    context: *anyopaque,
+    ready: *const fn (*anyopaque) void,
+    presented: *const fn (*anyopaque, presentation.Info) void,
+    discarded: *const fn (*anyopaque) void,
+};
 
 const Buffer = struct {
     gbm: ?Gbm.Buffer = null,
