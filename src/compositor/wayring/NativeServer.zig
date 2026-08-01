@@ -16,12 +16,14 @@ const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
+const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
 const Renderer = @import("../render/Renderer.zig");
 const HeadlessOutput = @import("../backend/headless.zig");
 const render = @import("../render/types.zig");
+const surface_geometry = @import("../surface_geometry.zig");
 
 const EventLoop = keywork_loop.EventLoop;
 const IoUringLoop = keywork_loop.IoUringLoop;
@@ -35,6 +37,7 @@ compositor_global: CompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
 fractional_scale_global: FractionalScaleGlobal,
+viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
 transport: IoUringServer,
 renderer: Renderer,
@@ -78,6 +81,7 @@ const SurfaceState = struct {
     x: i32 = 0,
     y: i32 = 0,
     full_damage: bool = false,
+    viewport: surface_geometry.ViewportState = .{},
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -137,6 +141,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.output.scale.numerator,
     );
     errdefer self.fractional_scale_global.deinit();
+    try self.viewporter_global.init(allocator, &self.server);
+    errdefer self.viewporter_global.deinit();
 
     const selection = try selectSocket(allocator, options);
     errdefer {
@@ -281,6 +287,7 @@ pub fn destroy(self: *NativeServer) void {
         state.deinit(self.allocator);
     }
     self.surfaces.deinit(self.allocator);
+    self.viewporter_global.deinit();
     self.fractional_scale_global.deinit();
     self.seat_global.deinit();
     self.output_global.deinit();
@@ -331,11 +338,13 @@ fn applyCommits(self: *NativeServer) !void {
             state.scale != commit.scale or
             state.transform != commit.transform or
             state.x != commit.offset_x or
-            state.y != commit.offset_y;
+            state.y != commit.offset_y or
+            !std.meta.eql(state.viewport, commit.viewport);
         state.scale = commit.scale;
         state.transform = commit.transform;
         state.x = commit.offset_x;
         state.y = commit.offset_y;
+        state.viewport = commit.viewport;
         switch (commit.attachment) {
             .buffer => |attachment| {
                 const damage: ?[]const render.Rect = if (commit.buffer_damage.len == 0)
@@ -371,6 +380,18 @@ fn applyCommits(self: *NativeServer) !void {
                 try present_result;
             },
             .unchanged => {
+                if (state.snapshot) |*snapshot| {
+                    _ = surface_geometry.calculate(
+                        snapshot.size,
+                        state.scale,
+                        @intCast(state.transform),
+                        state.viewport,
+                        false,
+                    ) catch |err| {
+                        commit.deinit();
+                        return self.viewporter_global.postGeometryError(state.surface, err);
+                    };
+                }
                 const present_result = self.present(&commit);
                 commit.deinit();
                 try present_result;
@@ -389,10 +410,28 @@ fn finishCopy(self: *NativeServer, present_frame: bool) !void {
     var active = self.active.?;
     self.active = null;
     self.copy_completed = false;
-    if (active.copy.takeSnapshot()) |snapshot| {
-        if (active.state.snapshot) |*old| old.deinit();
-        active.state.snapshot = snapshot;
-        try self.output_global.setSurfaceVisible(active.state.surface, true);
+    var geometry_error: ?surface_geometry.Error = null;
+    if (active.copy.takeSnapshot()) |snapshot_value| {
+        var snapshot = snapshot_value;
+        _ = surface_geometry.calculate(
+            snapshot.size,
+            active.state.scale,
+            @intCast(active.state.transform),
+            active.state.viewport,
+            false,
+        ) catch |err| {
+            snapshot.deinit();
+            geometry_error = err;
+        };
+        if (geometry_error == null) {
+            if (active.state.snapshot) |*old| old.deinit();
+            active.state.snapshot = snapshot;
+            try self.output_global.setSurfaceVisible(active.state.surface, true);
+        } else {
+            if (active.state.snapshot) |*old| old.deinit();
+            active.state.snapshot = null;
+            try self.output_global.setSurfaceVisible(active.state.surface, false);
+        }
     } else |_| {
         // Invalid mappings and short reads affect only this attachment.
         if (active.state.snapshot) |*old| old.deinit();
@@ -401,6 +440,10 @@ fn finishCopy(self: *NativeServer, present_frame: bool) !void {
     }
     active.copy.deinit();
     active.commit.releaseBuffer() catch {};
+    if (geometry_error) |err| {
+        active.commit.deinit();
+        return self.viewporter_global.postGeometryError(active.state.surface, err);
+    }
     const present_result = if (present_frame) self.present(&active.commit) else {};
     active.commit.deinit();
     try present_result;
@@ -422,16 +465,19 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
         if (!state.surface.resource_alive) continue;
         const snapshot = if (state.snapshot) |*value| value else continue;
         const transform = bufferTransform(state.transform);
-        const transformed = transform.applyToSize(snapshot.size);
-        const divisor: u32 = @intCast(@max(state.scale, 1));
+        const geometry = surface_geometry.calculate(
+            snapshot.size,
+            state.scale,
+            @intCast(state.transform),
+            state.viewport,
+            false,
+        ) catch continue;
         try commands.append(self.allocator, .{ .image = .{
             .x = state.x,
             .y = state.y,
-            .size = .{
-                .width = @max(transformed.width / divisor, 1),
-                .height = @max(transformed.height / divisor, 1),
-            },
+            .size = geometry.logical_size,
             .buffer = snapshot.pixelBuffer(),
+            .source = geometry.source,
             .transform = transform,
             .is_opaque = snapshot.force_opaque,
         } });
@@ -451,6 +497,7 @@ fn frameDamage(
     storage: *[1]render.Rect,
 ) ?[]const render.Rect {
     if (state.full_damage) return null;
+    if (state.viewport.source != null or state.viewport.destination != null) return null;
     const snapshot = if (state.snapshot) |*value| value else return null;
     const source_damage = snapshot.source_damage orelse return null;
     const transform = bufferTransform(state.transform);

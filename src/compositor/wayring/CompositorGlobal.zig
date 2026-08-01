@@ -7,6 +7,7 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const render = @import("../render/types.zig");
+const surface_geometry = @import("../surface_geometry.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const shm = @import("shm.zig");
 
@@ -52,6 +53,7 @@ pub const Commit = struct {
     transform: u32,
     offset_x: i32,
     offset_y: i32,
+    viewport: surface_geometry.ViewportState,
     frame_finished: bool = false,
 
     pub fn deinit(self: *Commit) void {
@@ -112,6 +114,8 @@ pub const Surface = struct {
     pending_offset_y: i32 = 0,
     current_offset_x: i32 = 0,
     current_offset_y: i32 = 0,
+    pending_viewport: surface_geometry.ViewportState = .{},
+    current_viewport: surface_geometry.ViewportState = .{},
 
     pub fn setRole(
         self: *Surface,
@@ -414,6 +418,7 @@ fn queueCommit(surface: *Surface) !void {
     surface.current_transform = surface.pending_transform;
     surface.current_offset_x = surface.pending_offset_x;
     surface.current_offset_y = surface.pending_offset_y;
+    surface.current_viewport = surface.pending_viewport;
     const attachment = surface.pending_attachment;
     surface.pending_attachment = .unchanged;
     surface.pending_surface_damage.clearRetainingCapacity();
@@ -430,6 +435,7 @@ fn queueCommit(surface: *Surface) !void {
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
         .offset_y = surface.current_offset_y,
+        .viewport = surface.current_viewport,
     });
 }
 
