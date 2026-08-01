@@ -173,8 +173,9 @@ pub fn WayringPlatform(comptime Backend: type) type {
             try backend.clipboardWrite(text);
         }
 
-        fn activationToken(_: *anyopaque, _: std.mem.Allocator, _: ?[*:0]const u8) anyerror!?[]u8 {
-            return null;
+        fn activationToken(ptr: *anyopaque, allocator: std.mem.Allocator, app_id: ?[*:0]const u8) anyerror!?[]u8 {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.activationToken(allocator, app_id);
         }
 
         fn startMove(ptr: *anyopaque) anyerror!void {

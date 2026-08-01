@@ -230,6 +230,10 @@ pub fn surfaceId(self: *const Window) u32 {
     return self.handles.surface.id;
 }
 
+pub fn surfaceHandle(self: *const Window) wayring.ObjectHandle {
+    return self.handles.surface;
+}
+
 pub fn startMove(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
     try protocol.xdg_toplevel_types.requests.move(
         self.client.connectionPtr(),

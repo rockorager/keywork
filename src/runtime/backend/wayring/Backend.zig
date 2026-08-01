@@ -6,6 +6,7 @@ const std = @import("std");
 const keywork_loop = @import("keywork-loop");
 const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
+const protocol = @import("wayring-protocols");
 const Client = @import("Client.zig");
 const Clipboard = @import("Clipboard.zig");
 const Input = @import("Input.zig");
@@ -36,6 +37,13 @@ pub const Options = struct {
     height: u32 = 480,
 };
 
+const ActivationRequest = struct {
+    handle: wayring.ObjectHandle,
+    allocator: std.mem.Allocator,
+    token: ?[]u8 = null,
+    done: bool = false,
+};
+
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 client: Client,
@@ -47,6 +55,7 @@ event_context: *anyopaque,
 event_notify: EventNotify,
 state: State = .connecting,
 shutdown_started: bool = false,
+activation_request: ?ActivationRequest = null,
 
 /// The backend and `loop` must remain at stable addresses until `deinit`.
 pub fn initConnect(
@@ -133,6 +142,8 @@ pub fn deinit(self: *Backend) void {
     if (self.window) |*window| window.deinit();
     if (self.clipboard) |*clipboard| clipboard.deinit();
     if (self.input) |*input| input.deinit();
+    if (self.activation_request) |request| if (request.token) |token|
+        request.allocator.free(token);
     self.client.deinit();
     self.* = undefined;
 }
@@ -186,6 +197,62 @@ pub fn startResize(self: *Backend, edge: ResizeEdge) !void {
     const serial = input.lastButtonPressSerial() orelse return error.NoRecentPress;
     const window = if (self.window) |*value| value else return error.WindowNotReady;
     try window.startResize(input.seatHandle(), serial, edge);
+}
+
+/// Requests an xdg-activation token while continuing to drain completion
+/// events. User callbacks are queued by the runner, so this does not re-enter
+/// application code while waiting for the compositor's reply.
+pub fn activationToken(
+    self: *Backend,
+    allocator: std.mem.Allocator,
+    app_id: ?[*:0]const u8,
+) !?[]u8 {
+    const manager = self.client.activationManager() orelse return null;
+    if (self.activation_request != null) return error.ActivationRequestPending;
+    const token_handle = try protocol.xdg_activation_v1_types.requests.get_activation_token(
+        self.client.connectionPtr(),
+        manager,
+    );
+    self.activation_request = .{ .handle = token_handle, .allocator = allocator };
+    errdefer self.cancelActivationRequest();
+
+    if (self.input) |*input| if (input.lastInputSerial()) |serial| {
+        try protocol.xdg_activation_token_v1_types.requests.set_serial(
+            self.client.connectionPtr(),
+            token_handle,
+            serial,
+            input.seatHandle(),
+        );
+    };
+    if (self.window) |*window| try protocol.xdg_activation_token_v1_types.requests.set_surface(
+        self.client.connectionPtr(),
+        token_handle,
+        window.surfaceHandle(),
+    );
+    if (app_id) |value| try protocol.xdg_activation_token_v1_types.requests.set_app_id(
+        self.client.connectionPtr(),
+        token_handle,
+        std.mem.span(value),
+    );
+    try protocol.xdg_activation_token_v1_types.requests.commit(
+        self.client.connectionPtr(),
+        token_handle,
+    );
+    try self.client.flush();
+
+    while (!self.activation_request.?.done) {
+        switch (self.state) {
+            .disconnected => return error.WaylandDisconnected,
+            .fatal => return error.WaylandTransportFailed,
+            .closing, .closed => return error.WindowClosed,
+            else => {},
+        }
+        if (!self.loop.hasActiveOperations()) return error.ConnectionStopped;
+        try self.runOnce();
+    }
+    const token = self.activation_request.?.token;
+    self.activation_request = null;
+    return token;
 }
 
 pub fn installEventTimers(self: *Backend, loop: *keywork_loop.EventLoop) !void {
@@ -259,6 +326,25 @@ fn clientMessage(
     message: *wayring.Message,
 ) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
+    if (self.activation_request) |request| {
+        if (message.object_id == request.handle.id) {
+            const done = (try protocol.xdg_activation_token_v1_types.decodeEvent(
+                self.client.connectionPtr(),
+                request.handle,
+                message,
+            )).done;
+            const token = try request.allocator.dupe(u8, done.token);
+            errdefer request.allocator.free(token);
+            try protocol.xdg_activation_token_v1_types.requests.destroy(
+                self.client.connectionPtr(),
+                request.handle,
+            );
+            self.activation_request.?.token = token;
+            self.activation_request.?.done = true;
+            try self.client.flush();
+            return;
+        }
+    }
     if (self.clipboard) |*clipboard| {
         if (clipboard.ownsObject(message.object_id)) {
             try clipboard.handleMessage(message);
@@ -324,6 +410,17 @@ fn startTransportShutdown(self: *Backend) !void {
 
 fn updateClosed(self: *Backend) void {
     if (self.state == .closing and self.client.readyToDeinit()) self.state = .closed;
+}
+
+fn cancelActivationRequest(self: *Backend) void {
+    if (self.activation_request) |request| {
+        if (request.token) |token| request.allocator.free(token);
+        protocol.xdg_activation_token_v1_types.requests.destroy(
+            self.client.connectionPtr(),
+            request.handle,
+        ) catch {};
+    }
+    self.activation_request = null;
 }
 
 test {

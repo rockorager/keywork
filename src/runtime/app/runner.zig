@@ -174,6 +174,7 @@ fn runWayring(
             try compatibility.cancel();
             try backend.beginClose();
         }
+        if (compatibility.ready) try compatibility.dispatch();
         try backend.runOnce();
         if (compatibility.ready) try compatibility.dispatch();
         try run_context.drain(&backend);
