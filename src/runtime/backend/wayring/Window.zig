@@ -11,6 +11,7 @@ const VulkanWindow = @import("VulkanWindow.zig");
 
 pub const Event = enum { configured, repaint, close };
 
+allocator: std.mem.Allocator,
 client: *Client,
 handles: Client.Window,
 renderer: VulkanWindow,
@@ -23,6 +24,9 @@ configured: bool = false,
 closed: bool = false,
 closing: bool = false,
 protocol_destroyed: bool = false,
+scale: u32 = 1,
+preferred_scale: ?u32 = null,
+entered_outputs: std.ArrayList(u32) = .empty,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -59,6 +63,7 @@ pub fn init(
     );
     errdefer renderer.deinit();
     return .{
+        .allocator = allocator,
         .client = client,
         .handles = handles,
         .renderer = renderer,
@@ -71,6 +76,7 @@ pub fn init(
 
 /// Call after disconnect or after `readyToDeinit` reports true.
 pub fn deinit(self: *Window) void {
+    self.entered_outputs.deinit(self.allocator);
     self.renderer.deinit();
     self.* = undefined;
 }
@@ -152,7 +158,8 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
             self.handles.xdg_surface,
             configure.serial,
         );
-        try self.renderer.configure(self.pending_width, self.pending_height);
+        const pixel_size = try scaledSize(self.pending_width, self.pending_height, self.scale);
+        try self.renderer.configure(pixel_size.width, pixel_size.height);
         self.width = self.pending_width;
         self.height = self.pending_height;
         self.configured = true;
@@ -172,11 +179,31 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         }
     }
     if (message.object_id == self.handles.surface.id) {
-        _ = try protocol.wl_surface_types.decodeEvent(
+        switch (try protocol.wl_surface_types.decodeEvent(
             self.client.connectionPtr(),
             self.handles.surface,
             message,
-        );
+        )) {
+            .enter => |event| {
+                for (self.entered_outputs.items) |id| if (id == event.output) return null;
+                try self.entered_outputs.append(self.allocator, event.output);
+                return self.applyScale();
+            },
+            .leave => |event| {
+                for (self.entered_outputs.items, 0..) |id, index| {
+                    if (id != event.output) continue;
+                    _ = self.entered_outputs.orderedRemove(index);
+                    break;
+                }
+                return self.applyScale();
+            },
+            .preferred_buffer_scale => |event| {
+                if (event.factor <= 0) return error.InvalidSurfaceScale;
+                self.preferred_scale = @intCast(event.factor);
+                return self.applyScale();
+            },
+            .preferred_buffer_transform => {},
+        }
         return null;
     }
     return error.UnknownWindowObject;
@@ -202,6 +229,11 @@ pub fn surfaceId(self: *const Window) u32 {
     return self.handles.surface.id;
 }
 
+pub fn outputScaleChanged(self: *Window) !?Event {
+    if (self.preferred_scale != null) return null;
+    return self.applyScale();
+}
+
 const render_backend_vtable: keywork.RenderBackend.VTable = .{
     .present = renderBackendPresent,
     .measure_text = renderBackendMeasureText,
@@ -220,18 +252,46 @@ fn renderBackendMeasureText(
     style: keywork.ResolvedTextStyle,
 ) !keywork.Size {
     const self: *Window = @ptrCast(@alignCast(context));
-    return self.renderer.measureText(1, value, style);
+    return self.renderer.measureText(@floatFromInt(self.scale), value, style);
 }
 
-fn renderBackendScale(_: *anyopaque) f32 {
-    // Output and fractional-scale negotiation are intentionally not guessed:
-    // the core-only bootstrap uses one logical pixel per buffer pixel.
-    return 1;
+fn renderBackendScale(context: *anyopaque) f32 {
+    const self: *Window = @ptrCast(@alignCast(context));
+    return @floatFromInt(self.scale);
 }
 
 fn renderBackendTextMetrics(context: *anyopaque, font_size: f32) !keywork.TextMetrics {
     const self: *Window = @ptrCast(@alignCast(context));
-    return self.renderer.textMetrics(1, font_size);
+    return self.renderer.textMetrics(@floatFromInt(self.scale), font_size);
+}
+
+fn applyScale(self: *Window) !?Event {
+    var next_scale = self.preferred_scale orelse 1;
+    if (self.preferred_scale == null) {
+        for (self.entered_outputs.items) |output_id| {
+            next_scale = @max(next_scale, self.client.outputScale(output_id) orelse 1);
+        }
+    }
+    if (next_scale == self.scale) return null;
+    if (next_scale > std.math.maxInt(i32)) return error.InvalidSurfaceScale;
+    try protocol.wl_surface_types.requests.set_buffer_scale(
+        self.client.connectionPtr(),
+        self.handles.surface,
+        @intCast(next_scale),
+    );
+    self.scale = next_scale;
+    if (!self.configured) return null;
+    const pixel_size = try scaledSize(self.width, self.height, self.scale);
+    try self.renderer.configure(pixel_size.width, pixel_size.height);
+    try self.client.flush();
+    return .configured;
+}
+
+fn scaledSize(width: u32, height: u32, scale: u32) !struct { width: u32, height: u32 } {
+    return .{
+        .width = std.math.mul(u32, width, scale) catch return error.DimensionOverflow,
+        .height = std.math.mul(u32, height, scale) catch return error.DimensionOverflow,
+    };
 }
 
 fn destroyProtocol(client: *Client, handles: Client.Window) void {
@@ -260,4 +320,9 @@ fn finishClose(self: *Window) !void {
 
 test {
     std.testing.refAllDecls(Window);
+    try std.testing.expectEqual(
+        @as(u32, 3840),
+        (try scaledSize(1920, 1080, 2)).width,
+    );
+    try std.testing.expectError(error.DimensionOverflow, scaledSize(std.math.maxInt(u32), 1, 2));
 }

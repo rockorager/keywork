@@ -10,7 +10,7 @@ const protocol = @import("wayring-protocols");
 
 const IoUringLoop = keywork_loop.IoUringLoop;
 
-pub const Notification = enum { ready, eof, fatal };
+pub const Notification = enum { ready, outputs_changed, eof, fatal };
 pub const Notify = *const fn (context: *anyopaque, client: *Client, notification: Notification) anyerror!void;
 pub const MessageNotify = *const fn (context: *anyopaque, client: *Client, message: *wayring.Message) anyerror!void;
 
@@ -37,6 +37,12 @@ const Global = struct {
     handle: wayring.ObjectHandle,
 };
 
+const Output = struct {
+    global_name: u32,
+    handle: wayring.ObjectHandle,
+    scale: u32 = 1,
+};
+
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 connection: wayring.Connection,
@@ -52,6 +58,7 @@ wm_base: ?Global = null,
 dmabuf: ?Global = null,
 seat: ?Global = null,
 cursor_shape_manager: ?Global = null,
+outputs: std.ArrayList(Output) = .empty,
 seat_capabilities: u32 = 0,
 seat_claimed: bool = false,
 dmabuf_candidates: std.ArrayList(DmaBufCandidate) = .empty,
@@ -129,6 +136,7 @@ pub fn readyToDeinit(self: *Client) bool {
 
 pub fn deinit(self: *Client) void {
     self.transport.deinit();
+    self.outputs.deinit(self.allocator);
     self.dmabuf_candidates.deinit(self.allocator);
     self.connection.deinit();
     self.* = undefined;
@@ -159,6 +167,13 @@ pub fn takeSeat(self: *Client) ?Seat {
 
 pub fn cursorShapeManager(self: *const Client) ?wayring.ObjectHandle {
     return if (self.cursor_shape_manager) |global| global.handle else null;
+}
+
+pub fn outputScale(self: *const Client, object_id: u32) ?u32 {
+    for (self.outputs.items) |output| {
+        if (output.handle.id == object_id) return output.scale;
+    }
+    return null;
 }
 
 pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Window {
@@ -286,6 +301,25 @@ fn dispatchApplicationMessage(self: *Client, message: *wayring.Message) !void {
             return;
         }
     }
+    for (self.outputs.items) |*output| {
+        if (message.object_id != output.handle.id) continue;
+        switch (try protocol.wl_output_types.decodeEvent(
+            &self.connection,
+            output.handle,
+            message,
+        )) {
+            .scale => |event| {
+                if (event.factor <= 0) return error.InvalidOutputScale;
+                const scale: u32 = @intCast(event.factor);
+                if (scale != output.scale) {
+                    output.scale = scale;
+                    if (self.ready) try self.notify(self.notify_context, self, .outputs_changed);
+                }
+            },
+            .geometry, .mode, .done, .name, .description => {},
+        }
+        return;
+    }
     if (self.seat) |global| {
         if (!self.seat_claimed and message.object_id == global.handle.id) {
             switch (try protocol.wl_seat_types.decodeEvent(
@@ -320,6 +354,12 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 return error.RequiredGlobalRemoved;
             }
             if (self.seat != null and self.seat.?.name == event.name) self.seat = null;
+            for (self.outputs.items, 0..) |output, index| {
+                if (output.global_name != event.name) continue;
+                _ = self.outputs.orderedRemove(index);
+                if (self.ready) try self.notify(self.notify_context, self, .outputs_changed);
+                break;
+            }
         },
     }
 }
@@ -356,6 +396,11 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
                 1,
             ),
         };
+    } else if (std.mem.eql(u8, interface_name, protocol.wl_output.name)) {
+        try self.outputs.append(self.allocator, .{
+            .global_name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.wl_output, 4),
+        });
     }
 }
 
@@ -385,9 +430,10 @@ test "io_uring client discovers and binds required globals" {
 
         fn clientNotify(context: *anyopaque, _: *Client, notification: Notification) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            if (notification == .outputs_changed) return;
             if (notification != .ready) return;
             self.ready = true;
-            if (self.bind_count == 4) {
+            if (self.bind_count == 5) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -436,6 +482,9 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 13 }, .{ .string = protocol.wl_seat.name }, .{ .uint = 8 },
                             });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 14 }, .{ .string = protocol.wl_output.name }, .{ .uint = 4 },
+                            });
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -468,6 +517,8 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.zwp_linux_dmabuf_v1
                     else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_seat.name))
                         &protocol.wl_seat
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_output.name))
+                        &protocol.wl_output
                     else
                         return error.UnexpectedBind;
                     const bound = try registerServerObject(
@@ -483,12 +534,14 @@ test "io_uring client discovers and binds required globals" {
                     } else if (interface == &protocol.wl_seat) {
                         try transport.connection.queue(bound.id, 0, &.{.{ .uint = protocol.wl_seat_types.capability.pointer |
                             protocol.wl_seat_types.capability.keyboard }});
+                    } else if (interface == &protocol.wl_output) {
+                        try transport.connection.queue(bound.id, 3, &.{.{ .int = 2 }});
                     }
                     self.bind_count += 1;
                 }
             }
             try transport.flush();
-            if (self.ready and self.bind_count == 4) {
+            if (self.ready and self.bind_count == 5) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -535,7 +588,7 @@ test "io_uring client discovers and binds required globals" {
     while (loop.hasActiveOperations()) try loop.runOnce();
 
     try std.testing.expect(context.ready);
-    try std.testing.expectEqual(@as(usize, 4), context.bind_count);
+    try std.testing.expectEqual(@as(usize, 5), context.bind_count);
     try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
         .format = 0x34325241,
         .modifier = 7,
@@ -545,6 +598,7 @@ test "io_uring client discovers and binds required globals" {
         protocol.wl_seat_types.capability.pointer | protocol.wl_seat_types.capability.keyboard,
         seat.capabilities,
     );
+    try std.testing.expectEqual(@as(u32, 2), client.outputScale(client.outputs.items[0].handle.id).?);
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();

@@ -193,6 +193,15 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
             if (self.input) |*input| input.setSurface(self.window.?.surfaceId());
             self.state = .configuring;
         },
+        .outputs_changed => if (self.window) |*window| {
+            if (try window.outputScaleChanged()) |_| {
+                const size = window.size();
+                try self.event_notify(self.event_context, self, .{ .configured = .{
+                    .width = size.width,
+                    .height = size.height,
+                } });
+            }
+        },
         .eof => {
             self.state = .disconnected;
             try self.startTransportShutdown();
