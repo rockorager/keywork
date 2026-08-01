@@ -1,8 +1,9 @@
-//! Connected Unix stream transport for Wayring using io_uring.
+//! Unix stream transport for Wayring using io_uring.
 //!
-//! The transport takes ownership of `fd` at initialization. Its address must
-//! remain stable until `readyToDeinit` becomes true; shutdown cancellation does
-//! not release buffers referenced by the kernel before terminal CQEs arrive.
+//! The transport either takes ownership of a connected fd or creates a socket
+//! and connects it asynchronously. Its address must remain stable until
+//! `readyToDeinit` becomes true; shutdown cancellation does not release buffers
+//! referenced by the kernel before terminal CQEs arrive.
 
 const IoUringTransport = @This();
 
@@ -17,7 +18,7 @@ const fd_bytes = wayring.max_fds_per_batch * @sizeOf(i32);
 const control_size = std.mem.alignForward(usize, @sizeOf(linux.cmsghdr), control_alignment) +
     std.mem.alignForward(usize, fd_bytes, control_alignment);
 
-pub const Notification = enum { messages, eof, fatal };
+pub const Notification = enum { connected, messages, eof, fatal };
 pub const Notify = *const fn (context: *anyopaque, transport: *IoUringTransport, notification: Notification) anyerror!void;
 
 loop: *IoUringLoop,
@@ -25,11 +26,16 @@ connection: *wayring.Connection,
 fd: i32,
 notify_context: *anyopaque,
 notify: Notify,
+connect_handle: ?IoUringLoop.Handle = null,
 receive_handle: ?IoUringLoop.Handle = null,
 send_handle: ?IoUringLoop.Handle = null,
+connected: bool = false,
 closing: bool = false,
 terminal_notified: bool = false,
 fd_closed: bool = false,
+
+connect_address: linux.sockaddr.un = undefined,
+connect_address_length: linux.socklen_t = 0,
 
 receive_bytes: [64 * 1024]u8 = undefined,
 receive_control: [control_size]u8 align(control_alignment) = undefined,
@@ -55,14 +61,55 @@ pub fn init(
         .fd = fd,
         .notify_context = notify_context,
         .notify = notify,
+        .connected = true,
     };
     errdefer _ = linux.close(fd);
     try self.armReceive();
 }
 
+/// Creates a Unix socket and submits its connect operation. Queued outbound
+/// messages remain buffered until the `.connected` completion.
+pub fn initConnect(
+    self: *IoUringTransport,
+    path: []const u8,
+    loop: *IoUringLoop,
+    connection: *wayring.Connection,
+    notify_context: *anyopaque,
+    notify: Notify,
+) !void {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidSocketPath;
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    if (path.len >= address.path.len) return error.SocketPathTooLong;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(socket_result);
+    self.* = .{
+        .loop = loop,
+        .connection = connection,
+        .fd = fd,
+        .notify_context = notify_context,
+        .notify = notify,
+        .connect_address = address,
+        .connect_address_length = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1),
+    };
+    errdefer _ = linux.close(fd);
+    self.connect_handle = try self.loop.queue(self, connectComplete, self, prepareConnect);
+}
+
+/// Resolves the standard Wayland display environment to an owned socket path.
+/// An absolute `WAYLAND_DISPLAY` does not require `XDG_RUNTIME_DIR`.
+pub fn waylandSocketPath(allocator: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
+    const display: []const u8 = environ.getPosix("WAYLAND_DISPLAY") orelse "wayland-0";
+    const runtime_dir = environ.getPosix("XDG_RUNTIME_DIR");
+    return composeSocketPath(allocator, runtime_dir, display);
+}
+
 /// Opens and submits the next Wayring batch when no send is in flight.
 pub fn flush(self: *IoUringTransport) !void {
-    if (self.closing or self.send_handle != null) return;
+    if (!self.connected or self.closing or self.send_handle != null) return;
     const batch = self.connection.nextBatch() orelse return;
     self.send_token = batch.token;
     self.send_iov = .{ .base = batch.bytes.ptr, .len = batch.bytes.len };
@@ -96,6 +143,7 @@ pub fn flush(self: *IoUringTransport) !void {
 
 pub fn shutdown(self: *IoUringTransport) !void {
     self.closing = true;
+    if (self.connect_handle) |handle| try self.loop.remove(handle);
     if (self.receive_handle) |handle| try self.loop.remove(handle);
     if (self.send_handle) |handle| try self.loop.remove(handle);
 }
@@ -103,8 +151,10 @@ pub fn shutdown(self: *IoUringTransport) !void {
 /// Also performs the deferred close once cancellation/completions have drained.
 pub fn readyToDeinit(self: *IoUringTransport) bool {
     if (!self.closing) return false;
+    if (self.connect_handle) |handle| if (self.loop.isActive(handle)) return false;
     if (self.receive_handle) |handle| if (self.loop.isActive(handle)) return false;
     if (self.send_handle) |handle| if (self.loop.isActive(handle)) return false;
+    self.connect_handle = null;
     self.receive_handle = null;
     self.send_handle = null;
     if (!self.fd_closed) {
@@ -112,6 +162,20 @@ pub fn readyToDeinit(self: *IoUringTransport) bool {
         self.fd_closed = true;
     }
     return true;
+}
+
+fn composeSocketPath(allocator: std.mem.Allocator, runtime_dir: ?[]const u8, display: []const u8) ![]u8 {
+    if (display.len == 0 or std.mem.indexOfScalar(u8, display, 0) != null) return error.InvalidDisplay;
+    if (display[0] == '/') return allocator.dupe(u8, display);
+    const runtime = runtime_dir orelse return error.MissingRuntimeDirectory;
+    if (runtime.len == 0 or std.mem.indexOfScalar(u8, runtime, 0) != null) return error.InvalidRuntimeDirectory;
+    const separator: []const u8 = if (runtime[runtime.len - 1] == '/') "" else "/";
+    return std.mem.concat(allocator, u8, &.{ runtime, separator, display });
+}
+
+fn prepareConnect(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const self: *IoUringTransport = @ptrCast(@alignCast(context));
+    sqe.prep_connect(self.fd, @ptrCast(&self.connect_address), self.connect_address_length);
 }
 
 pub fn deinit(self: *IoUringTransport) void {
@@ -143,6 +207,16 @@ fn prepareReceive(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
 fn prepareSend(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
     const self: *IoUringTransport = @ptrCast(@alignCast(context));
     sqe.prep_sendmsg(self.fd, &self.send_msg, linux.MSG.NOSIGNAL);
+}
+
+fn connectComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
+    const self: *IoUringTransport = @ptrCast(@alignCast(context));
+    self.connect_handle = null;
+    if (completion.result < 0) return self.fail();
+    self.connected = true;
+    self.armReceive() catch return self.fail();
+    self.notify(self.notify_context, self, .connected) catch return self.fail();
+    if (!self.closing) self.flush() catch return self.fail();
 }
 
 fn receiveComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
@@ -341,6 +415,55 @@ test "peer closure reports EOF and drains receive" {
 
     while (loop.hasActiveOperations()) try loop.runOnce();
     try std.testing.expect(context.eof);
+    try std.testing.expect(transport.readyToDeinit());
+    transport.deinit();
+}
+
+test "Wayland socket paths and asynchronous connect" {
+    const Context = struct {
+        connected: bool = false,
+
+        fn notify(context: *anyopaque, transport: *IoUringTransport, notification: Notification) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (notification != .connected) return;
+            self.connected = true;
+            try transport.shutdown();
+        }
+    };
+
+    const default_path = try composeSocketPath(std.testing.allocator, "/run/user/1000", "wayland-0");
+    defer std.testing.allocator.free(default_path);
+    try std.testing.expectEqualStrings("/run/user/1000/wayland-0", default_path);
+    const absolute_path = try composeSocketPath(std.testing.allocator, null, "/tmp/wayland-test");
+    defer std.testing.allocator.free(absolute_path);
+    try std.testing.expectEqualStrings("/tmp/wayland-test", absolute_path);
+    try std.testing.expectError(error.MissingRuntimeDirectory, composeSocketPath(std.testing.allocator, null, "wayland-0"));
+    try std.testing.expectError(error.MissingRuntimeDirectory, waylandSocketPath(std.testing.allocator, .empty));
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/wayland-0", .{temporary.sub_path});
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+    const listener_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(listener_result) != .SUCCESS) return error.SocketFailed;
+    const listener: i32 = @intCast(listener_result);
+    defer _ = linux.close(listener);
+    const address_length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    if (linux.errno(linux.bind(listener, @ptrCast(&address), address_length)) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(listener, 1)) != .SUCCESS) return error.ListenFailed;
+
+    var loop = try IoUringLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var connection = wayring.Connection.init(std.testing.allocator, .client, 4096);
+    defer connection.deinit();
+    var context: Context = .{};
+    var transport: IoUringTransport = undefined;
+    try transport.initConnect(path, &loop, &connection, &context, Context.notify);
+    while (loop.hasActiveOperations()) try loop.runOnce();
+    try std.testing.expect(context.connected);
     try std.testing.expect(transport.readyToDeinit());
     transport.deinit();
 }
