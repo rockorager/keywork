@@ -9,6 +9,7 @@ modules and coordinated changes without erasing component ownership.
 | Path | Owner |
 | --- | --- |
 | `src/loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
+| `src/wayring/` | The sans-I/O Wayland engine, protocol scanner, and io_uring transport |
 | `src/ui/` | The platform-neutral retained UI model and engine |
 | `src/runtime/` | The native Wayland application runtime and platform backends |
 | `src/lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |

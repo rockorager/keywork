@@ -52,9 +52,10 @@ pub fn run(
     const window = self.lua.window_config;
 
     const layer_shell = run_options.layer_shell orelse window.layer_shell;
-    // Apps declaring a window set need a windowing backend by default.
+    // Wayring is the primary windowing path. Headless roots remain on the log
+    // backend unless the user explicitly selects a windowed backend.
     const backend = run_options.backend orelse window.backend orelse
-        if (layer_shell != null or window.has_windows or window.session_lock) native_runtime.BackendKind.wayland_shm else .log;
+        if (layer_shell != null or window.has_windows or window.session_lock) native_runtime.BackendKind.wayring else .log;
     const title: [:0]const u8 = window.title orelse
         if (backend == .vulkan) "Keywork MVP (Vulkan)" else "Keywork MVP";
     const app_id = window.app_id orelse "dev.keywork.Keywork";

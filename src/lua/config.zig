@@ -41,7 +41,7 @@ pub fn parseRoot(lua_state: *c.lua_State, allocator: std.mem.Allocator, table_in
 
     if (try checkStringField(lua_state, table_index, "backend")) |name| {
         config.backend = backendFromName(name) orelse
-            return invalidAppRoot("unknown backend '{s}' (expected cpu, vulkan, or log)", .{name});
+            return invalidAppRoot("unknown backend '{s}' (expected wayring, cpu, vulkan, or log)", .{name});
     }
     if (try checkNumberField(lua_state, table_index, "width")) |value| config.width = @floatCast(value);
     if (try checkNumberField(lua_state, table_index, "height")) |value| config.height = @floatCast(value);

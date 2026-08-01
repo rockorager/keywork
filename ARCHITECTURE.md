@@ -15,13 +15,12 @@ all checked-in Wayland XML live outside `src/`.
 ### Loop (`src/loop/`)
 
 Owns the `keywork-loop` Zig module: concrete Linux reactors and their operation
-lifetime safety. The established `EventLoop` uses epoll, eventfd, timerfd, and
-inotify; the completion-native `IoUringLoop` is available for incremental
-consumer migration. An io_uring consumer may poll the established loop as a
-subordinate compatibility source and dispatch its ready turns without an
-epoll wait; this keeps io_uring as the outer blocking reactor while individual
-legacy sources migrate. The component owns source and completion dispatch, but
-not application lifecycle or protocol-specific policy.
+lifetime safety. The primary Wayring runtime uses the completion-native
+`IoUringLoop` as its outer blocking reactor. The established `EventLoop` uses
+epoll, eventfd, timerfd, and inotify; io_uring polls it as a subordinate
+compatibility source while individual legacy sources migrate. The component
+owns source and completion dispatch, but not application lifecycle or
+protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
@@ -66,9 +65,10 @@ runtime's typed callback contract; the server itself remains language-neutral.
 The native runtime depends on the UI and loop modules. It must compile and link
 without LuaJIT and must not acquire shell or compositor policy. Native Zig
 applications and language adapters consume the same public runtime contract.
-Its opt-in Wayring Vulkan backend owns protocol policy and presentation while
-using `wayring-uring` for transport. The sans-I/O engine remains independent of
-both runtime and Vulkan ownership.
+Its primary Wayring Vulkan backend owns protocol policy and presentation while
+using `wayring-uring` for transport. The libwayland CPU and Vulkan backends
+remain explicit compatibility fallbacks. The sans-I/O engine remains
+independent of both runtime and Vulkan ownership.
 
 ### Lua host (`src/lua/`)
 
