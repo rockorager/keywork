@@ -11,6 +11,7 @@ const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
+const NativeServer = @import("wayring/NativeServer.zig");
 
 pub const std_options: std.Options = .{
     // Compile every level in; Logging applies the selected level at runtime.
@@ -27,6 +28,7 @@ const usage =
     \\  --config PATH             use an explicit configuration file
     \\  --output KIND             select drm, nested, or headless output
     \\  --renderer KIND           select cpu or vulkan rendering
+    \\  --wayland-backend KIND    select legacy or wayring protocol server
     \\  --headless-size WIDTHxHEIGHT
     \\  --headless-scale SCALE
     \\  --headless-refresh HZ
@@ -37,12 +39,16 @@ const usage =
     \\
 ;
 
+const WaylandBackend = enum { legacy, wayring };
+
 const StartupOptions = struct {
     help: bool = false,
     version: bool = false,
     config_path: ?[]const u8 = null,
     output: ?OutputBackend.Kind = null,
     renderer: ?Renderer.Kind = null,
+    wayland_backend: WaylandBackend = .legacy,
+    wayland_backend_set: bool = false,
     headless_size: ?render.Size = null,
     headless_scale: ?render.Scale = null,
     headless_refresh_millihertz: ?i32 = null,
@@ -86,6 +92,7 @@ pub fn main(init: std.process.Init) !void {
     Logging.setLevel(options.log_level orelse Logging.defaultLevel());
     const output_kind = options.outputKind();
     const renderer_kind = options.rendererKind();
+    if (options.wayland_backend == .wayring) return runNative(init, options);
     const native_session = output_kind == .drm;
     if (native_session) {
         _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
@@ -200,6 +207,25 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
+fn runNative(init: std.process.Init, options: StartupOptions) !void {
+    const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
+        return error.MissingRuntimeDirectory;
+    const native = try NativeServer.create(init.gpa, init.io, .{
+        .runtime_directory = runtime_directory,
+        .output_size = options.headless_size orelse .{ .width = 1280, .height = 720 },
+        .scale = options.headless_scale orelse .{},
+        .refresh_millihertz = options.headless_refresh_millihertz orelse 60_000,
+    });
+    defer native.destroy();
+    try init.environ_map.put("WAYLAND_DISPLAY", native.displayName());
+
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init.io, &buffer);
+    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{native.displayName()});
+    try writer.interface.flush();
+    try native.run();
+}
+
 fn parseArguments(arguments: anytype) !StartupOptions {
     var options: StartupOptions = .{};
     while (arguments.next()) |argument| {
@@ -222,6 +248,12 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             options.renderer = std.meta.stringToEnum(Renderer.Kind, value) orelse
                 return error.InvalidRenderer;
+        } else if (std.mem.eql(u8, argument, "--wayland-backend")) {
+            if (options.wayland_backend_set) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.wayland_backend = std.meta.stringToEnum(WaylandBackend, value) orelse
+                return error.InvalidWaylandBackend;
+            options.wayland_backend_set = true;
         } else if (std.mem.eql(u8, argument, "--headless-size")) {
             if (options.headless_size != null) return error.DuplicateArgument;
             const value = arguments.next() orelse return error.MissingArgument;
@@ -263,6 +295,11 @@ fn parseArguments(arguments: anytype) !StartupOptions {
     }
     if (output != .drm and options.drm_device != null) {
         return error.DrmDeviceRequiresDrmOutput;
+    }
+    if (options.wayland_backend == .wayring) {
+        if (output != .headless) return error.WayringRequiresHeadlessOutput;
+        if (options.rendererKind() != .cpu) return error.WayringRequiresCpuRenderer;
+        if (options.config_path != null) return error.WayringDoesNotLoadConfiguration;
     }
     return options;
 }
@@ -369,6 +406,7 @@ test "startup options replace environment backend controls" {
     const default_options = try parseArguments(&defaults);
     try std.testing.expectEqual(OutputBackend.Kind.drm, default_options.outputKind());
     try std.testing.expectEqual(Renderer.Kind.vulkan, default_options.rendererKind());
+    try std.testing.expectEqual(WaylandBackend.legacy, default_options.wayland_backend);
 
     var configured: TestArguments = .{ .values = &.{
         "--config",
@@ -398,6 +436,17 @@ test "startup options replace environment backend controls" {
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
     const drm_options = try parseArguments(&drm);
     try std.testing.expectEqualStrings("/dev/dri/card1", drm_options.drm_device.?);
+
+    var wayring: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "headless",
+        "--renderer",
+        "cpu",
+    } };
+    const wayring_options = try parseArguments(&wayring);
+    try std.testing.expectEqual(WaylandBackend.wayring, wayring_options.wayland_backend);
 
     var help: TestArguments = .{ .values = &.{ "--help", "--headless-size", "1920x1080" } };
     try std.testing.expect((try parseArguments(&help)).help);
@@ -434,6 +483,28 @@ test "startup options reject duplicates and backend-specific misuse" {
     try std.testing.expectError(
         error.DrmDeviceRequiresDrmOutput,
         parseArguments(&misplaced_drm),
+    );
+
+    var wayring_drm: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+    } };
+    try std.testing.expectError(
+        error.WayringRequiresHeadlessOutput,
+        parseArguments(&wayring_drm),
+    );
+
+    var wayring_vulkan: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "headless",
+        "--renderer",
+        "vulkan",
+    } };
+    try std.testing.expectError(
+        error.WayringRequiresCpuRenderer,
+        parseArguments(&wayring_vulkan),
     );
 }
 

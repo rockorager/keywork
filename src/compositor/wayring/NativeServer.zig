@@ -21,6 +21,7 @@ const HeadlessOutput = @import("../backend/headless.zig");
 const render = @import("../render/types.zig");
 
 const EventLoop = keywork_loop.EventLoop;
+const IoUringLoop = keywork_loop.IoUringLoop;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -39,6 +40,12 @@ active: ?ActiveCopy = null,
 copy_completed: bool = false,
 frame_count: u64 = 0,
 terminating: bool = false,
+signal_fd: i32 = -1,
+signal_info: linux.signalfd_siginfo = undefined,
+signal_handle: ?IoUringLoop.Handle = null,
+signal_mask: std.posix.sigset_t = undefined,
+previous_signal_mask: std.posix.sigset_t = undefined,
+signals_installed: bool = false,
 
 pub const Options = struct {
     /// Used for relative display names. Defaults to XDG_RUNTIME_DIR.
@@ -138,11 +145,74 @@ pub fn displayName(self: *const NativeServer) []const u8 {
 
 /// Runs EventLoop's native submit/wait/drain loop until terminate is called.
 pub fn run(self: *NativeServer) !void {
+    try self.installSignals();
+    defer self.uninstallSignals();
     try self.event_loop.run();
 }
 
 pub fn terminate(self: *NativeServer) void {
     self.event_loop.quit();
+}
+
+fn installSignals(self: *NativeServer) !void {
+    std.debug.assert(!self.signals_installed);
+    self.signal_mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&self.signal_mask, .INT);
+    std.posix.sigaddset(&self.signal_mask, .TERM);
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &self.signal_mask, &self.previous_signal_mask);
+    var mask_installed = true;
+    errdefer if (mask_installed)
+        std.posix.sigprocmask(std.posix.SIG.SETMASK, &self.previous_signal_mask, null);
+    self.signal_fd = try std.posix.signalfd(-1, &self.signal_mask, linux.SFD.CLOEXEC);
+    errdefer {
+        _ = linux.close(self.signal_fd);
+        self.signal_fd = -1;
+    }
+    self.signal_handle = try self.event_loop.ioLoop().queue(
+        self,
+        signalComplete,
+        self,
+        prepareSignalRead,
+    );
+    self.signals_installed = true;
+    mask_installed = false;
+}
+
+fn prepareSignalRead(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    sqe.prep_read(self.signal_fd, std.mem.asBytes(&self.signal_info), 0);
+}
+
+fn signalComplete(
+    context: *anyopaque,
+    _: *IoUringLoop,
+    completion: IoUringLoop.Completion,
+) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.signal_handle = null;
+    if (completion.result == -@as(i32, @intFromEnum(linux.E.CANCELED))) return;
+    if (completion.result != @sizeOf(linux.signalfd_siginfo)) return error.SignalReadFailed;
+    if (self.signal_info.signo == @intFromEnum(std.posix.SIG.INT) or
+        self.signal_info.signo == @intFromEnum(std.posix.SIG.TERM))
+    {
+        self.terminate();
+    }
+}
+
+fn uninstallSignals(self: *NativeServer) void {
+    if (!self.signals_installed) return;
+    if (self.signal_handle) |handle| {
+        self.event_loop.ioLoop().cancel(handle) catch
+            @panic("failed to cancel native compositor signal read");
+        while (self.event_loop.ioLoop().isActive(handle))
+            self.event_loop.ioLoop().runOnce() catch
+                @panic("failed to drain native compositor signal read");
+        self.signal_handle = null;
+    }
+    _ = linux.close(self.signal_fd);
+    self.signal_fd = -1;
+    std.posix.sigprocmask(std.posix.SIG.SETMASK, &self.previous_signal_mask, null);
+    self.signals_installed = false;
 }
 
 pub fn inspectFrame(self: *const NativeServer) FrameInspection {
@@ -438,6 +508,15 @@ test "native compositor owns and drains its io_uring listener" {
     defer native.destroy();
 
     try std.testing.expect(std.mem.startsWith(u8, native.displayName(), "wayland-"));
+    const stop_timer = try native.event_loop.addTimer(native, stopTestServer);
+    defer native.event_loop.removeTimer(stop_timer);
+    try stop_timer.arm(1, 0);
+    try native.run();
     try std.testing.expectEqual(@as(u64, 0), native.inspectFrame().frame_count);
     try std.testing.expectEqual(@as(u32, 0), native.pixel(7, 3));
+}
+
+fn stopTestServer(context: *anyopaque, _: *EventLoop, _: u64) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.terminate();
 }
