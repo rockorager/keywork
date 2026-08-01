@@ -10,6 +10,7 @@ const render = @import("../render/types.zig");
 const surface_geometry = @import("../surface_geometry.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const shm = @import("shm.zig");
+const BufferResource = @import("BufferResource.zig");
 
 const advertised_version: u32 = 6;
 
@@ -20,10 +21,18 @@ commits: std.ArrayList(Commit) = .empty,
 
 pub const BufferAttachment = struct {
     resource: wayring.ObjectHandle,
-    buffer: shm.Buffer,
+    buffer: *BufferResource,
+
+    fn release(self: *const BufferAttachment, client: *Server.Client) !void {
+        if (!self.buffer.isLastUse()) return;
+        ShmGlobal.releaseBuffer(client, self.resource) catch |err| switch (err) {
+            error.UnknownResource, error.StaleObject => {},
+            else => return err,
+        };
+    }
 
     fn deinit(self: *BufferAttachment) void {
-        self.buffer.deinit();
+        self.buffer.unreference();
         self.* = undefined;
     }
 };
@@ -39,6 +48,13 @@ pub const Attachment = union(enum) {
             .unchanged, .removed => {},
         }
         self.* = undefined;
+    }
+
+    fn releaseBuffer(self: *const Attachment, client: *Server.Client) !void {
+        switch (self.*) {
+            .buffer => |*buffer| try buffer.release(client),
+            .unchanged, .removed => {},
+        }
     }
 };
 
@@ -81,14 +97,7 @@ pub const Commit = struct {
     }
 
     pub fn releaseBuffer(self: *Commit) !void {
-        const attachment = switch (self.attachment) {
-            .buffer => |buffer| buffer,
-            .unchanged, .removed => return,
-        };
-        ShmGlobal.releaseBuffer(self.surface.client, attachment.resource) catch |err| switch (err) {
-            error.UnknownResource, error.StaleObject => {},
-            else => return err,
-        };
+        try self.attachment.releaseBuffer(self.surface.client);
     }
 };
 
@@ -146,6 +155,7 @@ pub const Surface = struct {
         self.references -= 1;
         if (self.references != 0) return;
         const client = self.client;
+        self.pending_attachment.releaseBuffer(client) catch {};
         self.pending_attachment.deinit();
         for (self.pending_callbacks.items) |callback|
             self.client.destroyResource(callback) catch {};
@@ -299,9 +309,10 @@ fn dispatchSurface(
                 };
                 break :blk .{ .buffer = .{
                     .resource = handle,
-                    .buffer = try ShmGlobal.cloneBuffer(client, handle),
+                    .buffer = try ShmGlobal.cloneBufferResource(client, handle),
                 } };
             } else .removed;
+            surface.pending_attachment.releaseBuffer(client) catch {};
             surface.pending_attachment.deinit();
             surface.pending_attachment = attachment;
             if (try client.resourceVersion(resource, &generated.wl_surface) < 5) {

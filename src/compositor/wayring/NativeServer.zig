@@ -8,10 +8,13 @@ const NativeServer = @This();
 
 const std = @import("std");
 const linux = std.os.linux;
+const wayring = @import("wayring");
 const keywork_loop = @import("keywork-loop");
 const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
 const ShmGlobal = @import("ShmGlobal.zig");
+const LinuxDmabufGlobal = @import("LinuxDmabufGlobal.zig");
+const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
@@ -33,6 +36,7 @@ io: std.Io,
 event_loop: EventLoop,
 server: Server,
 shm_global: ShmGlobal,
+linux_dmabuf_global: LinuxDmabufGlobal,
 compositor_global: CompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
@@ -77,6 +81,7 @@ pub const FrameInspection = struct {
 const SurfaceState = struct {
     surface: *CompositorGlobal.Surface,
     snapshot: ?shm.Snapshot = null,
+    dmabuf: ?DmabufState = null,
     scale: i32 = 1,
     transform: u32 = 0,
     x: i32 = 0,
@@ -86,8 +91,24 @@ const SurfaceState = struct {
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
+        if (self.dmabuf) |*dmabuf| dmabuf.deinit(self.surface.client, true);
         self.surface.unreference();
         allocator.destroy(self);
+    }
+};
+
+const DmabufState = struct {
+    buffer: *BufferResource,
+    resource: wayring.ObjectHandle,
+    source_cache: render.SourceCache,
+
+    fn deinit(self: *DmabufState, client: *Server.Client, send_release: bool) void {
+        if (send_release and self.buffer.isLastUse()) ShmGlobal.releaseBuffer(client, self.resource) catch |err| switch (err) {
+            error.UnknownResource, error.StaleObject => {},
+            else => {},
+        };
+        self.buffer.unreference();
+        self.* = undefined;
     }
 };
 
@@ -116,6 +137,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.xdg_shell.deinit();
     self.renderer = try Renderer.init(allocator, options.renderer_kind);
     errdefer self.renderer.deinit();
+    try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
+    errdefer self.linux_dmabuf_global.deinit();
     self.output = try HeadlessOutput.initForRenderer(
         allocator,
         options.output_size,
@@ -295,6 +318,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_shell.deinit();
     self.compositor_global.deinit();
     self.shm_global.deinit();
+    self.linux_dmabuf_global.deinit();
     self.server.deinit();
     self.output.deinit();
     self.renderer.deinit();
@@ -348,6 +372,45 @@ fn applyCommits(self: *NativeServer) !void {
         state.viewport = commit.viewport;
         switch (commit.attachment) {
             .buffer => |attachment| {
+                if (attachment.buffer.content == .dmabuf) {
+                    const dmabuf = &attachment.buffer.content.dmabuf;
+                    _ = surface_geometry.calculate(
+                        dmabuf.size,
+                        state.scale,
+                        @intCast(state.transform),
+                        state.viewport,
+                        false,
+                    ) catch |err| {
+                        commit.releaseBuffer() catch {};
+                        commit.deinit();
+                        return self.viewporter_global.postGeometryError(state.surface, err);
+                    };
+                    attachment.buffer.reference() catch {
+                        commit.releaseBuffer() catch {};
+                        commit.deinit();
+                        return error.OutOfMemory;
+                    };
+                    if (state.snapshot) |*snapshot| snapshot.deinit();
+                    state.snapshot = null;
+                    if (state.dmabuf) |*old| old.deinit(
+                        state.surface.client,
+                        old.buffer != attachment.buffer or
+                            !std.meta.eql(old.resource, attachment.resource),
+                    );
+                    state.dmabuf = .{
+                        .buffer = attachment.buffer,
+                        .resource = attachment.resource,
+                        .source_cache = dmabuf.acquireSourceCache(),
+                    };
+                    self.output_global.setSurfaceVisible(state.surface, true) catch |err| {
+                        commit.deinit();
+                        return err;
+                    };
+                    const present_result = self.present(&commit);
+                    commit.deinit();
+                    try present_result;
+                    continue;
+                }
                 const damage: ?[]const render.Rect = if (commit.buffer_damage.len == 0)
                     null
                 else
@@ -356,7 +419,7 @@ fn applyCommits(self: *NativeServer) !void {
                 const copy = AsyncShmCopy.create(
                     self.allocator,
                     self.event_loop.ioLoop(),
-                    attachment.buffer,
+                    attachment.buffer.content.shm,
                     damage,
                     reuse,
                     self,
@@ -375,15 +438,23 @@ fn applyCommits(self: *NativeServer) !void {
             .removed => {
                 if (state.snapshot) |*snapshot| snapshot.deinit();
                 state.snapshot = null;
+                if (state.dmabuf) |*dmabuf| dmabuf.deinit(state.surface.client, true);
+                state.dmabuf = null;
                 try self.output_global.setSurfaceVisible(state.surface, false);
                 const present_result = self.present(&commit);
                 commit.deinit();
                 try present_result;
             },
             .unchanged => {
-                if (state.snapshot) |*snapshot| {
+                const size = if (state.dmabuf) |dmabuf|
+                    dmabuf.buffer.content.dmabuf.size
+                else if (state.snapshot) |*snapshot|
+                    snapshot.size
+                else
+                    null;
+                if (size) |buffer_size| {
                     _ = surface_geometry.calculate(
-                        snapshot.size,
+                        buffer_size,
                         state.scale,
                         @intCast(state.transform),
                         state.viewport,
@@ -427,16 +498,25 @@ fn finishCopy(self: *NativeServer, present_frame: bool) !void {
         if (geometry_error == null) {
             if (active.state.snapshot) |*old| old.deinit();
             active.state.snapshot = snapshot;
+            if (active.state.dmabuf) |*dmabuf|
+                dmabuf.deinit(active.state.surface.client, true);
+            active.state.dmabuf = null;
             try self.output_global.setSurfaceVisible(active.state.surface, true);
         } else {
             if (active.state.snapshot) |*old| old.deinit();
             active.state.snapshot = null;
+            if (active.state.dmabuf) |*dmabuf|
+                dmabuf.deinit(active.state.surface.client, true);
+            active.state.dmabuf = null;
             try self.output_global.setSurfaceVisible(active.state.surface, false);
         }
     } else |_| {
         // Invalid mappings and short reads affect only this attachment.
         if (active.state.snapshot) |*old| old.deinit();
         active.state.snapshot = null;
+        if (active.state.dmabuf) |*dmabuf|
+            dmabuf.deinit(active.state.surface.client, true);
+        active.state.dmabuf = null;
         try self.output_global.setSurfaceVisible(active.state.surface, false);
     }
     active.copy.deinit();
@@ -464,10 +544,22 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
     for (self.surfaces.items) |state| {
         if (!state.surface.resource_alive) continue;
-        const snapshot = if (state.snapshot) |*value| value else continue;
+        const pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
+            const dmabuf = dmabuf_state.buffer.content.dmabuf;
+            const format = render.DmabufFormat.fromFourcc(dmabuf.source.format) orelse continue;
+            break :blk .{
+                .size = dmabuf.size,
+                .stride_pixels = if (format.isPackedRgb())
+                    dmabuf.source.planes[0].stride / @sizeOf(u32)
+                else
+                    dmabuf.size.width,
+                .dmabuf = dmabuf.source,
+                .source_cache = dmabuf_state.source_cache,
+            };
+        } else if (state.snapshot) |*value| value.pixelBuffer() else continue;
         const transform = bufferTransform(state.transform);
         const geometry = surface_geometry.calculate(
-            snapshot.size,
+            pixel_buffer.size,
             state.scale,
             @intCast(state.transform),
             state.viewport,
@@ -477,10 +569,10 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             .x = state.x,
             .y = state.y,
             .size = geometry.logical_size,
-            .buffer = snapshot.pixelBuffer(),
+            .buffer = pixel_buffer,
             .source = geometry.source,
             .transform = transform,
-            .is_opaque = snapshot.force_opaque,
+            .is_opaque = if (pixel_buffer.dmabuf) |source| source.force_opaque else state.snapshot.?.force_opaque,
         } });
     }
     var damage_storage: [1]render.Rect = undefined;
@@ -498,6 +590,7 @@ fn frameDamage(
     storage: *[1]render.Rect,
 ) ?[]const render.Rect {
     if (state.full_damage) return null;
+    if (state.dmabuf != null) return null;
     if (state.viewport.source != null or state.viewport.destination != null) return null;
     const snapshot = if (state.snapshot) |*value| value else return null;
     const source_damage = snapshot.source_damage orelse return null;

@@ -8,6 +8,7 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const shm = @import("shm.zig");
+const BufferResource = @import("BufferResource.zig");
 
 const advertised_version: u32 = 2;
 
@@ -19,11 +20,6 @@ const PoolResource = struct {
     allocator: std.mem.Allocator,
     shm_resource: wayring.ObjectHandle,
     pool: *shm.Pool,
-};
-
-const BufferResource = struct {
-    allocator: std.mem.Allocator,
-    buffer: shm.Buffer,
 };
 
 pub fn init(self: *ShmGlobal, allocator: std.mem.Allocator, server: *Server) !void {
@@ -43,14 +39,15 @@ pub fn deinit(self: *ShmGlobal) void {
     self.* = undefined;
 }
 
-pub fn cloneBuffer(
+pub fn cloneBufferResource(
     client: *const Server.Client,
     handle: wayring.ObjectHandle,
-) !shm.Buffer {
+) !*BufferResource {
     const resource: *BufferResource = @ptrCast(@alignCast(
         try client.resourceContext(handle, &generated.wl_buffer),
     ));
-    return resource.buffer.clone();
+    try resource.reference();
+    return resource;
 }
 
 pub fn releaseBuffer(
@@ -164,7 +161,7 @@ fn dispatchPool(
             errdefer pool_resource.allocator.destroy(buffer_resource);
             buffer_resource.* = .{
                 .allocator = pool_resource.allocator,
-                .buffer = buffer,
+                .content = .{ .shm = buffer },
             };
             _ = client.createResource(request.id, &generated.wl_buffer, 1, .{
                 .context = buffer_resource,
@@ -207,8 +204,7 @@ fn destroyBuffer(
     _: wayring.ObjectHandle,
 ) void {
     const resource: *BufferResource = @ptrCast(@alignCast(context));
-    resource.buffer.deinit();
-    resource.allocator.destroy(resource);
+    resource.unreference();
 }
 
 const TestPeer = struct {
@@ -323,10 +319,10 @@ test "native wl_shm binds, creates buffers, and survives pool destruction" {
         @intFromEnum(shm.Format.argb8888),
     );
     try peer.toServer(client);
-    var retained = try cloneBuffer(client, buffer);
+    const retained = try cloneBufferResource(client, buffer);
     try generated.wl_shm_pool_types.requests.destroy(&peer.connection, pool);
     try peer.toServer(client);
-    retained.deinit();
+    retained.unreference();
     try generated.wl_buffer_types.requests.destroy(&peer.connection, buffer);
     try peer.toServer(client);
 }
