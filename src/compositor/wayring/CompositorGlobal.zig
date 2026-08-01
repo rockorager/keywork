@@ -71,6 +71,7 @@ pub const Commit = struct {
     frame_callbacks: []wayring.ObjectHandle,
     presentation_feedbacks: []*PresentationFeedback,
     content_type: ContentType,
+    alpha_multiplier: u32,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -267,6 +268,11 @@ pub const ContentTypeHandler = struct {
 
 pub const ContentType = generated.wp_content_type_v1_types.type;
 
+pub const AlphaModifierHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -279,6 +285,7 @@ pub const Surface = struct {
     role_destroyed: ?*const fn (*anyopaque) void = null,
     explicit_sync_handler: ?ExplicitSyncHandler = null,
     content_type_handler: ?ContentTypeHandler = null,
+    alpha_modifier_handler: ?AlphaModifierHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -286,6 +293,8 @@ pub const Surface = struct {
     pending_presentation_feedbacks: std.ArrayList(*PresentationFeedback) = .empty,
     pending_content_type: ContentType = .none,
     current_content_type: ContentType = .none,
+    pending_alpha_multiplier: u32 = std.math.maxInt(u32),
+    current_alpha_multiplier: u32 = std.math.maxInt(u32),
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -343,6 +352,18 @@ pub const Surface = struct {
         std.debug.assert(handler.context == context);
         self.content_type_handler = null;
         self.pending_content_type = .none;
+    }
+
+    pub fn setAlphaModifierHandler(self: *Surface, handler: AlphaModifierHandler) !void {
+        if (self.alpha_modifier_handler != null) return error.AlreadyExists;
+        self.alpha_modifier_handler = handler;
+    }
+
+    pub fn clearAlphaModifierHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.alpha_modifier_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.alpha_modifier_handler = null;
+        self.pending_alpha_multiplier = std.math.maxInt(u32);
     }
 
     pub fn reference(self: *Surface) !void {
@@ -761,6 +782,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
 
     surface.current_scale = surface.pending_scale;
     surface.current_content_type = surface.pending_content_type;
+    surface.current_alpha_multiplier = surface.pending_alpha_multiplier;
     surface.current_transform = surface.pending_transform;
     surface.current_offset_x = surface.pending_offset_x;
     surface.current_offset_y = surface.pending_offset_y;
@@ -784,6 +806,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .frame_callbacks = frame_callbacks,
         .presentation_feedbacks = presentation_feedbacks,
         .content_type = surface.current_content_type,
+        .alpha_multiplier = surface.current_alpha_multiplier,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
@@ -823,6 +846,10 @@ fn destroySurface(
     if (surface.content_type_handler) |handler| {
         handler.surface_destroyed(handler.context);
         surface.content_type_handler = null;
+    }
+    if (surface.alpha_modifier_handler) |handler| {
+        handler.surface_destroyed(handler.context);
+        surface.alpha_modifier_handler = null;
     }
     surface.unreference();
 }

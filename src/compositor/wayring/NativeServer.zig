@@ -19,6 +19,7 @@ const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
+const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -59,6 +60,7 @@ subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
+alpha_modifier_global: AlphaModifierGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -145,6 +147,7 @@ const SurfaceState = struct {
     opaque_region: Region,
     input_region: CompositorGlobal.InputRegion,
     content_type: CompositorGlobal.ContentType = .none,
+    alpha_multiplier: u32 = std.math.maxInt(u32),
 
     fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit();
@@ -423,6 +426,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.presentation_global.deinit();
     try self.content_type_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.content_type_global.deinit();
+    try self.alpha_modifier_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.alpha_modifier_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
@@ -667,6 +672,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
+    self.alpha_modifier_global.deinit();
     self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.output_global.deinit();
@@ -1683,12 +1689,14 @@ fn applyEntry(
     );
     state.full_damage = state.full_damage or
         state.scale != commit.scale or
+        state.alpha_multiplier != commit.alpha_multiplier or
         state.transform != commit.transform or
         state.x != commit.offset_x or
         state.y != commit.offset_y or
         !std.meta.eql(state.viewport, commit.viewport);
     state.scale = commit.scale;
     state.content_type = commit.content_type;
+    state.alpha_multiplier = commit.alpha_multiplier;
     state.transform = commit.transform;
     state.x = commit.offset_x;
     state.y = commit.offset_y;
@@ -2243,6 +2251,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             .source = geometry.source,
             .transform = transform,
             .is_opaque = force_opaque or region_covers_buffer,
+            .alpha_multiplier = state.alpha_multiplier,
             .opaque_region = if (force_opaque or region_covers_buffer)
                 .{}
             else
