@@ -407,7 +407,14 @@ fn writeEvent(set: ProtocolSet, writer: *std.Io.Writer, interface: Interface, me
     try writer.writeAll("            });\n        }\n");
 }
 
-fn writeUnionAndDecode(writer: *std.Io.Writer, interface: Interface, messages: []const Message, label: []const u8, descriptor_suffix: []const u8) !void {
+fn writeUnionAndDecode(
+    writer: *std.Io.Writer,
+    interface: Interface,
+    messages: []const Message,
+    label: []const u8,
+    descriptor_suffix: []const u8,
+    remove_destructor: bool,
+) !void {
     if (messages.len == 0) return;
     try writer.print("    pub const {s} = union(enum) {{\n", .{label});
     for (messages) |message| {
@@ -451,7 +458,8 @@ fn writeUnionAndDecode(writer: *std.Io.Writer, interface: Interface, messages: [
                 index += 1;
             }
         }
-        if (message.destructor) try writer.writeAll("            try connection.removeObject(handle.id, handle.generation);\n");
+        if (message.destructor and remove_destructor)
+            try writer.writeAll("            try connection.removeObject(handle.id, handle.generation);\n");
         try writer.writeAll("            return .{ .");
         try ident(writer, message.name);
         try writer.writeAll(" = .{\n");
@@ -507,8 +515,8 @@ pub fn generate(set: ProtocolSet, writer: *std.Io.Writer) !void {
         if (interface.events.len != 0) try writer.writeAll("    pub const events = struct {\n");
         for (interface.events, 0..) |message, opcode| try writeEvent(set, writer, interface, message, opcode);
         if (interface.events.len != 0) try writer.writeAll("    };\n");
-        try writeUnionAndDecode(writer, interface, interface.requests, "Request", "_requests");
-        try writeUnionAndDecode(writer, interface, interface.events, "Event", "_events");
+        try writeUnionAndDecode(writer, interface, interface.requests, "Request", "_requests", false);
+        try writeUnionAndDecode(writer, interface, interface.events, "Event", "_events", true);
         try writer.writeAll("};\n");
         for ([_]struct { label: []const u8, messages: []const Message }{ .{ .label = "requests", .messages = interface.requests }, .{ .label = "events", .messages = interface.events } }) |group| {
             for (group.messages, 0..) |message, opcode| {
@@ -633,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
 const fixture =
     \\<protocol name="sample"><interface name="wl_sample" version="3">
     \\<request name="destroy" type="destructor" since="2"><arg name="i" type="int"/><arg name="u" type="uint" enum="mode"/><arg name="f" type="fixed"/><arg name="s" type="string" allow-null="true"/><arg name="o" type="object" interface="wl_other" allow-null="true"/><arg name="a" type="array" allow-null="true"/><arg name="fd" type="fd"/><arg name="typed" type="new_id" interface="wl_other"/><arg name="dynamic" type="new_id"/></request>
-    \\<event name="done"><arg name="value" type="uint"/></event>
+    \\<event name="done" type="destructor"><arg name="value" type="uint"/></event>
     \\<enum name="mode"><entry name="one" value="1"/><entry name="shift" value="1 &lt;&lt; 4" since="2"/></enum>
     \\<enum name="flags" bitfield="true"><entry name="high" value="0x20"/></enum>
     \\<request name="create"><arg name="id" type="new_id" interface="wl_present"/></request>
@@ -667,7 +675,9 @@ test "parse and generate complete descriptor fixture" {
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.queueObject(handle, &@\"wl_sample\", 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "std.testing.refAllDecls(@\"wl_sample_types\".events);") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.queueDestructorObject(handle, &@\"wl_sample\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "try connection.removeObject(handle.id, handle.generation);") != null);
+    const decode_event = std.mem.indexOf(u8, text, "pub fn decodeEvent(connection: *wayring.Connection") orelse return error.MissingGeneratedEventDecoder;
+    const remove_object = std.mem.indexOf(u8, text, "try connection.removeObject(handle.id, handle.generation);") orelse return error.MissingGeneratedDestructor;
+    try std.testing.expect(remove_object > decode_event);
     try std.testing.expect(std.mem.indexOf(u8, text, ".new_id_interface = &@\"wl_present\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, ".@\"fd\" = 6,") != null);
 }
