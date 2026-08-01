@@ -22,6 +22,7 @@ height: u32,
 pending_width: u32,
 pending_height: u32,
 configured: bool = false,
+configure_generation: u64 = 0,
 closed: bool = false,
 closing: bool = false,
 protocol_destroyed: bool = false,
@@ -164,6 +165,7 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         self.height = self.pending_height;
         try self.configureScale();
         self.configured = true;
+        self.configure_generation +%= 1;
         try self.client.flush();
         return .configured;
     }
@@ -235,6 +237,14 @@ pub fn present(
 
 pub fn size(self: *const Window) struct { width: u32, height: u32 } {
     return .{ .width = self.width, .height = self.height };
+}
+
+pub fn configureGeneration(self: *const Window) u64 {
+    return self.configure_generation;
+}
+
+pub fn isClosed(self: *const Window) bool {
+    return self.closed;
 }
 
 pub fn surfaceId(self: *const Window) u32 {

@@ -17,6 +17,13 @@ const IoUringLoop = keywork_loop.IoUringLoop;
 pub const State = enum { connecting, configuring, running, closing, closed, disconnected, fatal };
 pub const Size = struct { width: u32, height: u32 };
 pub const ResizeEdge = ProtocolWindow.ResizeEdge;
+pub const PointerButtonHandler = *const fn (context: *anyopaque, event: keywork.PointerButtonEvent) void;
+pub const PointerMoveHandler = *const fn (context: *anyopaque, point: ?keywork.Point) void;
+pub const CursorShapeHandler = *const fn (context: *anyopaque, point: keywork.Point) keywork.CursorShape;
+pub const KeyHandler = *const fn (context: *anyopaque, input: keywork.KeyInput) void;
+pub const ScrollHandler = *const fn (context: *anyopaque, event: keywork.ScrollEvent) void;
+pub const RepaintHandler = *const fn (context: *anyopaque, size: keywork.Size) void;
+pub const FrameHandler = *const fn (context: *anyopaque) void;
 pub const Event = union(enum) {
     configured: Size,
     repaint,
@@ -44,13 +51,104 @@ const ActivationRequest = struct {
     done: bool = false,
 };
 
+pub const Window = struct {
+    backend: *Backend,
+    protocol: ProtocolWindow,
+    pointer_button_context: ?*anyopaque = null,
+    pointer_button_handler: ?PointerButtonHandler = null,
+    pointer_move_context: ?*anyopaque = null,
+    pointer_move_handler: ?PointerMoveHandler = null,
+    cursor_shape_context: ?*anyopaque = null,
+    cursor_shape_handler: ?CursorShapeHandler = null,
+    key_context: ?*anyopaque = null,
+    key_handler: ?KeyHandler = null,
+    scroll_context: ?*anyopaque = null,
+    scroll_handler: ?ScrollHandler = null,
+    repaint_context: ?*anyopaque = null,
+    repaint_handler: ?RepaintHandler = null,
+    frame_context: ?*anyopaque = null,
+    frame_handler: ?FrameHandler = null,
+    cursor_update_pending: bool = false,
+    cursor_point: ?keywork.Point = null,
+
+    pub fn renderBackend(self: *Window) keywork.RenderBackend {
+        return self.protocol.renderBackend();
+    }
+
+    pub fn currentSize(self: *const Window) keywork.Size {
+        const size = self.protocol.size();
+        return .{ .width = @floatFromInt(size.width), .height = @floatFromInt(size.height) };
+    }
+
+    pub fn configureGeneration(self: *const Window) u64 {
+        return self.protocol.configureGeneration();
+    }
+
+    pub fn isClosed(self: *const Window) bool {
+        return self.protocol.isClosed();
+    }
+
+    pub fn suspendedOpaque(_: *anyopaque) bool {
+        return false;
+    }
+
+    pub fn setPointerButtonHandler(self: *Window, context: *anyopaque, handler: PointerButtonHandler) void {
+        self.pointer_button_context = context;
+        self.pointer_button_handler = handler;
+    }
+
+    pub fn setPointerMoveHandler(self: *Window, context: *anyopaque, handler: PointerMoveHandler) void {
+        self.pointer_move_context = context;
+        self.pointer_move_handler = handler;
+    }
+
+    pub fn setCursorShapeHandler(self: *Window, context: *anyopaque, handler: CursorShapeHandler) void {
+        self.cursor_shape_context = context;
+        self.cursor_shape_handler = handler;
+    }
+
+    pub fn setKeyHandler(self: *Window, context: *anyopaque, handler: KeyHandler) void {
+        self.key_context = context;
+        self.key_handler = handler;
+    }
+
+    pub fn setScrollHandler(self: *Window, context: *anyopaque, handler: ScrollHandler) void {
+        self.scroll_context = context;
+        self.scroll_handler = handler;
+    }
+
+    pub fn setRepaintHandler(self: *Window, context: *anyopaque, handler: RepaintHandler) void {
+        self.repaint_context = context;
+        self.repaint_handler = handler;
+    }
+
+    pub fn setFrameHandler(self: *Window, context: *anyopaque, handler: FrameHandler) void {
+        self.frame_context = context;
+        self.frame_handler = handler;
+    }
+
+    pub fn setLayerContentRect(_: *Window, _: u31, _: u31, _: keywork.Rect) !void {
+        return error.NotLayerSurface;
+    }
+
+    fn updateCursor(self: *Window) !void {
+        if (!self.cursor_update_pending) return;
+        self.cursor_update_pending = false;
+        const point = self.cursor_point orelse return;
+        const handler = self.cursor_shape_handler orelse return;
+        const input = if (self.backend.input) |*value| value else return;
+        try input.setCursorShape(handler(self.cursor_shape_context.?, point));
+        try self.backend.client.flush();
+    }
+};
+
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 client: Client,
 input: ?Input = null,
 clipboard: ?Clipboard = null,
-windows: std.ArrayList(*ProtocolWindow) = .empty,
-main_window: ?*ProtocolWindow = null,
+windows: std.ArrayList(*Window) = .empty,
+main_window: ?*Window = null,
 options: Options,
 event_context: *anyopaque,
 event_notify: EventNotify,
@@ -111,6 +209,12 @@ pub fn runOnce(self: *Backend) !void {
     self.updateClosed();
 }
 
+/// Runs deferred application-facing work after a completion turn has fully
+/// drained. CQ callbacks may enqueue handlers but never call into a runtime.
+pub fn drainDeferred(self: *Backend) !void {
+    for (self.windows.items) |window| try window.updateCursor();
+}
+
 pub fn beginClose(self: *Backend) !void {
     switch (self.state) {
         .closed, .disconnected, .fatal => return,
@@ -118,7 +222,7 @@ pub fn beginClose(self: *Backend) !void {
         else => {},
     }
     self.state = .closing;
-    for (self.windows.items) |window| try window.beginClose();
+    for (self.windows.items) |window| try window.protocol.beginClose();
     try self.advanceClose();
 }
 
@@ -141,7 +245,7 @@ pub fn readyToDeinit(self: *Backend) bool {
 pub fn deinit(self: *Backend) void {
     std.debug.assert(self.readyToDeinit());
     for (self.windows.items) |window| {
-        window.deinit();
+        window.protocol.deinit();
         self.allocator.destroy(window);
     }
     self.windows.deinit(self.allocator);
@@ -155,12 +259,12 @@ pub fn deinit(self: *Backend) void {
 
 pub fn renderBackend(self: *Backend) !keywork.RenderBackend {
     const window = self.main_window orelse return error.WindowNotReady;
-    return window.renderBackend();
+    return window.protocol.renderBackend();
 }
 
 pub fn currentSize(self: *const Backend) !Size {
     const window = self.main_window orelse return error.WindowNotReady;
-    const size = window.size();
+    const size = window.protocol.size();
     return .{ .width = size.width, .height = size.height };
 }
 
@@ -195,7 +299,7 @@ pub fn startMove(self: *Backend) !void {
     const serial = input.lastButtonPressSerial() orelse return error.NoRecentPress;
     const surface_id = input.lastButtonPressSurfaceId() orelse return error.NoRecentPress;
     const window = self.findWindowBySurfaceId(surface_id) orelse return error.WindowNotReady;
-    try window.startMove(input.seatHandle(), serial);
+    try window.protocol.startMove(input.seatHandle(), serial);
 }
 
 pub fn startResize(self: *Backend, edge: ResizeEdge) !void {
@@ -203,7 +307,7 @@ pub fn startResize(self: *Backend, edge: ResizeEdge) !void {
     const serial = input.lastButtonPressSerial() orelse return error.NoRecentPress;
     const surface_id = input.lastButtonPressSurfaceId() orelse return error.NoRecentPress;
     const window = self.findWindowBySurfaceId(surface_id) orelse return error.WindowNotReady;
-    try window.startResize(input.seatHandle(), serial, edge);
+    try window.protocol.startResize(input.seatHandle(), serial, edge);
 }
 
 /// Requests an xdg-activation token while continuing to drain completion
@@ -241,7 +345,7 @@ pub fn activationToken(
     if (activation_window) |window| try protocol.xdg_activation_token_v1_types.requests.set_surface(
         self.client.connectionPtr(),
         token_handle,
-        window.surfaceHandle(),
+        window.protocol.surfaceHandle(),
     );
     if (app_id) |value| try protocol.xdg_activation_token_v1_types.requests.set_app_id(
         self.client.connectionPtr(),
@@ -308,11 +412,16 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
             self.state = .configuring;
         },
         .outputs_changed => for (self.windows.items) |window| {
-            if (try window.outputScaleChanged()) |_| {
-                if (self.input) |*input| if (input.pointerSurfaceId() == window.surfaceId())
-                    try input.setCursorScale(window.cursorScale());
-                const size = window.size();
-                try self.event_notify(self.event_context, self, .{ .configured = .{
+            if (try window.protocol.outputScaleChanged()) |_| {
+                if (self.input) |*input| if (input.pointerSurfaceId() == window.protocol.surfaceId())
+                    try input.setCursorScale(window.protocol.cursorScale());
+                const size = window.protocol.size();
+                const logical_size: keywork.Size = .{
+                    .width = @floatFromInt(size.width),
+                    .height = @floatFromInt(size.height),
+                };
+                if (window.repaint_handler) |handler| handler(window.repaint_context.?, logical_size);
+                if (window == self.main_window) try self.event_notify(self.event_context, self, .{ .configured = .{
                     .width = size.width,
                     .height = size.height,
                 } });
@@ -372,7 +481,7 @@ fn clientMessage(
     }
     const window = self.findWindowOwningObject(message.object_id) orelse
         return error.MessageBeforeWindow;
-    const event = try window.handleMessage(message) orelse {
+    const event = try window.protocol.handleMessage(message) orelse {
         if (self.state == .closing) try self.advanceClose();
         return;
     };
@@ -383,17 +492,26 @@ fn clientMessage(
                 return;
             }
             self.state = .running;
-            if (self.input) |*input| try input.setCursorScale(window.cursorScale());
-            const size = window.size();
-            try self.event_notify(self.event_context, self, .{ .configured = .{
+            if (self.input) |*input| try input.setCursorScale(window.protocol.cursorScale());
+            const size = window.protocol.size();
+            if (window.repaint_handler) |handler| handler(window.repaint_context.?, .{
+                .width = @floatFromInt(size.width),
+                .height = @floatFromInt(size.height),
+            });
+            if (window == self.main_window) try self.event_notify(self.event_context, self, .{ .configured = .{
                 .width = size.width,
                 .height = size.height,
             } });
         },
-        .repaint => try self.event_notify(self.event_context, self, .repaint),
+        .repaint => {
+            if (window.frame_handler) |handler| handler(window.frame_context.?);
+            if (window == self.main_window) try self.event_notify(self.event_context, self, .repaint);
+        },
         .close => {
-            try self.event_notify(self.event_context, self, .close);
-            try self.beginClose();
+            if (window == self.main_window) {
+                try self.event_notify(self.event_context, self, .close);
+                try self.beginClose();
+            }
         },
     }
     if (self.state == .closing) try self.advanceClose();
@@ -402,8 +520,18 @@ fn clientMessage(
 fn inputEvent(context: *anyopaque, _: *Input, event: Input.Event) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
     const window = self.findWindowBySurfaceId(event.surface_id) orelse return;
-    if (window != self.main_window) return;
-    try self.event_notify(self.event_context, self, switch (event.value) {
+    switch (event.value) {
+        .pointer_move => |value| {
+            window.cursor_point = value;
+            window.cursor_update_pending = true;
+            if (window.pointer_move_handler) |handler| handler(window.pointer_move_context.?, value);
+        },
+        .pointer_button => |value| if (window.pointer_button_handler) |handler|
+            handler(window.pointer_button_context.?, value),
+        .scroll => |value| if (window.scroll_handler) |handler| handler(window.scroll_context.?, value),
+        .key => |value| if (window.key_handler) |handler| handler(window.key_context.?, value),
+    }
+    if (window == self.main_window) try self.event_notify(self.event_context, self, switch (event.value) {
         .pointer_move => |value| .{ .pointer_move = value },
         .pointer_button => |value| .{ .pointer_button = value },
         .scroll => |value| .{ .scroll = value },
@@ -412,7 +540,7 @@ fn inputEvent(context: *anyopaque, _: *Input, event: Input.Event) !void {
 }
 
 fn advanceClose(self: *Backend) !void {
-    for (self.windows.items) |window| if (!window.readyToDeinit()) return;
+    for (self.windows.items) |window| if (!window.protocol.readyToDeinit()) return;
     try self.startTransportShutdown();
     self.updateClosed();
 }
@@ -438,32 +566,35 @@ fn cancelActivationRequest(self: *Backend) void {
     self.activation_request = null;
 }
 
-fn createXdgWindow(self: *Backend, window_options: Options) !*ProtocolWindow {
+fn createXdgWindow(self: *Backend, window_options: Options) !*Window {
     try self.windows.ensureUnusedCapacity(self.allocator, 1);
-    const window = try self.allocator.create(ProtocolWindow);
+    const window = try self.allocator.create(Window);
     errdefer self.allocator.destroy(window);
-    window.* = try ProtocolWindow.init(
-        self.allocator,
-        &self.client,
-        window_options.title,
-        window_options.app_id,
-        window_options.width,
-        window_options.height,
-    );
+    window.* = .{
+        .backend = self,
+        .protocol = try ProtocolWindow.init(
+            self.allocator,
+            &self.client,
+            window_options.title,
+            window_options.app_id,
+            window_options.width,
+            window_options.height,
+        ),
+    };
     self.windows.appendAssumeCapacity(window);
     return window;
 }
 
-fn findWindowBySurfaceId(self: *Backend, surface_id: u32) ?*ProtocolWindow {
+fn findWindowBySurfaceId(self: *Backend, surface_id: u32) ?*Window {
     for (self.windows.items) |window| {
-        if (window.surfaceId() == surface_id) return window;
+        if (window.protocol.surfaceId() == surface_id) return window;
     }
     return null;
 }
 
-fn findWindowOwningObject(self: *Backend, object_id: u32) ?*ProtocolWindow {
+fn findWindowOwningObject(self: *Backend, object_id: u32) ?*Window {
     for (self.windows.items) |window| {
-        if (window.ownsObject(object_id)) return window;
+        if (window.protocol.ownsObject(object_id)) return window;
     }
     return null;
 }
