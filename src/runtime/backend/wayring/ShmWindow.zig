@@ -11,6 +11,7 @@ const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
 const raster = @import("../../graphics/raster.zig");
+const ShmFrameHistory = @import("../../graphics/ShmFrameHistory.zig");
 const TextRenderer = @import("../../graphics/text.zig");
 
 const linux = std.os.linux;
@@ -23,6 +24,9 @@ const Buffer = struct {
     height: u31,
     busy: bool = false,
     retiring: bool = false,
+    /// ShmWindow.frame_counter value when this buffer was last committed;
+    /// zero means the buffer has never held a complete frame.
+    frame: u64 = 0,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -105,6 +109,10 @@ renderer: TextRenderer,
 buffers: std.ArrayList(*Buffer) = .empty,
 width: u31 = 0,
 height: u31 = 0,
+last_rendered: ?*Buffer = null,
+last_rendered_scale: f32 = 0,
+frame_counter: u64 = 0,
+history: ShmFrameHistory = .{},
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -162,22 +170,34 @@ pub fn handleMessage(self: *ShmWindow, message: *const wayring.Message) !void {
     return error.UnknownShmBuffer;
 }
 
-pub fn presentWithFrame(
-    self: *ShmWindow,
-    display_list: []const keywork.PaintCommand,
-    scale: f32,
-) !?wayring.ObjectHandle {
+pub fn presentWithFrame(self: *ShmWindow, frame: keywork.RenderBackend.Frame) !?wayring.ObjectHandle {
     if (self.width == 0 or self.height == 0) return error.EmptyTarget;
     const buffer = try self.acquireBuffer();
-    try raster.rasterize(
-        &self.renderer,
-        buffer.pixels(),
-        self.width,
-        self.height,
-        scale,
-        display_list,
-        null,
-    );
+    const damage_region = self.partialDamageRegion(frame, buffer);
+    if (frame.partial_display_list and damage_region == null) return error.PartialPaintUnavailable;
+    if (damage_region) |region| {
+        for (region.slice()) |clip| {
+            try raster.rasterize(
+                &self.renderer,
+                buffer.pixels(),
+                self.width,
+                self.height,
+                frame.scale,
+                frame.display_list,
+                clip,
+            );
+        }
+    } else {
+        try raster.rasterize(
+            &self.renderer,
+            buffer.pixels(),
+            self.width,
+            self.height,
+            frame.scale,
+            frame.display_list,
+            null,
+        );
+    }
 
     const callback = try protocol.wl_surface_types.requests.frame(self.connection, self.surface);
     errdefer self.connection.retireObject(callback) catch {};
@@ -188,17 +208,77 @@ pub fn presentWithFrame(
         0,
         0,
     );
-    try protocol.wl_surface_types.requests.damage_buffer(
-        self.connection,
-        self.surface,
-        0,
-        0,
-        @intCast(self.width),
-        @intCast(self.height),
-    );
+    if (damage_region) |region| {
+        for (region.slice()) |clip| {
+            const x0: i32 = @max(0, clip.x0);
+            const y0: i32 = @max(0, clip.y0);
+            const x1: i32 = @min(@as(i32, self.width), clip.x1);
+            const y1: i32 = @min(@as(i32, self.height), clip.y1);
+            try protocol.wl_surface_types.requests.damage_buffer(
+                self.connection,
+                self.surface,
+                x0,
+                y0,
+                @max(0, x1 - x0),
+                @max(0, y1 - y0),
+            );
+        }
+    } else {
+        try protocol.wl_surface_types.requests.damage_buffer(
+            self.connection,
+            self.surface,
+            0,
+            0,
+            @intCast(self.width),
+            @intCast(self.height),
+        );
+    }
     try protocol.wl_surface_types.requests.commit(self.connection, self.surface);
     buffer.busy = true;
+    self.last_rendered = buffer;
+    self.last_rendered_scale = frame.scale;
+    self.frame_counter += 1;
+    buffer.frame = self.frame_counter;
+    var committed_region: ShmFrameHistory.PixelRegion = .{};
+    if (damage_region) |region| {
+        committed_region = region;
+    } else {
+        committed_region.add(.{
+            .x0 = 0,
+            .y0 = 0,
+            .x1 = self.width,
+            .y1 = self.height,
+        });
+    }
+    self.history.record(self.frame_counter, self.width, self.height, committed_region);
     return callback;
+}
+
+pub fn partialPaintBounds(
+    self: *const ShmWindow,
+    scale: f32,
+    damage: []const keywork.Rect,
+) ?keywork.Rect {
+    if (scale != self.last_rendered_scale or damage.len == 0) return null;
+    const last = self.last_rendered orelse return null;
+    if (last.width != self.width or last.height != self.height) return null;
+
+    var region: ShmFrameHistory.PixelRegion = .{};
+    for (damage) |rect| region.add(TextRenderer.PixelClip.fromRect(rect, scale));
+    const clip = region.bounds() orelse return null;
+    if (clip.x0 >= clip.x1 or clip.y0 >= clip.y1) return null;
+    if (clip.x0 <= 0 and clip.y0 <= 0 and clip.x1 >= self.width and clip.y1 >= self.height) return null;
+
+    const x0: f32 = @floatFromInt(@max(0, clip.x0));
+    const y0: f32 = @floatFromInt(@max(0, clip.y0));
+    const x1: f32 = @floatFromInt(@min(@as(i32, self.width), clip.x1));
+    const y1: f32 = @floatFromInt(@min(@as(i32, self.height), clip.y1));
+    return .{
+        .x = x0 / scale,
+        .y = y0 / scale,
+        .width = (x1 - x0) / scale,
+        .height = (y1 - y0) / scale,
+    };
 }
 
 pub fn retireAll(self: *ShmWindow) !bool {
@@ -249,11 +329,51 @@ fn acquireBuffer(self: *ShmWindow) !*Buffer {
     return buffer;
 }
 
+fn partialDamageRegion(
+    self: *ShmWindow,
+    frame: keywork.RenderBackend.Frame,
+    buffer: *Buffer,
+) ?ShmFrameHistory.PixelRegion {
+    if (frame.damage.len == 0) return null;
+    var region: ShmFrameHistory.PixelRegion = .{};
+    for (frame.damage) |rect| region.add(TextRenderer.PixelClip.fromRect(rect, frame.scale));
+    const bounds = region.bounds() orelse return null;
+    if (region.len == 1 and bounds.x0 <= 0 and bounds.y0 <= 0 and
+        bounds.x1 >= self.width and bounds.y1 >= self.height)
+    {
+        return null;
+    }
+
+    const last = self.last_rendered orelse return null;
+    if (self.last_rendered_scale != frame.scale) return null;
+    if (last == buffer) return region;
+    if (last.width != self.width or last.height != self.height or
+        buffer.width != self.width or buffer.height != self.height)
+    {
+        return null;
+    }
+    if (self.history.canRepair(buffer.frame, self.width, self.height)) {
+        ShmFrameHistory.repairRegions(
+            buffer.pixels(),
+            last.pixels(),
+            self.width,
+            self.height,
+            self.history.entries[0..self.history.len],
+            buffer.frame,
+            region,
+        );
+    } else {
+        ShmFrameHistory.copyPixels(buffer.pixels(), last.pixels());
+    }
+    return region;
+}
+
 fn destroyBuffer(self: *ShmWindow, index: usize) !void {
     const buffer = self.buffers.items[index];
     std.debug.assert(!buffer.busy);
     try protocol.wl_buffer_types.requests.destroy(self.connection, buffer.handle);
     _ = self.buffers.orderedRemove(index);
+    if (self.last_rendered == buffer) self.last_rendered = null;
     buffer.deinit(self.allocator);
 }
 

@@ -61,14 +61,21 @@ const Renderer = union(Presentation) {
         }
     }
 
-    fn presentWithFrame(
-        self: *Renderer,
-        display_list: []const keywork.PaintCommand,
-        scale: f32,
-    ) !?wayring.ObjectHandle {
+    fn presentWithFrame(self: *Renderer, frame: keywork.RenderBackend.Frame) !?wayring.ObjectHandle {
         return switch (self.*) {
-            .dma_buf => |*renderer| renderer.presentWithFrame(display_list, scale),
-            .shm => |*renderer| renderer.presentWithFrame(display_list, scale),
+            .dma_buf => |*renderer| renderer.presentWithFrame(frame.display_list, frame.scale),
+            .shm => |*renderer| renderer.presentWithFrame(frame),
+        };
+    }
+
+    fn partialPaintBounds(
+        self: *Renderer,
+        scale: f32,
+        damage: []const keywork.Rect,
+    ) ?keywork.Rect {
+        return switch (self.*) {
+            .dma_buf => null,
+            .shm => |*renderer| renderer.partialPaintBounds(scale, damage),
         };
     }
 
@@ -628,11 +635,10 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
 
 pub fn present(
     self: *Window,
-    display_list: []const keywork.PaintCommand,
-    scale: f32,
+    frame: keywork.RenderBackend.Frame,
 ) !bool {
     if (!self.configured or self.closed or self.frame_callback != null) return false;
-    self.frame_callback = (try self.renderer.presentWithFrame(display_list, scale)) orelse
+    self.frame_callback = (try self.renderer.presentWithFrame(frame)) orelse
         return false;
     try self.client.flush();
     return true;
@@ -785,11 +791,12 @@ const render_backend_vtable: keywork.RenderBackend.VTable = .{
     .measure_text = renderBackendMeasureText,
     .scale = renderBackendScale,
     .text_metrics = renderBackendTextMetrics,
+    .partial_paint_bounds = renderBackendPartialPaintBounds,
 };
 
 fn renderBackendPresent(context: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
     const self: *Window = @ptrCast(@alignCast(context));
-    return self.present(frame.display_list, frame.scale);
+    return self.present(frame);
 }
 
 fn renderBackendMeasureText(
@@ -809,6 +816,17 @@ fn renderBackendScale(context: *anyopaque) f32 {
 fn renderBackendTextMetrics(context: *anyopaque, font_size: f32) !keywork.TextMetrics {
     const self: *Window = @ptrCast(@alignCast(context));
     return self.renderer.textMetrics(self.renderScale(), font_size);
+}
+
+fn renderBackendPartialPaintBounds(
+    context: *anyopaque,
+    _: keywork.Size,
+    scale: f32,
+    damage: []const keywork.Rect,
+) !?keywork.Rect {
+    const self: *Window = @ptrCast(@alignCast(context));
+    if (!self.configured or scale != self.renderScale()) return null;
+    return self.renderer.partialPaintBounds(scale, damage);
 }
 
 fn applyScale(self: *Window) !?Event {
