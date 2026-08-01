@@ -85,6 +85,7 @@ pending: std.ArrayList(*PendingTransaction) = .empty,
 frame_callbacks: std.ArrayList(CompositorGlobal.FrameCallbacks) = .empty,
 presentation_pending: std.ArrayList(CompositorGlobal.PresentationFeedbacks) = .empty,
 presentation_submitted: std.ArrayList(CompositorGlobal.PresentationFeedbacks) = .empty,
+next_surface_sample_tag: u64 = 1,
 input_paint_entries: std.ArrayList(SurfaceTree.PaintEntry) = .empty,
 routed_keys: std.ArrayList(RoutedKey) = .empty,
 routed_buttons: std.ArrayList(RoutedButton) = .empty,
@@ -136,6 +137,7 @@ pub const FrameInspection = struct {
 
 const SurfaceState = struct {
     surface: *CompositorGlobal.Surface,
+    sample_tag: u64,
     snapshot: ?shm.Snapshot = null,
     dmabuf: ?DmabufState = null,
     scale: i32 = 1,
@@ -456,6 +458,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.frame_callbacks = .empty;
     self.presentation_pending = .empty;
     self.presentation_submitted = .empty;
+    self.next_surface_sample_tag = 1;
     errdefer self.deinitInputState();
     errdefer if (self.native_input_initialized) {
         if (self.native_input_device_listener_installed) {
@@ -2083,18 +2086,12 @@ fn discardPendingPresentationFor(
     }
 }
 
-fn submitPendingPresentation(
-    self: *NativeServer,
-    sampled_surfaces: []const *CompositorGlobal.Surface,
-) void {
+fn submitPendingPresentation(self: *NativeServer) void {
     std.debug.assert(self.presentation_submitted.items.len == 0);
     while (self.presentation_pending.items.len != 0) {
         var feedbacks = self.presentation_pending.orderedRemove(0);
-        if (std.mem.indexOfScalar(
-            *CompositorGlobal.Surface,
-            sampled_surfaces,
-            feedbacks.surface,
-        ) != null) {
+        const state = self.findState(feedbacks.surface);
+        if (state != null and self.renderer.wasSampled(state.?.sample_tag)) {
             self.presentation_submitted.appendAssumeCapacity(feedbacks);
         } else {
             feedbacks.deinit();
@@ -2198,15 +2195,6 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
         const node = self.surface_tree.find(state.surface) orelse continue;
         if (node.parent == null) try self.surface_tree.paint(node, &paint_entries);
     }
-    var sampled_surfaces: std.ArrayList(*CompositorGlobal.Surface) = .empty;
-    defer sampled_surfaces.deinit(self.allocator);
-    try sampled_surfaces.ensureTotalCapacity(self.allocator, paint_entries.items.len);
-    const output_bounds: render.Rect = .{
-        .x = 0,
-        .y = 0,
-        .width = self.output.logicalSize().width,
-        .height = self.output.logicalSize().height,
-    };
     for (paint_entries.items) |paint_entry| {
         const state = self.findState(paint_entry.surface) orelse continue;
         if (!state.surface.resource_alive) continue;
@@ -2248,6 +2236,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             .y = image_y,
             .size = geometry.logical_size,
             .buffer = pixel_buffer,
+            .sample_tag = state.sample_tag,
             .source = geometry.source,
             .transform = transform,
             .is_opaque = force_opaque or region_covers_buffer,
@@ -2267,14 +2256,6 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
                     paint_entry.y,
                 ),
         } });
-        if ((render.Rect{
-            .x = image_x,
-            .y = image_y,
-            .width = geometry.logical_size.width,
-            .height = geometry.logical_size.height,
-        }).intersection(output_bounds) != null) {
-            sampled_surfaces.appendAssumeCapacity(state.surface);
-        }
     }
     var damage_storage: [1]render.Rect = undefined;
     const damage = if (damage_state) |state| self.frameDamage(state, &damage_storage) else null;
@@ -2331,7 +2312,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             self.output_busy_retries = 0;
         },
     }
-    self.submitPendingPresentation(sampled_surfaces.items);
+    self.submitPendingPresentation();
     self.repaint_needed = false;
     self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
@@ -2446,12 +2427,19 @@ fn bufferTransform(value: u32) render.BufferTransform {
 
 fn stateFor(self: *NativeServer, surface: *CompositorGlobal.Surface) !*SurfaceState {
     if (self.findState(surface)) |state| return state;
+    const sample_tag = self.next_surface_sample_tag;
+    self.next_surface_sample_tag = std.math.add(
+        u64,
+        self.next_surface_sample_tag,
+        1,
+    ) catch return error.SurfaceSampleTagExhausted;
     const state = try self.allocator.create(SurfaceState);
     errdefer self.allocator.destroy(state);
     try surface.reference();
     errdefer surface.unreference();
     state.* = .{
         .surface = surface,
+        .sample_tag = sample_tag,
         .opaque_region = Region.init(),
         .input_region = CompositorGlobal.InputRegion.init(),
     };
@@ -2691,6 +2679,134 @@ test "surface opaque hints clip to offset buffer bounds and translate globally" 
         &.{.{ .x = 12, .y = 23, .width = 2, .height = 2 }},
         opaque_hint.slice(),
     );
+}
+
+test "native presentation reports only renderer-sampled surfaces" {
+    const Counter = struct {
+        presented_count: usize = 0,
+        discarded_count: usize = 0,
+
+        fn presented(
+            context: *anyopaque,
+            _: *anyopaque,
+            _: presentation.Info,
+        ) void {
+            const counter: *@This() = @ptrCast(@alignCast(context));
+            counter.presented_count += 1;
+        }
+
+        fn discarded(context: *anyopaque) void {
+            const counter: *@This() = @ptrCast(@alignCast(context));
+            counter.discarded_count += 1;
+        }
+    };
+
+    const size: render.Size = .{ .width = 2, .height = 1 };
+    var lower_pixels = [_]u32{0xffff0000} ** 2;
+    var upper_pixels = [_]u32{0xff00ff00} ** 2;
+    const commands = [_]render.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{ .size = size, .stride_pixels = size.width, .pixels = &lower_pixels },
+            .sample_tag = 1,
+            .is_opaque = true,
+        } },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{ .size = size, .stride_pixels = size.width, .pixels = &upper_pixels },
+            .sample_tag = 2,
+            .is_opaque = true,
+        } },
+    };
+    var target_pixels = [_]u32{0} ** 2;
+    var server: NativeServer = undefined;
+    server.allocator = std.testing.allocator;
+    server.renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer server.renderer.deinit();
+    try server.renderer.render(
+        .{ .size = size, .commands = &commands },
+        .{ .size = size, .stride_pixels = size.width, .pixels = &target_pixels },
+    );
+
+    var lower_surface: CompositorGlobal.Surface = undefined;
+    lower_surface.references = 2;
+    var upper_surface: CompositorGlobal.Surface = undefined;
+    upper_surface.references = 2;
+    var lower_state: SurfaceState = undefined;
+    lower_state.surface = &lower_surface;
+    lower_state.sample_tag = 1;
+    var upper_state: SurfaceState = undefined;
+    upper_state.surface = &upper_surface;
+    upper_state.sample_tag = 2;
+
+    var lower_counter: Counter = .{};
+    var upper_counter: Counter = .{};
+    var lower_feedback: CompositorGlobal.PresentationFeedback = .{
+        .context = &lower_counter,
+        .presented = Counter.presented,
+        .discarded = Counter.discarded,
+    };
+    var upper_feedback: CompositorGlobal.PresentationFeedback = .{
+        .context = &upper_counter,
+        .presented = Counter.presented,
+        .discarded = Counter.discarded,
+    };
+    const lower_feedbacks = try std.testing.allocator.dupe(
+        *CompositorGlobal.PresentationFeedback,
+        &.{&lower_feedback},
+    );
+    var lower_feedbacks_owned = true;
+    errdefer if (lower_feedbacks_owned) std.testing.allocator.free(lower_feedbacks);
+    const upper_feedbacks = try std.testing.allocator.dupe(
+        *CompositorGlobal.PresentationFeedback,
+        &.{&upper_feedback},
+    );
+    var upper_feedbacks_owned = true;
+    errdefer if (upper_feedbacks_owned) std.testing.allocator.free(upper_feedbacks);
+
+    server.surfaces = .empty;
+    defer server.surfaces.deinit(std.testing.allocator);
+    try server.surfaces.append(std.testing.allocator, &lower_state);
+    try server.surfaces.append(std.testing.allocator, &upper_state);
+    server.presentation_pending = .empty;
+    server.presentation_submitted = .empty;
+    defer {
+        for (server.presentation_submitted.items) |*feedbacks| feedbacks.deinit();
+        server.presentation_submitted.deinit(std.testing.allocator);
+        for (server.presentation_pending.items) |*feedbacks| feedbacks.deinit();
+        server.presentation_pending.deinit(std.testing.allocator);
+    }
+    try server.presentation_submitted.ensureUnusedCapacity(std.testing.allocator, 2);
+    try server.presentation_pending.append(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .surface = &lower_surface,
+        .feedbacks = lower_feedbacks,
+    });
+    lower_feedbacks_owned = false;
+    try server.presentation_pending.append(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .surface = &upper_surface,
+        .feedbacks = upper_feedbacks,
+    });
+    upper_feedbacks_owned = false;
+
+    server.submitPendingPresentation();
+    try std.testing.expectEqual(@as(usize, 1), lower_counter.discarded_count);
+    try std.testing.expectEqual(@as(usize, 0), upper_counter.discarded_count);
+    try std.testing.expectEqual(@as(usize, 1), server.presentation_submitted.items.len);
+
+    var submitted = server.presentation_submitted.pop().?;
+    submitted.presented(&server, .{
+        .timestamp = .{ .seconds = 0, .nanoseconds = 0 },
+        .refresh_nanoseconds = presentation.nominal_refresh_nanoseconds,
+    });
+    submitted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), upper_counter.presented_count);
+    try std.testing.expectEqual(@as(usize, 0), upper_counter.discarded_count);
 }
 
 test "native compositor owns and drains its io_uring listener" {
