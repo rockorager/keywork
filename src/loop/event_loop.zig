@@ -2,3 +2,8 @@
 
 pub const IoUringLoop = @import("IoUringLoop.zig");
 pub const EventLoop = @import("EventLoop.zig");
+
+test {
+    _ = EventLoop;
+    _ = IoUringLoop;
+}
