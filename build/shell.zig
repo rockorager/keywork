@@ -217,6 +217,7 @@ const lua_files = [_][]const u8{
     "lua/lock.lua",
     "lua/background.lua",
     "lua/storybook.lua",
+    "lua/shell/init.lua",
     "lua/shell/ipc.lua",
     "lua/shell/audio.lua",
     "lua/shell/clock.lua",

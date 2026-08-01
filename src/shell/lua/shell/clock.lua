@@ -17,8 +17,8 @@ local clock_service = service.define("shell.clock", function(self)
     end
 end)
 
-function M.use(scope, on_change)
-    return clock_service:use(scope, on_change)
+function M.use(scope)
+    return clock_service:use(scope)
 end
 
 function M.format_bar(timestamp)

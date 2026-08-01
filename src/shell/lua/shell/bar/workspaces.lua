@@ -151,22 +151,19 @@ local function WorkspaceSwitcher(props)
     return kw.row({ spacing = palette.space[1], children = items })
 end
 
-local Workspaces = kw.stateful({
+local Workspaces = kw.component({
     hot_id = "Workspaces",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
-        self.workspace_state = workspace_service:use(self.scope, function(next_snapshot)
-            self.workspace_state = next_snapshot
-            self:set_state()
-        end)
-            or { workspaces = {}, connected = true, loading = true }
+        self.workspace_state = workspace_service:use(self.scope)
     end,
 
     build = function(self)
         return WorkspaceSwitcher({
             colors = self.props.colors,
             output = self.props.output,
-            state = self.workspace_state,
+            state = self.workspace_state and self.workspace_state()
+                or { workspaces = {}, connected = true, loading = true },
         })
     end,
 })

@@ -8,6 +8,14 @@
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
             .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
         },
+        .wayland_source = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
+            .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
+        },
+        .wayland_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
+            .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
+        },
         .uucode = .{
             .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
             .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",

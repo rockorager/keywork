@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=$1
+source=$2
+buildtype=$3
+
+rm -rf "$output"
+meson setup "$output" "$source" \
+    --buildtype="$buildtype" \
+    --default-library=static \
+    -Ddocumentation=false \
+    -Dtests=false
+meson compile -C "$output" wayland-client wayland-server

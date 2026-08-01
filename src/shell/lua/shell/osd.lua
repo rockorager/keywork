@@ -62,30 +62,13 @@ local function level_bar(theme, value, muted)
     })
 end
 
-local Level = kw.stateful({
+local Level = kw.component({
     hot_id = "Level",
-    hot_version = 1,
-    init = function(self)
-        self.level = self.props.controller and self.props.controller:visible() or self.level
-    end,
-
-    start = function(self)
-        local controller = self.props.controller
-        if not controller then
-            return
-        end
-        self.level = controller:visible()
-        self.scope:on_cancel(
-            controller:subscribe(function(level)
-                self.level = level
-                self:set_state()
-            end)
-        )
-    end,
+    hot_version = 3,
 
     build = function(self, context)
         local theme = context.theme
-        local level = self.level or self.props
+        local level = self.props.level
         local value = clamp(tonumber(level.value) or 0, 0, 1)
         local muted = level.muted == true
 
@@ -121,7 +104,7 @@ local Controller = {}
 Controller.__index = Controller
 
 ---@class OsdController
----@field current?          table
+---@field current           keywork.Signal<table?>
 ---@field hide_timer?       keywork.loop.Timer
 ---@field running           boolean
 ---@field backlight_name?   string
@@ -132,27 +115,8 @@ Controller.__index = Controller
 ---@field adjust_audio      fun(self: OsdController, kind: string, action: string): boolean
 ---@field adjust_brightness fun(self: OsdController, action: string): boolean
 
-function Controller:changed()
-    if self.on_change then
-        self.on_change()
-    end
-end
-
-function Controller:subscribe(callback)
-    self.subscribers[callback] = true
-    return function()
-        self.subscribers[callback] = nil
-    end
-end
-
-function Controller:updated()
-    for callback in pairs(self.subscribers) do
-        callback(self.current)
-    end
-end
-
 function Controller:visible()
-    return self.current
+    return self.current()
 end
 
 function Controller:close()
@@ -166,20 +130,14 @@ function Controller:close()
     self.hide_timer, self.system_bus = nil, nil
     self.jobs = {}
     self.running = false
-    self.subscribers = {}
 end
 
 function Controller:show(kind, value, muted)
-    local was_visible = self.current ~= nil
-    self.current = {
+    self.current:set({
         kind = kind,
         value = clamp(value, 0, 1),
         muted = muted == true,
-    }
-    self:updated()
-    if not was_visible then
-        self:changed()
-    end
+    })
 
     local previous = self.hide_timer
     local timer = loop.timer({ delay = DISPLAY_MS / 1000 })
@@ -193,8 +151,7 @@ function Controller:show(kind, value, muted)
         for _ in timer:ticks() do
             if self.hide_timer == timer then
                 self.hide_timer = nil
-                self.current = nil
-                self:changed()
+                self.current:set(nil)
             end
         end
     end)
@@ -358,11 +315,10 @@ function Controller:adjust_brightness(action)
     return true
 end
 
-function M.new(on_change)
+function M.new()
     ---@type OsdController
     local controller = setmetatable({
-        on_change = on_change,
-        subscribers = {},
+        current = kw.signal(nil),
         jobs = {},
         running = false,
         closed = false,

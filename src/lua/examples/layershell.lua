@@ -12,7 +12,7 @@ local colors = {
 -- Run with:
 --   zig build run -- src/lua/examples/layershell.lua
 --   zig build run -- src/lua/examples/layershell.lua --backend=vulkan
-local App = keywork.stateful({
+local App = keywork.component({
     build = function(self, state)
         local theme = keywork.resolve_theme(
             keywork.theme_data({

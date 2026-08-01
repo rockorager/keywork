@@ -11,9 +11,9 @@ local function viewport_for(story)
     }
 end
 
-local Browser = kw.stateful({
+local Browser = kw.component({
     init = function(self)
-        self.selected = 1
+        self.selected = kw.signal(1)
     end,
 
     build = function(self, context)
@@ -25,9 +25,10 @@ local Browser = kw.stateful({
         local font_size = theme.font_size
         local line_height = theme.line_height
         local menu = theme.components.menu
-        local selected = stories[self.selected]
+        local selected_index = self.selected()
+        local selected = stories[selected_index]
         if not selected and #stories > 0 then
-            self.selected = 1
+            selected_index = 1
             selected = stories[1]
         end
 
@@ -51,15 +52,13 @@ local Browser = kw.stateful({
                 previous_group = group
             end
 
-            local is_selected = index == self.selected
+            local is_selected = index == selected_index
             story_items[#story_items + 1] = kw.pressable({
                 id = "storybook-story:" .. story.id,
                 hover_background = menu.item.hover_background,
                 cursor = "pointer",
                 on_activate = function()
-                    self:set_state(function(state)
-                        state.selected = index
-                    end)
+                    self.selected:set(index)
                 end,
                 child = kw.container({
                     background = is_selected and menu.item.selected_background or 0x00000000,

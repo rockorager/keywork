@@ -6,6 +6,7 @@ const luajit = @import("build/luajit.zig");
 const release = @import("build/release.zig");
 const runtime = @import("build/runtime.zig");
 const shell = @import("build/shell.zig");
+const static_wayland = @import("build/static_wayland.zig");
 const stream = @import("build/stream.zig");
 const ui = @import("build/ui.zig");
 const version = @import("build/version.zig");
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wayring_core.addImport("wayring", wayring);
+    const wayland = static_wayland.add(b, target, optimize);
     const zig_wayland = b.dependency("wayland", .{});
     const wayring_xml = b.createModule(.{
         .root_source_file = zig_wayland.path("src/xml.zig"),
@@ -54,26 +56,25 @@ pub fn build(b: *std.Build) void {
         .name = "wayring-scanner",
         .root_module = wayring_scanner_module,
     });
-    const wayland_sources = stageWaylandSources(b);
     const generate_wayring_protocols = b.addRunArtifact(wayring_scanner);
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.wayland_xml);
+    generate_wayring_protocols.addFileArg(wayland.wayland_xml);
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/xdg-shell/xdg-shell.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/xdg-shell/xdg-shell.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/tablet/tablet-v2.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/tablet/tablet-v2.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/cursor-shape/cursor-shape-v1.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/cursor-shape/cursor-shape-v1.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/xdg-activation/xdg-activation-v1.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xdg-activation/xdg-activation-v1.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/viewporter/viewporter.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/viewporter/viewporter.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/fractional-scale/fractional-scale-v1.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/fractional-scale/fractional-scale-v1.xml"));
     generate_wayring_protocols.addArg("-i");
-    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/ext-session-lock/ext-session-lock-v1.xml"));
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-o");
@@ -195,8 +196,9 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         build_options,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     const ui_output = ui.add(b, target, optimize, test_step);
@@ -211,8 +213,8 @@ pub fn build(b: *std.Build) void {
         wayring_protocols,
         varlink,
         ui_output,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     const lua_jit = luajit.add(b, target, optimize);
@@ -240,8 +242,9 @@ pub fn build(b: *std.Build) void {
         wayring_protocols,
         varlink,
         keywork_control,
-        wayland_sources.wayland_xml,
-        wayland_sources.protocols,
+        wayland,
+        wayland.wayland_xml,
+        wayland.protocols,
         test_step,
     );
     release.add(
@@ -285,28 +288,10 @@ pub fn build(b: *std.Build) void {
         use_llvm,
         lua_jit,
         lua_output.executable,
-        wayland_sources.protocols,
+        wayland.protocols,
         test_step,
         lint_step,
         fmt_step,
         format_step,
     );
-}
-
-const WaylandSources = struct {
-    wayland_xml: std.Build.LazyPath,
-    protocols: std.Build.LazyPath,
-};
-
-fn stageWaylandSources(b: *std.Build) WaylandSources {
-    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
-    const stage = b.addSystemCommand(&.{"sh"});
-    stage.addFileArg(b.path("scripts/stage-wayland-sources"));
-    stage.addArg(pkg_config);
-    const output = stage.addOutputDirectoryArg("wayland-sources");
-    stage.has_side_effects = true;
-    return .{
-        .wayland_xml = output.path(b, "wayland.xml"),
-        .protocols = output.path(b, "wayland-protocols"),
-    };
 }

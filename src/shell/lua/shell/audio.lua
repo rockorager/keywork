@@ -43,8 +43,8 @@ local audio_service = service.define("shell.audio", function(self)
     end
 end)
 
-function M.use(scope, on_change)
-    return audio_service:use(scope, on_change)
+function M.use(scope)
+    return audio_service:use(scope)
 end
 
 local device_kind = {
@@ -248,7 +248,7 @@ local function settings_menu(palette, audio, on_select)
     })
 end
 
-local AudioMenu = kw.stateful({
+local AudioMenu = kw.component({
     hot_id = "AudioMenu",
     hot_version = 1,
     build = function(self)
@@ -261,29 +261,22 @@ local AudioMenu = kw.stateful({
     end,
 })
 
-local Audio = kw.stateful({
+local Audio = kw.component({
     init = function(self)
-        self.menu_open = false
+        self.menu_open = kw.signal(false)
     end,
 
     hot_id = "Audio",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
         self.audio_tap = function()
-            self:set_state(function(state)
-                state.menu_open = not state.menu_open
-            end)
+            self.menu_open:update(function(open) return not open end)
         end
-        self.audio = M.use(self.scope, function(snapshot)
-            self.audio = snapshot
-            self:set_state()
-        end)
+        self.audio = M.use(self.scope)
     end,
 
     open_settings = function(self)
-        self:set_state(function(state)
-            state.menu_open = false
-        end)
+        self.menu_open:set(false)
         if self.props.on_open_settings then self.props.on_open_settings() end
     end,
 
@@ -294,16 +287,16 @@ local Audio = kw.stateful({
 
     build = function(self)
         local palette = self.props.colors
-        local audio = self.audio or {}
+        local audio = self.audio and self.audio() or {}
         return kw.popover({
             id = "audio",
             anchor = volume_status(palette, audio.output, self.audio_tap),
-            open = self.menu_open,
+            open = self.menu_open(),
             placement = { edge = "bottom", alignment = "end", gap = palette.space[1] },
             width = 420,
             content = function()
                 return audio_menu(
-                    palette, self.audio,
+                    palette, self.audio and self.audio() or {},
                     function(device)
                         self:select_device(device)
                     end,
@@ -313,23 +306,18 @@ local Audio = kw.stateful({
                 )
             end,
             on_close = function()
-                self:set_state(function(state)
-                    state.menu_open = false
-                end)
+                self.menu_open:set(false)
             end,
         })
     end,
 })
 
-local Settings = kw.stateful({
+local Settings = kw.component({
     hot_id = "Settings",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
         if not self.props.audio then
-            self.audio = M.use(self.scope, function(snapshot)
-                self.audio = snapshot
-                self:set_state()
-            end)
+            self.audio = M.use(self.scope)
         end
     end,
 
@@ -345,7 +333,7 @@ local Settings = kw.stateful({
     build = function(self, context)
         local theme = context.theme
         local palette = self.props.colors or bar_colors.palette(theme)
-        local audio = self.props.audio or self.audio or {}
+        local audio = self.props.audio or (self.audio and self.audio()) or {}
         local content = kw.sized_box({
             width = M.settings_width,
             height = M.settings_height,

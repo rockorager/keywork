@@ -15,17 +15,14 @@ local function avatar(theme, path)
     return kw.icon({ name = "avatar-default", size = 96, color = theme.colors.text_secondary })
 end
 
-M.View = kw.stateful({
+M.View = kw.component({
     hot_id = "View",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
         if self.props.time and self.props.date then
             return
         end
-        self.timestamp = clock.use(self.scope, function(timestamp)
-            self.timestamp = timestamp
-            self:set_state()
-        end) or os.time()
+        self.timestamp = clock.use(self.scope)
     end,
 
     build = function(self, context)
@@ -33,7 +30,7 @@ M.View = kw.stateful({
         local status = self.props.status
         local message = status or "Enter your password to unlock"
         local message_color = status and theme.colors.danger or theme.colors.text_secondary
-        local timestamp = self.timestamp or os.time()
+        local timestamp = self.timestamp and self.timestamp() or os.time()
         local time = self.props.time or clock.format_time(timestamp)
         local date = self.props.date or clock.format_date(timestamp)
 

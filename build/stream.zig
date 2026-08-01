@@ -1,4 +1,5 @@
 const std = @import("std");
+const static_wayland = @import("static_wayland.zig");
 const Scanner = @import("wayland").Scanner;
 
 pub const Output = struct {
@@ -11,6 +12,7 @@ pub fn add(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Step.Options,
+    wayland_libraries: static_wayland.Output,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
     test_step: *std.Build.Step,
@@ -50,11 +52,7 @@ pub fn add(
     });
     capture_module.addOptions("build-options", build_options);
     capture_module.addImport("wayland", wayland);
-    capture_module.linkSystemLibrary("wayland-client", .{
-        .use_pkg_config = .no,
-        .preferred_link_mode = .static,
-        .search_strategy = .no_fallback,
-    });
+    wayland_libraries.linkClient(capture_module);
     capture_module.linkSystemLibrary("ffi", .{});
     capture_module.linkSystemLibrary("m", .{});
     capture_module.linkSystemLibrary("xkbcommon", .{});

@@ -1565,6 +1565,7 @@ fn localModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 const embedded_ui_source = @embedFile("ui.lua");
+const embedded_reactive_source = @embedFile("reactive.lua");
 const embedded_fluent_source = @embedFile("design/fluent.lua");
 const embedded_audio_source = @embedFile("audio.lua");
 const embedded_storybook_source = @embedFile("storybook.lua");
@@ -1591,6 +1592,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
         test_only: bool = false,
     }{
         .{ .name = "keywork", .loader = keyworkModuleLoader, .uses_app = true },
+        .{ .name = "keywork.reactive", .loader = reactiveModuleLoader },
         .{ .name = "keywork.design.fluent", .loader = fluentModuleLoader },
         .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
         .{ .name = "keywork.loop", .loader = loopModuleLoader, .uses_app = true },
@@ -1623,6 +1625,10 @@ fn storybookModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_storybook_source, "@keywork/storybook.lua");
 }
 
+fn reactiveModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return loadEmbeddedModule(lua_state_optional.?, embedded_reactive_source, "@keywork/reactive.lua");
+}
+
 fn fluentModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_fluent_source, "@keywork/design/fluent.lua");
 }
@@ -1650,6 +1656,13 @@ fn keyworkModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
     pushAppNamespace(lua_state, app);
     c.lua_setfield(lua_state, keywork_table, "app");
+    c.lua_getglobal(lua_state, "require");
+    c.lua_pushliteral(lua_state, "keywork.reactive");
+    if (c.lua_pcall(lua_state, 1, 1, 0) != 0) return c.lua_error(lua_state);
+    c.lua_getfield(lua_state, -1, "install_app");
+    c.lua_getfield(lua_state, keywork_table, "app");
+    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return c.lua_error(lua_state);
+    pop(lua_state, 1);
 
     pushClipboardNamespace(lua_state, app);
     c.lua_setfield(lua_state, keywork_table, "clipboard");
@@ -1899,16 +1912,14 @@ fn logModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn pushAppNamespace(lua_state: *c.lua_State, app: *App) void {
-    c.lua_createtable(lua_state, 0, 5);
+    c.lua_createtable(lua_state, 0, 4);
     const app_table = c.lua_gettop(lua_state);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "quit", luaQuit, 1);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, app_table, "reload", luaReload, 1);
     c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, app_table, "invalidate", luaInvalidate, 1);
-    c.lua_pushlightuserdata(lua_state, app);
-    lua_value.setClosureField(lua_state, app_table, "reconcile", luaReconcile, 1);
+    lua_value.setClosureField(lua_state, app_table, "__reconcile", luaReconcile, 1);
     c.lua_createtable(lua_state, 0, 1);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, -2, "state", luaHotState, 1);
@@ -2148,17 +2159,6 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn luaInvalidate(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    const invalidator = app.invalidator orelse return 0;
-    invalidator.invalidate() catch |err| {
-        std.log.scoped(.keywork_luajit).warn("invalidate failed: {}", .{err});
-        return c.luaL_error(lua_state, "invalidate failed");
-    };
-    return 0;
-}
-
 fn luaReconcile(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
@@ -2321,10 +2321,15 @@ test "keywork core excludes optional capability modules" {
     const script =
         \\local kw = require("keywork")
         \\assert(type(kw.app) == "table")
+        \\assert(type(kw.component) == "function")
+        \\assert(type(kw.signal) == "function")
+        \\assert(type(kw.computed) == "function")
+        \\assert(type(kw.app.hot.signal) == "function")
         \\assert(type(kw.app.quit) == "function")
         \\assert(type(kw.app.reload) == "function")
-        \\assert(type(kw.app.invalidate) == "function")
-        \\assert(type(kw.app.reconcile) == "function")
+        \\assert(kw.stateful == nil)
+        \\assert(kw.app.invalidate == nil)
+        \\assert(kw.app.reconcile == nil)
         \\assert(type(kw.session_lock.unlock) == "function")
         \\assert(type(kw.session_lock.locked) == "function")
         \\assert(kw.invalidate == nil)
@@ -2366,6 +2371,155 @@ test "keywork core excludes optional capability modules" {
     try app.ensureLoaded();
     try std.testing.expect(app.window_config.background_blur);
     try std.testing.expect(app.window_config.has_windows);
+}
+
+test "lua signals and computed implement canonical reactive semantics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local equal_calls = 0
+        \\local value = kw.signal({ count = 1 }, { equals = function(a, b)
+        \\  equal_calls = equal_calls + 1
+        \\  return a.count == b.count
+        \\end })
+        \\value:set({ count = 1 })
+        \\assert(equal_calls == 1 and value().count == 1)
+        \\value:update(function(old) return { count = old.count + 1 } end)
+        \\value:mutate(function(current) current.count = current.count + 1 end)
+        \\assert(value().count == 3)
+        \\local readonly = value:readonly()
+        \\assert(readonly() == value() and readonly.set == nil)
+        \\local choose_left, left, right = kw.signal(true), kw.signal(10), kw.signal(20)
+        \\local evaluations = 0
+        \\local selected = kw.computed(function()
+        \\  evaluations = evaluations + 1
+        \\  return choose_left() and left() or right()
+        \\end)
+        \\assert(evaluations == 0 and selected() == 10 and selected() == 10 and evaluations == 1)
+        \\right:set(21)
+        \\assert(selected() == 10 and evaluations == 1)
+        \\choose_left:set(false)
+        \\assert(selected() == 21 and evaluations == 2)
+        \\left:set(11)
+        \\assert(selected() == 21 and evaluations == 2)
+        \\local recursive
+        \\recursive = kw.computed(function() return recursive() end)
+        \\local ok, err = pcall(recursive)
+        \\assert(not ok and tostring(err):find("recursive computed read", 1, true))
+        \\local write = kw.signal(0)
+        \\local illegal = kw.computed(function() write:set(1) end)
+        \\ok, err = pcall(illegal)
+        \\assert(not ok and tostring(err):find("cannot be written", 1, true))
+        \\return kw.app({ child = kw.text("reactive") })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "reactive.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua component tracking coalesces, retries failures, and disposes dependencies" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local reactive = require("keywork.reactive")
+        \\local source = kw.signal(0)
+        \\local fail = false
+        \\local write = false
+        \\local spec
+        \\reactive.component(function(value) spec = value return value end, {
+        \\  build = function()
+        \\    local value = source()
+        \\    if fail then error("expected build failure") end
+        \\    if write then source:set(value + 1) end
+        \\    return kw.text(tostring(value))
+        \\  end,
+        \\})
+        \\local invalidations = 0
+        \\local state = { __invalidate = function() invalidations = invalidations + 1 end }
+        \\spec.build(state, {})
+        \\source:set(0)
+        \\assert(invalidations == 0)
+        \\source:set(1)
+        \\source:set(2)
+        \\assert(invalidations == 1)
+        \\fail = true
+        \\local ok, err = pcall(spec.build, state, {})
+        \\assert(not ok and tostring(err):find("expected build failure", 1, true))
+        \\source:set(3)
+        \\assert(invalidations == 2)
+        \\fail = false
+        \\spec.build(state, {})
+        \\write = true
+        \\ok, err = pcall(spec.build, state, {})
+        \\assert(not ok and tostring(err):find("cannot be written", 1, true))
+        \\write = false
+        \\spec.dispose(state)
+        \\source:set(4)
+        \\assert(invalidations == 2)
+        \\return kw.app({ child = kw.text("component tracking") })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "component-tracking.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
+}
+
+test "lua deferred popover and list builders track signals" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local reactive = require("keywork.reactive")
+        \\local popup_value = kw.signal("popup")
+        \\local row_values = { kw.signal("row one"), kw.signal("row two") }
+        \\local spec
+        \\reactive.component(function(value) spec = value return value end, {
+        \\  build = function()
+        \\    return {
+        \\      popup = kw.popover({
+        \\        id = "tracked-popup", anchor = kw.text("anchor"), open = true,
+        \\        content = function() return kw.text(popup_value()) end,
+        \\      }),
+        \\      list = kw.list_view({
+        \\        id = "tracked-list", item_count = 2, item_extent = 20,
+        \\        build_item = function(index) return kw.text(row_values[index]()) end,
+        \\      }),
+        \\    }
+        \\  end,
+        \\})
+        \\local invalidations = 0
+        \\local state = { __invalidate = function() invalidations = invalidations + 1 end }
+        \\local result = spec.build(state, {})
+        \\result.popup.popup.content({})
+        \\result.list.build_item(1)
+        \\result.list.build_item(2)
+        \\row_values[1]:set("next row one")
+        \\assert(invalidations == 1)
+        \\result = spec.build(state, {})
+        \\result.popup.popup.content({})
+        \\popup_value:set("next popup")
+        \\assert(invalidations == 2)
+        \\result = spec.build(state, {})
+        \\result.list.build_item(1)
+        \\result.list.build_item(2)
+        \\row_values[2]:set("next row two")
+        \\assert(invalidations == 3)
+        \\spec.dispose(state)
+        \\return kw.app({ child = kw.text("deferred tracking") })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "deferred-tracking.lua", script);
+    defer app.deinit();
+    try app.ensureLoaded();
 }
 
 test "test scripts register cases and report assertion diagnostics" {
@@ -2625,7 +2779,7 @@ test "syntax-invalid reload keeps the current generation and resources" {
     try std.testing.expect(!timer.canceled);
 }
 
-test "hot state retains, migrates, and versions plain application data" {
+test "hot signal persists plain values and migrates legacy hot state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2654,17 +2808,15 @@ test "hot state retains, migrates, and versions plain application data" {
 
     const migrated =
         \\local kw = require("keywork")
-        \\local state = kw.app.hot.state("main", {
+        \\local state = kw.app.hot.signal("main", 100, {
         \\  version = 2,
-        \\  init = function() return { count = 100 } end,
         \\  migrate = function(previous, previous_version)
         \\    assert(previous_version == 1)
-        \\    previous.count = previous.count + 10
-        \\    return previous
+        \\    return previous.count + 10
         \\  end,
         \\})
-        \\hot_count = state.count
-        \\return kw.app({ child = kw.text(tostring(state.count)) })
+        \\hot_count = state()
+        \\return kw.app({ child = kw.text(tostring(state())) })
         \\
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-state.lua", .data = migrated });
@@ -2673,6 +2825,55 @@ test "hot state retains, migrates, and versions plain application data" {
     c.lua_getglobal(app.state, "hot_count");
     try std.testing.expectEqual(@as(c.lua_Integer, 12), c.lua_tointeger(app.state, -1));
     pop(app.state, 1);
+
+    const persisted =
+        \\local kw = require("keywork")
+        \\local state = kw.app.hot.signal("main", 100, { version = 2 })
+        \\state:update(function(value) return value + 1 end)
+        \\hot_count = state()
+        \\return kw.app({ child = kw.text(tostring(state())) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-state.lua", .data = persisted });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    c.lua_getglobal(app.state, "hot_count");
+    try std.testing.expectEqual(@as(c.lua_Integer, 13), c.lua_tointeger(app.state, -1));
+    pop(app.state, 1);
+}
+
+test "hot signal migration preserves false values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first =
+        \\local kw = require("keywork")
+        \\local flag = kw.app.hot.signal("flag", false, { version = 1 })
+        \\return kw.app({ child = kw.text(tostring(flag())) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "hot-false.lua", first);
+    defer app.deinit();
+    try app.ensureLoaded();
+
+    const second =
+        \\local kw = require("keywork")
+        \\local flag = kw.app.hot.signal("flag", false, {
+        \\  version = 2,
+        \\  migrate = function(previous)
+        \\    assert(previous == false)
+        \\    return true
+        \\  end,
+        \\})
+        \\migrated_flag = flag()
+        \\return kw.app({ child = kw.text(tostring(flag())) })
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hot-false.lua", .data = second });
+    app.script_dirty = true;
+    try app.ensureLoaded();
+    try expectLuaBoolean(&app, "migrated_flag", true);
 }
 
 test "hot state rejects non-plain data before crossing a generation" {
@@ -2699,14 +2900,14 @@ test "hot state rejects non-plain data before crossing a generation" {
     try std.testing.expectEqual(@as(u64, 1), app.reload_generation);
 }
 
-test "stateful hot family token survives compatible reload and changes with version" {
+test "component hot family token survives compatible reload and changes with version" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script_v1 =
         \\local kw = require("keywork")
-        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\local Counter = kw.component({ hot_id = "Counter", hot_version = 1,
         \\  build = function() return kw.text("one") end,
         \\})
         \\return kw.app({ child = Counter({}) })
@@ -2729,7 +2930,7 @@ test "stateful hot family token survives compatible reload and changes with vers
 
     const script_v2 =
         \\local kw = require("keywork")
-        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 2,
+        \\local Counter = kw.component({ hot_id = "Counter", hot_version = 2,
         \\  build = function() return kw.text("two") end,
         \\})
         \\return kw.app({ child = Counter({}) })
@@ -3237,7 +3438,7 @@ test "shared service starts once, fans out, and stops with its last subscriber" 
         \\local first = svc:use(s1, function(v) got1 = v end)
         \\local second = svc:use(s2, function(v) got2 = v end)
         \\assert(starts == 1)
-        \\assert(first == "ready" and second == "ready")
+        \\assert(first() == "ready" and second() == "ready")
         \\-- publish fans out to every subscriber
         \\svc:publish("update")
         \\assert(got1 == "update" and got2 == "update")
@@ -3253,7 +3454,7 @@ test "shared service starts once, fans out, and stops with its last subscriber" 
         \\local s3 = loop.scope()
         \\local third = svc:use(s3, function() end)
         \\assert(starts == 2)
-        \\assert(third == "ready")
+        \\assert(third() == "ready")
         \\return kw.app({ child = kw.text("service") })
         \\
     ;
@@ -3320,7 +3521,8 @@ test "reload resets stale service entries" {
         \\  loop.sleep(3600000)
         \\end)
         \\local scope = loop.scope()
-        \\snapshot = svc:use(scope, function() end)
+        \\local readable = svc:use(scope)
+        \\snapshot = readable()
         \\return kw.app({ child = kw.text("service-reload") })
         \\
     ;
@@ -3919,26 +4121,24 @@ test "lua dbus property sugar and proxies drive exported objects" {
     });
 }
 
-test "lua stateful widget set_state rebuilds retained subtree" {
+test "lua component signal rebuilds retained subtree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script =
         \\local kw = require("keywork")
-        \\local Counter = kw.stateful({
+        \\local Counter = kw.component({
         \\  init = function(self)
-        \\    self.count = 0
+        \\    self.count = kw.signal(0)
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.pressable({ id = "counter", child = kw.text(tostring(self.count)), on_activate = function()
-        \\      self:set_state(function(s)
-        \\        s.count = s.count + 1
-        \\      end)
+        \\    return kw.pressable({ id = "counter", child = kw.text(tostring(self.count())), on_activate = function()
+        \\      self.count:update(function(count) return count + 1 end)
         \\    end })
         \\  end,
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  build = function(self, state)
         \\    return Counter({ key = "counter" })
         \\  end,
@@ -3963,7 +4163,7 @@ test "lua stateful widget set_state rebuilds retained subtree" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"1\"") != null);
 }
 
-test "stateful start reruns with new code and scope while init state survives reload" {
+test "component start reruns with new code and scope while init state survives reload" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3972,7 +4172,7 @@ test "stateful start reruns with new code and scope while init state survives re
         \\local kw = require("keywork")
         \\init_count = init_count or 0
         \\start_count = start_count or 0
-        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\local Counter = kw.component({ hot_id = "Counter", hot_version = 1,
         \\  init = function(self)
         \\    init_count = init_count + 1
         \\    self.count = 7
@@ -3999,7 +4199,7 @@ test "stateful start reruns with new code and scope while init state survives re
 
     const second =
         \\local kw = require("keywork")
-        \\local Counter = kw.stateful({ hot_id = "Counter", hot_version = 1,
+        \\local Counter = kw.component({ hot_id = "Counter", hot_version = 1,
         \\  init = function(self)
         \\    init_count = init_count + 100
         \\    self.count = 99
@@ -4027,17 +4227,18 @@ test "stateful start reruns with new code and scope while init state survives re
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "value=\"new:7\"") != null);
 }
 
-test "lua stateful widget prefers its build scope invalidator" {
+test "lua component signal prefers its build scope invalidator" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script =
         \\local kw = require("keywork")
-        \\local Counter = kw.stateful({
+        \\local count = kw.signal(0)
+        \\local Counter = kw.component({
         \\  build = function(self, state)
-        \\    return kw.pressable({ id = "counter", child = kw.text("counter"), on_activate = function()
-        \\      self:set_state()
+        \\    return kw.pressable({ id = "counter", child = kw.text(tostring(count())), on_activate = function()
+        \\      count:update(function(value) return value + 1 end)
         \\    end })
         \\  end,
         \\})
@@ -4100,7 +4301,7 @@ test "lua stateful widget prefers its build scope invalidator" {
     try std.testing.expectEqual(@as(usize, 0), global_invalidator.calls);
 }
 
-test "lua stateful widget dispose runs when removed" {
+test "lua component dispose runs when removed" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4108,7 +4309,7 @@ test "lua stateful widget dispose runs when removed" {
     const script =
         \\local kw = require("keywork")
         \\disposed = false
-        \\local Child = kw.stateful({
+        \\local Child = kw.component({
         \\  dispose = function(self)
         \\    disposed = true
         \\  end,
@@ -4116,16 +4317,14 @@ test "lua stateful widget dispose runs when removed" {
         \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
         \\  end,
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
-        \\    self.show = true
+        \\    self.show = kw.signal(true)
         \\  end,
         \\  build = function(self, state)
-        \\    if self.show then
+        \\    if self.show() then
         \\      return Child({ key = "child", on_remove = function()
-        \\        self:set_state(function(s)
-        \\          s.show = false
-        \\        end)
+        \\        self.show:set(false)
         \\      end })
         \\    end
         \\    return kw.text("gone")
@@ -4151,40 +4350,36 @@ test "lua stateful widget dispose runs when removed" {
     try expectLuaBoolean(&app, "disposed", true);
 }
 
-test "lua stateful set_state is inert after dispose" {
+test "stale signal update is safe after component dispose" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A callback may retain the state table (via self) past dispose. The
-    // stale set_state must be a safe no-op that neither errors nor marks
-    // the freed state dirty.
+    // A callback may retain a signal past dispose. Its dependency has been
+    // unlinked, so a stale write is safe and cannot dirty the freed subtree.
     const script =
         \\local kw = require("keywork")
         \\disposed = false
-        \\local Child = kw.stateful({
+        \\local Child = kw.component({
         \\  init = function(self)
-        \\    stale_set_state = function()
-        \\      self:set_state(function(s) s.poked = true end)
-        \\    end
+        \\    self.poked = kw.signal(false)
+        \\    stale_signal_update = function() self.poked:set(true) end
         \\  end,
         \\  dispose = function(self)
         \\    disposed = true
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text(tostring(self.poked())), on_activate = self.props.on_remove })
         \\  end,
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
-        \\    self.show = true
+        \\    self.show = kw.signal(true)
         \\  end,
         \\  build = function(self, state)
-        \\    if self.show then
+        \\    if self.show() then
         \\      return Child({ key = "child", on_remove = function()
-        \\        self:set_state(function(s)
-        \\          s.show = false
-        \\        end)
+        \\        self.show:set(false)
         \\      end })
         \\    end
         \\    return kw.text("gone")
@@ -4208,7 +4403,7 @@ test "lua stateful set_state is inert after dispose" {
 
     try expectLuaBoolean(&app, "disposed", true);
 
-    c.lua_getglobal(app.state, "stale_set_state");
+    c.lua_getglobal(app.state, "stale_signal_update");
     try std.testing.expectEqual(c.LUA_TFUNCTION, c.lua_type(app.state, -1));
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
 }
@@ -4226,7 +4421,7 @@ test "widget scope is canceled on the loop turn after dispose" {
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
         \\scope_task_woke = false
-        \\local Child = kw.stateful({
+        \\local Child = kw.component({
         \\  init = function(self)
         \\    self.scope:spawn(function()
         \\      loop.sleep(3600000)
@@ -4237,16 +4432,14 @@ test "widget scope is canceled on the loop turn after dispose" {
         \\    return kw.pressable({ id = "remove", child = kw.text("remove"), on_activate = self.props.on_remove })
         \\  end,
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
-        \\    self.show = true
+        \\    self.show = kw.signal(true)
         \\  end,
         \\  build = function(self, state)
-        \\    if self.show then
+        \\    if self.show() then
         \\      return Child({ key = "child", on_remove = function()
-        \\        self:set_state(function(s)
-        \\          s.show = false
-        \\        end)
+        \\        self.show:set(false)
         \\      end })
         \\    end
         \\    return kw.text("gone")
@@ -4323,26 +4516,22 @@ test "widget dispose releases its service subscription" {
         \\  loop.sleep(3600000)
         \\  service_unwound = true
         \\end)
-        \\local Child = kw.stateful({
+        \\local Child = kw.component({
         \\  init = function(self)
-        \\    self.snapshot = svc:use(self.scope, function(v)
-        \\      self:set_state(function(s) s.snapshot = v end)
-        \\    end)
+        \\    self.snapshot = svc:use(self.scope)
         \\  end,
         \\  build = function(self, state)
-        \\    return kw.pressable({ id = "remove", child = kw.text(self.snapshot or "none"), on_activate = self.props.on_remove })
+        \\    return kw.pressable({ id = "remove", child = kw.text(self.snapshot() or "none"), on_activate = self.props.on_remove })
         \\  end,
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
-        \\    self.show = true
+        \\    self.show = kw.signal(true)
         \\  end,
         \\  build = function(self, state)
-        \\    if self.show then
+        \\    if self.show() then
         \\      return Child({ key = "child", on_remove = function()
-        \\        self:set_state(function(s)
-        \\          s.show = false
-        \\        end)
+        \\        self.show:set(false)
         \\      end })
         \\    end
         \\    return kw.text("gone")
@@ -4535,7 +4724,7 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     try std.testing.expect(app.fd_watches.items[0].canceled);
 }
 
-test "lua stateful build context keeps ambient component theme" {
+test "lua component build context keeps ambient component theme" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4548,7 +4737,7 @@ test "lua stateful build context keeps ambient component theme" {
         \\    background = 0xffff0000,
         \\  } },
         \\}), "dark")
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  build = function(self, context)
         \\    local tag = context.theme.components.tag
         \\    local status = context.theme.color_scheme == "dark"
@@ -4608,7 +4797,7 @@ test "lua resolves theme families and component tokens" {
         \\    },
         \\  },
         \\})
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  build = function(self, context)
         \\    return kw.theme({
         \\      data = kw.resolve_theme(theme_family, context),
@@ -4816,6 +5005,117 @@ test "lua window declarations preserve numeric sizes and accept content height" 
     try std.testing.expect(declarations[1].layer_shell.?.pointer_interactivity == .none);
 }
 
+test "lua windows automatically reconcile tracked signal changes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local visible = kw.signal(false)
+        \\set_window_visible = function(value) visible:set(value) end
+        \\return kw.app({
+        \\  windows = function()
+        \\    if not visible() then return {} end
+        \\    return { kw.window({ id = "tracked", child = kw.text("tracked") }) }
+        \\  end,
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "tracked-windows.lua", script);
+    defer app.deinit();
+
+    const Counter = struct {
+        calls: usize = 0,
+
+        fn invalidate(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var counter: Counter = .{};
+    app.bindInvalidator(.{
+        .ptr = &counter,
+        .invalidate_fn = Counter.invalidate,
+        .invalidate_state_fn = Counter.invalidate,
+        .reconcile_fn = Counter.invalidate,
+    });
+
+    var first_arena = std.heap.ArenaAllocator.init(allocator);
+    defer first_arena.deinit();
+    const first = try app.buildWindowDecls(first_arena.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+
+    c.lua_getglobal(app.state, "set_window_visible");
+    c.lua_pushboolean(app.state, 1);
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 1, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+
+    var second_arena = std.heap.ArenaAllocator.init(allocator);
+    defer second_arena.deinit();
+    const second = try app.buildWindowDecls(second_arena.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqualStrings("tracked", second[0].id);
+
+    c.lua_getglobal(app.state, "set_window_visible");
+    c.lua_pushboolean(app.state, 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 1, 0, 0));
+    try std.testing.expectEqual(@as(usize, 2), counter.calls);
+}
+
+test "lua root-declared deferred builders track signals" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\local content = kw.signal("first")
+        \\set_root_content = function(value) content:set(value) end
+        \\return kw.app({
+        \\  windows = function()
+        \\    local popover = kw.popover({
+        \\      id = "root-popover", anchor = kw.text("anchor"), open = true,
+        \\      content = function() return kw.text(content()) end,
+        \\    })
+        \\    read_root_content = function() return popover.popup.content({}) end
+        \\    return { kw.window({ id = "root", child = popover }) }
+        \\  end,
+        \\})
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "root-deferred.lua", script);
+    defer app.deinit();
+
+    const Counter = struct {
+        calls: usize = 0,
+
+        fn invalidate(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var counter: Counter = .{};
+    app.bindInvalidator(.{
+        .ptr = &counter,
+        .invalidate_fn = Counter.invalidate,
+        .invalidate_state_fn = Counter.invalidate,
+        .reconcile_fn = Counter.invalidate,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try app.buildWindowDecls(arena.allocator(), .{});
+
+    c.lua_getglobal(app.state, "read_root_content");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 1, 0));
+    pop(app.state, 1);
+    c.lua_getglobal(app.state, "set_root_content");
+    c.lua_pushliteral(app.state, "second");
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 1, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+}
+
 test "lua managed window on_close callback is retained by id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4894,7 +5194,7 @@ test "lua loop fs_event observes file changes" {
         \\
         \\fs_event_seen = false
         \\fs_event_path = ""
-        \\local App = kw.stateful({{
+        \\local App = kw.component({{
         \\  init = function(self)
         \\    self.watch = loop.fs_event({{ path = "{s}" }})
         \\    loop.spawn(function()
@@ -4961,7 +5261,7 @@ test "lua process spawn captures stdout and exit" {
         \\
         \\spawn_done = false
         \\spawn_output = ""
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
         \\    self.proc = process.spawn({
         \\      argv = { "/usr/bin/printf", "hello" },
@@ -5191,7 +5491,7 @@ test "lua process.capture collects output and exit status" {
         \\
         \\capture_done = false
         \\capture_ok = false
-        \\local App = kw.stateful({
+        \\local App = kw.component({
         \\  init = function(self)
         \\    loop.spawn(function()
         \\      local result = process.capture({

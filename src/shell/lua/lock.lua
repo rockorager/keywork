@@ -22,7 +22,8 @@ if not pam_policy_installed() then
 end
 
 local username = os.getenv("USER") or "User"
-local status = nil
+---@type keywork.Signal<string?>
+local status = kw.signal(nil)
 
 local function avatar_path()
     local home = os.getenv("HOME")
@@ -40,21 +41,18 @@ local user_avatar_path = avatar_path()
 
 local function submit(password)
     if password == "" then
-        status = "Enter your password"
-        kw.app.invalidate()
+        status:set("Enter your password")
         return
     end
 
     if not auth.authenticate(password) then
-        status = "Authentication failed"
-        kw.app.invalidate()
+        status:set("Authentication failed")
         return
     end
 
     local ok, err = kw.session_lock.unlock()
     if not ok then
-        status = "Could not unlock: " .. tostring(err)
-        kw.app.invalidate()
+        status:set("Could not unlock: " .. tostring(err))
         return
     end
     kw.app.quit()
@@ -92,7 +90,7 @@ return kw.app({
                     key = "lock-view",
                     username = username,
                     avatar_path = user_avatar_path,
-                    status = status,
+                    status = status(),
                     on_submit = submit,
                 })
             end

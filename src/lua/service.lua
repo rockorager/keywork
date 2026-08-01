@@ -12,6 +12,7 @@
 --- and reset on the next use.
 
 local loop = require("keywork.loop")
+local reactive = require("keywork.reactive")
 
 local registry = {}
 
@@ -24,6 +25,7 @@ local function reset(svc)
     svc.state = nil
     svc.subscribers = {}
     svc.count = 0
+    if svc.value then svc.value:set(nil) end
 end
 
 local function dead(svc)
@@ -35,13 +37,14 @@ end
 --- refresh.
 function Service:publish(value)
     self.state = value
+    self.value:set(value)
     for _, on_change in pairs(self.subscribers) do
-        on_change(value)
+        if on_change then on_change(value) end
     end
 end
 
---- Subscribes `on_change` for the lifetime of `scope` and returns the
---- current snapshot (nil until the service first publishes). The first
+--- Acquires the service for the lifetime of `scope` and returns its readable
+--- snapshot signal (nil until the service first publishes). The first
 --- subscriber starts the service; scope cancellation releases the
 --- subscription, and the last release stops the service. A service whose
 --- body settled (finished or failed) is restarted by the next use.
@@ -76,7 +79,7 @@ function Service:use(scope, on_change)
         end
     end)
 
-    return self.state
+    return self.readonly
 end
 
 local service = {}
@@ -92,7 +95,13 @@ function service.define(name, start)
         existing.start = start
         return existing
     end
-    local svc = setmetatable({ name = name, start = start }, Service)
+    local value = reactive.signal(nil)
+    local svc = setmetatable({
+        name = name,
+        start = start,
+        value = value,
+        readonly = value:readonly(),
+    }, Service)
     reset(svc)
     registry[name] = svc
     return svc

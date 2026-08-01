@@ -44,12 +44,13 @@ The bundled Keywork icon theme is generated in the Zig cache from the pinned
 Fluent package dependency and installed under `share/icons`; generated SVGs
 are not checked into the repository.
 
-Zig 0.16, Go 1.26, and the native development libraries used by the products
-are developer prerequisites. Node.js and npm are required for browser SDK
-package validation and release packaging. The software streaming backend uses
-FFmpeg at runtime. Shell linting and formatting additionally require
-`emmylua_check` and `luafmt`; this repository does not install or select tools
-or system packages.
+Zig 0.16, Go 1.26, Meson, Ninja, and the native development libraries used by
+the products are developer prerequisites. Meson and Ninja build the pinned
+static Wayland libraries in Zig's build graph. Node.js and npm are required for
+browser SDK package validation and release packaging. The software streaming
+backend uses FFmpeg at runtime. Shell linting and formatting additionally
+require `emmylua_check` and `luafmt`; this repository does not install or select
+tools or system packages.
 
 Common commands:
 
@@ -82,6 +83,70 @@ run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
 are available from the repository root. The native example opens a Wayland
 window without compiling or linking LuaJIT.
 
+## Shell bar configuration
+
+`keywork-shell` loads `$XDG_CONFIG_HOME/keywork/shell/init.lua` when it exists
+and otherwise uses the built-in shell configuration. `KEYWORK_SHELL_CONFIG`
+selects an explicit entry point. A user entry point calls the public shell
+factory and declares ordered bar items:
+
+```lua
+local shell = require("shell")
+local hostname = require("modules.hostname")
+
+return shell.app({
+    bar = {
+        height = 40,
+        right = {
+            shell.bar.tray({ outputs = "first" }),
+            shell.bar.volume(),
+            shell.bar.network(),
+            hostname(),
+            shell.bar.battery({ show_percent = true }),
+            shell.bar.clock({ format = "%a %b %d  %I:%M %p" }),
+        },
+    },
+})
+```
+
+Omitted `left` or `right` lists retain that side's built-in defaults; an empty
+list disables it. Items appear on every output by default. Set `outputs` to
+`"first"`, an output name, or a list of output names to limit an item. Built-in
+constructors are `workspaces`, `tray`, `volume`, `network`, `battery`, and
+`clock`. The tray must target exactly one output because the shell owns one
+StatusNotifierWatcher name.
+
+Custom modules return the same item descriptors as the built-ins and build
+ordinary Keywork widgets:
+
+```lua
+-- $XDG_CONFIG_HOME/keywork/shell/modules/hostname.lua
+local shell = require("shell")
+
+return function(options)
+    options = options or {}
+    return shell.bar.item({
+        id = options.id or "hostname",
+        outputs = options.outputs,
+        widget = function(context)
+            return shell.bar.pill({
+                id = "hostname-pill",
+                icon = "computer",
+                label = os.getenv("HOSTNAME") or "host",
+                color = context.colors.foreground,
+            })
+        end,
+    })
+end
+```
+
+A custom item may return a `kw.component` and use scoped timers, processes,
+D-Bus, or `keywork.service` values exactly like any other Keywork application.
+Configuration is trusted Lua running inside the shell process, not a sandbox.
+The user entry point and its sibling Lua modules participate in explicit
+application reloads. Restart `keywork-shell` after creating or removing
+`init.lua`; entry-point selection happens at process startup.
+
 ## Application control and explicit reload
 
 Every hosted Lua application automatically exposes the runtime-owned
@@ -110,56 +175,84 @@ scopes, effects, tasks, and IPC resources restart. Compilation is the
 preservation boundary; if candidate execution fails after teardown, Keywork
 restarts the previous generation's lifecycle and reports the reload failure.
 
-Lua applications can opt specific state into Fast Refresh. Retained
-application data must be plain Lua tables containing only nil, booleans,
-numbers, strings, and other plain acyclic tables:
+Signals are the render-state API. Create state that affects build output with
+`kw.signal`, read it by calling the signal in `build`, and change it with
+`:set`, `:update`, or `:mutate`. A computed value tracks the signals it reads
+and is also read by calling it. Reads are tracked dynamically; writes are
+synchronous, while affected component rebuilds are deferred and coalesced by
+the runtime. Equality defaults to `rawequal`; use `:mutate` when changing a
+table in place, or pass an `equals` function when identity is not sufficient:
 
 ```lua
 local kw = require("keywork")
 
-local state = kw.app.hot.state("settings", {
-    version = 1,
-    init = function()
-        return { count = 0 }
+local Counter = kw.component({
+    hot_id = "Counter",
+    hot_version = 1,
+    init = function(self)
+        self.count = kw.signal(0)
+        self.label = kw.computed(function()
+            return "Count: " .. self.count()
+        end)
     end,
-    migrate = function(previous, previous_version)
-        return previous
+    build = function(self)
+        return kw.pressable({
+            on_activate = function()
+                self.count:update(function(value) return value + 1 end)
+            end,
+            child = kw.text(self.label()),
+        })
     end,
 })
 ```
 
-Changing `version` runs `migrate(previous, previous_version)` when provided,
-or resets through `init`. Stateful widgets retain their state when the source
-file, `hot_id`, and `hot_version` identify the same family:
+Components retain their mounted state when the source file, `hot_id`, and
+`hot_version` identify the same family. Their lifecycle remains
+`init`/`start`/`update`/`build`/`dispose`. Services expose readable signals
+from `:use(scope)`; call the returned signal in `build` rather than subscribing
+from a UI callback:
 
 ```lua
 local kw = require("keywork")
 local service = require("counter.service")
 
-local Counter = kw.stateful({
-    hot_id = "Counter",
-    hot_version = 1,
-    init = function(self)
-        self.count = 0
-    end,
+local ServiceCounter = kw.component({
     start = function(self)
-        self.subscription = service:use(self.scope, function(value)
-            self.value = value
-            self:set_state()
-        end)
+        self.value = service:use(self.scope)
     end,
     build = function(self)
-        return kw.text(tostring(self.count))
+        return kw.text(tostring(self.value()))
     end,
 })
 ```
 
-Changing `hot_id` or `hot_version` intentionally remounts the widget. Widget
-`init` creates durable widget state only on mount. `start` runs after `init` and
-again after every compatible reload with a fresh `self.scope`; subscriptions,
-tasks, timers, and other generation-owned effects belong there. Arbitrary
-closures, userdata, coroutine stacks, and Lua heaps are not patched or
-retained.
+Window-defining state uses a hot signal. Reading it inside `windows(ctx)`
+automatically reconciles the window set; no explicit invalidation is needed.
+Values retained through reload must be nil, booleans, numbers, strings, or
+plain acyclic tables. Increment `version` to run `migrate` (or reset to the
+initial value when no migration is supplied):
+
+```lua
+local launcher_open = kw.app.hot.signal("launcher-open", false, {
+    version = 2,
+    migrate = function(previous, previous_version)
+        return previous_version == 1 and previous == "open" or previous
+    end,
+})
+
+local app = kw.app({
+    windows = function(ctx)
+        return launcher_open() and { launcher_window(ctx) } or {}
+    end,
+})
+```
+
+Changing a component's `hot_id` or `hot_version` intentionally remounts it.
+`init` creates durable component state only on mount. `start` runs after
+`init` and again after every compatible reload with a fresh `self.scope`;
+tasks, timers, services, and other generation-owned effects belong there.
+Arbitrary closures, userdata, coroutine stacks, and Lua heaps are not patched
+or retained.
 
 GDM discovers session definitions only from system data directories and does
 not expand `$HOME` in `Exec`. The `install-gdm-session` step therefore runs the

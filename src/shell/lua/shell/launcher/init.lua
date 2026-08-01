@@ -69,7 +69,7 @@ local function run_action(self, entry, action)
     history.bump(self.counts, entry.id)
     if self.actions_open then
         self.actions_open = false
-        self:set_state()
+        self:mutate()
     end
     action.run({
         dismiss = function()
@@ -89,7 +89,7 @@ end
 
 local function close_actions(self)
     self.actions_open = false
-    self:set_state()
+    self:mutate()
 end
 
 local function toggle_actions(self)
@@ -102,7 +102,7 @@ local function toggle_actions(self)
     end
     self.actions_open = true
     self.action_selected = 1
-    self:set_state()
+    self:mutate()
 end
 
 local function set_query(self, text)
@@ -110,7 +110,7 @@ local function set_query(self, text)
     self.results = rank(self.entries, self.counts, text)
     self.selected = 1
     self.actions_open = false
-    self:set_state()
+    self:mutate()
 end
 
 local function move_selection(self, delta)
@@ -121,7 +121,7 @@ local function move_selection(self, delta)
             return
         end
         self.action_selected = math.max(1, math.min(count, self.action_selected + delta))
-        self:set_state()
+        self:mutate()
         return
     end
     local count = #self.results
@@ -129,7 +129,7 @@ local function move_selection(self, delta)
         return
     end
     self.selected = math.max(1, math.min(count, self.selected + delta))
-    self:set_state()
+    self:mutate()
 end
 
 local function search_field(self, theme)
@@ -173,7 +173,7 @@ local function result_row(self, index, entry, theme)
         on_hover = function(hovered)
             if hovered and not self.actions_open and self.selected ~= index then
                 self.selected = index
-                self:set_state()
+                self:mutate()
             end
         end,
         on_activate = function()
@@ -236,7 +236,7 @@ local function action_menu(self, entry)
                 on_hover = function(hovered)
                     if hovered and self.action_selected ~= index then
                         self.action_selected = index
-                        self:set_state()
+                        self:mutate()
                     end
                 end,
                 on_activate = function()
@@ -301,15 +301,21 @@ end
 
 -- Launcher view hosted inside the shell's launcher window. The window's
 -- existence is app state; props.on_dismiss asks the shell to drop it.
-local Launcher = kw.stateful({
+local Launcher = kw.component({
     hot_id = "Launcher",
-    hot_version = 1,
+    hot_version = 2,
     init = function(self)
+        self.revision = kw.signal(0)
         self.counts = history.load()
         self.query = ""
         self.selected = 1
         self.actions_open = false
         self.action_selected = 1
+    end,
+
+    mutate = function(self, fn)
+        if fn then fn(self) end
+        self.revision:update(function(value) return value + 1 end)
     end,
 
     start = function(self)
@@ -323,6 +329,7 @@ local Launcher = kw.stateful({
     end,
 
     build = function(self, context)
+        self.revision()
         local theme = context.theme
 
         local content = kw.column({

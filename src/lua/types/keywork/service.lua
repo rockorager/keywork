@@ -3,17 +3,19 @@
 ---@class keywork.service.ServiceBase<T>
 ---@field name        string
 ---@field state?      T
----@field subscribers table<table, fun(value: T)>
+---@field subscribers table<table, fun(value: T)?>
 ---@field count       integer
 local ServiceBase = {}
 
 ---@param value T
 function ServiceBase:publish(value) end
 
---- Subscribes for the lifetime of `scope` and returns the latest snapshot.
+--- Acquires the service for the lifetime of `scope` and returns its readable
+--- snapshot signal. `on_change` is reserved for imperative source reactions;
+--- UI code should read the returned signal during component builds.
 ---@param scope     keywork.loop.Scope
----@param on_change fun(value: T)
----@return T?
+---@param on_change? fun(value: T)
+---@return keywork.ReadonlySignal<T?>
 function ServiceBase:use(scope, on_change) end
 
 ---@class keywork.service.Service<T>: keywork.service.ServiceBase<T>

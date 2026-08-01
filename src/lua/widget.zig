@@ -66,23 +66,15 @@ fn noReloadGeneration(_: *anyopaque) u64 {
     return 0;
 }
 
-fn luaSetState(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+fn luaInvalidateComponent(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
-    // A callback may retain the state table past dispose; a dead slot makes
-    // the stale set_state a no-op instead of touching freed memory.
+    // A signal may retain its component invalidator past dispose; a dead slot
+    // makes the stale callback a no-op instead of touching freed memory.
     const state = lua_handle.slotResource(LuaStatefulState, lua_state, c.lua_upvalueindex(1)) orelse return 0;
-    if (c.lua_type(lua_state, 2) == c.LUA_TFUNCTION) {
-        c.lua_pushvalue(lua_state, 2);
-        c.lua_pushvalue(lua_state, 1);
-        if (c.lua_pcall(lua_state, 1, 0, 0) != 0) {
-            failLuaCall(lua_state, "set_state callback failed") catch {};
-            return c.luaL_error(lua_state, "set_state callback failed");
-        }
-    }
     state.rebuild_generation +%= 1;
     state.host.invalidateState() catch |err| {
-        std.log.scoped(.keywork_luajit).warn("set_state invalidate failed: {}", .{err});
-        return c.luaL_error(lua_state, "set_state invalidate failed");
+        std.log.scoped(.keywork_luajit).warn("component invalidate failed: {}", .{err});
+        return c.luaL_error(lua_state, "component invalidate failed");
     };
     return 0;
 }
@@ -1472,7 +1464,7 @@ fn shortcutKeyFromString(value: []const u8) !keywork.ShortcutKey {
 
 fn installStateMethods(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int) void {
     state.slot_ref = lua_handle.createSlot(lua_state, state);
-    lua_value.setClosureField(lua_state, state_table, "set_state", luaSetState, 1);
+    lua_value.setClosureField(lua_state, state_table, "__invalidate", luaInvalidateComponent, 1);
 }
 
 fn installStateSpec(lua_state: *c.lua_State, state: *LuaStatefulState, state_table: c_int, spec: c_int) void {

@@ -443,12 +443,17 @@ local function create_tray_host(on_change)
     return host
 end
 
-local TrayItems = kw.stateful({
+local TrayItems = kw.component({
     hot_id = "TrayItems",
-    hot_version = 1,
+    hot_version = 2,
     init = function(self)
+        self.revision = kw.signal(0)
         self.menu_generation = 0
         self.menu_pages = {}
+    end,
+
+    mutate = function(self)
+        self.revision:update(function(value) return value + 1 end)
     end,
 
     start = function(self)
@@ -468,7 +473,7 @@ local TrayItems = kw.stateful({
                 self.menu_open = false
                 self.menu_loading = false
             end
-            self:set_state()
+            self:mutate()
         end)
     end,
 
@@ -490,7 +495,7 @@ local TrayItems = kw.stateful({
         self.menu_pages = {}
         self.menu_open = false
         self.menu_loading = false
-        self:set_state()
+        self:mutate()
     end,
 
     open_menu = function(self, item, event)
@@ -509,7 +514,7 @@ local TrayItems = kw.stateful({
         self.menu_pages = {}
         self.menu_open = true
         self.menu_loading = true
-        self:set_state()
+        self:mutate()
         loop.spawn(function()
             local root, err = self.host:read_menu(item, 0)
             if generation ~= self.menu_generation then
@@ -523,7 +528,7 @@ local TrayItems = kw.stateful({
             end
             self.menu_pages = { root }
             self.menu_loading = false
-            self:set_state()
+            self:mutate()
         end)
     end,
 
@@ -534,7 +539,7 @@ local TrayItems = kw.stateful({
         end
         local generation = self.menu_generation
         self.menu_loading = true
-        self:set_state()
+        self:mutate()
         self.host:menu_event(item, node.id, "opened")
         loop.spawn(function()
             local page, err = self.host:read_menu(item, node.id)
@@ -544,11 +549,11 @@ local TrayItems = kw.stateful({
             self.menu_loading = false
             if not page then
                 log.warn("tray submenu GetLayout failed", item.id, err or "unknown")
-                self:set_state()
+                self:mutate()
                 return
             end
             self.menu_pages[#self.menu_pages + 1] = page
-            self:set_state()
+            self:mutate()
         end)
     end,
 
@@ -558,7 +563,7 @@ local TrayItems = kw.stateful({
         end
         local page = table.remove(self.menu_pages)
         self.host:menu_event(self.menu_item, page.id, "closed")
-        self:set_state()
+        self:mutate()
     end,
 
     activate_menu_item = function(self, node)
@@ -575,6 +580,7 @@ local TrayItems = kw.stateful({
     end,
 
     build = function(self)
+        self.revision()
         if not self.host then
             return kw.row({ spacing = 0, children = {} })
         end
