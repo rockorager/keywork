@@ -11,6 +11,7 @@ const wayring = @import("wayring");
 const keywork_loop = @import("keywork-loop");
 const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
+const FixesGlobal = @import("FixesGlobal.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const SinglePixelBufferGlobal = @import("SinglePixelBufferGlobal.zig");
 const LinuxDmabufGlobal = @import("LinuxDmabufGlobal.zig");
@@ -62,6 +63,7 @@ commit_timing_timer: *EventLoop.Timer,
 commit_timing_clock: std.Io.Clock,
 commit_timing_armed_target: ?i96 = null,
 server: Server,
+fixes_global: FixesGlobal,
 shm_global: ShmGlobal,
 single_pixel_buffer_global: SinglePixelBufferGlobal,
 linux_dmabuf_global: LinuxDmabufGlobal,
@@ -401,6 +403,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     renderer_initialized = true;
     self.server = Server.init(allocator);
     errdefer self.server.deinit();
+    try self.fixes_global.init(&self.server);
+    errdefer self.fixes_global.deinit();
     try self.shm_global.init(allocator, &self.server);
     errdefer self.shm_global.deinit();
     try self.single_pixel_buffer_global.init(allocator, &self.server);
@@ -771,6 +775,7 @@ pub fn destroy(self: *NativeServer) void {
     self.shm_global.deinit();
     self.linux_drm_syncobj_global.deinit();
     self.linux_dmabuf_global.deinit();
+    self.fixes_global.deinit();
     self.server.deinit();
     switch (self.output) {
         .headless => |*output| output.deinit(),
