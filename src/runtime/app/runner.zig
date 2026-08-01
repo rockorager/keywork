@@ -76,8 +76,67 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
             runWaylandWindowed(allocator, loop, windows_host, options, wayland_vulkan.Backend)
         else
             runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
-        .wayring => runWayring(allocator, loop, app, options),
+        .wayring => if (options.windows_host) |windows_host|
+            runWayringWindowed(allocator, loop, windows_host, options)
+        else
+            runWayring(allocator, loop, app, options),
     };
+}
+
+fn runWayringWindowed(
+    allocator: std.mem.Allocator,
+    compatibility_loop: *event_loop.EventLoop,
+    windows_host: app_windows.WindowsHost,
+    options: Options,
+) !void {
+    const Manager = WindowManager(WayringBackend);
+    const backend = try WayringBackend.create(allocator);
+    defer backend.destroy();
+    if (options.session_lock) try backend.beginSessionLock();
+
+    const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(backend);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(wayring_platform);
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
+
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var manager: Manager = .{
+        .allocator = allocator,
+        .backend = backend,
+        .windows_host = windows_host,
+        .options = &options,
+        .raster_cache = &raster_cache,
+    };
+    defer manager.deinit();
+    backend.setOutputsChangedHandler(&manager, Manager.outputsChanged);
+
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(manager.invalidator());
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(compatibility_loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
+    try backend.installEventTimers(compatibility_loop);
+    defer backend.uninstallEventTimers();
+
+    try manager.reconcile();
+    if (manager.shouldQuit()) return;
+
+    if (!compatibility_loop.beginEmbedded()) return;
+    defer compatibility_loop.endEmbedded();
+    var compatibility: CompatibilityPoll = .{
+        .ring = backend.ioLoop(),
+        .loop = compatibility_loop,
+    };
+    try compatibility.arm();
+    defer compatibility.cancel() catch {};
+
+    while (compatibility_loop.isRunning() and !backend.isClosing()) {
+        if (compatibility.ready) try compatibility.dispatch();
+        try backend.runOnce();
+        if (compatibility.ready) try compatibility.dispatch();
+        try backend.drainDeferred();
+        try Manager.afterPlatformHook(&manager, compatibility_loop);
+        try Manager.endTurnHook(&manager, compatibility_loop);
+    }
 }
 
 fn runWayring(
@@ -86,7 +145,7 @@ fn runWayring(
     app: keywork.AppHost,
     options: Options,
 ) !void {
-    if (options.windows_host != null or options.layer_shell != null or options.session_lock)
+    if (options.layer_shell != null or options.session_lock)
         return error.UnsupportedWayringWindowMode;
 
     const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";

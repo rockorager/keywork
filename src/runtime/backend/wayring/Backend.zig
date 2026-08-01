@@ -13,6 +13,7 @@ const Clipboard = @import("Clipboard.zig");
 const Input = @import("Input.zig");
 const ProtocolWindow = @import("Window.zig");
 const wayland_options = @import("../wayland/options.zig");
+const wayland_window = @import("../wayland/window.zig");
 
 const IoUringLoop = keywork_loop.IoUringLoop;
 
@@ -55,8 +56,10 @@ pub const WindowOptions = struct {
     layer_shell: ?wayland_options.LayerShellOptions = null,
     background_blur: bool = false,
     output: ?wayring.ObjectHandle = null,
-    session_lock: ?*anyopaque = null,
+    session_lock: ?*SessionLock = null,
 };
+
+pub const SessionLock = struct {};
 
 const ActivationRequest = struct {
     handle: wayring.ObjectHandle,
@@ -340,6 +343,7 @@ pub fn destroy(self: *Backend) void {
     self.beginClose() catch {};
     while (!self.readyToDeinit() and loop.hasActiveOperations()) self.runOnce() catch break;
     std.debug.assert(self.readyToDeinit());
+    while (loop.hasActiveOperations()) loop.runOnce() catch break;
     self.deinit();
     loop.deinit();
     allocator.destroy(loop);
@@ -412,6 +416,48 @@ pub fn setOutputsChangedHandler(
 ) void {
     self.outputs_changed_context = context;
     self.outputs_changed_handler = handler;
+}
+
+pub fn ioLoop(self: *Backend) *IoUringLoop {
+    return self.loop;
+}
+
+pub fn beginSessionLock(_: *Backend) !void {
+    return error.SessionLockNotImplemented;
+}
+
+pub fn sessionLockHandle(_: *Backend) ?*SessionLock {
+    return null;
+}
+
+pub fn sessionLockFinished(_: *const Backend) bool {
+    return false;
+}
+
+pub fn sessionLockDenied(_: *const Backend) bool {
+    return false;
+}
+
+pub fn sessionLocked(_: *const Backend) bool {
+    return false;
+}
+
+pub fn unlockSession(_: *Backend) !void {
+    return error.SessionLockNotImplemented;
+}
+
+pub fn createPopup(_: *Backend, _: *Window, _: wayland_window.PopupOptions) !*Window {
+    return error.PopupNotImplemented;
+}
+
+pub fn setPopupKeyboardFocus(_: *Backend, _: *Window, _: bool) void {}
+
+pub fn repositionPopup(_: *Backend, _: *Window, _: wayland_window.PopupOptions, _: u32) !void {
+    return error.PopupNotImplemented;
+}
+
+pub fn requestLayerSize(_: *Backend, _: *Window, _: u31, _: u31) !void {
+    return error.LayerShellNotImplemented;
 }
 
 pub fn renderBackend(self: *Backend) !keywork.RenderBackend {
