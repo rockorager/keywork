@@ -142,6 +142,37 @@ pub const Buffer = struct {
         damage: ?[]const render.Rect,
         reuse: ?*Snapshot,
     ) !Snapshot {
+        var plan = try CopyPlan.init(allocator, self, damage, reuse);
+        defer plan.deinit();
+        for (plan.reads) |range|
+            try reader.read(reader.context, plan.buffer.pool.fd, range.offset, range.destination);
+        return plan.finish();
+    }
+};
+
+/// Owns a validated destination and the positional byte ranges needed to
+/// produce one snapshot. Adapters may submit every range independently, but
+/// must call `finish` only after each range was read in full.
+pub const CopyPlan = struct {
+    allocator: std.mem.Allocator,
+    buffer: Buffer,
+    pixels: []u32,
+    source_damage: ?[]render.Rect,
+    reads: []Read,
+    finished: bool = false,
+
+    pub const Read = struct {
+        offset: u64,
+        destination: []u8,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        buffer: Buffer,
+        damage: ?[]const render.Rect,
+        reuse: ?*Snapshot,
+    ) !CopyPlan {
+        const self = buffer;
         const pixel_count = std.math.mul(usize, self.width, self.height) catch
             return error.InvalidBuffer;
         const partial = reuse != null and damage != null and
@@ -158,61 +189,102 @@ pub const Buffer = struct {
         errdefer if (source_damage) |rectangles| allocator.free(rectangles);
         if (partial) source_damage = try clippedDamage(allocator, damage.?, self.size());
 
-        if (partial) {
+        const read_count: usize = if (partial) blk: {
+            var count: usize = 0;
             for (source_damage.?) |rectangle|
-                try self.readRectangle(reader, pixels, rectangle);
+                count = std.math.add(usize, count, rectangle.height) catch
+                    return error.InvalidBuffer;
+            break :blk count;
+        } else self.height;
+        const reads = try allocator.alloc(Read, read_count);
+        errdefer allocator.free(reads);
+        var index: usize = 0;
+        if (partial) {
+            for (source_damage.?) |rectangle| {
+                index = try appendRectangleReads(self, pixels, rectangle, reads, index);
+            }
         } else {
-            try self.readRectangle(reader, pixels, .{
+            index = try appendRectangleReads(self, pixels, .{
                 .x = 0,
                 .y = 0,
                 .width = self.width,
                 .height = self.height,
-            });
+            }, reads, index);
         }
-        if (self.format == .xrgb8888) {
+        std.debug.assert(index == reads.len);
+        return .{
+            .allocator = allocator,
+            .buffer = try self.clone(),
+            .pixels = pixels,
+            .source_damage = source_damage,
+            .reads = reads,
+        };
+    }
+
+    pub fn deinit(self: *CopyPlan) void {
+        self.buffer.deinit();
+        self.allocator.free(self.reads);
+        if (!self.finished) {
+            self.allocator.free(self.pixels);
+            if (self.source_damage) |damage| self.allocator.free(damage);
+        }
+        self.* = undefined;
+    }
+
+    pub fn finish(self: *CopyPlan) Snapshot {
+        std.debug.assert(!self.finished);
+        const buffer = self.buffer;
+        const partial = self.source_damage != null;
+        const pixels = self.pixels;
+        if (buffer.format == .xrgb8888) {
             if (partial) {
-                for (source_damage.?) |rectangle| forceOpaque(pixels, self.width, rectangle);
+                for (self.source_damage.?) |rectangle| forceOpaque(pixels, buffer.width, rectangle);
             } else {
                 for (pixels) |*pixel| pixel.* |= 0xff000000;
             }
         }
+        self.finished = true;
         return .{
-            .allocator = allocator,
-            .size = self.size(),
+            .allocator = self.allocator,
+            .size = buffer.size(),
             .pixels = pixels,
-            .force_opaque = self.format == .xrgb8888,
-            .source_damage = source_damage,
+            .force_opaque = buffer.format == .xrgb8888,
+            .source_damage = self.source_damage,
         };
     }
-
-    fn readRectangle(
-        self: Buffer,
-        reader: Reader,
-        pixels: []u32,
-        rectangle: render.Rect,
-    ) !void {
-        std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
-        const x: usize = @intCast(rectangle.x);
-        const y: usize = @intCast(rectangle.y);
-        for (0..rectangle.height) |row| {
-            const source_row = std.math.mul(usize, y + row, self.stride) catch
-                return error.InvalidBuffer;
-            const source_offset = std.math.add(
-                usize,
-                self.offset,
-                std.math.add(usize, source_row, x * @sizeOf(u32)) catch
-                    return error.InvalidBuffer,
-            ) catch return error.InvalidBuffer;
-            const destination_offset = (y + row) * self.width + x;
-            try reader.read(
-                reader.context,
-                self.pool.fd,
-                source_offset,
-                std.mem.sliceAsBytes(pixels[destination_offset..][0..rectangle.width]),
-            );
-        }
-    }
 };
+
+fn appendRectangleReads(
+    buffer: Buffer,
+    pixels: []u32,
+    rectangle: render.Rect,
+    reads: []CopyPlan.Read,
+    start_index: usize,
+) !usize {
+    std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
+    const x: usize = @intCast(rectangle.x);
+    const y: usize = @intCast(rectangle.y);
+    var index = start_index;
+    for (0..rectangle.height) |row| {
+        const source_row = std.math.mul(usize, y + row, buffer.stride) catch
+            return error.InvalidBuffer;
+        const source_offset = std.math.add(
+            usize,
+            buffer.offset,
+            std.math.add(usize, source_row, x * @sizeOf(u32)) catch
+                return error.InvalidBuffer,
+        ) catch return error.InvalidBuffer;
+        const destination_offset = (y + row) * buffer.width + x;
+        reads[index] = .{
+            .offset = source_offset,
+            .destination = std.mem.sliceAsBytes(
+                pixels[destination_offset..][0..rectangle.width],
+            ),
+        };
+        index += 1;
+    }
+    return index;
+}
 
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
