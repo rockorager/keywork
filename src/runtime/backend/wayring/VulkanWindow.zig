@@ -14,6 +14,7 @@ const vulkan_renderer = @import("../wayland/vulkan/renderer.zig");
 const VulkanRenderer = vulkan_renderer.Renderer;
 
 const TargetSet = vulkan_renderer.DmaBufTargets;
+pub const Candidate = DmaBufPresenter.Candidate;
 
 const Generation = struct {
     id: u64,
@@ -33,6 +34,7 @@ pub fn init(
     connection: *wayring.Connection,
     surface: wayring.ObjectHandle,
     factory: wayring.ObjectHandle,
+    compositor_candidates: []const Candidate,
 ) !VulkanWindow {
     var renderer = try VulkanRenderer.initDmaBuf(allocator);
     errdefer renderer.deinit();
@@ -48,6 +50,9 @@ pub fn init(
 
     var presenter = try DmaBufPresenter.init(allocator, connection, surface, factory);
     errdefer presenter.deinit();
+    for (compositor_candidates) |candidate| {
+        try presenter.addCandidate(@intFromEnum(candidate.format), candidate.modifier);
+    }
     return .{
         .allocator = allocator,
         .renderer = renderer,

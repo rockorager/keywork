@@ -104,6 +104,19 @@ pub fn candidates(self: *const DmaBufPresenter) []const Candidate {
     return self.compositor_candidates.items;
 }
 
+pub fn addCandidate(self: *DmaBufPresenter, format_value: u32, modifier: u64) !void {
+    const format: Format = switch (format_value) {
+        @intFromEnum(Format.argb8888) => .argb8888,
+        @intFromEnum(Format.xrgb8888) => .xrgb8888,
+        else => return,
+    };
+    const candidate: Candidate = .{ .format = format, .modifier = modifier };
+    for (self.compositor_candidates.items) |existing| {
+        if (std.meta.eql(existing, candidate)) return;
+    }
+    try self.compositor_candidates.append(self.allocator, candidate);
+}
+
 /// Device candidates are ordered by renderer preference and must already have
 /// passed Vulkan's plane-count, usage, and external-export checks.
 pub fn chooseCandidate(compositor: []const Candidate, device: []const Candidate) ?Candidate {
@@ -125,19 +138,10 @@ pub fn handleMessage(self: *DmaBufPresenter, message: *const wayring.Message) !v
         )) {
             .format => {}, // Version 3 modifier events are authoritative.
             .modifier => |event| {
-                const format: Format = switch (event.format) {
-                    @intFromEnum(Format.argb8888) => .argb8888,
-                    @intFromEnum(Format.xrgb8888) => .xrgb8888,
-                    else => return,
-                };
-                const candidate: Candidate = .{
-                    .format = format,
-                    .modifier = (@as(u64, event.modifier_hi) << 32) | event.modifier_lo,
-                };
-                for (self.compositor_candidates.items) |existing| {
-                    if (std.meta.eql(existing, candidate)) return;
-                }
-                try self.compositor_candidates.append(self.allocator, candidate);
+                try self.addCandidate(
+                    event.format,
+                    (@as(u64, event.modifier_hi) << 32) | event.modifier_lo,
+                );
             },
         }
         return;

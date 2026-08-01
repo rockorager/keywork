@@ -20,6 +20,13 @@ pub const Window = struct {
     toplevel: wayring.ObjectHandle,
 };
 
+pub const DmaBufCandidate = struct {
+    format: u32,
+    modifier: u64,
+};
+
+const SyncPhase = enum { globals, bindings };
+
 const Global = struct {
     name: u32,
     handle: wayring.ObjectHandle,
@@ -38,6 +45,8 @@ sync_callback: ?wayring.ObjectHandle,
 compositor: ?Global = null,
 wm_base: ?Global = null,
 dmabuf: ?Global = null,
+dmabuf_candidates: std.ArrayList(DmaBufCandidate) = .empty,
+sync_phase: SyncPhase = .globals,
 ready: bool = false,
 
 pub fn initFd(
@@ -111,6 +120,7 @@ pub fn readyToDeinit(self: *Client) bool {
 
 pub fn deinit(self: *Client) void {
     self.transport.deinit();
+    self.dmabuf_candidates.deinit(self.allocator);
     self.connection.deinit();
     self.* = undefined;
 }
@@ -121,6 +131,10 @@ pub fn isReady(self: *const Client) bool {
 
 pub fn dmaBufFactory(self: *const Client) ?wayring.ObjectHandle {
     return if (self.dmabuf) |global| global.handle else null;
+}
+
+pub fn dmaBufCandidates(self: *const Client) []const DmaBufCandidate {
+    return self.dmabuf_candidates.items;
 }
 
 pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Window {
@@ -187,8 +201,19 @@ fn dispatchMessages(self: *Client) !void {
                 self.sync_callback = null;
                 if (self.compositor == null or self.wm_base == null or self.dmabuf == null)
                     return error.MissingRequiredGlobal;
-                self.ready = true;
-                try self.notify(self.notify_context, self, .ready);
+                switch (self.sync_phase) {
+                    .globals => {
+                        self.sync_phase = .bindings;
+                        self.sync_callback = try protocol.wl_display_types.requests.sync(
+                            &self.connection,
+                            self.display,
+                        );
+                    },
+                    .bindings => {
+                        self.ready = true;
+                        try self.notify(self.notify_context, self, .ready);
+                    },
+                }
                 continue;
             }
             try self.dispatchApplicationMessage(&message);
@@ -200,6 +225,28 @@ fn dispatchMessages(self: *Client) !void {
 }
 
 fn dispatchApplicationMessage(self: *Client, message: *const wayring.Message) !void {
+    if (self.dmabuf) |global| {
+        if (message.object_id == global.handle.id) {
+            switch (try protocol.zwp_linux_dmabuf_v1_types.decodeEvent(
+                &self.connection,
+                global.handle,
+                message,
+            )) {
+                .format => {},
+                .modifier => |event| {
+                    const candidate: DmaBufCandidate = .{
+                        .format = event.format,
+                        .modifier = (@as(u64, event.modifier_hi) << 32) | event.modifier_lo,
+                    };
+                    for (self.dmabuf_candidates.items) |existing| {
+                        if (std.meta.eql(existing, candidate)) return;
+                    }
+                    try self.dmabuf_candidates.append(self.allocator, candidate);
+                },
+            }
+            return;
+        }
+    }
     if (self.wm_base) |global| {
         if (message.object_id == global.handle.id) {
             const ping = (try protocol.xdg_wm_base_types.decodeEvent(
@@ -285,7 +332,12 @@ test "io_uring client discovers and binds required globals" {
 
         fn clientNotify(context: *anyopaque, _: *Client, notification: Notification) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            if (notification == .ready) self.ready = true;
+            if (notification != .ready) return;
+            self.ready = true;
+            if (self.bind_count == 3) {
+                try self.client.shutdown();
+                try self.server.shutdown();
+            }
         }
 
         fn clientMessage(_: *anyopaque, _: *Client, _: *const wayring.Message) !void {
@@ -360,12 +412,17 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.zwp_linux_dmabuf_v1
                     else
                         return error.UnexpectedBind;
-                    _ = try registerServerObject(
+                    const bound = try registerServerObject(
                         transport.connection,
                         request.id,
                         interface,
                         request.new_version,
                     );
+                    if (interface == &protocol.zwp_linux_dmabuf_v1) {
+                        try transport.connection.queue(bound.id, 1, &.{
+                            .{ .uint = 0x34325241 }, .{ .uint = 0 }, .{ .uint = 7 },
+                        });
+                    }
                     self.bind_count += 1;
                 }
             }
@@ -418,6 +475,10 @@ test "io_uring client discovers and binds required globals" {
 
     try std.testing.expect(context.ready);
     try std.testing.expectEqual(@as(usize, 3), context.bind_count);
+    try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
+        .format = 0x34325241,
+        .modifier = 7,
+    }}, client.dmaBufCandidates());
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();
