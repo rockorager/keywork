@@ -446,9 +446,9 @@ test "generated client builds and commits an SHM xdg surface" {
     defer create_pool_message.deinit();
     const create_pool = (try generated.wl_shm_types.decodeRequest(&server, shm.server, &create_pool_message)).create_pool;
     try std.testing.expectEqual(client_pool.id, create_pool.id);
-    try std.testing.expectEqual(@as(usize, 0), create_pool.fd);
+    try std.testing.expectEqual(@as(usize, 1), create_pool.fd);
     try std.testing.expectEqual(shm_size, create_pool.size);
-    const received_shm_fd = try create_pool_message.takeFd(1);
+    const received_shm_fd = try create_pool_message.takeFd(create_pool.fd);
     defer _ = linux.close(received_shm_fd);
     const server_pool = try Harness.register(&server, create_pool.id, &generated.wl_shm_pool, generated.wl_shm_pool.version);
 

@@ -221,6 +221,10 @@ fn writeArgType(writer: *std.Io.Writer, arg_value: Arg, decoded: bool) !void {
 }
 
 fn writeDecodedValue(writer: *std.Io.Writer, arg_value: Arg, index: usize) !void {
+    // Message.takeFd addresses the protocol argument so it can validate that
+    // ownership is transferred only from an FD argument. The wire value is an
+    // internal index into Message.fds and must not leak through typed facades.
+    if (std.mem.eql(u8, arg_value.kind, "fd")) return writer.print("{d}", .{index});
     try writer.print("message.values[{d}].{s}", .{ index, arg_value.kind });
     if (!arg_value.nullable and (std.mem.eql(u8, arg_value.kind, "string") or
         std.mem.eql(u8, arg_value.kind, "object") or std.mem.eql(u8, arg_value.kind, "array")))
@@ -574,6 +578,7 @@ test "parse and generate complete descriptor fixture" {
     try std.testing.expect(std.mem.indexOf(u8, text, "pub const Request = union(enum)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pub fn decodeEvent(connection: *wayring.Connection") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.removeObject(handle.id, handle.generation);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".@\"fd\" = 6,") != null);
 }
 
 test "semantic errors are rejected" {
