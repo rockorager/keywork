@@ -141,6 +141,7 @@ pub const Surface = struct {
         std.debug.assert(self.references > 0);
         self.references -= 1;
         if (self.references != 0) return;
+        const client = self.client;
         self.pending_attachment.deinit();
         for (self.pending_callbacks.items) |callback|
             self.client.destroyResource(callback) catch {};
@@ -148,6 +149,7 @@ pub const Surface = struct {
         self.pending_buffer_damage.deinit(self.allocator);
         self.pending_surface_damage.deinit(self.allocator);
         self.allocator.destroy(self);
+        client.unreference();
     }
 };
 
@@ -219,6 +221,8 @@ fn dispatchCompositor(
             const surface = self.allocator.create(Surface) catch
                 return client.postNoMemory();
             errdefer self.allocator.destroy(surface);
+            client.reference() catch return client.postNoMemory();
+            errdefer client.unreference();
             surface.* = .{
                 .allocator = self.allocator,
                 .owner = self,

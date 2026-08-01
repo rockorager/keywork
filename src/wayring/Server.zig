@@ -81,6 +81,8 @@ pub const Client = struct {
     deferred_destroys: std.ArrayList(wayring.ObjectHandle) = .empty,
     state: ClientState = .active,
     dispatch_depth: usize = 0,
+    references: usize = 1,
+    transport_attached: bool = true,
 
     fn init(allocator: std.mem.Allocator, server: *Server) !Client {
         var client: Client = .{
@@ -103,7 +105,8 @@ pub const Client = struct {
         return client;
     }
 
-    fn deinit(self: *Client) void {
+    fn closeResources(self: *Client) void {
+        if (self.state == .closing) return;
         self.state = .closing;
         while (self.resources.count() != 0) {
             var iterator = self.resources.iterator();
@@ -114,12 +117,27 @@ pub const Client = struct {
                 destroy(resource.implementation.context, self, resource.handle);
             self.connection.removeObject(resource.handle.id, resource.handle.generation) catch {};
         }
+    }
+
+    fn deinit(self: *Client) void {
+        self.closeResources();
         self.deferred_destroys.deinit(self.allocator);
         self.retired_ids.deinit(self.allocator);
         self.registries.deinit(self.allocator);
         self.resources.deinit(self.allocator);
         self.connection.deinit();
         self.* = undefined;
+    }
+
+    /// Retains the client storage beyond transport teardown. Policy objects
+    /// that keep a client pointer after request dispatch must hold a reference.
+    pub fn reference(self: *Client) !void {
+        if (self.references == std.math.maxInt(usize)) return error.ReferenceOverflow;
+        self.references += 1;
+    }
+
+    pub fn unreference(self: *Client) void {
+        self.server.releaseClientReference(self);
     }
 
     /// Feeds one transport receive and dispatches every complete request.
@@ -370,6 +388,10 @@ pub fn init(allocator: std.mem.Allocator) Server {
 
 pub fn deinit(self: *Server) void {
     while (self.clients.pop()) |client| {
+        client.closeResources();
+        std.debug.assert(client.transport_attached and client.references == 1);
+        client.transport_attached = false;
+        client.references = 0;
         client.deinit();
         self.allocator.destroy(client);
     }
@@ -391,8 +413,19 @@ pub fn createClient(self: *Server) !*Client {
 /// Destroys a client after transport completions no longer reference it.
 pub fn destroyClient(self: *Server, client: *Client) !void {
     if (client.dispatch_depth != 0) return error.DispatchActive;
-    const index = std.mem.indexOfScalar(*Client, self.clients.items, client) orelse
-        return error.UnknownClient;
+    if (!client.transport_attached) return error.TransportDetached;
+    std.debug.assert(client.server == self);
+    client.closeResources();
+    client.transport_attached = false;
+    self.releaseClientReference(client);
+}
+
+fn releaseClientReference(self: *Server, client: *Client) void {
+    std.debug.assert(client.references > 0);
+    client.references -= 1;
+    if (client.references != 0) return;
+    std.debug.assert(!client.transport_attached and client.dispatch_depth == 0);
+    const index = std.mem.indexOfScalar(*Client, self.clients.items, client) orelse unreachable;
     _ = self.clients.orderedRemove(index);
     client.deinit();
     self.allocator.destroy(client);
@@ -953,6 +986,20 @@ test "global add and remove fan out to every registry" {
     defer second_remove.deinit();
     try std.testing.expectEqual(name, (try core.decodeRegistryEvent(&first_remove, 2)).global_remove);
     try std.testing.expectEqual(name, (try core.decodeRegistryEvent(&second_remove, 2)).global_remove);
+}
+
+test "retained policy state keeps client storage alive after transport teardown" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    const client = try server.createClient();
+    try client.reference();
+
+    try server.destroyClient(client);
+    try std.testing.expectEqual(ClientState.closing, client.state);
+    try std.testing.expectEqual(@as(usize, 1), server.clients.items.len);
+
+    client.unreference();
+    try std.testing.expectEqual(@as(usize, 0), server.clients.items.len);
 }
 
 fn readTestU32(bytes: []const u8) u32 {
