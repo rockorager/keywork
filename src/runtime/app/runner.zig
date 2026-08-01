@@ -784,7 +784,7 @@ fn PopupManager(comptime Backend: type) type {
             while (index < self.popups.items.len) {
                 const popup = self.popups.items[index];
                 const request = findRequest(requests.items, popup.id);
-                if (popup.win.protocol.closed) {
+                if (popup.win.isClosed()) {
                     // Compositor dismissal (grab break) reaches the app via
                     // on_close so state stops declaring the popup.
                     if (request) |req| if (req.popup.on_close) |on_close| {
@@ -1290,7 +1290,7 @@ fn WindowManager(comptime Backend: type) type {
                 return;
             }
             for (self.windows.items) |managed| {
-                if (managed.win.protocol.closed) self.reconcile_pending = true;
+                if (managed.win.isClosed()) self.reconcile_pending = true;
             }
             if (self.reconcile_pending) {
                 try self.reconcile();
@@ -1354,7 +1354,7 @@ fn WindowManager(comptime Backend: type) type {
             var index: usize = 0;
             while (index < self.windows.items.len) {
                 const managed = self.windows.items[index];
-                if (managed.win.protocol.closed) {
+                if (managed.win.isClosed()) {
                     // Remember compositor closes so the still-present
                     // declaration does not resurrect the window.
                     self.windows_host.windowClosed(managed.id) catch |err| {
@@ -1571,7 +1571,7 @@ fn WindowManager(comptime Backend: type) type {
                 .wait => false,
                 .request => |request| blk: {
                     if (managed.runtime.frame_content_rect) |rect| {
-                        try managed.win.protocol.setLayerContentRect(request.width, request.height, rect);
+                        try managed.win.setLayerContentRect(request.width, request.height, rect);
                     }
                     try managed.manager.backend.requestLayerSize(
                         managed.win,
