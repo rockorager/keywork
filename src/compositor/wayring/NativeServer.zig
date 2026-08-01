@@ -807,6 +807,7 @@ fn nativeKeyboardAvailable(context: *anyopaque, available: bool) void {
     if (!available) {
         self.routed_keys.clearRetainingCapacity();
         self.unattributed_keys.clearRetainingCapacity();
+        self.keyboard_modifiers = .{};
         self.last_keyboard_serial = 0;
     }
     self.refreshSeatCapabilities() catch self.terminate();
@@ -885,7 +886,10 @@ fn nativePointerAvailable(context: *anyopaque, available: bool) void {
         self.pointer_axis_source = null;
     }
     self.refreshSeatCapabilities() catch self.terminate();
-    if (available) self.refreshPointerFocus(0) catch self.terminate();
+    if (available) {
+        const moved = self.refreshPointerFocus(0) catch return self.terminate();
+        if (moved) self.seat_global.pointerFrame() catch self.terminate();
+    }
 }
 
 fn nativePointerMotion(
@@ -901,7 +905,7 @@ fn nativePointerMotion(
     self.pointer_physical_y = clampPointerCoordinate(y, size.height);
     if (self.native_input_initialized)
         self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
-    self.refreshPointerFocus(time) catch self.terminate();
+    _ = self.refreshPointerFocus(time) catch return self.terminate();
 }
 
 fn nativePointerRelativeMotion(
@@ -919,7 +923,8 @@ fn nativePointerRelativeMotion(
     self.pointer_physical_y = clampPointerCoordinate(self.pointer_physical_y + dy, size.height);
     if (self.native_input_initialized)
         self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
-    self.refreshPointerFocus(@truncate(time_microseconds / std.time.us_per_ms)) catch self.terminate();
+    _ = self.refreshPointerFocus(@truncate(time_microseconds / std.time.us_per_ms)) catch
+        return self.terminate();
 }
 
 fn nativePointerButton(
@@ -1215,7 +1220,7 @@ fn refreshKeyboardFocus(
             try self.keyboard_enter_keys.append(self.allocator, routed.key);
     const serial = try self.seat_global.keyboardEnter(
         target.?,
-        std.mem.sliceAsBytes(self.keyboard_enter_keys.items),
+        self.keyboard_enter_keys.items,
     );
     self.last_keyboard_serial = serial;
     try self.seat_global.keyboardModifiers(
@@ -1246,7 +1251,7 @@ fn routePointerButton(
 ) !void {
     switch (state) {
         .pressed => {
-            try self.refreshPointerFocus(time);
+            _ = try self.refreshPointerFocus(time);
             for (self.routed_buttons.items) |routed|
                 if (routed.device_id == device_id and routed.button == button) return;
             const already_held = self.buttonHeld(button);
@@ -1270,7 +1275,7 @@ fn routePointerButton(
     }
     _ = try self.seat_global.pointerButton(time, button, @intFromEnum(state));
     if (state == .released and self.routed_buttons.items.len == 0)
-        try self.refreshPointerFocus(time);
+        _ = try self.refreshPointerFocus(time);
 }
 
 fn releaseDeviceButtons(self: *NativeServer, device_id: NativeInput.DeviceId) !void {
@@ -1291,8 +1296,11 @@ fn releaseDeviceButtons(self: *NativeServer, device_id: NativeInput.DeviceId) !v
         );
         sent = true;
     }
-    if (self.routed_buttons.items.len == 0) try self.refreshPointerFocus(0);
-    if (sent) try self.seat_global.pointerFrame();
+    const moved = if (self.routed_buttons.items.len == 0)
+        try self.refreshPointerFocus(0)
+    else
+        false;
+    if (sent or moved) try self.seat_global.pointerFrame();
 }
 
 fn buttonHeld(self: *const NativeServer, button: u32) bool {
@@ -1300,8 +1308,8 @@ fn buttonHeld(self: *const NativeServer, button: u32) bool {
     return false;
 }
 
-fn refreshPointerFocus(self: *NativeServer, time: u32) !void {
-    if (!self.pointer_available) return;
+fn refreshPointerFocus(self: *NativeServer, time: u32) !bool {
+    if (!self.pointer_available) return false;
     if (self.routed_buttons.items.len != 0) {
         if (self.seat_global.pointerFocus()) |surface| {
             if (self.surfaceLocal(surface, self.pointerLogicalX(), self.pointerLogicalY())) |local|
@@ -1318,12 +1326,14 @@ fn refreshPointerFocus(self: *NativeServer, time: u32) !void {
         const x = fixedFromDouble(target.local_x);
         const y = fixedFromDouble(target.local_y);
         if (self.seat_global.pointerFocus() == target.surface) {
-            try self.seat_global.pointerMotion(time, x, y);
+            return self.seat_global.pointerMotion(time, x, y);
         } else {
             _ = try self.seat_global.pointerEnter(target.surface, x, y);
+            return false;
         }
     } else {
         _ = try self.seat_global.pointerLeave();
+        return false;
     }
 }
 
@@ -1531,7 +1541,8 @@ fn inputTime(self: *const NativeServer) u32 {
 }
 
 fn refreshInputFocus(self: *NativeServer, time: u32) !void {
-    if (self.pointer_available) try self.refreshPointerFocus(time);
+    if (self.pointer_available and try self.refreshPointerFocus(time))
+        try self.seat_global.pointerFrame();
     if (self.keyboard_available) try self.refreshKeyboardFocus(null);
     for (self.touch_routes.items) |route| {
         if (!self.surfaceActive(route.surface)) {
