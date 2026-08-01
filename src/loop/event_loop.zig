@@ -463,6 +463,59 @@ pub const EventLoop = struct {
         self.wake() catch {};
     }
 
+    /// Starts externally driven turns. A completion reactor may poll
+    /// `pollFd`, call `dispatchReady` for each readiness completion, and use
+    /// `isRunning` to observe `quit` without letting epoll perform the wait.
+    pub fn beginEmbedded(self: *EventLoop) bool {
+        if (self.stop_requested) {
+            self.stop_requested = false;
+            return false;
+        }
+        self.running = true;
+        return true;
+    }
+
+    pub fn endEmbedded(self: *EventLoop) void {
+        self.running = false;
+        self.stop_requested = false;
+    }
+
+    pub fn isRunning(self: *const EventLoop) bool {
+        return self.running;
+    }
+
+    pub fn pollFd(self: *const EventLoop) i32 {
+        return self.epoll_fd;
+    }
+
+    /// Prepares subordinate sources, drains the currently ready epoll batch
+    /// without waiting, and runs the normal platform/end-turn phases.
+    pub fn dispatchReady(self: *EventLoop) !void {
+        if (!self.running) return;
+        if (self.wayland) |wayland| {
+            const prepared = try wayland.prepare(wayland.ctx);
+            var event: linux.epoll_event = .{
+                .events = prepared.events,
+                .data = .{ .u64 = wayland_token },
+            };
+            try linuxVoid(linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, wayland.fd, &event));
+            if (prepared.dispatched_pending) {
+                try self.dispatchTurn(0, &.{});
+                return;
+            }
+        }
+        if (self.pre_poll) |source| {
+            if (try source.prepare(source.ctx)) {
+                try self.dispatchTurn(0, &.{});
+                return;
+            }
+        }
+
+        var events: [max_events]linux.epoll_event = undefined;
+        const ready = try epollWait(self.epoll_fd, &events, 0);
+        try self.dispatchEvents(events[0..ready]);
+    }
+
     pub fn run(self: *EventLoop) !void {
         if (self.stop_requested) {
             self.stop_requested = false;
@@ -502,23 +555,27 @@ pub const EventLoop = struct {
             }
 
             const ready = try epollWait(self.epoll_fd, &events, -1);
-            var wayland_events: u32 = 0;
-            var source_events: [max_events]linux.epoll_event = undefined;
-            var source_count: usize = 0;
-
-            for (events[0..ready]) |event| {
-                if (event.data.u64 == wake_token) {
-                    drainWake(self.wake_fd);
-                } else if (event.data.u64 == wayland_token) {
-                    wayland_events |= event.events;
-                } else {
-                    source_events[source_count] = event;
-                    source_count += 1;
-                }
-            }
-
-            try self.dispatchTurn(wayland_events, source_events[0..source_count]);
+            try self.dispatchEvents(events[0..ready]);
         }
+    }
+
+    fn dispatchEvents(self: *EventLoop, events: []const linux.epoll_event) !void {
+        var wayland_events: u32 = 0;
+        var source_events: [max_events]linux.epoll_event = undefined;
+        var source_count: usize = 0;
+
+        for (events) |event| {
+            if (event.data.u64 == wake_token) {
+                drainWake(self.wake_fd);
+            } else if (event.data.u64 == wayland_token) {
+                wayland_events |= event.events;
+            } else {
+                source_events[source_count] = event;
+                source_count += 1;
+            }
+        }
+
+        try self.dispatchTurn(wayland_events, source_events[0..source_count]);
     }
 
     fn dispatchTurn(self: *EventLoop, wayland_events: u32, source_events: []const linux.epoll_event) !void {
@@ -1051,6 +1108,46 @@ test "Wayland events dispatched during prepare run without polling" {
     try loop.run();
 
     try std.testing.expectEqualStrings("pfae", context.order[0..context.len]);
+}
+
+test "embedded turn drains ready sources without waiting" {
+    const Embedded = struct {
+        fd: i32,
+        fired: bool = false,
+
+        fn callback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            var value: u64 = 0;
+            const bytes = std.mem.asBytes(&value);
+            if (linux.errno(linux.read(self.fd, bytes.ptr, bytes.len)) != .SUCCESS)
+                return error.EventReadFailed;
+            self.fired = true;
+            loop.quit();
+        }
+    };
+
+    const fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
+    defer _ = linux.close(fd);
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Embedded = .{ .fd = fd };
+    _ = try loop.addFd(.{
+        .fd = fd,
+        .events = linux.EPOLL.IN,
+        .ctx = &context,
+        .callback = Embedded.callback,
+    });
+    const value: u64 = 1;
+    const bytes = std.mem.asBytes(&value);
+    if (linux.errno(linux.write(fd, bytes.ptr, bytes.len)) != .SUCCESS)
+        return error.EventWriteFailed;
+
+    try std.testing.expect(loop.beginEmbedded());
+    try std.testing.expect(loop.pollFd() >= 0);
+    try loop.dispatchReady();
+    try std.testing.expect(context.fired);
+    try std.testing.expect(!loop.isRunning());
+    loop.endEmbedded();
 }
 
 test {
