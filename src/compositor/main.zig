@@ -540,6 +540,8 @@ test {
     _ = @import("wayring/AsyncShmCopy.zig");
     _ = @import("wayring/XdgShell.zig");
     _ = @import("wayring/CompositorGlobal.zig");
+    _ = @import("wayring/SurfaceTree.zig");
+    _ = @import("wayring/SubcompositorGlobal.zig");
     _ = @import("wayring/ShmGlobal.zig");
     _ = @import("wayring/shm.zig");
     _ = @import("render/types.zig");

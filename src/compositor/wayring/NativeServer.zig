@@ -21,6 +21,8 @@ const SeatGlobal = @import("SeatGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
+const SurfaceTree = @import("SurfaceTree.zig");
+const SubcompositorGlobal = @import("SubcompositorGlobal.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
 const DrmSyncobj = @import("../drm_syncobj.zig");
@@ -40,6 +42,8 @@ shm_global: ShmGlobal,
 linux_dmabuf_global: LinuxDmabufGlobal,
 linux_drm_syncobj_global: LinuxDrmSyncobjGlobal,
 compositor_global: CompositorGlobal,
+surface_tree: SurfaceTree,
+subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
 fractional_scale_global: FractionalScaleGlobal,
@@ -155,6 +159,10 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.shm_global.deinit();
     try self.compositor_global.init(allocator, &self.server);
     errdefer self.compositor_global.deinit();
+    self.surface_tree = SurfaceTree.init(allocator);
+    errdefer self.surface_tree.deinit();
+    try self.subcompositor_global.init(allocator, &self.server, &self.compositor_global, &self.surface_tree);
+    errdefer self.subcompositor_global.deinit();
     try self.xdg_shell.init(allocator, &self.server);
     errdefer self.xdg_shell.deinit();
     self.renderer = try Renderer.init(allocator, options.renderer_kind);
@@ -347,6 +355,8 @@ pub fn destroy(self: *NativeServer) void {
     self.seat_global.deinit();
     self.output_global.deinit();
     self.xdg_shell.deinit();
+    self.subcompositor_global.deinit();
+    self.surface_tree.deinit();
     self.compositor_global.deinit();
     self.shm_global.deinit();
     self.linux_drm_syncobj_global.deinit();
@@ -375,7 +385,8 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     try self.intakeTransactions();
     try self.cancelDeadTransactions();
     try self.progressTransactions();
-    if (self.pruneSurfaces()) try self.renderScene(null);
+    const pruned = self.pruneSurfaces();
+    if (pruned or self.surface_tree.needsRedraw()) try self.renderScene(null);
 }
 
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
@@ -753,7 +764,10 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
         try self.applyEntry(commit, entry);
     }
-    const damage_state = if (pending.transaction.entries.len == 1)
+    for (pending.transaction.hierarchy_updates) |update| update.apply(update.context);
+    const damage_state = if (pending.transaction.entries.len == 1 and
+        pending.transaction.hierarchy_updates.len == 0 and
+        (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
         self.findState(pending.transaction.entries[0].surface)
     else
         null;
@@ -794,7 +808,14 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     var commands: std.ArrayList(render.Command) = .empty;
     defer commands.deinit(self.allocator);
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
+    var paint_entries: std.ArrayList(SurfaceTree.PaintEntry) = .empty;
+    defer paint_entries.deinit(self.allocator);
     for (self.surfaces.items) |state| {
+        const node = self.surface_tree.find(state.surface) orelse continue;
+        if (node.parent == null) try self.surface_tree.paint(node, &paint_entries);
+    }
+    for (paint_entries.items) |paint_entry| {
+        const state = self.findState(paint_entry.surface) orelse continue;
         if (!state.surface.resource_alive) continue;
         const pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
             const dmabuf = dmabuf_state.buffer.content.dmabuf;
@@ -818,8 +839,8 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             false,
         ) catch continue;
         try commands.append(self.allocator, .{ .image = .{
-            .x = state.x,
-            .y = state.y,
+            .x = paint_entry.x +| state.x,
+            .y = paint_entry.y +| state.y,
             .size = geometry.logical_size,
             .buffer = pixel_buffer,
             .source = geometry.source,
@@ -832,6 +853,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     try self.renderer.beginFrame(self.output.renderTarget(), self.output.scale, .{}, damage, .{});
     try self.renderer.append(commands.items);
     try self.renderer.finishFrame();
+    self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
     self.frame_count +%= 1;
 }
@@ -1064,9 +1086,9 @@ test "root-head scheduler preserves per-root FIFO and unrelated progress" {
     var pending_entries: [3][0]PendingEntry = .{ .{}, .{}, .{} };
     var transaction_entries: [3][0]CompositorGlobal.Commit = .{ .{}, .{}, .{} };
     var transactions = [_]PendingTransaction{
-        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[0] }, .entries = &pending_entries[0] },
-        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[1] }, .entries = &pending_entries[1] },
-        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_b, .entries = &transaction_entries[2] }, .entries = &pending_entries[2] },
+        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[0], .hierarchy_updates = &.{} }, .entries = &pending_entries[0] },
+        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_a, .entries = &transaction_entries[1], .hierarchy_updates = &.{} }, .entries = &pending_entries[1] },
+        .{ .transaction = .{ .allocator = std.testing.allocator, .root = root_b, .entries = &transaction_entries[2], .hierarchy_updates = &.{} }, .entries = &pending_entries[2] },
     };
     var pointers = [_]*PendingTransaction{ &transactions[0], &transactions[1], &transactions[2] };
     var server: NativeServer = undefined;

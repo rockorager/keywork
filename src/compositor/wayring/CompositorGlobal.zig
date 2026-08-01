@@ -19,6 +19,7 @@ allocator: std.mem.Allocator,
 server: *Server,
 global_name: u32,
 transactions: std.ArrayList(Transaction) = .empty,
+hierarchy_handler: ?HierarchyHandler = null,
 
 pub const BufferAttachment = struct {
     resource: wayring.ObjectHandle,
@@ -113,16 +114,37 @@ pub const Transaction = struct {
     allocator: std.mem.Allocator,
     root: *Surface,
     entries: []Commit,
+    hierarchy_updates: []HierarchyUpdate,
+
+    pub fn init(allocator: std.mem.Allocator, root: *Surface, entries: []Commit, updates: []HierarchyUpdate) !Transaction {
+        try root.reference();
+        return .{ .allocator = allocator, .root = root, .entries = entries, .hierarchy_updates = updates };
+    }
 
     pub fn deinit(self: *Transaction) void {
+        for (self.hierarchy_updates) |update| update.deinit(update.context);
+        self.allocator.free(self.hierarchy_updates);
         for (self.entries) |*commit| commit.deinit();
         self.allocator.free(self.entries);
+        self.root.unreference();
         self.* = undefined;
     }
 
     pub fn releaseBuffers(self: *Transaction) void {
         for (self.entries) |*commit| commit.releaseBuffer() catch {};
     }
+};
+
+pub const HierarchyUpdate = struct {
+    context: *anyopaque,
+    apply: *const fn (*anyopaque) void,
+    deinit: *const fn (*anyopaque) void,
+};
+
+pub const HierarchyHandler = struct {
+    context: *anyopaque,
+    commit: *const fn (*anyopaque, Commit) anyerror!void,
+    surface_destroyed: *const fn (*anyopaque, *Surface) void,
 };
 
 pub const PendingAttachment = enum {
@@ -246,14 +268,33 @@ pub fn init(self: *CompositorGlobal, allocator: std.mem.Allocator, server: *Serv
 
 pub fn deinit(self: *CompositorGlobal) void {
     self.server.removeGlobal(self.global_name) catch unreachable;
-    for (self.transactions.items) |*transaction| transaction.deinit();
+    self.hierarchy_handler = null;
+    for (self.transactions.items) |*transaction| {
+        transaction.releaseBuffers();
+        transaction.deinit();
+    }
     self.transactions.deinit(self.allocator);
-    self.* = undefined;
+    // Surface resources may be destroyed later by Server.deinit. They retain
+    // this owner only to observe that no hierarchy handler remains installed.
 }
 
 pub fn popTransaction(self: *CompositorGlobal) ?Transaction {
     if (self.transactions.items.len == 0) return null;
     return self.transactions.orderedRemove(0);
+}
+
+pub fn setHierarchyHandler(self: *CompositorGlobal, handler: HierarchyHandler) void {
+    std.debug.assert(self.hierarchy_handler == null);
+    self.hierarchy_handler = handler;
+}
+
+pub fn clearHierarchyHandler(self: *CompositorGlobal, context: *anyopaque) void {
+    std.debug.assert(self.hierarchy_handler.?.context == context);
+    self.hierarchy_handler = null;
+}
+
+pub fn enqueueTransaction(self: *CompositorGlobal, transaction: Transaction) !void {
+    try self.transactions.append(self.allocator, transaction);
 }
 
 pub fn surfaceFor(
@@ -463,27 +504,57 @@ fn queueCommit(surface: *Surface) !void {
     if (surface.explicit_sync_handler) |handler| {
         if (!handler.validate_commit(handler.context, attachment_kind)) return;
     }
-    owner.transactions.ensureUnusedCapacity(owner.allocator, 1) catch
+    const commit = takeCommit(surface, attachment_kind) catch
         return surface.client.postNoMemory();
-    const entries = owner.allocator.alloc(Commit, 1) catch
+    if (owner.hierarchy_handler) |handler| {
+        handler.commit(handler.context, commit) catch return surface.client.postNoMemory();
+        return;
+    }
+    const entries = owner.allocator.alloc(Commit, 1) catch {
+        var owned = commit;
+        owned.releaseBuffer() catch {};
+        owned.deinit();
         return surface.client.postNoMemory();
-    errdefer owner.allocator.free(entries);
+    };
+    entries[0] = commit;
+    const updates = owner.allocator.alloc(HierarchyUpdate, 0) catch {
+        entries[0].releaseBuffer() catch {};
+        entries[0].deinit();
+        owner.allocator.free(entries);
+        return surface.client.postNoMemory();
+    };
+    var transaction = Transaction.init(owner.allocator, surface, entries, updates) catch {
+        owner.allocator.free(updates);
+        entries[0].releaseBuffer() catch {};
+        entries[0].deinit();
+        owner.allocator.free(entries);
+        return surface.client.postNoMemory();
+    };
+    owner.transactions.append(owner.allocator, transaction) catch {
+        transaction.releaseBuffers();
+        transaction.deinit();
+        return surface.client.postNoMemory();
+    };
+}
+
+fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
+    const owner = surface.owner;
     const surface_damage = owner.allocator.dupe(
         render.Rect,
         surface.pending_surface_damage.items,
-    ) catch return surface.client.postNoMemory();
+    ) catch return error.OutOfMemory;
     errdefer owner.allocator.free(surface_damage);
     const buffer_damage = owner.allocator.dupe(
         render.Rect,
         surface.pending_buffer_damage.items,
-    ) catch return surface.client.postNoMemory();
+    ) catch return error.OutOfMemory;
     errdefer owner.allocator.free(buffer_damage);
     const frame_callbacks = owner.allocator.dupe(
         wayring.ObjectHandle,
         surface.pending_callbacks.items,
-    ) catch return surface.client.postNoMemory();
+    ) catch return error.OutOfMemory;
     errdefer owner.allocator.free(frame_callbacks);
-    surface.reference() catch return surface.client.postNoMemory();
+    surface.reference() catch return error.OutOfMemory;
     errdefer surface.unreference();
 
     surface.current_scale = surface.pending_scale;
@@ -500,7 +571,7 @@ fn queueCommit(surface: *Surface) !void {
         if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
     else
         null;
-    entries[0] = .{
+    return .{
         .allocator = owner.allocator,
         .surface = surface,
         .attachment = attachment,
@@ -514,11 +585,6 @@ fn queueCommit(surface: *Surface) !void {
         .viewport = surface.current_viewport,
         .synchronization = synchronization,
     };
-    owner.transactions.appendAssumeCapacity(.{
-        .allocator = owner.allocator,
-        .root = surface,
-        .entries = entries,
-    });
 }
 
 fn pendingAttachment(attachment: Attachment) PendingAttachment {
@@ -539,6 +605,8 @@ fn destroySurface(
 ) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
     surface.resource_alive = false;
+    if (surface.owner.hierarchy_handler) |handler|
+        handler.surface_destroyed(handler.context, surface);
     if (surface.role_destroyed) |destroyed| destroyed(surface.role_context.?);
     if (surface.explicit_sync_handler) |handler| {
         handler.surface_destroyed(handler.context);
