@@ -205,6 +205,39 @@ pub fn initPopup(
     );
 }
 
+pub fn initSessionLock(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    lock: wayring.ObjectHandle,
+    output: wayring.ObjectHandle,
+    default_width: u32,
+    default_height: u32,
+) !Window {
+    const base = try client.createSurface();
+    errdefer client.destroySurface(base);
+    const lock_surface = try protocol.ext_session_lock_v1_types.requests.get_lock_surface(
+        client.connectionPtr(),
+        lock,
+        base.surface,
+        output,
+    );
+    errdefer protocol.ext_session_lock_surface_v1_types.requests.destroy(
+        client.connectionPtr(),
+        lock_surface,
+    ) catch {};
+    try client.flush();
+    return initSurface(
+        allocator,
+        client,
+        base,
+        .{ .session_lock = lock_surface },
+        default_width,
+        default_height,
+        .{},
+        null,
+    );
+}
+
 fn initSurface(
     allocator: std.mem.Allocator,
     client: *Client,
@@ -415,6 +448,28 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
                 return .close;
             },
         }
+    }
+    if (self.role == .session_lock and message.object_id == self.role.session_lock.id) {
+        const configure = (try protocol.ext_session_lock_surface_v1_types.decodeEvent(
+            self.client.connectionPtr(),
+            self.role.session_lock,
+            message,
+        )).configure;
+        if (configure.width == 0 or configure.height == 0) return error.EmptySessionLockConfigure;
+        try protocol.ext_session_lock_surface_v1_types.requests.ack_configure(
+            self.client.connectionPtr(),
+            self.role.session_lock,
+            configure.serial,
+        );
+        self.width = configure.width;
+        self.height = configure.height;
+        self.pending_width = configure.width;
+        self.pending_height = configure.height;
+        try self.configureScale();
+        self.configured = true;
+        self.configure_generation +%= 1;
+        try self.client.flush();
+        return .configured;
     }
     if (self.frame_callback) |callback| {
         if (message.object_id == callback.id) {

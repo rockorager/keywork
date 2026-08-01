@@ -59,7 +59,13 @@ pub const WindowOptions = struct {
     session_lock: ?*SessionLock = null,
 };
 
-pub const SessionLock = struct {};
+pub const SessionLock = struct {
+    handle: ?wayring.ObjectHandle,
+    sync_callback: ?wayring.ObjectHandle = null,
+    state: LockState = .pending,
+
+    const LockState = enum { pending, locked, denied, unlocking, unlocked };
+};
 
 const ActivationRequest = struct {
     handle: wayring.ObjectHandle,
@@ -167,6 +173,7 @@ owned_loop: ?*IoUringLoop = null,
 client: Client,
 input: ?Input = null,
 clipboard: ?Clipboard = null,
+session_lock: ?SessionLock = null,
 windows: std.ArrayList(*Window) = .empty,
 main_window: ?*Window = null,
 options: Options,
@@ -304,6 +311,7 @@ pub fn beginClose(self: *Backend) !void {
         else => {},
     }
     self.state = .closing;
+    try self.closeSessionLock();
     for (self.windows.items) |window| try window.protocol.beginClose();
     try self.advanceClose();
 }
@@ -354,7 +362,27 @@ pub fn destroy(self: *Backend) void {
 
 pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
     if (self.state != .running) return error.ConnectionNotReady;
-    if (window_options.session_lock != null) return error.SessionLockNotImplemented;
+    if (window_options.session_lock) |lock| {
+        if (self.sessionLockHandle() != lock) return error.ForeignSessionLock;
+        const handle = lock.handle orelse return error.SessionLockFinished;
+        const output = window_options.output orelse return error.SessionLockRequiresOutput;
+        try self.windows.ensureUnusedCapacity(self.allocator, 1);
+        const window = try self.allocator.create(Window);
+        errdefer self.allocator.destroy(window);
+        window.* = .{
+            .backend = self,
+            .protocol = try ProtocolWindow.initSessionLock(
+                self.allocator,
+                &self.client,
+                handle,
+                output,
+                window_options.width,
+                window_options.height,
+            ),
+        };
+        self.windows.appendAssumeCapacity(window);
+        return window;
+    }
     if (window_options.layer_shell) |layer_options| {
         try self.windows.ensureUnusedCapacity(self.allocator, 1);
         const window = try self.allocator.create(Window);
@@ -396,18 +424,20 @@ pub fn destroyWindow(self: *Backend, window: *Window) void {
 }
 
 pub fn waitForConfigured(self: *Backend, window: *Window) !void {
-    while (!window.protocol.isConfigured() and !window.protocol.isClosed()) {
+    while (!window.protocol.isConfigured() and !window.protocol.isClosed() and !self.sessionLockFinished()) {
         if (!self.loop.hasActiveOperations()) return error.ConnectionStopped;
         try self.runOnce();
     }
+    if (self.sessionLockFinished()) return error.SessionLockFinished;
     if (window.protocol.isClosed()) return error.WindowClosed;
 }
 
 pub fn waitForConfigureAfter(self: *Backend, window: *Window, generation: u64) !void {
-    while (window.protocol.configureGeneration() == generation and !window.protocol.isClosed()) {
+    while (window.protocol.configureGeneration() == generation and !window.protocol.isClosed() and !self.sessionLockFinished()) {
         if (!self.loop.hasActiveOperations()) return error.ConnectionStopped;
         try self.runOnce();
     }
+    if (self.sessionLockFinished()) return error.SessionLockFinished;
     if (window.protocol.isClosed()) return error.WindowClosed;
 }
 
@@ -441,28 +471,40 @@ pub fn ioLoop(self: *Backend) *IoUringLoop {
     return self.loop;
 }
 
-pub fn beginSessionLock(_: *Backend) !void {
-    return error.SessionLockNotImplemented;
+pub fn beginSessionLock(self: *Backend) !void {
+    if (self.session_lock != null) return error.SessionLockAlreadyStarted;
+    const manager = self.client.sessionLockManager() orelse return error.NoSessionLock;
+    const handle = try protocol.ext_session_lock_manager_v1_types.requests.lock(
+        self.client.connectionPtr(),
+        manager,
+    );
+    self.session_lock = .{ .handle = handle };
+    try self.client.flush();
 }
 
-pub fn sessionLockHandle(_: *Backend) ?*SessionLock {
-    return null;
+pub fn sessionLockHandle(self: *Backend) ?*SessionLock {
+    return if (self.session_lock) |*lock| lock else null;
 }
 
-pub fn sessionLockFinished(_: *const Backend) bool {
-    return false;
+pub fn sessionLockFinished(self: *const Backend) bool {
+    return if (self.session_lock) |lock|
+        lock.state == .denied or lock.state == .unlocked
+    else
+        false;
 }
 
-pub fn sessionLockDenied(_: *const Backend) bool {
-    return false;
+pub fn sessionLockDenied(self: *const Backend) bool {
+    return if (self.session_lock) |lock| lock.state == .denied else false;
 }
 
-pub fn sessionLocked(_: *const Backend) bool {
-    return false;
+pub fn sessionLocked(self: *const Backend) bool {
+    return if (self.session_lock) |lock| lock.state == .locked else false;
 }
 
-pub fn unlockSession(_: *Backend) !void {
-    return error.SessionLockNotImplemented;
+pub fn unlockSession(self: *Backend) !void {
+    const lock = if (self.session_lock) |*value| value else return error.NoSessionLock;
+    if (lock.state != .locked) return error.SessionNotLocked;
+    try self.beginSessionUnlock(lock);
 }
 
 pub fn createPopup(
@@ -706,6 +748,10 @@ fn clientMessage(
     message: *wayring.Message,
 ) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
+    if (try self.handleSessionLockMessage(message)) {
+        if (self.state == .closing) try self.advanceClose();
+        return;
+    }
     if (self.activation_request) |request| {
         if (message.object_id == request.handle.id) {
             const done = (try protocol.xdg_activation_token_v1_types.decodeEvent(
@@ -801,6 +847,9 @@ fn inputEvent(context: *anyopaque, _: *Input, event: Input.Event) !void {
 
 fn advanceClose(self: *Backend) !void {
     for (self.windows.items) |window| if (!window.protocol.readyToDeinit()) return;
+    if (self.session_lock) |lock| {
+        if (lock.state != .denied and lock.state != .unlocked) return;
+    }
     try self.startTransportShutdown();
     self.updateClosed();
 }
@@ -824,6 +873,82 @@ fn cancelActivationRequest(self: *Backend) void {
         ) catch {};
     }
     self.activation_request = null;
+}
+
+fn handleSessionLockMessage(self: *Backend, message: *wayring.Message) !bool {
+    const lock = if (self.session_lock) |*value| value else return false;
+    if (lock.handle) |handle| {
+        if (message.object_id == handle.id) {
+            switch (try protocol.ext_session_lock_v1_types.decodeEvent(
+                self.client.connectionPtr(),
+                handle,
+                message,
+            )) {
+                .locked => lock.state = .locked,
+                .finished => if (lock.state == .locked) {
+                    try self.beginSessionUnlock(lock);
+                } else {
+                    try protocol.ext_session_lock_v1_types.requests.destroy(
+                        self.client.connectionPtr(),
+                        handle,
+                    );
+                    lock.handle = null;
+                    lock.state = .denied;
+                    try self.client.flush();
+                },
+            }
+            return true;
+        }
+    }
+    if (lock.sync_callback) |callback| {
+        if (message.object_id == callback.id) {
+            _ = try protocol.wl_callback_types.decodeEvent(
+                self.client.connectionPtr(),
+                callback,
+                message,
+            );
+            lock.sync_callback = null;
+            lock.state = .unlocked;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn beginSessionUnlock(self: *Backend, lock: *SessionLock) !void {
+    const handle = lock.handle orelse return error.SessionLockFinished;
+    try protocol.ext_session_lock_v1_types.requests.unlock_and_destroy(
+        self.client.connectionPtr(),
+        handle,
+    );
+    lock.handle = null;
+    lock.state = .unlocking;
+    lock.sync_callback = protocol.wl_display_types.requests.sync(
+        self.client.connectionPtr(),
+        self.client.displayHandle(),
+    ) catch {
+        try self.client.flush();
+        lock.state = .unlocked;
+        return;
+    };
+    try self.client.flush();
+}
+
+fn closeSessionLock(self: *Backend) !void {
+    const lock = if (self.session_lock) |*value| value else return;
+    switch (lock.state) {
+        .pending => {
+            if (lock.handle) |handle| try protocol.ext_session_lock_v1_types.requests.destroy(
+                self.client.connectionPtr(),
+                handle,
+            );
+            lock.handle = null;
+            lock.state = .unlocked;
+            try self.client.flush();
+        },
+        .locked => try self.beginSessionUnlock(lock),
+        .denied, .unlocking, .unlocked => {},
+    }
 }
 
 fn createXdgWindow(self: *Backend, window_options: Options) !*Window {

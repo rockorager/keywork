@@ -189,6 +189,10 @@ pub fn connectionPtr(self: *Client) *wayring.Connection {
     return &self.connection;
 }
 
+pub fn displayHandle(self: *const Client) wayring.ObjectHandle {
+    return self.display;
+}
+
 pub fn dmaBufFactory(self: *const Client) ?wayring.ObjectHandle {
     return if (self.dmabuf) |global| global.handle else null;
 }

@@ -197,12 +197,14 @@ pub fn WayringPlatform(comptime Backend: type) type {
             });
         }
 
-        fn unlockSession(_: *anyopaque) anyerror!void {
-            return error.UnsupportedWayringOperation;
+        fn unlockSession(ptr: *anyopaque) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.unlockSession();
         }
 
-        fn sessionLocked(_: *anyopaque) bool {
-            return false;
+        fn sessionLocked(ptr: *anyopaque) bool {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.sessionLocked();
         }
     };
 }
