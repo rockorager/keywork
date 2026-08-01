@@ -283,6 +283,13 @@ pub const Connection = struct {
         return self.messages.orderedRemove(0);
     }
 
+    /// Resumes parsing after a consumer registers every object introduced by
+    /// an incoming `new_id` message. Parsing pauses at constructors so a
+    /// coalesced following message can be resolved against the new object.
+    pub fn resumeParsing(self: *Connection) !void {
+        try self.parseAvailable();
+    }
+
     fn parseAvailable(self: *Connection) !void {
         while (self.input.items.len >= 8) {
             const object_id = readU32(self.input.items[0..4]);
@@ -319,6 +326,9 @@ pub const Connection = struct {
             });
             consumeFront(u8, &self.input, size);
             consumeFront(i32, &self.input_fds, fd_count);
+            for (descriptor.args) |argument| {
+                if (argument.kind == .new_id) return;
+            }
         }
     }
 
@@ -703,6 +713,48 @@ test "headers split at every boundary and coalesced frames" {
     defer a.deinit();
     var b = c.popMessage().?;
     defer b.deinit();
+}
+
+test "incoming constructors pause coalesced parsing until object registration" {
+    const Parent = struct {
+        const parent_events = [_]MessageDescriptor{.{
+            .name = "created",
+            .opcode = 0,
+            .args = &.{.{ .kind = .new_id }},
+        }};
+        const interface: Interface = .{ .name = "parent", .version = 1, .events = &parent_events };
+    };
+    const Child = struct {
+        const child_events = [_]MessageDescriptor{.{
+            .name = "value",
+            .opcode = 0,
+            .args = &.{.{ .kind = .uint }},
+        }};
+        const interface: Interface = .{ .name = "child", .version = 1, .events = &child_events };
+    };
+
+    var frames: [24]u8 = undefined;
+    writeU32(frames[0..4], 2);
+    writeU32(frames[4..8], 12 << 16);
+    writeU32(frames[8..12], server_object_id_start);
+    writeU32(frames[12..16], server_object_id_start);
+    writeU32(frames[16..20], 12 << 16);
+    writeU32(frames[20..24], 99);
+
+    var connection = Connection.init(std.testing.allocator, .client, 4096);
+    defer connection.deinit();
+    _ = try connection.registerObject(2, &Parent.interface, 1);
+    try connection.feed(&frames, &.{});
+    var created = connection.popMessage().?;
+    defer created.deinit();
+    try std.testing.expectEqual(server_object_id_start, created.values[0].new_id);
+    try std.testing.expect(connection.popMessage() == null);
+
+    _ = try connection.registerObject(server_object_id_start, &Child.interface, 1);
+    try connection.resumeParsing();
+    var value = connection.popMessage().?;
+    defer value.deinit();
+    try std.testing.expectEqual(@as(u32, 99), value.values[0].uint);
 }
 
 test "all argument shapes, ownership, padding, and FD waiting" {
