@@ -43,6 +43,7 @@ const Slot = struct {
 const Operation = struct {
     context: *anyopaque,
     callback: Callback,
+    submitted: bool = false,
     removed: bool = false,
 };
 
@@ -117,7 +118,7 @@ pub fn hasActiveOperations(self: *const IoUringLoop) bool {
 /// consumers should use `runOnce`; this is for code that must make queued I/O
 /// visible before it performs a bounded synchronous operation.
 pub fn submit(self: *IoUringLoop) !u32 {
-    return self.ring.submit();
+    return self.flushPending();
 }
 
 pub fn quit(self: *IoUringLoop) void {
@@ -144,6 +145,7 @@ pub fn pollOnce(self: *IoUringLoop) !void {
 fn runOnceWait(self: *IoUringLoop, wait: bool) !void {
     if (self.active_count == 0) return;
     _ = try self.ring.submit_and_wait(if (wait and self.ring.cq_ready() == 0) 1 else 0);
+    if (self.ring.sq_ready() == 0) self.markSubmitted();
 
     var cqes: [32]linux.io_uring_cqe = undefined;
     while (true) {
@@ -157,6 +159,7 @@ fn runOnceWait(self: *IoUringLoop, wait: bool) !void {
 }
 
 fn queueCancellation(self: *IoUringLoop, handle: Handle) !void {
+    try self.ensureSubmitted(handle);
     const cancel_handle = try self.allocate(self, cancellationComplete);
     errdefer self.release(cancel_handle);
     const sqe = try self.getSqe();
@@ -198,9 +201,36 @@ fn operation(self: *IoUringLoop, handle: Handle) ?*Operation {
 fn getSqe(self: *IoUringLoop) !*linux.io_uring_sqe {
     return self.ring.get_sqe() catch |err| switch (err) {
         error.SubmissionQueueFull => {
-            _ = try self.ring.submit();
+            _ = try self.flushPending();
             return try self.ring.get_sqe();
         },
+    };
+}
+
+/// io_uring resolves an SQE's numeric fd only when the kernel consumes the
+/// submission. Flush an unsubmitted cancellation target before its owner is
+/// allowed to close that fd, then cancellation can proceed asynchronously.
+fn ensureSubmitted(self: *IoUringLoop, handle: Handle) !void {
+    const operation_value = self.operation(handle) orelse return;
+    if (operation_value.submitted) return;
+    _ = try self.flushPending();
+    std.debug.assert(self.operation(handle).?.submitted);
+}
+
+fn flushPending(self: *IoUringLoop) !u32 {
+    var total: u32 = 0;
+    while (self.ring.sq_ready() != 0) {
+        const submitted = try self.ring.submit();
+        total += submitted;
+        if (submitted == 0 and self.ring.sq_ready() != 0) return error.SubmissionQueueStalled;
+    }
+    self.markSubmitted();
+    return total;
+}
+
+fn markSubmitted(self: *IoUringLoop) void {
+    for (self.slots.items) |*slot| if (slot.operation) |*operation_value| {
+        operation_value.submitted = true;
     };
 }
 
@@ -361,6 +391,41 @@ test "cancel preserves the target terminal completion" {
     const handle = try loop.queue(&context, Context.complete, &context, Context.prepare);
     try loop.cancel(handle);
     while (loop.hasActiveOperations()) try loop.runOnce();
+    try std.testing.expect(context.called);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), context.result);
+}
+
+test "cancel submits a queued fd operation before its owner closes the fd" {
+    const Context = struct {
+        fd: i32,
+        called: bool = false,
+        result: i32 = 0,
+
+        fn prepare(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            sqe.prep_poll_add(self.fd, linux.POLL.IN);
+        }
+
+        fn complete(context: *anyopaque, _: *IoUringLoop, completion: Completion) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+            self.result = completion.result;
+        }
+    };
+
+    var pipe: [2]i32 = undefined;
+    const pipe_result = linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (linux.errno(pipe_result) != .SUCCESS) return error.PipeFailed;
+
+    var loop = try IoUringLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{ .fd = pipe[0] };
+    const handle = try loop.queue(&context, Context.complete, &context, Context.prepare);
+    try loop.cancel(handle);
+    _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
+    while (loop.hasActiveOperations()) try loop.runOnce();
+
     try std.testing.expect(context.called);
     try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), context.result);
 }
