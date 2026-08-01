@@ -72,6 +72,7 @@ pub const Commit = struct {
     presentation_feedbacks: []*PresentationFeedback,
     content_type: ContentType,
     alpha_multiplier: u32,
+    presentation_hint: PresentationHint,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -273,6 +274,13 @@ pub const AlphaModifierHandler = struct {
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
+pub const TearingControlHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub const PresentationHint = generated.wp_tearing_control_v1_types.presentation_hint;
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -286,6 +294,7 @@ pub const Surface = struct {
     explicit_sync_handler: ?ExplicitSyncHandler = null,
     content_type_handler: ?ContentTypeHandler = null,
     alpha_modifier_handler: ?AlphaModifierHandler = null,
+    tearing_control_handler: ?TearingControlHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -295,6 +304,8 @@ pub const Surface = struct {
     current_content_type: ContentType = .none,
     pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
+    pending_presentation_hint: PresentationHint = .vsync,
+    current_presentation_hint: PresentationHint = .vsync,
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -364,6 +375,18 @@ pub const Surface = struct {
         std.debug.assert(handler.context == context);
         self.alpha_modifier_handler = null;
         self.pending_alpha_multiplier = std.math.maxInt(u32);
+    }
+
+    pub fn setTearingControlHandler(self: *Surface, handler: TearingControlHandler) !void {
+        if (self.tearing_control_handler != null) return error.AlreadyExists;
+        self.tearing_control_handler = handler;
+    }
+
+    pub fn resetTearingControl(self: *Surface, context: *anyopaque) void {
+        const handler = self.tearing_control_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.tearing_control_handler = null;
+        self.pending_presentation_hint = .vsync;
     }
 
     pub fn reference(self: *Surface) !void {
@@ -783,6 +806,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     surface.current_scale = surface.pending_scale;
     surface.current_content_type = surface.pending_content_type;
     surface.current_alpha_multiplier = surface.pending_alpha_multiplier;
+    surface.current_presentation_hint = surface.pending_presentation_hint;
     surface.current_transform = surface.pending_transform;
     surface.current_offset_x = surface.pending_offset_x;
     surface.current_offset_y = surface.pending_offset_y;
@@ -807,6 +831,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .presentation_feedbacks = presentation_feedbacks,
         .content_type = surface.current_content_type,
         .alpha_multiplier = surface.current_alpha_multiplier,
+        .presentation_hint = surface.current_presentation_hint,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
@@ -850,6 +875,10 @@ fn destroySurface(
     if (surface.alpha_modifier_handler) |handler| {
         handler.surface_destroyed(handler.context);
         surface.alpha_modifier_handler = null;
+    }
+    if (surface.tearing_control_handler) |handler| {
+        surface.tearing_control_handler = null;
+        handler.surface_destroyed(handler.context);
     }
     surface.unreference();
 }
