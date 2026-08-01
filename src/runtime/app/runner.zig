@@ -174,14 +174,13 @@ fn runWayring(
         &run_context,
         WayringRunContext.backendEvent,
     );
-    var backend_live = true;
-    defer if (backend_live) {
+    defer {
         backend.beginClose() catch {};
         while (!backend.readyToDeinit() and ring.hasActiveOperations()) {
             backend.runOnce() catch {};
         }
         if (backend.readyToDeinit()) backend.deinit();
-    };
+    }
     try backend.waitConfigured();
     const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(&backend);
     if (options.host_bindings) |bindings| bindings.bindPlatform(wayring_platform);
@@ -241,8 +240,6 @@ fn runWayring(
     }
     try compatibility.cancel();
     while (ring.hasActiveOperations()) try ring.runOnce();
-    backend.deinit();
-    backend_live = false;
 }
 
 const WayringRunContext = struct {
