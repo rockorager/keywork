@@ -7,10 +7,12 @@ const keywork_loop = @import("keywork-loop");
 const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
+const wayring_transport = @import("wayring-uring");
 const Client = @import("Client.zig");
 const Clipboard = @import("Clipboard.zig");
 const Input = @import("Input.zig");
 const ProtocolWindow = @import("Window.zig");
+const wayland_options = @import("../wayland/options.zig");
 
 const IoUringLoop = keywork_loop.IoUringLoop;
 
@@ -42,6 +44,18 @@ pub const Options = struct {
     app_id: []const u8 = "dev.keywork.Keywork",
     width: u32 = 640,
     height: u32 = 480,
+};
+
+pub const WindowOptions = struct {
+    title: [:0]const u8 = "Keywork",
+    app_id: [:0]const u8 = "dev.keywork.Keywork",
+    width: u31 = 640,
+    height: u31 = 480,
+    decorations: wayland_options.Decorations = .server,
+    layer_shell: ?wayland_options.LayerShellOptions = null,
+    background_blur: bool = false,
+    output: ?wayring.ObjectHandle = null,
+    session_lock: ?*anyopaque = null,
 };
 
 const ActivationRequest = struct {
@@ -144,6 +158,7 @@ pub const Window = struct {
 
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
+owned_loop: ?*IoUringLoop = null,
 client: Client,
 input: ?Input = null,
 clipboard: ?Clipboard = null,
@@ -152,6 +167,9 @@ main_window: ?*Window = null,
 options: Options,
 event_context: *anyopaque,
 event_notify: EventNotify,
+auto_window: bool = true,
+outputs_changed_context: ?*anyopaque = null,
+outputs_changed_handler: ?*const fn (*anyopaque) void = null,
 state: State = .connecting,
 shutdown_started: bool = false,
 activation_request: ?ActivationRequest = null,
@@ -166,6 +184,27 @@ pub fn initConnect(
     event_context: *anyopaque,
     event_notify: EventNotify,
 ) !void {
+    return self.initConnection(
+        allocator,
+        path,
+        loop,
+        options,
+        event_context,
+        event_notify,
+        true,
+    );
+}
+
+fn initConnection(
+    self: *Backend,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    loop: *IoUringLoop,
+    options: Options,
+    event_context: *anyopaque,
+    event_notify: EventNotify,
+    auto_window: bool,
+) !void {
     if (options.width == 0 or options.height == 0) return error.EmptyWindow;
     self.* = .{
         .allocator = allocator,
@@ -174,6 +213,7 @@ pub fn initConnect(
         .options = options,
         .event_context = event_context,
         .event_notify = event_notify,
+        .auto_window = auto_window,
     };
     try self.client.initConnect(
         allocator,
@@ -184,6 +224,43 @@ pub fn initConnect(
         clientMessage,
     );
     try self.client.flush();
+}
+
+/// Creates a managed Wayring connection with an internally owned io_uring.
+/// Windows are created explicitly through `createWindow`.
+pub fn create(allocator: std.mem.Allocator) !*Backend {
+    const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";
+    const socket_path = try wayring_transport.waylandSocketPathFrom(
+        allocator,
+        processEnvironment("XDG_RUNTIME_DIR"),
+        display,
+    );
+    defer allocator.free(socket_path);
+
+    const loop = try allocator.create(IoUringLoop);
+    errdefer allocator.destroy(loop);
+    loop.* = try IoUringLoop.init(allocator);
+    errdefer loop.deinit();
+
+    const self = try allocator.create(Backend);
+    errdefer allocator.destroy(self);
+    try self.initConnection(
+        allocator,
+        socket_path,
+        loop,
+        .{},
+        self,
+        noopEvent,
+        false,
+    );
+    self.owned_loop = loop;
+    errdefer {
+        self.beginClose() catch {};
+        while (!self.readyToDeinit() and loop.hasActiveOperations()) self.runOnce() catch break;
+        if (self.readyToDeinit()) self.deinit();
+    }
+    try self.waitConfigured();
+    return self;
 }
 
 /// Drives bootstrap with the same submit/wait/drain turns used at runtime.
@@ -255,6 +332,86 @@ pub fn deinit(self: *Backend) void {
         request.allocator.free(token);
     self.client.deinit();
     self.* = undefined;
+}
+
+pub fn destroy(self: *Backend) void {
+    const allocator = self.allocator;
+    const loop = self.owned_loop orelse @panic("destroy requires Backend.create");
+    self.beginClose() catch {};
+    while (!self.readyToDeinit() and loop.hasActiveOperations()) self.runOnce() catch break;
+    std.debug.assert(self.readyToDeinit());
+    self.deinit();
+    loop.deinit();
+    allocator.destroy(loop);
+    allocator.destroy(self);
+}
+
+pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
+    if (self.state != .running) return error.ConnectionNotReady;
+    if (window_options.layer_shell != null) return error.LayerShellNotImplemented;
+    if (window_options.session_lock != null) return error.SessionLockNotImplemented;
+    return self.createXdgWindow(.{
+        .title = window_options.title,
+        .app_id = window_options.app_id,
+        .width = window_options.width,
+        .height = window_options.height,
+    });
+}
+
+pub fn destroyWindow(self: *Backend, window: *Window) void {
+    window.pointer_button_handler = null;
+    window.pointer_move_handler = null;
+    window.cursor_shape_handler = null;
+    window.key_handler = null;
+    window.scroll_handler = null;
+    window.repaint_handler = null;
+    window.frame_handler = null;
+    window.protocol.beginClose() catch return;
+    while (!window.protocol.readyToDeinit() and self.loop.hasActiveOperations()) self.runOnce() catch break;
+    if (!window.protocol.readyToDeinit()) return;
+    self.removeWindow(window);
+}
+
+pub fn waitForConfigured(self: *Backend, window: *Window) !void {
+    while (!window.protocol.isConfigured() and !window.protocol.isClosed()) {
+        if (!self.loop.hasActiveOperations()) return error.ConnectionStopped;
+        try self.runOnce();
+    }
+    if (window.protocol.isClosed()) return error.WindowClosed;
+}
+
+pub fn waitForConfigureAfter(self: *Backend, window: *Window, generation: u64) !void {
+    while (window.protocol.configureGeneration() == generation and !window.protocol.isClosed()) {
+        if (!self.loop.hasActiveOperations()) return error.ConnectionStopped;
+        try self.runOnce();
+    }
+    if (window.protocol.isClosed()) return error.WindowClosed;
+}
+
+pub fn outputCount(self: *const Backend) usize {
+    return self.client.outputCount();
+}
+
+pub fn outputAt(self: *const Backend, index: usize) wayring.ObjectHandle {
+    return self.client.outputAt(index);
+}
+
+pub fn outputInfoAt(self: *const Backend, index: usize) wayland_options.OutputInfo {
+    const info = self.client.outputInfoAt(index);
+    return .{ .name = info.name, .width = info.width, .height = info.height, .scale = info.scale };
+}
+
+pub fn findOutputByName(self: *const Backend, name: []const u8) ?wayring.ObjectHandle {
+    return self.client.findOutputByName(name);
+}
+
+pub fn setOutputsChangedHandler(
+    self: *Backend,
+    context: *anyopaque,
+    handler: *const fn (*anyopaque) void,
+) void {
+    self.outputs_changed_context = context;
+    self.outputs_changed_handler = handler;
 }
 
 pub fn renderBackend(self: *Backend) !keywork.RenderBackend {
@@ -408,24 +565,31 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
                 );
                 self.input = input;
             }
-            self.main_window = try self.createXdgWindow(self.options);
-            self.state = .configuring;
-        },
-        .outputs_changed => for (self.windows.items) |window| {
-            if (try window.protocol.outputScaleChanged()) |_| {
-                if (self.input) |*input| if (input.pointerSurfaceId() == window.protocol.surfaceId())
-                    try input.setCursorScale(window.protocol.cursorScale());
-                const size = window.protocol.size();
-                const logical_size: keywork.Size = .{
-                    .width = @floatFromInt(size.width),
-                    .height = @floatFromInt(size.height),
-                };
-                if (window.repaint_handler) |handler| handler(window.repaint_context.?, logical_size);
-                if (window == self.main_window) try self.event_notify(self.event_context, self, .{ .configured = .{
-                    .width = size.width,
-                    .height = size.height,
-                } });
+            if (self.auto_window) {
+                self.main_window = try self.createXdgWindow(self.options);
+                self.state = .configuring;
+            } else {
+                self.state = .running;
             }
+        },
+        .outputs_changed => {
+            for (self.windows.items) |window| {
+                if (try window.protocol.outputScaleChanged()) |_| {
+                    if (self.input) |*input| if (input.pointerSurfaceId() == window.protocol.surfaceId())
+                        try input.setCursorScale(window.protocol.cursorScale());
+                    const size = window.protocol.size();
+                    const logical_size: keywork.Size = .{
+                        .width = @floatFromInt(size.width),
+                        .height = @floatFromInt(size.height),
+                    };
+                    if (window.repaint_handler) |handler| handler(window.repaint_context.?, logical_size);
+                    if (window == self.main_window) try self.event_notify(self.event_context, self, .{ .configured = .{
+                        .width = size.width,
+                        .height = size.height,
+                    } });
+                }
+            }
+            if (self.outputs_changed_handler) |handler| handler(self.outputs_changed_context.?);
         },
         .eof => {
             self.state = .disconnected;
@@ -598,6 +762,24 @@ fn findWindowOwningObject(self: *Backend, object_id: u32) ?*Window {
     }
     return null;
 }
+
+fn removeWindow(self: *Backend, window: *Window) void {
+    for (self.windows.items, 0..) |candidate, index| {
+        if (candidate != window) continue;
+        _ = self.windows.orderedRemove(index);
+        break;
+    }
+    if (self.main_window == window) self.main_window = null;
+    window.protocol.deinit();
+    self.allocator.destroy(window);
+}
+
+fn processEnvironment(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+fn noopEvent(_: *anyopaque, _: *Backend, _: Event) !void {}
 
 test {
     std.testing.refAllDecls(Backend);
