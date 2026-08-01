@@ -17,6 +17,7 @@ const LinuxDrmSyncobjGlobal = @import("LinuxDrmSyncobjGlobal.zig");
 const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
+const PresentationGlobal = @import("PresentationGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -55,6 +56,7 @@ compositor_global: CompositorGlobal,
 surface_tree: SurfaceTree,
 subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
+presentation_global: PresentationGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -77,6 +79,8 @@ socket_path: [:0]u8,
 surfaces: std.ArrayList(*SurfaceState) = .empty,
 pending: std.ArrayList(*PendingTransaction) = .empty,
 frame_callbacks: std.ArrayList(CompositorGlobal.FrameCallbacks) = .empty,
+presentation_pending: std.ArrayList(CompositorGlobal.PresentationFeedbacks) = .empty,
+presentation_submitted: std.ArrayList(CompositorGlobal.PresentationFeedbacks) = .empty,
 input_paint_entries: std.ArrayList(SurfaceTree.PaintEntry) = .empty,
 routed_keys: std.ArrayList(RoutedKey) = .empty,
 routed_buttons: std.ArrayList(RoutedButton) = .empty,
@@ -185,6 +189,13 @@ const Output = union(OutputKind) {
         return switch (self.*) {
             .headless => |output| output.refreshMillihertz(),
             .drm => |output| output.?.refreshMillihertz(),
+        };
+    }
+
+    fn presentationClockId(self: *const Output) u32 {
+        return switch (self.*) {
+            .headless => presentation.monotonic_clock_id,
+            .drm => |output| output.?.presentation_clock_id,
         };
     }
 
@@ -400,6 +411,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .model = self.output.model(),
     });
     errdefer self.output_global.deinit();
+    try self.presentation_global.init(
+        allocator,
+        &self.server,
+        &self.compositor_global,
+        self.output.presentationClockId(),
+    );
+    errdefer self.presentation_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
@@ -426,6 +444,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.surfaces = .empty;
     self.pending = .empty;
     self.frame_callbacks = .empty;
+    self.presentation_pending = .empty;
+    self.presentation_submitted = .empty;
     errdefer self.deinitInputState();
     errdefer if (self.native_input_initialized) {
         if (self.native_input_device_listener_installed) {
@@ -624,6 +644,7 @@ pub fn destroy(self: *NativeServer) void {
     while (self.pending.items.len != 0) self.destroyPending(0);
     self.pending.deinit(self.allocator);
     self.discardFrameCallbacks();
+    self.discardPresentationFeedbacks();
     self.deinitInputState();
 
     while (self.compositor_global.popTransaction()) |transaction_value| {
@@ -641,6 +662,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
+    self.presentation_global.deinit();
     self.output_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
@@ -706,10 +728,14 @@ fn drmOutputReady(context: *anyopaque) void {
     if (self.repaint_needed) self.scheduleRepaint(0);
 }
 
-fn drmOutputPresented(_: *anyopaque, _: presentation.Info) void {}
+fn drmOutputPresented(context: *anyopaque, info: presentation.Info) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.finishSubmittedPresentation(info);
+}
 
 fn drmOutputDiscarded(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.discardSubmittedPresentation();
     self.repaint_needed = true;
 }
 
@@ -1967,11 +1993,17 @@ fn startShmCopy(
 
 fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     var callback_batch_count: usize = 0;
+    var feedback_batch_count: usize = 0;
     for (pending.transaction.entries) |commit|
         if (commit.frame_callbacks.len != 0) {
             callback_batch_count += 1;
         };
+    for (pending.transaction.entries) |commit|
+        if (commit.presentation_feedbacks.len != 0) {
+            feedback_batch_count += 1;
+        };
     try self.frame_callbacks.ensureUnusedCapacity(self.allocator, callback_batch_count);
+    try self.presentation_pending.ensureUnusedCapacity(self.allocator, feedback_batch_count);
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
         if (entry.configure_only) continue;
@@ -1999,7 +2031,80 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         if (try commit.takeFrameCallbacks()) |callbacks|
             self.frame_callbacks.appendAssumeCapacity(callbacks);
     }
+    for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+        if (entry.configure_only) {
+            if (commit.takePresentationFeedbacks()) |feedbacks_value| {
+                var feedbacks = feedbacks_value;
+                feedbacks.deinit();
+            }
+            continue;
+        }
+        self.discardPendingPresentationFor(commit.surface);
+        if (commit.takePresentationFeedbacks()) |feedbacks| {
+            const state = self.findState(commit.surface) orelse unreachable;
+            if (state.snapshot != null or state.dmabuf != null) {
+                self.presentation_pending.appendAssumeCapacity(feedbacks);
+            } else {
+                var discarded = feedbacks;
+                discarded.deinit();
+            }
+        }
+    }
     try self.renderScene(damage_state);
+}
+
+fn discardPendingPresentationFor(
+    self: *NativeServer,
+    surface: *CompositorGlobal.Surface,
+) void {
+    var index: usize = 0;
+    while (index < self.presentation_pending.items.len) {
+        if (self.presentation_pending.items[index].surface != surface) {
+            index += 1;
+            continue;
+        }
+        var feedbacks = self.presentation_pending.orderedRemove(index);
+        feedbacks.deinit();
+    }
+}
+
+fn submitPendingPresentation(
+    self: *NativeServer,
+    sampled_surfaces: []const *CompositorGlobal.Surface,
+) void {
+    std.debug.assert(self.presentation_submitted.items.len == 0);
+    while (self.presentation_pending.items.len != 0) {
+        var feedbacks = self.presentation_pending.orderedRemove(0);
+        if (std.mem.indexOfScalar(
+            *CompositorGlobal.Surface,
+            sampled_surfaces,
+            feedbacks.surface,
+        ) != null) {
+            self.presentation_submitted.appendAssumeCapacity(feedbacks);
+        } else {
+            feedbacks.deinit();
+        }
+    }
+}
+
+fn finishSubmittedPresentation(self: *NativeServer, info: presentation.Info) void {
+    for (self.presentation_submitted.items) |*feedbacks| {
+        feedbacks.presented(&self.output_global, info);
+        feedbacks.deinit();
+    }
+    self.presentation_submitted.clearRetainingCapacity();
+}
+
+fn discardSubmittedPresentation(self: *NativeServer) void {
+    for (self.presentation_submitted.items) |*feedbacks| feedbacks.deinit();
+    self.presentation_submitted.clearRetainingCapacity();
+}
+
+fn discardPresentationFeedbacks(self: *NativeServer) void {
+    for (self.presentation_submitted.items) |*feedbacks| feedbacks.deinit();
+    self.presentation_submitted.deinit(self.allocator);
+    for (self.presentation_pending.items) |*feedbacks| feedbacks.deinit();
+    self.presentation_pending.deinit(self.allocator);
 }
 
 fn finishFrameCallbacks(self: *NativeServer) !void {
@@ -2064,6 +2169,11 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             return;
         }
     }
+    try self.presentation_submitted.ensureUnusedCapacity(
+        self.allocator,
+        self.presentation_pending.items.len,
+    );
+    var immediate_presentation: ?presentation.Info = null;
     var commands: std.ArrayList(render.Command) = .empty;
     defer commands.deinit(self.allocator);
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
@@ -2073,6 +2183,15 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
         const node = self.surface_tree.find(state.surface) orelse continue;
         if (node.parent == null) try self.surface_tree.paint(node, &paint_entries);
     }
+    var sampled_surfaces: std.ArrayList(*CompositorGlobal.Surface) = .empty;
+    defer sampled_surfaces.deinit(self.allocator);
+    try sampled_surfaces.ensureTotalCapacity(self.allocator, paint_entries.items.len);
+    const output_bounds: render.Rect = .{
+        .x = 0,
+        .y = 0,
+        .width = self.output.logicalSize().width,
+        .height = self.output.logicalSize().height,
+    };
     for (paint_entries.items) |paint_entry| {
         const state = self.findState(paint_entry.surface) orelse continue;
         if (!state.surface.resource_alive) continue;
@@ -2132,6 +2251,14 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
                     paint_entry.y,
                 ),
         } });
+        if ((render.Rect{
+            .x = image_x,
+            .y = image_y,
+            .width = geometry.logical_size.width,
+            .height = geometry.logical_size.height,
+        }).intersection(output_bounds) != null) {
+            sampled_surfaces.appendAssumeCapacity(state.surface);
+        }
     }
     var damage_storage: [1]render.Rect = undefined;
     const damage = if (damage_state) |state| self.frameDamage(state, &damage_storage) else null;
@@ -2143,6 +2270,8 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             try self.renderer.append(commands.items);
             frame_active = false;
             try self.renderer.finishFrame();
+            immediate_presentation = presentation.Info.now(self.io);
+            immediate_presentation.?.refresh_nanoseconds = output.refreshNanoseconds();
         },
         .drm => |maybe_output| {
             const output = maybe_output orelse return;
@@ -2166,7 +2295,11 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             defer if (completion.sync_file_fd) |fd| {
                 _ = std.c.close(fd);
             };
-            _ = output.present(&frame_damage, completion.sync_file_fd, false) catch |err| switch (err) {
+            immediate_presentation = output.present(
+                &frame_damage,
+                completion.sync_file_fd,
+                false,
+            ) catch |err| switch (err) {
                 error.OutputBusy => {
                     if (self.output_busy_retries == maximum_output_busy_retries)
                         return error.OutputBusy;
@@ -2182,11 +2315,13 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
             self.output_busy_retries = 0;
         },
     }
+    self.submitPendingPresentation(sampled_surfaces.items);
     self.repaint_needed = false;
     self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
     self.frame_count +%= 1;
     try self.finishFrameCallbacks();
+    if (immediate_presentation) |info| self.finishSubmittedPresentation(info);
 }
 
 fn frameDamage(

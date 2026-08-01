@@ -9,6 +9,7 @@ const Server = @import("wayring-server");
 const Region = @import("../region.zig");
 const render = @import("../render/types.zig");
 const DrmSyncobj = @import("../drm_syncobj.zig");
+const presentation = @import("../presentation.zig");
 const surface_geometry = @import("../surface_geometry.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const shm = @import("shm.zig");
@@ -68,6 +69,7 @@ pub const Commit = struct {
     surface_damage: []render.Rect,
     buffer_damage: []render.Rect,
     frame_callbacks: []wayring.ObjectHandle,
+    presentation_feedbacks: []*PresentationFeedback,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -86,6 +88,11 @@ pub const Commit = struct {
         self.allocator.free(self.surface_damage);
         self.allocator.free(self.buffer_damage);
         self.allocator.free(self.frame_callbacks);
+        if (self.presentation_feedbacks.len != 0) {
+            for (self.presentation_feedbacks) |feedback| feedback.discarded(feedback.context);
+            self.surface.unreference();
+        }
+        self.allocator.free(self.presentation_feedbacks);
         self.opaque_region.deinit();
         self.input_region.deinit();
         self.surface.unreference();
@@ -108,6 +115,19 @@ pub const Commit = struct {
             .allocator = self.allocator,
             .surface = self.surface,
             .callbacks = callbacks,
+        };
+    }
+
+    /// Transfers this commit's presentation feedback so the output scheduler
+    /// can retain it until the sampled frame is presented or discarded.
+    pub fn takePresentationFeedbacks(self: *Commit) ?PresentationFeedbacks {
+        if (self.presentation_feedbacks.len == 0) return null;
+        const feedbacks = self.presentation_feedbacks;
+        self.presentation_feedbacks = &.{};
+        return .{
+            .allocator = self.allocator,
+            .surface = self.surface,
+            .feedbacks = feedbacks,
         };
     }
 };
@@ -142,6 +162,45 @@ pub const FrameCallbacks = struct {
                 self.surface.client.destroyResource(callback) catch {};
         }
         self.allocator.free(self.callbacks);
+        self.surface.unreference();
+        self.* = undefined;
+    }
+};
+
+/// The pending surface, commit, or output batch retains this caller-owned
+/// callback until exactly one terminal method runs.
+pub const PresentationFeedback = struct {
+    context: *anyopaque,
+    presented: *const fn (*anyopaque, *anyopaque, presentation.Info) void,
+    discarded: *const fn (*anyopaque) void,
+};
+
+pub const PresentationFeedbacks = struct {
+    allocator: std.mem.Allocator,
+    surface: *Surface,
+    feedbacks: []*PresentationFeedback,
+    finished: bool = false,
+
+    pub fn presented(
+        self: *PresentationFeedbacks,
+        output_context: *anyopaque,
+        info: presentation.Info,
+    ) void {
+        std.debug.assert(!self.finished);
+        self.finished = true;
+        for (self.feedbacks) |feedback|
+            feedback.presented(feedback.context, output_context, info);
+    }
+
+    pub fn discard(self: *PresentationFeedbacks) void {
+        if (self.finished) return;
+        self.finished = true;
+        for (self.feedbacks) |feedback| feedback.discarded(feedback.context);
+    }
+
+    pub fn deinit(self: *PresentationFeedbacks) void {
+        self.discard();
+        self.allocator.free(self.feedbacks);
         self.surface.unreference();
         self.* = undefined;
     }
@@ -215,6 +274,7 @@ pub const Surface = struct {
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
     pending_callbacks: std.ArrayList(wayring.ObjectHandle) = .empty,
+    pending_presentation_feedbacks: std.ArrayList(*PresentationFeedback) = .empty,
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -277,6 +337,9 @@ pub const Surface = struct {
         for (self.pending_callbacks.items) |callback|
             self.client.destroyResource(callback) catch {};
         self.pending_callbacks.deinit(self.allocator);
+        for (self.pending_presentation_feedbacks.items) |feedback|
+            feedback.discarded(feedback.context);
+        self.pending_presentation_feedbacks.deinit(self.allocator);
         self.pending_buffer_damage.deinit(self.allocator);
         self.pending_surface_damage.deinit(self.allocator);
         self.pending_opaque.deinit();
@@ -661,8 +724,17 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         surface.pending_callbacks.items,
     ) catch return error.OutOfMemory;
     errdefer owner.allocator.free(frame_callbacks);
+    const presentation_feedbacks = owner.allocator.dupe(
+        *PresentationFeedback,
+        surface.pending_presentation_feedbacks.items,
+    ) catch return error.OutOfMemory;
+    errdefer owner.allocator.free(presentation_feedbacks);
     surface.reference() catch return error.OutOfMemory;
     errdefer surface.unreference();
+    if (presentation_feedbacks.len != 0) {
+        surface.reference() catch return error.OutOfMemory;
+        errdefer surface.unreference();
+    }
 
     surface.current_scale = surface.pending_scale;
     surface.current_transform = surface.pending_transform;
@@ -674,6 +746,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     surface.pending_surface_damage.clearRetainingCapacity();
     surface.pending_buffer_damage.clearRetainingCapacity();
     surface.pending_callbacks.clearRetainingCapacity();
+    surface.pending_presentation_feedbacks.clearRetainingCapacity();
     const synchronization = if (attachment_kind == .dmabuf)
         if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
     else
@@ -685,6 +758,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .surface_damage = surface_damage,
         .buffer_damage = buffer_damage,
         .frame_callbacks = frame_callbacks,
+        .presentation_feedbacks = presentation_feedbacks,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,

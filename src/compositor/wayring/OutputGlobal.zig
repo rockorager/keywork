@@ -138,6 +138,21 @@ pub fn setSurfaceVisible(
     surface.unreference();
 }
 
+pub fn sendPresentationSync(
+    self: *const OutputGlobal,
+    client: *Server.Client,
+    feedback: wayring.ObjectHandle,
+) !void {
+    for (self.resources.items) |binding| {
+        if (binding.client != client) continue;
+        try generated.wp_presentation_feedback_types.events.sync_output(
+            &client.connection,
+            feedback,
+            binding.resource,
+        );
+    }
+}
+
 fn validSize(size: render.Size) bool {
     return size.width > 0 and size.height > 0 and
         size.width <= std.math.maxInt(i32) and size.height <= std.math.maxInt(i32);
