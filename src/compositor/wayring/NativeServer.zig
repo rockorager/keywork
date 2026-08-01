@@ -27,6 +27,7 @@ const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
+const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
 const SubcompositorGlobal = @import("SubcompositorGlobal.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
@@ -69,6 +70,7 @@ primary_selection_global: PrimarySelectionGlobal,
 fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
+xdg_system_bell_global: XdgSystemBellGlobal,
 transport: IoUringServer,
 renderer: Renderer,
 output: Output,
@@ -386,6 +388,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .output_bounds = xdgOutputBounds,
     });
     errdefer self.xdg_shell.deinit();
+    try self.xdg_system_bell_global.init(&self.server);
+    errdefer self.xdg_system_bell_global.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
     errdefer self.linux_dmabuf_global.deinit();
     try self.linux_drm_syncobj_global.init(
@@ -683,6 +687,7 @@ pub fn destroy(self: *NativeServer) void {
     self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.output_global.deinit();
+    self.xdg_system_bell_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
     self.surface_tree.deinit();
