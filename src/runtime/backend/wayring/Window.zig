@@ -11,7 +11,6 @@ const VulkanWindow = @import("VulkanWindow.zig");
 
 pub const Event = enum { configured, repaint, close };
 
-allocator: std.mem.Allocator,
 client: *Client,
 handles: Client.Window,
 renderer: VulkanWindow,
@@ -22,6 +21,8 @@ pending_width: u32,
 pending_height: u32,
 configured: bool = false,
 closed: bool = false,
+closing: bool = false,
+protocol_destroyed: bool = false,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -58,7 +59,6 @@ pub fn init(
     );
     errdefer renderer.deinit();
     return .{
-        .allocator = allocator,
         .client = client,
         .handles = handles,
         .renderer = renderer,
@@ -69,11 +69,36 @@ pub fn init(
     };
 }
 
-/// Call after disconnect, or after `renderer.retireAll` has reported true and
-/// the protocol objects have been destroyed.
+/// Call after disconnect or after `readyToDeinit` reports true.
 pub fn deinit(self: *Window) void {
     self.renderer.deinit();
     self.* = undefined;
+}
+
+/// Unmaps the surface before retiring its buffers. Committed DMA-BUF targets
+/// remain alive until the compositor releases every `wl_buffer`; only then
+/// are the XDG and surface objects destroyed.
+pub fn beginClose(self: *Window) !void {
+    if (self.closing) return;
+    self.closing = true;
+    self.closed = true;
+    try protocol.wl_surface_types.requests.attach(
+        self.client.connectionPtr(),
+        self.handles.surface,
+        null,
+        0,
+        0,
+    );
+    try protocol.wl_surface_types.requests.commit(
+        self.client.connectionPtr(),
+        self.handles.surface,
+    );
+    try self.finishClose();
+    try self.client.flush();
+}
+
+pub fn readyToDeinit(self: *const Window) bool {
+    return self.protocol_destroyed;
 }
 
 pub fn ownsObject(self: *const Window, id: u32) bool {
@@ -87,6 +112,7 @@ pub fn ownsObject(self: *const Window, id: u32) bool {
 pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
     if (self.renderer.ownsObject(message.object_id)) {
         try self.renderer.handleMessage(message);
+        if (self.closing) try self.finishClose();
         return null;
     }
     if (message.object_id == self.handles.toplevel.id) {
@@ -133,6 +159,7 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
                 message,
             );
             self.frame_callback = null;
+            if (self.closing) return null;
             return .repaint;
         }
     }
@@ -168,6 +195,23 @@ fn destroyProtocol(client: *Client, handles: Client.Window) void {
     protocol.xdg_surface_types.requests.destroy(client.connectionPtr(), handles.xdg_surface) catch {};
     protocol.wl_surface_types.requests.destroy(client.connectionPtr(), handles.surface) catch {};
     client.flush() catch {};
+}
+
+fn finishClose(self: *Window) !void {
+    if (self.protocol_destroyed or !try self.renderer.retireAll()) return;
+    try protocol.xdg_toplevel_types.requests.destroy(
+        self.client.connectionPtr(),
+        self.handles.toplevel,
+    );
+    try protocol.xdg_surface_types.requests.destroy(
+        self.client.connectionPtr(),
+        self.handles.xdg_surface,
+    );
+    try protocol.wl_surface_types.requests.destroy(
+        self.client.connectionPtr(),
+        self.handles.surface,
+    );
+    self.protocol_destroyed = true;
 }
 
 test {
