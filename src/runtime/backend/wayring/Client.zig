@@ -76,6 +76,8 @@ cursor_shape_manager: ?Global = null,
 activation: ?Global = null,
 viewporter: ?Global = null,
 fractional_scale_manager: ?Global = null,
+layer_shell: ?Global = null,
+session_lock_manager: ?Global = null,
 outputs: std.ArrayList(Output) = .empty,
 seat_capabilities: u32 = 0,
 seat_claimed: bool = false,
@@ -214,6 +216,14 @@ pub fn dataDeviceManager(self: *const Client) ?wayring.ObjectHandle {
 
 pub fn activationManager(self: *const Client) ?wayring.ObjectHandle {
     return if (self.activation) |global| global.handle else null;
+}
+
+pub fn layerShell(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.layer_shell) |global| global.handle else null;
+}
+
+pub fn sessionLockManager(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.session_lock_manager) |global| global.handle else null;
 }
 
 pub fn outputScale(self: *const Client, object_id: u32) ?u32 {
@@ -499,6 +509,10 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 self.viewporter = null;
             if (self.fractional_scale_manager != null and self.fractional_scale_manager.?.name == event.name)
                 self.fractional_scale_manager = null;
+            if (self.layer_shell != null and self.layer_shell.?.name == event.name)
+                self.layer_shell = null;
+            if (self.session_lock_manager != null and self.session_lock_manager.?.name == event.name)
+                self.session_lock_manager = null;
             for (self.outputs.items, 0..) |output, index| {
                 if (output.global_name != event.name) continue;
                 if (output.name) |name| self.allocator.free(name);
@@ -572,6 +586,16 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
             .name = name,
             .handle = try self.bind(name, advertised_version, &protocol.wp_fractional_scale_manager_v1, 1),
         };
+    } else if (std.mem.eql(u8, interface_name, protocol.zwlr_layer_shell_v1.name) and self.layer_shell == null) {
+        self.layer_shell = .{
+            .name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.zwlr_layer_shell_v1, protocol.zwlr_layer_shell_v1.version),
+        };
+    } else if (std.mem.eql(u8, interface_name, protocol.ext_session_lock_manager_v1.name) and self.session_lock_manager == null) {
+        self.session_lock_manager = .{
+            .name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.ext_session_lock_manager_v1, 1),
+        };
     } else if (std.mem.eql(u8, interface_name, protocol.wl_output.name)) {
         try self.outputs.append(self.allocator, .{
             .global_name = name,
@@ -609,7 +633,7 @@ test "io_uring client discovers and binds required globals" {
             if (notification == .outputs_changed) return;
             if (notification != .ready) return;
             self.ready = true;
-            if (self.bind_count == 10) {
+            if (self.bind_count == 12) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -676,6 +700,12 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 19 }, .{ .string = protocol.wl_shm.name }, .{ .uint = 1 },
                             });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 20 }, .{ .string = protocol.zwlr_layer_shell_v1.name }, .{ .uint = 5 },
+                            });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 21 }, .{ .string = protocol.ext_session_lock_manager_v1.name }, .{ .uint = 1 },
+                            });
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -720,6 +750,10 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.wp_fractional_scale_manager_v1
                     else if (std.mem.eql(u8, request.new_interface.?, protocol.wl_shm.name))
                         &protocol.wl_shm
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.zwlr_layer_shell_v1.name))
+                        &protocol.zwlr_layer_shell_v1
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.ext_session_lock_manager_v1.name))
+                        &protocol.ext_session_lock_manager_v1
                     else
                         return error.UnexpectedBind;
                     const bound = try registerServerObject(
@@ -754,7 +788,7 @@ test "io_uring client discovers and binds required globals" {
                 }
             }
             try transport.flush();
-            if (self.ready and self.bind_count == 10) {
+            if (self.ready and self.bind_count == 12) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -801,7 +835,7 @@ test "io_uring client discovers and binds required globals" {
     while (loop.hasActiveOperations()) try loop.runOnce();
 
     try std.testing.expect(context.ready);
-    try std.testing.expectEqual(@as(usize, 10), context.bind_count);
+    try std.testing.expectEqual(@as(usize, 12), context.bind_count);
     try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
         .format = 0x34325241,
         .modifier = 7,
@@ -821,6 +855,8 @@ test "io_uring client discovers and binds required globals" {
     try std.testing.expect(client.viewporter != null);
     try std.testing.expect(client.fractional_scale_manager != null);
     try std.testing.expect(client.shmHandle() != null);
+    try std.testing.expect(client.layerShell() != null);
+    try std.testing.expect(client.sessionLockManager() != null);
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();
