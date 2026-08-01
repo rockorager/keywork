@@ -81,6 +81,71 @@ run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
 are available from the repository root. The native example opens a Wayland
 window without compiling or linking LuaJIT.
 
+## Shell bar configuration
+
+`keywork-shell` loads `$XDG_CONFIG_HOME/keywork/shell/init.lua` when it exists
+and otherwise uses the built-in shell configuration. `KEYWORK_SHELL_CONFIG`
+selects an explicit entry point. A user entry point calls the public shell
+factory and declares ordered bar items:
+
+```lua
+local shell = require("shell")
+local hostname = require("modules.hostname")
+
+return shell.app({
+    bar = {
+        height = 40,
+        right = {
+            shell.bar.tray({ outputs = "first" }),
+            shell.bar.volume(),
+            shell.bar.network(),
+            hostname(),
+            shell.bar.battery({ show_percent = true }),
+            shell.bar.clock({ format = "%a %b %d  %I:%M %p" }),
+        },
+    },
+})
+```
+
+Omitted `left` or `right` lists retain that side's built-in defaults; an empty
+list disables it. Items appear on every output by default. Set `outputs` to
+`"first"`, an output name, or a list of output names to limit an item. Built-in
+constructors are `workspaces`, `tray`, `volume`, `network`, `battery`, and
+`clock`. The tray must target exactly one output because the shell owns one
+StatusNotifierWatcher name.
+
+Custom modules return the same item descriptors as the built-ins and build
+ordinary Keywork widgets:
+
+```lua
+-- $XDG_CONFIG_HOME/keywork/shell/modules/hostname.lua
+local shell = require("shell")
+
+return function(options)
+    options = options or {}
+    return shell.bar.item({
+        id = options.id or "hostname",
+        outputs = options.outputs,
+        widget = function(context)
+            return shell.bar.pill({
+                id = "hostname-pill",
+                icon = "computer",
+                label = os.getenv("HOSTNAME") or "host",
+                color = context.colors.foreground,
+            })
+        end,
+    })
+end
+```
+
+A custom item may return a `kw.stateful` widget and use scoped timers,
+processes, D-Bus, or `keywork.service` subscriptions exactly like any other
+Keywork application. Configuration is trusted Lua running inside the shell
+process, not a sandbox. The user entry point and its sibling Lua modules
+participate in explicit application reloads. Restart `keywork-shell` after
+creating or removing `init.lua`; entry-point selection happens at process
+startup.
+
 ## Application control and explicit reload
 
 Every hosted Lua application automatically exposes the runtime-owned

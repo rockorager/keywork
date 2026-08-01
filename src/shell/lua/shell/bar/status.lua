@@ -2,9 +2,7 @@ local kw = require("keywork")
 local dbus = require("keywork.dbus")
 local log = require("keywork.log")
 local service = require("keywork.service")
-local audio = require("shell.audio")
 local clock = require("shell.clock")
-local network = require("shell.bar.network")
 local util = require("shell.bar.util")
 
 local label = util.label
@@ -29,7 +27,7 @@ local function upower_state_name(state)
     return "Unknown"
 end
 
-local function battery_status_from_values(palette, percentage, state)
+local function battery_status_from_values(palette, percentage, state, show_percent)
     if not percentage then
         return status_pill("battery", "battery-level-0", "", palette.muted)
     end
@@ -55,7 +53,8 @@ local function battery_status_from_values(palette, percentage, state)
     end
 
     local color = capacity < 20 and palette.danger or palette.foreground
-    return status_pill("battery", name, tostring(capacity) .. "%", color)
+    local text = show_percent and tostring(capacity) .. "%" or nil
+    return status_pill("battery", name, text, color)
 end
 
 local battery_service = service.define("shell.bar.battery", function(self)
@@ -87,41 +86,45 @@ local battery_service = service.define("shell.bar.battery", function(self)
     end
 end)
 
-local StatusItems = kw.stateful({
-    hot_id = "StatusItems",
+local Battery = kw.stateful({
+    hot_id = "Battery",
     hot_version = 1,
     start = function(self)
         self.battery = battery_service:use(self.scope, function(battery)
             self.battery = battery
             self:set_state()
         end)
-        self.time = clock.use(self.scope, function(timestamp)
-            self.time = clock.format_bar(timestamp)
-            self:set_state()
-        end)
-        self.time = clock.format_bar(self.time or os.time())
     end,
 
-    build = function(self, _context)
-        local palette = self.props.colors
+    build = function(self)
         local battery = self.battery or {}
-        return kw.row({
-            spacing = palette.space[2],
-            align = "baseline",
-            children = {
-                audio.Audio({
-                    key = "audio",
-                    colors = palette,
-                    on_open_settings = self.props.on_open_audio_settings,
-                }),
-                network.Network({ key = "network", colors = palette }),
-                battery_status_from_values(palette, battery.percentage, battery.state),
-                kw.padding({ x = palette.space[1], child = label(self.time) }),
-            },
-        })
+        return battery_status_from_values(
+            self.props.colors,
+            battery.percentage,
+            battery.state,
+            self.props.show_percent ~= false
+        )
+    end,
+})
+
+local Clock = kw.stateful({
+    hot_id = "BarClock",
+    hot_version = 1,
+    start = function(self)
+        self.timestamp = clock.use(self.scope, function(timestamp)
+            self.timestamp = timestamp
+            self:set_state()
+        end)
+    end,
+
+    build = function(self)
+        local timestamp = self.timestamp or os.time()
+        local text = self.props.format and os.date(self.props.format, timestamp) or clock.format_bar(timestamp)
+        return kw.padding({ x = self.props.colors.space[1], child = label(text) })
     end,
 })
 
 return {
-    Items = StatusItems,
+    Battery = Battery,
+    Clock = Clock,
 }

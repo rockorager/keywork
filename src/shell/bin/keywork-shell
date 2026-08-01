@@ -80,12 +80,38 @@ EOF
 esac
 
 app_dir=${KEYWORK_SHELL_DATADIR:-${XDG_DATA_HOME:-$HOME/.local/share}/keywork-shell}
+if [ "${LUA_PATH+x}" ]; then
+  LUA_PATH="$app_dir/lua/?.lua;$app_dir/lua/?/init.lua;$LUA_PATH"
+else
+  LUA_PATH="$app_dir/lua/?.lua;$app_dir/lua/?/init.lua;;"
+fi
+export LUA_PATH
+
 if [ "${LUA_CPATH+x}" ]; then
   LUA_CPATH="$app_dir/lua/?.so;$app_dir/lua/?/init.so;$LUA_CPATH"
 else
   LUA_CPATH="$app_dir/lua/?.so;$app_dir/lua/?/init.so;;"
 fi
 export LUA_CPATH
+
+if [ "$script" = "lua/init.lua" ]; then
+  if [ -n "${KEYWORK_SHELL_CONFIG-}" ]; then
+    script=$KEYWORK_SHELL_CONFIG
+  else
+    case ${XDG_CONFIG_HOME-} in
+    /*) config_home=$XDG_CONFIG_HOME ;;
+    *) config_home=$HOME/.config ;;
+    esac
+    config=$config_home/keywork/shell/init.lua
+    if [ -f "$config" ]; then
+      script=$config
+    else
+      script=$app_dir/$script
+    fi
+  fi
+else
+  script=$app_dir/$script
+fi
 
 if [ "${KEYWORK_SHELL_KEYWORK+x}" ]; then
   keywork=$KEYWORK_SHELL_KEYWORK
@@ -95,4 +121,4 @@ else
   keywork=keywork
 fi
 
-exec "$keywork" --script="$app_dir/$script" "$@"
+exec "$keywork" --script="$script" "$@"
