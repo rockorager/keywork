@@ -14,6 +14,12 @@ pub const Notification = enum { ready, outputs_changed, eof, fatal };
 pub const Notify = *const fn (context: *anyopaque, client: *Client, notification: Notification) anyerror!void;
 pub const MessageNotify = *const fn (context: *anyopaque, client: *Client, message: *wayring.Message) anyerror!void;
 
+pub const Surface = struct {
+    surface: wayring.ObjectHandle,
+    viewport: ?wayring.ObjectHandle,
+    fractional_scale: ?wayring.ObjectHandle,
+};
+
 pub const Window = struct {
     surface: wayring.ObjectHandle,
     xdg_surface: wayring.ObjectHandle,
@@ -259,36 +265,14 @@ pub fn findOutputByName(self: *const Client, name: []const u8) ?wayring.ObjectHa
     return null;
 }
 
-pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Window {
+pub fn createSurface(self: *Client) !Surface {
     if (!self.ready) return error.ClientNotReady;
     const compositor = self.compositor orelse return error.MissingCompositor;
-    const wm_base = self.wm_base orelse return error.MissingXdgWmBase;
     const surface = try protocol.wl_compositor_types.requests.create_surface(
         &self.connection,
         compositor.handle,
     );
     errdefer protocol.wl_surface_types.requests.destroy(&self.connection, surface) catch {};
-    const xdg_surface = try protocol.xdg_wm_base_types.requests.get_xdg_surface(
-        &self.connection,
-        wm_base.handle,
-        surface,
-    );
-    errdefer protocol.xdg_surface_types.requests.destroy(&self.connection, xdg_surface) catch {};
-    const toplevel = try protocol.xdg_surface_types.requests.get_toplevel(
-        &self.connection,
-        xdg_surface,
-    );
-    errdefer protocol.xdg_toplevel_types.requests.destroy(&self.connection, toplevel) catch {};
-    if (title.len != 0) try protocol.xdg_toplevel_types.requests.set_title(
-        &self.connection,
-        toplevel,
-        title,
-    );
-    if (app_id.len != 0) try protocol.xdg_toplevel_types.requests.set_app_id(
-        &self.connection,
-        toplevel,
-        app_id,
-    );
     const viewport = if (self.viewporter != null and self.fractional_scale_manager != null)
         try protocol.wp_viewporter_types.requests.get_viewport(
             &self.connection,
@@ -307,16 +291,54 @@ pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Wi
         )
     else
         null;
-    errdefer if (fractional_scale) |handle|
-        protocol.wp_fractional_scale_v1_types.requests.destroy(&self.connection, handle) catch {};
-    try protocol.wl_surface_types.requests.commit(&self.connection, surface);
-    try self.flush();
     return .{
         .surface = surface,
-        .xdg_surface = xdg_surface,
-        .toplevel = toplevel,
         .viewport = viewport,
         .fractional_scale = fractional_scale,
+    };
+}
+
+pub fn destroySurface(self: *Client, surface: Surface) void {
+    if (surface.fractional_scale) |handle|
+        protocol.wp_fractional_scale_v1_types.requests.destroy(&self.connection, handle) catch {};
+    if (surface.viewport) |handle|
+        protocol.wp_viewport_types.requests.destroy(&self.connection, handle) catch {};
+    protocol.wl_surface_types.requests.destroy(&self.connection, surface.surface) catch {};
+}
+
+pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Window {
+    const wm_base = self.wm_base orelse return error.MissingXdgWmBase;
+    const base = try self.createSurface();
+    errdefer self.destroySurface(base);
+    const xdg_surface = try protocol.xdg_wm_base_types.requests.get_xdg_surface(
+        &self.connection,
+        wm_base.handle,
+        base.surface,
+    );
+    errdefer protocol.xdg_surface_types.requests.destroy(&self.connection, xdg_surface) catch {};
+    const toplevel = try protocol.xdg_surface_types.requests.get_toplevel(
+        &self.connection,
+        xdg_surface,
+    );
+    errdefer protocol.xdg_toplevel_types.requests.destroy(&self.connection, toplevel) catch {};
+    if (title.len != 0) try protocol.xdg_toplevel_types.requests.set_title(
+        &self.connection,
+        toplevel,
+        title,
+    );
+    if (app_id.len != 0) try protocol.xdg_toplevel_types.requests.set_app_id(
+        &self.connection,
+        toplevel,
+        app_id,
+    );
+    try protocol.wl_surface_types.requests.commit(&self.connection, base.surface);
+    try self.flush();
+    return .{
+        .surface = base.surface,
+        .xdg_surface = xdg_surface,
+        .toplevel = toplevel,
+        .viewport = base.viewport,
+        .fractional_scale = base.fractional_scale,
     };
 }
 

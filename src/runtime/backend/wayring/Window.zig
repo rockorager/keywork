@@ -8,6 +8,7 @@ const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
 const Client = @import("Client.zig");
 const VulkanWindow = @import("VulkanWindow.zig");
+const wayland_options = @import("../wayland/options.zig");
 
 pub const Event = enum { configured, repaint, close };
 pub const ResizeEdge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
@@ -58,6 +59,96 @@ pub fn init(
     const handles = try client.createXdgWindow(title, app_id);
     errdefer destroyProtocol(client, handles);
 
+    return initSurface(
+        allocator,
+        client,
+        .{
+            .surface = handles.surface,
+            .viewport = handles.viewport,
+            .fractional_scale = handles.fractional_scale,
+        },
+        .{ .toplevel = .{
+            .xdg_surface = handles.xdg_surface,
+            .toplevel = handles.toplevel,
+        } },
+        default_width,
+        default_height,
+    );
+}
+
+pub fn initLayer(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    options: wayland_options.LayerShellOptions,
+    output: ?wayring.ObjectHandle,
+    default_width: u32,
+    default_height: u32,
+) !Window {
+    const shell = client.layerShell() orelse return error.MissingLayerShell;
+    const base = try client.createSurface();
+    errdefer client.destroySurface(base);
+    const layer_surface = try protocol.zwlr_layer_shell_v1_types.requests.get_layer_surface(
+        client.connectionPtr(),
+        shell,
+        base.surface,
+        output,
+        @intFromEnum(layer(options.layer)),
+        options.namespace,
+    );
+    errdefer protocol.zwlr_layer_surface_v1_types.requests.destroy(
+        client.connectionPtr(),
+        layer_surface,
+    ) catch {};
+    try protocol.zwlr_layer_surface_v1_types.requests.set_size(
+        client.connectionPtr(),
+        layer_surface,
+        default_width,
+        default_height,
+    );
+    try protocol.zwlr_layer_surface_v1_types.requests.set_anchor(
+        client.connectionPtr(),
+        layer_surface,
+        layerAnchor(options.anchors),
+    );
+    try protocol.zwlr_layer_surface_v1_types.requests.set_exclusive_zone(
+        client.connectionPtr(),
+        layer_surface,
+        options.exclusive_zone,
+    );
+    try protocol.zwlr_layer_surface_v1_types.requests.set_margin(
+        client.connectionPtr(),
+        layer_surface,
+        options.margin.top,
+        options.margin.right,
+        options.margin.bottom,
+        options.margin.left,
+    );
+    try protocol.zwlr_layer_surface_v1_types.requests.set_keyboard_interactivity(
+        client.connectionPtr(),
+        layer_surface,
+        @intFromEnum(keyboardInteractivity(options.keyboard_interactivity)),
+    );
+    if (options.pointer_interactivity == .none) try setEmptyInputRegion(client, base.surface);
+    try protocol.wl_surface_types.requests.commit(client.connectionPtr(), base.surface);
+    try client.flush();
+    return initSurface(
+        allocator,
+        client,
+        base,
+        .{ .layer = layer_surface },
+        default_width,
+        default_height,
+    );
+}
+
+fn initSurface(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    base: Client.Surface,
+    role: Role,
+    default_width: u32,
+    default_height: u32,
+) !Window {
     const raw_candidates = client.dmaBufCandidates();
     const candidates = try allocator.alloc(VulkanWindow.Candidate, raw_candidates.len);
     defer allocator.free(candidates);
@@ -75,7 +166,7 @@ pub fn init(
     var renderer = try VulkanWindow.init(
         allocator,
         client.connectionPtr(),
-        handles.surface,
+        base.surface,
         client.dmaBufFactory() orelse return error.MissingDmaBufFactory,
         candidates[0..candidate_count],
     );
@@ -83,13 +174,10 @@ pub fn init(
     return .{
         .allocator = allocator,
         .client = client,
-        .surface = handles.surface,
-        .viewport = handles.viewport,
-        .fractional_scale = handles.fractional_scale,
-        .role = .{ .toplevel = .{
-            .xdg_surface = handles.xdg_surface,
-            .toplevel = handles.toplevel,
-        } },
+        .surface = base.surface,
+        .viewport = base.viewport,
+        .fractional_scale = base.fractional_scale,
+        .role = role,
         .renderer = renderer,
         .width = default_width,
         .height = default_height,
@@ -193,6 +281,35 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         self.configure_generation +%= 1;
         try self.client.flush();
         return .configured;
+    }
+    if (self.role == .layer and message.object_id == self.role.layer.id) {
+        switch (try protocol.zwlr_layer_surface_v1_types.decodeEvent(
+            self.client.connectionPtr(),
+            self.role.layer,
+            message,
+        )) {
+            .configure => |configure| {
+                if (configure.width == 0 or configure.height == 0) return error.EmptyLayerConfigure;
+                try protocol.zwlr_layer_surface_v1_types.requests.ack_configure(
+                    self.client.connectionPtr(),
+                    self.role.layer,
+                    configure.serial,
+                );
+                self.width = configure.width;
+                self.height = configure.height;
+                self.pending_width = configure.width;
+                self.pending_height = configure.height;
+                try self.configureScale();
+                self.configured = true;
+                self.configure_generation +%= 1;
+                try self.client.flush();
+                return .configured;
+            },
+            .closed => {
+                self.closed = true;
+                return .close;
+            },
+        }
     }
     if (self.frame_callback) |callback| {
         if (message.object_id == callback.id) {
@@ -326,6 +443,21 @@ pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge:
 pub fn outputScaleChanged(self: *Window) !?Event {
     if (self.fractional_scale != null or self.preferred_buffer_scale != null) return null;
     return self.applyScale();
+}
+
+pub fn requestLayerSize(self: *Window, width: u31, height: u31) !void {
+    const role = switch (self.role) {
+        .layer => |value| value,
+        else => return error.NotLayerSurface,
+    };
+    try protocol.zwlr_layer_surface_v1_types.requests.set_size(
+        self.client.connectionPtr(),
+        role,
+        width,
+        height,
+    );
+    try protocol.wl_surface_types.requests.commit(self.client.connectionPtr(), self.surface);
+    try self.client.flush();
 }
 
 const render_backend_vtable: keywork.RenderBackend.VTable = .{
@@ -484,6 +616,50 @@ fn destroyRole(self: *Window) !void {
     }
 }
 
+fn setEmptyInputRegion(client: *Client, surface: wayring.ObjectHandle) !void {
+    const compositor = client.compositorHandle() orelse return error.MissingCompositor;
+    const region = try protocol.wl_compositor_types.requests.create_region(
+        client.connectionPtr(),
+        compositor,
+    );
+    errdefer protocol.wl_region_types.requests.destroy(client.connectionPtr(), region) catch {};
+    try protocol.wl_surface_types.requests.set_input_region(
+        client.connectionPtr(),
+        surface,
+        region,
+    );
+    try protocol.wl_region_types.requests.destroy(client.connectionPtr(), region);
+}
+
+fn layer(value: wayland_options.LayerShellOptions.Layer) protocol.zwlr_layer_shell_v1_types.layer {
+    return switch (value) {
+        .background => .background,
+        .bottom => .bottom,
+        .top => .top,
+        .overlay => .overlay,
+    };
+}
+
+fn layerAnchor(value: wayland_options.LayerShellOptions.AnchorSet) u32 {
+    const anchor = protocol.zwlr_layer_surface_v1_types.anchor;
+    var result: u32 = 0;
+    if (value.top) result |= anchor.top;
+    if (value.bottom) result |= anchor.bottom;
+    if (value.left) result |= anchor.left;
+    if (value.right) result |= anchor.right;
+    return result;
+}
+
+fn keyboardInteractivity(
+    value: wayland_options.LayerShellOptions.KeyboardInteractivity,
+) protocol.zwlr_layer_surface_v1_types.keyboard_interactivity {
+    return switch (value) {
+        .none => .none,
+        .exclusive => .exclusive,
+        .on_demand => .on_demand,
+    };
+}
+
 test {
     std.testing.refAllDecls(Window);
     try std.testing.expectEqual(
@@ -499,4 +675,9 @@ test {
         scaledSize120(std.math.maxInt(u32), 1, 240),
     );
     try std.testing.expectError(error.InvalidSurfaceScale, scaledSize120(1, 1, 0));
+    try std.testing.expectEqual(
+        protocol.zwlr_layer_surface_v1_types.anchor.top |
+            protocol.zwlr_layer_surface_v1_types.anchor.left,
+        layerAnchor(.{ .top = true, .left = true }),
+    );
 }

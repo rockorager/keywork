@@ -145,7 +145,9 @@ pub const Window = struct {
     }
 
     pub fn setLayerContentRect(_: *Window, _: u31, _: u31, _: keywork.Rect) !void {
-        return error.NotLayerSurface;
+        // Wayring currently uses the full logical layer surface as its input
+        // and opaque geometry. Content rects only affect the libwayland
+        // background-effect integration.
     }
 
     fn updateCursor(self: *Window) !void {
@@ -352,8 +354,25 @@ pub fn destroy(self: *Backend) void {
 
 pub fn createWindow(self: *Backend, window_options: WindowOptions) !*Window {
     if (self.state != .running) return error.ConnectionNotReady;
-    if (window_options.layer_shell != null) return error.LayerShellNotImplemented;
     if (window_options.session_lock != null) return error.SessionLockNotImplemented;
+    if (window_options.layer_shell) |layer_options| {
+        try self.windows.ensureUnusedCapacity(self.allocator, 1);
+        const window = try self.allocator.create(Window);
+        errdefer self.allocator.destroy(window);
+        window.* = .{
+            .backend = self,
+            .protocol = try ProtocolWindow.initLayer(
+                self.allocator,
+                &self.client,
+                layer_options,
+                window_options.output,
+                window_options.width,
+                window_options.height,
+            ),
+        };
+        self.windows.appendAssumeCapacity(window);
+        return window;
+    }
     return self.createXdgWindow(.{
         .title = window_options.title,
         .app_id = window_options.app_id,
@@ -456,8 +475,8 @@ pub fn repositionPopup(_: *Backend, _: *Window, _: wayland_window.PopupOptions, 
     return error.PopupNotImplemented;
 }
 
-pub fn requestLayerSize(_: *Backend, _: *Window, _: u31, _: u31) !void {
-    return error.LayerShellNotImplemented;
+pub fn requestLayerSize(_: *Backend, window: *Window, width: u31, height: u31) !void {
+    try window.protocol.requestLayerSize(width, height);
 }
 
 pub fn renderBackend(self: *Backend) !keywork.RenderBackend {
