@@ -26,16 +26,19 @@ local fit_by_mode = {
 ---@field mode?  BackgroundMode
 ---@field color? integer
 
-local retained = kw.app.hot.state("shell.background", {
-    init = function()
-        return {
-            profiles = { ["*"] = {} },
-            enabled = false,
-        }
-    end,
-})
----@cast retained { profiles: table<string, BackgroundProfile>, enabled: boolean }
-local profiles = retained.profiles
+local state = kw.app.hot.signal(
+    "shell.background",
+    {
+        profiles = { ["*"] = {} },
+        enabled = false,
+    },
+    {
+        version = 2,
+        migrate = function(previous)
+            return previous or { profiles = { ["*"] = {} }, enabled = false }
+        end,
+    }
+)
 
 local function arguments(payload)
     local args = {}
@@ -137,13 +140,12 @@ end
 function M.configure(payload)
     local parsed, err = parse(payload)
     if not parsed then return false, err end
-    profiles = parsed
-    retained.profiles = parsed
-    retained.enabled = true
+    state:set({ profiles = parsed, enabled = true })
     return true
 end
 
 local function setting(output_name, key, fallback)
+    local profiles = state().profiles
     local profile = profiles[output_name]
     if profile and profile[key] ~= nil then return profile[key] end
     local defaults = profiles["*"]
@@ -151,7 +153,7 @@ local function setting(output_name, key, fallback)
     return fallback
 end
 
-local Background = kw.stateful({
+local Background = kw.component({
     hot_id = "Background",
     hot_version = 1,
     build = function(self, context)
@@ -184,7 +186,7 @@ local Background = kw.stateful({
 })
 
 function M.append_windows(windows, outputs)
-    if not retained.enabled then return end
+    if not state().enabled then return end
     for _, output in ipairs(outputs) do
         windows[#windows + 1] = kw.window({
             id = "background:" .. output.name,

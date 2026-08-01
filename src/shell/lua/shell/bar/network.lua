@@ -423,7 +423,7 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
     })
 end
 
-local WifiMenu = kw.stateful({
+local WifiMenu = kw.component({
     hot_id = "WifiMenu",
     hot_version = 1,
     build = function(self)
@@ -913,8 +913,9 @@ local network_service = service.define("shell.bar.network", function(self)
     end
 end)
 
-local Network = kw.stateful({
+local Network = kw.component({
     init = function(self)
+        self.revision = kw.signal(0)
         self.wifi_menu_open = false
         self.wifi_auth_entry = nil
         self.wifi_auth_token = nil
@@ -924,7 +925,11 @@ local Network = kw.stateful({
     end,
 
     hot_id = "Network",
-    hot_version = 1,
+    hot_version = 2,
+    mutate = function(self, fn)
+        if fn then fn(self) end
+        self.revision:update(function(value) return value + 1 end)
+    end,
     start = function(self)
         self.wifi_refresh_pending = false --[[@as boolean]]
         self.wifi_fetching = false
@@ -932,18 +937,13 @@ local Network = kw.stateful({
         self.wifi_tap = function()
             self:toggle_wifi_menu()
         end
-        self.net = network_service:use(self.scope, function(snapshot)
-            self.net = snapshot
-            self:set_state(function(state)
-                if state.wifi_menu_open then
-                    state:refresh_wifi_list()
-                end
-            end)
+        self.net = network_service:use(self.scope, function()
+            if self.wifi_menu_open then self:refresh_wifi_list() end
         end)
     end,
 
     toggle_wifi_menu = function(self)
-        self:set_state(function(state)
+        self:mutate(function(state)
             state.wifi_menu_open = not state.wifi_menu_open
             if state.wifi_menu_open then
                 state.wifi_status = nil
@@ -960,21 +960,21 @@ local Network = kw.stateful({
     end,
 
     scan_wifi = function(self)
-        local net = self.net
+        local net = self.net and self.net()
         if not net or not net.scan or self.wifi_scan_inflight then
             return
         end
         -- Show Scanning… while NetworkManager accepts the request; LastScan
         -- then keeps the service-level indicator active until completion.
         self.wifi_scan_inflight = true
-        self:set_state(function(state)
+        self:mutate(function(state)
             state.wifi_scanning = true
         end)
         self.scope:spawn(function()
             local reply, err = net.scan()
             self.wifi_scan_inflight = false
             if not reply then
-                self:set_state(function(state)
+                self:mutate(function(state)
                     state.wifi_status = "Scan failed: " .. (err or "unknown")
                 end)
             end
@@ -1007,9 +1007,9 @@ local Network = kw.stateful({
     end,
 
     refresh_wifi_list_now = function(self)
-        local net = self.net
+        local net = self.net and self.net()
         if not net or not net.list then
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_status = "NetworkManager unavailable"
             end)
             return
@@ -1018,7 +1018,7 @@ local Network = kw.stateful({
         if not result then
             return -- retain the last good snapshot on transient D-Bus failures
         end
-        self:set_state(function(state)
+        self:mutate(function(state)
             state.wifi_networks = result.networks
             -- Keep Scanning… while RequestScan itself is still in flight even
             -- if this snapshot predates the service-level scan flag.
@@ -1027,16 +1027,16 @@ local Network = kw.stateful({
     end,
 
     connect_wifi = function(self, entry)
-        local net = self.net
+        local net = self.net and self.net()
         if not net or not net.connect then
             return
         end
         self.scope:spawn(function()
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_status = entry.connected and "Disconnecting…" or ("Connecting to " .. entry.name .. "…")
             end)
             local reply, err = net.connect(entry)
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_status = reply and nil or ("Failed: " .. (err or "unknown"))
             end)
             self:refresh_wifi_list()
@@ -1045,11 +1045,11 @@ local Network = kw.stateful({
 
     select_wifi = function(self, entry)
         if not entry.known and entry.security == "enterprise" then
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_status = "Enterprise Wi-Fi isn't supported yet"
             end)
         elseif not entry.known and entry.requires_password then
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_auth_entry = entry
                 state.wifi_auth_token = {}
                 state.wifi_password = ""
@@ -1062,27 +1062,27 @@ local Network = kw.stateful({
     end,
 
     submit_wifi_password = function(self, password)
-        local net = self.net
+        local net = self.net and self.net()
         local entry = self.wifi_auth_entry
         local token = self.wifi_auth_token
         if not net or not net.connect or not entry or self.wifi_auth_connecting then
             return
         end
         if password == "" then
-            self:set_state(function(state)
+            self:mutate(function(state)
                 state.wifi_auth_error = "Enter the network password."
             end)
             return
         end
 
-        self:set_state(function(state)
+        self:mutate(function(state)
             state.wifi_password = password
             state.wifi_auth_error = nil
             state.wifi_auth_connecting = true
         end)
         self.scope:spawn(function()
             local reply, err = net.connect(entry, password)
-            self:set_state(function(state)
+            self:mutate(function(state)
                 if state.wifi_auth_token ~= token then return end
                 state.wifi_auth_connecting = false
                 if reply then
@@ -1117,7 +1117,7 @@ local Network = kw.stateful({
                 networks = self.wifi_networks,
                 auth = auth,
                 on_auth_back = function()
-                    self:set_state(function(state)
+                    self:mutate(function(state)
                         if state.wifi_auth_connecting then return end
                         state.wifi_auth_entry = nil
                         state.wifi_auth_token = nil
@@ -1126,7 +1126,7 @@ local Network = kw.stateful({
                     end)
                 end,
                 on_auth_change = function(password)
-                    self:set_state(function(state)
+                    self:mutate(function(state)
                         state.wifi_password = password
                         state.wifi_auth_error = nil
                     end)
@@ -1145,8 +1145,9 @@ local Network = kw.stateful({
     end,
 
     build = function(self)
+        self.revision()
         local palette = self.props.colors
-        local net = self.net or { operstate = "down", essid = "", percent = 0 }
+        local net = self.net and self.net() or { operstate = "down", essid = "", percent = 0 }
         return kw.popover({
             id = "network",
             anchor = pill_from_values(palette, net.operstate, net.essid, net.percent, self.wifi_tap),
@@ -1157,7 +1158,7 @@ local Network = kw.stateful({
                 return self:build_wifi_menu()
             end,
             on_close = function()
-                self:set_state(function(state)
+                self:mutate(function(state)
                     state.wifi_menu_open = false
                     state.wifi_auth_entry = nil
                     state.wifi_auth_token = nil

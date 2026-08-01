@@ -1,4 +1,5 @@
 local ui = {}
+local reactive = require("keywork.reactive")
 
 -- The authoritative built-in profile lives separately from generic theme and
 -- widget mechanics so additional design profiles do not duplicate this API.
@@ -271,28 +272,27 @@ function ui.keyed(key, child)
     }
 end
 
-local hot_stateful_families = {}
+local hot_component_families = {}
 
-function ui.stateful(spec)
+local function native_component(spec, source)
     if spec.hot_id ~= nil then
         if type(spec.hot_id) ~= "string" or spec.hot_id == "" then
-            error("stateful hot_id must be a non-empty string", 2)
+            error("component hot_id must be a non-empty string", 2)
         end
         local version = spec.hot_version or 1
         if type(version) ~= "number" or version < 1 or version % 1 ~= 0 then
-            error("stateful hot_version must be a positive integer", 2)
+            error("component hot_version must be a positive integer", 2)
         end
-        local info = debug.getinfo(2, "S")
-        local source = info and info.source or "?"
+        source = source or "?"
         local family = source .. "\0" .. spec.hot_id .. "\0" .. tostring(version)
-        local token = hot_stateful_families[family]
+        local token = hot_component_families[family]
         if token == nil then
             token = {}
-            hot_stateful_families[family] = token
+            hot_component_families[family] = token
         end
         spec.__hot_token = token
     elseif spec.hot_version ~= nil then
-        error("stateful hot_version requires hot_id", 2)
+        error("component hot_version requires hot_id", 2)
     end
 
     local build = spec.build
@@ -319,6 +319,14 @@ function ui.stateful(spec)
         return widget
     end
 end
+
+function ui.component(spec)
+    local info = debug.getinfo(2, "S")
+    return reactive.component(native_component, spec, info and info.source)
+end
+
+ui.signal = reactive.signal
+ui.computed = reactive.computed
 
 function ui.theme(options)
     options = validate(options, { data=true, theme=true, child=true }, "theme")
@@ -516,7 +524,7 @@ function ui.popover(options)
     options = validate(options, { id=true, anchor=true, open=true, placement=true, width=true, height=true,
         content=true, shadow=true, on_close=true }, "popover")
     local placement = validate(options.placement, { edge=true, alignment=true, gap=true }, "popover placement")
-    local content = options.content
+    local content = reactive.wrap_deferred(options.content)
     if options.shadow and content then
         if type(content) == "function" then
             local builder = content
@@ -594,7 +602,7 @@ function ui.editable_text(options)
     }
 end
 
-local TextField = ui.stateful({
+local TextField = ui.component({
     build = function(self, context)
         local recipe = context.theme.components.text_field
         local options = copy_table(self.props)
@@ -636,7 +644,7 @@ function ui.list_view(options)
         item_height = options.item_extent,
         selected = options.reveal_index,
         follow_end = options.follow_end,
-        build_item = options.build_item,
+        build_item = reactive.wrap_deferred(options.build_item, true),
     }
 end
 
@@ -929,7 +937,7 @@ local function build_button(options, theme)
     })
 end
 
-local Button = ui.stateful({
+local Button = ui.component({
     build = function(self, context)
         return build_button(self.props, context.theme)
     end,
@@ -992,12 +1000,12 @@ local function token(options, theme, kind)
         child = child,
     })
 end
-local Tag = ui.stateful({
+local Tag = ui.component({
     build = function(self, context)
         return token(self.props, context.theme, "tag")
     end,
 })
-local Badge = ui.stateful({
+local Badge = ui.component({
     build = function(self, context)
         return token(self.props, context.theme, "badge")
     end,
@@ -1022,7 +1030,7 @@ local function build_menu(options, theme)
     })
 end
 
-local Menu = ui.stateful({
+local Menu = ui.component({
     build = function(self, context)
         return build_menu(self.props, self.props.theme or context.theme)
     end,
@@ -1084,7 +1092,7 @@ local function build_menu_item(options, theme)
     })
 end
 
-local MenuItem = ui.stateful({
+local MenuItem = ui.component({
     build = function(self, context)
         return build_menu_item(self.props, self.props.theme or context.theme)
     end,
@@ -1132,7 +1140,7 @@ local function build_menu_label(options, theme)
     })
 end
 
-local MenuLabel = ui.stateful({
+local MenuLabel = ui.component({
     build = function(self, context)
         return build_menu_label(self.props, self.props.theme or context.theme)
     end,
@@ -1158,7 +1166,7 @@ local function build_menu_separator(options, theme)
     })
 end
 
-local MenuSeparator = ui.stateful({
+local MenuSeparator = ui.component({
     build = function(self, context)
         return build_menu_separator(self.props, self.props.theme or context.theme)
     end,

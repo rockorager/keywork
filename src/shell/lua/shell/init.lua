@@ -34,33 +34,37 @@ function M.app(options)
     options = validate(options)
     local bar_config = bar.configure(options.bar)
 
-    -- App-level state shared by the window set. Anything that decides which
-    -- windows exist lives here and flips via kw.app.reconcile(); widget
-    -- state (kw.stateful) is per-window runtime.
-    local shell_state = kw.app.hot.state("shell.root", {
-        init = function()
-            return {
-                audio_settings_open = false,
-                launcher_open = false,
-            }
-        end,
-    })
-    ---@cast shell_state { audio_settings_open: boolean, launcher_open: boolean }
+    -- Window-defining state survives reload and is tracked by windows().
+    local shell_state = kw.app.hot.signal(
+        "shell.root",
+        {
+            audio_settings_open = false,
+            launcher_open = false,
+        },
+        {
+            version = 2,
+            migrate = function(previous)
+                return previous or { audio_settings_open = false, launcher_open = false }
+            end,
+        }
+    )
 
     local function set_audio_settings_open(open)
-        if shell_state.audio_settings_open == open then
+        if shell_state().audio_settings_open == open then
             return
         end
-        shell_state.audio_settings_open = open
-        kw.app.reconcile()
+        shell_state:mutate(function(state)
+            state.audio_settings_open = open
+        end)
     end
 
     local function set_launcher_open(open)
-        if shell_state.launcher_open == open then
+        if shell_state().launcher_open == open then
             return
         end
-        shell_state.launcher_open = open
-        kw.app.reconcile()
+        shell_state:mutate(function(state)
+            state.launcher_open = open
+        end)
     end
 
     ---@type OsdController?
@@ -86,9 +90,7 @@ function M.app(options)
 
     local function start()
         stop()
-        osd_controller = osd.new(function()
-            kw.app.reconcile()
-        end)
+        osd_controller = osd.new()
         session_controller = session.start()
         idle_controller = idle.start({
             lock = function()
@@ -98,7 +100,7 @@ function M.app(options)
         local ipc_err
         ipc_handle, ipc_err = ipc.serve({
             toggle_launcher = function()
-                set_launcher_open(not shell_state.launcher_open)
+                set_launcher_open(not shell_state().launcher_open)
             end,
             lock = function()
                 session_controller:lock()
@@ -110,19 +112,14 @@ function M.app(options)
                 return osd_controller:adjust_brightness(action)
             end,
             configure_background = function(payload)
-                local ok, err = background.configure(payload)
-                if not ok then return false, err end
-                kw.app.invalidate()
-                return true
+                return background.configure(payload)
             end,
         })
         if not ipc_handle and ipc_err == "name-taken" then
             io.stderr:write("keywork-shell: another instance already owns " .. ipc.name .. "\n")
             os.exit(1)
         end
-        notification_server = notifications.serve(function()
-            kw.app.invalidate()
-        end)
+        notification_server = notifications.serve()
     end
 
     ---@type shell.BarActions
@@ -131,7 +128,7 @@ function M.app(options)
             set_audio_settings_open(true)
         end,
         toggle_launcher = function()
-            set_launcher_open(not shell_state.launcher_open)
+            set_launcher_open(not shell_state().launcher_open)
         end,
     }
 
@@ -141,6 +138,7 @@ function M.app(options)
         start = start,
         stop = stop,
         windows = function(ctx)
+            local state = shell_state()
             local windows = {}
             local has_output = ctx.outputs[1] ~= nil
             background.append_windows(windows, ctx.outputs)
@@ -165,7 +163,7 @@ function M.app(options)
                 })
             end
 
-            if shell_state.audio_settings_open then
+            if state.audio_settings_open then
                 windows[#windows + 1] = kw.window({
                     id = "audio-settings",
                     title = "Audio Settings",
@@ -186,7 +184,7 @@ function M.app(options)
             -- The launcher window's existence follows app state: declaring it
             -- creates the surface, dropping it destroys it. No output asks the
             -- compositor to use the output under the pointer; no anchors centers it.
-            if shell_state.launcher_open and has_output then
+            if state.launcher_open and has_output then
                 windows[#windows + 1] = kw.window({
                     id = "launcher",
                     width = launcher.width,
@@ -217,12 +215,13 @@ function M.app(options)
                     },
                     child = osd.Level({
                         key = "osd-level",
-                        controller = osd_controller,
+                        level = level,
                     }),
                 })
             end
 
-            if notification_server and has_output and #notification_server:visible() > 0 then
+            local visible_notifications = notification_server and notification_server.notifications() or {}
+            if has_output and #visible_notifications > 0 then
                 -- Match Fluent's default corner-toaster offsets.
                 windows[#windows + 1] = kw.window({
                     id = "notifications",
@@ -239,6 +238,7 @@ function M.app(options)
                     child = notifications.Stack({
                         key = "notification-stack",
                         server = notification_server,
+                        notifications = visible_notifications,
                     }),
                 })
             end

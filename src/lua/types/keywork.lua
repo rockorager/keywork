@@ -28,6 +28,22 @@
 
 ---@class keywork.Widget
 
+---@class keywork.Signal<T>
+---@operator call(): T
+---@field set fun(self: keywork.Signal<T>, value: T)
+---@field update fun(self: keywork.Signal<T>, update: fun(value: T): T)
+---@field mutate fun(self: keywork.Signal<T>, update: fun(value: T))
+---@field readonly fun(self: keywork.Signal<T>): keywork.ReadonlySignal<T>
+
+---@class keywork.ReadonlySignal<T>
+---@operator call(): T
+
+---@class keywork.Computed<T>
+---@operator call(): T
+
+---@class keywork.SignalOptions<T>
+---@field equals? fun(previous: T, next: T): boolean
+
 ---@class keywork.Modifiers
 ---@field shift boolean
 ---@field ctrl  boolean
@@ -496,25 +512,24 @@
 
 ---@alias keywork.AppOptions keywork.AppChildOptions | keywork.AppWindowsOptions
 
----@class keywork.StatefulState<P: table>
+---@class keywork.ComponentState<P: table>
 ---@field props     P
 ---@field scope     keywork.loop.Scope                                                                 Lifecycle scope, created on first access.
----@field set_state fun(self: keywork.StatefulState<P>, update?: fun(state: keywork.StatefulState<P>))
 ---@field [string]  any                                                                                State initialization may add arbitrary fields and methods.
 
----@class keywork.StatefulBuildContext: keywork.BuildContext
+---@class keywork.ComponentBuildContext: keywork.BuildContext
 ---@field theme keywork.Theme
 
----@class keywork.StatefulSpec<P: table>
+---@class keywork.ComponentSpec<P: table>
 ---@field hot_id?      string Stable family identifier, scoped to the defining source file.
 ---@field hot_version? integer Changing the version remounts this widget instead of retaining state.
----@field init?    fun(self: keywork.StatefulState<P>, props: P)
----@field start?   fun(self: keywork.StatefulState<P>, props: P) Runs after init and after every compatible reload with a fresh lifecycle scope.
----@field update?  fun(self: keywork.StatefulState<P>, props: P)
----@field build    fun(self: keywork.StatefulState<P>, context: keywork.StatefulBuildContext): keywork.Widget
----@field dispose? fun(self: keywork.StatefulState<P>)
+---@field init?    fun(self: keywork.ComponentState<P>, props: P)
+---@field start?   fun(self: keywork.ComponentState<P>, props: P) Runs after init and after every compatible reload with a fresh lifecycle scope.
+---@field update?  fun(self: keywork.ComponentState<P>, props: P)
+---@field build    fun(self: keywork.ComponentState<P>, context: keywork.ComponentBuildContext): keywork.Widget
+---@field dispose? fun(self: keywork.ComponentState<P>)
 
----@class keywork.StatefulFactory<P: table>
+---@class keywork.ComponentFactory<P: table>
 ---@operator call(P?): keywork.Widget
 
 ---@class keywork.ThemeWidgetOptions
@@ -842,14 +857,17 @@ function PixelBuffer:commit(options) end
 ---@field init fun(): T Creates state when the key is new or its version changes without a migrator.
 ---@field migrate? fun(previous: T, previous_version: integer): T Migrates state when `version` changes.
 
+---@class keywork.HotSignalOptions<T>
+---@field version? integer Version of the retained value; defaults to 1.
+---@field migrate? fun(previous: T, previous_version: integer): T Migrates the value when `version` changes.
+
 ---@class keywork.HotNamespace
 ---@field state fun(key: string, options: keywork.HotStateOptions): table Retain a plain, acyclic Lua data table across reload generations.
+---@field signal fun(key: string, initial: any, options?: keywork.HotSignalOptions): keywork.Signal Retain a signal's plain Lua value across reload generations.
 
 ---@class keywork.AppNamespace
 ---@field quit       fun()
 ---@field reload     fun()
----@field invalidate fun() Rebuild the window set and all retained window content.
----@field reconcile  fun() Rebuild only the window set, preserving retained content in existing windows.
 ---@field hot        keywork.HotNamespace
 ---@operator call(keywork.AppOptions): keywork.App
 
@@ -934,10 +952,21 @@ function M.text(value, style) end
 ---@return keywork.Widget
 function M.keyed(key, child) end
 
+---@generic T
+---@param value T
+---@param options? keywork.SignalOptions<T>
+---@return keywork.Signal<T>
+function M.signal(value, options) end
+
+---@generic T
+---@param compute fun(): T
+---@return keywork.Computed<T>
+function M.computed(compute) end
+
 ---@generic P: table
----@param spec keywork.StatefulSpec<P>
----@return keywork.StatefulFactory<P>
-function M.stateful(spec) end
+---@param spec keywork.ComponentSpec<P>
+---@return keywork.ComponentFactory<P>
+function M.component(spec) end
 
 ---@param options keywork.ThemeWidgetOptions
 ---@return keywork.Widget

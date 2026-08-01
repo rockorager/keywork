@@ -696,12 +696,15 @@ local function battery_status_from_values(palette, percentage, state, line_power
     return status_pill(palette, "battery", name, tostring(capacity) .. "%", color, { icon_size = 14 })
 end
 
-local StatusItems = kw.stateful({
+local StatusItems = kw.component({
     init = function(self)
         local palette = self.props.colors
-        self.volume = status_pill(palette, "volume", "audio-volume-muted", nil, palette.muted)
-        self.network = status_pill(palette, "network", "network-wireless-offline", nil, palette.error)
-        self.battery = status_pill(palette, "battery", "battery-level-0", "", palette.muted, { icon_size = 14 })
+        self.status = kw.signal({
+            volume = status_pill(palette, "volume", "audio-volume-muted", nil, palette.muted),
+            network = status_pill(palette, "network", "network-wireless-offline", nil, palette.error),
+            battery = status_pill(palette, "battery", "battery-level-0", "", palette.muted, { icon_size = 14 }),
+            time = os.date("%a %b %d  %I:%M %p"),
+        })
         self:update_time()
         self:update_volume()
         self:update_network()
@@ -713,9 +716,7 @@ local StatusItems = kw.stateful({
         local timer = self.timer
         loop.spawn(function()
             for _ in timer:ticks() do
-                self:set_state(function(state)
-                    state:update_time()
-                end)
+                self:update_time()
             end
         end)
     end,
@@ -748,7 +749,9 @@ local StatusItems = kw.stateful({
     end,
 
     update_time = function(self)
-        self.time = os.date("%a %b %d  %I:%M %p")
+        self.status:mutate(function(status)
+            status.time = os.date("%a %b %d  %I:%M %p")
+        end)
     end,
 
     update_volume = function(self)
@@ -759,8 +762,8 @@ local StatusItems = kw.stateful({
             self.volume_proc = capture({ "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@" }, function(result)
                 self.volume_proc = nil
                 if result.ok then
-                    self:set_state(function(state)
-                        state.volume = volume_status_from_output(state.props.colors, result.stdout)
+                    self.status:mutate(function(status)
+                        status.volume = volume_status_from_output(self.props.colors, result.stdout)
                     end)
                 end
                 if self.volume_dirty then
@@ -797,13 +800,11 @@ local StatusItems = kw.stateful({
                     local line = buffer:sub(1, newline - 1)
                     buffer = buffer:sub(newline + 1)
                     if line:find("sink", 1, true) or line:find("server", 1, true) then
-                        self:set_state(function(state)
-                            if state.volume_proc then
-                                state.volume_dirty = true
-                            else
-                                state:update_volume()
-                            end
-                        end)
+                        if self.volume_proc then
+                            self.volume_dirty = true
+                        else
+                            self:update_volume()
+                        end
                     end
                 end
             end
@@ -835,8 +836,8 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
                 function(result)
                     self.network_proc = nil
                     if result.ok then
-                        self:set_state(function(state)
-                            state.network = network_status_from_output(state.props.colors, result.stdout)
+                        self.status:mutate(function(status)
+                            status.network = network_status_from_output(self.props.colors, result.stdout)
                         end)
                     end
                 end)
@@ -862,9 +863,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
             for signal in sub:events() do
                 if signal.member == "PropertiesChanged" or signal.member == "StateChanged"
                     or signal.member == "DeviceAdded" or signal.member == "DeviceRemoved" then
-                    self:set_state(function(state)
-                        state:update_network()
-                    end)
+                    self:update_network()
                 end
             end
         end)
@@ -884,10 +883,8 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
                 log.warn("battery dbus properties failed", err or path)
                 return
             end
-            self:set_state(function(state)
-                state:apply_battery_properties(path, (reply.args or {})[1] or {})
-                state:update_battery_widget()
-            end)
+            self:apply_battery_properties(path, (reply.args or {})[1] or {})
+            self:update_battery_widget()
         end)
     end,
 
@@ -911,12 +908,14 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
     end,
 
     update_battery_widget = function(self)
-        self.battery = battery_status_from_values(
-            self.props.colors,
-            self.battery_percentage,
-            self.battery_state,
-            self.line_power_online
-        )
+        self.status:mutate(function(status)
+            status.battery = battery_status_from_values(
+                self.props.colors,
+                self.battery_percentage,
+                self.battery_state,
+                self.line_power_online
+            )
+        end)
     end,
 
     update_battery = function(self)
@@ -971,9 +970,7 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
                     for signal in sub:events() do
                         if signal.member == "PropertiesChanged" or signal.member == "DeviceAdded"
                             or signal.member == "DeviceRemoved" or signal.member == "Changed" then
-                            self:set_state(function(state)
-                                state:apply_battery_signal(signal)
-                            end)
+                            self:apply_battery_signal(signal)
                         end
                     end
                 end)
@@ -997,25 +994,28 @@ printf '%s\n%s\n%s\n' "$operstate" "$essid" "$quality"
 
     build = function(self, context)
         local palette = self.props.colors
+        local status = self.status()
         return kw.row({
             spacing = 8,
             align = "center",
             children = {
-                self.volume,
-                self.network,
-                self.battery,
-                label(self.time, palette),
+                status.volume,
+                status.network,
+                status.battery,
+                label(status.time, palette),
             },
         })
     end,
 })
 
-local SwayWorkspaces = kw.stateful({
+local SwayWorkspaces = kw.component({
     init = function(self)
+        self.sway_state = kw.signal(nil)
         self.sway = connect_sway(function()
-            self:set_state()
+            self.sway_state:mutate(function() end)
         end)
             or { fd = -1, buffer = "", workspaces = {}, connected = false }
+        self.sway_state:set(self.sway)
     end,
 
     dispose = function(self)
@@ -1028,15 +1028,17 @@ local SwayWorkspaces = kw.stateful({
     end,
 
     build = function(self)
-        return workspaces(self.props.colors, self.sway)
+        return workspaces(self.props.colors, self.sway_state())
     end,
 })
 
-local TrayItems = kw.stateful({
+local TrayItems = kw.component({
     init = function(self)
+        self.host_state = kw.signal(nil)
         self.host = create_tray_host(function()
-            self:set_state()
+            self.host_state:mutate(function() end)
         end)
+        self.host_state:set(self.host)
     end,
 
     dispose = function(self)
@@ -1046,13 +1048,14 @@ local TrayItems = kw.stateful({
     end,
 
     build = function(self)
-        if not self.host then
+        local host = self.host_state()
+        if not host then
             return kw.row({ spacing = 0, children = {} })
         end
 
         local palette = self.props.colors
         local items = {}
-        for _, item in ipairs(self.host:visible_items()) do
+        for _, item in ipairs(host:visible_items()) do
             local icon_name = item.icon_name or "application-x-executable"
             local pixmap = best_icon_pixmap(item.icon_pixmap)
             local icon = pixmap
@@ -1083,7 +1086,7 @@ local TrayItems = kw.stateful({
     end,
 })
 
-local App = kw.stateful({
+local App = kw.component({
     build = function(self, context)
         local theme = kw.resolve_theme(bar_theme, context)
         local palette = bar_colors(theme)

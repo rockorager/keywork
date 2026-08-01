@@ -22,16 +22,12 @@ local colors = {
     accent = 0xff0090ff,
 }
 
--- App-level state shared by the window set and every window's widgets.
--- Widget state (kw.stateful) is per-runtime, so anything that decides
--- which windows exist lives here and flips via kw.app.reconcile().
-local shell = {
-    launcher_open = false,
-}
+-- Hot app signals survive compatible reloads. Reading this one in windows()
+-- makes changes reconcile the window set automatically.
+local launcher_open = kw.app.hot.signal("launcher-open", false)
 
 local function set_launcher_open(open)
-    shell.launcher_open = open
-    kw.app.reconcile()
+    launcher_open:set(open)
 end
 
 local function seconds_until_next_minute()
@@ -39,16 +35,15 @@ local function seconds_until_next_minute()
     return 60 - now.sec
 end
 
-local Clock = kw.stateful({
+local Clock = kw.component({
     init = function(self)
-        self:update_time()
+        self.time = kw.signal(os.date("%a %b %d  %I:%M %p"))
+        self.menu_open = kw.signal(false)
         self.timer = loop.timer({ delay = seconds_until_next_minute(), interval = 60.0 })
         local timer = self.timer
         loop.spawn(function()
             for _ in timer:ticks() do
-                self:set_state(function(state)
-                    state:update_time()
-                end)
+                self.time:set(os.date("%a %b %d  %I:%M %p"))
             end
         end)
     end,
@@ -59,19 +54,13 @@ local Clock = kw.stateful({
         end
     end,
 
-    update_time = function(self)
-        self.time = os.date("%a %b %d  %I:%M %p")
-    end,
-
     build_menu = function(self)
         local function item(label)
             return kw.gesture({
                 id = "menu-" .. label,
                 hover_background = 0xff2a2c31,
                 on_tap = function()
-                    self:set_state(function(state)
-                        state.menu_open = false
-                    end)
+                    self.menu_open:set(false)
                 end,
                 child = kw.padding({
                     x = 12,
@@ -102,9 +91,10 @@ local Clock = kw.stateful({
         -- [popups] Clicking the clock toggles menu_open; the popup's
         -- existence follows that state, so the compositor dismissing it
         -- (on_close) and tapping an item both just clear the flag.
+        local menu_open = self.menu_open()
         return kw.anchored({
             id = "clock",
-            popup = self.menu_open
+            popup = menu_open
                 and kw.popup({
                     edge = "bottom",
                     alignment = "end",
@@ -113,27 +103,25 @@ local Clock = kw.stateful({
                         return self:build_menu()
                     end,
                     on_close = function()
-                        self:set_state(function(state)
-                            state.menu_open = false
-                        end)
+                        self.menu_open:set(false)
                     end,
                 }) or nil,
             child = kw.gesture({
                 id = "clock-tap",
                 on_tap = function()
-                    self:set_state(function(state)
-                        state.menu_open = not state.menu_open
+                    self.menu_open:update(function(open)
+                        return not open
                     end)
                 end,
-                child = kw.text(self.time, {
-                    color = self.menu_open and colors.accent or colors.text,
+                child = kw.text(self.time(), {
+                    color = menu_open and colors.accent or colors.text,
                 }),
             }),
         })
     end,
 })
 
-local Bar = kw.stateful({
+local Bar = kw.component({
     build = function(self, state)
         return kw.container({
             background = colors.background,
@@ -148,10 +136,10 @@ local Bar = kw.stateful({
                         id = "launcher-toggle",
                         hover_background = 0xff2a2c31,
                         on_tap = function()
-                            set_launcher_open(not shell.launcher_open)
+                            set_launcher_open(not launcher_open())
                         end,
                         child = kw.text("keywork", {
-                            color = shell.launcher_open and colors.accent or colors.muted,
+                            color = launcher_open() and colors.accent or colors.muted,
                         }),
                     }),
                     kw.spacer(),
@@ -233,7 +221,7 @@ return kw.app({
         -- [launcher] the window's existence follows app state: declaring it
         -- creates the surface, dropping it destroys it. No anchors, so the
         -- compositor centers it on the output.
-        if shell.launcher_open and ctx.outputs[1] then
+        if launcher_open() and ctx.outputs[1] then
             windows[#windows + 1] = kw.window({
                 id = "launcher",
                 output = ctx.outputs[1].name,

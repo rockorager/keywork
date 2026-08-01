@@ -86,18 +86,15 @@ local battery_service = service.define("shell.bar.battery", function(self)
     end
 end)
 
-local Battery = kw.stateful({
+local Battery = kw.component({
     hot_id = "Battery",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
-        self.battery = battery_service:use(self.scope, function(battery)
-            self.battery = battery
-            self:set_state()
-        end)
+        self.battery = battery_service:use(self.scope)
     end,
 
     build = function(self)
-        local battery = self.battery or {}
+        local battery = self.battery and self.battery() or {}
         return battery_status_from_values(
             self.props.colors,
             battery.percentage,
@@ -107,18 +104,15 @@ local Battery = kw.stateful({
     end,
 })
 
-local Clock = kw.stateful({
+local Clock = kw.component({
     hot_id = "BarClock",
-    hot_version = 1,
+    hot_version = 2,
     start = function(self)
-        self.timestamp = clock.use(self.scope, function(timestamp)
-            self.timestamp = timestamp
-            self:set_state()
-        end)
+        self.timestamp = clock.use(self.scope)
     end,
 
     build = function(self)
-        local timestamp = self.timestamp or os.time()
+        local timestamp = self.timestamp and self.timestamp() or os.time()
         local text = self.props.format and os.date(self.props.format, timestamp) or clock.format_bar(timestamp)
         return kw.padding({ x = self.props.colors.space[1], child = label(text) })
     end,

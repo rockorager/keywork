@@ -353,7 +353,7 @@ end
 -- One bar per output. Item descriptors turn the output and shared shell
 -- actions into ordinary retained widgets; their effects remain owned by the
 -- widgets' normal lifecycle scopes.
-local Bar = kw.stateful({
+local Bar = kw.component({
     hot_id = "Bar",
     hot_version = 1,
     build = function(self, context)

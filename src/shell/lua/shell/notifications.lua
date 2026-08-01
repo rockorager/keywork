@@ -197,7 +197,7 @@ Server.__index = Server
 ---@field order           integer[]
 ---@field next_id         integer
 ---@field generation      integer
----@field on_change       fun()
+---@field notifications   keywork.Signal<ShellNotification[]>
 ---@field closed          boolean
 ---@field close           fun(self: NotificationServer)
 ---@field notify          function
@@ -206,7 +206,7 @@ Server.__index = Server
 ---@field visible         fun(self: NotificationServer, limit?: integer): ShellNotification[]
 
 function Server:changed()
-    self.on_change()
+    self.notifications:set(self:visible(MAX_VISIBLE))
 end
 
 function Server:emit(member, args)
@@ -410,9 +410,8 @@ function Server:close()
     self.bus:close()
 end
 
----@param on_change fun()
 ---@return NotificationServer?
-function M.serve(on_change)
+function M.serve()
     local ok, bus = pcall(function()
         return dbus.session()
     end)
@@ -439,9 +438,9 @@ function M.serve(on_change)
         order = retained.order,
         next_id = retained.next_id,
         generation = retained.generation,
-        on_change = on_change,
         closed = false,
     }, Server)
+    server.notifications = kw.signal(server:visible(MAX_VISIBLE))
 
     server.exported = bus:export(OBJECT_PATH, {
         [INTERFACE] = {
@@ -552,7 +551,7 @@ local function action_buttons(server, notification, on_hover)
     return buttons
 end
 
-local NotificationCard = kw.stateful({
+local NotificationCard = kw.component({
     hot_id = "NotificationCard",
     hot_version = 1,
     build = function(self, context)
@@ -680,12 +679,12 @@ local NotificationCard = kw.stateful({
 
 M.Card = NotificationCard
 
-local NotificationStack = kw.stateful({
+local NotificationStack = kw.component({
     hot_id = "NotificationStack",
-    hot_version = 1,
+    hot_version = 2,
     build = function(self)
         local children = {}
-        for _, notification in ipairs(self.props.server:visible(MAX_VISIBLE)) do
+        for _, notification in ipairs(self.props.notifications) do
             children[#children + 1] = NotificationCard({
                 key = "notification:" .. notification.id,
                 server = self.props.server,
