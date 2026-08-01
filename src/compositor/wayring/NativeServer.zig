@@ -2737,6 +2737,14 @@ test "native presentation reports only renderer-sampled surfaces" {
             .sample_tag = 2,
             .is_opaque = true,
         } },
+        .{ .image = .{
+            .x = 2,
+            .y = 0,
+            .size = size,
+            .buffer = .{ .size = size, .stride_pixels = size.width, .pixels = &upper_pixels },
+            .sample_tag = 3,
+            .is_opaque = true,
+        } },
     };
     var target_pixels = [_]u32{0} ** 2;
     var server: NativeServer = undefined;
@@ -2752,15 +2760,21 @@ test "native presentation reports only renderer-sampled surfaces" {
     lower_surface.references = 2;
     var upper_surface: CompositorGlobal.Surface = undefined;
     upper_surface.references = 2;
+    var off_output_surface: CompositorGlobal.Surface = undefined;
+    off_output_surface.references = 2;
     var lower_state: SurfaceState = undefined;
     lower_state.surface = &lower_surface;
     lower_state.sample_tag = 1;
     var upper_state: SurfaceState = undefined;
     upper_state.surface = &upper_surface;
     upper_state.sample_tag = 2;
+    var off_output_state: SurfaceState = undefined;
+    off_output_state.surface = &off_output_surface;
+    off_output_state.sample_tag = 3;
 
     var lower_counter: Counter = .{};
     var upper_counter: Counter = .{};
+    var off_output_counter: Counter = .{};
     var lower_feedback: CompositorGlobal.PresentationFeedback = .{
         .context = &lower_counter,
         .presented = Counter.presented,
@@ -2768,6 +2782,11 @@ test "native presentation reports only renderer-sampled surfaces" {
     };
     var upper_feedback: CompositorGlobal.PresentationFeedback = .{
         .context = &upper_counter,
+        .presented = Counter.presented,
+        .discarded = Counter.discarded,
+    };
+    var off_output_feedback: CompositorGlobal.PresentationFeedback = .{
+        .context = &off_output_counter,
         .presented = Counter.presented,
         .discarded = Counter.discarded,
     };
@@ -2783,11 +2802,19 @@ test "native presentation reports only renderer-sampled surfaces" {
     );
     var upper_feedbacks_owned = true;
     errdefer if (upper_feedbacks_owned) std.testing.allocator.free(upper_feedbacks);
+    const off_output_feedbacks = try std.testing.allocator.dupe(
+        *CompositorGlobal.PresentationFeedback,
+        &.{&off_output_feedback},
+    );
+    var off_output_feedbacks_owned = true;
+    errdefer if (off_output_feedbacks_owned)
+        std.testing.allocator.free(off_output_feedbacks);
 
     server.surfaces = .empty;
     defer server.surfaces.deinit(std.testing.allocator);
     try server.surfaces.append(std.testing.allocator, &lower_state);
     try server.surfaces.append(std.testing.allocator, &upper_state);
+    try server.surfaces.append(std.testing.allocator, &off_output_state);
     server.presentation_pending = .empty;
     server.presentation_submitted = .empty;
     defer {
@@ -2796,7 +2823,7 @@ test "native presentation reports only renderer-sampled surfaces" {
         for (server.presentation_pending.items) |*feedbacks| feedbacks.deinit();
         server.presentation_pending.deinit(std.testing.allocator);
     }
-    try server.presentation_submitted.ensureUnusedCapacity(std.testing.allocator, 2);
+    try server.presentation_submitted.ensureUnusedCapacity(std.testing.allocator, 3);
     try server.presentation_pending.append(std.testing.allocator, .{
         .allocator = std.testing.allocator,
         .surface = &lower_surface,
@@ -2809,10 +2836,17 @@ test "native presentation reports only renderer-sampled surfaces" {
         .feedbacks = upper_feedbacks,
     });
     upper_feedbacks_owned = false;
+    try server.presentation_pending.append(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .surface = &off_output_surface,
+        .feedbacks = off_output_feedbacks,
+    });
+    off_output_feedbacks_owned = false;
 
     server.submitPendingPresentation();
     try std.testing.expectEqual(@as(usize, 1), lower_counter.discarded_count);
     try std.testing.expectEqual(@as(usize, 0), upper_counter.discarded_count);
+    try std.testing.expectEqual(@as(usize, 1), off_output_counter.discarded_count);
     try std.testing.expectEqual(@as(usize, 1), server.presentation_submitted.items.len);
 
     var submitted = server.presentation_submitted.pop().?;
@@ -2823,6 +2857,7 @@ test "native presentation reports only renderer-sampled surfaces" {
     submitted.deinit();
     try std.testing.expectEqual(@as(usize, 1), upper_counter.presented_count);
     try std.testing.expectEqual(@as(usize, 0), upper_counter.discarded_count);
+    try std.testing.expectEqual(@as(usize, 0), off_output_counter.presented_count);
 }
 
 test "native compositor owns and drains its io_uring listener" {

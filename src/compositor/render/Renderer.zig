@@ -220,7 +220,7 @@ pub fn finishFrame(self: *Renderer) Error!void {
         .output_color_description = active.color_description,
         .output_calibration = active.output_calibration,
     }, active.target);
-    self.rememberSampledCommands(commands);
+    self.rememberSampledCommands(commands, active.target.size());
     self.active_frame = null;
     self.commands.clearRetainingCapacity();
 }
@@ -257,7 +257,7 @@ pub fn finishFrameReadback(self: *Renderer) Error!FrameCompletion {
         },
         .vulkan => |*renderer| try renderer.renderFrameReadback(frame, target),
     };
-    self.rememberSampledCommands(commands);
+    self.rememberSampledCommands(commands, target.size);
     self.active_frame = null;
     self.commands.clearRetainingCapacity();
     return completion;
@@ -368,9 +368,9 @@ fn finishFrameScanoutCommands(
             gpu_sample_tag,
         ),
     };
-    self.rememberSampledCommands(commands);
+    self.rememberSampledCommands(commands, active.target.size());
     if (exclude_topmost) {
-        self.rememberSampledCommand(self.commands.getLast());
+        self.rememberSampledCommand(self.commands.getLast(), active.target.size());
     }
     self.active_frame = null;
     self.commands.clearRetainingCapacity();
@@ -541,8 +541,8 @@ pub fn cancelFrame(self: *Renderer) void {
 
 /// Finish a frame whose topmost image is presented directly by the output.
 pub fn finishFrameDirectScanout(self: *Renderer) void {
-    std.debug.assert(self.active_frame != null);
-    self.rememberSampledCommand(self.commands.getLast());
+    const active = self.active_frame orelse unreachable;
+    self.rememberSampledCommand(self.commands.getLast(), active.target.size());
     self.cancelFrame();
 }
 
@@ -554,15 +554,21 @@ pub fn wasSampled(self: *const Renderer, tag: u64) bool {
 fn rememberSampledCommands(
     self: *Renderer,
     commands: []const render_types.Command,
+    frame_size: render_types.Size,
 ) void {
-    for (commands) |command| self.rememberSampledCommand(command);
+    for (commands) |command| self.rememberSampledCommand(command, frame_size);
 }
 
-fn rememberSampledCommand(self: *Renderer, command: render_types.Command) void {
+fn rememberSampledCommand(
+    self: *Renderer,
+    command: render_types.Command,
+    frame_size: render_types.Size,
+) void {
     const tag = switch (command) {
         .image => |image| image.sample_tag orelse return,
         else => return,
     };
+    if (command_geometry.visibleRect(command, frame_size) == null) return;
     if (std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null) return;
     self.sampled_tags.appendAssumeCapacity(tag);
 }
@@ -936,7 +942,7 @@ test "renderer prunes commands completely hidden by an opaque image" {
     );
 }
 
-test "renderer reports only sampled image tags after occlusion pruning" {
+test "renderer reports only visible image tags after occlusion pruning" {
     const size: render_types.Size = .{ .width = 2, .height = 1 };
     var lower_pixels = [_]u32{0xffff0000} ** 2;
     var upper_pixels = [_]u32{0xff00ff00} ** 2;
@@ -965,6 +971,18 @@ test "renderer reports only sampled image tags after occlusion pruning" {
             .sample_tag = 2,
             .is_opaque = true,
         } },
+        .{ .image = .{
+            .x = 2,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &upper_pixels,
+            },
+            .sample_tag = 3,
+            .is_opaque = true,
+        } },
     };
     var output = try headless.init(std.testing.allocator, size);
     defer output.deinit();
@@ -975,6 +993,7 @@ test "renderer reports only sampled image tags after occlusion pruning" {
 
     try std.testing.expect(!renderer.wasSampled(1));
     try std.testing.expect(renderer.wasSampled(2));
+    try std.testing.expect(!renderer.wasSampled(3));
 }
 
 test "renderer reports direct and overlay scanout image tags" {
