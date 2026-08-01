@@ -22,6 +22,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const wayring = b.addModule("wayring", .{
+        .root_source_file = b.path("src/wayring/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -41,6 +46,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests and formatting checks");
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
+    const wayring_tests = b.addTest(.{ .root_module = wayring });
+    test_step.dependOn(&b.addRunArtifact(wayring_tests).step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
 
