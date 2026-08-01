@@ -215,6 +215,19 @@ pub const Connection = struct {
         self.free_client_object_ids.appendAssumeCapacity(handle.id);
     }
 
+    /// Makes a destroyed client-created ID reusable after the server confirms
+    /// it with `wl_display.delete_id`. The object must already have been
+    /// removed by its destructor request or event.
+    pub fn releaseClientObjectId(self: *Connection, id: u32) !void {
+        if (self.role != .client) return error.InvalidRole;
+        if (id < first_client_object_id or id >= self.next_client_object_id)
+            return error.InvalidObject;
+        if (self.objects.contains(id)) return error.ObjectStillRegistered;
+        if (std.mem.indexOfScalar(u32, self.free_client_object_ids.items, id) != null)
+            return error.ObjectIdAlreadyReleased;
+        try self.free_client_object_ids.append(self.allocator, id);
+    }
+
     pub fn registerObject(self: *Connection, id: u32, interface: *const Interface, version: u32) !u64 {
         if (id == 0 or version == 0 or version > interface.version) return error.InvalidObject;
         if (self.objects.contains(id)) return error.ObjectExists;
@@ -575,6 +588,22 @@ test "client object IDs increase and released IDs get new generations" {
         .{ .int = 1 },    .{ .uint = 2 },   .{ .fixed = 3 },    .{ .string = null },
         .{ .object = 0 }, .{ .new_id = 4 }, .{ .array = null }, .{ .fd = -1 },
     }));
+}
+
+test "client IDs are reused only after delete-id release" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+    const original = try c.allocateObject(&test_interface, 1);
+    try std.testing.expectError(error.ObjectStillRegistered, c.releaseClientObjectId(original.id));
+    try c.removeObject(original.id, original.generation);
+
+    const next = try c.allocateObject(&test_interface, 1);
+    try std.testing.expect(next.id != original.id);
+    try c.releaseClientObjectId(original.id);
+    try std.testing.expectError(error.ObjectIdAlreadyReleased, c.releaseClientObjectId(original.id));
+    const reused = try c.allocateObject(&test_interface, 1);
+    try std.testing.expectEqual(original.id, reused.id);
+    try std.testing.expect(reused.generation != original.generation);
 }
 
 test "stale and double client object releases do not duplicate reusable IDs" {
