@@ -85,6 +85,13 @@ pub fn build(b: *std.Build) void {
     });
     wayring_protocols.addImport("wayring", wayring);
     wayring_core.addImport("wayring-protocols", wayring_protocols);
+    const wayring_server = b.addModule("wayring-server", .{
+        .root_source_file = b.path("src/wayring/Server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_server.addImport("wayring", wayring);
+    wayring_server.addImport("wayring-core", wayring_core);
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -127,6 +134,8 @@ pub fn build(b: *std.Build) void {
     wayring_scanner_test_module.addImport("xml", wayring_xml);
     const wayring_scanner_tests = b.addTest(.{ .root_module = wayring_scanner_test_module });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_scanner_tests).step);
+    const wayring_server_tests = b.addTest(.{ .root_module = wayring_server });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_server_tests).step);
     test_step.dependOn(wayring_test_step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
