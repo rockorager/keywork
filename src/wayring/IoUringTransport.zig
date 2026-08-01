@@ -29,6 +29,9 @@ notify: Notify,
 connect_handle: ?IoUringLoop.Handle = null,
 receive_handle: ?IoUringLoop.Handle = null,
 send_handle: ?IoUringLoop.Handle = null,
+connect_cancel_requested: bool = false,
+receive_cancel_requested: bool = false,
+send_cancel_requested: bool = false,
 connected: bool = false,
 closing: bool = false,
 terminal_notified: bool = false,
@@ -155,9 +158,23 @@ pub fn canStartSend(self: *const IoUringTransport) bool {
 
 pub fn shutdown(self: *IoUringTransport) !void {
     self.closing = true;
-    if (self.connect_handle) |handle| try self.loop.remove(handle);
-    if (self.receive_handle) |handle| try self.loop.remove(handle);
-    if (self.send_handle) |handle| try self.loop.remove(handle);
+    var first_error: ?anyerror = null;
+    if (self.connect_handle) |handle| if (!self.connect_cancel_requested) {
+        requestCancellation(self.loop, handle, &self.connect_cancel_requested) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    };
+    if (self.receive_handle) |handle| if (!self.receive_cancel_requested) {
+        requestCancellation(self.loop, handle, &self.receive_cancel_requested) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    };
+    if (self.send_handle) |handle| if (!self.send_cancel_requested) {
+        requestCancellation(self.loop, handle, &self.send_cancel_requested) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    };
+    if (first_error) |err| return err;
 }
 
 /// Also performs the deferred close once cancellation/completions have drained.
@@ -224,6 +241,7 @@ fn prepareSend(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
 fn connectComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
     const self: *IoUringTransport = @ptrCast(@alignCast(context));
     self.connect_handle = null;
+    if (self.closing) return;
     if (completion.result < 0) return self.fail();
     self.connected = true;
     self.armReceive() catch return self.fail();
@@ -234,6 +252,15 @@ fn connectComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop
 fn receiveComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Completion) !void {
     const self: *IoUringTransport = @ptrCast(@alignCast(context));
     self.receive_handle = null;
+    if (self.closing) {
+        if (completion.result > 0) {
+            var fds: [wayring.max_fds_per_batch]i32 = undefined;
+            var fd_count: usize = 0;
+            parseControl(self.receive_control[0..self.receive_msg.controllen], &fds, &fd_count) catch {};
+            closeAll(fds[0..fd_count]);
+        }
+        return;
+    }
     if (completion.result < 0) return self.fail();
     if (completion.result == 0) return self.terminal(.eof);
 
@@ -260,9 +287,11 @@ fn sendComplete(context: *anyopaque, _: *IoUringLoop, completion: IoUringLoop.Co
     self.send_handle = null;
     if (completion.result < 0) {
         try self.connection.acknowledge(self.send_token, null);
+        if (self.closing) return;
         return self.fail();
     }
     try self.connection.acknowledge(self.send_token, @intCast(completion.result));
+    if (self.closing) return;
     if (!self.connection.hasPendingOutput())
         self.notify(self.notify_context, self, .output_drained) catch return self.fail();
     if (!self.closing) self.flush() catch return self.fail();
@@ -277,6 +306,15 @@ fn terminal(self: *IoUringTransport, notification: Notification) !void {
     if (self.terminal_notified) return;
     self.terminal_notified = true;
     try self.notify(self.notify_context, self, notification);
+}
+
+fn requestCancellation(
+    loop: *IoUringLoop,
+    handle: IoUringLoop.Handle,
+    requested: *bool,
+) !void {
+    try loop.cancel(handle);
+    requested.* = true;
 }
 
 fn parseControl(control: []align(control_alignment) const u8, fds: *[wayring.max_fds_per_batch]i32, count: *usize) !void {

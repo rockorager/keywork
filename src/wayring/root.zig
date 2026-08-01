@@ -550,6 +550,15 @@ pub const Connection = struct {
         return self.outbound.items.len != 0;
     }
 
+    pub fn pendingOutputBytes(self: *const Connection) usize {
+        var total: usize = 0;
+        for (self.outbound.items) |frame| {
+            total = std.math.add(usize, total, frame.bytes.len - frame.offset) catch
+                return std.math.maxInt(usize);
+        }
+        return total;
+    }
+
     pub fn nextBatch(self: *Connection) ?OutboundBatch {
         if (self.batch_live or self.outbound.items.len == 0) return null;
         self.batch_token +%= 1;

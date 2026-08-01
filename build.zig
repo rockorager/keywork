@@ -92,6 +92,16 @@ pub fn build(b: *std.Build) void {
     });
     wayring_server.addImport("wayring", wayring);
     wayring_server.addImport("wayring-core", wayring_core);
+    const wayring_server_uring = b.addModule("wayring-server-uring", .{
+        .root_source_file = b.path("src/wayring/IoUringServer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_server_uring.addImport("keywork-loop", keywork_loop);
+    wayring_server_uring.addImport("wayring", wayring);
+    wayring_server_uring.addImport("wayring-core", wayring_core);
+    wayring_server_uring.addImport("wayring-server", wayring_server);
+    wayring_server_uring.addImport("wayring-uring", wayring_uring);
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -136,6 +146,8 @@ pub fn build(b: *std.Build) void {
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_scanner_tests).step);
     const wayring_server_tests = b.addTest(.{ .root_module = wayring_server });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_server_tests).step);
+    const wayring_server_uring_tests = b.addTest(.{ .root_module = wayring_server_uring });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_server_uring_tests).step);
     test_step.dependOn(wayring_test_step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
