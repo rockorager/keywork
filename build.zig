@@ -34,6 +34,12 @@ pub fn build(b: *std.Build) void {
     });
     wayring_uring.addImport("wayring", wayring);
     wayring_uring.addImport("keywork-loop", keywork_loop);
+    const wayring_core = b.addModule("wayring-core", .{
+        .root_source_file = b.path("src/wayring/core_protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_core.addImport("wayring", wayring);
     const varlink = b.addModule("varlink", .{
         .root_source_file = b.path("src/varlink/root.zig"),
         .target = target,
@@ -51,12 +57,24 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version.string);
 
     const test_step = b.step("test", "Run all unit tests and formatting checks");
+    const wayring_test_step = b.step("test-wayring", "Run Wayring protocol and transport tests");
     const loop_tests = b.addTest(.{ .root_module = keywork_loop });
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
     const wayring_tests = b.addTest(.{ .root_module = wayring });
-    test_step.dependOn(&b.addRunArtifact(wayring_tests).step);
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_tests).step);
     const wayring_uring_tests = b.addTest(.{ .root_module = wayring_uring });
-    test_step.dependOn(&b.addRunArtifact(wayring_uring_tests).step);
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_uring_tests).step);
+    const wayring_core_test_module = b.createModule(.{
+        .root_source_file = b.path("src/wayring/core_protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_core_test_module.addImport("wayring", wayring);
+    wayring_core_test_module.addImport("wayring-uring", wayring_uring);
+    wayring_core_test_module.addImport("keywork-loop", keywork_loop);
+    const wayring_core_tests = b.addTest(.{ .root_module = wayring_core_test_module });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_core_tests).step);
+    test_step.dependOn(wayring_test_step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
 

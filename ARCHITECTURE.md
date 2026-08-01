@@ -217,6 +217,7 @@ Current source module roots are:
 | `keywork-loop` | `src/loop/event_loop.zig` | none |
 | `wayring` | `src/wayring/root.zig` | none |
 | `wayring-uring` | `src/wayring/IoUringTransport.zig` | `wayring`, `keywork-loop` |
+| `wayring-core` | `src/wayring/core_protocol.zig` | `wayring` |
 | `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
