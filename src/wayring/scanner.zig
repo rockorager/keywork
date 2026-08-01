@@ -338,6 +338,75 @@ fn writeRequest(set: ProtocolSet, writer: *std.Io.Writer, interface: Interface, 
     try writer.writeAll("        }\n");
 }
 
+fn writeEvent(set: ProtocolSet, writer: *std.Io.Writer, interface: Interface, message: Message, opcode: usize) !void {
+    try writer.writeAll("        pub fn ");
+    try ident(writer, message.name);
+    try writer.writeAll("(connection: *wayring.Connection, handle: wayring.ObjectHandle");
+    for (message.args) |arg_value| {
+        if (std.mem.eql(u8, arg_value.kind, "new_id") and arg_value.interface_name == null)
+            try writer.writeAll(", new_interface: *const wayring.Interface, new_version: u32");
+        try writer.writeAll(", ");
+        if (std.mem.eql(u8, arg_value.kind, "new_id")) try writer.writeAll("new_object") else try writeRequestArg(writer, arg_value.name);
+        try writer.writeAll(": ");
+        if (std.mem.eql(u8, arg_value.kind, "new_id")) try writer.writeAll("wayring.ObjectHandle") else try writeArgType(writer, arg_value, false);
+    }
+    try writer.writeAll(") !void {\n            _ = try connection.objectForHandle(handle, &");
+    try ident(writer, interface.name);
+    try writer.writeAll(");\n");
+    for (message.args) |arg_value| {
+        if (!std.mem.eql(u8, arg_value.kind, "object") and !std.mem.eql(u8, arg_value.kind, "new_id")) continue;
+        const name = if (std.mem.eql(u8, arg_value.kind, "new_id")) "new_object" else null;
+        if (arg_value.nullable) {
+            try writer.writeAll("            if (");
+            try writeRequestArg(writer, arg_value.name);
+            try writer.writeAll(") |value| _ = try connection.");
+        } else {
+            try writer.writeAll("            _ = try connection.");
+        }
+        if (arg_value.interface_name) |target| {
+            if (findInterface(set, target) != null) {
+                try writer.writeAll("objectForHandle(");
+                if (arg_value.nullable) try writer.writeAll("value") else if (name) |value| try writer.writeAll(value) else try writeRequestArg(writer, arg_value.name);
+                try writer.writeAll(", &");
+                try ident(writer, target);
+                try writer.writeAll(");\n");
+                continue;
+            }
+        } else if (std.mem.eql(u8, arg_value.kind, "new_id")) {
+            try writer.writeAll("objectForHandle(new_object, new_interface);\n");
+            continue;
+        }
+        try writer.writeAll("objectForHandleAny(");
+        if (name) |value| try writer.writeAll(value) else if (!arg_value.nullable) try writeRequestArg(writer, arg_value.name);
+        if (arg_value.nullable) try writer.writeAll("value");
+        try writer.writeAll(");\n");
+    }
+    try writer.writeAll("            try connection.queueObject(handle, &");
+    try ident(writer, interface.name);
+    try writer.print(", {d}, &.{{\n", .{opcode});
+    for (message.args) |arg_value| {
+        if (std.mem.eql(u8, arg_value.kind, "new_id") and arg_value.interface_name == null)
+            try writer.writeAll("                .{ .string = new_interface.name },\n                .{ .uint = new_version },\n");
+        try writer.writeAll("                .{ .");
+        try writer.writeAll(arg_value.kind);
+        try writer.writeAll(" = ");
+        if (std.mem.eql(u8, arg_value.kind, "new_id")) {
+            try writer.writeAll("new_object.id");
+        } else if (std.mem.eql(u8, arg_value.kind, "object")) {
+            if (arg_value.nullable) {
+                try writer.writeAll("if (");
+                try writeRequestArg(writer, arg_value.name);
+                try writer.writeAll(") |value| value.id else null");
+            } else {
+                try writeRequestArg(writer, arg_value.name);
+                try writer.writeAll(".id");
+            }
+        } else try writeRequestArg(writer, arg_value.name);
+        try writer.writeAll(" },\n");
+    }
+    try writer.writeAll("            });\n        }\n");
+}
+
 fn writeUnionAndDecode(writer: *std.Io.Writer, interface: Interface, messages: []const Message, label: []const u8, descriptor_suffix: []const u8) !void {
     if (messages.len == 0) return;
     try writer.print("    pub const {s} = union(enum) {{\n", .{label});
@@ -435,6 +504,9 @@ pub fn generate(set: ProtocolSet, writer: *std.Io.Writer) !void {
         if (interface.requests.len != 0) try writer.writeAll("    pub const requests = struct {\n");
         for (interface.requests, 0..) |message, opcode| try writeRequest(set, writer, interface, message, opcode);
         if (interface.requests.len != 0) try writer.writeAll("    };\n");
+        if (interface.events.len != 0) try writer.writeAll("    pub const events = struct {\n");
+        for (interface.events, 0..) |message, opcode| try writeEvent(set, writer, interface, message, opcode);
+        if (interface.events.len != 0) try writer.writeAll("    };\n");
         try writeUnionAndDecode(writer, interface, interface.requests, "Request", "_requests");
         try writeUnionAndDecode(writer, interface, interface.events, "Event", "_events");
         try writer.writeAll("};\n");
@@ -511,6 +583,11 @@ pub fn generate(set: ProtocolSet, writer: *std.Io.Writer) !void {
             try compositeIdent(writer, interface.name, "_types");
             try writer.writeAll(".requests);\n");
         }
+        if (interface.events.len != 0) {
+            try writer.writeAll("    std.testing.refAllDecls(");
+            try compositeIdent(writer, interface.name, "_types");
+            try writer.writeAll(".events);\n");
+        }
     }
     try writer.writeAll("}\n");
 }
@@ -585,6 +662,10 @@ test "parse and generate complete descriptor fixture" {
     try std.testing.expect(std.mem.indexOf(u8, text, "connection.allocateObject(&@\"wl_present\", @min(registered_parent.version, @\"wl_present\".version))") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pub const Request = union(enum)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pub fn decodeEvent(connection: *wayring.Connection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pub const events = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pub fn @\"done\"(connection: *wayring.Connection, handle: wayring.ObjectHandle, @\"value_arg\": u32) !void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "try connection.queueObject(handle, &@\"wl_sample\", 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "std.testing.refAllDecls(@\"wl_sample_types\".events);") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.queueDestructorObject(handle, &@\"wl_sample\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "try connection.removeObject(handle.id, handle.generation);") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, ".new_id_interface = &@\"wl_present\"") != null);

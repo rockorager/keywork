@@ -147,6 +147,7 @@ pub const Connection = struct {
     pending_server_object_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
     next_generation: u64 = 1,
     next_client_object_id: u32 = first_client_object_id,
+    next_server_object_id: u64 = server_object_id_start,
     free_client_object_ids: std.ArrayList(u32) = .empty,
     input: std.ArrayList(u8) = .empty,
     input_fds: std.ArrayList(i32) = .empty,
@@ -208,6 +209,24 @@ pub const Connection = struct {
         return error.ObjectIdExhausted;
     }
 
+    /// Allocates a server-created object from Wayland's high numeric range.
+    /// Server IDs are never recycled within one connection.
+    pub fn allocateServerObject(self: *Connection, interface: *const Interface, version: u32) !ObjectHandle {
+        if (self.role != .server) return error.InvalidRole;
+        if (version == 0 or version > interface.version) return error.InvalidObject;
+
+        while (self.next_server_object_id <= std.math.maxInt(u32)) {
+            const id: u32 = @intCast(self.next_server_object_id);
+            self.next_server_object_id += 1;
+            if (self.objects.contains(id) or self.pending_server_object_ids.contains(id)) continue;
+            return .{
+                .id = id,
+                .generation = try self.registerObject(id, interface, version),
+            };
+        }
+        return error.ObjectIdExhausted;
+    }
+
     /// Abandons an allocated object whose constructor was never queued and
     /// makes its numeric ID immediately reusable. Objects visible to the
     /// server must instead remain reserved until `wl_display.delete_id`.
@@ -262,10 +281,11 @@ pub const Connection = struct {
         _ = self.objects.remove(id);
     }
 
-    /// Removes a server-owned active object while reserving its numeric ID
-    /// until output through the corresponding `wl_display.delete_id` is sent.
+    /// Removes a client-created object from the server while reserving its
+    /// numeric ID until output through `wl_display.delete_id` is sent.
     pub fn retireServerObject(self: *Connection, handle: ObjectHandle) !void {
         if (self.role != .server) return error.InvalidRole;
+        if (handle.id >= server_object_id_start) return error.InvalidObject;
         const registered = self.objects.get(handle.id) orelse return error.UnknownObject;
         if (registered.generation != handle.generation) return error.StaleObject;
         try self.pending_server_object_ids.ensureUnusedCapacity(self.allocator, 1);
@@ -782,6 +802,30 @@ test "server object IDs remain reserved until delete-id output is sent" {
     try std.testing.expectError(error.UnknownObject, server.releaseServerObjectId(id + 1));
     const replacement_generation = try server.registerObject(id, &interface, 1);
     try std.testing.expect(replacement_generation != generation);
+}
+
+test "server-created objects use the high ID range without recycling" {
+    var client = Connection.init(std.testing.allocator, .client, 4096);
+    defer client.deinit();
+    try std.testing.expectError(error.InvalidRole, client.allocateServerObject(&test_interface, 1));
+
+    var server = Connection.init(std.testing.allocator, .server, 4096);
+    defer server.deinit();
+    _ = try server.registerObject(server_object_id_start, &test_interface, 1);
+    const first = try server.allocateServerObject(&test_interface, 1);
+    const second = try server.allocateServerObject(&test_interface, 2);
+    try std.testing.expectEqual(server_object_id_start + 1, first.id);
+    try std.testing.expectEqual(server_object_id_start + 2, second.id);
+    try std.testing.expect(first.generation != second.generation);
+    try std.testing.expectError(error.InvalidObject, server.allocateServerObject(&test_interface, 3));
+    try std.testing.expectError(error.InvalidObject, server.retireServerObject(first));
+
+    try server.removeObject(first.id, first.generation);
+    const third = try server.allocateServerObject(&test_interface, 1);
+    try std.testing.expectEqual(server_object_id_start + 3, third.id);
+
+    server.next_server_object_id = @as(u64, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.ObjectIdExhausted, server.allocateServerObject(&test_interface, 1));
 }
 
 test "client object IDs increase and released IDs get new generations" {
