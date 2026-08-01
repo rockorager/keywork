@@ -25,6 +25,7 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
 const TabletGlobal = @import("TabletGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -75,6 +76,7 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+relative_pointer_global: RelativePointerGlobal,
 tablet_global: TabletGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -471,6 +473,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.commit_timing_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
+    try self.relative_pointer_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+    );
+    errdefer self.relative_pointer_global.deinit();
     try self.tablet_global.init(
         allocator,
         &self.server,
@@ -727,6 +735,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.tablet_global.deinit();
+    self.relative_pointer_global.deinit();
     self.seat_global.deinit();
     self.commit_timing_global.deinit();
     self.fifo_global.deinit();
@@ -1045,10 +1054,17 @@ fn nativePointerRelativeMotion(
     time_microseconds: u64,
     dx: f64,
     dy: f64,
-    _: f64,
-    _: f64,
+    dx_unaccelerated: f64,
+    dy_unaccelerated: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.relative_pointer_global.motion(
+        time_microseconds,
+        dx,
+        dy,
+        dx_unaccelerated,
+        dy_unaccelerated,
+    ) catch return self.terminate();
     const size = self.output.modeSize();
     self.pointer_physical_x = clampPointerCoordinate(self.pointer_physical_x + dx, size.width);
     self.pointer_physical_y = clampPointerCoordinate(self.pointer_physical_y + dy, size.height);

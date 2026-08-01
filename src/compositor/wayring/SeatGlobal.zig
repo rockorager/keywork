@@ -320,6 +320,37 @@ pub fn pointerFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.pointer_focus;
 }
 
+/// Captures a live pointer resource without retaining its owning seat child.
+pub fn pointerHandle(
+    self: *const SeatGlobal,
+    client: *const Server.Client,
+    resource_id: u32,
+) ?wayring.ObjectHandle {
+    for (self.children.items) |child| {
+        if (child.kind == .pointer and
+            child.client == client and
+            child.resource.id == resource_id)
+            return child.resource;
+    }
+    return null;
+}
+
+/// Returns whether a captured pointer still belongs to an active capability.
+pub fn pointerHandleIsActive(
+    self: *const SeatGlobal,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) bool {
+    for (self.children.items) |child| {
+        if (child.kind == .pointer and
+            child.client == client and
+            child.resource.id == handle.id and
+            child.resource.generation == handle.generation)
+            return self.childActive(child);
+    }
+    return false;
+}
+
 /// Returns a borrowed focus retained until the next focus or capability change.
 pub fn keyboardFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.keyboard_focus;
