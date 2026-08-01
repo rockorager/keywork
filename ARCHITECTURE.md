@@ -14,13 +14,28 @@ all checked-in Wayland XML live outside `src/`.
 
 ### Loop (`src/loop/`)
 
-Owns the `keywork-loop` Zig module: a concrete Linux reactor built on epoll,
-eventfd, timerfd, and inotify. It owns source dispatch and lifetime safety, but
-not application lifecycle or protocol-specific policy.
+Owns the `keywork-loop` Zig module: concrete Linux reactors and their operation
+lifetime safety. The established `EventLoop` uses epoll, eventfd, timerfd, and
+inotify; the completion-native `IoUringLoop` is available for incremental
+consumer migration. The component owns source and completion dispatch, but not
+application lifecycle or protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
 the loop's generic callback and phase contracts.
+
+### Wayring (`src/wayring/`)
+
+Owns the `wayring` Zig module: a sans-I/O Wayland wire and connection engine.
+It owns framing, argument validation, ordered byte and file-descriptor queues,
+object metadata, and send acknowledgement semantics. It receives bytes and
+owned descriptors from a transport and exposes drainable messages; it never
+waits on sockets or invokes application callbacks while parsing input.
+
+The core must not depend on the loop, runtime, compositor, Vulkan, or
+libwayland. Concrete transport adapters may depend on both `wayring` and
+`keywork-loop`; product-specific protocol policy remains with the runtime,
+stream client, or compositor that consumes generated bindings.
 
 ### UI (`src/ui/`)
 
@@ -200,6 +215,7 @@ Current source module roots are:
 | Module | Root | Direct module dependencies |
 | --- | --- | --- |
 | `keywork-loop` | `src/loop/event_loop.zig` | none |
+| `wayring` | `src/wayring/root.zig` | none |
 | `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
