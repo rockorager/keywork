@@ -44,7 +44,7 @@ next_selection_serial: usize = 0,
 const selection_serial_capacity = 32;
 
 const SelectionSerial = struct {
-    client: *Server.Client,
+    client_identity: u64,
     serial: u32,
 };
 
@@ -337,7 +337,7 @@ pub fn ownsResource(self: *const SeatGlobal, client: *const Server.Client, resou
 /// the claiming client rather than only the most recent event.
 pub fn acceptsSelectionSerial(self: *const SeatGlobal, client: *const Server.Client, serial: u32) bool {
     for (self.selection_serials[0..self.selection_serial_count]) |entry| {
-        if (entry.client == client and entry.serial == serial) return true;
+        if (entry.client_identity == client.identity() and entry.serial == serial) return true;
     }
     return false;
 }
@@ -639,7 +639,7 @@ fn beginCapabilityGeneration(self: *SeatGlobal, kind: ChildKind) void {
 
 fn recordSelectionSerial(self: *SeatGlobal, client: *Server.Client, serial: u32) void {
     self.selection_serials[self.next_selection_serial] = .{
-        .client = client,
+        .client_identity = client.identity(),
         .serial = serial,
     };
     self.next_selection_serial =

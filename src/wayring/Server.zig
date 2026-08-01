@@ -74,6 +74,7 @@ pub const Global = struct {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     server: *Server,
+    identity_value: u64,
     connection: wayring.Connection,
     resources: std.AutoHashMapUnmanaged(u32, Resource) = .empty,
     registries: std.ArrayList(wayring.ObjectHandle) = .empty,
@@ -84,10 +85,11 @@ pub const Client = struct {
     references: usize = 1,
     transport_attached: bool = true,
 
-    fn init(allocator: std.mem.Allocator, server: *Server) !Client {
+    fn init(allocator: std.mem.Allocator, server: *Server, identity_value: u64) !Client {
         var client: Client = .{
             .allocator = allocator,
             .server = server,
+            .identity_value = identity_value,
             .connection = wayring.Connection.init(allocator, .server, wayring.default_max_frame_size),
         };
         errdefer client.connection.deinit();
@@ -138,6 +140,11 @@ pub const Client = struct {
 
     pub fn unreference(self: *Client) void {
         self.server.releaseClientReference(self);
+    }
+
+    /// Unique for this client's lifetime and never reused by its server.
+    pub fn identity(self: *const Client) u64 {
+        return self.identity_value;
     }
 
     /// Feeds one transport receive and dispatches every complete request.
@@ -380,6 +387,7 @@ allocator: std.mem.Allocator,
 clients: std.ArrayList(*Client) = .empty,
 globals: std.ArrayList(Global) = .empty,
 next_global_name: u64 = 1,
+next_client_identity: u64 = 1,
 serial: u32 = 0,
 
 pub fn init(allocator: std.mem.Allocator) Server {
@@ -402,9 +410,15 @@ pub fn deinit(self: *Server) void {
 
 /// Allocates a stable client address suitable for completion callback context.
 pub fn createClient(self: *Server) !*Client {
+    const identity_value = self.next_client_identity;
+    self.next_client_identity = std.math.add(
+        u64,
+        self.next_client_identity,
+        1,
+    ) catch return error.ClientIdentityExhausted;
     const client = try self.allocator.create(Client);
     errdefer self.allocator.destroy(client);
-    client.* = try Client.init(self.allocator, self);
+    client.* = try Client.init(self.allocator, self, identity_value);
     errdefer client.deinit();
     try self.clients.append(self.allocator, client);
     return client;
@@ -1000,6 +1014,16 @@ test "retained policy state keeps client storage alive after transport teardown"
 
     client.unreference();
     try std.testing.expectEqual(@as(usize, 0), server.clients.items.len);
+}
+
+test "client identities are not reused after storage is released" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    const first = try server.createClient();
+    const first_identity = first.identity();
+    try server.destroyClient(first);
+    const second = try server.createClient();
+    try std.testing.expect(first_identity != second.identity());
 }
 
 fn readTestU32(bytes: []const u8) u32 {

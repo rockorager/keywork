@@ -433,12 +433,18 @@ fn receiveOffer(
     };
     const source = offer.source orelse return;
     if (!source.hasMime(mime_type)) return;
-    try generated.wl_data_source_types.events.send(
+    if (source.client.state != .active) return;
+    generated.wl_data_source_types.events.send(
         &source.client.connection,
         source.resource,
         mime_type,
         fd,
-    );
+    ) catch {
+        if (source.client == offer.client)
+            return source.client.postNoMemory();
+        source.client.postNoMemory() catch {};
+        return;
+    };
     fd_owned = false;
 }
 
