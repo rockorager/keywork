@@ -123,6 +123,9 @@ fn runWayring(
         if (backend.readyToDeinit()) backend.deinit();
     };
     try backend.waitConfigured();
+    const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(&backend);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(wayring_platform);
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
 
     const configured_size = try backend.currentSize();
     var raster_cache: keywork.RasterCache = .{};
@@ -139,6 +142,7 @@ fn runWayring(
         &raster_cache,
     );
     defer runtime.deinit();
+    runtime.setClipboardReader(wayring_platform.ptr, wayring_platform.vtable.clipboard_read);
     run_context.runtime = &runtime;
     defer run_context.runtime = null;
     if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));

@@ -7,6 +7,7 @@ const keywork_loop = @import("keywork-loop");
 const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const Client = @import("Client.zig");
+const Clipboard = @import("Clipboard.zig");
 const Input = @import("Input.zig");
 const Window = @import("Window.zig");
 
@@ -38,6 +39,7 @@ allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 client: Client,
 input: ?Input = null,
+clipboard: ?Clipboard = null,
 window: ?Window = null,
 options: Options,
 event_context: *anyopaque,
@@ -128,6 +130,7 @@ pub fn readyToDeinit(self: *Backend) bool {
 pub fn deinit(self: *Backend) void {
     std.debug.assert(self.readyToDeinit());
     if (self.window) |*window| window.deinit();
+    if (self.clipboard) |*clipboard| clipboard.deinit();
     if (self.input) |*input| input.deinit();
     self.client.deinit();
     self.* = undefined;
@@ -158,6 +161,18 @@ pub fn setCursorShape(self: *Backend, shape: keywork.CursorShape) !void {
     }
 }
 
+pub fn clipboardRead(self: *Backend, allocator: std.mem.Allocator) !?[]u8 {
+    const clipboard = if (self.clipboard) |*value| value else return null;
+    return clipboard.read(allocator);
+}
+
+pub fn clipboardWrite(self: *Backend, text: []const u8) !void {
+    const clipboard = if (self.clipboard) |*value| value else return error.ClipboardUnavailable;
+    const input = if (self.input) |*value| value else return error.NoInputSerial;
+    const serial = input.lastInputSerial() orelse return error.NoInputSerial;
+    try clipboard.write(text, serial);
+}
+
 pub fn installEventTimers(self: *Backend, loop: *keywork_loop.EventLoop) !void {
     if (self.input) |*input| try input.installEventTimer(loop);
 }
@@ -172,6 +187,14 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
         .ready => {
             if (self.state != .connecting) return error.UnexpectedClientReady;
             if (self.client.takeSeat()) |seat| {
+                if (self.client.dataDeviceManager()) |manager| {
+                    self.clipboard = try Clipboard.init(
+                        self.allocator,
+                        &self.client,
+                        manager,
+                        seat.handle,
+                    );
+                }
                 var input: Input = undefined;
                 try input.init(
                     self.client.connectionPtr(),
@@ -221,6 +244,13 @@ fn clientMessage(
     message: *wayring.Message,
 ) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
+    if (self.clipboard) |*clipboard| {
+        if (clipboard.ownsObject(message.object_id)) {
+            try clipboard.handleMessage(message);
+            try self.client.flush();
+            return;
+        }
+    }
     if (self.input) |*input| {
         if (input.ownsObject(message.object_id)) {
             try input.handleMessage(message);

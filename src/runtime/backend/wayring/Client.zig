@@ -127,6 +127,18 @@ pub fn flush(self: *Client) !void {
     try self.transport.flush();
 }
 
+pub fn canSubmitOutputImmediately(self: *const Client) bool {
+    return !self.connection.hasPendingOutput() and self.transport.canStartSend();
+}
+
+/// Makes queued protocol output visible to the compositor without dispatching
+/// completions. Used before bounded synchronous transfers such as clipboard
+/// pipe reads.
+pub fn submitOutput(self: *Client) !void {
+    try self.flush();
+    _ = try self.loop.submit();
+}
+
 pub fn shutdown(self: *Client) !void {
     try self.transport.shutdown();
 }

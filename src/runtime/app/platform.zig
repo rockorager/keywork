@@ -144,6 +144,57 @@ pub fn WaylandPlatform(comptime Backend: type) type {
     };
 }
 
+/// Platform services currently implemented by the native Wayring backend.
+/// Unsupported window-management services remain explicit until their
+/// protocols are migrated rather than falling back through libwayland.
+pub fn WayringPlatform(comptime Backend: type) type {
+    return struct {
+        const vtable: Platform.VTable = .{
+            .clipboard_read = clipboardRead,
+            .clipboard_write = clipboardWrite,
+            .activation_token = activationToken,
+            .start_move = startMove,
+            .start_resize = startResize,
+            .unlock_session = unlockSession,
+            .session_locked = sessionLocked,
+        };
+
+        pub fn platform(backend: *Backend) Platform {
+            return .{ .ptr = backend, .vtable = &vtable };
+        }
+
+        fn clipboardRead(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.clipboardRead(allocator);
+        }
+
+        fn clipboardWrite(ptr: *anyopaque, text: []const u8) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.clipboardWrite(text);
+        }
+
+        fn activationToken(_: *anyopaque, _: std.mem.Allocator, _: ?[*:0]const u8) anyerror!?[]u8 {
+            return null;
+        }
+
+        fn startMove(_: *anyopaque) anyerror!void {
+            return error.UnsupportedWayringOperation;
+        }
+
+        fn startResize(_: *anyopaque, _: ResizeEdge) anyerror!void {
+            return error.UnsupportedWayringOperation;
+        }
+
+        fn unlockSession(_: *anyopaque) anyerror!void {
+            return error.UnsupportedWayringOperation;
+        }
+
+        fn sessionLocked(_: *anyopaque) bool {
+            return false;
+        }
+    };
+}
+
 /// Parses a resize edge name as used by the Lua API ("top", "bottom_left",
 /// "bottom-left", ...).
 pub fn resizeEdgeFromName(name: []const u8) ?ResizeEdge {

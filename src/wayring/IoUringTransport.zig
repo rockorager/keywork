@@ -149,6 +149,10 @@ pub fn flush(self: *IoUringTransport) !void {
     };
 }
 
+pub fn canStartSend(self: *const IoUringTransport) bool {
+    return self.connected and !self.closing and self.send_handle == null;
+}
+
 pub fn shutdown(self: *IoUringTransport) !void {
     self.closing = true;
     if (self.connect_handle) |handle| try self.loop.remove(handle);

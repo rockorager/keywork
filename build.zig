@@ -148,6 +148,17 @@ pub fn build(b: *std.Build) void {
     wayring_client_test_module.addImport("wayring-protocols", wayring_protocols);
     const wayring_client_tests = b.addTest(.{ .root_module = wayring_client_test_module });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_client_tests).step);
+    const wayring_clipboard_test_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/backend/wayring/Clipboard.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_clipboard_test_module.addImport("keywork-loop", keywork_loop);
+    wayring_clipboard_test_module.addImport("wayring", wayring);
+    wayring_clipboard_test_module.addImport("wayring-uring", wayring_uring);
+    wayring_clipboard_test_module.addImport("wayring-protocols", wayring_protocols);
+    const wayring_clipboard_tests = b.addTest(.{ .root_module = wayring_clipboard_test_module });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_clipboard_tests).step);
     const stream_output = stream.add(
         b,
         target,

@@ -51,6 +51,7 @@ pointer_enabled: bool = false,
 keyboard_enabled: bool = false,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
+last_input_serial: ?u32 = null,
 cursor_shape: ?keywork.CursorShape = null,
 pending_pointer: PendingPointer = .{},
 shift_down: bool = false,
@@ -101,6 +102,10 @@ pub fn deinit(self: *Input) void {
 
 pub fn setSurface(self: *Input, surface_id: u32) void {
     self.surface_id = surface_id;
+}
+
+pub fn lastInputSerial(self: *const Input) ?u32 {
+    return self.last_input_serial;
 }
 
 pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
@@ -228,6 +233,8 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
         },
         .button => |button| {
             if (!self.pointer_focused) return;
+            if (button.state == @intFromEnum(protocol.wl_pointer_types.button_state.pressed))
+                self.last_input_serial = button.serial;
             const mapped_button: keywork.PointerButton = switch (button.button) {
                 272 => .left,
                 273 => .right,
@@ -333,6 +340,7 @@ fn handleKeyboard(
         .enter => |enter| {
             self.keyboard_focused = self.keyboard_enabled and
                 self.surface_id != null and enter.surface == self.surface_id.?;
+            self.last_input_serial = enter.serial;
             self.shift_down = false;
         },
         .leave => |leave| {
@@ -346,6 +354,7 @@ fn handleKeyboard(
             if (!self.keyboard_focused) return;
             const repeated = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.repeated);
             const pressed = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.pressed) or repeated;
+            if (pressed and !repeated) self.last_input_serial = key.serial;
             switch (key.key) {
                 42, 54 => {
                     self.shift_down = pressed;

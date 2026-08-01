@@ -363,6 +363,10 @@ pub const Connection = struct {
         try self.queue(handle.id, opcode, values);
     }
 
+    pub fn hasPendingOutput(self: *const Connection) bool {
+        return self.outbound.items.len != 0;
+    }
+
     pub fn nextBatch(self: *Connection) ?OutboundBatch {
         if (self.batch_live or self.outbound.items.len == 0) return null;
         self.batch_token +%= 1;
