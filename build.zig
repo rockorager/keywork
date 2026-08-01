@@ -60,6 +60,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addFileArg(wayland_sources.wayland_xml);
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/xdg-shell/xdg-shell.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_wayring_protocols.addArg("-o");
     const wayring_protocol_source = generate_wayring_protocols.addOutputFileArg("wayring-protocols.zig");
     const wayring_protocols = b.addModule("wayring-protocols", .{
