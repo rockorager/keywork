@@ -67,6 +67,14 @@ pub const Interface = struct {
 
 pub const Object = struct { interface: *const Interface, version: u32, generation: u64 };
 
+pub const ObjectHandle = struct {
+    id: u32,
+    generation: u64,
+};
+
+const first_client_object_id: u32 = 2;
+const server_object_id_start: u32 = 0xff000000;
+
 pub const Value = union(ArgumentKind) {
     int: i32,
     uint: u32,
@@ -133,6 +141,8 @@ pub const Connection = struct {
     max_frame_size: usize,
     objects: std.AutoHashMapUnmanaged(u32, Object) = .empty,
     next_generation: u64 = 1,
+    next_client_object_id: u32 = first_client_object_id,
+    free_client_object_ids: std.ArrayList(u32) = .empty,
     input: std.ArrayList(u8) = .empty,
     input_fds: std.ArrayList(i32) = .empty,
     messages: std.ArrayList(Message) = .empty,
@@ -156,16 +166,62 @@ pub const Connection = struct {
             self.allocator.free(frame.bytes);
         }
         self.outbound.deinit(self.allocator);
+        self.free_client_object_ids.deinit(self.allocator);
         self.objects.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Allocates and registers a client-created object. Released numeric IDs
+    /// are preferred, but every registration receives a fresh generation.
+    pub fn allocateObject(self: *Connection, interface: *const Interface, version: u32) !ObjectHandle {
+        if (self.role != .client) return error.InvalidRole;
+        if (version == 0 or version > interface.version) return error.InvalidObject;
+
+        while (self.free_client_object_ids.pop()) |id| {
+            // Manual registration may have occupied an ID after it was
+            // released. Such an ID leaves allocator ownership permanently.
+            if (self.objects.contains(id)) continue;
+            const generation = self.registerObject(id, interface, version) catch |err| {
+                self.free_client_object_ids.appendAssumeCapacity(id);
+                return err;
+            };
+            return .{ .id = id, .generation = generation };
+        }
+
+        while (self.next_client_object_id < server_object_id_start) {
+            const id = self.next_client_object_id;
+            if (self.objects.contains(id)) {
+                self.next_client_object_id += 1;
+                continue;
+            }
+            const generation = try self.registerObject(id, interface, version);
+            self.next_client_object_id += 1;
+            return .{ .id = id, .generation = generation };
+        }
+        return error.ObjectIdExhausted;
+    }
+
+    /// Abandons an allocated object whose constructor was never queued and
+    /// makes its numeric ID immediately reusable. Objects visible to the
+    /// server must instead remain reserved until `wl_display.delete_id`.
+    pub fn abandonObject(self: *Connection, handle: ObjectHandle) !void {
+        if (self.role != .client) return error.InvalidRole;
+        if (handle.id < first_client_object_id or handle.id >= server_object_id_start)
+            return error.InvalidObject;
+        const registered = self.objects.get(handle.id) orelse return error.UnknownObject;
+        if (registered.generation != handle.generation) return error.StaleObject;
+        try self.free_client_object_ids.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.objects.remove(handle.id);
+        self.free_client_object_ids.appendAssumeCapacity(handle.id);
     }
 
     pub fn registerObject(self: *Connection, id: u32, interface: *const Interface, version: u32) !u64 {
         if (id == 0 or version == 0 or version > interface.version) return error.InvalidObject;
         if (self.objects.contains(id)) return error.ObjectExists;
+        if (self.next_generation == std.math.maxInt(u64)) return error.GenerationExhausted;
         const generation = self.next_generation;
-        self.next_generation += 1;
         try self.objects.put(self.allocator, id, .{ .interface = interface, .version = version, .generation = generation });
+        self.next_generation += 1;
         return generation;
     }
 
@@ -485,6 +541,49 @@ const events = [_]MessageDescriptor{
     .{ .name = "descriptor", .opcode = 1, .args = &.{.{ .kind = .fd }} },
 };
 const test_interface: Interface = .{ .name = "test", .version = 2, .requests = &requests, .events = &events };
+
+test "client object IDs increase and released IDs get new generations" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+
+    const first = try c.allocateObject(&test_interface, 1);
+    const second = try c.allocateObject(&test_interface, 2);
+    try std.testing.expectEqual(@as(u32, 2), first.id);
+    try std.testing.expectEqual(@as(u32, 3), second.id);
+    try c.abandonObject(first);
+    const reused = try c.allocateObject(&test_interface, 1);
+    try std.testing.expectEqual(first.id, reused.id);
+    try std.testing.expect(reused.generation != first.generation);
+}
+
+test "stale and double client object releases do not duplicate reusable IDs" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+
+    const original = try c.allocateObject(&test_interface, 1);
+    try c.abandonObject(original);
+    try std.testing.expectError(error.UnknownObject, c.abandonObject(original));
+    const replacement = try c.allocateObject(&test_interface, 1);
+    try std.testing.expectError(error.StaleObject, c.abandonObject(original));
+    const next = try c.allocateObject(&test_interface, 1);
+    try std.testing.expectEqual(@as(u32, 3), next.id);
+    try std.testing.expectEqual(original.id, replacement.id);
+}
+
+test "client object allocation is role restricted and skips manual collisions" {
+    var server = Connection.init(std.testing.allocator, .server, 4096);
+    defer server.deinit();
+    try std.testing.expectError(error.InvalidRole, server.allocateObject(&test_interface, 1));
+    try std.testing.expectError(error.InvalidRole, server.abandonObject(.{ .id = 2, .generation = 1 }));
+
+    var client = Connection.init(std.testing.allocator, .client, 4096);
+    defer client.deinit();
+    _ = try client.registerObject(2, &test_interface, 1);
+    const allocated = try client.allocateObject(&test_interface, 1);
+    try std.testing.expectEqual(@as(u32, 3), allocated.id);
+    try std.testing.expectError(error.InvalidObject, client.abandonObject(.{ .id = 1, .generation = 1 }));
+    try std.testing.expectError(error.InvalidObject, client.abandonObject(.{ .id = server_object_id_start, .generation = 1 }));
+}
 
 test "descriptor declaration metadata is retained without changing wire kinds" {
     const args = [_]ArgumentSpec{.{
