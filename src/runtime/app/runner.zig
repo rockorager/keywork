@@ -193,6 +193,10 @@ const WayringRunContext = struct {
             }),
             .repaint => if (self.runtime) |runtime| try runtime.frameDone(),
             .close, .disconnected, .fatal => self.stop = true,
+            .pointer_move => |point| if (self.runtime) |runtime| try runtime.pointerMove(point),
+            .pointer_button => |button| if (self.runtime) |runtime| try runtime.pointerButton(button),
+            .scroll => |scroll| if (self.runtime) |runtime| try runtime.scrollBy(scroll),
+            .key => |key| if (self.runtime) |runtime| try runtime.keyInput(key),
         }
     }
 };

@@ -7,6 +7,7 @@ const keywork_loop = @import("keywork-loop");
 const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const Client = @import("Client.zig");
+const Input = @import("Input.zig");
 const Window = @import("Window.zig");
 
 const IoUringLoop = keywork_loop.IoUringLoop;
@@ -19,6 +20,10 @@ pub const Event = union(enum) {
     close,
     disconnected,
     fatal,
+    pointer_move: ?keywork.Point,
+    pointer_button: keywork.PointerButtonEvent,
+    scroll: keywork.ScrollEvent,
+    key: keywork.KeyInput,
 };
 pub const EventNotify = *const fn (context: *anyopaque, backend: *Backend, event: Event) anyerror!void;
 
@@ -32,6 +37,7 @@ pub const Options = struct {
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 client: Client,
+input: ?Input = null,
 window: ?Window = null,
 options: Options,
 event_context: *anyopaque,
@@ -122,6 +128,7 @@ pub fn readyToDeinit(self: *Backend) bool {
 pub fn deinit(self: *Backend) void {
     std.debug.assert(self.readyToDeinit());
     if (self.window) |*window| window.deinit();
+    if (self.input) |*input| input.deinit();
     self.client.deinit();
     self.* = undefined;
 }
@@ -149,6 +156,16 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
     switch (notification) {
         .ready => {
             if (self.state != .connecting) return error.UnexpectedClientReady;
+            if (self.client.takeSeat()) |seat| {
+                var input: Input = undefined;
+                try input.init(
+                    self.client.connectionPtr(),
+                    seat,
+                    self,
+                    inputEvent,
+                );
+                self.input = input;
+            }
             self.window = try Window.init(
                 self.allocator,
                 &self.client,
@@ -157,6 +174,7 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
                 self.options.width,
                 self.options.height,
             );
+            if (self.input) |*input| input.setSurface(self.window.?.surfaceId());
             self.state = .configuring;
         },
         .eof => {
@@ -175,9 +193,16 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
 fn clientMessage(
     context: *anyopaque,
     _: *Client,
-    message: *const wayring.Message,
+    message: *wayring.Message,
 ) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
+    if (self.input) |*input| {
+        if (input.ownsObject(message.object_id)) {
+            try input.handleMessage(message);
+            try self.client.flush();
+            return;
+        }
+    }
     const window = if (self.window) |*value| value else return error.MessageBeforeWindow;
     const event = try window.handleMessage(message) orelse {
         if (self.state == .closing) try self.advanceClose();
@@ -203,6 +228,16 @@ fn clientMessage(
         },
     }
     if (self.state == .closing) try self.advanceClose();
+}
+
+fn inputEvent(context: *anyopaque, _: *Input, event: Input.Event) !void {
+    const self: *Backend = @ptrCast(@alignCast(context));
+    try self.event_notify(self.event_context, self, switch (event) {
+        .pointer_move => |value| .{ .pointer_move = value },
+        .pointer_button => |value| .{ .pointer_button = value },
+        .scroll => |value| .{ .scroll = value },
+        .key => |value| .{ .key = value },
+    });
 }
 
 fn advanceClose(self: *Backend) !void {

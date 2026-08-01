@@ -198,6 +198,10 @@ pub fn size(self: *const Window) struct { width: u32, height: u32 } {
     return .{ .width = self.width, .height = self.height };
 }
 
+pub fn surfaceId(self: *const Window) u32 {
+    return self.handles.surface.id;
+}
+
 const render_backend_vtable: keywork.RenderBackend.VTable = .{
     .present = renderBackendPresent,
     .measure_text = renderBackendMeasureText,
