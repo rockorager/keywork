@@ -64,11 +64,10 @@ pub fn sdEvent(self: *SystemdEvent) *systemd.sd_event {
 }
 
 /// Marks userspace-only sd-event state changed while the nested dispatcher is
-/// armed. Kernel-backed sources wake through sd-event's poll descriptor; defer
-/// sources need this explicit outer-loop check because they own no fd.
+/// armed. Calls originate on the outer loop thread, so its next prepare phase
+/// observes this flag without a separate eventfd wakeup.
 pub fn notify(self: *SystemdEvent) void {
     self.dirty = true;
-    if (self.bound_loop) |loop| loop.wake() catch {};
 }
 
 /// Drives pending work and leaves sd-event armed for its next outer poll

@@ -8,7 +8,6 @@ const IoUringLoop = @import("IoUringLoop.zig");
 
 allocator: std.mem.Allocator,
 io: IoUringLoop,
-wake_fd: i32,
 wall_timer_fd: i32,
 sources: std.ArrayList(Slot) = .empty,
 free_slots: std.ArrayList(u32) = .empty,
@@ -38,7 +37,6 @@ end_turn_context: ?*anyopaque = null,
 running: bool = false,
 stop_requested: bool = false,
 dispatching: bool = false,
-wake_handle: ?SourceHandle = null,
 
 const Slot = struct { generation: u32 = 0, registration: ?*Registration = null };
 const Ready = struct { handle: SourceHandle, events: u32 };
@@ -139,14 +137,11 @@ pub const FileWatch = struct {
 };
 
 pub fn init(allocator: std.mem.Allocator) !EventLoop {
-    const wake_fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
-    errdefer _ = linux.close(wake_fd);
     const wall_timer_fd = try linuxFd(linux.timerfd_create(.REALTIME, .{ .CLOEXEC = true, .NONBLOCK = true }));
     errdefer _ = linux.close(wall_timer_fd);
     return .{
         .allocator = allocator,
         .io = try IoUringLoop.init(allocator),
-        .wake_fd = wake_fd,
         .wall_timer_fd = wall_timer_fd,
     };
 }
@@ -180,7 +175,6 @@ pub fn deinit(self: *EventLoop) void {
     self.wall_timers.deinit(self.allocator);
     self.file_watches.deinit(self.allocator);
     _ = linux.close(self.wall_timer_fd);
-    _ = linux.close(self.wake_fd);
 }
 
 pub fn addFd(self: *EventLoop, source: Source) !SourceHandle {
@@ -708,19 +702,9 @@ pub fn clearEndTurnHook(self: *EventLoop) void {
     self.end_turn_hook = null;
     self.end_turn_context = null;
 }
-pub fn wake(self: *EventLoop) !void {
-    const value: u64 = 1;
-    const bytes = std.mem.asBytes(&value);
-    const result = linux.write(self.wake_fd, bytes.ptr, bytes.len);
-    switch (linux.errno(result)) {
-        .SUCCESS, .AGAIN => {},
-        else => return error.WakeFailed,
-    }
-}
 pub fn quit(self: *EventLoop) void {
     self.stop_requested = true;
     self.running = false;
-    self.wake() catch {};
 }
 pub fn run(self: *EventLoop) !void {
     if (self.stop_requested) {
@@ -728,22 +712,11 @@ pub fn run(self: *EventLoop) !void {
         return;
     }
     self.running = true;
-    self.ensureWake() catch |err| {
-        self.running = false;
-        return err;
-    };
     defer {
         self.running = false;
         self.stop_requested = false;
     }
     while (self.running) try self.turn(true);
-}
-fn ensureWake(self: *EventLoop) !void {
-    if (self.wake_handle == null) self.wake_handle = try self.addFd(.{ .fd = self.wake_fd, .events = linux.POLL.IN, .ctx = self, .callback = wakeCallback });
-}
-fn wakeCallback(context: *anyopaque, _: *EventLoop, _: u32) !void {
-    const self: *EventLoop = @ptrCast(@alignCast(context));
-    drainWake(self.wake_fd);
 }
 
 fn turn(self: *EventLoop, wait: bool) !void {
@@ -768,6 +741,13 @@ fn turn(self: *EventLoop, wait: bool) !void {
     };
     try self.collectReadyTimers();
     try self.dispatchPhases();
+    if (wait and !userspace_work and
+        !self.io.hasActiveOperations() and
+        self.monotonic_timers.items.len == 0 and
+        self.wall_timers.items.len == 0)
+    {
+        self.running = false;
+    }
 }
 fn drive(self: *EventLoop, wait: bool) !void {
     if (wait) try self.io.runOnce() else try self.io.pollOnce();
@@ -832,18 +812,6 @@ fn dispatchFileWatchEvents(watch: *FileWatch, loop: *EventLoop, bytes: []align(@
         try watch.callback(watch.ctx, loop, watch.path[0..watch.path.len], event.mask, name);
         if (watch.removed) return;
         offset += @sizeOf(linux.inotify_event) + event.len;
-    }
-}
-fn drainWake(fd: i32) void {
-    var value: u64 = 0;
-    const bytes = std.mem.asBytes(&value);
-    while (true) {
-        const result = linux.read(fd, bytes.ptr, bytes.len);
-        switch (linux.errno(result)) {
-            .SUCCESS => {},
-            .AGAIN => return,
-            else => return,
-        }
     }
 }
 fn linuxFd(result: usize) !i32 {
@@ -1109,6 +1077,13 @@ test "repeating timer fires and can quit the loop" {
     try loop.addRepeatingTimer(1, &context, Context.callback);
     try loop.run();
     try std.testing.expect(context.fired > 0);
+}
+
+test "run returns when the loop has no work" {
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    try loop.run();
+    try std.testing.expectEqual(@as(usize, 0), loop.sources.items.len);
 }
 
 test "quit before run is consumed without poisoning a later run" {

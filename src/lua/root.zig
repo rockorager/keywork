@@ -353,7 +353,6 @@ pub const App = struct {
     pub fn requestReload(self: *App) !void {
         self.script_dirty = true;
         if (self.invalidator) |invalidator| try invalidator.invalidate();
-        if (self.event_loop) |loop| try loop.wake();
     }
 
     /// Run the script if it has not executed yet (or is dirty). Called

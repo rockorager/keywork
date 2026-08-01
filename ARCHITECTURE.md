@@ -17,10 +17,12 @@ all checked-in Wayland XML live outside `src/`.
 Owns the `keywork-loop` Zig module: concrete Linux reactors and their operation
 lifetime safety. `EventLoop` owns the process's completion-native `IoUringLoop`;
 Wayring transport and ordinary runtime fd sources share that ring and its
-submit/wait/drain turns. Eventfd, timerfd, inotify, and library-owned poll
-descriptors remain Linux event producers, but io_uring is the only outer wait
-mechanism. The component owns source and completion dispatch, but not
-application lifecycle or protocol-specific policy.
+submit/wait/drain turns. Monotonic timers share an indexed heap backed by one
+io_uring timeout; realtime timers share a second heap and one timerfd read for
+clock-change semantics. Inotify and library-owned poll descriptors remain
+Linux event producers, but io_uring is the only outer wait mechanism. The
+component owns source and completion dispatch, but not application lifecycle
+or protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
