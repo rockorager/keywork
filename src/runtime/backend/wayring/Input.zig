@@ -15,11 +15,15 @@ const linux = std.os.linux;
 const posix = std.posix;
 const log = std.log.scoped(.keywork_wayring_input);
 
-pub const Event = union(enum) {
+pub const EventValue = union(enum) {
     pointer_move: ?keywork.Point,
     pointer_button: keywork.PointerButtonEvent,
     scroll: keywork.ScrollEvent,
     key: keywork.KeyInput,
+};
+pub const Event = struct {
+    surface_id: u32,
+    value: EventValue,
 };
 pub const Notify = *const fn (context: *anyopaque, input: *Input, event: Event) anyerror!void;
 
@@ -47,15 +51,15 @@ legacy_cursor: ?LegacyCursor,
 cursor_scale: u32 = 1,
 pointer: ?wayring.ObjectHandle = null,
 keyboard: ?wayring.ObjectHandle = null,
-surface_id: ?u32 = null,
-pointer_focused: bool = false,
-keyboard_focused: bool = false,
+pointer_surface_id: ?u32 = null,
+keyboard_surface_id: ?u32 = null,
 pointer_enabled: bool = false,
 keyboard_enabled: bool = false,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
 last_input_serial: ?u32 = null,
 last_button_press_serial: ?u32 = null,
+last_button_press_surface_id: ?u32 = null,
 cursor_shape: ?keywork.CursorShape = null,
 pending_pointer: PendingPointer = .{},
 shift_down: bool = false,
@@ -113,10 +117,6 @@ pub fn deinit(self: *Input) void {
     self.* = undefined;
 }
 
-pub fn setSurface(self: *Input, surface_id: u32) void {
-    self.surface_id = surface_id;
-}
-
 pub fn lastInputSerial(self: *const Input) ?u32 {
     return self.last_input_serial;
 }
@@ -127,6 +127,10 @@ pub fn seatHandle(self: *const Input) wayring.ObjectHandle {
 
 pub fn lastButtonPressSerial(self: *const Input) ?u32 {
     return self.last_button_press_serial;
+}
+
+pub fn lastButtonPressSurfaceId(self: *const Input) ?u32 {
+    return self.last_button_press_surface_id;
 }
 
 pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
@@ -237,8 +241,11 @@ fn applyCapabilities(self: *Input, capabilities: u32) !void {
             };
         }
     } else if (!self.pointer_enabled) {
-        if (self.pointer_focused) try self.notify(self.notify_context, self, .{ .pointer_move = null });
-        self.pointer_focused = false;
+        if (self.pointer_surface_id) |surface_id| try self.notify(self.notify_context, self, .{
+            .surface_id = surface_id,
+            .value = .{ .pointer_move = null },
+        });
+        self.pointer_surface_id = null;
         self.pointer_position = null;
         self.pointer_enter_serial = null;
         self.cursor_shape = null;
@@ -247,7 +254,7 @@ fn applyCapabilities(self: *Input, capabilities: u32) !void {
     if (self.keyboard_enabled and self.keyboard == null) {
         self.keyboard = try protocol.wl_seat_types.requests.get_keyboard(self.connection, self.seat);
     } else if (!self.keyboard_enabled) {
-        self.keyboard_focused = false;
+        self.keyboard_surface_id = null;
         self.shift_down = false;
         self.stopKeyRepeat();
     }
@@ -257,31 +264,31 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
     if (!self.pointer_enabled) return;
     switch (event) {
         .enter => |enter| {
-            if (self.pointer_focused) try self.flushPointerFrame();
-            self.pointer_focused = self.surface_id != null and enter.surface == self.surface_id.?;
-            if (!self.pointer_focused) return;
+            if (self.pointer_surface_id != null) try self.flushPointerFrame();
+            self.pointer_surface_id = enter.surface;
             self.pointer_enter_serial = enter.serial;
             self.cursor_shape = null;
             self.pointer_position = fixedPoint(enter.surface_x, enter.surface_y);
             self.pending_pointer.moved = true;
         },
         .leave => |leave| {
-            if (!self.pointer_focused or self.surface_id == null or leave.surface != self.surface_id.?) return;
+            if (self.pointer_surface_id == null or leave.surface != self.pointer_surface_id.?) return;
             self.pointer_position = null;
             self.pointer_enter_serial = null;
             self.cursor_shape = null;
             self.pending_pointer.left = true;
         },
         .motion => |motion| {
-            if (!self.pointer_focused) return;
+            if (self.pointer_surface_id == null) return;
             self.pointer_position = fixedPoint(motion.surface_x, motion.surface_y);
             self.pending_pointer.moved = true;
         },
         .button => |button| {
-            if (!self.pointer_focused) return;
+            if (self.pointer_surface_id == null) return;
             if (button.state == @intFromEnum(protocol.wl_pointer_types.button_state.pressed)) {
                 self.last_input_serial = button.serial;
                 self.last_button_press_serial = button.serial;
+                self.last_button_press_surface_id = self.pointer_surface_id;
             }
             const mapped_button: keywork.PointerButton = switch (button.button) {
                 272 => .left,
@@ -305,7 +312,7 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
             }
         },
         .axis => |axis| {
-            if (!self.pointer_focused) return;
+            if (self.pointer_surface_id == null) return;
             const delta = fixedToFloat(axis.value);
             switch (axis.axis) {
                 @intFromEnum(protocol.wl_pointer_types.axis.vertical_scroll) => self.pending_pointer.scroll_dy += delta,
@@ -334,7 +341,7 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
         .frame => try self.flushPointerFrame(),
         .axis_stop, .axis_relative_direction => {},
         .warp => |warp| {
-            if (!self.pointer_focused) return;
+            if (self.pointer_surface_id == null) return;
             self.pointer_position = fixedPoint(warp.surface_x, warp.surface_y);
             self.pending_pointer.moved = true;
         },
@@ -344,34 +351,46 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
 fn flushPointerFrame(self: *Input) !void {
     const pending = self.pending_pointer;
     self.pending_pointer = .{};
-    if (!self.pointer_focused) return;
+    const surface_id = self.pointer_surface_id orelse return;
     defer {
-        if (pending.left) self.pointer_focused = false;
+        if (pending.left) self.pointer_surface_id = null;
     }
     if (pending.left) {
-        try self.notify(self.notify_context, self, .{ .pointer_move = null });
+        try self.notify(self.notify_context, self, .{
+            .surface_id = surface_id,
+            .value = .{ .pointer_move = null },
+        });
     } else if (pending.moved) {
-        try self.notify(self.notify_context, self, .{ .pointer_move = self.pointer_position });
+        try self.notify(self.notify_context, self, .{
+            .surface_id = surface_id,
+            .value = .{ .pointer_move = self.pointer_position },
+        });
     }
     const point = self.pointer_position orelse return;
     const modifiers = self.currentModifiers();
     for (pending.buttons[0..pending.button_count]) |button| {
-        try self.notify(self.notify_context, self, .{ .pointer_button = .{
-            .button = button.button,
-            .state = button.state,
-            .position = point,
-            .modifiers = modifiers,
-        } });
+        try self.notify(self.notify_context, self, .{
+            .surface_id = surface_id,
+            .value = .{ .pointer_button = .{
+                .button = button.button,
+                .state = button.state,
+                .position = point,
+                .modifiers = modifiers,
+            } },
+        });
     }
     if (pending.scrolled) {
         const wheel = pending.scroll_source == @intFromEnum(protocol.wl_pointer_types.axis_source.wheel) or
             pending.scroll_source == @intFromEnum(protocol.wl_pointer_types.axis_source.wheel_tilt);
-        try self.notify(self.notify_context, self, .{ .scroll = .{
-            .position = point,
-            .dx = normalizedAxis(pending.scroll_dx, pending.scroll_steps_x, wheel),
-            .dy = normalizedAxis(pending.scroll_dy, pending.scroll_steps_y, wheel),
-            .modifiers = modifiers,
-        } });
+        try self.notify(self.notify_context, self, .{
+            .surface_id = surface_id,
+            .value = .{ .scroll = .{
+                .position = point,
+                .dx = normalizedAxis(pending.scroll_dx, pending.scroll_steps_x, wheel),
+                .dy = normalizedAxis(pending.scroll_dy, pending.scroll_steps_y, wheel),
+                .modifiers = modifiers,
+            } },
+        });
     }
 }
 
@@ -386,20 +405,19 @@ fn handleKeyboard(
             self.installXkbKeymap(fd, keymap.format, keymap.size);
         },
         .enter => |enter| {
-            self.keyboard_focused = self.keyboard_enabled and
-                self.surface_id != null and enter.surface == self.surface_id.?;
+            self.keyboard_surface_id = if (self.keyboard_enabled) enter.surface else null;
             self.last_input_serial = enter.serial;
             self.shift_down = false;
         },
         .leave => |leave| {
-            if (self.surface_id != null and leave.surface == self.surface_id.?) {
-                self.keyboard_focused = false;
+            if (self.keyboard_surface_id != null and leave.surface == self.keyboard_surface_id.?) {
+                self.keyboard_surface_id = null;
                 self.shift_down = false;
                 self.stopKeyRepeat();
             }
         },
         .key => |key| {
-            if (!self.keyboard_focused) return;
+            const surface_id = self.keyboard_surface_id orelse return;
             const repeated = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.repeated);
             const pressed = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.pressed) or repeated;
             if (pressed and !repeated) self.last_input_serial = key.serial;
@@ -415,7 +433,10 @@ fn handleKeyboard(
                 return;
             }
             const input = self.keyInput(key.key) orelse return;
-            try self.notify(self.notify_context, self, .{ .key = input });
+            try self.notify(self.notify_context, self, .{
+                .surface_id = surface_id,
+                .value = .{ .key = input },
+            });
             if (repeated) {
                 self.stopKeyRepeat();
             } else {
@@ -528,7 +549,11 @@ fn stopKeyRepeat(self: *Input) void {
 fn repeatTimerCallback(context: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
     const self: *Input = @ptrCast(@alignCast(context));
     const input = self.repeat_input orelse return;
-    for (0..expirations) |_| try self.notify(self.notify_context, self, .{ .key = input });
+    const surface_id = self.keyboard_surface_id orelse return self.stopKeyRepeat();
+    for (0..expirations) |_| try self.notify(self.notify_context, self, .{
+        .surface_id = surface_id,
+        .value = .{ .key = input },
+    });
 }
 
 fn inputCanRepeat(input: keywork.KeyInput) bool {

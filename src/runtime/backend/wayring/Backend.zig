@@ -298,7 +298,6 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
                 self.options.width,
                 self.options.height,
             );
-            if (self.input) |*input| input.setSurface(self.window.?.surfaceId());
             self.state = .configuring;
         },
         .outputs_changed => if (self.window) |*window| {
@@ -393,7 +392,9 @@ fn clientMessage(
 
 fn inputEvent(context: *anyopaque, _: *Input, event: Input.Event) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
-    try self.event_notify(self.event_context, self, switch (event) {
+    const window = if (self.window) |*value| value else return;
+    if (event.surface_id != window.surfaceId()) return;
+    try self.event_notify(self.event_context, self, switch (event.value) {
         .pointer_move => |value| .{ .pointer_move = value },
         .pointer_button => |value| .{ .pointer_button = value },
         .scroll => |value| .{ .scroll = value },
