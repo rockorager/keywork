@@ -20,6 +20,10 @@ pub const ArgumentKind = enum { int, uint, fixed, string, object, new_id, array,
 pub const ArgumentSpec = struct {
     kind: ArgumentKind,
     nullable: bool = false,
+    /// XML declaration metadata. These do not affect wire encoding.
+    name: ?[]const u8 = null,
+    interface_name: ?[]const u8 = null,
+    enum_name: ?[]const u8 = null,
     /// Wayland strings are normally protocol text and therefore UTF-8. Set
     /// false only for a protocol contract which explicitly carries bytes.
     validate_utf8: bool = true,
@@ -29,6 +33,7 @@ pub const MessageDescriptor = struct {
     name: []const u8,
     opcode: u16,
     since: u32 = 1,
+    destructor: bool = false,
     args: []const ArgumentSpec = &.{},
 
     pub fn fdCount(self: *const MessageDescriptor) usize {
@@ -480,6 +485,22 @@ const events = [_]MessageDescriptor{
     .{ .name = "descriptor", .opcode = 1, .args = &.{.{ .kind = .fd }} },
 };
 const test_interface: Interface = .{ .name = "test", .version = 2, .requests = &requests, .events = &events };
+
+test "descriptor declaration metadata is retained without changing wire kinds" {
+    const args = [_]ArgumentSpec{.{
+        .kind = .object,
+        .nullable = true,
+        .name = "surface",
+        .interface_name = "wl_surface",
+        .enum_name = "state",
+    }};
+    const descriptor: MessageDescriptor = .{ .name = "destroy", .opcode = 3, .destructor = true, .args = &args };
+    try std.testing.expect(descriptor.destructor);
+    try std.testing.expectEqualStrings("surface", descriptor.args[0].name.?);
+    try std.testing.expectEqualStrings("wl_surface", descriptor.args[0].interface_name.?);
+    try std.testing.expectEqualStrings("state", descriptor.args[0].enum_name.?);
+    try std.testing.expectEqual(ArgumentKind.object, descriptor.args[0].kind);
+}
 
 fn testFrame(allocator: std.mem.Allocator, object_id: u32, descriptor: *const MessageDescriptor, values: []const OutValue) ![]u8 {
     var c = Connection.init(allocator, .client, 4096);

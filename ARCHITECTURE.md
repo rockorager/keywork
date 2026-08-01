@@ -31,6 +31,8 @@ It owns framing, argument validation, ordered byte and file-descriptor queues,
 object metadata, and send acknowledgement semantics. It receives bytes and
 owned descriptors from a transport and exposes drainable messages; it never
 waits on sockets or invokes application callbacks while parsing input.
+Its host-side scanner consumes repository-managed protocol XML and emits native
+Wayring descriptors without generating or linking libwayland ABI wrappers.
 
 The core must not depend on the loop, runtime, compositor, Vulkan, or
 libwayland. Concrete transport adapters may depend on both `wayring` and
