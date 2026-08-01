@@ -1092,7 +1092,7 @@ pub fn createWithVirtualOutput(
         try self.drm_device.init(
             allocator,
             io,
-            display.getEventLoop(),
+            .{ .wayland = display.getEventLoop() },
             &self.session,
             drm_device_path,
         );
