@@ -201,6 +201,10 @@ pub fn compositorHandle(self: *const Client) ?wayring.ObjectHandle {
     return if (self.compositor) |global| global.handle else null;
 }
 
+pub fn wmBaseHandle(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.wm_base) |global| global.handle else null;
+}
+
 pub fn shmHandle(self: *const Client) ?wayring.ObjectHandle {
     return if (self.shm) |global| global.handle else null;
 }

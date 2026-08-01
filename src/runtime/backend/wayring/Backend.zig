@@ -465,14 +465,45 @@ pub fn unlockSession(_: *Backend) !void {
     return error.SessionLockNotImplemented;
 }
 
-pub fn createPopup(_: *Backend, _: *Window, _: wayland_window.PopupOptions) !*Window {
-    return error.PopupNotImplemented;
+pub fn createPopup(
+    self: *Backend,
+    parent: *Window,
+    popup_options: wayland_window.PopupOptions,
+) !*Window {
+    try self.windows.ensureUnusedCapacity(self.allocator, 1);
+    const window = try self.allocator.create(Window);
+    errdefer self.allocator.destroy(window);
+    window.* = .{
+        .backend = self,
+        .protocol = try ProtocolWindow.initPopup(
+            self.allocator,
+            &self.client,
+            &parent.protocol,
+            popup_options,
+        ),
+    };
+    if (self.input) |*input| if (input.lastButtonPressSerial()) |serial| {
+        window.protocol.grabPopup(input.seatHandle(), serial) catch |err| {
+            window.protocol.beginClose() catch {};
+            window.protocol.deinit();
+            return err;
+        };
+    };
+    self.windows.appendAssumeCapacity(window);
+    return window;
 }
 
-pub fn setPopupKeyboardFocus(_: *Backend, _: *Window, _: bool) void {}
+pub fn setPopupKeyboardFocus(_: *Backend, window: *Window, focused: bool) void {
+    window.protocol.setPopupKeyboardFocus(focused) catch {};
+}
 
-pub fn repositionPopup(_: *Backend, _: *Window, _: wayland_window.PopupOptions, _: u32) !void {
-    return error.PopupNotImplemented;
+pub fn repositionPopup(
+    _: *Backend,
+    window: *Window,
+    popup_options: wayland_window.PopupOptions,
+    token: u32,
+) !void {
+    try window.protocol.repositionPopup(popup_options, token);
 }
 
 pub fn requestLayerSize(_: *Backend, window: *Window, width: u31, height: u31) !void {

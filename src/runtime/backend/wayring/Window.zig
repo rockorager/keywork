@@ -9,6 +9,7 @@ const protocol = @import("wayring-protocols");
 const Client = @import("Client.zig");
 const VulkanWindow = @import("VulkanWindow.zig");
 const wayland_options = @import("../wayland/options.zig");
+const wayland_window = @import("../wayland/window.zig");
 
 pub const Event = enum { configured, repaint, close };
 pub const ResizeEdge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
@@ -46,6 +47,8 @@ protocol_destroyed: bool = false,
 scale_120: u32 = 120,
 preferred_buffer_scale: ?u32 = null,
 entered_outputs: std.ArrayList(u32) = .empty,
+popup_insets: wayland_window.SurfaceInsets = .{},
+layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity = null,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -73,6 +76,8 @@ pub fn init(
         } },
         default_width,
         default_height,
+        .{},
+        null,
     );
 }
 
@@ -138,6 +143,65 @@ pub fn initLayer(
         .{ .layer = layer_surface },
         default_width,
         default_height,
+        .{},
+        options.keyboard_interactivity,
+    );
+}
+
+pub fn initPopup(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    parent: *Window,
+    options: wayland_window.PopupOptions,
+) !Window {
+    const wm_base = client.wmBaseHandle() orelse return error.MissingXdgWmBase;
+    const parent_xdg_surface = switch (parent.role) {
+        .toplevel => |role| role.xdg_surface,
+        .popup => |role| role.xdg_surface,
+        .layer => null,
+        .session_lock => return error.PopupUnsupported,
+    };
+    const base = try client.createSurface();
+    errdefer client.destroySurface(base);
+    const xdg_surface = try protocol.xdg_wm_base_types.requests.get_xdg_surface(
+        client.connectionPtr(),
+        wm_base,
+        base.surface,
+    );
+    errdefer protocol.xdg_surface_types.requests.destroy(client.connectionPtr(), xdg_surface) catch {};
+    const positioner = try protocol.xdg_wm_base_types.requests.create_positioner(
+        client.connectionPtr(),
+        wm_base,
+    );
+    errdefer protocol.xdg_positioner_types.requests.destroy(client.connectionPtr(), positioner) catch {};
+    try configurePopupPositioner(client, positioner, options);
+    const popup = try protocol.xdg_surface_types.requests.get_popup(
+        client.connectionPtr(),
+        xdg_surface,
+        parent_xdg_surface,
+        positioner,
+    );
+    errdefer protocol.xdg_popup_types.requests.destroy(client.connectionPtr(), popup) catch {};
+    if (parent.role == .layer) try protocol.zwlr_layer_surface_v1_types.requests.get_popup(
+        client.connectionPtr(),
+        parent.role.layer,
+        popup,
+    );
+    try protocol.xdg_positioner_types.requests.destroy(client.connectionPtr(), positioner);
+    try configurePopupGeometry(client, base.surface, xdg_surface, options);
+    try protocol.wl_surface_types.requests.commit(client.connectionPtr(), base.surface);
+    try client.flush();
+    const width = try options.insets.bufferWidth(options.width);
+    const height = try options.insets.bufferHeight(options.height);
+    return initSurface(
+        allocator,
+        client,
+        base,
+        .{ .popup = .{ .xdg_surface = xdg_surface, .popup = popup } },
+        width,
+        height,
+        options.insets,
+        null,
     );
 }
 
@@ -148,6 +212,8 @@ fn initSurface(
     role: Role,
     default_width: u32,
     default_height: u32,
+    popup_insets: wayland_window.SurfaceInsets,
+    layer_keyboard_interactivity: ?wayland_options.LayerShellOptions.KeyboardInteractivity,
 ) !Window {
     const raw_candidates = client.dmaBufCandidates();
     const candidates = try allocator.alloc(VulkanWindow.Candidate, raw_candidates.len);
@@ -183,6 +249,8 @@ fn initSurface(
         .height = default_height,
         .pending_width = default_width,
         .pending_height = default_height,
+        .popup_insets = popup_insets,
+        .layer_keyboard_interactivity = layer_keyboard_interactivity,
     };
 }
 
@@ -272,6 +340,43 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         try protocol.xdg_surface_types.requests.ack_configure(
             self.client.connectionPtr(),
             role.xdg_surface,
+            configure.serial,
+        );
+        self.width = self.pending_width;
+        self.height = self.pending_height;
+        try self.configureScale();
+        self.configured = true;
+        self.configure_generation +%= 1;
+        try self.client.flush();
+        return .configured;
+    }
+    if (self.role == .popup and message.object_id == self.role.popup.popup.id) {
+        switch (try protocol.xdg_popup_types.decodeEvent(
+            self.client.connectionPtr(),
+            self.role.popup.popup,
+            message,
+        )) {
+            .configure => |configure| {
+                if (configure.width > 0) self.pending_width = try self.popup_insets.bufferWidth(@intCast(configure.width));
+                if (configure.height > 0) self.pending_height = try self.popup_insets.bufferHeight(@intCast(configure.height));
+            },
+            .popup_done => {
+                self.closed = true;
+                return .close;
+            },
+            .repositioned => {},
+        }
+        return null;
+    }
+    if (self.role == .popup and message.object_id == self.role.popup.xdg_surface.id) {
+        const configure = (try protocol.xdg_surface_types.decodeEvent(
+            self.client.connectionPtr(),
+            self.role.popup.xdg_surface,
+            message,
+        )).configure;
+        try protocol.xdg_surface_types.requests.ack_configure(
+            self.client.connectionPtr(),
+            self.role.popup.xdg_surface,
             configure.serial,
         );
         self.width = self.pending_width;
@@ -457,6 +562,65 @@ pub fn requestLayerSize(self: *Window, width: u31, height: u31) !void {
         height,
     );
     try protocol.wl_surface_types.requests.commit(self.client.connectionPtr(), self.surface);
+    try self.client.flush();
+}
+
+pub fn grabPopup(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
+    const role = switch (self.role) {
+        .popup => |value| value,
+        else => return error.NotPopup,
+    };
+    try protocol.xdg_popup_types.requests.grab(
+        self.client.connectionPtr(),
+        role.popup,
+        seat,
+        serial,
+    );
+    try self.client.flush();
+}
+
+pub fn setPopupKeyboardFocus(self: *Window, focused: bool) !void {
+    if (self.layer_keyboard_interactivity != .none) return;
+    const role = switch (self.role) {
+        .layer => |value| value,
+        else => return,
+    };
+    try protocol.zwlr_layer_surface_v1_types.requests.set_keyboard_interactivity(
+        self.client.connectionPtr(),
+        role,
+        @intFromEnum(if (focused)
+            protocol.zwlr_layer_surface_v1_types.keyboard_interactivity.exclusive
+        else
+            protocol.zwlr_layer_surface_v1_types.keyboard_interactivity.none),
+    );
+    try protocol.wl_surface_types.requests.commit(self.client.connectionPtr(), self.surface);
+    try self.client.flush();
+}
+
+pub fn repositionPopup(self: *Window, options: wayland_window.PopupOptions, token: u32) !void {
+    const role = switch (self.role) {
+        .popup => |value| value,
+        else => return error.NotPopup,
+    };
+    const wm_base = self.client.wmBaseHandle() orelse return error.MissingXdgWmBase;
+    const positioner = try protocol.xdg_wm_base_types.requests.create_positioner(
+        self.client.connectionPtr(),
+        wm_base,
+    );
+    errdefer protocol.xdg_positioner_types.requests.destroy(
+        self.client.connectionPtr(),
+        positioner,
+    ) catch {};
+    try configurePopupPositioner(self.client, positioner, options);
+    try configurePopupGeometry(self.client, self.surface, role.xdg_surface, options);
+    try protocol.xdg_popup_types.requests.reposition(
+        self.client.connectionPtr(),
+        role.popup,
+        positioner,
+        token,
+    );
+    try protocol.xdg_positioner_types.requests.destroy(self.client.connectionPtr(), positioner);
+    self.popup_insets = options.insets;
     try self.client.flush();
 }
 
@@ -660,6 +824,159 @@ fn keyboardInteractivity(
     };
 }
 
+fn configurePopupPositioner(
+    client: *Client,
+    positioner: wayring.ObjectHandle,
+    options: wayland_window.PopupOptions,
+) !void {
+    const connection = client.connectionPtr();
+    try protocol.xdg_positioner_types.requests.set_size(
+        connection,
+        positioner,
+        @intCast(options.width),
+        @intCast(options.height),
+    );
+    try protocol.xdg_positioner_types.requests.set_anchor_rect(
+        connection,
+        positioner,
+        options.anchor_x,
+        options.anchor_y,
+        @max(options.anchor_width, 1),
+        @max(options.anchor_height, 1),
+    );
+    try protocol.xdg_positioner_types.requests.set_anchor(
+        connection,
+        positioner,
+        @intFromEnum(popupAnchor(options.edge, options.alignment)),
+    );
+    try protocol.xdg_positioner_types.requests.set_gravity(
+        connection,
+        positioner,
+        @intFromEnum(popupGravity(options.edge, options.alignment)),
+    );
+    const adjustment = protocol.xdg_positioner_types.constraint_adjustment;
+    try protocol.xdg_positioner_types.requests.set_constraint_adjustment(
+        connection,
+        positioner,
+        adjustment.slide_x | adjustment.slide_y | adjustment.flip_x | adjustment.flip_y,
+    );
+    const offset = popupOffset(options.edge, options.gap);
+    try protocol.xdg_positioner_types.requests.set_offset(
+        connection,
+        positioner,
+        offset.x,
+        offset.y,
+    );
+}
+
+fn configurePopupGeometry(
+    client: *Client,
+    surface: wayring.ObjectHandle,
+    xdg_surface: wayring.ObjectHandle,
+    options: wayland_window.PopupOptions,
+) !void {
+    const left: i32 = @intCast(options.insets.left);
+    const top: i32 = @intCast(options.insets.top);
+    const width: i32 = @intCast(options.width);
+    const height: i32 = @intCast(options.height);
+    try protocol.xdg_surface_types.requests.set_window_geometry(
+        client.connectionPtr(),
+        xdg_surface,
+        left,
+        top,
+        width,
+        height,
+    );
+    const compositor = client.compositorHandle() orelse return error.MissingCompositor;
+    const region = try protocol.wl_compositor_types.requests.create_region(
+        client.connectionPtr(),
+        compositor,
+    );
+    errdefer protocol.wl_region_types.requests.destroy(client.connectionPtr(), region) catch {};
+    try protocol.wl_region_types.requests.add(
+        client.connectionPtr(),
+        region,
+        left,
+        top,
+        width,
+        height,
+    );
+    try protocol.wl_surface_types.requests.set_input_region(
+        client.connectionPtr(),
+        surface,
+        region,
+    );
+    try protocol.wl_region_types.requests.destroy(client.connectionPtr(), region);
+}
+
+fn popupAnchor(
+    edge: keywork.Widget.PopupPlacement.Edge,
+    alignment: keywork.Widget.Alignment,
+) protocol.xdg_positioner_types.anchor {
+    return switch (edge) {
+        .bottom => switch (alignment) {
+            .start => .bottom_left,
+            .center => .bottom,
+            .end => .bottom_right,
+        },
+        .top => switch (alignment) {
+            .start => .top_left,
+            .center => .top,
+            .end => .top_right,
+        },
+        .right => switch (alignment) {
+            .start => .top_right,
+            .center => .right,
+            .end => .bottom_right,
+        },
+        .left => switch (alignment) {
+            .start => .top_left,
+            .center => .left,
+            .end => .bottom_left,
+        },
+    };
+}
+
+fn popupGravity(
+    edge: keywork.Widget.PopupPlacement.Edge,
+    alignment: keywork.Widget.Alignment,
+) protocol.xdg_positioner_types.gravity {
+    return switch (edge) {
+        .bottom => switch (alignment) {
+            .start => .bottom_right,
+            .center => .bottom,
+            .end => .bottom_left,
+        },
+        .top => switch (alignment) {
+            .start => .top_right,
+            .center => .top,
+            .end => .top_left,
+        },
+        .right => switch (alignment) {
+            .start => .bottom_right,
+            .center => .right,
+            .end => .top_right,
+        },
+        .left => switch (alignment) {
+            .start => .bottom_left,
+            .center => .left,
+            .end => .top_left,
+        },
+    };
+}
+
+fn popupOffset(
+    edge: keywork.Widget.PopupPlacement.Edge,
+    gap: i32,
+) struct { x: i32, y: i32 } {
+    return switch (edge) {
+        .bottom => .{ .x = 0, .y = gap },
+        .top => .{ .x = 0, .y = -gap },
+        .right => .{ .x = gap, .y = 0 },
+        .left => .{ .x = -gap, .y = 0 },
+    };
+}
+
 test {
     std.testing.refAllDecls(Window);
     try std.testing.expectEqual(
@@ -680,4 +997,10 @@ test {
             protocol.zwlr_layer_surface_v1_types.anchor.left,
         layerAnchor(.{ .top = true, .left = true }),
     );
+    try std.testing.expectEqual(
+        protocol.xdg_positioner_types.anchor.bottom_right,
+        popupAnchor(.bottom, .end),
+    );
+    const expected_offset: @TypeOf(popupOffset(.left, 8)) = .{ .x = -8, .y = 0 };
+    try std.testing.expectEqualDeep(expected_offset, popupOffset(.left, 8));
 }
