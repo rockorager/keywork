@@ -15,12 +15,12 @@ all checked-in Wayland XML live outside `src/`.
 ### Loop (`src/loop/`)
 
 Owns the `keywork-loop` Zig module: concrete Linux reactors and their operation
-lifetime safety. The primary Wayring runtime uses the completion-native
-`IoUringLoop` as its outer blocking reactor. The established `EventLoop` uses
-epoll, eventfd, timerfd, and inotify; io_uring polls it as a subordinate
-compatibility source while individual legacy sources migrate. The component
-owns source and completion dispatch, but not application lifecycle or
-protocol-specific policy.
+lifetime safety. `EventLoop` owns the process's completion-native `IoUringLoop`;
+Wayring transport and ordinary runtime fd sources share that ring and its
+submit/wait/drain turns. Eventfd, timerfd, inotify, and library-owned poll
+descriptors remain Linux event producers, but io_uring is the only outer wait
+mechanism. The component owns source and completion dispatch, but not
+application lifecycle or protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through

@@ -162,7 +162,7 @@ pub const LuaSocket = struct {
                     if (result == 0) {
                         // Peer EOF: virtually no SOCK_STREAM protocol keeps a
                         // half-open connection useful, and an open EOF'd fd
-                        // would re-report readability every epoll turn.
+                        // would re-report readability every poll turn.
                         self.shutdownFd(lua_state, .resume_reader);
                         return;
                     }

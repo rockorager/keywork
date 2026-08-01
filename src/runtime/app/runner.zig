@@ -92,14 +92,14 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
 
 fn runWayringWindowed(
     allocator: std.mem.Allocator,
-    compatibility_loop: *event_loop.EventLoop,
+    loop: *event_loop.EventLoop,
     windows_host: app_windows.WindowsHost,
     options: Options,
     presentation: WayringBackend.Presentation,
 ) !void {
     const Manager = WindowManager(WayringBackend);
-    const backend = try WayringBackend.createWithOptions(allocator, .{ .presentation = presentation });
-    defer backend.destroy();
+    const backend = try WayringBackend.createWithLoop(allocator, loop.ioLoop(), .{ .presentation = presentation });
+    defer backend.destroyBorrowed();
     if (options.session_lock) try backend.beginSessionLock();
 
     const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(backend);
@@ -120,36 +120,24 @@ fn runWayringWindowed(
 
     if (options.host_bindings) |bindings| bindings.bindInvalidator(manager.invalidator());
     defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
-    if (options.host_bindings) |bindings| try bindings.bindEventLoop(compatibility_loop);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
     defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
-    try backend.installEventTimers(compatibility_loop);
+    try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
 
     try manager.reconcile();
     if (manager.shouldQuit()) return;
 
-    if (!compatibility_loop.beginEmbedded()) return;
-    defer compatibility_loop.endEmbedded();
-    var compatibility: CompatibilityPoll = .{
-        .ring = backend.ioLoop(),
-        .loop = compatibility_loop,
-    };
-    try compatibility.arm();
-    defer compatibility.cancel() catch {};
-
-    while (compatibility_loop.isRunning() and !backend.isClosing()) {
-        if (compatibility.ready) try compatibility.dispatch();
-        try backend.runOnce();
-        if (compatibility.ready) try compatibility.dispatch();
-        try backend.drainDeferred();
-        try Manager.afterPlatformHook(&manager, compatibility_loop);
-        try Manager.endTurnHook(&manager, compatibility_loop);
-    }
+    loop.setAfterPlatformHook(&manager, Manager.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
+    loop.setEndTurnHook(&manager, Manager.endTurnHook);
+    defer loop.clearEndTurnHook();
+    try loop.run();
 }
 
 fn runWayring(
     allocator: std.mem.Allocator,
-    compatibility_loop: *event_loop.EventLoop,
+    loop: *event_loop.EventLoop,
     app: keywork.AppHost,
     options: Options,
     presentation: WayringBackend.Presentation,
@@ -165,15 +153,14 @@ fn runWayring(
     );
     defer allocator.free(socket_path);
 
-    var ring = try event_loop.IoUringLoop.init(allocator);
-    defer ring.deinit();
+    const ring = loop.ioLoop();
     var run_context: WayringRunContext = .{ .allocator = allocator };
     defer run_context.deinit();
     var backend: WayringBackend = undefined;
     try backend.initConnect(
         allocator,
         socket_path,
-        &ring,
+        ring,
         .{
             .title = options.title,
             .app_id = options.app_id,
@@ -214,47 +201,28 @@ fn runWayring(
     runtime.setClipboardReader(wayring_platform.ptr, wayring_platform.vtable.clipboard_read);
     run_context.runtime = &runtime;
     defer run_context.runtime = null;
+    run_context.backend = &backend;
+    defer run_context.backend = null;
     if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
     defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
     runtime.setDeferredRepaint(true);
-    if (options.host_bindings) |bindings| try bindings.bindEventLoop(compatibility_loop);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
     defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
-    try backend.installEventTimers(compatibility_loop);
+    try backend.installEventTimers(loop);
     defer backend.uninstallEventTimers();
 
-    if (!compatibility_loop.beginEmbedded()) {
-        run_context.stop = true;
-    }
-    defer compatibility_loop.endEmbedded();
-    var compatibility: CompatibilityPoll = .{
-        .ring = &ring,
-        .loop = compatibility_loop,
-    };
-    if (compatibility_loop.isRunning()) try compatibility.arm();
-    defer {
-        compatibility.cancel() catch {};
-        while (ring.hasActiveOperations() and backend.readyToDeinit()) ring.runOnce() catch break;
-    }
-
+    loop.setAfterPlatformHook(&run_context, WayringRunContext.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
+    loop.setEndTurnHook(&run_context, WayringRunContext.endTurnHook);
+    defer loop.clearEndTurnHook();
     try runtime.repaint();
-    while (!backend.readyToDeinit()) {
-        if (run_context.stop or !compatibility_loop.isRunning()) {
-            try compatibility.cancel();
-            try backend.beginClose();
-        }
-        if (compatibility.ready) try compatibility.dispatch();
-        try backend.runOnce();
-        if (compatibility.ready) try compatibility.dispatch();
-        try run_context.drain(&backend);
-        try runtime.flushPendingRepaint();
-    }
-    try compatibility.cancel();
-    while (ring.hasActiveOperations()) try ring.runOnce();
+    try loop.run();
 }
 
 const WayringRunContext = struct {
     allocator: std.mem.Allocator,
     runtime: ?*runtime_mod.Runtime = null,
+    backend: ?*WayringBackend = null,
     stop: bool = false,
     events: std.ArrayList(WayringBackend.Event) = .empty,
 
@@ -316,6 +284,24 @@ const WayringRunContext = struct {
         }
     }
 
+    fn afterPlatformHook(context: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        const backend = self.backend orelse return;
+        try backend.drainDeferred();
+        try self.drain(backend);
+        if (self.stop or backend.isClosing()) loop.quit();
+    }
+
+    fn endTurnHook(context: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        const backend = self.backend orelse return;
+        // Input timers are ordinary loop sources and may queue semantic
+        // events after the platform phase.
+        try self.drain(backend);
+        if (self.runtime) |runtime| try runtime.flushPendingRepaint();
+        if (self.stop or backend.isClosing()) loop.quit();
+    }
+
     fn clear(self: *WayringRunContext, events: *std.ArrayList(WayringBackend.Event)) void {
         for (events.items) |event| self.deinitEvent(event);
         events.clearRetainingCapacity();
@@ -329,48 +315,6 @@ const WayringRunContext = struct {
             },
             else => {},
         }
-    }
-};
-
-const CompatibilityPoll = struct {
-    ring: *event_loop.IoUringLoop,
-    loop: *event_loop.EventLoop,
-    handle: ?event_loop.IoUringLoop.Handle = null,
-    ready: bool = false,
-
-    fn arm(self: *CompatibilityPoll) !void {
-        std.debug.assert(self.handle == null);
-        self.handle = try self.ring.queue(self, complete, self, prepare);
-    }
-
-    fn cancel(self: *CompatibilityPoll) !void {
-        self.ready = false;
-        const handle = self.handle orelse return;
-        self.handle = null;
-        if (self.ring.isActive(handle)) try self.ring.remove(handle);
-    }
-
-    fn prepare(context: *anyopaque, sqe: *std.os.linux.io_uring_sqe) void {
-        const self: *CompatibilityPoll = @ptrCast(@alignCast(context));
-        sqe.prep_poll_add(self.loop.pollFd(), std.os.linux.POLL.IN);
-    }
-
-    fn complete(
-        context: *anyopaque,
-        _: *event_loop.IoUringLoop,
-        completion: event_loop.IoUringLoop.Completion,
-    ) !void {
-        const self: *CompatibilityPoll = @ptrCast(@alignCast(context));
-        self.handle = null;
-        if (completion.result < 0) return error.CompatibilityPollFailed;
-        self.ready = true;
-    }
-
-    fn dispatch(self: *CompatibilityPoll) !void {
-        std.debug.assert(self.ready and self.handle == null);
-        self.ready = false;
-        try self.loop.dispatchReady();
-        if (self.loop.isRunning()) try self.arm();
     }
 };
 
@@ -1341,6 +1285,7 @@ fn WindowManager(comptime Backend: type) type {
 
         fn afterPlatformHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            if (Backend == WayringBackend) try self.backend.drainDeferred();
             try self.drainAll();
         }
 

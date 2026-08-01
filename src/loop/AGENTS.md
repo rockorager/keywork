@@ -4,9 +4,9 @@ The root Zig, safety, documentation, and module-boundary guidance applies here.
 
 ## Loop ownership
 
-- `keywork-loop` owns concrete Linux reactors. During the io_uring migration it
-  owns both the established epoll/eventfd/timerfd/inotify loop and the managed
-  io_uring operation reactor, including source and operation lifetime safety.
+- `keywork-loop` owns the completion-native Linux event loop and its managed
+  io_uring reactor, including source and operation lifetime safety. Eventfd,
+  timerfd, and inotify may remain event producers; io_uring owns outer waits.
 - Keep the module independent of the runtime, UI, Lua, compositor, systemd,
   and Wayland libraries. Protocol-specific prepare and dispatch policy belongs
   in consumer-owned adapters.

@@ -16,7 +16,7 @@ free_slots: std.ArrayList(u32) = .empty,
 active_count: usize = 0,
 running: bool = false,
 
-pub const default_queue_depth: u16 = 8;
+pub const default_queue_depth: u16 = 64;
 
 pub const Completion = struct {
     result: i32,
@@ -90,14 +90,17 @@ pub fn queue(
 pub fn remove(self: *IoUringLoop, handle: Handle) !void {
     const operation_value = self.operation(handle) orelse return;
     if (operation_value.removed) return;
-
-    const cancel_handle = try self.allocate(self, cancellationComplete);
-    errdefer self.release(cancel_handle);
-    const sqe = try self.getSqe();
-    sqe.prep_cancel(token(handle), 0);
-    sqe.user_data = token(cancel_handle);
+    try self.queueCancellation(handle);
     // allocate may have moved slot storage, so resolve the target again.
     self.operation(handle).?.removed = true;
+}
+
+/// Requests cancellation while preserving the target callback. The target's
+/// terminal CQE, usually `-ECANCELED`, remains observable so an owner can
+/// release fd and callback storage only after the kernel is finished with it.
+pub fn cancel(self: *IoUringLoop, handle: Handle) !void {
+    if (self.operation(handle) == null) return;
+    try self.queueCancellation(handle);
 }
 
 /// Reports whether an operation still owns a slot. A removed operation stays
@@ -130,8 +133,17 @@ pub fn run(self: *IoUringLoop) !void {
 /// Submits pending SQEs, waits when no completion is already available, and
 /// drains the CQ. Consumers never need to coordinate ring entry themselves.
 pub fn runOnce(self: *IoUringLoop) !void {
+    return self.runOnceWait(true);
+}
+
+/// Submits and drains completions without waiting when none are ready.
+pub fn pollOnce(self: *IoUringLoop) !void {
+    return self.runOnceWait(false);
+}
+
+fn runOnceWait(self: *IoUringLoop, wait: bool) !void {
     if (self.active_count == 0) return;
-    _ = try self.ring.submit_and_wait(if (self.ring.cq_ready() == 0) 1 else 0);
+    _ = try self.ring.submit_and_wait(if (wait and self.ring.cq_ready() == 0) 1 else 0);
 
     var cqes: [32]linux.io_uring_cqe = undefined;
     while (true) {
@@ -142,6 +154,14 @@ pub fn runOnce(self: *IoUringLoop) !void {
             .flags = cqe.flags,
         });
     }
+}
+
+fn queueCancellation(self: *IoUringLoop, handle: Handle) !void {
+    const cancel_handle = try self.allocate(self, cancellationComplete);
+    errdefer self.release(cancel_handle);
+    const sqe = try self.getSqe();
+    sqe.prep_cancel(token(handle), 0);
+    sqe.user_data = token(cancel_handle);
 }
 
 fn allocate(self: *IoUringLoop, context: *anyopaque, callback: Callback) !Handle {
@@ -308,6 +328,70 @@ test "removed pending poll is suppressed and retained until terminal CQE" {
     while (loop.active_count != 0) try loop.runOnce();
     try std.testing.expect(!context.called);
     try std.testing.expect(loop.operation(handle) == null);
+}
+
+test "cancel preserves the target terminal completion" {
+    const Context = struct {
+        fd: i32,
+        called: bool = false,
+        result: i32 = 0,
+
+        fn prepare(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            sqe.prep_poll_add(self.fd, linux.POLL.IN);
+        }
+
+        fn complete(context: *anyopaque, _: *IoUringLoop, completion: Completion) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+            self.result = completion.result;
+        }
+    };
+
+    var pipe: [2]i32 = undefined;
+    const pipe_result = linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (linux.errno(pipe_result) != .SUCCESS) return error.PipeFailed;
+    defer for (pipe) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var loop = try IoUringLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{ .fd = pipe[0] };
+    const handle = try loop.queue(&context, Context.complete, &context, Context.prepare);
+    try loop.cancel(handle);
+    while (loop.hasActiveOperations()) try loop.runOnce();
+    try std.testing.expect(context.called);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), context.result);
+}
+
+test "pollOnce submits without waiting for an incomplete operation" {
+    const Context = struct {
+        fd: i32,
+
+        fn prepare(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            sqe.prep_poll_add(self.fd, linux.POLL.IN);
+        }
+
+        fn complete(_: *anyopaque, _: *IoUringLoop, _: Completion) !void {}
+    };
+
+    var pipe: [2]i32 = undefined;
+    const pipe_result = linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (linux.errno(pipe_result) != .SUCCESS) return error.PipeFailed;
+    defer for (pipe) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var loop = try IoUringLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{ .fd = pipe[0] };
+    const handle = try loop.queue(&context, Context.complete, &context, Context.prepare);
+    try loop.pollOnce();
+    try std.testing.expect(loop.isActive(handle));
+    try loop.remove(handle);
+    while (loop.hasActiveOperations()) try loop.runOnce();
 }
 
 test "tokens reject stale generations" {

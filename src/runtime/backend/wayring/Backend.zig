@@ -281,6 +281,39 @@ pub fn createWithOptions(allocator: std.mem.Allocator, options: Options) !*Backe
     return self;
 }
 
+/// Creates a managed Wayring connection on a caller-owned reactor. The caller
+/// must use `destroyBorrowed` before deinitializing the reactor.
+pub fn createWithLoop(
+    allocator: std.mem.Allocator,
+    loop: *IoUringLoop,
+    options: Options,
+) !*Backend {
+    const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";
+    const socket_path = try wayring_transport.waylandSocketPathFrom(
+        allocator,
+        processEnvironment("XDG_RUNTIME_DIR"),
+        display,
+    );
+    defer allocator.free(socket_path);
+
+    const self = try allocator.create(Backend);
+    var raw_owned = true;
+    errdefer if (raw_owned) allocator.destroy(self);
+    try self.initConnection(
+        allocator,
+        socket_path,
+        loop,
+        options,
+        self,
+        noopEvent,
+        false,
+    );
+    raw_owned = false;
+    errdefer if (self.finishBorrowedClose()) allocator.destroy(self);
+    try self.waitConfigured();
+    return self;
+}
+
 /// Drives bootstrap with the same submit/wait/drain turns used at runtime.
 pub fn waitConfigured(self: *Backend) !void {
     while (self.state == .connecting or self.state == .configuring) {
@@ -366,6 +399,19 @@ pub fn destroy(self: *Backend) void {
     loop.deinit();
     allocator.destroy(loop);
     allocator.destroy(self);
+}
+
+pub fn destroyBorrowed(self: *Backend) void {
+    std.debug.assert(self.owned_loop == null);
+    const allocator = self.allocator;
+    if (!self.finishBorrowedClose()) return;
+    allocator.destroy(self);
+}
+
+fn finishBorrowedClose(self: *Backend) bool {
+    if (!self.finishOwnedClose(self.loop)) return false;
+    self.deinit();
+    return true;
 }
 
 fn finishOwnedClose(self: *Backend, loop: *IoUringLoop) bool {
