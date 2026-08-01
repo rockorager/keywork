@@ -110,6 +110,13 @@ pub fn hasActiveOperations(self: *const IoUringLoop) bool {
     return self.active_count != 0;
 }
 
+/// Submits pending SQEs without waiting for or dispatching completions. Most
+/// consumers should use `runOnce`; this is for code that must make queued I/O
+/// visible before it performs a bounded synchronous operation.
+pub fn submit(self: *IoUringLoop) !u32 {
+    return self.ring.submit();
+}
+
 pub fn quit(self: *IoUringLoop) void {
     self.running = false;
 }
@@ -224,6 +231,26 @@ test "NOP completion dispatches its signed result" {
     try loop.run();
     try std.testing.expect(context.called);
     try std.testing.expectEqual(@as(i32, 0), context.result);
+}
+
+test "submit makes queued operations visible without dispatching callbacks" {
+    const Context = struct {
+        called: bool = false,
+
+        fn complete(context: *anyopaque, _: *IoUringLoop, _: Completion) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+        }
+    };
+
+    var loop = try IoUringLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    _ = try loop.queue(&context, Context.complete, &context, prepareNop);
+    try std.testing.expectEqual(@as(u32, 1), try loop.submit());
+    try std.testing.expect(!context.called);
+    try loop.runOnce();
+    try std.testing.expect(context.called);
 }
 
 test "callback queues a second NOP and quits" {
