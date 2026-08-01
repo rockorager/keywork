@@ -128,10 +128,23 @@ pub const Message = struct {
     }
 };
 
-const OutFrame = struct { bytes: []u8, offset: usize = 0, fds: []i32 };
+const OutFrame = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    offset: usize = 0,
+    fds: std.ArrayList(i32) = .empty,
+
+    fn deinit(self: *OutFrame, allocator: std.mem.Allocator) void {
+        closeAll(self.fds.items);
+        self.fds.deinit(allocator);
+        self.bytes.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 pub const OutboundBatch = struct {
     token: u64,
+    /// One or more complete queued messages, or their unsent suffix after a
+    /// partial write. Message framing remains in-band in the Wayland headers.
     bytes: []const u8,
     /// These descriptors accompany the first byte only. A positive send result
     /// retires all of them, exactly matching SCM_RIGHTS/sendmsg semantics.
@@ -166,11 +179,7 @@ pub const Connection = struct {
         closeAll(self.input_fds.items);
         self.input_fds.deinit(self.allocator);
         self.input.deinit(self.allocator);
-        for (self.outbound.items) |frame| {
-            closeAll(frame.fds);
-            self.allocator.free(frame.fds);
-            self.allocator.free(frame.bytes);
-        }
+        for (self.outbound.items) |*frame| frame.deinit(self.allocator);
         self.outbound.deinit(self.allocator);
         self.free_client_object_ids.deinit(self.allocator);
         self.pending_server_object_ids.deinit(self.allocator);
@@ -435,14 +444,40 @@ pub const Connection = struct {
         for (descriptor.args, values) |spec, value| try encodeValue(self.allocator, &body, &fds, spec, value);
         const size = body.items.len + 8;
         if (size > self.max_frame_size or size > std.math.maxInt(u16)) return error.FrameTooLarge;
-        const bytes = try self.allocator.alloc(u8, size);
-        errdefer self.allocator.free(bytes);
-        writeU32(bytes[0..4], object_id);
-        writeU32(bytes[4..8], (@as(u32, @intCast(size)) << 16) | opcode);
-        @memcpy(bytes[8..], body.items);
-        const owned_fds = try self.allocator.dupe(i32, fds.items);
-        errdefer self.allocator.free(owned_fds);
-        try self.outbound.append(self.allocator, .{ .bytes = bytes, .fds = owned_fds });
+        const frame = try self.writableOutFrame(size, fds.items.len);
+        const header = frame.bytes.addManyAsArrayAssumeCapacity(8);
+        writeU32(header[0..4], object_id);
+        writeU32(
+            header[4..8],
+            (@as(u32, @intCast(size)) << 16) | opcode,
+        );
+        frame.bytes.appendSliceAssumeCapacity(body.items);
+        frame.fds.appendSliceAssumeCapacity(fds.items);
+    }
+
+    /// Returns an unsent frame whose storage is not borrowed by a live batch.
+    /// Messages queued during one turn share its byte slice and one sendmsg;
+    /// SCM_RIGHTS capacity starts a new frame when necessary.
+    fn writableOutFrame(self: *Connection, byte_count: usize, fd_count: usize) !*OutFrame {
+        std.debug.assert(!self.batch_live or self.outbound.items.len != 0);
+        if (self.outbound.items.len != 0) {
+            const tail_index = self.outbound.items.len - 1;
+            const tail = &self.outbound.items[tail_index];
+            const tail_is_live = self.batch_live and tail_index == 0;
+            if (!tail_is_live and fd_count <= max_fds_per_batch - tail.fds.items.len) {
+                try tail.bytes.ensureUnusedCapacity(self.allocator, byte_count);
+                try tail.fds.ensureUnusedCapacity(self.allocator, fd_count);
+                return tail;
+            }
+        }
+
+        try self.outbound.ensureUnusedCapacity(self.allocator, 1);
+        var frame: OutFrame = .{};
+        errdefer frame.deinit(self.allocator);
+        try frame.bytes.ensureUnusedCapacity(self.allocator, byte_count);
+        try frame.fds.ensureUnusedCapacity(self.allocator, fd_count);
+        self.outbound.appendAssumeCapacity(frame);
+        return &self.outbound.items[self.outbound.items.len - 1];
     }
 
     pub fn queueObject(self: *Connection, handle: ObjectHandle, interface: *const Interface, opcode: u16, values: []const OutValue) !void {
@@ -553,7 +588,7 @@ pub const Connection = struct {
     pub fn pendingOutputBytes(self: *const Connection) usize {
         var total: usize = 0;
         for (self.outbound.items) |frame| {
-            total = std.math.add(usize, total, frame.bytes.len - frame.offset) catch
+            total = std.math.add(usize, total, frame.bytes.items.len - frame.offset) catch
                 return std.math.maxInt(usize);
         }
         return total;
@@ -565,7 +600,11 @@ pub const Connection = struct {
         if (self.batch_token == 0) self.batch_token = 1;
         self.batch_live = true;
         const frame = &self.outbound.items[0];
-        return .{ .token = self.batch_token, .bytes = frame.bytes[frame.offset..], .fds = frame.fds };
+        return .{
+            .token = self.batch_token,
+            .bytes = frame.bytes.items[frame.offset..],
+            .fds = frame.fds.items,
+        };
     }
 
     /// `written == null` is sendmsg failure: nothing changes. Zero is also no
@@ -574,17 +613,16 @@ pub const Connection = struct {
     pub fn acknowledge(self: *Connection, token: u64, written: ?usize) !void {
         if (!self.batch_live or token != self.batch_token) return error.InvalidBatch;
         const frame = &self.outbound.items[0];
-        if (written) |count| if (count > frame.bytes.len - frame.offset) return error.InvalidWriteCount;
+        if (written) |count| if (count > frame.bytes.items.len - frame.offset) return error.InvalidWriteCount;
         self.batch_live = false;
         const count = written orelse return;
         if (count == 0) return;
-        closeAll(frame.fds);
-        self.allocator.free(frame.fds);
-        frame.fds = &.{};
+        closeAll(frame.fds.items);
+        frame.fds.clearRetainingCapacity();
         frame.offset += count;
-        if (frame.offset == frame.bytes.len) {
-            self.allocator.free(frame.bytes);
-            _ = self.outbound.orderedRemove(0);
+        if (frame.offset == frame.bytes.items.len) {
+            var complete = self.outbound.orderedRemove(0);
+            complete.deinit(self.allocator);
         }
     }
 };
@@ -1029,7 +1067,20 @@ test "retiring an object adopts already queued constructor children" {
     try std.testing.expect(connection.popMessage() == null);
 }
 
-test "outbound frames queue behind a live completion batch" {
+test "outbound messages coalesce before transport batching" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+    _ = try c.registerObject(2, &test_interface, 1);
+    try c.queue(2, 2, &.{.{ .string = "first" }});
+    try c.queue(2, 2, &.{.{ .string = "second" }});
+    const batch = c.nextBatch().?;
+    const first_size: usize = readU32(batch.bytes[4..8]) >> 16;
+    try std.testing.expect(first_size < batch.bytes.len);
+    try std.testing.expectEqual(@as(u32, 2), readU32(batch.bytes[first_size..][0..4]));
+    try c.acknowledge(batch.token, batch.bytes.len);
+}
+
+test "messages queued behind a live batch coalesce separately" {
     var c = Connection.init(std.testing.allocator, .client, 4096);
     defer c.deinit();
     _ = try c.registerObject(2, &test_interface, 1);
@@ -1037,10 +1088,32 @@ test "outbound frames queue behind a live completion batch" {
     const first = c.nextBatch().?;
     const first_ptr = first.bytes.ptr;
     try c.queue(2, 2, &.{.{ .string = "second" }});
+    try c.queue(2, 2, &.{.{ .string = "third" }});
     try std.testing.expect(c.nextBatch() == null);
+    try std.testing.expectEqual(first_ptr, first.bytes.ptr);
     try c.acknowledge(first.token, first.bytes.len);
     const second = c.nextBatch().?;
     try std.testing.expect(first_ptr != second.bytes.ptr);
+    const second_size: usize = readU32(second.bytes[4..8]) >> 16;
+    try std.testing.expect(second_size < second.bytes.len);
+    try std.testing.expectEqual(@as(u32, 2), readU32(second.bytes[second_size..][0..4]));
+    try c.acknowledge(second.token, second.bytes.len);
+}
+
+test "outbound coalescing starts a new batch at the descriptor cap" {
+    var c = Connection.init(std.testing.allocator, .client, 4096);
+    defer c.deinit();
+    _ = try c.registerObject(2, &test_interface, 2);
+    for (0..max_fds_per_batch + 1) |_| try c.queue(2, 4, &.{.{ .fd = -1 }});
+
+    const first = c.nextBatch().?;
+    try std.testing.expectEqual(max_fds_per_batch, first.fds.len);
+    try std.testing.expectEqual(max_fds_per_batch * 8, first.bytes.len);
+    try c.acknowledge(first.token, first.bytes.len);
+
+    const second = c.nextBatch().?;
+    try std.testing.expectEqual(@as(usize, 1), second.fds.len);
+    try std.testing.expectEqual(@as(usize, 8), second.bytes.len);
     try c.acknowledge(second.token, second.bytes.len);
 }
 

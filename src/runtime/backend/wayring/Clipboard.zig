@@ -434,13 +434,11 @@ test "selection offers and outgoing source sends use typed FD ownership" {
     try server_connection.queue(clipboard.device.id, 0, &.{.{ .new_id = offer_id }});
     try server_connection.queue(offer_id, 0, &.{.{ .string = "text/plain" }});
     try server_connection.queue(clipboard.device.id, 5, &.{.{ .object = offer_id }});
-    for (0..3) |_| {
-        try transfer(&server_connection, &client_connection);
-        while (client_connection.popMessage()) |popped| {
-            var message = popped;
-            defer message.deinit();
-            try clipboard.handleMessage(&message);
-        }
+    try transfer(&server_connection, &client_connection);
+    while (client_connection.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        try clipboard.handleMessage(&message);
     }
     try std.testing.expectEqualStrings("text/plain", clipboard.selection.?.firstTextMime().?);
 

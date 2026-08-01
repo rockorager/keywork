@@ -253,12 +253,14 @@ test "io_uring synthetic registry and sync round trip" {
                         try std.testing.expectEqual(self.registry_id, id);
                         _ = try self.server.connection.registerObject(id, &wl_registry, 1);
                         try queueGlobal(self.server.connection, id, 41, "wl_callback", 1);
+                        try self.server.connection.resumeParsing();
                     },
                     .sync => |id| {
                         try std.testing.expectEqual(self.callback_id, id);
                         _ = try self.server.connection.registerObject(id, &wl_callback, 1);
                         try queueCallbackDone(self.server.connection, id, 99);
                         try queueDeleteId(self.server.connection, id);
+                        try self.server.connection.resumeParsing();
                     },
                 }
             }

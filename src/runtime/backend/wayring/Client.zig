@@ -752,6 +752,7 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 21 }, .{ .string = protocol.ext_session_lock_manager_v1.name }, .{ .uint = 1 },
                             });
+                            try transport.connection.resumeParsing();
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -762,6 +763,7 @@ test "io_uring client discovers and binds required globals" {
                             );
                             try transport.connection.queue(callback.id, 0, &.{.{ .uint = 1 }});
                             try transport.connection.queue(1, 1, &.{.{ .uint = callback.id }});
+                            try transport.connection.resumeParsing();
                         },
                     }
                 } else {
@@ -831,6 +833,7 @@ test "io_uring client discovers and binds required globals" {
                         }});
                     }
                     self.bind_count += 1;
+                    try transport.connection.resumeParsing();
                 }
             }
             try transport.flush();

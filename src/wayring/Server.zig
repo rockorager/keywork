@@ -849,14 +849,14 @@ test "destructor requests queue events before delete-id and reserve the ID" {
         client.createResource(server_child.id, &test_child, 1, .{ .context = client }),
     );
 
-    const event_batch = client.connection.nextBatch() orelse return error.MissingDestructorEvent;
-    try std.testing.expectEqual(server_child.id, readTestU32(event_batch.bytes[0..4]));
-    try peer.connection.feed(event_batch.bytes, event_batch.fds);
-    try client.connection.acknowledge(event_batch.token, event_batch.bytes.len);
-    const delete_batch = client.connection.nextBatch() orelse return error.MissingDeleteId;
-    try std.testing.expectEqual(@as(u32, 1), readTestU32(delete_batch.bytes[0..4]));
-    try peer.connection.feed(delete_batch.bytes, delete_batch.fds);
-    try client.connection.acknowledge(delete_batch.token, delete_batch.bytes.len);
+    const batch = client.connection.nextBatch() orelse return error.MissingDestructorEvent;
+    try std.testing.expectEqual(server_child.id, readTestU32(batch.bytes[0..4]));
+    const event_size: usize = readTestU32(batch.bytes[4..8]) >> 16;
+    try std.testing.expect(event_size < batch.bytes.len);
+    try std.testing.expectEqual(@as(u32, 1), readTestU32(batch.bytes[event_size..][0..4]));
+    try peer.connection.feed(batch.bytes, batch.fds);
+    try client.connection.acknowledge(batch.token, batch.bytes.len);
+    try std.testing.expect(client.connection.nextBatch() == null);
     try client.outputDrained();
 
     var delete_message = peer.connection.popMessage() orelse return error.MissingDeleteId;
@@ -891,7 +891,7 @@ test "destroy callbacks may destroy another resource" {
         frame_count += 1;
         try client.connection.acknowledge(batch.token, batch.bytes.len);
     }
-    try std.testing.expectEqual(@as(usize, 2), frame_count);
+    try std.testing.expectEqual(@as(usize, 1), frame_count);
     try client.outputDrained();
     _ = try client.createResource(first.id, &test_child, 1, .{ .context = client });
     _ = try client.createResource(second.id, &test_child, 1, .{ .context = client });
