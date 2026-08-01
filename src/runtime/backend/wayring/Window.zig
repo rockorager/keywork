@@ -25,8 +25,8 @@ configured: bool = false,
 closed: bool = false,
 closing: bool = false,
 protocol_destroyed: bool = false,
-scale: u32 = 1,
-preferred_scale: ?u32 = null,
+scale_120: u32 = 120,
+preferred_buffer_scale: ?u32 = null,
 entered_outputs: std.ArrayList(u32) = .empty,
 
 pub fn init(
@@ -120,6 +120,7 @@ pub fn ownsObject(self: *const Window, id: u32) bool {
     return id == self.handles.surface.id or
         id == self.handles.xdg_surface.id or
         id == self.handles.toplevel.id or
+        (self.handles.fractional_scale != null and id == self.handles.fractional_scale.?.id) or
         (self.frame_callback != null and id == self.frame_callback.?.id) or
         self.renderer.ownsObject(id);
 }
@@ -159,10 +160,9 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
             self.handles.xdg_surface,
             configure.serial,
         );
-        const pixel_size = try scaledSize(self.pending_width, self.pending_height, self.scale);
-        try self.renderer.configure(pixel_size.width, pixel_size.height);
         self.width = self.pending_width;
         self.height = self.pending_height;
+        try self.configureScale();
         self.configured = true;
         try self.client.flush();
         return .configured;
@@ -200,12 +200,23 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
             },
             .preferred_buffer_scale => |event| {
                 if (event.factor <= 0) return error.InvalidSurfaceScale;
-                self.preferred_scale = @intCast(event.factor);
+                self.preferred_buffer_scale = @intCast(event.factor);
                 return self.applyScale();
             },
             .preferred_buffer_transform => {},
         }
         return null;
+    }
+    if (self.handles.fractional_scale) |fractional_scale| {
+        if (message.object_id == fractional_scale.id) {
+            const preferred = (try protocol.wp_fractional_scale_v1_types.decodeEvent(
+                self.client.connectionPtr(),
+                fractional_scale,
+                message,
+            )).preferred_scale;
+            if (preferred.scale == 0) return error.InvalidSurfaceScale;
+            return self.applyScale120(preferred.scale);
+        }
     }
     return error.UnknownWindowObject;
 }
@@ -266,7 +277,7 @@ pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge:
 }
 
 pub fn outputScaleChanged(self: *Window) !?Event {
-    if (self.preferred_scale != null) return null;
+    if (self.handles.fractional_scale != null or self.preferred_buffer_scale != null) return null;
     return self.applyScale();
 }
 
@@ -288,49 +299,86 @@ fn renderBackendMeasureText(
     style: keywork.ResolvedTextStyle,
 ) !keywork.Size {
     const self: *Window = @ptrCast(@alignCast(context));
-    return self.renderer.measureText(@floatFromInt(self.scale), value, style);
+    return self.renderer.measureText(self.renderScale(), value, style);
 }
 
 fn renderBackendScale(context: *anyopaque) f32 {
     const self: *Window = @ptrCast(@alignCast(context));
-    return @floatFromInt(self.scale);
+    return self.renderScale();
 }
 
 fn renderBackendTextMetrics(context: *anyopaque, font_size: f32) !keywork.TextMetrics {
     const self: *Window = @ptrCast(@alignCast(context));
-    return self.renderer.textMetrics(@floatFromInt(self.scale), font_size);
+    return self.renderer.textMetrics(self.renderScale(), font_size);
 }
 
 fn applyScale(self: *Window) !?Event {
-    var next_scale = self.preferred_scale orelse 1;
-    if (self.preferred_scale == null) {
+    if (self.handles.fractional_scale != null) return null;
+    var next_scale = self.preferred_buffer_scale orelse 1;
+    if (self.preferred_buffer_scale == null) {
         for (self.entered_outputs.items) |output_id| {
             next_scale = @max(next_scale, self.client.outputScale(output_id) orelse 1);
         }
     }
-    if (next_scale == self.scale) return null;
     if (next_scale > std.math.maxInt(i32)) return error.InvalidSurfaceScale;
+    const next_scale_120 = std.math.mul(u32, next_scale, 120) catch return error.InvalidSurfaceScale;
+    if (next_scale_120 == self.scale_120) return null;
     try protocol.wl_surface_types.requests.set_buffer_scale(
         self.client.connectionPtr(),
         self.handles.surface,
         @intCast(next_scale),
     );
-    self.scale = next_scale;
+    return self.applyScale120(next_scale_120);
+}
+
+fn applyScale120(self: *Window, next_scale_120: u32) !?Event {
+    if (next_scale_120 == 0) return error.InvalidSurfaceScale;
+    if (next_scale_120 == self.scale_120) return null;
+    self.scale_120 = next_scale_120;
     if (!self.configured) return null;
-    const pixel_size = try scaledSize(self.width, self.height, self.scale);
-    try self.renderer.configure(pixel_size.width, pixel_size.height);
+    try self.configureScale();
     try self.client.flush();
     return .configured;
 }
 
-fn scaledSize(width: u32, height: u32, scale: u32) !struct { width: u32, height: u32 } {
+fn configureScale(self: *Window) !void {
+    if (self.handles.viewport) |viewport| {
+        const logical_width = std.math.cast(i32, self.width) orelse return error.DimensionOverflow;
+        const logical_height = std.math.cast(i32, self.height) orelse return error.DimensionOverflow;
+        try protocol.wp_viewport_types.requests.set_destination(
+            self.client.connectionPtr(),
+            viewport,
+            logical_width,
+            logical_height,
+        );
+    }
+    const pixel_size = try scaledSize120(self.width, self.height, self.scale_120);
+    try self.renderer.configure(pixel_size.width, pixel_size.height);
+}
+
+fn renderScale(self: *const Window) f32 {
+    return @as(f32, @floatFromInt(self.scale_120)) / 120.0;
+}
+
+fn scaledSize120(width: u32, height: u32, scale_120: u32) !struct { width: u32, height: u32 } {
+    if (scale_120 == 0) return error.InvalidSurfaceScale;
     return .{
-        .width = std.math.mul(u32, width, scale) catch return error.DimensionOverflow,
-        .height = std.math.mul(u32, height, scale) catch return error.DimensionOverflow,
+        .width = try scaledDimension120(width, scale_120),
+        .height = try scaledDimension120(height, scale_120),
     };
 }
 
+fn scaledDimension120(dimension: u32, scale_120: u32) !u32 {
+    const product = @as(u64, dimension) * @as(u64, scale_120);
+    const result = product / 120 + @intFromBool(product % 120 != 0);
+    return std.math.cast(u32, result) orelse error.DimensionOverflow;
+}
+
 fn destroyProtocol(client: *Client, handles: Client.Window) void {
+    if (handles.fractional_scale) |fractional_scale|
+        protocol.wp_fractional_scale_v1_types.requests.destroy(client.connectionPtr(), fractional_scale) catch {};
+    if (handles.viewport) |viewport|
+        protocol.wp_viewport_types.requests.destroy(client.connectionPtr(), viewport) catch {};
     protocol.xdg_toplevel_types.requests.destroy(client.connectionPtr(), handles.toplevel) catch {};
     protocol.xdg_surface_types.requests.destroy(client.connectionPtr(), handles.xdg_surface) catch {};
     protocol.wl_surface_types.requests.destroy(client.connectionPtr(), handles.surface) catch {};
@@ -339,6 +387,18 @@ fn destroyProtocol(client: *Client, handles: Client.Window) void {
 
 fn finishClose(self: *Window) !void {
     if (self.protocol_destroyed or !try self.renderer.retireAll()) return;
+    if (self.handles.fractional_scale) |fractional_scale| {
+        try protocol.wp_fractional_scale_v1_types.requests.destroy(
+            self.client.connectionPtr(),
+            fractional_scale,
+        );
+    }
+    if (self.handles.viewport) |viewport| {
+        try protocol.wp_viewport_types.requests.destroy(
+            self.client.connectionPtr(),
+            viewport,
+        );
+    }
     try protocol.xdg_toplevel_types.requests.destroy(
         self.client.connectionPtr(),
         self.handles.toplevel,
@@ -358,7 +418,15 @@ test {
     std.testing.refAllDecls(Window);
     try std.testing.expectEqual(
         @as(u32, 3840),
-        (try scaledSize(1920, 1080, 2)).width,
+        (try scaledSize120(1920, 1080, 240)).width,
     );
-    try std.testing.expectError(error.DimensionOverflow, scaledSize(std.math.maxInt(u32), 1, 2));
+    try std.testing.expectEqual(
+        @as(u32, 1282),
+        (try scaledSize120(1025, 1, 150)).width,
+    );
+    try std.testing.expectError(
+        error.DimensionOverflow,
+        scaledSize120(std.math.maxInt(u32), 1, 240),
+    );
+    try std.testing.expectError(error.InvalidSurfaceScale, scaledSize120(1, 1, 0));
 }

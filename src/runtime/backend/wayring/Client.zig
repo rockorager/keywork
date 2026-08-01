@@ -18,6 +18,8 @@ pub const Window = struct {
     surface: wayring.ObjectHandle,
     xdg_surface: wayring.ObjectHandle,
     toplevel: wayring.ObjectHandle,
+    viewport: ?wayring.ObjectHandle,
+    fractional_scale: ?wayring.ObjectHandle,
 };
 
 pub const DmaBufCandidate = struct {
@@ -60,6 +62,8 @@ seat: ?Global = null,
 data_device_manager: ?Global = null,
 cursor_shape_manager: ?Global = null,
 activation: ?Global = null,
+viewporter: ?Global = null,
+fractional_scale_manager: ?Global = null,
 outputs: std.ArrayList(Output) = .empty,
 seat_capabilities: u32 = 0,
 seat_claimed: bool = false,
@@ -206,15 +210,18 @@ pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Wi
         &self.connection,
         compositor.handle,
     );
+    errdefer protocol.wl_surface_types.requests.destroy(&self.connection, surface) catch {};
     const xdg_surface = try protocol.xdg_wm_base_types.requests.get_xdg_surface(
         &self.connection,
         wm_base.handle,
         surface,
     );
+    errdefer protocol.xdg_surface_types.requests.destroy(&self.connection, xdg_surface) catch {};
     const toplevel = try protocol.xdg_surface_types.requests.get_toplevel(
         &self.connection,
         xdg_surface,
     );
+    errdefer protocol.xdg_toplevel_types.requests.destroy(&self.connection, toplevel) catch {};
     if (title.len != 0) try protocol.xdg_toplevel_types.requests.set_title(
         &self.connection,
         toplevel,
@@ -225,9 +232,35 @@ pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Wi
         toplevel,
         app_id,
     );
+    const viewport = if (self.viewporter != null and self.fractional_scale_manager != null)
+        try protocol.wp_viewporter_types.requests.get_viewport(
+            &self.connection,
+            self.viewporter.?.handle,
+            surface,
+        )
+    else
+        null;
+    errdefer if (viewport) |handle|
+        protocol.wp_viewport_types.requests.destroy(&self.connection, handle) catch {};
+    const fractional_scale = if (viewport != null)
+        try protocol.wp_fractional_scale_manager_v1_types.requests.get_fractional_scale(
+            &self.connection,
+            self.fractional_scale_manager.?.handle,
+            surface,
+        )
+    else
+        null;
+    errdefer if (fractional_scale) |handle|
+        protocol.wp_fractional_scale_v1_types.requests.destroy(&self.connection, handle) catch {};
     try protocol.wl_surface_types.requests.commit(&self.connection, surface);
     try self.flush();
-    return .{ .surface = surface, .xdg_surface = xdg_surface, .toplevel = toplevel };
+    return .{
+        .surface = surface,
+        .xdg_surface = xdg_surface,
+        .toplevel = toplevel,
+        .viewport = viewport,
+        .fractional_scale = fractional_scale,
+    };
 }
 
 fn transportNotify(
@@ -380,6 +413,10 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 self.data_device_manager = null;
             if (self.activation != null and self.activation.?.name == event.name)
                 self.activation = null;
+            if (self.viewporter != null and self.viewporter.?.name == event.name)
+                self.viewporter = null;
+            if (self.fractional_scale_manager != null and self.fractional_scale_manager.?.name == event.name)
+                self.fractional_scale_manager = null;
             for (self.outputs.items, 0..) |output, index| {
                 if (output.global_name != event.name) continue;
                 _ = self.outputs.orderedRemove(index);
@@ -437,6 +474,16 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
             .name = name,
             .handle = try self.bind(name, advertised_version, &protocol.xdg_activation_v1, 1),
         };
+    } else if (std.mem.eql(u8, interface_name, protocol.wp_viewporter.name) and self.viewporter == null) {
+        self.viewporter = .{
+            .name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.wp_viewporter, 1),
+        };
+    } else if (std.mem.eql(u8, interface_name, protocol.wp_fractional_scale_manager_v1.name) and self.fractional_scale_manager == null) {
+        self.fractional_scale_manager = .{
+            .name = name,
+            .handle = try self.bind(name, advertised_version, &protocol.wp_fractional_scale_manager_v1, 1),
+        };
     } else if (std.mem.eql(u8, interface_name, protocol.wl_output.name)) {
         try self.outputs.append(self.allocator, .{
             .global_name = name,
@@ -474,7 +521,7 @@ test "io_uring client discovers and binds required globals" {
             if (notification == .outputs_changed) return;
             if (notification != .ready) return;
             self.ready = true;
-            if (self.bind_count == 7) {
+            if (self.bind_count == 9) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -532,6 +579,12 @@ test "io_uring client discovers and binds required globals" {
                             try transport.connection.queue(registry.id, 0, &.{
                                 .{ .uint = 16 }, .{ .string = protocol.xdg_activation_v1.name }, .{ .uint = 1 },
                             });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 17 }, .{ .string = protocol.wp_viewporter.name }, .{ .uint = 1 },
+                            });
+                            try transport.connection.queue(registry.id, 0, &.{
+                                .{ .uint = 18 }, .{ .string = protocol.wp_fractional_scale_manager_v1.name }, .{ .uint = 1 },
+                            });
                         },
                         .sync => |request| {
                             const callback = try registerServerObject(
@@ -570,6 +623,10 @@ test "io_uring client discovers and binds required globals" {
                         &protocol.wl_data_device_manager
                     else if (std.mem.eql(u8, request.new_interface.?, protocol.xdg_activation_v1.name))
                         &protocol.xdg_activation_v1
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.wp_viewporter.name))
+                        &protocol.wp_viewporter
+                    else if (std.mem.eql(u8, request.new_interface.?, protocol.wp_fractional_scale_manager_v1.name))
+                        &protocol.wp_fractional_scale_manager_v1
                     else
                         return error.UnexpectedBind;
                     const bound = try registerServerObject(
@@ -592,7 +649,7 @@ test "io_uring client discovers and binds required globals" {
                 }
             }
             try transport.flush();
-            if (self.ready and self.bind_count == 7) {
+            if (self.ready and self.bind_count == 9) {
                 try self.client.shutdown();
                 try self.server.shutdown();
             }
@@ -639,7 +696,7 @@ test "io_uring client discovers and binds required globals" {
     while (loop.hasActiveOperations()) try loop.runOnce();
 
     try std.testing.expect(context.ready);
-    try std.testing.expectEqual(@as(usize, 7), context.bind_count);
+    try std.testing.expectEqual(@as(usize, 9), context.bind_count);
     try std.testing.expectEqualSlices(DmaBufCandidate, &.{.{
         .format = 0x34325241,
         .modifier = 7,
@@ -652,6 +709,8 @@ test "io_uring client discovers and binds required globals" {
     try std.testing.expectEqual(@as(u32, 2), client.outputScale(client.outputs.items[0].handle.id).?);
     try std.testing.expect(client.dataDeviceManager() != null);
     try std.testing.expect(client.activationManager() != null);
+    try std.testing.expect(client.viewporter != null);
+    try std.testing.expect(client.fractional_scale_manager != null);
     try std.testing.expect(client.readyToDeinit());
     try std.testing.expect(server.readyToDeinit());
     client.deinit();
