@@ -64,6 +64,7 @@ pub const Options = struct {
     output_size: render.Size = .{ .width = 1280, .height = 720 },
     scale: render.Scale = .{},
     refresh_millihertz: i32 = 60_000,
+    renderer_kind: Renderer.Kind = .cpu,
     listen_backlog: u31 = 128,
 };
 
@@ -113,14 +114,14 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.compositor_global.deinit();
     try self.xdg_shell.init(allocator, &self.server);
     errdefer self.xdg_shell.deinit();
-    self.renderer = try Renderer.init(allocator, .cpu);
+    self.renderer = try Renderer.init(allocator, options.renderer_kind);
     errdefer self.renderer.deinit();
     self.output = try HeadlessOutput.initForRenderer(
         allocator,
         options.output_size,
         options.scale,
         options.refresh_millihertz,
-        null,
+        self.renderer.offscreenAccess(),
     );
     errdefer self.output.deinit();
     try self.output_global.init(allocator, &self.server, .{

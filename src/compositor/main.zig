@@ -215,6 +215,7 @@ fn runNative(init: std.process.Init, options: StartupOptions) !void {
         .output_size = options.headless_size orelse .{ .width = 1280, .height = 720 },
         .scale = options.headless_scale orelse .{},
         .refresh_millihertz = options.headless_refresh_millihertz orelse 60_000,
+        .renderer_kind = options.rendererKind(),
     });
     defer native.destroy();
     try init.environ_map.put("WAYLAND_DISPLAY", native.displayName());
@@ -298,7 +299,6 @@ fn parseArguments(arguments: anytype) !StartupOptions {
     }
     if (options.wayland_backend == .wayring) {
         if (output != .headless) return error.WayringRequiresHeadlessOutput;
-        if (options.rendererKind() != .cpu) return error.WayringRequiresCpuRenderer;
         if (options.config_path != null) return error.WayringDoesNotLoadConfiguration;
     }
     return options;
@@ -502,10 +502,8 @@ test "startup options reject duplicates and backend-specific misuse" {
         "--renderer",
         "vulkan",
     } };
-    try std.testing.expectError(
-        error.WayringRequiresCpuRenderer,
-        parseArguments(&wayring_vulkan),
-    );
+    const wayring_vulkan_options = try parseArguments(&wayring_vulkan);
+    try std.testing.expectEqual(Renderer.Kind.vulkan, wayring_vulkan_options.rendererKind());
 }
 
 test "headless output configuration parses size, scale, and refresh" {
