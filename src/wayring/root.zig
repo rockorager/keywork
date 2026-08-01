@@ -144,6 +144,7 @@ pub const Connection = struct {
     max_frame_size: usize,
     objects: std.AutoHashMapUnmanaged(u32, Object) = .empty,
     zombies: std.AutoHashMapUnmanaged(u32, Object) = .empty,
+    pending_server_object_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
     next_generation: u64 = 1,
     next_client_object_id: u32 = first_client_object_id,
     free_client_object_ids: std.ArrayList(u32) = .empty,
@@ -171,6 +172,7 @@ pub const Connection = struct {
         }
         self.outbound.deinit(self.allocator);
         self.free_client_object_ids.deinit(self.allocator);
+        self.pending_server_object_ids.deinit(self.allocator);
         self.zombies.deinit(self.allocator);
         self.objects.deinit(self.allocator);
         self.* = undefined;
@@ -239,6 +241,7 @@ pub const Connection = struct {
         if (id == 0 or version == 0 or version > interface.version) return error.InvalidObject;
         if (self.next_generation == std.math.maxInt(u64)) return error.GenerationExhausted;
         if (self.objects.contains(id)) return error.ObjectExists;
+        if (self.pending_server_object_ids.contains(id)) return error.ObjectExists;
         const replaces_server_zombie = self.role == .client and id >= server_object_id_start;
         if (self.zombies.contains(id) and !replaces_server_zombie) return error.ObjectExists;
         try self.objects.ensureUnusedCapacity(self.allocator, 1);
@@ -257,6 +260,24 @@ pub const Connection = struct {
         const registered = self.objects.get(id) orelse return error.UnknownObject;
         if (generation) |expected| if (expected != registered.generation) return error.StaleObject;
         _ = self.objects.remove(id);
+    }
+
+    /// Removes a server-owned active object while reserving its numeric ID
+    /// until output through the corresponding `wl_display.delete_id` is sent.
+    pub fn retireServerObject(self: *Connection, handle: ObjectHandle) !void {
+        if (self.role != .server) return error.InvalidRole;
+        const registered = self.objects.get(handle.id) orelse return error.UnknownObject;
+        if (registered.generation != handle.generation) return error.StaleObject;
+        try self.pending_server_object_ids.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.objects.remove(handle.id);
+        self.pending_server_object_ids.putAssumeCapacity(handle.id, {});
+    }
+
+    /// Releases a retired server-side numeric ID after the transport confirms
+    /// that all output through `wl_display.delete_id` has been sent.
+    pub fn releaseServerObjectId(self: *Connection, id: u32) !void {
+        if (self.role != .server) return error.InvalidRole;
+        if (!self.pending_server_object_ids.remove(id)) return error.UnknownObject;
     }
 
     /// Stops exposing a server-known client object while retaining enough
@@ -726,6 +747,42 @@ const events = [_]MessageDescriptor{
     .{ .name = "descriptor", .opcode = 1, .args = &.{.{ .kind = .fd }} },
 };
 const test_interface: Interface = .{ .name = "test", .version = 2, .requests = &requests, .events = &events };
+
+test "server object IDs remain reserved until delete-id output is sent" {
+    const request = [_]MessageDescriptor{.{ .name = "ping", .opcode = 0 }};
+    const interface: Interface = .{ .name = "server-lifetime", .version = 1, .requests = &request };
+
+    var client = Connection.init(std.testing.allocator, .client, 4096);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.InvalidRole,
+        client.retireServerObject(.{ .id = 2, .generation = 1 }),
+    );
+    try std.testing.expectError(error.InvalidRole, client.releaseServerObjectId(2));
+
+    var server = Connection.init(std.testing.allocator, .server, 4096);
+    defer server.deinit();
+    const id: u32 = 7;
+    const generation = try server.registerObject(id, &interface, 1);
+    try std.testing.expectError(
+        error.StaleObject,
+        server.retireServerObject(.{ .id = id, .generation = generation + 1 }),
+    );
+    try server.retireServerObject(.{ .id = id, .generation = generation });
+    try std.testing.expect(server.object(id) == null);
+    try std.testing.expectError(error.ObjectExists, server.registerObject(id, &interface, 1));
+
+    var frame: [8]u8 = undefined;
+    writeU32(frame[0..4], id);
+    writeU32(frame[4..8], 8 << 16);
+    try std.testing.expectError(error.UnknownObject, server.feed(&frame, &.{}));
+
+    try server.releaseServerObjectId(id);
+    try std.testing.expectError(error.UnknownObject, server.releaseServerObjectId(id));
+    try std.testing.expectError(error.UnknownObject, server.releaseServerObjectId(id + 1));
+    const replacement_generation = try server.registerObject(id, &interface, 1);
+    try std.testing.expect(replacement_generation != generation);
+}
 
 test "client object IDs increase and released IDs get new generations" {
     var c = Connection.init(std.testing.allocator, .client, 4096);
