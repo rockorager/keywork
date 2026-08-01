@@ -312,7 +312,11 @@ pub fn beginClose(self: *Backend) !void {
     }
     self.state = .closing;
     try self.closeSessionLock();
-    for (self.windows.items) |window| try window.protocol.beginClose();
+    var index = self.windows.items.len;
+    while (index > 0) {
+        index -= 1;
+        try self.windows.items[index].protocol.beginClose();
+    }
     try self.advanceClose();
 }
 
@@ -884,7 +888,10 @@ fn handleSessionLockMessage(self: *Backend, message: *wayring.Message) !bool {
                 handle,
                 message,
             )) {
-                .locked => lock.state = .locked,
+                .locked => {
+                    lock.state = .locked;
+                    if (self.state == .closing) try self.beginSessionUnlock(lock);
+                },
                 .finished => if (lock.state == .locked) {
                     try self.beginSessionUnlock(lock);
                 } else {
@@ -937,15 +944,10 @@ fn beginSessionUnlock(self: *Backend, lock: *SessionLock) !void {
 fn closeSessionLock(self: *Backend) !void {
     const lock = if (self.session_lock) |*value| value else return;
     switch (lock.state) {
-        .pending => {
-            if (lock.handle) |handle| try protocol.ext_session_lock_v1_types.requests.destroy(
-                self.client.connectionPtr(),
-                handle,
-            );
-            lock.handle = null;
-            lock.state = .unlocked;
-            try self.client.flush();
-        },
+        // Destroying a pending lock races an in-flight `locked` event and can
+        // leave the session locked without a client able to unlock it. Wait
+        // for either `locked` or `finished` and handle that event above.
+        .pending => {},
         .locked => try self.beginSessionUnlock(lock),
         .denied, .unlocking, .unlocked => {},
     }
