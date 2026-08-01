@@ -467,6 +467,7 @@ test "cursor size defaults when missing or empty" {
 }
 
 test {
+    _ = @import("wayring/CompositorGlobal.zig");
     _ = @import("wayring/ShmGlobal.zig");
     _ = @import("wayring/shm.zig");
     _ = @import("render/types.zig");
