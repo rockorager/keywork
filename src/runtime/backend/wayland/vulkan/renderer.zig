@@ -78,6 +78,15 @@ const SwapchainResources = struct {
     present_fence_pending: []bool,
 };
 
+/// Attachment state needed to record one UI frame. WSI acquisition and
+/// presentation deliberately remain outside this target description.
+const RenderTarget = struct {
+    framebuffer: vk.Framebuffer,
+    render_pass: vk.RenderPass,
+    format: vk.Format,
+    extent: vk.Extent2D,
+};
+
 const GpuBuffer = struct {
     buffer: vk.Buffer = .null_handle,
     memory: vk.DeviceMemory = .null_handle,
@@ -1252,49 +1261,12 @@ pub const Renderer = struct {
         };
         const suboptimal = acquired.result == .suboptimal_khr;
         const image_index = acquired.image_index;
-        var repacked_at_atlas_limit = false;
-        while (true) {
-            const atlas_layout_before = self.atlas.layout;
-            try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
-            try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
-
-            self.prepareQuads(display_list, scale) catch |err| switch (err) {
-                error.GlyphAtlasFull => {
-                    self.retireExternalFrame(frame);
-                    if (!try self.recoverAtlasCapacity(atlas_layout_before, &repacked_at_atlas_limit)) return err;
-                    continue;
-                },
-                error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
-                    self.retireExternalFrame(frame);
-                    try self.growStaging(atlas_layout_before);
-                    continue;
-                },
-                else => {
-                    // This command buffer is abandoned, so its recorded
-                    // transition never changed the real image layout.
-                    self.atlas.layout = atlas_layout_before;
-                    return err;
-                },
-            };
-            break;
-        }
-
-        const clear_value: vk.ClearValue = .{ .color = colorClearValue(self.swapchain_format, keywork.colors.transparent) };
-        self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
-            .render_pass = self.render_pass,
+        try self.recordFrame(display_list, scale, frame, .{
             .framebuffer = self.framebuffers[image_index],
-            .render_area = .{
-                .offset = .{ .x = 0, .y = 0 },
-                .extent = self.swapchain_extent,
-            },
-            .clear_value_count = 1,
-            .p_clear_values = @ptrCast(&clear_value),
-        }, .@"inline");
-
-        self.drawQuads();
-
-        self.vkd.cmdEndRenderPass(self.command_buffer);
-        try self.vkd.endCommandBuffer(self.command_buffer);
+            .render_pass = self.render_pass,
+            .format = self.swapchain_format,
+            .extent = self.swapchain_extent,
+        });
 
         const wait_stage: vk.PipelineStageFlags = .{ .color_attachment_output_bit = true };
         const signal_semaphores = [_]vk.Semaphore{
@@ -1347,6 +1319,52 @@ pub const Renderer = struct {
         self.loadFrameViews();
         if (suboptimal or present_result == .suboptimal_khr) return .stale;
         return .presented;
+    }
+
+    fn recordFrame(self: *Self, display_list: []const keywork.PaintCommand, scale: f32, frame: *FrameResources, target: RenderTarget) !void {
+        var repacked_at_atlas_limit = false;
+        while (true) {
+            const atlas_layout_before = self.atlas.layout;
+            try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
+            try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+
+            self.prepareQuads(display_list, scale) catch |err| switch (err) {
+                error.GlyphAtlasFull => {
+                    self.retireExternalFrame(frame);
+                    if (!try self.recoverAtlasCapacity(atlas_layout_before, &repacked_at_atlas_limit)) return err;
+                    continue;
+                },
+                error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
+                    self.retireExternalFrame(frame);
+                    try self.growStaging(atlas_layout_before);
+                    continue;
+                },
+                else => {
+                    // This command buffer is abandoned, so its recorded
+                    // transition never changed the real image layout.
+                    self.atlas.layout = atlas_layout_before;
+                    return err;
+                },
+            };
+            break;
+        }
+
+        const clear_value: vk.ClearValue = .{ .color = colorClearValue(target.format, keywork.colors.transparent) };
+        self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
+            .render_pass = target.render_pass,
+            .framebuffer = target.framebuffer,
+            .render_area = .{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = target.extent,
+            },
+            .clear_value_count = 1,
+            .p_clear_values = @ptrCast(&clear_value),
+        }, .@"inline");
+
+        self.drawQuads(target.extent);
+
+        self.vkd.cmdEndRenderPass(self.command_buffer);
+        try self.vkd.endCommandBuffer(self.command_buffer);
     }
 
     /// The single command/sync/upload fields act as views of the active
@@ -1947,25 +1965,25 @@ pub const Renderer = struct {
         try self.writeBuffer(self.vertex_buffer, 0, bytes);
     }
 
-    fn drawQuads(self: *Self) void {
+    fn drawQuads(self: *Self, extent: vk.Extent2D) void {
         if (self.text_vertices.items.len == 0) return;
 
         const push: PushConstants = .{ .viewport = .{
-            @floatFromInt(self.swapchain_extent.width),
-            @floatFromInt(self.swapchain_extent.height),
+            @floatFromInt(extent.width),
+            @floatFromInt(extent.height),
         } };
         self.vkd.cmdBindPipeline(self.command_buffer, .graphics, self.text_pipeline);
         self.vkd.cmdSetViewport(self.command_buffer, 0, &.{.{
             .x = 0,
             .y = 0,
-            .width = @floatFromInt(self.swapchain_extent.width),
-            .height = @floatFromInt(self.swapchain_extent.height),
+            .width = @floatFromInt(extent.width),
+            .height = @floatFromInt(extent.height),
             .min_depth = 0,
             .max_depth = 1,
         }});
         self.vkd.cmdSetScissor(self.command_buffer, 0, &.{.{
             .offset = .{ .x = 0, .y = 0 },
-            .extent = self.swapchain_extent,
+            .extent = extent,
         }});
         self.vkd.cmdBindDescriptorSets(self.command_buffer, .graphics, self.text_pipeline_layout, 0, &.{self.text_descriptor_set}, null);
         self.vkd.cmdPushConstants(self.command_buffer, self.text_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(PushConstants), &push);
