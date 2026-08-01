@@ -151,6 +151,21 @@ pub fn isClosing(self: *const Backend) bool {
     };
 }
 
+pub fn setCursorShape(self: *Backend, shape: keywork.CursorShape) !void {
+    if (self.input) |*input| {
+        try input.setCursorShape(shape);
+        try self.client.flush();
+    }
+}
+
+pub fn installEventTimers(self: *Backend, loop: *keywork_loop.EventLoop) !void {
+    if (self.input) |*input| try input.installEventTimer(loop);
+}
+
+pub fn uninstallEventTimers(self: *Backend) void {
+    if (self.input) |*input| input.uninstallEventTimer();
+}
+
 fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notification) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
     switch (notification) {
@@ -161,6 +176,7 @@ fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notificati
                 try input.init(
                     self.client.connectionPtr(),
                     seat,
+                    self.client.cursorShapeManager(),
                     self,
                     inputEvent,
                 );

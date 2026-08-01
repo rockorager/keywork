@@ -51,6 +51,7 @@ compositor: ?Global = null,
 wm_base: ?Global = null,
 dmabuf: ?Global = null,
 seat: ?Global = null,
+cursor_shape_manager: ?Global = null,
 seat_capabilities: u32 = 0,
 seat_claimed: bool = false,
 dmabuf_candidates: std.ArrayList(DmaBufCandidate) = .empty,
@@ -154,6 +155,10 @@ pub fn takeSeat(self: *Client) ?Seat {
     std.debug.assert(!self.seat_claimed);
     self.seat_claimed = true;
     return .{ .handle = seat.handle, .capabilities = self.seat_capabilities };
+}
+
+pub fn cursorShapeManager(self: *const Client) ?wayring.ObjectHandle {
+    return if (self.cursor_shape_manager) |global| global.handle else null;
 }
 
 pub fn createXdgWindow(self: *Client, title: []const u8, app_id: []const u8) !Window {
@@ -340,6 +345,16 @@ fn bindGlobal(self: *Client, name: u32, interface_name: []const u8, advertised_v
         self.seat = .{
             .name = name,
             .handle = try self.bind(name, advertised_version, &protocol.wl_seat, 8),
+        };
+    } else if (std.mem.eql(u8, interface_name, protocol.wp_cursor_shape_manager_v1.name) and self.cursor_shape_manager == null) {
+        self.cursor_shape_manager = .{
+            .name = name,
+            .handle = try self.bind(
+                name,
+                advertised_version,
+                &protocol.wp_cursor_shape_manager_v1,
+                1,
+            ),
         };
     }
 }

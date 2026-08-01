@@ -3,6 +3,7 @@
 const Input = @This();
 
 const std = @import("std");
+const event_loop = @import("keywork-loop");
 const keywork = @import("keywork-ui");
 const wayring = @import("wayring");
 const protocol = @import("wayring-protocols");
@@ -39,6 +40,8 @@ const smooth_scroll_speed: f32 = 3;
 
 connection: *wayring.Connection,
 seat: wayring.ObjectHandle,
+cursor_shape_manager: ?wayring.ObjectHandle,
+cursor_shape_device: ?wayring.ObjectHandle = null,
 pointer: ?wayring.ObjectHandle = null,
 keyboard: ?wayring.ObjectHandle = null,
 surface_id: ?u32 = null,
@@ -47,12 +50,21 @@ keyboard_focused: bool = false,
 pointer_enabled: bool = false,
 keyboard_enabled: bool = false,
 pointer_position: ?keywork.Point = null,
+pointer_enter_serial: ?u32 = null,
+cursor_shape: ?keywork.CursorShape = null,
 pending_pointer: PendingPointer = .{},
 shift_down: bool = false,
 xkb_context: *xkb.struct_xkb_context,
 xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
 key_text_buffer: [64]u8 = undefined,
+repeat_text_buffer: [64]u8 = undefined,
+timer_loop: ?*event_loop.EventLoop = null,
+repeat_timer: ?*event_loop.EventLoop.Timer = null,
+repeat_key: ?u32 = null,
+repeat_input: ?keywork.KeyInput = null,
+repeat_delay_ms: u64 = 0,
+repeat_interval_ms: u64 = 0,
 notify_context: *anyopaque,
 notify: Notify,
 
@@ -60,6 +72,7 @@ pub fn init(
     self: *Input,
     connection: *wayring.Connection,
     seat: Client.Seat,
+    cursor_shape_manager: ?wayring.ObjectHandle,
     notify_context: *anyopaque,
     notify: Notify,
 ) !void {
@@ -68,6 +81,7 @@ pub fn init(
     self.* = .{
         .connection = connection,
         .seat = seat.handle,
+        .cursor_shape_manager = cursor_shape_manager,
         .xkb_context = xkb_context,
         .notify_context = notify_context,
         .notify = notify,
@@ -79,6 +93,7 @@ pub fn init(
 /// Protocol objects are connection-owned at this point; local XKB state is
 /// safe to release after transport shutdown or disconnect.
 pub fn deinit(self: *Input) void {
+    self.uninstallEventTimer();
     self.clearXkbKeymap();
     xkb.xkb_context_unref(self.xkb_context);
     self.* = undefined;
@@ -86,6 +101,38 @@ pub fn deinit(self: *Input) void {
 
 pub fn setSurface(self: *Input, surface_id: u32) void {
     self.surface_id = surface_id;
+}
+
+pub fn setCursorShape(self: *Input, shape: keywork.CursorShape) !void {
+    if (self.cursor_shape == shape) return;
+    const device = self.cursor_shape_device orelse return;
+    const serial = self.pointer_enter_serial orelse return;
+    const protocol_shape: protocol.wp_cursor_shape_device_v1_types.shape = switch (shape) {
+        .default => .default,
+        .pointer => .pointer,
+        .text => .text,
+    };
+    try protocol.wp_cursor_shape_device_v1_types.requests.set_shape(
+        self.connection,
+        device,
+        serial,
+        @intFromEnum(protocol_shape),
+    );
+    self.cursor_shape = shape;
+}
+
+pub fn installEventTimer(self: *Input, loop: *event_loop.EventLoop) !void {
+    if (self.repeat_timer != null) return;
+    self.timer_loop = loop;
+    errdefer self.timer_loop = null;
+    self.repeat_timer = try loop.addTimer(self, repeatTimerCallback);
+}
+
+pub fn uninstallEventTimer(self: *Input) void {
+    self.stopKeyRepeat();
+    if (self.timer_loop) |loop| if (self.repeat_timer) |timer| loop.removeTimer(timer);
+    self.repeat_timer = null;
+    self.timer_loop = null;
 }
 
 pub fn ownsObject(self: *const Input, id: u32) bool {
@@ -131,10 +178,19 @@ fn applyCapabilities(self: *Input, capabilities: u32) !void {
     self.keyboard_enabled = capabilities & protocol.wl_seat_types.capability.keyboard != 0;
     if (self.pointer_enabled and self.pointer == null) {
         self.pointer = try protocol.wl_seat_types.requests.get_pointer(self.connection, self.seat);
+        if (self.cursor_shape_manager) |manager| {
+            self.cursor_shape_device = try protocol.wp_cursor_shape_manager_v1_types.requests.get_pointer(
+                self.connection,
+                manager,
+                self.pointer.?,
+            );
+        }
     } else if (!self.pointer_enabled) {
         if (self.pointer_focused) try self.notify(self.notify_context, self, .{ .pointer_move = null });
         self.pointer_focused = false;
         self.pointer_position = null;
+        self.pointer_enter_serial = null;
+        self.cursor_shape = null;
         self.pending_pointer = .{};
     }
     if (self.keyboard_enabled and self.keyboard == null) {
@@ -142,6 +198,7 @@ fn applyCapabilities(self: *Input, capabilities: u32) !void {
     } else if (!self.keyboard_enabled) {
         self.keyboard_focused = false;
         self.shift_down = false;
+        self.stopKeyRepeat();
     }
 }
 
@@ -152,12 +209,16 @@ fn handlePointer(self: *Input, event: protocol.wl_pointer_types.Event) !void {
             if (self.pointer_focused) try self.flushPointerFrame();
             self.pointer_focused = self.surface_id != null and enter.surface == self.surface_id.?;
             if (!self.pointer_focused) return;
+            self.pointer_enter_serial = enter.serial;
+            self.cursor_shape = null;
             self.pointer_position = fixedPoint(enter.surface_x, enter.surface_y);
             self.pending_pointer.moved = true;
         },
         .leave => |leave| {
             if (!self.pointer_focused or self.surface_id == null or leave.surface != self.surface_id.?) return;
             self.pointer_position = null;
+            self.pointer_enter_serial = null;
+            self.cursor_shape = null;
             self.pending_pointer.left = true;
         },
         .motion => |motion| {
@@ -278,12 +339,13 @@ fn handleKeyboard(
             if (self.surface_id != null and leave.surface == self.surface_id.?) {
                 self.keyboard_focused = false;
                 self.shift_down = false;
+                self.stopKeyRepeat();
             }
         },
         .key => |key| {
             if (!self.keyboard_focused) return;
-            const pressed = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.pressed) or
-                key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.repeated);
+            const repeated = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.repeated);
+            const pressed = key.state == @intFromEnum(protocol.wl_keyboard_types.key_state.pressed) or repeated;
             switch (key.key) {
                 42, 54 => {
                     self.shift_down = pressed;
@@ -291,9 +353,17 @@ fn handleKeyboard(
                 },
                 else => {},
             }
-            if (!pressed) return;
+            if (!pressed) {
+                if (self.repeat_key == key.key) self.stopKeyRepeat();
+                return;
+            }
             const input = self.keyInput(key.key) orelse return;
             try self.notify(self.notify_context, self, .{ .key = input });
+            if (repeated) {
+                self.stopKeyRepeat();
+            } else {
+                self.startKeyRepeat(key.key, input);
+            }
         },
         .modifiers => |modifiers| if (self.xkb_state) |state| {
             _ = xkb.xkb_state_update_mask(
@@ -306,7 +376,7 @@ fn handleKeyboard(
                 modifiers.group,
             );
         },
-        .repeat_info => {},
+        .repeat_info => |repeat| self.setRepeatInfo(repeat.rate, repeat.delay),
     }
 }
 
@@ -350,10 +420,65 @@ fn installXkbKeymap(self: *Input, fd: i32, format: u32, size: u32) void {
 }
 
 fn clearXkbKeymap(self: *Input) void {
+    self.stopKeyRepeat();
     if (self.xkb_state) |state| xkb.xkb_state_unref(state);
     if (self.xkb_keymap) |keymap| xkb.xkb_keymap_unref(keymap);
     self.xkb_state = null;
     self.xkb_keymap = null;
+}
+
+fn setRepeatInfo(self: *Input, rate: i32, delay: i32) void {
+    if (rate <= 0 or delay < 0) {
+        self.repeat_interval_ms = 0;
+        self.repeat_delay_ms = 0;
+        self.stopKeyRepeat();
+        return;
+    }
+    self.repeat_delay_ms = @max(1, @as(u64, @intCast(delay)));
+    self.repeat_interval_ms = @max(1, 1000 / @as(u64, @intCast(rate)));
+}
+
+fn startKeyRepeat(self: *Input, key: u32, input: keywork.KeyInput) void {
+    if (!inputCanRepeat(input) or self.repeat_interval_ms == 0) return;
+    const timer = self.repeat_timer orelse return;
+    self.repeat_input = self.storedRepeatInput(input) orelse return;
+    self.repeat_key = key;
+    timer.arm(self.repeat_delay_ms, self.repeat_interval_ms) catch {
+        self.stopKeyRepeat();
+    };
+}
+
+fn storedRepeatInput(self: *Input, input: keywork.KeyInput) ?keywork.KeyInput {
+    return switch (input) {
+        .text => |bytes| {
+            if (bytes.len > self.repeat_text_buffer.len) return null;
+            @memcpy(self.repeat_text_buffer[0..bytes.len], bytes);
+            return .{ .text = self.repeat_text_buffer[0..bytes.len] };
+        },
+        .backspace => .backspace,
+        .up => .up,
+        .down => .down,
+        .enter, .space, .tab, .escape, .paste => null,
+    };
+}
+
+fn stopKeyRepeat(self: *Input) void {
+    if (self.repeat_timer) |timer| timer.disarm();
+    self.repeat_key = null;
+    self.repeat_input = null;
+}
+
+fn repeatTimerCallback(context: *anyopaque, _: *event_loop.EventLoop, expirations: u64) !void {
+    const self: *Input = @ptrCast(@alignCast(context));
+    const input = self.repeat_input orelse return;
+    for (0..expirations) |_| try self.notify(self.notify_context, self, .{ .key = input });
+}
+
+fn inputCanRepeat(input: keywork.KeyInput) bool {
+    return switch (input) {
+        .text, .backspace, .up, .down => true,
+        .enter, .space, .tab, .escape, .paste => false,
+    };
 }
 
 fn keyInput(self: *Input, key: u32) ?keywork.KeyInput {

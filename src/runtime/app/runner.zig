@@ -146,6 +146,8 @@ fn runWayring(
     runtime.setDeferredRepaint(true);
     if (options.host_bindings) |bindings| try bindings.bindEventLoop(compatibility_loop);
     defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
+    try backend.installEventTimers(compatibility_loop);
+    defer backend.uninstallEventTimers();
 
     if (!compatibility_loop.beginEmbedded()) {
         run_context.stop = true;
@@ -182,7 +184,7 @@ const WayringRunContext = struct {
 
     fn backendEvent(
         context: *anyopaque,
-        _: *WayringBackend,
+        backend: *WayringBackend,
         event: WayringBackend.Event,
     ) !void {
         const self: *WayringRunContext = @ptrCast(@alignCast(context));
@@ -193,7 +195,10 @@ const WayringRunContext = struct {
             }),
             .repaint => if (self.runtime) |runtime| try runtime.frameDone(),
             .close, .disconnected, .fatal => self.stop = true,
-            .pointer_move => |point| if (self.runtime) |runtime| try runtime.pointerMove(point),
+            .pointer_move => |point| if (self.runtime) |runtime| {
+                try runtime.pointerMove(point);
+                if (point) |position| try backend.setCursorShape(runtime.waylandCursorShape(position));
+            },
             .pointer_button => |button| if (self.runtime) |runtime| try runtime.pointerButton(button),
             .scroll => |scroll| if (self.runtime) |runtime| try runtime.scrollBy(scroll),
             .key => |key| if (self.runtime) |runtime| try runtime.keyInput(key),
