@@ -54,6 +54,7 @@ test {
     _ = @import("backend/memory.zig");
     _ = @import("backend/wayland/input.zig");
     _ = @import("backend/wayland/shm.zig");
+    _ = @import("backend/wayland/vulkan/DmaBufTargetSet.zig");
     _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");
     _ = @import("graphics/raster.zig");
