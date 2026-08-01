@@ -62,7 +62,13 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/xdg-shell/xdg-shell.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "unstable/primary-selection/primary-selection-unstable-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/presentation-time/presentation-time.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/tablet/tablet-v2.xml"));
     generate_wayring_protocols.addArg("-i");
@@ -75,6 +81,10 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/fractional-scale/fractional-scale-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-session-lock/ext-session-lock-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xwayland-shell/xwayland-shell-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "unstable/xwayland-keyboard-grab/xwayland-keyboard-grab-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-o");
