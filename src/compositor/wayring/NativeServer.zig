@@ -19,6 +19,7 @@ const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
+const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
@@ -56,6 +57,7 @@ subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
+primary_selection_global: PrimarySelectionGlobal,
 fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
@@ -398,6 +400,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
     errdefer self.data_device_global.deinit();
+    try self.primary_selection_global.init(allocator, &self.server, &self.seat_global);
+    errdefer self.primary_selection_global.deinit();
     self.input_paint_entries = .empty;
     self.routed_keys = .empty;
     self.routed_buttons = .empty;
@@ -630,6 +634,7 @@ pub fn destroy(self: *NativeServer) void {
     self.surfaces.deinit(self.allocator);
     self.viewporter_global.deinit();
     self.fractional_scale_global.deinit();
+    self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
     self.output_global.deinit();
@@ -815,6 +820,7 @@ fn nativeKeyboardAvailable(context: *anyopaque, available: bool) void {
         self.keyboard_modifiers = .{};
         self.last_keyboard_serial = 0;
         self.data_device_global.setKeyboardFocus(null) catch return self.terminate();
+        self.primary_selection_global.setKeyboardFocus(null) catch return self.terminate();
     }
     self.refreshSeatCapabilities() catch self.terminate();
     if (available) self.refreshKeyboardFocus(null) catch self.terminate();
@@ -1215,6 +1221,7 @@ fn refreshKeyboardFocus(
     if (target == null) {
         _ = try self.seat_global.keyboardLeave();
         try self.data_device_global.setKeyboardFocus(null);
+        try self.primary_selection_global.setKeyboardFocus(null);
         self.last_keyboard_serial = 0;
         return;
     }
@@ -1238,6 +1245,7 @@ fn refreshKeyboardFocus(
         self.keyboard_modifiers.group,
     );
     try self.data_device_global.setKeyboardFocus(target.?.client);
+    try self.primary_selection_global.setKeyboardFocus(target.?.client);
 }
 
 fn reenterKeyboardFocus(self: *NativeServer) !void {
