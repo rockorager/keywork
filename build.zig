@@ -78,6 +78,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/fifo/fifo-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/commit-timing/commit-timing-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));

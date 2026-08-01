@@ -75,6 +75,7 @@ pub const Commit = struct {
     presentation_hint: PresentationHint,
     fifo_set: bool,
     fifo_wait: bool,
+    target_timestamp: ?i96,
     scale: i32,
     transform: u32,
     offset_x: i32,
@@ -288,6 +289,11 @@ pub const FifoHandler = struct {
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
+pub const CommitTimerHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -303,6 +309,7 @@ pub const Surface = struct {
     alpha_modifier_handler: ?AlphaModifierHandler = null,
     tearing_control_handler: ?TearingControlHandler = null,
     fifo_handler: ?FifoHandler = null,
+    commit_timer_handler: ?CommitTimerHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -316,6 +323,7 @@ pub const Surface = struct {
     current_presentation_hint: PresentationHint = .vsync,
     pending_fifo_set: bool = false,
     pending_fifo_wait: bool = false,
+    pending_commit_timestamp: ?i96 = null,
     pending_scale: i32 = 1,
     current_scale: i32 = 1,
     pending_transform: u32 = 0,
@@ -418,6 +426,23 @@ pub const Surface = struct {
     pub fn setPendingFifoWait(self: *Surface) void {
         std.debug.assert(self.fifo_handler != null);
         self.pending_fifo_wait = true;
+    }
+
+    pub fn setCommitTimerHandler(self: *Surface, handler: CommitTimerHandler) !void {
+        if (self.commit_timer_handler != null) return error.AlreadyExists;
+        self.commit_timer_handler = handler;
+    }
+
+    pub fn clearCommitTimerHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.commit_timer_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.commit_timer_handler = null;
+    }
+
+    pub fn setPendingCommitTimestamp(self: *Surface, target: i96) !void {
+        std.debug.assert(self.commit_timer_handler != null);
+        if (self.pending_commit_timestamp != null) return error.AlreadyExists;
+        self.pending_commit_timestamp = target;
     }
 
     pub fn reference(self: *Surface) !void {
@@ -852,6 +877,8 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     const fifo_wait = surface.pending_fifo_wait;
     surface.pending_fifo_set = false;
     surface.pending_fifo_wait = false;
+    const target_timestamp = surface.pending_commit_timestamp;
+    surface.pending_commit_timestamp = null;
     const synchronization = if (attachment_kind == .dmabuf)
         if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
     else
@@ -869,6 +896,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .presentation_hint = surface.current_presentation_hint,
         .fifo_set = fifo_set,
         .fifo_wait = fifo_wait,
+        .target_timestamp = target_timestamp,
         .scale = surface.current_scale,
         .transform = surface.current_transform,
         .offset_x = surface.current_offset_x,
@@ -921,6 +949,11 @@ fn destroySurface(
         surface.fifo_handler = null;
         handler.surface_destroyed(handler.context);
     }
+    if (surface.commit_timer_handler) |handler| {
+        surface.commit_timer_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    surface.pending_commit_timestamp = null;
     surface.unreference();
 }
 

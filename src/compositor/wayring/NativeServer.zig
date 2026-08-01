@@ -23,6 +23,7 @@ const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
 const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
+const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -54,6 +55,9 @@ allocator: std.mem.Allocator,
 io: std.Io,
 event_loop: EventLoop,
 repaint_timer: *EventLoop.Timer,
+commit_timing_timer: *EventLoop.Timer,
+commit_timing_clock: std.Io.Clock,
+commit_timing_armed_target: ?i96 = null,
 server: Server,
 shm_global: ShmGlobal,
 single_pixel_buffer_global: SinglePixelBufferGlobal,
@@ -68,6 +72,7 @@ content_type_global: ContentTypeGlobal,
 alpha_modifier_global: AlphaModifierGlobal,
 tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
+commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -277,6 +282,7 @@ const PendingTransaction = struct {
 
 const PendingEntry = struct {
     prepared: bool = false,
+    protocol_prepared: bool = false,
     release_needed: bool = true,
     copy: ?*AsyncShmCopy = null,
     copy_cancel_requested: bool = false,
@@ -425,6 +431,14 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         },
     };
     output_initialized = true;
+    self.commit_timing_clock = try commitTimingClock(self.output.presentationClockId());
+    self.commit_timing_timer = switch (self.commit_timing_clock) {
+        .awake => try self.event_loop.addTimer(self, commitTimingTimer),
+        .real => try self.event_loop.addWallTimer(self, commitTimingTimer),
+        else => unreachable,
+    };
+    self.commit_timing_armed_target = null;
+    errdefer self.event_loop.removeTimer(self.commit_timing_timer);
     try self.output_global.init(allocator, &self.server, .{
         .mode_size = self.output.modeSize(),
         .physical_size = self.output.physicalSize(),
@@ -451,6 +465,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.tearing_control_global.deinit();
     try self.fifo_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.fifo_global.deinit();
+    try self.commit_timing_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.commit_timing_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
@@ -644,6 +660,7 @@ pub fn destroy(self: *NativeServer) void {
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
     self.event_loop.removeTimer(self.repaint_timer);
+    self.event_loop.removeTimer(self.commit_timing_timer);
     if (self.drm_listener_installed) {
         self.drm_device.clearListener();
         self.drm_listener_installed = false;
@@ -697,6 +714,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.seat_global.deinit();
+    self.commit_timing_global.deinit();
     self.fifo_global.deinit();
     self.tearing_control_global.deinit();
     self.alpha_modifier_global.deinit();
@@ -758,6 +776,16 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
         self.fifo_progress_needed = false;
         try self.progressTransactions();
     }
+    try self.scheduleCommitTiming();
+}
+
+fn commitTimingTimer(context: *anyopaque, _: *EventLoop, _: u64) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    // The protocol range exceeds EventLoop's bounded relative delay. Clear
+    // the deduplication key so a clamped intermediate wake can arm the next
+    // chunk. The after-platform phase has already applied any due commits.
+    self.commit_timing_armed_target = null;
+    try self.scheduleCommitTiming();
 }
 
 fn drmOutputListener(self: *NativeServer) DrmOutput.Listener {
@@ -1907,6 +1935,7 @@ fn pendingIoTerminal(pending: *const PendingTransaction) bool {
 }
 
 fn progressTransactions(self: *NativeServer) !void {
+    const now = self.commit_timing_clock.now(self.io).nanoseconds;
     var index: usize = 0;
     while (index < self.pending.items.len) {
         const pending = self.pending.items[index];
@@ -1924,23 +1953,13 @@ fn progressTransactions(self: *NativeServer) !void {
         }
         var ready = true;
         for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+            if (commit.surface.client.state != .active or !commit.surface.resource_alive) {
+                pending.discarded = true;
+                try self.cancelPending(pending);
+                ready = false;
+                break;
+            }
             if (!entry.prepared) {
-                const applicable = self.prepareCommit(commit, entry) catch |err| {
-                    pending.discarded = true;
-                    self.cancelPending(pending) catch {};
-                    if (isProtocolError(err)) {
-                        ready = false;
-                        break;
-                    }
-                    if (pendingIoTerminal(pending)) self.destroyPending(index);
-                    return err;
-                };
-                if (!applicable) {
-                    pending.discarded = true;
-                    try self.cancelPending(pending);
-                    ready = false;
-                    break;
-                }
                 if (commit.attachment == .buffer) switch (commit.attachment.buffer.buffer.content) {
                     .shm => self.startShmCopy(entry, commit) catch |err| {
                         pending.discarded = true;
@@ -1983,14 +2002,37 @@ fn progressTransactions(self: *NativeServer) !void {
             if (entry.copy) |copy| {
                 if (!copy.isTerminal()) {
                     ready = false;
-                    continue;
+                } else {
+                    entry.snapshot = copy.takeSnapshot() catch null;
+                    entry.copy_failed = entry.snapshot == null;
+                    copy.deinit();
+                    entry.copy = null;
                 }
-                entry.snapshot = copy.takeSnapshot() catch null;
-                entry.copy_failed = entry.snapshot == null;
-                copy.deinit();
-                entry.copy = null;
             }
             if (entry.handle != null) ready = false;
+            if (!commitTimingReady(commit.target_timestamp, now)) {
+                ready = false;
+                continue;
+            }
+            if (!entry.protocol_prepared) {
+                const applicable = self.prepareCommit(commit, entry) catch |err| {
+                    pending.discarded = true;
+                    self.cancelPending(pending) catch {};
+                    if (isProtocolError(err)) {
+                        ready = false;
+                        break;
+                    }
+                    if (pendingIoTerminal(pending)) self.destroyPending(index);
+                    return err;
+                };
+                if (!applicable) {
+                    pending.discarded = true;
+                    try self.cancelPending(pending);
+                    ready = false;
+                    break;
+                }
+                entry.protocol_prepared = true;
+            }
             if (commit.fifo_wait and !self.fifoWaitReady(commit.surface)) ready = false;
         }
         if (pending.discarded) {
@@ -2012,6 +2054,70 @@ fn progressTransactions(self: *NativeServer) !void {
         };
         self.destroyPending(index);
     }
+}
+
+fn commitTimingReady(target: ?i96, now: i96) bool {
+    return target == null or target.? <= now;
+}
+
+fn scheduleCommitTiming(self: *NativeServer) !void {
+    const now = self.commit_timing_clock.now(self.io).nanoseconds;
+    const earliest = self.earliestCommitTimestamp(now);
+    switch (commitTimingSchedule(self.commit_timing_armed_target, earliest, now)) {
+        .unchanged => {},
+        .disarm => {
+            self.commit_timing_timer.disarm();
+            self.commit_timing_armed_target = null;
+        },
+        .arm => |arm| {
+            try self.commit_timing_timer.arm(arm.delay_milliseconds, 0);
+            self.commit_timing_armed_target = arm.target;
+        },
+    }
+}
+
+fn earliestCommitTimestamp(self: *const NativeServer, now: i96) ?i96 {
+    var earliest: ?i96 = null;
+    for (self.pending.items) |pending| {
+        if (pending.discarded) continue;
+        for (pending.transaction.entries) |commit| {
+            const target = commit.target_timestamp orelse continue;
+            if (target <= now) continue;
+            earliest = if (earliest) |current| @min(current, target) else target;
+        }
+    }
+    return earliest;
+}
+
+const CommitTimingSchedule = union(enum) {
+    unchanged,
+    disarm,
+    arm: struct {
+        target: i96,
+        delay_milliseconds: u64,
+    },
+};
+
+fn commitTimingSchedule(armed: ?i96, earliest: ?i96, now: i96) CommitTimingSchedule {
+    const target = earliest orelse return if (armed == null) .unchanged else .disarm;
+    if (armed == target) return .unchanged;
+    return .{ .arm = .{
+        .target = target,
+        .delay_milliseconds = commitTimingDelayMilliseconds(now, target),
+    } };
+}
+
+fn commitTimingDelayMilliseconds(now: i96, target: i96) u64 {
+    std.debug.assert(target > now);
+    const delta = target - now;
+    const milliseconds = @divTrunc(delta - 1, std.time.ns_per_ms) + 1;
+    return @intCast(@min(milliseconds, std.math.maxInt(i32)));
+}
+
+fn commitTimingClock(clock_id: u32) !std.Io.Clock {
+    if (clock_id == presentation.monotonic_clock_id) return .awake;
+    if (clock_id == @as(u32, @intCast(@intFromEnum(std.posix.CLOCK.REALTIME)))) return .real;
+    return error.UnsupportedPresentationClock;
 }
 
 fn fifoWaitReady(
@@ -2691,6 +2797,43 @@ test "root-head scheduler preserves per-root FIFO and unrelated progress" {
     try std.testing.expect(server.isRootHead(0));
     try std.testing.expect(!server.isRootHead(1));
     try std.testing.expect(server.isRootHead(2));
+    try std.testing.expect(!commitTimingReady(200, 100));
+    try std.testing.expect(commitTimingReady(100, 100));
+    try std.testing.expect(commitTimingReady(null, 100));
+}
+
+test "commit timing scheduling deduplicates and clamps distant deadlines" {
+    try std.testing.expectEqual(std.Io.Clock.awake, try commitTimingClock(
+        presentation.monotonic_clock_id,
+    ));
+    try std.testing.expectEqual(std.Io.Clock.real, try commitTimingClock(
+        @intCast(@intFromEnum(std.posix.CLOCK.REALTIME)),
+    ));
+    try std.testing.expectError(error.UnsupportedPresentationClock, commitTimingClock(
+        std.math.maxInt(u32),
+    ));
+
+    switch (commitTimingSchedule(null, 1_000_000, 0)) {
+        .arm => |arm| {
+            try std.testing.expectEqual(@as(i96, 1_000_000), arm.target);
+            try std.testing.expectEqual(@as(u64, 1), arm.delay_milliseconds);
+        },
+        else => return error.ExpectedArm,
+    }
+    try std.testing.expect(commitTimingSchedule(1_000_000, 1_000_000, 0) == .unchanged);
+    try std.testing.expect(commitTimingSchedule(1_000_000, null, 0) == .disarm);
+    try std.testing.expect(commitTimingSchedule(null, null, 0) == .unchanged);
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        commitTimingDelayMilliseconds(0, std.time.ns_per_ms + 1),
+    );
+    try std.testing.expectEqual(
+        @as(u64, std.math.maxInt(i32)),
+        commitTimingDelayMilliseconds(
+            0,
+            (@as(i96, std.math.maxInt(i32)) + 1) * std.time.ns_per_ms,
+        ),
+    );
 }
 
 test "native accepted frames clear mapped and configure-only FIFO barriers" {

@@ -219,6 +219,10 @@ fn mergeCommit(old: *CompositorGlobal.Commit, commit_value: CompositorGlobal.Com
     const allocator = old.allocator;
     const fifo_set = old.fifo_set or newest.fifo_set;
     const fifo_wait = old.fifo_wait or newest.fifo_wait;
+    const target_timestamp = if (old.target_timestamp) |old_target|
+        if (newest.target_timestamp) |newest_target| @max(old_target, newest_target) else old_target
+    else
+        newest.target_timestamp;
     const callbacks = try allocator.alloc(wayring.ObjectHandle, old.frame_callbacks.len + newest.frame_callbacks.len);
     errdefer allocator.free(callbacks);
     const surface_damage = try allocator.alloc(@TypeOf(newest.surface_damage[0]), old.surface_damage.len + newest.surface_damage.len);
@@ -247,11 +251,12 @@ fn mergeCommit(old: *CompositorGlobal.Commit, commit_value: CompositorGlobal.Com
     }
     old.deinit();
     old.* = newest;
-    // Synchronized commits collapse into one absolute state update, but each
-    // FIFO action remains part of that update until a parent boundary ignores
-    // its waits.
+    // Synchronized commits collapse into one absolute state update. FIFO
+    // actions accumulate, while timestamps retain the latest deadline needed
+    // to preserve receipt order. A parent boundary ignores only FIFO waits.
     old.fifo_set = fifo_set;
     old.fifo_wait = fifo_wait;
+    old.target_timestamp = target_timestamp;
     newest_owned = false;
 }
 
@@ -447,8 +452,12 @@ test "synchronized subsurfaces preserve nested parent commit boundaries" {
 
     child.pending_fifo_set = true;
     child.pending_fifo_wait = true;
+    child.pending_commit_timestamp = 50;
     const first_callback = try generated.wl_surface_types.requests.frame(&peer, child_surface);
     try generated.wl_surface_types.requests.commit(&peer, child_surface);
+    try transferToServer(&peer, client);
+    try std.testing.expect(compositor.popTransaction() == null);
+    child.pending_commit_timestamp = 30;
     const second_callback = try generated.wl_surface_types.requests.frame(&peer, child_surface);
     try generated.wl_surface_types.requests.commit(&peer, child_surface);
     try generated.wl_subsurface_types.requests.set_position(&peer, child_subsurface, 7, 9);
@@ -467,6 +476,7 @@ test "synchronized subsurfaces preserve nested parent commit boundaries" {
     try std.testing.expectEqual(second_callback.id, child_entry.frame_callbacks[1].id);
     try std.testing.expect(child_entry.fifo_set);
     try std.testing.expect(!child_entry.fifo_wait);
+    try std.testing.expectEqual(@as(?i96, 50), child_entry.target_timestamp);
     for (initial.hierarchy_updates) |update| update.apply(update.context);
     const child_node = tree.find(child_entry.surface) orelse return error.MissingChildNode;
     const root_node = tree.find(initial.root) orelse return error.MissingRootNode;
@@ -516,6 +526,7 @@ test "synchronized subsurfaces preserve nested parent commit boundaries" {
 
     try generated.wl_subsurface_types.requests.set_desync(&peer, grandchild_subsurface);
     child.pending_fifo_wait = true;
+    child.pending_commit_timestamp = 75;
     try generated.wl_surface_types.requests.commit(&peer, child_surface);
     try generated.wl_surface_types.requests.commit(&peer, grandchild_surface);
     try transferToServer(&peer, client);
@@ -527,6 +538,7 @@ test "synchronized subsurfaces preserve nested parent commit boundaries" {
     try std.testing.expectEqual(@as(usize, 1), desynchronized.entries.len);
     try std.testing.expectEqual(child_surface.id, desynchronized.entries[0].surface.resource.id);
     try std.testing.expect(desynchronized.entries[0].fifo_wait);
+    try std.testing.expectEqual(@as(?i96, 75), desynchronized.entries[0].target_timestamp);
     var descendant_desynchronized = compositor.popTransaction() orelse return error.MissingTransaction;
     defer descendant_desynchronized.deinit();
     try std.testing.expectEqual(@as(usize, 1), descendant_desynchronized.entries.len);
