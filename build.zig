@@ -124,6 +124,15 @@ pub fn build(b: *std.Build) void {
 
     const wayring_protocol_tests = b.addTest(.{ .root_module = wayring_protocols });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_protocol_tests).step);
+    const wayring_presenter_test_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/backend/wayring/DmaBufPresenter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_presenter_test_module.addImport("wayring", wayring);
+    wayring_presenter_test_module.addImport("wayring-protocols", wayring_protocols);
+    const wayring_presenter_tests = b.addTest(.{ .root_module = wayring_presenter_test_module });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_presenter_tests).step);
     const stream_output = stream.add(
         b,
         target,
