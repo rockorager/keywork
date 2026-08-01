@@ -16,7 +16,7 @@ const log = std.log.scoped(.drm_syncobj);
 pub const Device = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    event_loop: *wl.EventLoop,
+    event_loop: ?*wl.EventLoop,
     file: std.Io.File,
     timeline_count: usize,
 
@@ -24,6 +24,26 @@ pub const Device = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         event_loop: *wl.EventLoop,
+        preferred_device: ?render.DrmDeviceId,
+    ) error{Unavailable}!Device {
+        return initWithEventLoop(allocator, io, event_loop, preferred_device);
+    }
+
+    /// Initializes timeline synchronization without coupling waits to a
+    /// libwayland event loop. Completion-native consumers arm eventfds through
+    /// Point.armEventFd and wait with their own reactor.
+    pub fn initNative(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        preferred_device: ?render.DrmDeviceId,
+    ) error{Unavailable}!Device {
+        return initWithEventLoop(allocator, io, null, preferred_device);
+    }
+
+    fn initWithEventLoop(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        event_loop: ?*wl.EventLoop,
         preferred_device: ?render.DrmDeviceId,
     ) error{Unavailable}!Device {
         const file = openDevice(io, preferred_device) orelse return error.Unavailable;
@@ -159,6 +179,19 @@ pub const Point = struct {
         ) == 0;
     }
 
+    /// Arms a one-shot eventfd notification for this timeline point. The
+    /// caller owns the descriptor and must keep it open until notification or
+    /// cancellation has completed.
+    pub fn armEventFd(self: Point, event_fd: std.posix.fd_t) bool {
+        return c.drmSyncobjEventfd(
+            self.timeline.device.file.handle,
+            self.timeline.handle,
+            self.value,
+            event_fd,
+            0,
+        ) == 0;
+    }
+
     pub fn wait(
         self: Point,
         context: *anyopaque,
@@ -194,6 +227,7 @@ pub const Waiter = struct {
         callback: Callback,
     ) error{WaitFailed}!*Waiter {
         const device = point.timeline.device;
+        const event_loop = device.event_loop orelse return error.WaitFailed;
         const event_result = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (std.posix.errno(event_result) != .SUCCESS) return error.WaitFailed;
         const event_fd: std.posix.fd_t = @intCast(event_result);
@@ -208,7 +242,7 @@ pub const Waiter = struct {
             .context = context,
             .callback = callback,
         };
-        self.event_source = device.event_loop.addFd(
+        self.event_source = event_loop.addFd(
             *Waiter,
             event_fd,
             .{ .readable = true, .hangup = true, .@"error" = true },

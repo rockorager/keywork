@@ -7,6 +7,7 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const render = @import("../render/types.zig");
+const DrmSyncobj = @import("../drm_syncobj.zig");
 const surface_geometry = @import("../surface_geometry.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const shm = @import("shm.zig");
@@ -70,9 +71,14 @@ pub const Commit = struct {
     offset_x: i32,
     offset_y: i32,
     viewport: surface_geometry.ViewportState,
+    synchronization: ?DrmSyncobj.Commit = null,
     frame_finished: bool = false,
 
     pub fn deinit(self: *Commit) void {
+        if (self.synchronization) |*synchronization| {
+            _ = synchronization.release.signal();
+            synchronization.deinit();
+        }
         self.attachment.deinit();
         self.allocator.free(self.surface_damage);
         self.allocator.free(self.buffer_damage);
@@ -101,6 +107,20 @@ pub const Commit = struct {
     }
 };
 
+pub const PendingAttachment = enum {
+    none,
+    null_buffer,
+    dmabuf,
+    unsupported,
+};
+
+pub const ExplicitSyncHandler = struct {
+    context: *anyopaque,
+    validate_commit: *const fn (*anyopaque, PendingAttachment) bool,
+    take_pending: *const fn (*anyopaque) DrmSyncobj.Commit,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const Surface = struct {
     allocator: std.mem.Allocator,
     owner: *CompositorGlobal,
@@ -111,6 +131,7 @@ pub const Surface = struct {
     role_owner: ?*const anyopaque = null,
     role_context: ?*anyopaque = null,
     role_destroyed: ?*const fn (*anyopaque) void = null,
+    explicit_sync_handler: ?ExplicitSyncHandler = null,
     pending_attachment: Attachment = .unchanged,
     pending_surface_damage: std.ArrayList(render.Rect) = .empty,
     pending_buffer_damage: std.ArrayList(render.Rect) = .empty,
@@ -143,6 +164,21 @@ pub const Surface = struct {
         self.role_owner = null;
         self.role_context = null;
         self.role_destroyed = null;
+    }
+
+    pub fn hasExplicitSyncHandler(self: *const Surface) bool {
+        return self.explicit_sync_handler != null;
+    }
+
+    pub fn setExplicitSyncHandler(self: *Surface, handler: ExplicitSyncHandler) !void {
+        if (self.explicit_sync_handler != null) return error.AlreadyExists;
+        self.explicit_sync_handler = handler;
+    }
+
+    pub fn clearExplicitSyncHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.explicit_sync_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.explicit_sync_handler = null;
     }
 
     pub fn reference(self: *Surface) !void {
@@ -405,6 +441,10 @@ fn appendDamage(
 
 fn queueCommit(surface: *Surface) !void {
     const owner = surface.owner;
+    const attachment_kind = pendingAttachment(surface.pending_attachment);
+    if (surface.explicit_sync_handler) |handler| {
+        if (!handler.validate_commit(handler.context, attachment_kind)) return;
+    }
     owner.commits.ensureUnusedCapacity(owner.allocator, 1) catch
         return surface.client.postNoMemory();
     const surface_damage = owner.allocator.dupe(
@@ -435,6 +475,10 @@ fn queueCommit(surface: *Surface) !void {
     surface.pending_surface_damage.clearRetainingCapacity();
     surface.pending_buffer_damage.clearRetainingCapacity();
     surface.pending_callbacks.clearRetainingCapacity();
+    const synchronization = if (attachment_kind == .dmabuf)
+        if (surface.explicit_sync_handler) |handler| handler.take_pending(handler.context) else null
+    else
+        null;
     owner.commits.appendAssumeCapacity(.{
         .allocator = owner.allocator,
         .surface = surface,
@@ -447,7 +491,19 @@ fn queueCommit(surface: *Surface) !void {
         .offset_x = surface.current_offset_x,
         .offset_y = surface.current_offset_y,
         .viewport = surface.current_viewport,
+        .synchronization = synchronization,
     });
+}
+
+fn pendingAttachment(attachment: Attachment) PendingAttachment {
+    return switch (attachment) {
+        .unchanged => .none,
+        .removed => .null_buffer,
+        .buffer => |buffer| switch (buffer.buffer.content) {
+            .dmabuf => .dmabuf,
+            .shm => .unsupported,
+        },
+    };
 }
 
 fn destroySurface(
@@ -458,6 +514,10 @@ fn destroySurface(
     const surface: *Surface = @ptrCast(@alignCast(context));
     surface.resource_alive = false;
     if (surface.role_destroyed) |destroyed| destroyed(surface.role_context.?);
+    if (surface.explicit_sync_handler) |handler| {
+        handler.surface_destroyed(handler.context);
+        surface.explicit_sync_handler = null;
+    }
     surface.unreference();
 }
 

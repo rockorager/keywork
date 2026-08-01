@@ -14,6 +14,7 @@ const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
 const ShmGlobal = @import("ShmGlobal.zig");
 const LinuxDmabufGlobal = @import("LinuxDmabufGlobal.zig");
+const LinuxDrmSyncobjGlobal = @import("LinuxDrmSyncobjGlobal.zig");
 const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
@@ -23,6 +24,7 @@ const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
 const shm = @import("shm.zig");
+const DrmSyncobj = @import("../drm_syncobj.zig");
 const Renderer = @import("../render/Renderer.zig");
 const HeadlessOutput = @import("../backend/headless.zig");
 const render = @import("../render/types.zig");
@@ -37,6 +39,7 @@ event_loop: EventLoop,
 server: Server,
 shm_global: ShmGlobal,
 linux_dmabuf_global: LinuxDmabufGlobal,
+linux_drm_syncobj_global: LinuxDrmSyncobjGlobal,
 compositor_global: CompositorGlobal,
 output_global: OutputGlobal,
 seat_global: SeatGlobal,
@@ -50,6 +53,7 @@ display_name: []u8,
 socket_path: [:0]u8,
 surfaces: std.ArrayList(*SurfaceState) = .empty,
 active: ?ActiveCopy = null,
+sync_waits: std.ArrayList(*SyncWait) = .empty,
 copy_completed: bool = false,
 frame_count: u64 = 0,
 terminating: bool = false,
@@ -101,8 +105,13 @@ const DmabufState = struct {
     buffer: *BufferResource,
     resource: wayring.ObjectHandle,
     source_cache: render.SourceCache,
+    synchronization: ?DrmSyncobj.Commit,
 
     fn deinit(self: *DmabufState, client: *Server.Client, send_release: bool) void {
+        if (self.synchronization) |*synchronization| {
+            _ = synchronization.release.signal();
+            synchronization.deinit();
+        }
         if (send_release and self.buffer.isLastUse()) ShmGlobal.releaseBuffer(client, self.resource) catch |err| switch (err) {
             error.UnknownResource, error.StaleObject => {},
             else => {},
@@ -110,6 +119,22 @@ const DmabufState = struct {
         self.buffer.unreference();
         self.* = undefined;
     }
+};
+
+const SyncWait = struct {
+    event_fd: std.posix.fd_t = -1,
+    event_value: u64 = 0,
+    handle: ?IoUringLoop.Handle = null,
+    completed: bool = false,
+    ready: bool = false,
+    result: i32 = 0,
+    cancel_requested: bool = false,
+    commits: std.ArrayList(WaitingCommit) = .empty,
+};
+
+const WaitingCommit = struct {
+    commit: CompositorGlobal.Commit,
+    prepared: bool,
 };
 
 const ActiveCopy = struct {
@@ -139,6 +164,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.renderer.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
     errdefer self.linux_dmabuf_global.deinit();
+    try self.linux_drm_syncobj_global.init(
+        allocator,
+        io,
+        &self.server,
+        self.renderer.dmabufDeviceId(),
+    );
+    errdefer self.linux_drm_syncobj_global.deinit();
     self.output = try HeadlessOutput.initForRenderer(
         allocator,
         options.output_size,
@@ -186,6 +218,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.socket_path = selection.path;
     self.surfaces = .empty;
     self.active = null;
+    self.sync_waits = .empty;
     self.copy_completed = false;
     self.frame_count = 0;
     self.terminating = false;
@@ -289,9 +322,17 @@ pub fn destroy(self: *NativeServer) void {
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
     if (self.active) |active| active.copy.cancel() catch {};
+    for (self.sync_waits.items) |wait| {
+        if (wait.handle) |handle| {
+            self.event_loop.ioLoop().cancel(handle) catch
+                @panic("failed to cancel native DRM syncobj wait");
+            wait.cancel_requested = true;
+        }
+    }
     self.transport.shutdown() catch {};
     while (!self.transport.readyToDeinit() or
-        (self.active != null and !self.active.?.copy.isTerminal()))
+        (self.active != null and !self.active.?.copy.isTerminal()) or
+        self.hasActiveSyncWait())
     {
         self.event_loop.ioLoop().runOnce() catch @panic("failed to drain native compositor I/O");
         self.transport.dispatch() catch {};
@@ -300,6 +341,8 @@ pub fn destroy(self: *NativeServer) void {
     self.finishCopy(false) catch {};
     self.transport.dispatch() catch {};
     self.transport.deinit();
+    while (self.sync_waits.items.len != 0) self.destroySyncWait(0);
+    self.sync_waits.deinit(self.allocator);
 
     while (self.compositor_global.popCommit()) |commit_value| {
         var commit = commit_value;
@@ -318,6 +361,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_shell.deinit();
     self.compositor_global.deinit();
     self.shm_global.deinit();
+    self.linux_drm_syncobj_global.deinit();
     self.linux_dmabuf_global.deinit();
     self.server.deinit();
     self.output.deinit();
@@ -331,10 +375,17 @@ pub fn destroy(self: *NativeServer) void {
     allocator.destroy(self);
 }
 
+fn hasActiveSyncWait(self: *const NativeServer) bool {
+    for (self.sync_waits.items) |wait| if (wait.handle != null) return true;
+    return false;
+}
+
 fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     try self.transport.dispatch();
+    try self.cancelDeadSyncWaits();
     try self.finishCopy(true);
+    try self.finishSyncWaits();
     if (self.active == null) try self.applyCommits();
     if (self.pruneSurfaces()) try self.renderScene(null);
 }
@@ -347,129 +398,314 @@ fn endTurn(context: *anyopaque, _: *EventLoop) !void {
 fn applyCommits(self: *NativeServer) !void {
     while (self.active == null) {
         var commit = self.compositor_global.popCommit() orelse return;
-        const disposition = self.xdg_shell.handleCommit(&commit) catch |err| {
-            commit.releaseBuffer() catch {};
+        if (self.findSyncWait(commit.surface)) |wait| {
+            wait.commits.append(self.allocator, .{ .commit = commit, .prepared = false }) catch {
+                commit.releaseBuffer() catch {};
+                commit.deinit();
+                return error.OutOfMemory;
+            };
+            continue;
+        }
+        if (!try self.prepareCommit(&commit)) continue;
+        if (commit.synchronization) |synchronization| {
+            if (!synchronization.acquire.signaled()) {
+                self.startSyncWait(&commit) catch |err| {
+                    commit.releaseBuffer() catch {};
+                    commit.deinit();
+                    return err;
+                };
+                continue;
+            }
+        }
+        try self.applyCommit(&commit);
+    }
+}
+
+fn prepareCommit(self: *NativeServer, commit: *CompositorGlobal.Commit) !bool {
+    const disposition = self.xdg_shell.handleCommit(commit) catch |err| {
+        commit.releaseBuffer() catch {};
+        commit.deinit();
+        return err;
+    };
+    if (disposition == .configure_only or commit.surface.client.state != .active) {
+        commit.releaseBuffer() catch {};
+        commit.deinit();
+        return false;
+    }
+    return true;
+}
+
+fn applyCommit(self: *NativeServer, commit: *CompositorGlobal.Commit) !void {
+    const state = self.stateFor(commit.surface) catch |err| {
+        commit.releaseBuffer() catch {};
+        commit.deinit();
+        return err;
+    };
+    state.full_damage = state.full_damage or
+        state.scale != commit.scale or
+        state.transform != commit.transform or
+        state.x != commit.offset_x or
+        state.y != commit.offset_y or
+        !std.meta.eql(state.viewport, commit.viewport);
+    state.scale = commit.scale;
+    state.transform = commit.transform;
+    state.x = commit.offset_x;
+    state.y = commit.offset_y;
+    state.viewport = commit.viewport;
+    switch (commit.attachment) {
+        .buffer => |attachment| {
+            if (attachment.buffer.content == .dmabuf) {
+                const dmabuf = &attachment.buffer.content.dmabuf;
+                _ = surface_geometry.calculate(
+                    dmabuf.size,
+                    state.scale,
+                    @intCast(state.transform),
+                    state.viewport,
+                    false,
+                ) catch |err| {
+                    commit.releaseBuffer() catch {};
+                    commit.deinit();
+                    return self.viewporter_global.postGeometryError(state.surface, err);
+                };
+                attachment.buffer.reference() catch {
+                    commit.releaseBuffer() catch {};
+                    commit.deinit();
+                    return error.OutOfMemory;
+                };
+                if (state.snapshot) |*snapshot| snapshot.deinit();
+                state.snapshot = null;
+                if (state.dmabuf) |*old| old.deinit(
+                    state.surface.client,
+                    old.buffer != attachment.buffer or
+                        !std.meta.eql(old.resource, attachment.resource),
+                );
+                state.dmabuf = .{
+                    .buffer = attachment.buffer,
+                    .resource = attachment.resource,
+                    .source_cache = dmabuf.acquireSourceCache(),
+                    .synchronization = commit.synchronization,
+                };
+                commit.synchronization = null;
+                self.output_global.setSurfaceVisible(state.surface, true) catch |err| {
+                    commit.deinit();
+                    return err;
+                };
+                const present_result = self.present(commit);
+                commit.deinit();
+                try present_result;
+                return;
+            }
+            const damage: ?[]const render.Rect = if (commit.buffer_damage.len == 0)
+                null
+            else
+                commit.buffer_damage;
+            const reuse = if (state.snapshot) |*snapshot| snapshot else null;
+            const copy = AsyncShmCopy.create(
+                self.allocator,
+                self.event_loop.ioLoop(),
+                attachment.buffer.content.shm,
+                damage,
+                reuse,
+                self,
+                copyComplete,
+            ) catch |err| {
+                commit.releaseBuffer() catch {};
+                const present_result = self.present(commit);
+                commit.deinit();
+                try present_result;
+                if (err == error.OutOfMemory) return err;
+                return;
+            };
+            self.active = .{ .copy = copy, .commit = commit.*, .state = state };
+            copy.start() catch {};
+        },
+        .removed => {
+            if (state.snapshot) |*snapshot| snapshot.deinit();
+            state.snapshot = null;
+            if (state.dmabuf) |*dmabuf| dmabuf.deinit(state.surface.client, true);
+            state.dmabuf = null;
+            self.output_global.setSurfaceVisible(state.surface, false) catch |err| {
+                commit.deinit();
+                return err;
+            };
+            const present_result = self.present(commit);
             commit.deinit();
-            return err;
-        };
-        if (disposition == .configure_only) {
-            commit.releaseBuffer() catch {};
+            try present_result;
+        },
+        .unchanged => {
+            const size = if (state.dmabuf) |dmabuf|
+                dmabuf.buffer.content.dmabuf.size
+            else if (state.snapshot) |*snapshot|
+                snapshot.size
+            else
+                null;
+            if (size) |buffer_size| {
+                _ = surface_geometry.calculate(
+                    buffer_size,
+                    state.scale,
+                    @intCast(state.transform),
+                    state.viewport,
+                    false,
+                ) catch |err| {
+                    commit.deinit();
+                    return self.viewporter_global.postGeometryError(state.surface, err);
+                };
+            }
+            const present_result = self.present(commit);
             commit.deinit();
+            try present_result;
+        },
+    }
+}
+
+fn findSyncWait(self: *const NativeServer, surface: *const CompositorGlobal.Surface) ?*SyncWait {
+    for (self.sync_waits.items) |wait| {
+        if (wait.commits.items[0].commit.surface == surface) return wait;
+    }
+    return null;
+}
+
+fn startSyncWait(self: *NativeServer, commit: *CompositorGlobal.Commit) !void {
+    try self.sync_waits.ensureUnusedCapacity(self.allocator, 1);
+    const wait = try self.allocator.create(SyncWait);
+    errdefer self.allocator.destroy(wait);
+    wait.* = .{};
+    errdefer wait.commits.deinit(self.allocator);
+    try wait.commits.ensureUnusedCapacity(self.allocator, 1);
+    wait.commits.appendAssumeCapacity(.{ .commit = commit.*, .prepared = true });
+    errdefer _ = wait.commits.pop();
+    try self.armSyncWait(wait);
+    self.sync_waits.appendAssumeCapacity(wait);
+}
+
+fn armSyncWait(self: *NativeServer, wait: *SyncWait) !void {
+    std.debug.assert(wait.handle == null and wait.event_fd < 0);
+    std.debug.assert(wait.commits.items.len != 0);
+    const synchronization = wait.commits.items[0].commit.synchronization orelse
+        return error.MissingSynchronization;
+    const event_result = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (std.posix.errno(event_result) != .SUCCESS) return error.SyncWaitFailed;
+    wait.event_fd = @intCast(event_result);
+    errdefer {
+        _ = linux.close(wait.event_fd);
+        wait.event_fd = -1;
+    }
+    if (!synchronization.acquire.armEventFd(wait.event_fd)) return error.SyncWaitFailed;
+    wait.event_value = 0;
+    wait.completed = false;
+    wait.ready = false;
+    wait.result = 0;
+    wait.cancel_requested = false;
+    wait.handle = try self.event_loop.ioLoop().queue(
+        wait,
+        syncWaitComplete,
+        wait,
+        prepareSyncWaitRead,
+    );
+}
+
+fn prepareSyncWaitRead(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const wait: *SyncWait = @ptrCast(@alignCast(context));
+    sqe.prep_read(wait.event_fd, std.mem.asBytes(&wait.event_value), 0);
+}
+
+fn syncWaitComplete(
+    context: *anyopaque,
+    _: *IoUringLoop,
+    completion: IoUringLoop.Completion,
+) !void {
+    const wait: *SyncWait = @ptrCast(@alignCast(context));
+    wait.handle = null;
+    wait.result = completion.result;
+    wait.completed = true;
+}
+
+fn cancelDeadSyncWaits(self: *NativeServer) !void {
+    for (self.sync_waits.items) |wait| {
+        const surface = wait.commits.items[0].commit.surface;
+        if ((surface.client.state == .active and surface.resource_alive) or
+            wait.handle == null or wait.cancel_requested) continue;
+        try self.event_loop.ioLoop().cancel(wait.handle.?);
+        wait.cancel_requested = true;
+    }
+}
+
+fn finishSyncWaits(self: *NativeServer) !void {
+    var index: usize = 0;
+    while (index < self.sync_waits.items.len and self.active == null) {
+        const wait = self.sync_waits.items[index];
+        const surface = wait.commits.items[0].commit.surface;
+        if (wait.handle == null and
+            (surface.client.state != .active or !surface.resource_alive))
+        {
+            self.destroySyncWait(index);
+            continue;
+        }
+        if (wait.completed) {
+            std.debug.assert(wait.handle == null);
+            if (wait.event_fd >= 0) {
+                _ = linux.close(wait.event_fd);
+                wait.event_fd = -1;
+            }
+            wait.completed = false;
+            if (wait.result != @sizeOf(u64) or wait.event_value == 0) {
+                self.destroySyncWait(index);
+                continue;
+            }
+            wait.ready = true;
+        }
+        if (!wait.ready) {
+            index += 1;
             continue;
         }
 
-        const state = try self.stateFor(commit.surface);
-        state.full_damage = state.full_damage or
-            state.scale != commit.scale or
-            state.transform != commit.transform or
-            state.x != commit.offset_x or
-            state.y != commit.offset_y or
-            !std.meta.eql(state.viewport, commit.viewport);
-        state.scale = commit.scale;
-        state.transform = commit.transform;
-        state.x = commit.offset_x;
-        state.y = commit.offset_y;
-        state.viewport = commit.viewport;
-        switch (commit.attachment) {
-            .buffer => |attachment| {
-                if (attachment.buffer.content == .dmabuf) {
-                    const dmabuf = &attachment.buffer.content.dmabuf;
-                    _ = surface_geometry.calculate(
-                        dmabuf.size,
-                        state.scale,
-                        @intCast(state.transform),
-                        state.viewport,
-                        false,
-                    ) catch |err| {
-                        commit.releaseBuffer() catch {};
-                        commit.deinit();
-                        return self.viewporter_global.postGeometryError(state.surface, err);
-                    };
-                    attachment.buffer.reference() catch {
-                        commit.releaseBuffer() catch {};
-                        commit.deinit();
-                        return error.OutOfMemory;
-                    };
-                    if (state.snapshot) |*snapshot| snapshot.deinit();
-                    state.snapshot = null;
-                    if (state.dmabuf) |*old| old.deinit(
-                        state.surface.client,
-                        old.buffer != attachment.buffer or
-                            !std.meta.eql(old.resource, attachment.resource),
-                    );
-                    state.dmabuf = .{
-                        .buffer = attachment.buffer,
-                        .resource = attachment.resource,
-                        .source_cache = dmabuf.acquireSourceCache(),
-                    };
-                    self.output_global.setSurfaceVisible(state.surface, true) catch |err| {
-                        commit.deinit();
+        while (wait.commits.items.len != 0 and self.active == null) {
+            const waiting = &wait.commits.items[0];
+            if (!waiting.prepared) {
+                const prepared = self.prepareCommit(&waiting.commit) catch |err| {
+                    _ = wait.commits.orderedRemove(0);
+                    self.destroySyncWait(index);
+                    return err;
+                };
+                if (!prepared) {
+                    _ = wait.commits.orderedRemove(0);
+                    continue;
+                }
+                waiting.prepared = true;
+            }
+            if (waiting.commit.synchronization) |synchronization| {
+                if (!synchronization.acquire.signaled()) {
+                    self.armSyncWait(wait) catch |err| {
+                        self.destroySyncWait(index);
                         return err;
                     };
-                    const present_result = self.present(&commit);
-                    commit.deinit();
-                    try present_result;
-                    continue;
+                    break;
                 }
-                const damage: ?[]const render.Rect = if (commit.buffer_damage.len == 0)
-                    null
-                else
-                    commit.buffer_damage;
-                const reuse = if (state.snapshot) |*snapshot| snapshot else null;
-                const copy = AsyncShmCopy.create(
-                    self.allocator,
-                    self.event_loop.ioLoop(),
-                    attachment.buffer.content.shm,
-                    damage,
-                    reuse,
-                    self,
-                    copyComplete,
-                ) catch |err| {
-                    commit.releaseBuffer() catch {};
-                    const present_result = self.present(&commit);
-                    commit.deinit();
-                    try present_result;
-                    if (err == error.OutOfMemory) return err;
-                    continue;
-                };
-                self.active = .{ .copy = copy, .commit = commit, .state = state };
-                copy.start() catch {};
-            },
-            .removed => {
-                if (state.snapshot) |*snapshot| snapshot.deinit();
-                state.snapshot = null;
-                if (state.dmabuf) |*dmabuf| dmabuf.deinit(state.surface.client, true);
-                state.dmabuf = null;
-                try self.output_global.setSurfaceVisible(state.surface, false);
-                const present_result = self.present(&commit);
-                commit.deinit();
-                try present_result;
-            },
-            .unchanged => {
-                const size = if (state.dmabuf) |dmabuf|
-                    dmabuf.buffer.content.dmabuf.size
-                else if (state.snapshot) |*snapshot|
-                    snapshot.size
-                else
-                    null;
-                if (size) |buffer_size| {
-                    _ = surface_geometry.calculate(
-                        buffer_size,
-                        state.scale,
-                        @intCast(state.transform),
-                        state.viewport,
-                        false,
-                    ) catch |err| {
-                        commit.deinit();
-                        return self.viewporter_global.postGeometryError(state.surface, err);
-                    };
-                }
-                const present_result = self.present(&commit);
-                commit.deinit();
-                try present_result;
-            },
+            }
+            var ready = wait.commits.orderedRemove(0).commit;
+            self.applyCommit(&ready) catch |err| {
+                self.destroySyncWait(index);
+                return err;
+            };
         }
+        if (wait.commits.items.len == 0) {
+            self.destroySyncWait(index);
+            continue;
+        }
+        index += 1;
     }
+}
+
+fn destroySyncWait(self: *NativeServer, index: usize) void {
+    const wait = self.sync_waits.swapRemove(index);
+    std.debug.assert(wait.handle == null);
+    if (wait.event_fd >= 0) _ = linux.close(wait.event_fd);
+    for (wait.commits.items) |*waiting| {
+        waiting.commit.releaseBuffer() catch {};
+        waiting.commit.deinit();
+    }
+    wait.commits.deinit(self.allocator);
+    self.allocator.destroy(wait);
 }
 
 fn copyComplete(context: ?*anyopaque, _: *AsyncShmCopy) void {
