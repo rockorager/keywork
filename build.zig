@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "stable/tablet/tablet-v2.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/cursor-shape/cursor-shape-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland_sources.protocols.path(b, "staging/xdg-activation/xdg-activation-v1.xml"));
     generate_wayring_protocols.addArg("-o");
     const wayring_protocol_source = generate_wayring_protocols.addOutputFileArg("wayring-protocols.zig");
     const wayring_protocols = b.addModule("wayring-protocols", .{
