@@ -101,6 +101,14 @@ pub fn readyToDeinit(self: *const Window) bool {
     return self.protocol_destroyed;
 }
 
+pub fn isConfigured(self: *const Window) bool {
+    return self.configured;
+}
+
+pub fn renderBackend(self: *Window) keywork.RenderBackend {
+    return .{ .ptr = self, .vtable = &render_backend_vtable };
+}
+
 pub fn ownsObject(self: *const Window, id: u32) bool {
     return id == self.handles.surface.id or
         id == self.handles.xdg_surface.id or
@@ -188,6 +196,38 @@ pub fn present(
 
 pub fn size(self: *const Window) struct { width: u32, height: u32 } {
     return .{ .width = self.width, .height = self.height };
+}
+
+const render_backend_vtable: keywork.RenderBackend.VTable = .{
+    .present = renderBackendPresent,
+    .measure_text = renderBackendMeasureText,
+    .scale = renderBackendScale,
+    .text_metrics = renderBackendTextMetrics,
+};
+
+fn renderBackendPresent(context: *anyopaque, frame: keywork.RenderBackend.Frame) !bool {
+    const self: *Window = @ptrCast(@alignCast(context));
+    return self.present(frame.display_list, frame.scale);
+}
+
+fn renderBackendMeasureText(
+    context: *anyopaque,
+    value: []const u8,
+    style: keywork.ResolvedTextStyle,
+) !keywork.Size {
+    const self: *Window = @ptrCast(@alignCast(context));
+    return self.renderer.measureText(1, value, style);
+}
+
+fn renderBackendScale(_: *anyopaque) f32 {
+    // Output and fractional-scale negotiation are intentionally not guessed:
+    // the core-only bootstrap uses one logical pixel per buffer pixel.
+    return 1;
+}
+
+fn renderBackendTextMetrics(context: *anyopaque, font_size: f32) !keywork.TextMetrics {
+    const self: *Window = @ptrCast(@alignCast(context));
+    return self.renderer.textMetrics(1, font_size);
 }
 
 fn destroyProtocol(client: *Client, handles: Client.Window) void {
