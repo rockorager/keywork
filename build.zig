@@ -133,6 +133,17 @@ pub fn build(b: *std.Build) void {
     wayring_presenter_test_module.addImport("wayring-protocols", wayring_protocols);
     const wayring_presenter_tests = b.addTest(.{ .root_module = wayring_presenter_test_module });
     wayring_test_step.dependOn(&b.addRunArtifact(wayring_presenter_tests).step);
+    const wayring_client_test_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/backend/wayring/Client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wayring_client_test_module.addImport("keywork-loop", keywork_loop);
+    wayring_client_test_module.addImport("wayring", wayring);
+    wayring_client_test_module.addImport("wayring-uring", wayring_uring);
+    wayring_client_test_module.addImport("wayring-protocols", wayring_protocols);
+    const wayring_client_tests = b.addTest(.{ .root_module = wayring_client_test_module });
+    wayring_test_step.dependOn(&b.addRunArtifact(wayring_client_tests).step);
     const stream_output = stream.add(
         b,
         target,
@@ -150,6 +161,7 @@ pub fn build(b: *std.Build) void {
         use_llvm,
         keywork_loop,
         wayring,
+        wayring_uring,
         wayring_protocols,
         varlink,
         ui_output,
