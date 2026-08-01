@@ -25,6 +25,7 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const TabletGlobal = @import("TabletGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
@@ -74,6 +75,7 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+tablet_global: TabletGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
 fractional_scale_global: FractionalScaleGlobal,
@@ -469,6 +471,17 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.commit_timing_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
     errdefer self.seat_global.deinit();
+    try self.tablet_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        .{
+            .context = self,
+            .surface_coordinates = tabletSurfaceCoordinates,
+            .repaint = tabletRepaint,
+        },
+    );
+    errdefer self.tablet_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
     errdefer self.data_device_global.deinit();
     try self.primary_selection_global.init(allocator, &self.server, &self.seat_global);
@@ -713,6 +726,7 @@ pub fn destroy(self: *NativeServer) void {
     self.fractional_scale_global.deinit();
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
+    self.tablet_global.deinit();
     self.seat_global.deinit();
     self.commit_timing_global.deinit();
     self.fifo_global.deinit();
@@ -763,6 +777,7 @@ fn hasPendingIo(self: *const NativeServer) bool {
 fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     try self.transport.dispatch();
+    try self.tablet_global.pruneDeadFocus();
     try self.intakeTransactions();
     try self.cancelDeadTransactions();
     try self.progressTransactions();
@@ -885,14 +900,14 @@ fn nativeInputListener(self: *NativeServer) NativeInput.Listener {
         .pinch_end = ignorePinchEnd,
         .hold_begin = ignoreHoldBegin,
         .hold_end = ignoreHoldEnd,
-        .tablet_tool_proximity = ignoreTabletToolProximity,
-        .tablet_tool_axis = ignoreTabletToolAxis,
-        .tablet_tool_tip = ignoreTabletToolTip,
-        .tablet_tool_button = ignoreTabletToolButton,
-        .tablet_pad_button = ignoreTabletPadButton,
-        .tablet_pad_ring = ignoreTabletPadRing,
-        .tablet_pad_strip = ignoreTabletPadStrip,
-        .tablet_pad_dial = ignoreTabletPadDial,
+        .tablet_tool_proximity = nativeTabletToolProximity,
+        .tablet_tool_axis = nativeTabletToolAxis,
+        .tablet_tool_tip = nativeTabletToolTip,
+        .tablet_tool_button = nativeTabletToolButton,
+        .tablet_pad_button = nativeTabletPadButton,
+        .tablet_pad_ring = nativeTabletPadRing,
+        .tablet_pad_strip = nativeTabletPadStrip,
+        .tablet_pad_dial = nativeTabletPadDial,
         .touch_available = nativeTouchAvailable,
         .touch_down = nativeTouchDown,
         .touch_up = nativeTouchUp,
@@ -1170,10 +1185,25 @@ fn nativeTouchCancel(context: *anyopaque, _: NativeInput.DeviceId) void {
     self.cancelTouches() catch self.terminate();
 }
 
-fn nativeInputDeviceAdded(_: *anyopaque, _: NativeInput.DeviceInfo) void {}
+fn nativeInputDeviceAdded(context: *anyopaque, device: NativeInput.DeviceInfo) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    switch (device.device_type) {
+        .tablet => self.tablet_global.addTablet(
+            device,
+            self.native_input.tabletInfo(device.id) orelse return,
+        ) catch self.terminate(),
+        .tablet_pad => self.tablet_global.addPad(
+            device,
+            self.native_input.tabletPadInfo(device.id) orelse return,
+        ) catch self.terminate(),
+        else => {},
+    }
+}
 
 fn nativeInputDeviceRemoved(context: *anyopaque, device_id: NativeInput.DeviceId) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.tablet_global.removePad(device_id) catch return self.terminate();
+    self.tablet_global.removeTablet(device_id) catch return self.terminate();
     self.releaseDeviceKeys(device_id) catch return self.terminate();
     self.releaseDeviceButtons(device_id) catch return self.terminate();
     for (self.touch_routes.items) |route| if (route.device_id == device_id) {
@@ -1190,14 +1220,120 @@ fn ignorePinchUpdate(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: f64, _: 
 fn ignorePinchEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
 fn ignoreHoldBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
 fn ignoreHoldEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
-fn ignoreTabletToolProximity(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: f64, _: f64, _: bool, _: NativeInput.TabletToolAxes) void {}
-fn ignoreTabletToolAxis(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes) void {}
-fn ignoreTabletToolTip(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes, _: bool) void {}
-fn ignoreTabletToolButton(_: *anyopaque, _: NativeInput.DeviceId, _: NativeInput.TabletToolId, _: u32, _: NativeInput.TabletToolAxes, _: u32, _: bool) void {}
-fn ignoreTabletPadButton(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: bool, _: u32, _: u32) void {}
-fn ignoreTabletPadRing(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: f64, _: bool, _: u32, _: u32) void {}
-fn ignoreTabletPadStrip(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: f64, _: bool, _: u32, _: u32) void {}
-fn ignoreTabletPadDial(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32, _: i32, _: u32, _: u32) void {}
+
+fn nativeTabletToolProximity(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    x: f64,
+    y: f64,
+    in_proximity: bool,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const info = self.native_input.tabletToolInfo(tool_id) orelse return;
+    const focus = if (in_proximity)
+        self.tabletFocus(self.physicalToLogical(x), self.physicalToLogical(y)) catch
+            return self.terminate()
+    else
+        null;
+    self.tablet_global.proximity(
+        device_id,
+        info,
+        time,
+        focus,
+        in_proximity,
+        self.routeTabletAxes(axes),
+    ) catch self.terminate();
+}
+
+fn nativeTabletToolAxis(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const routed = self.routeTabletAxes(axes);
+    const focus = self.tabletAxesFocus(routed) catch return self.terminate();
+    self.tablet_global.axis(device_id, tool_id, time, focus, routed) catch self.terminate();
+}
+
+fn nativeTabletToolTip(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+    down: bool,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const routed = self.routeTabletAxes(axes);
+    const focus = self.tabletAxesFocus(routed) catch return self.terminate();
+    self.tablet_global.tip(device_id, tool_id, time, focus, routed, down) catch self.terminate();
+}
+
+fn nativeTabletToolButton(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+    button: u32,
+    pressed: bool,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const routed = self.routeTabletAxes(axes);
+    const focus = self.tabletAxesFocus(routed) catch return self.terminate();
+    self.tablet_global.button(
+        device_id,
+        tool_id,
+        time,
+        focus,
+        routed,
+        button,
+        pressed,
+    ) catch self.terminate();
+}
+
+fn nativeTabletPadButton(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, button: u32, pressed: bool, group: u32, mode: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.tablet_global.padButton(device_id, time, button, pressed, group, mode) catch self.terminate();
+}
+
+fn nativeTabletPadRing(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, ring: u32, position: f64, finger: bool, group: u32, mode: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.tablet_global.padRing(device_id, time, ring, position, finger, group, mode) catch self.terminate();
+}
+
+fn nativeTabletPadStrip(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, strip: u32, position: f64, finger: bool, group: u32, mode: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.tablet_global.padStrip(device_id, time, strip, position, finger, group, mode) catch self.terminate();
+}
+
+fn nativeTabletPadDial(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dial: u32, value120: i32, group: u32, mode: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.tablet_global.padDial(device_id, time, dial, value120, group, mode) catch self.terminate();
+}
+
+fn tabletRepaint(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return;
+    self.scheduleRepaint(0);
+}
+
+fn tabletSurfaceCoordinates(
+    context: *anyopaque,
+    surface: *CompositorGlobal.Surface,
+    x: f64,
+    y: f64,
+) ?TabletGlobal.Point {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const local = self.surfaceLocal(surface, x, y) orelse return null;
+    return .{ .x = local.x, .y = local.y };
+}
 
 fn repaintTimer(_: *anyopaque, _: *EventLoop, _: u64) !void {}
 
@@ -1604,7 +1740,8 @@ fn collectInputPaintEntries(self: *NativeServer) !void {
     self.input_paint_entries.clearRetainingCapacity();
     for (self.surfaces.items) |state| {
         const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null) try self.surface_tree.paint(node, &self.input_paint_entries);
+        if (node.parent == null and !self.tablet_global.isCursorSurface(state.surface))
+            try self.surface_tree.paint(node, &self.input_paint_entries);
     }
 }
 
@@ -1640,6 +1777,31 @@ fn pointerLogicalY(self: *const NativeServer) f64 {
 
 fn physicalToLogical(self: *const NativeServer, value: f64) f64 {
     return physicalToLogicalScale(value, self.output.scale());
+}
+
+fn routeTabletAxes(
+    self: *const NativeServer,
+    axes: NativeInput.TabletToolAxes,
+) NativeInput.TabletToolAxes {
+    var routed = axes;
+    if (axes.position) |position| routed.position = .{
+        .x = self.physicalToLogical(position.x),
+        .y = self.physicalToLogical(position.y),
+    };
+    return routed;
+}
+
+fn tabletAxesFocus(
+    self: *NativeServer,
+    axes: NativeInput.TabletToolAxes,
+) !?TabletGlobal.Focus {
+    const position = axes.position orelse return null;
+    return self.tabletFocus(position.x, position.y);
+}
+
+fn tabletFocus(self: *NativeServer, x: f64, y: f64) !?TabletGlobal.Focus {
+    const hit = (try self.hitTest(x, y)) orelse return null;
+    return .{ .surface = hit.surface, .x = hit.local_x, .y = hit.local_y };
 }
 
 fn physicalToLogicalScale(value: f64, scale: render.Scale) f64 {
@@ -2211,6 +2373,7 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     try self.refreshInputFocus(inputTime(self));
     const damage_state = if (pending.transaction.entries.len == 1 and
         pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
+        !self.tablet_global.isCursorSurface(pending.transaction.entries[0].surface) and
         (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
         self.findState(pending.transaction.entries[0].surface)
     else
@@ -2363,7 +2526,19 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     defer paint_entries.deinit(self.allocator);
     for (self.surfaces.items) |state| {
         const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null) try self.surface_tree.paint(node, &paint_entries);
+        if (node.parent == null and !self.tablet_global.isCursorSurface(state.surface))
+            try self.surface_tree.paint(node, &paint_entries);
+    }
+    var cursors = self.tablet_global.cursorIterator();
+    while (cursors.next()) |cursor| {
+        const node = self.surface_tree.find(cursor.root) orelse continue;
+        if (node.parent != null) continue;
+        const first = paint_entries.items.len;
+        try self.surface_tree.paint(node, &paint_entries);
+        for (paint_entries.items[first..]) |*entry| {
+            entry.x +|= cursor.x;
+            entry.y +|= cursor.y;
+        }
     }
     for (paint_entries.items) |paint_entry| {
         const state = self.findState(paint_entry.surface) orelse continue;
