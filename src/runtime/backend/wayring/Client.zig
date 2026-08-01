@@ -27,6 +27,13 @@ pub const DmaBufCandidate = struct {
     modifier: u64,
 };
 
+pub const OutputInfo = struct {
+    name: []const u8,
+    width: f32,
+    height: f32,
+    scale: f32,
+};
+
 pub const Seat = struct {
     handle: wayring.ObjectHandle,
     capabilities: u32,
@@ -42,7 +49,11 @@ const Global = struct {
 const Output = struct {
     global_name: u32,
     handle: wayring.ObjectHandle,
+    name: ?[]u8 = null,
+    mode_width: i32 = 0,
+    mode_height: i32 = 0,
     scale: u32 = 1,
+    dirty: bool = false,
 };
 
 allocator: std.mem.Allocator,
@@ -155,6 +166,7 @@ pub fn readyToDeinit(self: *Client) bool {
 
 pub fn deinit(self: *Client) void {
     self.transport.deinit();
+    for (self.outputs.items) |output| if (output.name) |name| self.allocator.free(name);
     self.outputs.deinit(self.allocator);
     self.dmabuf_candidates.deinit(self.allocator);
     self.connection.deinit();
@@ -207,6 +219,32 @@ pub fn activationManager(self: *const Client) ?wayring.ObjectHandle {
 pub fn outputScale(self: *const Client, object_id: u32) ?u32 {
     for (self.outputs.items) |output| {
         if (output.handle.id == object_id) return output.scale;
+    }
+    return null;
+}
+
+pub fn outputCount(self: *const Client) usize {
+    return self.outputs.items.len;
+}
+
+pub fn outputAt(self: *const Client, index: usize) wayring.ObjectHandle {
+    return self.outputs.items[index].handle;
+}
+
+pub fn outputInfoAt(self: *const Client, index: usize) OutputInfo {
+    const output = self.outputs.items[index];
+    const scale: f32 = @floatFromInt(output.scale);
+    return .{
+        .name = output.name orelse "",
+        .width = @as(f32, @floatFromInt(@max(0, output.mode_width))) / scale,
+        .height = @as(f32, @floatFromInt(@max(0, output.mode_height))) / scale,
+        .scale = scale,
+    };
+}
+
+pub fn findOutputByName(self: *const Client, name: []const u8) ?wayring.ObjectHandle {
+    for (self.outputs.items) |output| {
+        if (output.name) |candidate| if (std.mem.eql(u8, name, candidate)) return output.handle;
     }
     return null;
 }
@@ -387,10 +425,33 @@ fn dispatchApplicationMessage(self: *Client, message: *wayring.Message) !void {
                 const scale: u32 = @intCast(event.factor);
                 if (scale != output.scale) {
                     output.scale = scale;
+                    output.dirty = true;
+                }
+            },
+            .mode => |event| {
+                if (event.flags & protocol.wl_output_types.mode.current != 0 and
+                    (output.mode_width != event.width or output.mode_height != event.height))
+                {
+                    output.mode_width = event.width;
+                    output.mode_height = event.height;
+                    output.dirty = true;
+                }
+            },
+            .name => |event| {
+                if (output.name == null or !std.mem.eql(u8, output.name.?, event.name)) {
+                    const name = try self.allocator.dupe(u8, event.name);
+                    if (output.name) |old_name| self.allocator.free(old_name);
+                    output.name = name;
+                    output.dirty = true;
+                }
+            },
+            .done => {
+                if (output.dirty) {
+                    output.dirty = false;
                     if (self.ready) try self.notify(self.notify_context, self, .outputs_changed);
                 }
             },
-            .geometry, .mode, .done, .name, .description => {},
+            .geometry, .description => {},
         }
         return;
     }
@@ -440,6 +501,7 @@ fn handleRegistry(self: *Client, message: *const wayring.Message) !void {
                 self.fractional_scale_manager = null;
             for (self.outputs.items, 0..) |output, index| {
                 if (output.global_name != event.name) continue;
+                if (output.name) |name| self.allocator.free(name);
                 _ = self.outputs.orderedRemove(index);
                 if (self.ready) try self.notify(self.notify_context, self, .outputs_changed);
                 break;
@@ -674,7 +736,15 @@ test "io_uring client discovers and binds required globals" {
                         try transport.connection.queue(bound.id, 0, &.{.{ .uint = protocol.wl_seat_types.capability.pointer |
                             protocol.wl_seat_types.capability.keyboard }});
                     } else if (interface == &protocol.wl_output) {
+                        try transport.connection.queue(bound.id, 1, &.{
+                            .{ .uint = protocol.wl_output_types.mode.current },
+                            .{ .int = 3840 },
+                            .{ .int = 2160 },
+                            .{ .int = 60000 },
+                        });
                         try transport.connection.queue(bound.id, 3, &.{.{ .int = 2 }});
+                        try transport.connection.queue(bound.id, 4, &.{.{ .string = "DP-1" }});
+                        try transport.connection.queue(bound.id, 2, &.{});
                     } else if (interface == &protocol.wl_shm) {
                         try transport.connection.queue(bound.id, 0, &.{.{
                             .uint = @intFromEnum(protocol.wl_shm_types.format.argb8888),
@@ -742,6 +812,10 @@ test "io_uring client discovers and binds required globals" {
         seat.capabilities,
     );
     try std.testing.expectEqual(@as(u32, 2), client.outputScale(client.outputs.items[0].handle.id).?);
+    try std.testing.expectEqual(@as(usize, 1), client.outputCount());
+    try std.testing.expectEqualStrings("DP-1", client.outputInfoAt(0).name);
+    try std.testing.expectEqual(@as(f32, 1920), client.outputInfoAt(0).width);
+    try std.testing.expectEqual(client.outputAt(0), client.findOutputByName("DP-1").?);
     try std.testing.expect(client.dataDeviceManager() != null);
     try std.testing.expect(client.activationManager() != null);
     try std.testing.expect(client.viewporter != null);
