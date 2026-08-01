@@ -99,7 +99,8 @@ fn runWayring(
 
     var ring = try event_loop.IoUringLoop.init(allocator);
     defer ring.deinit();
-    var run_context: WayringRunContext = .{};
+    var run_context: WayringRunContext = .{ .allocator = allocator };
+    defer run_context.deinit();
     var backend: WayringBackend = undefined;
     try backend.initConnect(
         allocator,
@@ -174,6 +175,8 @@ fn runWayring(
             try backend.beginClose();
         }
         try backend.runOnce();
+        if (compatibility.ready) try compatibility.dispatch();
+        try run_context.drain(&backend);
         try runtime.flushPendingRepaint();
     }
     try compatibility.cancel();
@@ -183,29 +186,81 @@ fn runWayring(
 }
 
 const WayringRunContext = struct {
+    allocator: std.mem.Allocator,
     runtime: ?*runtime_mod.Runtime = null,
     stop: bool = false,
+    events: std.ArrayList(WayringBackend.Event) = .empty,
+
+    fn deinit(self: *WayringRunContext) void {
+        self.clear(&self.events);
+        self.events.deinit(self.allocator);
+    }
 
     fn backendEvent(
         context: *anyopaque,
-        backend: *WayringBackend,
+        _: *WayringBackend,
         event: WayringBackend.Event,
     ) !void {
         const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        if (self.runtime == null) {
+            switch (event) {
+                .close, .disconnected, .fatal => self.stop = true,
+                else => {},
+            }
+            return;
+        }
+        const copied = switch (event) {
+            .key => |key| WayringBackend.Event{ .key = switch (key) {
+                .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
+                else => key,
+            } },
+            else => event,
+        };
+        self.events.append(self.allocator, copied) catch |err| {
+            self.deinitEvent(copied);
+            return err;
+        };
+    }
+
+    fn drain(self: *WayringRunContext, backend: *WayringBackend) !void {
+        while (self.events.items.len != 0) {
+            var events = self.events;
+            self.events = .empty;
+            defer {
+                self.clear(&events);
+                events.deinit(self.allocator);
+            }
+            const runtime = self.runtime orelse continue;
+            for (events.items) |event| switch (event) {
+                .configured => |size| try runtime.configure(.{
+                    .width = @floatFromInt(size.width),
+                    .height = @floatFromInt(size.height),
+                }),
+                .repaint => try runtime.frameDone(),
+                .close, .disconnected, .fatal => self.stop = true,
+                .pointer_move => |point| {
+                    try runtime.pointerMove(point);
+                    if (point) |position| try backend.setCursorShape(runtime.waylandCursorShape(position));
+                },
+                .pointer_button => |button| try runtime.pointerButton(button),
+                .scroll => |scroll| try runtime.scrollBy(scroll),
+                .key => |key| try runtime.keyInput(key),
+            };
+        }
+    }
+
+    fn clear(self: *WayringRunContext, events: *std.ArrayList(WayringBackend.Event)) void {
+        for (events.items) |event| self.deinitEvent(event);
+        events.clearRetainingCapacity();
+    }
+
+    fn deinitEvent(self: *WayringRunContext, event: WayringBackend.Event) void {
         switch (event) {
-            .configured => |size| if (self.runtime) |runtime| try runtime.configure(.{
-                .width = @floatFromInt(size.width),
-                .height = @floatFromInt(size.height),
-            }),
-            .repaint => if (self.runtime) |runtime| try runtime.frameDone(),
-            .close, .disconnected, .fatal => self.stop = true,
-            .pointer_move => |point| if (self.runtime) |runtime| {
-                try runtime.pointerMove(point);
-                if (point) |position| try backend.setCursorShape(runtime.waylandCursorShape(position));
+            .key => |key| switch (key) {
+                .text => |text| self.allocator.free(text),
+                else => {},
             },
-            .pointer_button => |button| if (self.runtime) |runtime| try runtime.pointerButton(button),
-            .scroll => |scroll| if (self.runtime) |runtime| try runtime.scrollBy(scroll),
-            .key => |key| if (self.runtime) |runtime| try runtime.keyInput(key),
+            else => {},
         }
     }
 };
@@ -214,6 +269,7 @@ const CompatibilityPoll = struct {
     ring: *event_loop.IoUringLoop,
     loop: *event_loop.EventLoop,
     handle: ?event_loop.IoUringLoop.Handle = null,
+    ready: bool = false,
 
     fn arm(self: *CompatibilityPoll) !void {
         std.debug.assert(self.handle == null);
@@ -221,6 +277,7 @@ const CompatibilityPoll = struct {
     }
 
     fn cancel(self: *CompatibilityPoll) !void {
+        self.ready = false;
         const handle = self.handle orelse return;
         self.handle = null;
         if (self.ring.isActive(handle)) try self.ring.remove(handle);
@@ -239,6 +296,12 @@ const CompatibilityPoll = struct {
         const self: *CompatibilityPoll = @ptrCast(@alignCast(context));
         self.handle = null;
         if (completion.result < 0) return error.CompatibilityPollFailed;
+        self.ready = true;
+    }
+
+    fn dispatch(self: *CompatibilityPoll) !void {
+        std.debug.assert(self.ready and self.handle == null);
+        self.ready = false;
         try self.loop.dispatchReady();
         if (self.loop.isRunning()) try self.arm();
     }
@@ -1606,6 +1669,23 @@ test "queued key text is copied" {
     try std.testing.expectEqual(@as(usize, 1), queue.events.items.len);
     const input = queue.events.items[0].key;
     try std.testing.expectEqualStrings("ab", input.text);
+}
+
+test "Wayring events leave completion callbacks with owned key text" {
+    var runtime: runtime_mod.Runtime = undefined;
+    var context: WayringRunContext = .{
+        .allocator = std.testing.allocator,
+        .runtime = &runtime,
+    };
+    defer context.deinit();
+    var backend: WayringBackend = undefined;
+    var buffer = [_]u8{ 'a', 'b' };
+
+    try WayringRunContext.backendEvent(&context, &backend, .{ .key = .{ .text = &buffer } });
+    buffer[0] = 'z';
+
+    try std.testing.expectEqual(@as(usize, 1), context.events.items.len);
+    try std.testing.expectEqualStrings("ab", context.events.items[0].key.text);
 }
 
 test "queued escape dismisses an open popup" {
