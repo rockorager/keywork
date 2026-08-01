@@ -104,6 +104,14 @@ pub fn initConnect(
 pub fn waylandSocketPath(allocator: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
     const display: []const u8 = environ.getPosix("WAYLAND_DISPLAY") orelse "wayland-0";
     const runtime_dir = environ.getPosix("XDG_RUNTIME_DIR");
+    return waylandSocketPathFrom(allocator, runtime_dir, display);
+}
+
+pub fn waylandSocketPathFrom(
+    allocator: std.mem.Allocator,
+    runtime_dir: ?[]const u8,
+    display: []const u8,
+) ![]u8 {
     return composeSocketPath(allocator, runtime_dir, display);
 }
 

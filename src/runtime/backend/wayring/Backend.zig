@@ -137,6 +137,13 @@ pub fn currentSize(self: *const Backend) !Size {
     return .{ .width = size.width, .height = size.height };
 }
 
+pub fn isClosing(self: *const Backend) bool {
+    return switch (self.state) {
+        .closing, .closed, .disconnected, .fatal => true,
+        else => false,
+    };
+}
+
 fn clientNotify(context: *anyopaque, _: *Client, notification: Client.Notification) !void {
     const self: *Backend = @ptrCast(@alignCast(context));
     switch (notification) {

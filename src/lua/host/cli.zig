@@ -104,6 +104,8 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
             result.backend = .wayland_shm;
         } else if (std.mem.eql(u8, arg, "--backend=vulkan")) {
             result.backend = .vulkan;
+        } else if (std.mem.eql(u8, arg, "--backend=wayring")) {
+            result.backend = .wayring;
         } else if (std.mem.eql(u8, arg, "--backend=log")) {
             result.backend = .log;
         } else if (std.mem.eql(u8, arg, "--layer-shell")) {

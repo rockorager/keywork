@@ -16,6 +16,8 @@ const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
 const wayland_vulkan = @import("../backend/wayland/vulkan.zig");
 const wayland_window = @import("../backend/wayland/window.zig");
+const WayringBackend = @import("../backend/wayring/Backend.zig");
+const wayring_transport = @import("wayring-uring");
 
 const log = std.log.scoped(.keywork_runner);
 
@@ -74,7 +76,164 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
             runWaylandWindowed(allocator, loop, windows_host, options, wayland_vulkan.Backend)
         else
             runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
+        .wayring => runWayring(allocator, loop, app, options),
     };
+}
+
+fn runWayring(
+    allocator: std.mem.Allocator,
+    compatibility_loop: *event_loop.EventLoop,
+    app: keywork.AppHost,
+    options: Options,
+) !void {
+    if (options.windows_host != null or options.layer_shell != null or options.session_lock)
+        return error.UnsupportedWayringWindowMode;
+
+    const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";
+    const socket_path = try wayring_transport.waylandSocketPathFrom(
+        allocator,
+        processEnvironment("XDG_RUNTIME_DIR"),
+        display,
+    );
+    defer allocator.free(socket_path);
+
+    var ring = try event_loop.IoUringLoop.init(allocator);
+    defer ring.deinit();
+    var run_context: WayringRunContext = .{};
+    var backend: WayringBackend = undefined;
+    try backend.initConnect(
+        allocator,
+        socket_path,
+        &ring,
+        .{
+            .title = options.title,
+            .app_id = options.app_id,
+            .width = try wayland_window.frameDimension(options.width),
+            .height = try wayland_window.frameDimension(options.height),
+        },
+        &run_context,
+        WayringRunContext.backendEvent,
+    );
+    var backend_live = true;
+    defer if (backend_live) {
+        backend.beginClose() catch {};
+        while (!backend.readyToDeinit() and ring.hasActiveOperations()) {
+            backend.runOnce() catch {};
+        }
+        if (backend.readyToDeinit()) backend.deinit();
+    };
+    try backend.waitConfigured();
+
+    const configured_size = try backend.currentSize();
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var runtime = try runtime_mod.Runtime.initWithRasterCache(
+        allocator,
+        try backend.renderBackend(),
+        .{
+            .max_width = @floatFromInt(configured_size.width),
+            .max_height = @floatFromInt(configured_size.height),
+        },
+        app,
+        .no_preference,
+        &raster_cache,
+    );
+    defer runtime.deinit();
+    run_context.runtime = &runtime;
+    defer run_context.runtime = null;
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
+    runtime.setDeferredRepaint(true);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(compatibility_loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
+
+    if (!compatibility_loop.beginEmbedded()) {
+        run_context.stop = true;
+    }
+    defer compatibility_loop.endEmbedded();
+    var compatibility: CompatibilityPoll = .{
+        .ring = &ring,
+        .loop = compatibility_loop,
+    };
+    if (compatibility_loop.isRunning()) try compatibility.arm();
+    defer {
+        compatibility.cancel() catch {};
+        while (ring.hasActiveOperations() and backend.readyToDeinit()) ring.runOnce() catch break;
+    }
+
+    try runtime.repaint();
+    while (!backend.readyToDeinit()) {
+        if (run_context.stop or !compatibility_loop.isRunning()) {
+            try compatibility.cancel();
+            try backend.beginClose();
+        }
+        try backend.runOnce();
+        try runtime.flushPendingRepaint();
+    }
+    try compatibility.cancel();
+    while (ring.hasActiveOperations()) try ring.runOnce();
+    backend.deinit();
+    backend_live = false;
+}
+
+const WayringRunContext = struct {
+    runtime: ?*runtime_mod.Runtime = null,
+    stop: bool = false,
+
+    fn backendEvent(
+        context: *anyopaque,
+        _: *WayringBackend,
+        event: WayringBackend.Event,
+    ) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        switch (event) {
+            .configured => |size| if (self.runtime) |runtime| try runtime.configure(.{
+                .width = @floatFromInt(size.width),
+                .height = @floatFromInt(size.height),
+            }),
+            .repaint => if (self.runtime) |runtime| try runtime.frameDone(),
+            .close, .disconnected, .fatal => self.stop = true,
+        }
+    }
+};
+
+const CompatibilityPoll = struct {
+    ring: *event_loop.IoUringLoop,
+    loop: *event_loop.EventLoop,
+    handle: ?event_loop.IoUringLoop.Handle = null,
+
+    fn arm(self: *CompatibilityPoll) !void {
+        std.debug.assert(self.handle == null);
+        self.handle = try self.ring.queue(self, complete, self, prepare);
+    }
+
+    fn cancel(self: *CompatibilityPoll) !void {
+        const handle = self.handle orelse return;
+        self.handle = null;
+        if (self.ring.isActive(handle)) try self.ring.remove(handle);
+    }
+
+    fn prepare(context: *anyopaque, sqe: *std.os.linux.io_uring_sqe) void {
+        const self: *CompatibilityPoll = @ptrCast(@alignCast(context));
+        sqe.prep_poll_add(self.loop.pollFd(), std.os.linux.POLL.IN);
+    }
+
+    fn complete(
+        context: *anyopaque,
+        _: *event_loop.IoUringLoop,
+        completion: event_loop.IoUringLoop.Completion,
+    ) !void {
+        const self: *CompatibilityPoll = @ptrCast(@alignCast(context));
+        self.handle = null;
+        if (completion.result < 0) return error.CompatibilityPollFailed;
+        try self.loop.dispatchReady();
+        if (self.loop.isRunning()) try self.arm();
+    }
+};
+
+fn processEnvironment(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
 }
 
 fn runLog(

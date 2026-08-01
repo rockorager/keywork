@@ -4,4 +4,5 @@ pub const BackendKind = enum {
     log,
     wayland_shm,
     vulkan,
+    wayring,
 };
