@@ -26,6 +26,7 @@ const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
+const PointerGesturesGlobal = @import("PointerGesturesGlobal.zig");
 const TabletGlobal = @import("TabletGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
@@ -77,6 +78,7 @@ fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 relative_pointer_global: RelativePointerGlobal,
+pointer_gestures_global: PointerGesturesGlobal,
 tablet_global: TabletGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
@@ -111,6 +113,7 @@ keyboard_enter_keys: std.ArrayList(u32) = .empty,
 touch_routes: std.ArrayList(TouchRoute) = .empty,
 pointer_axes: [2]PendingAxis = .{ .{}, .{} },
 pointer_axis_source: ?u32 = null,
+active_gesture: ?RoutedGesture = null,
 keyboard_available: bool = false,
 pointer_available: bool = false,
 touch_available: bool = false,
@@ -313,6 +316,13 @@ const RoutedButton = struct {
     button: u32,
 };
 
+const GestureKind = enum { swipe, pinch, hold };
+
+const RoutedGesture = struct {
+    device_id: NativeInput.DeviceId,
+    kind: GestureKind,
+};
+
 const PendingAxis = struct {
     active: bool = false,
     time_milliseconds: u32 = 0,
@@ -479,6 +489,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.seat_global,
     );
     errdefer self.relative_pointer_global.deinit();
+    try self.pointer_gestures_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+    );
+    errdefer self.pointer_gestures_global.deinit();
     try self.tablet_global.init(
         allocator,
         &self.server,
@@ -502,6 +518,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.touch_routes = .empty;
     self.pointer_axes = .{ .{}, .{} };
     self.pointer_axis_source = null;
+    self.active_gesture = null;
     self.keyboard_available = false;
     self.pointer_available = false;
     self.touch_available = false;
@@ -735,6 +752,7 @@ pub fn destroy(self: *NativeServer) void {
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.tablet_global.deinit();
+    self.pointer_gestures_global.deinit();
     self.relative_pointer_global.deinit();
     self.seat_global.deinit();
     self.commit_timing_global.deinit();
@@ -901,14 +919,14 @@ fn nativeInputListener(self: *NativeServer) NativeInput.Listener {
         .pointer_axis_stop = nativePointerAxisStop,
         .pointer_axis_discrete = nativePointerAxisDiscrete,
         .pointer_axis_value120 = nativePointerAxisValue120,
-        .swipe_begin = ignoreSwipeBegin,
-        .swipe_update = ignoreSwipeUpdate,
-        .swipe_end = ignoreSwipeEnd,
-        .pinch_begin = ignorePinchBegin,
-        .pinch_update = ignorePinchUpdate,
-        .pinch_end = ignorePinchEnd,
-        .hold_begin = ignoreHoldBegin,
-        .hold_end = ignoreHoldEnd,
+        .swipe_begin = nativeSwipeBegin,
+        .swipe_update = nativeSwipeUpdate,
+        .swipe_end = nativeSwipeEnd,
+        .pinch_begin = nativePinchBegin,
+        .pinch_update = nativePinchUpdate,
+        .pinch_end = nativePinchEnd,
+        .hold_begin = nativeHoldBegin,
+        .hold_end = nativeHoldEnd,
         .tablet_tool_proximity = nativeTabletToolProximity,
         .tablet_tool_axis = nativeTabletToolAxis,
         .tablet_tool_tip = nativeTabletToolTip,
@@ -1021,6 +1039,7 @@ fn nativePointerAvailable(context: *anyopaque, available: bool) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.pointer_available = available;
     if (!available) {
+        self.cancelActiveGesture() catch return self.terminate();
         self.routed_buttons.clearRetainingCapacity();
         self.pointer_axes = .{ .{}, .{} };
         self.pointer_axis_source = null;
@@ -1218,6 +1237,8 @@ fn nativeInputDeviceAdded(context: *anyopaque, device: NativeInput.DeviceInfo) v
 
 fn nativeInputDeviceRemoved(context: *anyopaque, device_id: NativeInput.DeviceId) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.active_gesture) |gesture| if (gesture.device_id == device_id)
+        self.cancelActiveGesture() catch return self.terminate();
     self.tablet_global.removePad(device_id) catch return self.terminate();
     self.tablet_global.removeTablet(device_id) catch return self.terminate();
     self.releaseDeviceKeys(device_id) catch return self.terminate();
@@ -1228,14 +1249,103 @@ fn nativeInputDeviceRemoved(context: *anyopaque, device_id: NativeInput.DeviceId
     };
 }
 
-fn ignoreSwipeBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
-fn ignoreSwipeUpdate(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: f64, _: f64) void {}
-fn ignoreSwipeEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
-fn ignorePinchBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
-fn ignorePinchUpdate(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: f64, _: f64, _: f64, _: f64) void {}
-fn ignorePinchEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
-fn ignoreHoldBegin(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: u32) void {}
-fn ignoreHoldEnd(_: *anyopaque, _: NativeInput.DeviceId, _: u32, _: bool) void {}
+fn nativeSwipeBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.beginGesture(device_id, time, fingers, .swipe) catch self.terminate();
+}
+
+fn nativeSwipeUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const gesture = self.active_gesture orelse return;
+    if (gesture.device_id != device_id or gesture.kind != .swipe) return;
+    self.pointer_gestures_global.updateSwipe(time, dx, dy) catch self.terminate();
+}
+
+fn nativeSwipeEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.endGesture(device_id, time, .swipe, cancelled) catch self.terminate();
+}
+
+fn nativePinchBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.beginGesture(device_id, time, fingers, .pinch) catch self.terminate();
+}
+
+fn nativePinchUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64, scale: f64, rotation: f64) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const gesture = self.active_gesture orelse return;
+    if (gesture.device_id != device_id or gesture.kind != .pinch) return;
+    self.pointer_gestures_global.updatePinch(
+        time,
+        dx,
+        dy,
+        scale,
+        rotation,
+    ) catch self.terminate();
+}
+
+fn nativePinchEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.endGesture(device_id, time, .pinch, cancelled) catch self.terminate();
+}
+
+fn nativeHoldBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.beginGesture(device_id, time, fingers, .hold) catch self.terminate();
+}
+
+fn nativeHoldEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.endGesture(device_id, time, .hold, cancelled) catch self.terminate();
+}
+
+fn beginGesture(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    fingers: u32,
+    kind: GestureKind,
+) !void {
+    try self.cancelActiveGesture();
+    self.active_gesture = .{ .device_id = device_id, .kind = kind };
+    switch (kind) {
+        .swipe => try self.pointer_gestures_global.beginSwipe(time, fingers),
+        .pinch => try self.pointer_gestures_global.beginPinch(time, fingers),
+        .hold => try self.pointer_gestures_global.beginHold(time, fingers),
+    }
+}
+
+fn endGesture(
+    self: *NativeServer,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    kind: GestureKind,
+    cancelled: bool,
+) !void {
+    const gesture = self.active_gesture orelse return;
+    if (gesture.device_id != device_id or gesture.kind != kind) return;
+    self.active_gesture = null;
+    try self.sendGestureEnd(kind, time, cancelled);
+}
+
+fn cancelActiveGesture(self: *NativeServer) !void {
+    const gesture = self.active_gesture orelse return;
+    self.active_gesture = null;
+    try self.sendGestureEnd(gesture.kind, 0, true);
+}
+
+fn sendGestureEnd(
+    self: *NativeServer,
+    kind: GestureKind,
+    time: u32,
+    cancelled: bool,
+) !void {
+    switch (kind) {
+        .swipe => try self.pointer_gestures_global.endSwipe(time, cancelled),
+        .pinch => try self.pointer_gestures_global.endPinch(time, cancelled),
+        .hold => try self.pointer_gestures_global.endHold(time, cancelled),
+    }
+}
 
 fn nativeTabletToolProximity(
     context: *anyopaque,
@@ -1854,6 +1964,7 @@ fn refreshInputFocus(self: *NativeServer, time: u32) !void {
 }
 
 fn deinitInputState(self: *NativeServer) void {
+    self.active_gesture = null;
     for (self.touch_routes.items) |route| route.surface.unreference();
     self.touch_routes.deinit(self.allocator);
     self.keyboard_enter_keys.deinit(self.allocator);
