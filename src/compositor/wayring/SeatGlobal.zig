@@ -37,6 +37,16 @@ keymap_size: u32 = 0,
 repeat_rate: i32 = 0,
 repeat_delay: i32 = 0,
 repeat_info_set: bool = false,
+selection_serials: [selection_serial_capacity]SelectionSerial = undefined,
+selection_serial_count: usize = 0,
+next_selection_serial: usize = 0,
+
+const selection_serial_capacity = 32;
+
+const SelectionSerial = struct {
+    client: *Server.Client,
+    serial: u32,
+};
 
 pub const Capability = generated.wl_seat_types.capability;
 
@@ -191,6 +201,7 @@ pub fn pointerMotion(self: *SeatGlobal, time: u32, x: i32, y: i32) !bool {
 pub fn pointerButton(self: *SeatGlobal, time: u32, button: u32, state: u32) !?u32 {
     const surface = self.pointer_focus orelse return null;
     const serial = self.server.nextSerial();
+    self.recordSelectionSerial(surface.client, serial);
     for (self.children.items) |child| if (matches(child, .pointer, surface))
         try generated.wl_pointer_types.events.button(&child.client.connection, child.resource, serial, time, button, state);
     return serial;
@@ -244,6 +255,7 @@ pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys
     self.keyboard_held_keys.appendSliceAssumeCapacity(keys);
     try setFocus(&self.keyboard_focus, surface);
     const serial = self.server.nextSerial();
+    self.recordSelectionSerial(surface.client, serial);
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
         try generated.wl_keyboard_types.events.enter(
             &child.client.connection,
@@ -274,6 +286,7 @@ pub fn keyboardKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
     }
     const surface = self.keyboard_focus orelse return null;
     const serial = self.server.nextSerial();
+    self.recordSelectionSerial(surface.client, serial);
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
         try generated.wl_keyboard_types.events.key(&child.client.connection, child.resource, serial, time, key, state);
     return serial;
@@ -312,6 +325,23 @@ pub fn keyboardFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.keyboard_focus;
 }
 
+/// Returns whether resource is a binding of this seat owned by client.
+pub fn ownsResource(self: *const SeatGlobal, client: *const Server.Client, resource_id: u32) bool {
+    for (self.bindings.items) |binding| {
+        if (binding.client == client and binding.resource.id == resource_id) return true;
+    }
+    return false;
+}
+
+/// Selection claims accept a bounded history of input serials delivered to
+/// the claiming client rather than only the most recent event.
+pub fn acceptsSelectionSerial(self: *const SeatGlobal, client: *const Server.Client, serial: u32) bool {
+    for (self.selection_serials[0..self.selection_serial_count]) |entry| {
+        if (entry.client == client and entry.serial == serial) return true;
+    }
+    return false;
+}
+
 pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u32, id: i32, x: i32, y: i32) !u32 {
     if (self.touch_focus != null and self.touch_focus != surface)
         try self.touchCancel();
@@ -321,6 +351,7 @@ pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u3
     self.touch_finish_pending = false;
     try setFocus(&self.touch_focus, surface);
     const serial = self.server.nextSerial();
+    self.recordSelectionSerial(surface.client, serial);
     for (self.children.items) |child| if (matchesTouchSequence(self, child, surface))
         try generated.wl_touch_types.events.down(&child.client.connection, child.resource, serial, time, surface.resource, id, x, y);
     return serial;
@@ -329,6 +360,7 @@ pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u3
 pub fn touchUp(self: *SeatGlobal, time: u32, id: i32) !?u32 {
     const surface = self.touch_focus orelse return null;
     const serial = self.server.nextSerial();
+    self.recordSelectionSerial(surface.client, serial);
     for (self.children.items) |child| if (matchesTouchSequence(self, child, surface))
         try generated.wl_touch_types.events.up(&child.client.connection, child.resource, serial, time, id);
     return serial;
@@ -454,6 +486,7 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
                 if (self.keyboard_focus) |surface| {
                     if (surface.client == client and surface.resource_alive) {
                         const serial = self.server.nextSerial();
+                        self.recordSelectionSerial(client, serial);
                         try generated.wl_keyboard_types.events.enter(
                             &client.connection,
                             child.resource,
@@ -602,6 +635,19 @@ fn beginCapabilityGeneration(self: *SeatGlobal, kind: ChildKind) void {
         1,
     ) catch unreachable;
     self.ever_available[index] = true;
+}
+
+fn recordSelectionSerial(self: *SeatGlobal, client: *Server.Client, serial: u32) void {
+    self.selection_serials[self.next_selection_serial] = .{
+        .client = client,
+        .serial = serial,
+    };
+    self.next_selection_serial =
+        (self.next_selection_serial + 1) % selection_serial_capacity;
+    self.selection_serial_count = @min(
+        self.selection_serial_count + 1,
+        selection_serial_capacity,
+    );
 }
 
 fn childKindIndex(kind: ChildKind) usize {
