@@ -1086,7 +1086,7 @@ pub fn createWithVirtualOutput(
     errdefer self.window_transitions.deinit(allocator);
     errdefer self.workspace_transitions.deinit(allocator);
     if (output_kind == .drm) {
-        try self.session.init(allocator, display.getEventLoop());
+        try self.session.init(allocator, .{ .wayland = display.getEventLoop() });
         self.session_initialized = true;
         errdefer self.session.deinit();
         try self.drm_device.init(
@@ -1709,7 +1709,7 @@ pub fn createWithVirtualOutput(
         try self.native_input.init(
             allocator,
             io,
-            display.getEventLoop(),
+            .{ .wayland = display.getEventLoop() },
             &self.session,
             render_output.backend.size(),
             nativeInputListener(render_output),
@@ -5253,14 +5253,14 @@ fn serverForOutput(context: *anyopaque) *Self {
     return output.server;
 }
 
-fn nativeKeyboardKeymap(context: *anyopaque, source: ?NativeInput.DeviceId, format: wl.Keyboard.KeymapFormat, fd: std.posix.fd_t, size: u32) void {
+fn nativeKeyboardKeymap(context: *anyopaque, source: ?NativeInput.DeviceId, format: NativeInput.KeyboardKeymapFormat, fd: std.posix.fd_t, size: u32) void {
     const self = serverForOutput(context);
     const seat = if (source) |id| self.seatForDevice(id) else &self.seat;
-    seat.setKeymap(format, fd, size);
+    seat.setKeymap(@enumFromInt(@intFromEnum(format)), fd, size);
 }
-fn nativeKeyboardKey(context: *anyopaque, id: NativeInput.DeviceId, time: u32, key: u32, state: wl.Keyboard.KeyState) void {
+fn nativeKeyboardKey(context: *anyopaque, id: NativeInput.DeviceId, time: u32, key: u32, state: NativeInput.KeyState) void {
     const self = serverForOutput(context);
-    self.routeKeyboardKey(id, time, key, state);
+    self.routeKeyboardKey(id, time, key, @enumFromInt(@intFromEnum(state)));
 }
 fn nativeKeyboardModifiers(context: *anyopaque, source: ?NativeInput.DeviceId, depressed: u32, latched: u32, locked: u32, group: u32) void {
     const self = serverForOutput(context);
@@ -5304,30 +5304,30 @@ fn nativePointerRelativeMotion(context: *anyopaque, id: NativeInput.DeviceId, ti
         point.y,
     );
 }
-fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32, button: u32, state: wl.Pointer.ButtonState) void {
+fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32, button: u32, state: NativeInput.ButtonState) void {
     const self = serverForOutput(context);
-    self.routePointerButton(id, time, button, state);
+    self.routePointerButton(id, time, button, @enumFromInt(@intFromEnum(state)));
 }
-fn nativePointerAxis(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
+fn nativePointerAxis(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: NativeInput.Axis, value: i32) void {
     const self = serverForOutput(context);
     const seat = self.seatForDevice(id);
     self.idle_notify.notifyActivity(seat);
-    seat.pointerAxis(time, axis, value);
+    seat.pointerAxis(time, @enumFromInt(@intFromEnum(axis)), @enumFromInt(value));
 }
 fn nativePointerFrame(context: *anyopaque, id: NativeInput.DeviceId) void {
     serverForOutput(context).seatForDevice(id).pointerFrame();
 }
-fn nativePointerAxisSource(context: *anyopaque, id: NativeInput.DeviceId, source: wl.Pointer.AxisSource) void {
-    serverForOutput(context).seatForDevice(id).pointerAxisSource(source);
+fn nativePointerAxisSource(context: *anyopaque, id: NativeInput.DeviceId, source: NativeInput.AxisSource) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisSource(@enumFromInt(@intFromEnum(source)));
 }
-fn nativePointerAxisStop(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis) void {
-    serverForOutput(context).seatForDevice(id).pointerAxisStop(time, axis);
+fn nativePointerAxisStop(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: NativeInput.Axis) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisStop(time, @enumFromInt(@intFromEnum(axis)));
 }
-fn nativePointerAxisDiscrete(context: *anyopaque, id: NativeInput.DeviceId, axis: wl.Pointer.Axis, discrete: i32) void {
-    serverForOutput(context).seatForDevice(id).pointerAxisDiscrete(axis, discrete);
+fn nativePointerAxisDiscrete(context: *anyopaque, id: NativeInput.DeviceId, axis: NativeInput.Axis, discrete: i32) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisDiscrete(@enumFromInt(@intFromEnum(axis)), discrete);
 }
-fn nativePointerAxisValue120(context: *anyopaque, id: NativeInput.DeviceId, axis: wl.Pointer.Axis, value: i32) void {
-    serverForOutput(context).seatForDevice(id).pointerAxisValue120(axis, value);
+fn nativePointerAxisValue120(context: *anyopaque, id: NativeInput.DeviceId, axis: NativeInput.Axis, value: i32) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisValue120(@enumFromInt(@intFromEnum(axis)), value);
 }
 fn nativeSwipeBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fingers: u32) void {
     serverForOutput(context).beginGesture(id, time, fingers, .swipe);
