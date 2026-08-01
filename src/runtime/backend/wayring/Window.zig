@@ -12,9 +12,25 @@ const VulkanWindow = @import("VulkanWindow.zig");
 pub const Event = enum { configured, repaint, close };
 pub const ResizeEdge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
 
+const Role = union(enum) {
+    toplevel: struct {
+        xdg_surface: wayring.ObjectHandle,
+        toplevel: wayring.ObjectHandle,
+    },
+    popup: struct {
+        xdg_surface: wayring.ObjectHandle,
+        popup: wayring.ObjectHandle,
+    },
+    layer: wayring.ObjectHandle,
+    session_lock: wayring.ObjectHandle,
+};
+
 allocator: std.mem.Allocator,
 client: *Client,
-handles: Client.Window,
+surface: wayring.ObjectHandle,
+viewport: ?wayring.ObjectHandle,
+fractional_scale: ?wayring.ObjectHandle,
+role: Role,
 renderer: VulkanWindow,
 frame_callback: ?wayring.ObjectHandle = null,
 width: u32,
@@ -67,7 +83,13 @@ pub fn init(
     return .{
         .allocator = allocator,
         .client = client,
-        .handles = handles,
+        .surface = handles.surface,
+        .viewport = handles.viewport,
+        .fractional_scale = handles.fractional_scale,
+        .role = .{ .toplevel = .{
+            .xdg_surface = handles.xdg_surface,
+            .toplevel = handles.toplevel,
+        } },
         .renderer = renderer,
         .width = default_width,
         .height = default_height,
@@ -90,17 +112,19 @@ pub fn beginClose(self: *Window) !void {
     if (self.closing) return;
     self.closing = true;
     self.closed = true;
-    try protocol.wl_surface_types.requests.attach(
-        self.client.connectionPtr(),
-        self.handles.surface,
-        null,
-        0,
-        0,
-    );
-    try protocol.wl_surface_types.requests.commit(
-        self.client.connectionPtr(),
-        self.handles.surface,
-    );
+    if (self.role != .session_lock) {
+        try protocol.wl_surface_types.requests.attach(
+            self.client.connectionPtr(),
+            self.surface,
+            null,
+            0,
+            0,
+        );
+        try protocol.wl_surface_types.requests.commit(
+            self.client.connectionPtr(),
+            self.surface,
+        );
+    }
     try self.finishClose();
     try self.client.flush();
 }
@@ -118,10 +142,9 @@ pub fn renderBackend(self: *Window) keywork.RenderBackend {
 }
 
 pub fn ownsObject(self: *const Window, id: u32) bool {
-    return id == self.handles.surface.id or
-        id == self.handles.xdg_surface.id or
-        id == self.handles.toplevel.id or
-        (self.handles.fractional_scale != null and id == self.handles.fractional_scale.?.id) or
+    return id == self.surface.id or
+        self.roleOwnsObject(id) or
+        (self.fractional_scale != null and id == self.fractional_scale.?.id) or
         (self.frame_callback != null and id == self.frame_callback.?.id) or
         self.renderer.ownsObject(id);
 }
@@ -132,10 +155,11 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         if (self.closing) try self.finishClose();
         return null;
     }
-    if (message.object_id == self.handles.toplevel.id) {
+    if (self.role == .toplevel and message.object_id == self.role.toplevel.toplevel.id) {
+        const role = self.role.toplevel;
         switch (try protocol.xdg_toplevel_types.decodeEvent(
             self.client.connectionPtr(),
-            self.handles.toplevel,
+            role.toplevel,
             message,
         )) {
             .configure => |event| {
@@ -150,15 +174,16 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         }
         return null;
     }
-    if (message.object_id == self.handles.xdg_surface.id) {
+    if (self.role == .toplevel and message.object_id == self.role.toplevel.xdg_surface.id) {
+        const role = self.role.toplevel;
         const configure = (try protocol.xdg_surface_types.decodeEvent(
             self.client.connectionPtr(),
-            self.handles.xdg_surface,
+            role.xdg_surface,
             message,
         )).configure;
         try protocol.xdg_surface_types.requests.ack_configure(
             self.client.connectionPtr(),
-            self.handles.xdg_surface,
+            role.xdg_surface,
             configure.serial,
         );
         self.width = self.pending_width;
@@ -181,10 +206,10 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
             return .repaint;
         }
     }
-    if (message.object_id == self.handles.surface.id) {
+    if (message.object_id == self.surface.id) {
         switch (try protocol.wl_surface_types.decodeEvent(
             self.client.connectionPtr(),
-            self.handles.surface,
+            self.surface,
             message,
         )) {
             .enter => |event| {
@@ -209,7 +234,7 @@ pub fn handleMessage(self: *Window, message: *const wayring.Message) !?Event {
         }
         return null;
     }
-    if (self.handles.fractional_scale) |fractional_scale| {
+    if (self.fractional_scale) |fractional_scale| {
         if (message.object_id == fractional_scale.id) {
             const preferred = (try protocol.wp_fractional_scale_v1_types.decodeEvent(
                 self.client.connectionPtr(),
@@ -248,11 +273,11 @@ pub fn isClosed(self: *const Window) bool {
 }
 
 pub fn surfaceId(self: *const Window) u32 {
-    return self.handles.surface.id;
+    return self.surface.id;
 }
 
 pub fn surfaceHandle(self: *const Window) wayring.ObjectHandle {
-    return self.handles.surface;
+    return self.surface;
 }
 
 pub fn cursorScale(self: *const Window) u32 {
@@ -260,9 +285,13 @@ pub fn cursorScale(self: *const Window) u32 {
 }
 
 pub fn startMove(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
+    const role = switch (self.role) {
+        .toplevel => |value| value,
+        else => return error.NotToplevel,
+    };
     try protocol.xdg_toplevel_types.requests.move(
         self.client.connectionPtr(),
-        self.handles.toplevel,
+        role.toplevel,
         seat,
         serial,
     );
@@ -270,6 +299,10 @@ pub fn startMove(self: *Window, seat: wayring.ObjectHandle, serial: u32) !void {
 }
 
 pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge: ResizeEdge) !void {
+    const role = switch (self.role) {
+        .toplevel => |value| value,
+        else => return error.NotToplevel,
+    };
     const protocol_edge: protocol.xdg_toplevel_types.resize_edge = switch (edge) {
         .top => .top,
         .bottom => .bottom,
@@ -282,7 +315,7 @@ pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge:
     };
     try protocol.xdg_toplevel_types.requests.resize(
         self.client.connectionPtr(),
-        self.handles.toplevel,
+        role.toplevel,
         seat,
         serial,
         @intFromEnum(protocol_edge),
@@ -291,7 +324,7 @@ pub fn startResize(self: *Window, seat: wayring.ObjectHandle, serial: u32, edge:
 }
 
 pub fn outputScaleChanged(self: *Window) !?Event {
-    if (self.handles.fractional_scale != null or self.preferred_buffer_scale != null) return null;
+    if (self.fractional_scale != null or self.preferred_buffer_scale != null) return null;
     return self.applyScale();
 }
 
@@ -327,7 +360,7 @@ fn renderBackendTextMetrics(context: *anyopaque, font_size: f32) !keywork.TextMe
 }
 
 fn applyScale(self: *Window) !?Event {
-    if (self.handles.fractional_scale != null) return null;
+    if (self.fractional_scale != null) return null;
     var next_scale = self.preferred_buffer_scale orelse 1;
     if (self.preferred_buffer_scale == null) {
         for (self.entered_outputs.items) |output_id| {
@@ -339,7 +372,7 @@ fn applyScale(self: *Window) !?Event {
     if (next_scale_120 == self.scale_120) return null;
     try protocol.wl_surface_types.requests.set_buffer_scale(
         self.client.connectionPtr(),
-        self.handles.surface,
+        self.surface,
         @intCast(next_scale),
     );
     return self.applyScale120(next_scale_120);
@@ -356,7 +389,7 @@ fn applyScale120(self: *Window, next_scale_120: u32) !?Event {
 }
 
 fn configureScale(self: *Window) !void {
-    if (self.handles.viewport) |viewport| {
+    if (self.viewport) |viewport| {
         const logical_width = std.math.cast(i32, self.width) orelse return error.DimensionOverflow;
         const logical_height = std.math.cast(i32, self.height) orelse return error.DimensionOverflow;
         try protocol.wp_viewport_types.requests.set_destination(
@@ -401,31 +434,54 @@ fn destroyProtocol(client: *Client, handles: Client.Window) void {
 
 fn finishClose(self: *Window) !void {
     if (self.protocol_destroyed or !try self.renderer.retireAll()) return;
-    if (self.handles.fractional_scale) |fractional_scale| {
+    if (self.fractional_scale) |fractional_scale| {
         try protocol.wp_fractional_scale_v1_types.requests.destroy(
             self.client.connectionPtr(),
             fractional_scale,
         );
     }
-    if (self.handles.viewport) |viewport| {
+    if (self.viewport) |viewport| {
         try protocol.wp_viewport_types.requests.destroy(
             self.client.connectionPtr(),
             viewport,
         );
     }
-    try protocol.xdg_toplevel_types.requests.destroy(
-        self.client.connectionPtr(),
-        self.handles.toplevel,
-    );
-    try protocol.xdg_surface_types.requests.destroy(
-        self.client.connectionPtr(),
-        self.handles.xdg_surface,
-    );
+    try self.destroyRole();
     try protocol.wl_surface_types.requests.destroy(
         self.client.connectionPtr(),
-        self.handles.surface,
+        self.surface,
     );
     self.protocol_destroyed = true;
+}
+
+fn roleOwnsObject(self: *const Window, id: u32) bool {
+    return switch (self.role) {
+        .toplevel => |role| id == role.xdg_surface.id or id == role.toplevel.id,
+        .popup => |role| id == role.xdg_surface.id or id == role.popup.id,
+        .layer => |role| id == role.id,
+        .session_lock => |role| id == role.id,
+    };
+}
+
+fn destroyRole(self: *Window) !void {
+    switch (self.role) {
+        .toplevel => |role| {
+            try protocol.xdg_toplevel_types.requests.destroy(self.client.connectionPtr(), role.toplevel);
+            try protocol.xdg_surface_types.requests.destroy(self.client.connectionPtr(), role.xdg_surface);
+        },
+        .popup => |role| {
+            try protocol.xdg_popup_types.requests.destroy(self.client.connectionPtr(), role.popup);
+            try protocol.xdg_surface_types.requests.destroy(self.client.connectionPtr(), role.xdg_surface);
+        },
+        .layer => |role| try protocol.zwlr_layer_surface_v1_types.requests.destroy(
+            self.client.connectionPtr(),
+            role,
+        ),
+        .session_lock => |role| try protocol.ext_session_lock_surface_v1_types.requests.destroy(
+            self.client.connectionPtr(),
+            role,
+        ),
+    }
 }
 
 test {
