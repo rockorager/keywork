@@ -73,7 +73,6 @@ pub const Commit = struct {
     offset_y: i32,
     viewport: surface_geometry.ViewportState,
     synchronization: ?DrmSyncobj.Commit = null,
-    frame_finished: bool = false,
 
     pub fn deinit(self: *Commit) void {
         if (self.synchronization) |*synchronization| {
@@ -88,23 +87,58 @@ pub const Commit = struct {
         self.* = undefined;
     }
 
-    /// Completes all frame callbacks atomically after the compositor presents
-    /// this commit. Callback resources are retired after their done events.
-    pub fn finishFrame(self: *Commit, time_milliseconds: u32) !void {
-        if (self.frame_finished) return error.FrameAlreadyFinished;
-        for (self.frame_callbacks) |callback| {
-            try generated.wl_callback_types.events.done(
-                &self.surface.client.connection,
-                callback,
-                time_milliseconds,
-            );
-            try self.surface.client.destroyResource(callback);
-        }
-        self.frame_finished = true;
-    }
-
     pub fn releaseBuffer(self: *Commit) !void {
         try self.attachment.releaseBuffer(self.surface.client);
+    }
+
+    /// Transfers this commit's callbacks so an output scheduler can retain
+    /// them until it actually accepts a frame. The returned batch owns one
+    /// surface reference and the callback slice.
+    pub fn takeFrameCallbacks(self: *Commit) !?FrameCallbacks {
+        if (self.frame_callbacks.len == 0) return null;
+        try self.surface.reference();
+        const callbacks = self.frame_callbacks;
+        self.frame_callbacks = &.{};
+        return .{
+            .allocator = self.allocator,
+            .surface = self.surface,
+            .callbacks = callbacks,
+        };
+    }
+};
+
+pub const FrameCallbacks = struct {
+    allocator: std.mem.Allocator,
+    surface: *Surface,
+    callbacks: []wayring.ObjectHandle,
+    finished: bool = false,
+
+    pub fn finish(self: *FrameCallbacks, time_milliseconds: u32) !void {
+        if (self.finished) return error.FrameAlreadyFinished;
+        if (self.surface.client.state == .active) {
+            for (self.callbacks) |callback| {
+                try generated.wl_callback_types.events.done(
+                    &self.surface.client.connection,
+                    callback,
+                    time_milliseconds,
+                );
+                self.surface.client.destroyResource(callback) catch |err| switch (err) {
+                    error.UnknownResource, error.StaleObject => {},
+                    else => return err,
+                };
+            }
+        }
+        self.finished = true;
+    }
+
+    pub fn deinit(self: *FrameCallbacks) void {
+        if (!self.finished and self.surface.client.state == .active) {
+            for (self.callbacks) |callback|
+                self.surface.client.destroyResource(callback) catch {};
+        }
+        self.allocator.free(self.callbacks);
+        self.surface.unreference();
+        self.* = undefined;
     }
 };
 
@@ -759,7 +793,9 @@ test "native surfaces queue atomic damage-aware SHM commits" {
     );
     try std.testing.expectEqual(callback.id, commit.frame_callbacks[0].id);
     try commit.releaseBuffer();
-    try commit.finishFrame(42);
+    var callbacks = (try commit.takeFrameCallbacks()).?;
+    defer callbacks.deinit();
+    try callbacks.finish(42);
     try transferFromServer(&peer, client);
     var got_release = false;
     var got_frame = false;

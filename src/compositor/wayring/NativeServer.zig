@@ -28,15 +28,22 @@ const shm = @import("shm.zig");
 const DrmSyncobj = @import("../drm_syncobj.zig");
 const Renderer = @import("../render/Renderer.zig");
 const HeadlessOutput = @import("../backend/headless.zig");
+const DrmOutput = @import("../backend/drm.zig");
+const DrmDevice = @import("../backend/drm_device.zig");
+const Session = @import("../backend/session.zig");
+const Region = @import("../region.zig");
+const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 const surface_geometry = @import("../surface_geometry.zig");
 
 const EventLoop = keywork_loop.EventLoop;
 const IoUringLoop = keywork_loop.IoUringLoop;
+const maximum_output_busy_retries = 60;
 
 allocator: std.mem.Allocator,
 io: std.Io,
 event_loop: EventLoop,
+repaint_timer: *EventLoop.Timer,
 server: Server,
 shm_global: ShmGlobal,
 linux_dmabuf_global: LinuxDmabufGlobal,
@@ -51,12 +58,20 @@ viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
 transport: IoUringServer,
 renderer: Renderer,
-output: HeadlessOutput,
+output: Output,
+session: Session,
+session_initialized: bool,
+drm_device: DrmDevice,
+drm_device_initialized: bool,
+drm_listener_installed: bool,
 display_name: []u8,
 socket_path: [:0]u8,
 surfaces: std.ArrayList(*SurfaceState) = .empty,
 pending: std.ArrayList(*PendingTransaction) = .empty,
+frame_callbacks: std.ArrayList(CompositorGlobal.FrameCallbacks) = .empty,
 frame_count: u64 = 0,
+repaint_needed: bool = false,
+output_busy_retries: u8 = 0,
 terminating: bool = false,
 signal_fd: i32 = -1,
 signal_info: linux.signalfd_siginfo = undefined,
@@ -74,8 +89,12 @@ pub const Options = struct {
     scale: render.Scale = .{},
     refresh_millihertz: i32 = 60_000,
     renderer_kind: Renderer.Kind = .cpu,
+    output_kind: OutputKind = .headless,
+    drm_device_path: ?[]const u8 = null,
     listen_backlog: u31 = 128,
 };
+
+pub const OutputKind = enum { headless, drm };
 
 pub const FrameInspection = struct {
     size: render.Size,
@@ -99,6 +118,74 @@ const SurfaceState = struct {
         if (self.dmabuf) |*dmabuf| dmabuf.deinit(self.surface.client, true);
         self.surface.unreference();
         allocator.destroy(self);
+    }
+};
+
+const Output = union(OutputKind) {
+    headless: HeadlessOutput,
+    drm: ?*DrmOutput,
+
+    fn modeSize(self: *const Output) render.Size {
+        return switch (self.*) {
+            .headless => |output| output.size,
+            .drm => |output| output.?.size,
+        };
+    }
+
+    fn logicalSize(self: *const Output) render.Size {
+        return switch (self.*) {
+            .headless => |output| output.logicalSize(),
+            .drm => |output| output.?.logicalSize(),
+        };
+    }
+
+    fn physicalSize(self: *const Output) render.Size {
+        return switch (self.*) {
+            .headless => |output| output.size,
+            .drm => |output| output.?.physical_size,
+        };
+    }
+
+    fn scale(self: *const Output) render.Scale {
+        return switch (self.*) {
+            .headless => |output| output.scale,
+            .drm => |output| output.?.scale,
+        };
+    }
+
+    fn refreshMillihertz(self: *const Output) i32 {
+        return switch (self.*) {
+            .headless => |output| output.refreshMillihertz(),
+            .drm => |output| output.?.refreshMillihertz(),
+        };
+    }
+
+    fn name(self: *const Output) []const u8 {
+        return switch (self.*) {
+            .headless => "HEADLESS-1",
+            .drm => |output| output.?.name(),
+        };
+    }
+
+    fn description(self: *const Output) []const u8 {
+        return switch (self.*) {
+            .headless => "Keywork headless output",
+            .drm => |output| output.?.description(),
+        };
+    }
+
+    fn make(self: *const Output) []const u8 {
+        return switch (self.*) {
+            .headless => "keywork",
+            .drm => |output| output.?.make() orelse "unknown",
+        };
+    }
+
+    fn model(self: *const Output) []const u8 {
+        return switch (self.*) {
+            .headless => "headless",
+            .drm => |output| output.?.model() orelse "unknown",
+        };
     }
 };
 
@@ -155,6 +242,48 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.io = io;
     self.event_loop = try EventLoop.init(allocator);
     errdefer self.event_loop.deinit();
+    self.repaint_timer = try self.event_loop.addTimer(self, repaintTimer);
+    errdefer self.event_loop.removeTimer(self.repaint_timer);
+    self.session_initialized = false;
+    self.drm_device_initialized = false;
+    self.drm_listener_installed = false;
+    var renderer_initialized = false;
+    var output_initialized = false;
+    errdefer {
+        if (self.drm_listener_installed) self.drm_device.clearListener();
+        if (output_initialized) switch (self.output) {
+            .headless => |*output| output.deinit(),
+            .drm => |output| output.?.detach(),
+        };
+        if (self.drm_device_initialized) {
+            self.drm_device.releaseClientBuffers();
+            self.drm_device.deinit();
+            self.drm_device_initialized = false;
+        }
+        if (renderer_initialized) self.renderer.deinit();
+        if (self.session_initialized) {
+            self.session.deinit();
+            self.session_initialized = false;
+        }
+    }
+    if (options.output_kind == .drm) {
+        try self.session.init(allocator, .{ .io_uring = &self.event_loop });
+        self.session_initialized = true;
+        try self.drm_device.init(
+            allocator,
+            io,
+            .{ .io_uring = &self.event_loop },
+            &self.session,
+            options.drm_device_path,
+        );
+        self.drm_device_initialized = true;
+    }
+    self.renderer = try Renderer.initForDevice(
+        allocator,
+        options.renderer_kind,
+        if (self.drm_device_initialized) self.drm_device.deviceId() else null,
+    );
+    renderer_initialized = true;
     self.server = Server.init(allocator);
     errdefer self.server.deinit();
     try self.shm_global.init(allocator, &self.server);
@@ -171,8 +300,6 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .output_bounds = xdgOutputBounds,
     });
     errdefer self.xdg_shell.deinit();
-    self.renderer = try Renderer.init(allocator, options.renderer_kind);
-    errdefer self.renderer.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
     errdefer self.linux_dmabuf_global.deinit();
     try self.linux_drm_syncobj_global.init(
@@ -182,22 +309,32 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.renderer.dmabufDeviceId(),
     );
     errdefer self.linux_drm_syncobj_global.deinit();
-    self.output = try HeadlessOutput.initForRenderer(
-        allocator,
-        options.output_size,
-        options.scale,
-        options.refresh_millihertz,
-        self.renderer.offscreenAccess(),
-    );
-    errdefer self.output.deinit();
+    self.output = switch (options.output_kind) {
+        .headless => .{ .headless = try HeadlessOutput.initForRenderer(
+            allocator,
+            options.output_size,
+            options.scale,
+            options.refresh_millihertz,
+            self.renderer.offscreenAccess(),
+        ) },
+        .drm => drm: {
+            const output = for (self.drm_device.outputs()) |candidate| {
+                if (candidate.enabled) break candidate;
+            } else return error.NoEnabledDrmOutput;
+            try output.attach(drmOutputListener(self), self.renderer.dmabufAccess());
+            break :drm .{ .drm = @as(?*DrmOutput, output) };
+        },
+    };
+    output_initialized = true;
     try self.output_global.init(allocator, &self.server, .{
-        .mode_size = self.output.size,
-        .physical_size = self.output.size,
+        .mode_size = self.output.modeSize(),
+        .physical_size = self.output.physicalSize(),
         .refresh_millihertz = self.output.refreshMillihertz(),
-        .scale = self.output.scale.ceil() catch return error.InvalidScale,
-        .name = "HEADLESS-1",
-        .description = "Keywork headless output",
-        .model = "headless",
+        .scale = self.output.scale().ceil() catch return error.InvalidScale,
+        .name = self.output.name(),
+        .description = self.output.description(),
+        .make = self.output.make(),
+        .model = self.output.model(),
     });
     errdefer self.output_global.deinit();
     try self.seat_global.init(allocator, &self.server, "default", 0, null);
@@ -205,7 +342,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     try self.fractional_scale_global.init(
         allocator,
         &self.server,
-        self.output.scale.numerator,
+        self.output.scale().numerator,
     );
     errdefer self.fractional_scale_global.deinit();
     try self.viewporter_global.init(allocator, &self.server);
@@ -229,10 +366,18 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.socket_path = selection.path;
     self.surfaces = .empty;
     self.pending = .empty;
+    self.frame_callbacks = .empty;
     self.frame_count = 0;
+    self.repaint_needed = options.output_kind == .drm;
+    self.output_busy_retries = 0;
     self.terminating = false;
     self.event_loop.setAfterPlatformHook(self, afterPlatform);
     self.event_loop.setEndTurnHook(self, endTurn);
+    if (self.repaint_needed) try self.repaint_timer.arm(0, 0);
+    if (self.drm_device_initialized) {
+        self.drm_device.setListener(drmDeviceListener(self));
+        self.drm_listener_installed = true;
+    }
     return self;
 }
 
@@ -314,14 +459,20 @@ fn uninstallSignals(self: *NativeServer) void {
 
 pub fn inspectFrame(self: *const NativeServer) FrameInspection {
     return .{
-        .size = self.output.size,
-        .pixels = self.output.pixels,
+        .size = self.output.modeSize(),
+        .pixels = switch (self.output) {
+            .headless => |output| output.pixels,
+            .drm => &.{},
+        },
         .frame_count = self.frame_count,
     };
 }
 
 pub fn pixel(self: *const NativeServer, x: u32, y: u32) u32 {
-    return self.output.pixel(x, y);
+    return switch (self.output) {
+        .headless => |output| output.pixel(x, y),
+        .drm => unreachable,
+    };
 }
 
 /// Cancels and drains all ring users before freeing callback storage and the
@@ -330,6 +481,18 @@ pub fn destroy(self: *NativeServer) void {
     self.terminating = true;
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
+    self.event_loop.removeTimer(self.repaint_timer);
+    if (self.drm_listener_installed) {
+        self.drm_device.clearListener();
+        self.drm_listener_installed = false;
+    }
+    switch (self.output) {
+        .headless => {},
+        .drm => |*output| if (output.*) |drm_output| {
+            drm_output.detach();
+            output.* = null;
+        },
+    }
     for (self.pending.items) |pending| {
         pending.discarded = true;
         self.cancelPending(pending) catch @panic("failed to cancel native transaction");
@@ -345,6 +508,7 @@ pub fn destroy(self: *NativeServer) void {
     self.transport.deinit();
     while (self.pending.items.len != 0) self.destroyPending(0);
     self.pending.deinit(self.allocator);
+    self.discardFrameCallbacks();
 
     while (self.compositor_global.popTransaction()) |transaction_value| {
         var transaction = transaction_value;
@@ -368,8 +532,20 @@ pub fn destroy(self: *NativeServer) void {
     self.linux_drm_syncobj_global.deinit();
     self.linux_dmabuf_global.deinit();
     self.server.deinit();
-    self.output.deinit();
+    switch (self.output) {
+        .headless => |*output| output.deinit(),
+        .drm => {},
+    }
+    if (self.drm_device_initialized) {
+        self.drm_device.releaseClientBuffers();
+        self.drm_device.deinit();
+        self.drm_device_initialized = false;
+    }
     self.renderer.deinit();
+    if (self.session_initialized) {
+        self.session.deinit();
+        self.session_initialized = false;
+    }
     self.event_loop.deinit();
     _ = std.c.unlink(self.socket_path.ptr);
     self.allocator.free(self.socket_path);
@@ -391,8 +567,82 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     try self.intakeTransactions();
     try self.cancelDeadTransactions();
     try self.progressTransactions();
+    self.discardDeadFrameCallbacks();
     const pruned = self.pruneSurfaces();
-    if (pruned or self.surface_tree.needsRedraw()) try self.renderScene(null);
+    if (pruned or self.surface_tree.needsRedraw() or self.repaint_needed)
+        try self.renderScene(null);
+}
+
+fn drmOutputListener(self: *NativeServer) DrmOutput.Listener {
+    return .{
+        .context = self,
+        .ready = drmOutputReady,
+        .presented = drmOutputPresented,
+        .discarded = drmOutputDiscarded,
+    };
+}
+
+fn drmOutputReady(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.repaint_needed) self.scheduleRepaint(0);
+}
+
+fn drmOutputPresented(_: *anyopaque, _: presentation.Info) void {}
+
+fn drmOutputDiscarded(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.repaint_needed = true;
+}
+
+fn drmDeviceListener(self: *NativeServer) DrmDevice.Listener {
+    return .{
+        .context = self,
+        .added = drmOutputAdded,
+        .removing = drmOutputRemoving,
+        .failed = drmDeviceFailed,
+        .activated = drmDeviceActivated,
+        .deactivating = drmDeviceDeactivating,
+        .changed = drmOutputChanged,
+    };
+}
+
+fn drmOutputAdded(_: *anyopaque, _: *DrmOutput) void {}
+
+fn drmOutputRemoving(context: *anyopaque, removed: *DrmOutput) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const selected = switch (self.output) {
+        .headless => return,
+        .drm => |output| output,
+    } orelse return;
+    if (selected != removed) return;
+    removed.detach();
+    self.output.drm = null;
+    self.terminate();
+}
+
+fn drmDeviceFailed(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
+fn drmDeviceActivated(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.repaint_needed = true;
+    self.scheduleRepaint(0);
+}
+
+fn drmDeviceDeactivating(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.repaint_needed = true;
+}
+
+fn drmOutputChanged(_: *anyopaque, _: *DrmOutput) void {}
+
+fn repaintTimer(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+
+fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
+    self.repaint_needed = true;
+    self.repaint_timer.arm(delay_milliseconds, 0) catch self.terminate();
 }
 
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
@@ -773,6 +1023,12 @@ fn startShmCopy(
 }
 
 fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
+    var callback_batch_count: usize = 0;
+    for (pending.transaction.entries) |commit|
+        if (commit.frame_callbacks.len != 0) {
+            callback_batch_count += 1;
+        };
+    try self.frame_callbacks.ensureUnusedCapacity(self.allocator, callback_batch_count);
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
         if (entry.configure_only) continue;
@@ -795,13 +1051,41 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         self.findState(pending.transaction.entries[0].surface)
     else
         null;
+    for (pending.transaction.entries) |*commit| {
+        if (try commit.takeFrameCallbacks()) |callbacks|
+            self.frame_callbacks.appendAssumeCapacity(callbacks);
+    }
     try self.renderScene(damage_state);
+}
+
+fn finishFrameCallbacks(self: *NativeServer) !void {
     const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
     const milliseconds: u32 = @truncate(@as(u64, @intCast(@max(now, 0))));
-    for (pending.transaction.entries) |*commit| {
-        if (commit.surface.client.state == .active and commit.surface.resource_alive)
-            try commit.finishFrame(milliseconds);
+    while (self.frame_callbacks.items.len != 0) {
+        var callbacks = self.frame_callbacks.orderedRemove(0);
+        callbacks.finish(milliseconds) catch |err| {
+            callbacks.deinit();
+            return err;
+        };
+        callbacks.deinit();
     }
+}
+
+fn discardDeadFrameCallbacks(self: *NativeServer) void {
+    var index: usize = 0;
+    while (index < self.frame_callbacks.items.len) {
+        if (self.frame_callbacks.items[index].surface.client.state == .active) {
+            index += 1;
+            continue;
+        }
+        var callbacks = self.frame_callbacks.orderedRemove(index);
+        callbacks.deinit();
+    }
+}
+
+fn discardFrameCallbacks(self: *NativeServer) void {
+    for (self.frame_callbacks.items) |*callbacks| callbacks.deinit();
+    self.frame_callbacks.deinit(self.allocator);
 }
 
 fn destroyPending(self: *NativeServer, index: usize) void {
@@ -829,6 +1113,13 @@ fn copyComplete(_: ?*anyopaque, _: *AsyncShmCopy) void {
 }
 
 fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
+    if (self.output == .drm) {
+        const output = self.output.drm orelse return;
+        if (!output.ready()) {
+            self.repaint_needed = true;
+            return;
+        }
+    }
     var commands: std.ArrayList(render.Command) = .empty;
     defer commands.deinit(self.allocator);
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
@@ -874,12 +1165,58 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     }
     var damage_storage: [1]render.Rect = undefined;
     const damage = if (damage_state) |state| self.frameDamage(state, &damage_storage) else null;
-    try self.renderer.beginFrame(self.output.renderTarget(), self.output.scale, .{}, damage, .{});
-    try self.renderer.append(commands.items);
-    try self.renderer.finishFrame();
+    switch (self.output) {
+        .headless => |*output| {
+            try self.renderer.beginFrame(output.renderTarget(), output.scale, .{}, damage, .{});
+            var frame_active = true;
+            errdefer if (frame_active) self.renderer.cancelFrame();
+            try self.renderer.append(commands.items);
+            frame_active = false;
+            try self.renderer.finishFrame();
+        },
+        .drm => |maybe_output| {
+            const output = maybe_output orelse return;
+            const target = output.acquire() orelse {
+                self.repaint_needed = true;
+                return;
+            };
+            var output_frame_active = true;
+            defer if (output_frame_active) output.cancel();
+            var frame_damage = Region.init();
+            defer frame_damage.deinit();
+            const size = output.size;
+            frame_damage.setRectangle(0, 0, size.width, size.height);
+            try output.repairDamage(&frame_damage);
+            try self.renderer.beginFrame(target, output.scale, .{}, null, output.colorDescription());
+            var renderer_frame_active = true;
+            errdefer if (renderer_frame_active) self.renderer.cancelFrame();
+            try self.renderer.append(commands.items);
+            renderer_frame_active = false;
+            const completion = try self.renderer.finishFrameScanout(null);
+            defer if (completion.sync_file_fd) |fd| {
+                _ = std.c.close(fd);
+            };
+            _ = output.present(&frame_damage, completion.sync_file_fd, false) catch |err| switch (err) {
+                error.OutputBusy => {
+                    if (self.output_busy_retries == maximum_output_busy_retries)
+                        return error.OutputBusy;
+                    self.output_busy_retries += 1;
+                    // Kernel EBUSY does not imply that a tracked page flip will
+                    // produce a ready event, so retry from an io_uring timer turn.
+                    self.scheduleRepaint(1);
+                    return;
+                },
+                else => return err,
+            };
+            output_frame_active = false;
+            self.output_busy_retries = 0;
+        },
+    }
+    self.repaint_needed = false;
     self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
     self.frame_count +%= 1;
+    try self.finishFrameCallbacks();
 }
 
 fn frameDamage(
@@ -901,8 +1238,8 @@ fn frameDamage(
             transform,
             @intCast(state.scale),
             .{ .x = state.x, .y = state.y },
-            self.output.scale,
-            self.output.size,
+            self.output.scale(),
+            self.output.modeSize(),
         ) orelse continue;
         bounds = if (bounds) |existing| existing.unionWith(mapped) else mapped;
     }

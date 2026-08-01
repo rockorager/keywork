@@ -92,7 +92,6 @@ pub fn main(init: std.process.Init) !void {
     Logging.setLevel(options.log_level orelse Logging.defaultLevel());
     const output_kind = options.outputKind();
     const renderer_kind = options.rendererKind();
-    if (options.wayland_backend == .wayring) return runNative(init, options);
     const native_session = output_kind == .drm;
     if (native_session) {
         _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
@@ -112,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
     defer if (session_lock) |file| file.close(init.io);
+    if (options.wayland_backend == .wayring) return runNative(init, options);
     var systemd: Systemd = .init(init.io, init.environ_map, native_session);
     try systemd.prepare();
     var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
@@ -210,12 +210,19 @@ pub fn main(init: std.process.Init) !void {
 fn runNative(init: std.process.Init, options: StartupOptions) !void {
     const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
         return error.MissingRuntimeDirectory;
+    const output_kind: NativeServer.OutputKind = switch (options.outputKind()) {
+        .headless => .headless,
+        .drm => .drm,
+        .nested => unreachable,
+    };
     const native = try NativeServer.create(init.gpa, init.io, .{
         .runtime_directory = runtime_directory,
         .output_size = options.headless_size orelse .{ .width = 1280, .height = 720 },
         .scale = options.headless_scale orelse .{},
         .refresh_millihertz = options.headless_refresh_millihertz orelse 60_000,
         .renderer_kind = options.rendererKind(),
+        .output_kind = output_kind,
+        .drm_device_path = options.drm_device,
     });
     defer native.destroy();
     try init.environ_map.put("WAYLAND_DISPLAY", native.displayName());
@@ -298,7 +305,7 @@ fn parseArguments(arguments: anytype) !StartupOptions {
         return error.DrmDeviceRequiresDrmOutput;
     }
     if (options.wayland_backend == .wayring) {
-        if (output != .headless) return error.WayringRequiresHeadlessOutput;
+        if (output == .nested) return error.WayringDoesNotSupportNestedOutput;
         if (options.config_path != null) return error.WayringDoesNotLoadConfiguration;
     }
     return options;
@@ -489,9 +496,18 @@ test "startup options reject duplicates and backend-specific misuse" {
         "--wayland-backend",
         "wayring",
     } };
+    const wayring_drm_options = try parseArguments(&wayring_drm);
+    try std.testing.expectEqual(OutputBackend.Kind.drm, wayring_drm_options.outputKind());
+
+    var wayring_nested: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "nested",
+    } };
     try std.testing.expectError(
-        error.WayringRequiresHeadlessOutput,
-        parseArguments(&wayring_drm),
+        error.WayringDoesNotSupportNestedOutput,
+        parseArguments(&wayring_nested),
     );
 
     var wayring_vulkan: TestArguments = .{ .values = &.{
