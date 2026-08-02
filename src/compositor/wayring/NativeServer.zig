@@ -27,6 +27,7 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const PointerCursor = @import("PointerCursor.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
 const PointerGesturesGlobal = @import("PointerGesturesGlobal.zig");
 const TabletGlobal = @import("TabletGlobal.zig");
@@ -81,6 +82,7 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+pointer_cursor: PointerCursor,
 relative_pointer_global: RelativePointerGlobal,
 pointer_gestures_global: PointerGesturesGlobal,
 tablet_global: TabletGlobal,
@@ -494,7 +496,18 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.fifo_global.deinit();
     try self.commit_timing_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.commit_timing_global.deinit();
-    try self.seat_global.init(allocator, &self.server, "default", 0, null);
+    self.pointer_cursor.init(allocator, .{
+        .context = self,
+        .repaint = cursorRepaint,
+    });
+    errdefer self.pointer_cursor.deinit();
+    try self.seat_global.init(
+        allocator,
+        &self.server,
+        "default",
+        0,
+        self.pointer_cursor.handler(),
+    );
     errdefer self.seat_global.deinit();
     try self.relative_pointer_global.init(
         allocator,
@@ -515,7 +528,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .{
             .context = self,
             .surface_coordinates = tabletSurfaceCoordinates,
-            .repaint = tabletRepaint,
+            .repaint = cursorRepaint,
         },
     );
     errdefer self.tablet_global.deinit();
@@ -538,6 +551,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     const mode_size = self.output.modeSize();
     self.pointer_physical_x = @as(f64, @floatFromInt(mode_size.width)) / 2;
     self.pointer_physical_y = @as(f64, @floatFromInt(mode_size.height)) / 2;
+    self.syncPointerCursorPosition();
     self.keyboard_modifiers = .{};
     self.last_keyboard_serial = 0;
     self.next_touch_id = 1;
@@ -768,6 +782,7 @@ pub fn destroy(self: *NativeServer) void {
     self.pointer_gestures_global.deinit();
     self.relative_pointer_global.deinit();
     self.seat_global.deinit();
+    self.pointer_cursor.deinit();
     self.commit_timing_global.deinit();
     self.fifo_global.deinit();
     self.tearing_control_global.deinit();
@@ -1079,6 +1094,7 @@ fn nativePointerMotion(
     self.pointer_physical_y = clampPointerCoordinate(y, size.height);
     if (self.native_input_initialized)
         self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.syncPointerCursorPosition();
     _ = self.refreshPointerFocus(time) catch return self.terminate();
 }
 
@@ -1104,6 +1120,7 @@ fn nativePointerRelativeMotion(
     self.pointer_physical_y = clampPointerCoordinate(self.pointer_physical_y + dy, size.height);
     if (self.native_input_initialized)
         self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.syncPointerCursorPosition();
     _ = self.refreshPointerFocus(@truncate(time_microseconds / std.time.us_per_ms)) catch
         return self.terminate();
 }
@@ -1459,7 +1476,7 @@ fn nativeTabletPadDial(context: *anyopaque, device_id: NativeInput.DeviceId, tim
     self.tablet_global.padDial(device_id, time, dial, value120, group, mode) catch self.terminate();
 }
 
-fn tabletRepaint(context: *anyopaque) void {
+fn cursorRepaint(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     if (self.terminating) return;
     self.scheduleRepaint(0);
@@ -1881,7 +1898,7 @@ fn collectInputPaintEntries(self: *NativeServer) !void {
     self.input_paint_entries.clearRetainingCapacity();
     for (self.surfaces.items) |state| {
         const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null and !self.tablet_global.isCursorSurface(state.surface))
+        if (node.parent == null and !self.isCursorSurface(state.surface))
             try self.surface_tree.paint(node, &self.input_paint_entries);
     }
 }
@@ -1914,6 +1931,18 @@ fn pointerLogicalX(self: *const NativeServer) f64 {
 
 fn pointerLogicalY(self: *const NativeServer) f64 {
     return self.physicalToLogical(self.pointer_physical_y);
+}
+
+fn syncPointerCursorPosition(self: *NativeServer) void {
+    self.pointer_cursor.setPosition(self.pointerLogicalX(), self.pointerLogicalY());
+}
+
+fn isCursorSurface(
+    self: *const NativeServer,
+    surface: *const CompositorGlobal.Surface,
+) bool {
+    return self.pointer_cursor.isCursorSurface(surface) or
+        self.tablet_global.isCursorSurface(surface);
 }
 
 fn physicalToLogical(self: *const NativeServer, value: f64) f64 {
@@ -2513,9 +2542,10 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         has_direct_update = true;
     };
     try self.refreshInputFocus(inputTime(self));
-    const damage_state = if (pending.transaction.entries.len == 1 and
+    const damage_state = if (!self.repaint_needed and
+        pending.transaction.entries.len == 1 and
         pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
-        !self.tablet_global.isCursorSurface(pending.transaction.entries[0].surface) and
+        !self.isCursorSurface(pending.transaction.entries[0].surface) and
         (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
         self.findState(pending.transaction.entries[0].surface)
     else
@@ -2668,20 +2698,14 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     defer paint_entries.deinit(self.allocator);
     for (self.surfaces.items) |state| {
         const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null and !self.tablet_global.isCursorSurface(state.surface))
+        if (node.parent == null and !self.isCursorSurface(state.surface))
             try self.surface_tree.paint(node, &paint_entries);
     }
+    if (self.pointer_cursor.current()) |cursor|
+        try self.appendCursorPaint(cursor.root, cursor.x, cursor.y, &paint_entries);
     var cursors = self.tablet_global.cursorIterator();
-    while (cursors.next()) |cursor| {
-        const node = self.surface_tree.find(cursor.root) orelse continue;
-        if (node.parent != null) continue;
-        const first = paint_entries.items.len;
-        try self.surface_tree.paint(node, &paint_entries);
-        for (paint_entries.items[first..]) |*entry| {
-            entry.x +|= cursor.x;
-            entry.y +|= cursor.y;
-        }
-    }
+    while (cursors.next()) |cursor|
+        try self.appendCursorPaint(cursor.root, cursor.x, cursor.y, &paint_entries);
     for (paint_entries.items) |paint_entry| {
         const state = self.findState(paint_entry.surface) orelse continue;
         if (!state.surface.resource_alive) continue;
@@ -2809,6 +2833,23 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     self.frame_count +%= 1;
     try self.finishFrameCallbacks();
     if (immediate_presentation) |info| self.finishSubmittedPresentation(info);
+}
+
+fn appendCursorPaint(
+    self: *NativeServer,
+    root: *CompositorGlobal.Surface,
+    x: i32,
+    y: i32,
+    paint_entries: *std.ArrayList(SurfaceTree.PaintEntry),
+) !void {
+    const node = self.surface_tree.find(root) orelse return;
+    if (node.parent != null) return;
+    const first = paint_entries.items.len;
+    try self.surface_tree.paint(node, paint_entries);
+    for (paint_entries.items[first..]) |*entry| {
+        entry.x +|= x;
+        entry.y +|= y;
+    }
 }
 
 fn frameDamage(

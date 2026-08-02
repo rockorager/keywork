@@ -62,6 +62,7 @@ pub const CursorIntent = struct {
 pub const CursorHandler = struct {
     context: *anyopaque,
     handle: *const fn (*anyopaque, CursorIntent) anyerror!void,
+    clear: ?*const fn (*anyopaque) void = null,
 };
 
 pub const AxisFrame = struct {
@@ -178,6 +179,8 @@ pub fn pointerEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, x: i3
 
 pub fn pointerLeave(self: *SeatGlobal) !?u32 {
     const surface = self.pointer_focus orelse return null;
+    if (self.cursor_handler) |handler| if (handler.clear) |clear|
+        clear(handler.context);
     const serial = self.server.nextSerial();
     for (self.children.items) |child| if (matches(child, .pointer, surface)) {
         try generated.wl_pointer_types.events.leave(&child.client.connection, child.resource, serial, surface.resource);
