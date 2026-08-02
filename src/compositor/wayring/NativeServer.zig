@@ -11,6 +11,7 @@ const wayring = @import("wayring");
 const keywork_loop = @import("keywork-loop");
 const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
+const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const FixesGlobal = @import("FixesGlobal.zig");
 const ShmGlobal = @import("ShmGlobal.zig");
 const SinglePixelBufferGlobal = @import("SinglePixelBufferGlobal.zig");
@@ -80,6 +81,7 @@ commit_timing_timer: *EventLoop.Timer,
 commit_timing_clock: std.Io.Clock,
 commit_timing_armed_target: ?i96 = null,
 server: Server,
+security_context_global: SecurityContextGlobal,
 fixes_global: FixesGlobal,
 shm_global: ShmGlobal,
 single_pixel_buffer_global: SinglePixelBufferGlobal,
@@ -440,6 +442,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     renderer_initialized = true;
     self.server = Server.init(allocator);
     errdefer self.server.deinit();
+    try self.security_context_global.init(allocator, &self.server, &self.transport);
+    errdefer self.security_context_global.deinit();
     try self.fixes_global.init(&self.server);
     errdefer self.fixes_global.deinit();
     try self.shm_global.init(allocator, &self.server);
@@ -648,7 +652,14 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.data_device_global.deinit();
     try self.primary_selection_global.init(allocator, &self.server, &self.seat_global);
     errdefer self.primary_selection_global.deinit();
-    try self.data_control_global.init(allocator, &self.server, &self.seat_global, &self.data_device_global, &self.primary_selection_global);
+    try self.data_control_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        &self.data_device_global,
+        &self.primary_selection_global,
+        &self.security_context_global,
+    );
     errdefer self.data_control_global.deinit();
     self.input_paint_entries = .empty;
     self.routed_keys = .empty;
@@ -931,6 +942,7 @@ pub fn destroy(self: *NativeServer) void {
     self.linux_drm_syncobj_global.deinit();
     self.linux_dmabuf_global.deinit();
     self.fixes_global.deinit();
+    self.security_context_global.deinit();
     self.server.deinit();
     switch (self.output) {
         .headless => |*output| output.deinit(),

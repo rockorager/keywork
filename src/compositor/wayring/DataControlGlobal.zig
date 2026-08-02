@@ -9,6 +9,7 @@ const Server = @import("wayring-server");
 const SeatGlobal = @import("SeatGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
+const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SelectionSource = @import("SelectionSource.zig");
 
 const Kind = enum { regular, primary };
@@ -54,13 +55,30 @@ const Offer = struct {
     generation: u64,
 };
 
-pub fn init(self: *DataControlGlobal, allocator: std.mem.Allocator, server: *Server, seat: *SeatGlobal, regular: *DataDeviceGlobal, primary: *PrimarySelectionGlobal) !void {
+pub fn init(
+    self: *DataControlGlobal,
+    allocator: std.mem.Allocator,
+    server: *Server,
+    seat: *SeatGlobal,
+    regular: *DataDeviceGlobal,
+    primary: *PrimarySelectionGlobal,
+    security_context: *SecurityContextGlobal,
+) !void {
     self.* = .{ .allocator = allocator, .server = server, .seat = seat, .regular = regular, .primary = primary, .global_name = undefined };
     try regular.addSelectionListener(.{ .context = self, .changed = regularChanged, .offered = regularOffered });
     errdefer regular.removeSelectionListener(self);
     try primary.addSelectionListener(.{ .context = self, .changed = primaryChanged, .offered = primaryOffered });
     errdefer primary.removeSelectionListener(self);
-    self.global_name = try server.createGlobal(&generated.ext_data_control_manager_v1, 1, .{ .context = self, .bind = bind });
+    self.global_name = try server.createGlobal(
+        &generated.ext_data_control_manager_v1,
+        1,
+        .{
+            .context = self,
+            .bind = bind,
+            .filter_context = security_context,
+            .filter = SecurityContextGlobal.allowUnconfined,
+        },
+    );
 }
 
 pub fn deinit(self: *DataControlGlobal) void {
@@ -303,6 +321,10 @@ test "ext data control advertises v1 and children outlive their manager" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator);
     defer server.deinit();
+    var transport: @import("wayring-server-uring") = undefined;
+    var security_context: SecurityContextGlobal = undefined;
+    try security_context.init(allocator, &server, &transport);
+    defer security_context.deinit();
     var seat: SeatGlobal = undefined;
     try seat.init(allocator, &server, "default", SeatGlobal.Capability.keyboard, null);
     defer seat.deinit();
@@ -313,7 +335,14 @@ test "ext data control advertises v1 and children outlive their manager" {
     try primary.init(allocator, &server, &seat);
     defer primary.deinit();
     var control: DataControlGlobal = undefined;
-    try control.init(allocator, &server, &seat, &regular, &primary);
+    try control.init(
+        allocator,
+        &server,
+        &seat,
+        &regular,
+        &primary,
+        &security_context,
+    );
     defer control.deinit();
 
     const client = try server.createClient();

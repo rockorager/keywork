@@ -118,6 +118,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xdg-activation/xdg-activation-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/security-context/security-context-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/viewporter/viewporter.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/fractional-scale/fractional-scale-v1.xml"));
