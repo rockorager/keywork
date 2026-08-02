@@ -41,6 +41,7 @@ const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
+const XdgToplevelIconGlobal = @import("XdgToplevelIconGlobal.zig");
 const XdgToplevelTagGlobal = @import("XdgToplevelTagGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
 const SubcompositorGlobal = @import("SubcompositorGlobal.zig");
@@ -101,6 +102,7 @@ fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
 xdg_system_bell_global: XdgSystemBellGlobal,
+xdg_toplevel_icon_global: XdgToplevelIconGlobal,
 xdg_toplevel_tag_global: XdgToplevelTagGlobal,
 transport: IoUringServer,
 renderer: Renderer,
@@ -438,6 +440,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.xdg_shell.deinit();
     try self.xdg_toplevel_tag_global.init(&self.server, &self.xdg_shell);
     errdefer self.xdg_toplevel_tag_global.deinit();
+    try self.xdg_toplevel_icon_global.init(
+        allocator,
+        &self.server,
+        &self.xdg_shell,
+        .{ .context = self, .read = readIconBuffer },
+    );
+    errdefer self.xdg_toplevel_icon_global.deinit();
     try self.xdg_system_bell_global.init(&self.server);
     errdefer self.xdg_system_bell_global.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
@@ -836,6 +845,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_output_global.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
+    self.xdg_toplevel_icon_global.deinit();
     self.xdg_toplevel_tag_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
@@ -1559,6 +1569,26 @@ fn tabletSurfaceCoordinates(
     const self: *NativeServer = @ptrCast(@alignCast(context));
     const local = self.surfaceLocal(surface, x, y) orelse return null;
     return .{ .x = local.x, .y = local.y };
+}
+
+fn readIconBuffer(_: *anyopaque, fd: i32, offset: u64, destination: []u8) !void {
+    var completed: usize = 0;
+    while (completed < destination.len) {
+        const result = linux.pread(
+            fd,
+            destination[completed..].ptr,
+            destination.len - completed,
+            @intCast(offset + completed),
+        );
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return error.UnexpectedEndOfFile;
+                completed += result;
+            },
+            .INTR => continue,
+            else => return error.IconBufferReadFailed,
+        }
+    }
 }
 
 fn repaintTimer(_: *anyopaque, _: *EventLoop, _: u64) !void {}

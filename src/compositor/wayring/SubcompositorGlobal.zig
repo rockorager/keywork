@@ -241,6 +241,10 @@ fn mergeCommit(old: *CompositorGlobal.Commit, commit_value: CompositorGlobal.Com
     newest.frame_callbacks = callbacks;
     newest.surface_damage = surface_damage;
     newest.buffer_damage = buffer_damage;
+    if (newest.role_state == null) {
+        newest.role_state = old.role_state;
+        old.role_state = null;
+    }
     if (newest.attachment == .unchanged) {
         newest.attachment = old.attachment;
         old.attachment = .unchanged;

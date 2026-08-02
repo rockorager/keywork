@@ -186,6 +186,7 @@ pub const Client = struct {
             self.destroyDeferredResources() catch {
                 return self.protocolError(message.object_id, 2, "deferred resource destruction failed");
             };
+            if (self.state == .protocol_error) return error.ProtocolError;
             if (hasConstructor(message.descriptor)) {
                 self.connection.resumeParsing() catch {
                     return self.protocolError(message.object_id, 0, "invalid request following constructor");
@@ -619,6 +620,7 @@ const TestContext = struct {
     child_pings: usize = 0,
     child_destroys: usize = 0,
     register_constructor: bool = true,
+    post_error_on_destroy: bool = false,
     denied_client: ?*Client = null,
     nested_destroy: ?wayring.ObjectHandle = null,
     nested_destroy_failed: bool = false,
@@ -678,10 +680,13 @@ const TestContext = struct {
     fn childDestroy(
         context: *anyopaque,
         client: *Client,
-        _: wayring.ObjectHandle,
+        resource: wayring.ObjectHandle,
     ) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         self.child_destroys += 1;
+        if (self.post_error_on_destroy) {
+            client.postError(resource, 20, "destroy rejected") catch {};
+        }
         if (self.nested_destroy) |handle| {
             self.nested_destroy = null;
             client.destroyResource(handle) catch {
@@ -878,6 +883,35 @@ test "destructor requests queue events before delete-id and reserve the ID" {
     try std.testing.expectEqual(server_child.id, (try core.decodeDisplayEvent(&delete_message)).delete_id);
     const reused = try client.createResource(server_child.id, &test_child, 1, .{ .context = client });
     try std.testing.expectEqual(server_child.id, reused.id);
+}
+
+test "destroy callback protocol errors stop coalesced requests" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{ .post_error_on_destroy = true };
+    const client = try server.createClient();
+    _ = try client.createResource(2, &test_child, 2, .{
+        .context = &context,
+        .dispatch = TestContext.childDispatch,
+        .destroy = TestContext.childDestroy,
+    });
+    _ = try client.createResource(3, &test_child, 2, .{
+        .context = &context,
+        .dispatch = TestContext.childDispatch,
+    });
+    var peer = try TestPeer.init(std.testing.allocator);
+    defer peer.deinit();
+    const first: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try peer.connection.registerObject(2, &test_child, 2),
+    };
+    _ = try peer.connection.registerObject(3, &test_child, 2);
+
+    try peer.connection.queueDestructorObject(first, &test_child, 1, &.{});
+    try peer.connection.queue(3, 0, &.{.{ .uint = 77 }});
+    try std.testing.expectError(error.ProtocolError, peer.transferToServer(client));
+    try std.testing.expectEqual(@as(usize, 1), context.child_destroys);
+    try std.testing.expectEqual(@as(usize, 0), context.child_pings);
 }
 
 test "destroy callbacks may destroy another resource" {

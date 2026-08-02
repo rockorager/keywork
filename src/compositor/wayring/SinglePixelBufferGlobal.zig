@@ -95,7 +95,7 @@ fn destroyBuffer(
     _: wayring.ObjectHandle,
 ) void {
     const buffer: *BufferResource = @ptrCast(@alignCast(context));
-    buffer.unreference();
+    buffer.resourceDestroyed();
 }
 
 fn pixelFromComponents(red: u32, green: u32, blue: u32, alpha: u32) u32 {

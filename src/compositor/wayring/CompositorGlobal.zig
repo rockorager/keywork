@@ -65,6 +65,7 @@ pub const Attachment = union(enum) {
 pub const Commit = struct {
     allocator: std.mem.Allocator,
     surface: *Surface,
+    role_state: ?RoleCommitState,
     attachment: Attachment,
     surface_damage: []render.Rect,
     buffer_damage: []render.Rect,
@@ -87,6 +88,7 @@ pub const Commit = struct {
     synchronization: ?DrmSyncobj.Commit = null,
 
     pub fn deinit(self: *Commit) void {
+        if (self.role_state) |state| state.deinit(state.context);
         if (self.synchronization) |*synchronization| {
             _ = synchronization.release.signal();
             synchronization.deinit();
@@ -108,6 +110,15 @@ pub const Commit = struct {
 
     pub fn releaseBuffer(self: *Commit) !void {
         try self.attachment.releaseBuffer(self.surface.client);
+    }
+
+    /// Transfers state captured by the matching surface role at this commit
+    /// boundary. A different role owner cannot consume it.
+    pub fn takeRoleState(self: *Commit, owner: *const anyopaque) ?RoleCommitState {
+        const state = self.role_state orelse return null;
+        if (state.owner != owner) return null;
+        self.role_state = null;
+        return state;
     }
 
     /// Transfers this commit's callbacks so an output scheduler can retain
@@ -246,6 +257,17 @@ pub const HierarchyUpdate = struct {
     deinit: *const fn (*anyopaque) void,
 };
 
+pub const RoleCommitState = struct {
+    owner: *const anyopaque,
+    context: *anyopaque,
+    deinit: *const fn (*anyopaque) void,
+};
+
+pub const RoleCommitHandler = struct {
+    context: *anyopaque,
+    capture: *const fn (*anyopaque) error{OutOfMemory}!?RoleCommitState,
+};
+
 pub const HierarchyHandler = struct {
     context: *anyopaque,
     commit: *const fn (*anyopaque, Commit) anyerror!void,
@@ -351,6 +373,7 @@ pub const Surface = struct {
     role_owner: ?*const anyopaque = null,
     role_context: ?*anyopaque = null,
     role_destroyed: ?*const fn (*anyopaque) void = null,
+    role_commit_handler: ?RoleCommitHandler = null,
     explicit_sync_handler: ?ExplicitSyncHandler = null,
     content_type_handler: ?ContentTypeHandler = null,
     color_representation_handler: ?ColorRepresentationHandler = null,
@@ -402,9 +425,22 @@ pub const Surface = struct {
 
     pub fn clearRole(self: *Surface, context: *anyopaque) void {
         std.debug.assert(self.role_context == context);
+        std.debug.assert(self.role_commit_handler == null);
         self.role_owner = null;
         self.role_context = null;
         self.role_destroyed = null;
+    }
+
+    pub fn setRoleCommitHandler(self: *Surface, handler: RoleCommitHandler) void {
+        std.debug.assert(self.role_context == handler.context);
+        std.debug.assert(self.role_commit_handler == null);
+        self.role_commit_handler = handler;
+    }
+
+    pub fn clearRoleCommitHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.role_commit_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.role_commit_handler = null;
     }
 
     pub fn hasExplicitSyncHandler(self: *const Surface) bool {
@@ -533,6 +569,7 @@ pub const Surface = struct {
         self.pending_surface_damage.deinit(self.allocator);
         self.pending_opaque.deinit();
         self.pending_input.deinit();
+        std.debug.assert(self.role_commit_handler == null);
         self.allocator.destroy(self);
         client.unreference();
     }
@@ -932,6 +969,11 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         surface.reference() catch return error.OutOfMemory;
         errdefer surface.unreference();
     }
+    const role_state = if (surface.role_commit_handler) |handler|
+        try handler.capture(handler.context)
+    else
+        null;
+    errdefer if (role_state) |state| state.deinit(state.context);
 
     surface.current_scale = surface.pending_scale;
     surface.current_content_type = surface.pending_content_type;
@@ -962,6 +1004,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
     return .{
         .allocator = owner.allocator,
         .surface = surface,
+        .role_state = role_state,
         .attachment = attachment,
         .surface_damage = surface_damage,
         .buffer_damage = buffer_damage,

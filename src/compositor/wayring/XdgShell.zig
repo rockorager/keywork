@@ -8,6 +8,7 @@ const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
+const native_shm = @import("shm.zig");
 const popup_placement = @import("../xdg_popup_placement.zig");
 const render = @import("../render/types.zig");
 
@@ -84,8 +85,10 @@ const XdgSurface = struct {
         std.debug.assert(self.references > 0);
         self.references -= 1;
         if (self.references != 0) return;
-        if (self.surface.role_context == @as(*anyopaque, @ptrCast(self)))
+        if (self.surface.role_context == @as(*anyopaque, @ptrCast(self))) {
+            self.surface.clearRoleCommitHandler(self);
             self.surface.clearRole(self);
+        }
         self.surface.unreference();
         self.configures.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -100,6 +103,9 @@ const Toplevel = struct {
     app_id: ?[]u8 = null,
     tag: ?[]u8 = null,
     description: ?[]u8 = null,
+    icon: ?ToplevelIcon = null,
+    pending_icon: ?ToplevelIcon = null,
+    pending_icon_changed: bool = false,
     minimum_width: i32 = 0,
     minimum_height: i32 = 0,
     maximum_width: i32 = 0,
@@ -110,7 +116,43 @@ const Toplevel = struct {
         if (self.app_id) |app_id| self.allocator.free(app_id);
         if (self.tag) |tag| self.allocator.free(tag);
         if (self.description) |description| self.allocator.free(description);
+        if (self.icon) |*icon| icon.deinit(self.allocator);
+        if (self.pending_icon) |*icon| icon.deinit(self.allocator);
         self.xdg_surface.unreference();
+        self.allocator.destroy(self);
+    }
+};
+
+pub const ToplevelIconBuffer = struct {
+    snapshot: native_shm.Snapshot,
+    scale: i32,
+};
+
+pub const ToplevelIcon = struct {
+    name: ?[]u8,
+    buffers: []ToplevelIconBuffer,
+
+    pub fn deinit(self: *ToplevelIcon, allocator: std.mem.Allocator) void {
+        if (self.name) |name| allocator.free(name);
+        for (self.buffers) |*buffer| buffer.snapshot.deinit();
+        allocator.free(self.buffers);
+        self.* = undefined;
+    }
+};
+
+pub const ToplevelIconInfo = struct {
+    name: ?[]const u8,
+    buffers: []const ToplevelIconBuffer,
+};
+
+const ToplevelIconCommit = struct {
+    allocator: std.mem.Allocator,
+    toplevel: wayring.ObjectHandle,
+    icon: ?ToplevelIcon,
+
+    fn deinit(context: *anyopaque) void {
+        const self: *ToplevelIconCommit = @ptrCast(@alignCast(context));
+        if (self.icon) |*icon| icon.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -224,6 +266,32 @@ pub fn toplevelMetadata(
     return .{ .tag = toplevel.tag, .description = toplevel.description };
 }
 
+/// Takes ownership of icon on success and applies it on the next accepted
+/// wl_surface commit for this toplevel.
+pub fn setPendingToplevelIcon(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    icon: ?ToplevelIcon,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    if (toplevel.pending_icon) |*pending| pending.deinit(self.allocator);
+    toplevel.pending_icon = icon;
+    toplevel.pending_icon_changed = true;
+}
+
+/// Returns icon state borrowed until the next accepted toplevel commit or
+/// until the toplevel is destroyed.
+pub fn toplevelIcon(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) !?ToplevelIconInfo {
+    const toplevel = try self.toplevelFor(client, handle);
+    const icon = if (toplevel.icon) |*value| value else return null;
+    return .{ .name = icon.name, .buffers = icon.buffers };
+}
+
 fn toplevelFor(
     self: *XdgShell,
     client: *const Server.Client,
@@ -277,6 +345,8 @@ pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitRe
             try invalidPopupParent(xdg_surface, "xdg_popup parent is not mapped");
             return .{};
         }
+        if (xdg_surface.role == .toplevel)
+            commitToplevelIcon(self, commit, xdg_surface.role.toplevel);
         try sendInitialConfigure(xdg_surface);
         return .{ .disposition = .configure_only };
     }
@@ -288,6 +358,8 @@ pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitRe
         );
         return .{};
     }
+    if (xdg_surface.role == .toplevel)
+        commitToplevelIcon(self, commit, xdg_surface.role.toplevel);
     const node = try self.tree.nodeFor(commit.surface);
     var position: SurfaceTree.Position = .{};
     switch (xdg_surface.role) {
@@ -372,6 +444,45 @@ fn resetConfigureState(xdg_surface: *XdgSurface) void {
     xdg_surface.configures.clearRetainingCapacity();
     xdg_surface.initial_configure_sent = false;
     xdg_surface.configured = false;
+}
+
+fn commitToplevelIcon(
+    self: *XdgShell,
+    commit: *CompositorGlobal.Commit,
+    toplevel: *Toplevel,
+) void {
+    const role_state = commit.takeRoleState(self) orelse return;
+    defer role_state.deinit(role_state.context);
+    const captured: *ToplevelIconCommit = @ptrCast(@alignCast(role_state.context));
+    if (!std.meta.eql(captured.toplevel, toplevel.resource)) return;
+    if (toplevel.icon) |*icon| icon.deinit(toplevel.allocator);
+    toplevel.icon = captured.icon;
+    captured.icon = null;
+}
+
+fn captureRoleCommitState(
+    context: *anyopaque,
+) error{OutOfMemory}!?CompositorGlobal.RoleCommitState {
+    const xdg_surface: *XdgSurface = @ptrCast(@alignCast(context));
+    const toplevel = switch (xdg_surface.role) {
+        .toplevel => |value| value,
+        .none, .popup => return null,
+    };
+    if (!toplevel.pending_icon_changed) return null;
+    const captured = toplevel.allocator.create(ToplevelIconCommit) catch
+        return error.OutOfMemory;
+    captured.* = .{
+        .allocator = toplevel.allocator,
+        .toplevel = toplevel.resource,
+        .icon = toplevel.pending_icon,
+    };
+    toplevel.pending_icon = null;
+    toplevel.pending_icon_changed = false;
+    return .{
+        .owner = xdg_surface.binding.owner,
+        .context = captured,
+        .deinit = ToplevelIconCommit.deinit,
+    };
 }
 
 fn popupTreePosition(popup: *const Popup) SurfaceTree.Position {
@@ -467,6 +578,11 @@ fn dispatchWmBase(
                 "wl_surface already has a role",
             );
             errdefer surface.clearRole(xdg_surface);
+            surface.setRoleCommitHandler(.{
+                .context = xdg_surface,
+                .capture = captureRoleCommitState,
+            });
+            errdefer surface.clearRoleCommitHandler(xdg_surface);
             binding.reference() catch return client.postNoMemory();
             errdefer binding.unreferenceSurface();
             const version = @min(

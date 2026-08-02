@@ -474,7 +474,7 @@ fn dispatchBuffer(
 
 fn destroyBuffer(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const holder: *BufferResource = @ptrCast(@alignCast(context));
-    holder.unreference();
+    holder.resourceDestroyed();
 }
 
 test "DMA-BUF descriptors reject malformed planes and implicit v3 modifiers" {

@@ -204,7 +204,7 @@ fn destroyBuffer(
     _: wayring.ObjectHandle,
 ) void {
     const resource: *BufferResource = @ptrCast(@alignCast(context));
-    resource.unreference();
+    resource.resourceDestroyed();
 }
 
 const TestPeer = struct {

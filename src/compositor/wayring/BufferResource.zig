@@ -9,6 +9,7 @@ const shm = @import("shm.zig");
 allocator: std.mem.Allocator,
 references: usize = 1,
 content: Content,
+destroy_listeners: std.ArrayList(DestroyListener) = .empty,
 
 pub const Content = union(enum) {
     shm: shm.Buffer,
@@ -33,6 +34,39 @@ pub const Dmabuf = struct {
     }
 };
 
+pub const DestroyListener = struct {
+    context: *anyopaque,
+    destroyed: *const fn (*anyopaque) void,
+};
+
+/// Copies the listener and retains its context until removal or resource
+/// destruction. Callbacks must not mutate this resource's listener list.
+pub fn addDestroyListener(
+    self: *BufferResource,
+    listener: DestroyListener,
+) error{OutOfMemory}!void {
+    for (self.destroy_listeners.items) |existing|
+        std.debug.assert(existing.context != listener.context);
+    try self.destroy_listeners.append(self.allocator, listener);
+}
+
+pub fn removeDestroyListener(self: *BufferResource, context: *anyopaque) void {
+    for (self.destroy_listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.destroy_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+/// Marks the wl_buffer object dead before releasing its resource reference.
+pub fn resourceDestroyed(self: *BufferResource) void {
+    for (self.destroy_listeners.items) |listener|
+        listener.destroyed(listener.context);
+    self.destroy_listeners.clearRetainingCapacity();
+    self.unreference();
+}
+
 pub fn reference(self: *BufferResource) !void {
     if (self.references == std.math.maxInt(usize)) return error.ReferenceOverflow;
     self.references += 1;
@@ -49,6 +83,8 @@ pub fn unreference(self: *BufferResource) void {
     std.debug.assert(self.references > 0);
     self.references -= 1;
     if (self.references != 0) return;
+    std.debug.assert(self.destroy_listeners.items.len == 0);
+    self.destroy_listeners.deinit(self.allocator);
     switch (self.content) {
         .shm => |*buffer| buffer.deinit(),
         .dmabuf => |dmabuf| dmabuf.source.release(dmabuf.source.context),
