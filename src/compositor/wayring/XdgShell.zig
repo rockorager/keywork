@@ -19,6 +19,7 @@ server: *Server,
 global_name: u32,
 tree: *SurfaceTree,
 geometry_provider: GeometryProvider,
+toplevel_configure_handler: ?ToplevelConfigureHandler = null,
 popups: std.ArrayList(*Popup) = .empty,
 next_popup_order: u64 = 1,
 
@@ -26,6 +27,11 @@ pub const GeometryProvider = struct {
     context: *anyopaque,
     surface_size: *const fn (*anyopaque, *const CompositorGlobal.Surface) ?render.Size,
     output_bounds: *const fn (*anyopaque) render.Rect,
+};
+
+pub const ToplevelConfigureHandler = struct {
+    context: *anyopaque,
+    configure: *const fn (*anyopaque, *CompositorGlobal.Surface) anyerror!void,
 };
 
 pub const CommitResult = struct {
@@ -277,10 +283,27 @@ pub fn init(
 }
 
 pub fn deinit(self: *XdgShell) void {
+    std.debug.assert(self.toplevel_configure_handler == null);
     self.server.removeGlobal(self.global_name) catch unreachable;
     std.debug.assert(self.popups.items.len == 0);
     self.popups.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Installs the one borrowed observer for supplemental toplevel configure
+/// events. The observer must be cleared before its context is destroyed.
+pub fn setToplevelConfigureHandler(
+    self: *XdgShell,
+    handler: ToplevelConfigureHandler,
+) void {
+    std.debug.assert(self.toplevel_configure_handler == null);
+    self.toplevel_configure_handler = handler;
+}
+
+pub fn clearToplevelConfigureHandler(self: *XdgShell, context: *anyopaque) void {
+    const handler = self.toplevel_configure_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.toplevel_configure_handler = null;
 }
 
 pub const ToplevelTagField = enum { tag, description };
@@ -1397,6 +1420,8 @@ fn sendToplevelConfigure(xdg_surface: *XdgSurface, initial: bool) !void {
         ) catch return client.postNoMemory();
         toplevel.decoration_configure_sent = true;
     }
+    if (xdg_surface.binding.owner.toplevel_configure_handler) |handler|
+        try handler.configure(handler.context, xdg_surface.surface);
     generated.xdg_toplevel_types.events.configure(
         &client.connection,
         toplevel.resource,

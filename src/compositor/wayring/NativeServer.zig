@@ -41,6 +41,7 @@ const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgDecorationGlobal = @import("XdgDecorationGlobal.zig");
 const XdgDialogGlobal = @import("XdgDialogGlobal.zig");
+const GtkShellGlobal = @import("GtkShellGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
 const XdgToplevelIconGlobal = @import("XdgToplevelIconGlobal.zig");
@@ -104,6 +105,7 @@ fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_decoration_global: XdgDecorationGlobal,
 xdg_dialog_global: XdgDialogGlobal,
+gtk_shell_global: GtkShellGlobal,
 xdg_shell: XdgShell,
 xdg_system_bell_global: XdgSystemBellGlobal,
 xdg_toplevel_icon_global: XdgToplevelIconGlobal,
@@ -442,6 +444,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .output_bounds = xdgOutputBounds,
     });
     errdefer self.xdg_shell.deinit();
+    try self.gtk_shell_global.init(
+        allocator,
+        &self.server,
+        &self.compositor_global,
+        &self.xdg_shell,
+    );
+    errdefer self.gtk_shell_global.deinit();
     try self.xdg_toplevel_tag_global.init(&self.server, &self.xdg_shell);
     errdefer self.xdg_toplevel_tag_global.deinit();
     try self.xdg_toplevel_icon_global.init(
@@ -857,6 +866,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_dialog_global.deinit();
     self.xdg_toplevel_icon_global.deinit();
     self.xdg_toplevel_tag_global.deinit();
+    self.gtk_shell_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
     self.surface_tree.deinit();
