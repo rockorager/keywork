@@ -30,6 +30,7 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const TransientSeatGlobal = @import("TransientSeatGlobal.zig");
 const XdgActivationGlobal = @import("XdgActivationGlobal.zig");
 const IdleNotifyGlobal = @import("IdleNotifyGlobal.zig");
 const IdleInhibitGlobal = @import("IdleInhibitGlobal.zig");
@@ -102,6 +103,7 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+transient_seat_global: TransientSeatGlobal,
 xdg_activation_global: XdgActivationGlobal,
 idle_notify_global: IdleNotifyGlobal,
 idle_inhibit_global: IdleInhibitGlobal,
@@ -574,6 +576,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.pointer_cursor.handler(),
     );
     errdefer self.seat_global.deinit();
+    try self.transient_seat_global.init(
+        allocator,
+        &self.server,
+        &self.security_context_global,
+    );
+    errdefer self.transient_seat_global.deinit();
     var activation_token_key: [std.crypto.auth.hmac.sha2.HmacSha256.key_length]u8 = undefined;
     defer @memset(&activation_token_key, 0);
     try io.randomSecure(&activation_token_key);
@@ -919,6 +927,7 @@ pub fn destroy(self: *NativeServer) void {
     self.idle_inhibit_global.deinit();
     self.idle_notify_global.deinit();
     self.xdg_activation_global.deinit();
+    self.transient_seat_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
     self.commit_timing_global.deinit();

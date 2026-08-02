@@ -7,25 +7,31 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 
-// Version 2 acknowledgement bookkeeping is not needed while globals remain
-// process-lifetime objects, matching the legacy compositor advertisement.
-const advertised_version: u32 = 1;
+const advertised_version: u32 = 2;
 
 server: *Server,
 global_name: u32,
+finalized: bool,
 
 pub fn init(self: *FixesGlobal, server: *Server) !void {
-    self.* = .{ .server = server, .global_name = undefined };
+    self.* = .{ .server = server, .global_name = undefined, .finalized = false };
     self.global_name = try server.createGlobal(
         &generated.wl_fixes,
         advertised_version,
-        .{ .context = self, .bind = bind },
+        .{ .context = self, .bind = bind, .finalized = globalFinalized },
     );
 }
 
 pub fn deinit(self: *FixesGlobal) void {
     self.server.removeGlobal(self.global_name) catch unreachable;
+    std.debug.assert(self.finalized);
     self.* = undefined;
+}
+
+fn globalFinalized(context: *anyopaque) void {
+    const self: *FixesGlobal = @ptrCast(@alignCast(context));
+    std.debug.assert(!self.finalized);
+    self.finalized = true;
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
@@ -37,11 +43,12 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
 }
 
 fn dispatchFixes(
-    _: *anyopaque,
+    context: *anyopaque,
     client: *Server.Client,
     resource: wayring.ObjectHandle,
     message: *wayring.Message,
 ) !void {
+    const self: *FixesGlobal = @ptrCast(@alignCast(context));
     switch (try generated.wl_fixes_types.decodeRequest(
         &client.connection,
         resource,
@@ -56,7 +63,19 @@ fn dispatchFixes(
                 .generation = object.generation,
             });
         },
-        .ack_global_remove => unreachable,
+        .ack_global_remove => |request| {
+            const object = client.connection.object(request.registry) orelse
+                return error.UnknownRegistry;
+            self.server.ackGlobalRemove(
+                client,
+                .{ .id = request.registry, .generation = object.generation },
+                request.name,
+            ) catch return client.postError(
+                resource,
+                @intFromEnum(generated.wl_fixes_types.@"error".invalid_ack_remove),
+                "unknown global or global is not retiring for this registry",
+            );
+        },
     }
 }
 
@@ -161,6 +180,63 @@ test "native fixes destroys registries without disturbing other subscriptions" {
     try generated.wl_fixes_types.requests.destroy(&peer, fixes_resource);
     try transferToServer(&peer, client);
     try std.testing.expectEqual(Server.ClientState.active, client.state);
+}
+
+test "native fixes rejects acknowledgements for active globals" {
+    const core = @import("wayring-core");
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var fixes: FixesGlobal = undefined;
+    try fixes.init(&server);
+    defer fixes.deinit();
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var advertisement = peer.popMessage() orelse return error.MissingFixes;
+    defer advertisement.deinit();
+    const fixes_name = (try core.decodeRegistryEvent(&advertisement, registry.id)).global.name;
+    const fixes_resource: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            fixes_name,
+            generated.wl_fixes.name,
+            2,
+            3,
+            &generated.wl_fixes,
+        ),
+    };
+    try transferToServer(&peer, client);
+
+    try peer.queueObject(
+        fixes_resource,
+        &generated.wl_fixes,
+        2,
+        &.{ .{ .object = registry.id }, .{ .uint = fixes.global_name } },
+    );
+    try std.testing.expectError(error.ProtocolError, transferToServer(&peer, client));
+    try transferFromServer(&peer, client);
+    var error_message = peer.popMessage() orelse return error.MissingFixesError;
+    defer error_message.deinit();
+    const event = (try core.decodeDisplayEvent(&error_message)).error_event;
+    try std.testing.expectEqual(fixes_resource.id, event.object_id);
+    try std.testing.expectEqual(
+        @intFromEnum(generated.wl_fixes_types.@"error".invalid_ack_remove),
+        event.code,
+    );
 }
 
 fn transferToServer(connection: *wayring.Connection, client: *Server.Client) !void {

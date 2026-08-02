@@ -34,6 +34,8 @@ pub const GlobalBind = *const fn (
     version: u32,
 ) anyerror!void;
 
+/// Must be stable for immutable client provenance: creation and registry
+/// enumeration may evaluate a filter once to reserve and again to announce.
 pub const GlobalFilter = *const fn (context: *anyopaque, client: *const Client) bool;
 
 pub const ResourceImplementation = struct {
@@ -47,6 +49,9 @@ pub const GlobalImplementation = struct {
     bind: GlobalBind,
     filter_context: ?*anyopaque = null,
     filter: ?GlobalFilter = null,
+    /// Called after removal from Server storage. It may free context but must
+    /// not add or remove globals while announcement cleanup is iterating.
+    finalized: ?*const fn (context: *anyopaque) void = null,
 };
 
 pub const ClientState = enum { active, protocol_error, closing };
@@ -68,10 +73,18 @@ const Resource = struct {
 };
 
 pub const Global = struct {
+    const Lifecycle = enum { active, retiring };
+    const Announcement = struct {
+        client: *Client,
+        registry: wayring.ObjectHandle,
+    };
+
     name: u32,
     interface: *const wayring.Interface,
     version: u32,
     implementation: GlobalImplementation,
+    lifecycle: Lifecycle = .active,
+    announcements: std.ArrayList(Announcement) = .empty,
 
     fn visibleTo(self: *const Global, client: *const Client) bool {
         const filter = self.implementation.filter orelse return true;
@@ -138,6 +151,7 @@ pub const Client = struct {
                 destroy(resource.implementation.context, self, resource.handle);
             self.connection.removeObject(resource.handle.id, resource.handle.generation) catch {};
         }
+        self.server.clearAnnouncements(self, null);
     }
 
     fn deinit(self: *Client) void {
@@ -436,6 +450,8 @@ pub fn deinit(self: *Server) void {
         client.deinit();
         self.allocator.destroy(client);
     }
+    for (self.globals.items) |*global_value|
+        global_value.announcements.deinit(self.allocator);
     self.globals.deinit(self.allocator);
     self.clients.deinit(self.allocator);
     self.* = undefined;
@@ -506,6 +522,21 @@ pub fn createGlobal(
     if (version == 0 or version > interface.version) return error.InvalidGlobalVersion;
     if (self.next_global_name > std.math.maxInt(u32)) return error.GlobalNameExhausted;
     try self.globals.ensureUnusedCapacity(self.allocator, 1);
+    var announcements: std.ArrayList(Global.Announcement) = .empty;
+    errdefer announcements.deinit(self.allocator);
+    var announcement_count: usize = 0;
+    for (self.clients.items) |client| {
+        if (client.state != .active) continue;
+        const probe: Global = .{
+            .name = 0,
+            .interface = interface,
+            .version = version,
+            .implementation = implementation,
+        };
+        if (probe.visibleTo(client))
+            announcement_count = try std.math.add(usize, announcement_count, client.registries.items.len);
+    }
+    try announcements.ensureUnusedCapacity(self.allocator, announcement_count);
     const name: u32 = @intCast(self.next_global_name);
     self.next_global_name += 1;
     self.globals.appendAssumeCapacity(.{
@@ -513,25 +544,82 @@ pub fn createGlobal(
         .interface = interface,
         .version = version,
         .implementation = implementation,
+        .announcements = announcements,
     });
-    const added_global = self.globals.items[self.globals.items.len - 1];
+    const added_global = &self.globals.items[self.globals.items.len - 1];
     for (self.clients.items) |client| {
         if (client.state != .active or !added_global.visibleTo(client)) continue;
-        for (client.registries.items) |registry|
-            try core.queueGlobal(&client.connection, registry.id, name, interface.name, version);
+        for (client.registries.items) |registry| {
+            core.queueGlobal(&client.connection, registry.id, name, interface.name, version) catch {
+                client.postNoMemory() catch {};
+                break;
+            };
+            added_global.announcements.appendAssumeCapacity(.{ .client = client, .registry = registry });
+        }
     }
     return name;
 }
 
 pub fn removeGlobal(self: *Server, name: u32) !void {
     const index = self.globalIndex(name) orelse return error.UnknownGlobal;
-    const removed_global = self.globals.items[index];
-    for (self.clients.items) |client| {
-        if (client.state != .active or !removed_global.visibleTo(client)) continue;
-        for (client.registries.items) |registry|
-            try core.queueGlobalRemove(&client.connection, registry.id, name);
+    const global_value = &self.globals.items[index];
+    if (global_value.lifecycle != .active) return error.GlobalRetiring;
+    global_value.lifecycle = .retiring;
+    for (global_value.announcements.items) |announcement| {
+        if (announcement.client.state != .active) continue;
+        core.queueGlobalRemove(&announcement.client.connection, announcement.registry.id, name) catch {
+            announcement.client.postNoMemory() catch {};
+        };
     }
-    _ = self.globals.orderedRemove(index);
+    if (global_value.announcements.items.len == 0) self.finalizeGlobal(index);
+}
+
+pub fn ackGlobalRemove(
+    self: *Server,
+    client: *Client,
+    registry: wayring.ObjectHandle,
+    name: u32,
+) !void {
+    const resource = client.resources.get(registry.id) orelse return error.InvalidGlobalRemoveAck;
+    if (client.server != self or resource.handle.generation != registry.generation or
+        resource.interface != &core.wl_registry)
+        return error.InvalidGlobalRemoveAck;
+    const global_index = self.globalIndex(name) orelse return error.InvalidGlobalRemoveAck;
+    const global_value = &self.globals.items[global_index];
+    if (global_value.lifecycle != .retiring) return error.InvalidGlobalRemoveAck;
+    for (global_value.announcements.items, 0..) |announcement, index| {
+        if (announcement.client == client and handlesEqual(announcement.registry, registry)) {
+            _ = global_value.announcements.orderedRemove(index);
+            if (global_value.announcements.items.len == 0) self.finalizeGlobal(global_index);
+            return;
+        }
+    }
+    return error.InvalidGlobalRemoveAck;
+}
+
+fn finalizeGlobal(self: *Server, index: usize) void {
+    var removed = self.globals.orderedRemove(index);
+    removed.announcements.deinit(self.allocator);
+    if (removed.implementation.finalized) |finalized|
+        finalized(removed.implementation.context);
+}
+
+fn clearAnnouncements(self: *Server, client: *Client, registry: ?wayring.ObjectHandle) void {
+    var global_index: usize = 0;
+    while (global_index < self.globals.items.len) {
+        const global_value = &self.globals.items[global_index];
+        var index = global_value.announcements.items.len;
+        while (index > 0) {
+            index -= 1;
+            const announcement = global_value.announcements.items[index];
+            if (announcement.client == client and
+                (registry == null or handlesEqual(announcement.registry, registry.?)))
+                _ = global_value.announcements.orderedRemove(index);
+        }
+        if (global_value.lifecycle == .retiring and global_value.announcements.items.len == 0) {
+            self.finalizeGlobal(global_index);
+        } else global_index += 1;
+    }
 }
 
 fn globalIndex(self: *const Server, name: u32) ?usize {
@@ -560,20 +648,29 @@ fn dispatchDisplay(
     switch (try core.decodeDisplayRequest(message)) {
         .get_registry => |id| {
             try client.registries.ensureUnusedCapacity(client.allocator, 1);
+            for (self.globals.items) |*global_value| {
+                if (global_value.lifecycle == .active and global_value.visibleTo(client))
+                    try global_value.announcements.ensureUnusedCapacity(self.allocator, 1);
+            }
             const handle = try client.createResource(id, &core.wl_registry, 1, .{
                 .context = self,
                 .dispatch = dispatchRegistry,
+                .destroy = destroyRegistry,
             });
             client.registries.appendAssumeCapacity(handle);
             for (self.globals.items) |*global_value| {
-                if (!global_value.visibleTo(client)) continue;
-                try core.queueGlobal(
+                if (global_value.lifecycle != .active or !global_value.visibleTo(client)) continue;
+                core.queueGlobal(
                     &client.connection,
                     handle.id,
                     global_value.name,
                     global_value.interface.name,
                     global_value.version,
-                );
+                ) catch {
+                    client.postNoMemory() catch {};
+                    break;
+                };
+                global_value.announcements.appendAssumeCapacity(.{ .client = client, .registry = handle });
             }
         },
         .sync => |id| {
@@ -595,7 +692,18 @@ fn dispatchRegistry(
     const self: *Server = @ptrCast(@alignCast(context));
     const request = (try core.decodeRegistryRequest(message, resource.id)).bind;
     const global_value = (self.findGlobal(request.name) orelse return error.UnknownGlobal).*;
-    if (!global_value.visibleTo(client)) return error.FilteredGlobal;
+    if (global_value.lifecycle == .active) {
+        if (!global_value.visibleTo(client)) return error.FilteredGlobal;
+    } else {
+        var entitled = false;
+        for (global_value.announcements.items) |announcement| {
+            if (announcement.client == client and handlesEqual(announcement.registry, resource)) {
+                entitled = true;
+                break;
+            }
+        }
+        if (!entitled) return error.UnknownGlobal;
+    }
     if (!std.mem.eql(u8, request.interface, global_value.interface.name)) return error.WrongInterface;
     if (request.version == 0 or request.version > global_value.version) return error.InvalidVersion;
     try global_value.implementation.bind(
@@ -607,6 +715,15 @@ fn dispatchRegistry(
     const created = client.resources.get(request.new_id) orelse return error.MissingResource;
     if (created.interface != global_value.interface or created.version != request.version)
         return error.WrongBoundResource;
+}
+
+fn destroyRegistry(
+    context: *anyopaque,
+    client: *Client,
+    resource: wayring.ObjectHandle,
+) void {
+    const self: *Server = @ptrCast(@alignCast(context));
+    self.clearAnnouncements(client, resource);
 }
 
 fn hasConstructor(descriptor: *const wayring.MessageDescriptor) bool {
@@ -621,6 +738,10 @@ fn removeHandle(handles: *std.ArrayList(wayring.ObjectHandle), target: wayring.O
             return;
         }
     }
+}
+
+fn handlesEqual(a: wayring.ObjectHandle, b: wayring.ObjectHandle) bool {
+    return a.id == b.id and a.generation == b.generation;
 }
 
 fn closeAll(fds: []const i32) void {
@@ -715,6 +836,12 @@ const TestContext = struct {
     denied_client: ?*Client = null,
     nested_destroy: ?wayring.ObjectHandle = null,
     nested_destroy_failed: bool = false,
+    global_finalizations: usize = 0,
+
+    fn globalFinalized(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.global_finalizations += 1;
+    }
 
     fn bind(context: *anyopaque, client: *Client, id: u32, version: u32) !void {
         const self: *@This() = @ptrCast(@alignCast(context));
@@ -1160,7 +1287,7 @@ test "missing constructor registration stops a coalesced child request" {
     try std.testing.expectEqual(@as(usize, 0), context.child_pings);
 }
 
-test "global add and remove fan out to every registry" {
+test "global retirement preserves exact obligations until ack or registry teardown" {
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
     var context: TestContext = .{};
@@ -1178,6 +1305,7 @@ test "global add and remove fan out to every registry" {
     const name = try server.createGlobal(&test_factory, 1, .{
         .context = &context,
         .bind = TestContext.bind,
+        .finalized = TestContext.globalFinalized,
     });
     try first.transferFromServer(first_client);
     try second.transferFromServer(second_client);
@@ -1197,6 +1325,218 @@ test "global add and remove fan out to every registry" {
     defer second_remove.deinit();
     try std.testing.expectEqual(name, (try core.decodeRegistryEvent(&first_remove, 2)).global_remove);
     try std.testing.expectEqual(name, (try core.decodeRegistryEvent(&second_remove, 2)).global_remove);
+
+    try std.testing.expectError(error.GlobalRetiring, server.removeGlobal(name));
+    try std.testing.expectError(
+        error.InvalidGlobalRemoveAck,
+        server.ackGlobalRemove(first_client, .{ .id = 2, .generation = 999 }, name),
+    );
+
+    // A bind already entitled by this exact registry remains valid after the
+    // remove event was queued.
+    _ = try core.bind(
+        &first.connection,
+        first.registry.?.id,
+        name,
+        test_factory.name,
+        1,
+        3,
+        &test_factory,
+    );
+    try first.transferToServer(first_client);
+    try std.testing.expect(first_client.resources.contains(3));
+
+    // Retiring globals are hidden from registries created after removal.
+    const late_client = try server.createClient();
+    var late = try TestPeer.init(std.testing.allocator);
+    defer late.deinit();
+    try late.getRegistry();
+    try late.transferToServer(late_client);
+    try late.transferFromServer(late_client);
+    try std.testing.expect(late.connection.popMessage() == null);
+    _ = try core.bind(
+        &late.connection,
+        late.registry.?.id,
+        name,
+        test_factory.name,
+        1,
+        3,
+        &test_factory,
+    );
+    try std.testing.expectError(error.ProtocolError, late.transferToServer(late_client));
+
+    try server.ackGlobalRemove(first_client, first.registry.?, name);
+    try std.testing.expect(server.findGlobal(name) != null);
+    try std.testing.expectEqual(@as(usize, 0), context.global_finalizations);
+    try second_client.destroyResource(second.registry.?);
+    try std.testing.expect(server.findGlobal(name) == null);
+    try std.testing.expectEqual(@as(usize, 1), context.global_finalizations);
+    try std.testing.expectError(
+        error.InvalidGlobalRemoveAck,
+        server.ackGlobalRemove(first_client, first.registry.?, name),
+    );
+}
+
+test "client teardown clears unacknowledged global retirement" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{};
+    const client = try server.createClient();
+    var peer = try TestPeer.init(std.testing.allocator);
+    defer peer.deinit();
+    try peer.getRegistry();
+    try peer.transferToServer(client);
+
+    const name = try server.createGlobal(&test_factory, 1, .{
+        .context = &context,
+        .bind = TestContext.bind,
+        .finalized = TestContext.globalFinalized,
+    });
+    try server.removeGlobal(name);
+    try std.testing.expect(server.findGlobal(name) != null);
+
+    // A v1 registry has no acknowledgement request, so its obligation keeps
+    // the global alive until registry/client teardown.
+    try server.destroyClient(client);
+    try std.testing.expect(server.findGlobal(name) == null);
+    try std.testing.expectEqual(@as(usize, 1), context.global_finalizations);
+}
+
+test "post-commit global announcement OOM keeps context registered" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{};
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+    var peer = try TestPeer.init(std.testing.allocator);
+    defer peer.deinit();
+    try peer.getRegistry();
+    try peer.transferToServer(client);
+
+    // Force queueGlobal, not the pre-commit Global/announcement storage, to
+    // fail. Restore the normal allocator before client teardown.
+    client.connection.outbound.deinit(std.testing.allocator);
+    client.connection.outbound = .empty;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    client.connection.allocator = failing.allocator();
+    const name = try server.createGlobal(&test_factory, 1, .{
+        .context = &context,
+        .bind = TestContext.bind,
+        .finalized = TestContext.globalFinalized,
+    });
+    client.connection.allocator = std.testing.allocator;
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(ClientState.protocol_error, client.state);
+    try std.testing.expect(server.findGlobal(name) != null);
+    try std.testing.expectEqual(@as(usize, 0), server.findGlobal(name).?.announcements.items.len);
+    try server.removeGlobal(name);
+    try std.testing.expect(server.findGlobal(name) == null);
+    try std.testing.expectEqual(@as(usize, 1), context.global_finalizations);
+}
+
+test "each registry acknowledges global retirement independently" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{};
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+    var peer = try TestPeer.init(std.testing.allocator);
+    defer peer.deinit();
+    try peer.getRegistry();
+    const second_registry: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.getRegistry(&peer.connection, 3),
+    };
+    try peer.transferToServer(client);
+
+    const name = try server.createGlobal(&test_factory, 1, .{
+        .context = &context,
+        .bind = TestContext.bind,
+        .finalized = TestContext.globalFinalized,
+    });
+    try peer.transferFromServer(client);
+    var add_count: usize = 0;
+    while (peer.connection.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const registry_id = if (message.object_id == peer.registry.?.id)
+            peer.registry.?.id
+        else if (message.object_id == second_registry.id)
+            second_registry.id
+        else
+            return error.UnexpectedRegistryEvent;
+        if ((try core.decodeRegistryEvent(&message, registry_id)).global.name == name)
+            add_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), add_count);
+
+    try server.removeGlobal(name);
+    try peer.transferFromServer(client);
+    while (peer.connection.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+    const unentitled_registry: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.getRegistry(&peer.connection, 4),
+    };
+    try peer.transferToServer(client);
+    try peer.transferFromServer(client);
+    try std.testing.expect(peer.connection.popMessage() == null);
+
+    try server.ackGlobalRemove(client, peer.registry.?, name);
+    try std.testing.expect(server.findGlobal(name) != null);
+    try std.testing.expectError(
+        error.InvalidGlobalRemoveAck,
+        server.ackGlobalRemove(client, unentitled_registry, name),
+    );
+    try server.ackGlobalRemove(client, second_registry, name);
+    try std.testing.expect(server.findGlobal(name) == null);
+    try std.testing.expectEqual(@as(usize, 1), context.global_finalizations);
+}
+
+test "global removal enqueue OOM retains obligation until teardown" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{};
+    const client = try server.createClient();
+    var client_owned = true;
+    defer if (client_owned) server.destroyClient(client) catch unreachable;
+    var peer = try TestPeer.init(std.testing.allocator);
+    defer peer.deinit();
+    try peer.getRegistry();
+    try peer.transferToServer(client);
+    const name = try server.createGlobal(&test_factory, 1, .{
+        .context = &context,
+        .bind = TestContext.bind,
+        .finalized = TestContext.globalFinalized,
+    });
+    try peer.transferFromServer(client);
+    while (peer.connection.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    client.connection.outbound.deinit(std.testing.allocator);
+    client.connection.outbound = .empty;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    client.connection.allocator = failing.allocator();
+    try server.removeGlobal(name);
+    client.connection.allocator = std.testing.allocator;
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(ClientState.protocol_error, client.state);
+    try std.testing.expectEqual(@as(usize, 1), server.findGlobal(name).?.announcements.items.len);
+    try std.testing.expectEqual(@as(usize, 0), context.global_finalizations);
+    try server.destroyClient(client);
+    client_owned = false;
+    try std.testing.expect(server.findGlobal(name) == null);
+    try std.testing.expectEqual(@as(usize, 1), context.global_finalizations);
 }
 
 test "retained policy state keeps client storage alive after transport teardown" {

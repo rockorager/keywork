@@ -16,6 +16,8 @@ server: *Server,
 global_name: u32,
 name: []const u8,
 capabilities: u32,
+lifecycle: Lifecycle = .active,
+lifecycle_listener: ?LifecycleListener = null,
 capability_generations: [3]u64 = .{ 0, 0, 0 },
 ever_available: [3]bool = .{ false, false, false },
 bindings: std.ArrayList(*Binding) = .empty,
@@ -51,6 +53,14 @@ const SelectionSerial = struct {
 };
 
 pub const Capability = generated.wl_seat_types.capability;
+
+const Lifecycle = enum { active, retiring, finalized };
+
+pub const LifecycleListener = struct {
+    context: *anyopaque,
+    resource_count_changed: *const fn (*anyopaque, usize) void,
+    global_finalized: *const fn (*anyopaque) void,
+};
 
 pub const CursorIntent = struct {
     client: *Server.Client,
@@ -130,6 +140,7 @@ pub fn init(
     self.global_name = try server.createGlobal(&generated.wl_seat, advertised_version, .{
         .context = self,
         .bind = bind,
+        .finalized = globalFinalizedCallback,
     });
 }
 
@@ -137,19 +148,56 @@ pub fn deinit(self: *SeatGlobal) void {
     std.debug.assert(self.bindings.items.len == 0);
     std.debug.assert(self.children.items.len == 0);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
+    std.debug.assert(self.lifecycle_listener == null);
+    if (self.lifecycle == .active) self.removeGlobal() catch unreachable;
+    std.debug.assert(self.lifecycle == .finalized);
     clearFocus(&self.pointer_focus);
     clearFocus(&self.keyboard_focus);
     clearFocus(&self.touch_focus);
     self.keyboard_held_keys.deinit(self.allocator);
     self.keyboard_focus_listeners.deinit(self.allocator);
     if (self.keymap_fd >= 0) _ = linux.close(self.keymap_fd);
-    self.server.removeGlobal(self.global_name) catch unreachable;
     self.children.deinit(self.allocator);
     self.bindings.deinit(self.allocator);
     self.* = undefined;
 }
 
+/// Retires this global once and makes all existing resources inert.
+pub fn removeGlobal(self: *SeatGlobal) !void {
+    if (self.lifecycle != .active) return;
+    try self.setCapabilities(0);
+    self.lifecycle = .retiring;
+    try self.server.removeGlobal(self.global_name);
+}
+
+pub fn setLifecycleListener(self: *SeatGlobal, listener: LifecycleListener) void {
+    std.debug.assert(self.lifecycle_listener == null);
+    self.lifecycle_listener = listener;
+}
+
+pub fn clearLifecycleListener(self: *SeatGlobal) void {
+    std.debug.assert(self.lifecycle_listener != null);
+    self.lifecycle_listener = null;
+}
+
+pub fn globalName(self: *const SeatGlobal) u32 {
+    return self.global_name;
+}
+
+pub fn resourceCount(self: *const SeatGlobal) usize {
+    return self.bindings.items.len + self.children.items.len;
+}
+
+pub fn isActive(self: *const SeatGlobal) bool {
+    return self.lifecycle == .active;
+}
+
+pub fn globalFinalized(self: *const SeatGlobal) bool {
+    return self.lifecycle == .finalized;
+}
+
 pub fn setCapabilities(self: *SeatGlobal, capabilities: u32) !void {
+    std.debug.assert(self.lifecycle == .active or capabilities == 0);
     if (self.capabilities == capabilities) return;
     const removed = self.capabilities & ~capabilities;
     const added = capabilities & ~self.capabilities;
@@ -580,8 +628,13 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
     }) catch return client.postNoMemory();
     self.bindings.appendAssumeCapacity(binding);
     registered = true;
+    self.notifyResourceCount();
     if (version >= 2) try generated.wl_seat_types.events.name(&client.connection, binding.resource, self.name);
-    try generated.wl_seat_types.events.capabilities(&client.connection, binding.resource, self.capabilities);
+    try generated.wl_seat_types.events.capabilities(
+        &client.connection,
+        binding.resource,
+        if (self.lifecycle == .active) self.capabilities else 0,
+    );
 }
 
 fn dispatchSeat(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
@@ -631,6 +684,7 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
     }) catch return client.postNoMemory();
     self.children.appendAssumeCapacity(child);
     registered = true;
+    self.notifyResourceCount();
     if (!self.childActive(child)) return;
     switch (kind) {
         .pointer => if (self.pointer_focus) |surface| {
@@ -760,11 +814,28 @@ fn dispatchTouch(_: *anyopaque, client: *Server.Client, resource: wayring.Object
 
 fn destroyBinding(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const binding: *Binding = @ptrCast(@alignCast(context));
-    removeOwned(Binding, binding.owner.allocator, &binding.owner.bindings, binding);
+    const owner = binding.owner;
+    removeOwned(Binding, owner.allocator, &owner.bindings, binding);
+    owner.notifyResourceCount();
 }
 fn destroyChild(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const child: *Child = @ptrCast(@alignCast(context));
-    removeOwned(Child, child.owner.allocator, &child.owner.children, child);
+    const owner = child.owner;
+    removeOwned(Child, owner.allocator, &owner.children, child);
+    owner.notifyResourceCount();
+}
+
+fn notifyResourceCount(self: *SeatGlobal) void {
+    const listener = self.lifecycle_listener orelse return;
+    listener.resource_count_changed(listener.context, self.resourceCount());
+}
+
+fn globalFinalizedCallback(context: *anyopaque) void {
+    const self: *SeatGlobal = @ptrCast(@alignCast(context));
+    std.debug.assert(self.lifecycle == .retiring);
+    self.lifecycle = .finalized;
+    const listener = self.lifecycle_listener orelse return;
+    listener.global_finalized(listener.context);
 }
 
 fn removeOwned(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayList(*T), item: *T) void {
@@ -864,6 +935,103 @@ test "seat capability constants match core protocol" {
     try std.testing.expectEqual(@as(u32, 1), Capability.pointer);
     try std.testing.expectEqual(@as(u32, 2), Capability.keyboard);
     try std.testing.expectEqual(@as(u32, 4), Capability.touch);
+}
+
+const LifecycleTestContext = struct {
+    counts: [4]usize = undefined,
+    count_len: usize = 0,
+    finalizations: usize = 0,
+
+    fn countChanged(context: *anyopaque, count: usize) void {
+        const self: *LifecycleTestContext = @ptrCast(@alignCast(context));
+        self.counts[self.count_len] = count;
+        self.count_len += 1;
+    }
+
+    fn finalized(context: *anyopaque) void {
+        const self: *LifecycleTestContext = @ptrCast(@alignCast(context));
+        self.finalizations += 1;
+    }
+};
+
+test "inputless seat retirement accepts entitled late binds and tracks resources" {
+    const core = @import("wayring-core");
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var seat: SeatGlobal = undefined;
+    try seat.init(std.testing.allocator, &server, "transient", 0, null);
+    var lifecycle: LifecycleTestContext = .{};
+    seat.setLifecycleListener(.{
+        .context = &lifecycle,
+        .resource_count_changed = LifecycleTestContext.countChanged,
+        .global_finalized = LifecycleTestContext.finalized,
+    });
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(std.testing.allocator, .client, wayring.default_max_frame_size);
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{ .id = 2, .generation = try core.getRegistry(&peer, 2) };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var advertisement = peer.popMessage() orelse return error.MissingSeatAdvertisement;
+    defer advertisement.deinit();
+    const advertised = (try core.decodeRegistryEvent(&advertisement, registry.id)).global;
+    try std.testing.expectEqual(seat.globalName(), advertised.name);
+    try std.testing.expectEqualStrings(generated.wl_seat.name, advertised.interface);
+
+    const first: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(&peer, registry.id, advertised.name, advertised.interface, 10, 3, &generated.wl_seat),
+    };
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(@as(usize, 1), seat.resourceCount());
+    try seat.removeGlobal();
+    try std.testing.expect(!seat.isActive());
+    try transferFromServer(&peer, client);
+
+    var saw_remove = false;
+    var first_capabilities_zero = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == registry.id) {
+            saw_remove = (try core.decodeRegistryEvent(&message, registry.id)).global_remove == advertised.name;
+        } else if (message.object_id == first.id) {
+            switch (try generated.wl_seat_types.decodeEvent(&peer, first, &message)) {
+                .capabilities => |event| first_capabilities_zero = event.capabilities == 0,
+                .name => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_remove and first_capabilities_zero);
+
+    const late: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(&peer, registry.id, advertised.name, advertised.interface, 10, 4, &generated.wl_seat),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var late_named = false;
+    var late_inert = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        switch (try generated.wl_seat_types.decodeEvent(&peer, late, &message)) {
+            .name => |event| late_named = std.mem.eql(u8, event.name, "transient"),
+            .capabilities => |event| late_inert = event.capabilities == 0,
+        }
+    }
+    try std.testing.expect(late_named and late_inert);
+    try std.testing.expectEqual(@as(usize, 2), seat.resourceCount());
+    try server.ackGlobalRemove(client, registry, advertised.name);
+    try std.testing.expect(seat.globalFinalized());
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.finalizations);
+    try client.destroyResource(first);
+    try client.destroyResource(late);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 1, 0 }, lifecycle.counts[0..lifecycle.count_len]);
+    seat.clearLifecycleListener();
+    seat.deinit();
 }
 
 const CursorTestContext = struct {

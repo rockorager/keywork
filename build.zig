@@ -70,7 +70,13 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-transient-seat/ext-transient-seat-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(b.path("protocols/wayland/upstream/wlr-data-control-unstable-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(b.path("protocols/wayland/virtual-keyboard-unstable-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(b.path("protocols/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/presentation-time/presentation-time.xml"));
     generate_wayring_protocols.addArg("-i");
