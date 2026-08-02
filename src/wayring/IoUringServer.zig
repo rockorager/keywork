@@ -148,10 +148,12 @@ fn destroySpec(spec: ListenerSpec) void {
 /// outer ring drain and before policy-owned end-of-turn work.
 pub fn dispatch(self: *IoUringServer) !void {
     self.retryListenerCancellations();
+    self.retryPeerCancellations();
     var index: usize = 0;
     var completed = false;
     defer {
         if (index != 0) self.pending.replaceRangeAssumeCapacity(0, index, &.{});
+        self.retryPeerCancellations();
         if (completed) self.reapClients();
         self.reapListeners();
     }
@@ -221,7 +223,7 @@ pub fn shutdown(self: *IoUringServer) !void {
     }
     for (self.clients.items) |peer| {
         peer.terminal = true;
-        if (!peer.transport.closing) peer.transport.shutdown() catch |err| {
+        peer.transport.shutdown() catch |err| {
             if (first_error == null) first_error = err;
         };
     }
@@ -233,6 +235,7 @@ pub fn shutdown(self: *IoUringServer) !void {
 pub fn readyToDeinit(self: *IoUringServer) bool {
     if (!self.closing) return false;
     if (self.pending.items.len != 0) return false;
+    self.retryPeerCancellations();
     self.reapClients();
     self.retryListenerCancellations();
     self.reapListeners();
@@ -361,6 +364,14 @@ fn requestListenerCancellation(self: *IoUringServer, listener: *Listener) !void 
 fn retryListenerCancellations(self: *IoUringServer) void {
     for (self.listeners.items) |listener| if (listener.draining)
         self.requestListenerCancellation(listener) catch {};
+}
+
+fn retryPeerCancellations(self: *IoUringServer) void {
+    for (self.clients.items) |peer| {
+        if (!peer.terminal and !peer.transport.closing) continue;
+        peer.terminal = true;
+        peer.transport.shutdown() catch {};
+    }
 }
 
 fn reapListeners(self: *IoUringServer) void {
@@ -848,6 +859,15 @@ test "listener accepts a client and completes native display sync" {
     try std.testing.expect(client_context.got_delete);
     try std.testing.expect(!client_context.fatal);
 
+    // Model an earlier shutdown attempt that set closing before cancellation
+    // submission failed. Server dispatch must retry the still-active receive.
+    const accepted_peer = transport_server.clients.items[0];
+    try std.testing.expect(accepted_peer.transport.receive_handle != null);
+    try std.testing.expect(!accepted_peer.transport.receive_cancel_requested);
+    accepted_peer.transport.closing = true;
+    try transport_server.dispatch();
+    try std.testing.expect(accepted_peer.terminal);
+    try std.testing.expect(accepted_peer.transport.receive_cancel_requested);
     try transport_server.shutdown();
     while (loop.hasActiveOperations()) {
         try loop.runOnce();
