@@ -11,6 +11,7 @@ const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const SeatGlobal = @import("SeatGlobal.zig");
+const SelectionSource = @import("SelectionSource.zig");
 
 const advertised_version: u32 = 4;
 
@@ -22,6 +23,9 @@ sources: std.ArrayList(*Source) = .empty,
 devices: std.ArrayList(*Device) = .empty,
 offers: std.ArrayList(*Offer) = .empty,
 selection: ?*Source = null,
+external_selection: ?*SelectionSource = null,
+selection_generation: u64 = 0,
+listeners: std.ArrayList(SelectionSource.Listener) = .empty,
 selection_serial: ?u32 = null,
 focused_client: ?*Server.Client = null,
 
@@ -59,6 +63,7 @@ const Offer = struct {
     client: *Server.Client,
     resource: wayring.ObjectHandle,
     source: ?*Source,
+    generation: u64,
 };
 
 pub fn init(
@@ -90,6 +95,7 @@ pub fn deinit(self: *DataDeviceGlobal) void {
     self.offers.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.sources.deinit(self.allocator);
+    self.listeners.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -253,6 +259,8 @@ fn offerMime(
         self.allocator.free(copy);
         return source.client.postNoMemory();
     };
+    if (self.selection == source) for (self.listeners.items) |listener|
+        listener.offered(listener.context, copy);
     for (self.offers.items) |offer| {
         if (offer.source != source) continue;
         if (offer.client.state != .active) continue;
@@ -366,18 +374,82 @@ fn replaceSelection(
     requester: ?*Server.Client,
 ) !void {
     const old_source = self.selection;
+    const old_external = self.external_selection;
     self.selection = source;
+    self.external_selection = null;
     self.selection_serial = serial;
+    self.selection_generation +%= 1;
     self.invalidateOffers();
+    var requester_error: ?anyerror = null;
     if (self.focused_client) |client| self.sendSelectionToClient(client) catch |err| {
-        if (client == requester) {
-            if (cancel_old) if (old_source) |old| self.cancelSource(old) catch {};
-            return err;
-        }
+        if (client == requester) requester_error = err;
     };
     if (cancel_old) if (old_source) |old| self.cancelSource(old) catch |err| {
-        if (old.client == requester) return err;
+        if (old.client == requester and requester_error == null) requester_error = err;
     };
+    if (cancel_old) if (old_external) |old| old.cancel(old.context) catch {};
+    for (self.listeners.items) |listener| listener.changed(listener.context);
+    if (requester_error) |err| return err;
+}
+
+pub fn addSelectionListener(self: *DataDeviceGlobal, listener: SelectionSource.Listener) !void {
+    try self.listeners.append(self.allocator, listener);
+}
+
+pub fn removeSelectionListener(self: *DataDeviceGlobal, context: *anyopaque) void {
+    for (self.listeners.items, 0..) |listener, index| if (listener.context == context) {
+        _ = self.listeners.swapRemove(index);
+        return;
+    };
+}
+
+pub fn hasSelection(self: *const DataDeviceGlobal) bool {
+    return self.selection != null or self.external_selection != null;
+}
+
+pub fn selectionGeneration(self: *const DataDeviceGlobal) u64 {
+    return self.selection_generation;
+}
+
+pub fn selectionMimeTypes(self: *const DataDeviceGlobal) []const []const u8 {
+    if (self.external_selection) |source| return source.mimeTypes();
+    const source = self.selection orelse return &.{};
+    return source.mime_types.items;
+}
+
+pub fn sendSelection(self: *DataDeviceGlobal, mime_type: []const u8, fd: std.posix.fd_t) !void {
+    if (self.external_selection) |source| return source.send(source.context, mime_type, fd);
+    const source = self.selection orelse return error.NoSelection;
+    if (!source.hasMime(mime_type) or source.client.state != .active) return error.InvalidMime;
+    generated.wl_data_source_types.events.send(&source.client.connection, source.resource, mime_type, fd) catch return source.client.postNoMemory();
+}
+
+pub fn setExternalSelection(self: *DataDeviceGlobal, source: ?*SelectionSource) void {
+    if (self.external_selection == source and self.selection == null) return;
+    const old_local = self.selection;
+    const old_external = self.external_selection;
+    self.selection = null;
+    self.external_selection = source;
+    self.selection_serial = self.server.nextSerial();
+    self.selection_generation +%= 1;
+    self.invalidateOffers();
+    if (self.focused_client) |client| self.sendSelectionToClient(client) catch {
+        client.postNoMemory() catch {};
+    };
+    if (old_local) |old| self.cancelSource(old) catch {};
+    if (old_external) |old| old.cancel(old.context) catch {};
+    for (self.listeners.items) |listener| listener.changed(listener.context);
+}
+
+pub fn externalSourceDestroyed(self: *DataDeviceGlobal, source: *SelectionSource) void {
+    if (self.external_selection != source) return;
+    self.external_selection = null;
+    self.selection_generation +%= 1;
+    self.invalidateOffers();
+    if (self.focused_client) |client| self.sendSelectionToClient(client) catch {
+        client.postNoMemory() catch {};
+    };
+    for (self.listeners.items) |listener| listener.changed(listener.context);
 }
 
 fn cancelSource(_: *DataDeviceGlobal, source: *Source) !void {
@@ -432,21 +504,15 @@ fn receiveOffer(
     defer if (fd_owned) {
         _ = linux.close(fd);
     };
-    const source = offer.source orelse return;
-    if (!source.hasMime(mime_type)) return;
-    if (source.client.state != .active) return;
-    generated.wl_data_source_types.events.send(
-        &source.client.connection,
-        source.resource,
-        mime_type,
-        fd,
-    ) catch {
-        if (source.client == offer.client)
-            return source.client.postNoMemory();
-        source.client.postNoMemory() catch {};
-        return;
-    };
+    if (offer.generation != offer.owner.selection_generation) return;
+    if (!offer.owner.hasCurrentMime(mime_type)) return;
+    offer.owner.sendSelection(mime_type, fd) catch return;
     fd_owned = false;
+}
+
+fn hasCurrentMime(self: *DataDeviceGlobal, mime_type: []const u8) bool {
+    for (self.selectionMimeTypes()) |offered| if (std.mem.eql(u8, offered, mime_type)) return true;
+    return false;
 }
 
 fn sendSelectionToClient(
@@ -470,7 +536,7 @@ fn queueSelectionToDevice(
     self: *DataDeviceGlobal,
     device: *Device,
 ) !void {
-    const source = self.selection orelse return generated.wl_data_device_types.events.selection(
+    if (!self.hasSelection()) return generated.wl_data_device_types.events.selection(
         &device.client.connection,
         device.resource,
         null,
@@ -483,7 +549,8 @@ fn queueSelectionToDevice(
         .owner = self,
         .client = device.client,
         .resource = undefined,
-        .source = source,
+        .source = self.selection,
+        .generation = self.selection_generation,
     };
     const version = @min(
         try device.client.resourceVersion(
@@ -508,7 +575,7 @@ fn queueSelectionToDevice(
         device.resource,
         offer.resource,
     );
-    for (source.mime_types.items) |mime_type| try generated.wl_data_offer_types.events.offer(
+    for (self.selectionMimeTypes()) |mime_type| try generated.wl_data_offer_types.events.offer(
         &device.client.connection,
         offer.resource,
         mime_type,

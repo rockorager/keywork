@@ -41,6 +41,7 @@ const TabletGlobal = @import("TabletGlobal.zig");
 const CursorShapeGlobal = @import("CursorShapeGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
+const DataControlGlobal = @import("DataControlGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgDecorationGlobal = @import("XdgDecorationGlobal.zig");
@@ -110,6 +111,7 @@ tablet_global: TabletGlobal,
 cursor_shape_global: CursorShapeGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
+data_control_global: DataControlGlobal,
 fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_decoration_global: XdgDecorationGlobal,
@@ -646,6 +648,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.data_device_global.deinit();
     try self.primary_selection_global.init(allocator, &self.server, &self.seat_global);
     errdefer self.primary_selection_global.deinit();
+    try self.data_control_global.init(allocator, &self.server, &self.seat_global, &self.data_device_global, &self.primary_selection_global);
+    errdefer self.data_control_global.deinit();
     self.input_paint_entries = .empty;
     self.routed_keys = .empty;
     self.routed_buttons = .empty;
@@ -888,6 +892,7 @@ pub fn destroy(self: *NativeServer) void {
     self.surfaces.deinit(self.allocator);
     self.viewporter_global.deinit();
     self.fractional_scale_global.deinit();
+    self.data_control_global.deinit();
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
     self.cursor_shape_global.deinit();
