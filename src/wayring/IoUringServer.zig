@@ -29,18 +29,41 @@ const Pending = struct {
     notification: IoUringTransport.Notification,
 };
 
+/// One owned listener-level template that creates independent client values.
+pub const ProvenanceTemplate = struct {
+    context: *anyopaque,
+    cloneForClient: *const fn (*anyopaque) anyerror!Server.OwnedProvenance,
+    destroy: *const fn (*anyopaque) void,
+};
+
+/// Owned descriptors and optional provenance for one listening socket.
+pub const ListenerSpec = struct {
+    listen_fd: i32,
+    lifetime_fd: ?i32 = null,
+    provenance: ?ProvenanceTemplate = null,
+};
+
+const Listener = struct {
+    owner: *IoUringServer,
+    listen_fd: i32,
+    lifetime_fd: ?i32,
+    provenance: ?ProvenanceTemplate,
+    accept_handle: ?IoUringLoop.Handle = null,
+    lifetime_handle: ?IoUringLoop.Handle = null,
+    accept_cancel_requested: bool = false,
+    lifetime_cancel_requested: bool = false,
+    multishot_accept: bool = true,
+    draining: bool = false,
+};
+
 allocator: std.mem.Allocator,
 loop: *IoUringLoop,
 server: *Server,
-listener_fd: i32,
 max_pending_output_bytes: usize,
-accept_handle: ?IoUringLoop.Handle = null,
-accept_cancel_requested: bool = false,
+listeners: std.ArrayList(*Listener) = .empty,
 clients: std.ArrayList(*Peer) = .empty,
 pending: std.ArrayList(Pending) = .empty,
-multishot_accept: bool = true,
 closing: bool = false,
-listener_closed: bool = false,
 
 /// Takes ownership of an already bound and listening Unix stream socket,
 /// including when post-adoption initialization fails.
@@ -73,21 +96,64 @@ pub fn initWithLimit(
         .allocator = allocator,
         .loop = loop,
         .server = server,
-        .listener_fd = listener_fd,
         .max_pending_output_bytes = max_pending_output_bytes,
     };
-    errdefer _ = linux.close(listener_fd);
-    try self.armAccept();
+    errdefer self.listeners.deinit(allocator);
+    try self.adoptListener(.{ .listen_fd = listener_fd });
+}
+
+/// Takes ownership of every member of `spec` on every return path. If setup
+/// fails after an operation is queued, cleanup continues asynchronously while
+/// the caller keeps dispatching or shuts the server down.
+pub fn adoptListener(self: *IoUringServer, spec: ListenerSpec) !void {
+    var listener = self.allocator.create(Listener) catch |err| {
+        destroySpec(spec);
+        return err;
+    };
+    listener.* = .{
+        .owner = self,
+        .listen_fd = spec.listen_fd,
+        .lifetime_fd = spec.lifetime_fd,
+        .provenance = spec.provenance,
+    };
+    if (self.closing) {
+        self.destroyListener(listener);
+        return error.ServerClosing;
+    }
+    self.listeners.append(self.allocator, listener) catch |err| {
+        self.destroyListener(listener);
+        return err;
+    };
+    listener.accept_handle = self.loop.queue(listener, acceptComplete, listener, prepareAccept) catch |err| {
+        _ = self.listeners.pop();
+        self.destroyListener(listener);
+        return err;
+    };
+    if (listener.lifetime_fd != null) {
+        listener.lifetime_handle = self.loop.queue(listener, lifetimeComplete, listener, prepareLifetime) catch |err| {
+            listener.draining = true;
+            self.requestListenerCancellation(listener) catch {};
+            return err;
+        };
+    }
+}
+
+fn destroySpec(spec: ListenerSpec) void {
+    _ = linux.close(spec.listen_fd);
+    if (spec.lifetime_fd) |fd| _ = linux.close(fd);
+    if (spec.provenance) |template| template.destroy(template.context);
 }
 
 /// Dispatches transport notifications in CQ order. This must run after each
 /// outer ring drain and before policy-owned end-of-turn work.
 pub fn dispatch(self: *IoUringServer) !void {
+    self.retryListenerCancellations();
     var index: usize = 0;
     var completed = false;
     defer {
         if (index != 0) self.pending.replaceRangeAssumeCapacity(0, index, &.{});
         if (completed) self.reapClients();
+        self.reapListeners();
     }
     while (index < self.pending.items.len) {
         const item = self.pending.items[index];
@@ -147,12 +213,12 @@ pub fn endTurnHook(context: *anyopaque, _: *EventLoop) !void {
 pub fn shutdown(self: *IoUringServer) !void {
     self.closing = true;
     var first_error: ?anyerror = null;
-    if (self.accept_handle) |handle| if (!self.accept_cancel_requested) {
-        self.loop.cancel(handle) catch |err| {
+    for (self.listeners.items) |listener| {
+        listener.draining = true;
+        self.requestListenerCancellation(listener) catch |err| if (first_error == null) {
             first_error = err;
         };
-        if (first_error == null) self.accept_cancel_requested = true;
-    };
+    }
     for (self.clients.items) |peer| {
         peer.terminal = true;
         if (!peer.transport.closing) peer.transport.shutdown() catch |err| {
@@ -168,20 +234,19 @@ pub fn readyToDeinit(self: *IoUringServer) bool {
     if (!self.closing) return false;
     if (self.pending.items.len != 0) return false;
     self.reapClients();
-    if (self.accept_handle) |handle| {
-        if (self.loop.isActive(handle)) return false;
-        self.accept_handle = null;
-    }
+    self.retryListenerCancellations();
+    self.reapListeners();
+    if (self.listeners.items.len != 0) return false;
     if (self.clients.items.len != 0) return false;
-    if (!self.listener_closed) {
-        _ = linux.close(self.listener_fd);
-        self.listener_closed = true;
-    }
     return true;
 }
 
 pub fn clientCount(self: *const IoUringServer) usize {
     return self.clients.items.len;
+}
+
+pub fn listenerCount(self: *const IoUringServer) usize {
+    return self.listeners.items.len;
 }
 
 pub fn deinit(self: *IoUringServer) void {
@@ -190,25 +255,26 @@ pub fn deinit(self: *IoUringServer) void {
     std.debug.assert(self.readyToDeinit());
     self.pending.deinit(self.allocator);
     self.clients.deinit(self.allocator);
+    self.listeners.deinit(self.allocator);
     self.* = undefined;
 }
 
-fn armAccept(self: *IoUringServer) !void {
-    if (self.closing or self.accept_handle != null) return;
-    self.accept_handle = try self.loop.queue(self, acceptComplete, self, prepareAccept);
+fn armAccept(listener: *Listener) !void {
+    if (listener.draining or listener.accept_handle != null) return;
+    listener.accept_handle = try listener.owner.loop.queue(listener, acceptComplete, listener, prepareAccept);
 }
 
 fn prepareAccept(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
-    const self: *IoUringServer = @ptrCast(@alignCast(context));
-    if (self.multishot_accept)
+    const listener: *Listener = @ptrCast(@alignCast(context));
+    if (listener.multishot_accept)
         sqe.prep_multishot_accept(
-            self.listener_fd,
+            listener.listen_fd,
             null,
             null,
             linux.SOCK.CLOEXEC,
         )
     else
-        sqe.prep_accept(self.listener_fd, null, null, linux.SOCK.CLOEXEC);
+        sqe.prep_accept(listener.listen_fd, null, null, linux.SOCK.CLOEXEC);
 }
 
 fn acceptComplete(
@@ -216,27 +282,112 @@ fn acceptComplete(
     _: *IoUringLoop,
     completion: IoUringLoop.Completion,
 ) !void {
-    const self: *IoUringServer = @ptrCast(@alignCast(context));
-    if (!completion.more()) self.accept_handle = null;
+    const listener: *Listener = @ptrCast(@alignCast(context));
+    const self = listener.owner;
+    if (!completion.more()) {
+        listener.accept_handle = null;
+        listener.accept_cancel_requested = false;
+    }
     if (completion.result >= 0) {
         const fd: i32 = @intCast(completion.result);
-        if (self.closing)
+        if (listener.draining)
             _ = linux.close(fd)
         else
-            try self.addClient(fd);
-    } else if (!self.closing and
+            self.addClient(fd, listener.provenance) catch {
+                listener.draining = true;
+                self.requestListenerCancellation(listener) catch {};
+            };
+    } else if (!listener.draining and
         completion.result == -@as(i32, @intFromEnum(linux.E.INVAL)) and
-        self.multishot_accept)
+        listener.multishot_accept)
     {
-        self.multishot_accept = false;
-    } else if (!self.closing and completion.result != -@as(i32, @intFromEnum(linux.E.CANCELED))) {
-        // A failed accept consumes no connection state. Re-arming below keeps
-        // transient per-connection errors from stopping the listener.
+        listener.multishot_accept = false;
+    } else if (!listener.draining and completion.result != -@as(i32, @intFromEnum(linux.E.CANCELED)) and !transientAccept(completion.result)) {
+        listener.draining = true;
+        self.requestListenerCancellation(listener) catch {};
     }
-    if (!self.closing and !completion.more()) try self.armAccept();
+    if (!listener.draining and !completion.more()) armAccept(listener) catch {
+        listener.draining = true;
+        self.requestListenerCancellation(listener) catch {};
+    };
 }
 
-fn addClient(self: *IoUringServer, fd: i32) !void {
+fn prepareLifetime(context: *anyopaque, sqe: *linux.io_uring_sqe) void {
+    const listener: *Listener = @ptrCast(@alignCast(context));
+    sqe.prep_poll_add(listener.lifetime_fd.?, linux.POLL.HUP | linux.POLL.ERR);
+}
+
+fn lifetimeComplete(
+    context: *anyopaque,
+    _: *IoUringLoop,
+    _: IoUringLoop.Completion,
+) !void {
+    const listener: *Listener = @ptrCast(@alignCast(context));
+    listener.lifetime_handle = null;
+    listener.lifetime_cancel_requested = false;
+    listener.draining = true;
+    listener.owner.requestListenerCancellation(listener) catch {};
+}
+
+fn transientAccept(result: i32) bool {
+    return result == -@as(i32, @intFromEnum(linux.E.INTR)) or
+        result == -@as(i32, @intFromEnum(linux.E.AGAIN)) or
+        result == -@as(i32, @intFromEnum(linux.E.CONNABORTED)) or
+        result == -@as(i32, @intFromEnum(linux.E.PROTO)) or
+        result == -@as(i32, @intFromEnum(linux.E.MFILE)) or
+        result == -@as(i32, @intFromEnum(linux.E.NFILE)) or
+        result == -@as(i32, @intFromEnum(linux.E.NOBUFS)) or
+        result == -@as(i32, @intFromEnum(linux.E.NOMEM));
+}
+
+fn requestListenerCancellation(self: *IoUringServer, listener: *Listener) !void {
+    var first_error: ?anyerror = null;
+    if (listener.accept_handle) |handle| if (!listener.accept_cancel_requested) {
+        self.loop.cancel(handle) catch |err| {
+            first_error = err;
+        };
+        if (first_error == null) listener.accept_cancel_requested = true;
+    };
+    if (listener.lifetime_handle) |handle| if (!listener.lifetime_cancel_requested) {
+        var lifetime_error: ?anyerror = null;
+        self.loop.cancel(handle) catch |err| {
+            lifetime_error = err;
+            if (first_error == null) first_error = err;
+        };
+        if (lifetime_error == null) listener.lifetime_cancel_requested = true;
+    };
+    if (first_error) |err| return err;
+}
+
+fn retryListenerCancellations(self: *IoUringServer) void {
+    for (self.listeners.items) |listener| if (listener.draining)
+        self.requestListenerCancellation(listener) catch {};
+}
+
+fn reapListeners(self: *IoUringServer) void {
+    var index: usize = 0;
+    while (index < self.listeners.items.len) {
+        const listener = self.listeners.items[index];
+        if (!listener.draining or
+            (listener.accept_handle != null and self.loop.isActive(listener.accept_handle.?)) or
+            (listener.lifetime_handle != null and self.loop.isActive(listener.lifetime_handle.?)))
+        {
+            index += 1;
+            continue;
+        }
+        self.destroyListener(listener);
+        _ = self.listeners.swapRemove(index);
+    }
+}
+
+fn destroyListener(self: *IoUringServer, listener: *Listener) void {
+    _ = linux.close(listener.listen_fd);
+    if (listener.lifetime_fd) |fd| _ = linux.close(fd);
+    if (listener.provenance) |template| template.destroy(template.context);
+    self.allocator.destroy(listener);
+}
+
+fn addClient(self: *IoUringServer, fd: i32, template: ?ProvenanceTemplate) !void {
     var fd_owned = true;
     errdefer if (fd_owned) {
         _ = linux.close(fd);
@@ -244,7 +395,8 @@ fn addClient(self: *IoUringServer, fd: i32) !void {
     try self.clients.ensureUnusedCapacity(self.allocator, 1);
     const peer = try self.allocator.create(Peer);
     errdefer self.allocator.destroy(peer);
-    const client = try self.server.createClient();
+    const provenance = if (template) |value| try value.cloneForClient(value.context) else null;
+    const client = try self.server.createClientWithProvenance(provenance);
     errdefer self.server.destroyClient(client) catch unreachable;
     peer.* = .{
         .owner = self,
@@ -303,6 +455,264 @@ fn reapClients(self: *IoUringServer) void {
         self.allocator.destroy(peer);
         _ = self.clients.swapRemove(index);
     }
+}
+
+var test_provenance_key: u8 = 0;
+
+const TestClientProvenance = struct {
+    allocator: std.mem.Allocator,
+    destroy_count: *usize,
+    value: u32,
+
+    fn destroy(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.destroy_count.* += 1;
+        self.allocator.destroy(self);
+    }
+};
+
+const TestProvenanceTemplate = struct {
+    allocator: std.mem.Allocator,
+    template_destroyed: *bool,
+    client_destroy_count: *usize,
+    value: u32,
+
+    fn cloneForClient(context: *anyopaque) !Server.OwnedProvenance {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const provenance = try self.allocator.create(TestClientProvenance);
+        provenance.* = .{
+            .allocator = self.allocator,
+            .destroy_count = self.client_destroy_count,
+            .value = self.value,
+        };
+        return .{
+            .key = &test_provenance_key,
+            .data = provenance,
+            .destroy = TestClientProvenance.destroy,
+        };
+    }
+
+    fn destroy(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.template_destroyed.* = true;
+        self.allocator.destroy(self);
+    }
+};
+
+fn createTestListener(path: []const u8) !i32 {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    if (path.len >= address.path.len) return error.NameTooLong;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+    const result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(result) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(result);
+    errdefer _ = linux.close(fd);
+    const address_length: linux.socklen_t = @intCast(
+        @offsetOf(linux.sockaddr.un, "path") + path.len + 1,
+    );
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), address_length)) != .SUCCESS)
+        return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.ListenFailed;
+    return fd;
+}
+
+fn connectTestClient(path: []const u8) !i32 {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    if (path.len >= address.path.len) return error.NameTooLong;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+    const result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(result) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(result);
+    errdefer _ = linux.close(fd);
+    const address_length: linux.socklen_t = @intCast(
+        @offsetOf(linux.sockaddr.un, "path") + path.len + 1,
+    );
+    if (linux.errno(linux.connect(fd, @ptrCast(&address), address_length)) != .SUCCESS)
+        return error.ConnectFailed;
+    return fd;
+}
+
+test "dynamic listeners isolate lifetime and clone client provenance" {
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+
+    var main_path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    const main_path = try std.fmt.bufPrint(
+        &main_path_buffer,
+        ".zig-cache/tmp/{s}/main",
+        .{temporary.sub_path},
+    );
+    const main_listener = try createTestListener(main_path);
+    var main_listener_owned = true;
+    defer if (main_listener_owned) {
+        _ = linux.close(main_listener);
+    };
+
+    var loop = try IoUringLoop.init(allocator);
+    defer loop.deinit();
+    var native_server = Server.init(allocator);
+    defer native_server.deinit();
+    var transport_server: IoUringServer = undefined;
+    main_listener_owned = false;
+    try transport_server.init(allocator, &loop, &native_server, main_listener);
+
+    var dynamic_path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    const dynamic_path = try std.fmt.bufPrint(
+        &dynamic_path_buffer,
+        ".zig-cache/tmp/{s}/contextual",
+        .{temporary.sub_path},
+    );
+    const dynamic_listener = try createTestListener(dynamic_path);
+    var dynamic_listener_owned = true;
+    defer if (dynamic_listener_owned) {
+        _ = linux.close(dynamic_listener);
+    };
+    var lifetime: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &lifetime,
+    )) != .SUCCESS) return error.SocketPairFailed;
+    var lifetime_listener_owned = true;
+    defer if (lifetime_listener_owned) {
+        _ = linux.close(lifetime[0]);
+    };
+    var lifetime_peer_owned = true;
+    defer if (lifetime_peer_owned) {
+        _ = linux.close(lifetime[1]);
+    };
+    var template_destroyed = false;
+    var client_provenance_destroy_count: usize = 0;
+    const template = try allocator.create(TestProvenanceTemplate);
+    var template_owned = true;
+    defer if (template_owned) {
+        TestProvenanceTemplate.destroy(template);
+    };
+    template.* = .{
+        .allocator = allocator,
+        .template_destroyed = &template_destroyed,
+        .client_destroy_count = &client_provenance_destroy_count,
+        .value = 42,
+    };
+    dynamic_listener_owned = false;
+    lifetime_listener_owned = false;
+    template_owned = false;
+    try transport_server.adoptListener(.{
+        .listen_fd = dynamic_listener,
+        .lifetime_fd = lifetime[0],
+        .provenance = .{
+            .context = template,
+            .cloneForClient = TestProvenanceTemplate.cloneForClient,
+            .destroy = TestProvenanceTemplate.destroy,
+        },
+    });
+
+    // Grow the pointer array after operation callbacks retain listener records.
+    const extra_listener_count = 6;
+    var extra_path_buffers: [extra_listener_count][@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    for (&extra_path_buffers, 0..) |*path_buffer, index| {
+        const path = try std.fmt.bufPrint(
+            path_buffer,
+            ".zig-cache/tmp/{s}/extra-{d}",
+            .{ temporary.sub_path, index },
+        );
+        try transport_server.adoptListener(.{ .listen_fd = try createTestListener(path) });
+    }
+    const initial_listener_count = 2 + extra_listener_count;
+    try std.testing.expectEqual(initial_listener_count, transport_server.listenerCount());
+
+    const main_client_one = try connectTestClient(main_path);
+    var main_client_one_owned = true;
+    defer if (main_client_one_owned) {
+        _ = linux.close(main_client_one);
+    };
+    const contextual_client = try connectTestClient(dynamic_path);
+    var contextual_client_owned = true;
+    defer if (contextual_client_owned) {
+        _ = linux.close(contextual_client);
+    };
+    var turns: usize = 0;
+    while (transport_server.clientCount() < 2 and turns < 32) : (turns += 1) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try std.testing.expectEqual(@as(usize, 2), transport_server.clientCount());
+
+    var contextual_clients: usize = 0;
+    for (transport_server.clients.items) |peer| {
+        const raw = peer.client.provenance(&test_provenance_key) orelse continue;
+        const provenance: *const TestClientProvenance = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(@as(u32, 42), provenance.value);
+        contextual_clients += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), contextual_clients);
+
+    // Readable lifetime data is ignored; peer closure alone drains this listener.
+    const lifetime_data = "still alive";
+    const written = linux.write(lifetime[1], lifetime_data.ptr, lifetime_data.len);
+    if (linux.errno(written) != .SUCCESS) return error.WriteFailed;
+    try std.testing.expectEqual(lifetime_data.len, written);
+    try loop.pollOnce();
+    try transport_server.dispatch();
+    try std.testing.expectEqual(initial_listener_count, transport_server.listenerCount());
+    try std.testing.expect(!template_destroyed);
+
+    _ = linux.close(lifetime[1]);
+    lifetime_peer_owned = false;
+    turns = 0;
+    while (transport_server.listenerCount() == initial_listener_count and turns < 32) : (turns += 1) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try std.testing.expectEqual(initial_listener_count - 1, transport_server.listenerCount());
+    try std.testing.expect(template_destroyed);
+    try std.testing.expectEqual(@as(usize, 2), transport_server.clientCount());
+    try std.testing.expectEqual(@as(usize, 0), client_provenance_destroy_count);
+
+    const main_client_two = try connectTestClient(main_path);
+    var main_client_two_owned = true;
+    defer if (main_client_two_owned) {
+        _ = linux.close(main_client_two);
+    };
+    turns = 0;
+    while (transport_server.clientCount() < 3 and turns < 32) : (turns += 1) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try std.testing.expectEqual(@as(usize, 3), transport_server.clientCount());
+    contextual_clients = 0;
+    for (transport_server.clients.items) |peer| {
+        if (peer.client.provenance(&test_provenance_key) != null) contextual_clients += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), contextual_clients);
+
+    _ = linux.close(main_client_one);
+    main_client_one_owned = false;
+    _ = linux.close(contextual_client);
+    contextual_client_owned = false;
+    _ = linux.close(main_client_two);
+    main_client_two_owned = false;
+    turns = 0;
+    while (transport_server.clientCount() != 0 and turns < 64) : (turns += 1) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try std.testing.expectEqual(@as(usize, 0), transport_server.clientCount());
+    try std.testing.expectEqual(@as(usize, 1), client_provenance_destroy_count);
+
+    try transport_server.shutdown();
+    while (loop.hasActiveOperations()) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try transport_server.dispatch();
+    try std.testing.expect(transport_server.readyToDeinit());
+    try std.testing.expectEqual(@as(usize, 0), transport_server.listenerCount());
+    transport_server.deinit();
 }
 
 test "listener accepts a client and completes native display sync" {
