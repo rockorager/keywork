@@ -22,6 +22,7 @@ bindings: std.ArrayList(*Binding) = .empty,
 children: std.ArrayList(*Child) = .empty,
 pointer_focus: ?*CompositorGlobal.Surface = null,
 keyboard_focus: ?*CompositorGlobal.Surface = null,
+keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener) = .empty,
 touch_focus: ?*CompositorGlobal.Surface = null,
 cursor_handler: ?CursorHandler = null,
 pointer_x: i32 = 0,
@@ -63,6 +64,11 @@ pub const CursorHandler = struct {
     context: *anyopaque,
     handle: *const fn (*anyopaque, CursorIntent) anyerror!void,
     clear: ?*const fn (*anyopaque) void = null,
+};
+
+pub const KeyboardFocusListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, ?*CompositorGlobal.Surface) anyerror!void,
 };
 
 pub const AxisFrame = struct {
@@ -129,10 +135,12 @@ pub fn init(
 pub fn deinit(self: *SeatGlobal) void {
     std.debug.assert(self.bindings.items.len == 0);
     std.debug.assert(self.children.items.len == 0);
+    std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
     clearFocus(&self.pointer_focus);
     clearFocus(&self.keyboard_focus);
     clearFocus(&self.touch_focus);
     self.keyboard_held_keys.deinit(self.allocator);
+    self.keyboard_focus_listeners.deinit(self.allocator);
     if (self.keymap_fd >= 0) _ = linux.close(self.keymap_fd);
     self.server.removeGlobal(self.global_name) catch unreachable;
     self.children.deinit(self.allocator);
@@ -259,6 +267,7 @@ pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys
     try setFocus(&self.keyboard_focus, surface);
     const serial = self.server.nextSerial();
     self.recordSelectionSerial(surface.client, serial);
+    try self.notifyKeyboardFocus();
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
         try generated.wl_keyboard_types.events.enter(
             &child.client.connection,
@@ -276,6 +285,7 @@ pub fn keyboardLeave(self: *SeatGlobal) !?u32 {
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
         try generated.wl_keyboard_types.events.leave(&child.client.connection, child.resource, serial, surface.resource);
     clearFocus(&self.keyboard_focus);
+    try self.notifyKeyboardFocus();
     return serial;
 }
 
@@ -402,6 +412,25 @@ pub fn warpPointer(
 /// Returns a borrowed focus retained until the next focus or capability change.
 pub fn keyboardFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.keyboard_focus;
+}
+
+/// Copies the listener and retains its context until removal.
+pub fn addKeyboardFocusListener(
+    self: *SeatGlobal,
+    listener: KeyboardFocusListener,
+) error{OutOfMemory}!void {
+    for (self.keyboard_focus_listeners.items) |existing|
+        std.debug.assert(existing.context != listener.context);
+    try self.keyboard_focus_listeners.append(self.allocator, listener);
+}
+
+pub fn removeKeyboardFocusListener(self: *SeatGlobal, context: *anyopaque) void {
+    for (self.keyboard_focus_listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.keyboard_focus_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 /// Returns whether resource is a binding of this seat owned by client.
@@ -746,6 +775,11 @@ fn setFocus(slot: *?*CompositorGlobal.Surface, surface: *CompositorGlobal.Surfac
 fn clearFocus(slot: *?*CompositorGlobal.Surface) void {
     if (slot.*) |surface| surface.unreference();
     slot.* = null;
+}
+
+fn notifyKeyboardFocus(self: *SeatGlobal) !void {
+    for (self.keyboard_focus_listeners.items) |listener|
+        try listener.changed(listener.context, self.keyboard_focus);
 }
 
 fn clearTouchFocus(self: *SeatGlobal) void {

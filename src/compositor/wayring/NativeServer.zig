@@ -29,6 +29,7 @@ const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const PointerCursor = @import("PointerCursor.zig");
+const KeyboardShortcutsInhibitGlobal = @import("KeyboardShortcutsInhibitGlobal.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
 const PointerWarpGlobal = @import("PointerWarpGlobal.zig");
 const PointerGesturesGlobal = @import("PointerGesturesGlobal.zig");
@@ -88,6 +89,7 @@ fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 pointer_cursor: PointerCursor,
+keyboard_shortcuts_inhibit_global: KeyboardShortcutsInhibitGlobal,
 relative_pointer_global: RelativePointerGlobal,
 pointer_warp_global: PointerWarpGlobal,
 pointer_gestures_global: PointerGesturesGlobal,
@@ -522,6 +524,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.pointer_cursor.handler(),
     );
     errdefer self.seat_global.deinit();
+    try self.keyboard_shortcuts_inhibit_global.init(
+        allocator,
+        &self.server,
+        &self.compositor_global,
+        &self.seat_global,
+    );
+    errdefer self.keyboard_shortcuts_inhibit_global.deinit();
     try self.relative_pointer_global.init(
         allocator,
         &self.server,
@@ -814,6 +823,7 @@ pub fn destroy(self: *NativeServer) void {
     self.pointer_gestures_global.deinit();
     self.pointer_warp_global.deinit();
     self.relative_pointer_global.deinit();
+    self.keyboard_shortcuts_inhibit_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
     self.commit_timing_global.deinit();
