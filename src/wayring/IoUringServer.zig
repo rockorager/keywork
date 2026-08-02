@@ -293,10 +293,9 @@ fn acceptComplete(
         if (listener.draining)
             _ = linux.close(fd)
         else
-            self.addClient(fd, listener.provenance) catch {
-                listener.draining = true;
-                self.requestListenerCancellation(listener) catch {};
-            };
+            // A rejected client is isolated to its accepted descriptor. The
+            // listener remains authoritative and available to later clients.
+            self.addClient(fd, listener.provenance) catch {};
     } else if (!listener.draining and
         completion.result == -@as(i32, @intFromEnum(linux.E.INVAL)) and
         listener.multishot_accept)
@@ -475,10 +474,15 @@ const TestProvenanceTemplate = struct {
     allocator: std.mem.Allocator,
     template_destroyed: *bool,
     client_destroy_count: *usize,
+    clone_failures: *usize,
     value: u32,
 
     fn cloneForClient(context: *anyopaque) !Server.OwnedProvenance {
         const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.clone_failures.* != 0) {
+            self.clone_failures.* -= 1;
+            return error.TestCloneFailed;
+        }
         const provenance = try self.allocator.create(TestClientProvenance);
         provenance.* = .{
             .allocator = self.allocator,
@@ -587,6 +591,7 @@ test "dynamic listeners isolate lifetime and clone client provenance" {
     };
     var template_destroyed = false;
     var client_provenance_destroy_count: usize = 0;
+    var clone_failures: usize = 1;
     const template = try allocator.create(TestProvenanceTemplate);
     var template_owned = true;
     defer if (template_owned) {
@@ -596,6 +601,7 @@ test "dynamic listeners isolate lifetime and clone client provenance" {
         .allocator = allocator,
         .template_destroyed = &template_destroyed,
         .client_destroy_count = &client_provenance_destroy_count,
+        .clone_failures = &clone_failures,
         .value = 42,
     };
     dynamic_listener_owned = false;
@@ -625,6 +631,24 @@ test "dynamic listeners isolate lifetime and clone client provenance" {
     const initial_listener_count = 2 + extra_listener_count;
     try std.testing.expectEqual(initial_listener_count, transport_server.listenerCount());
 
+    // One rejected contextual client does not retire its authoritative
+    // listener; the next client can still connect with cloned provenance.
+    const rejected_contextual_client = try connectTestClient(dynamic_path);
+    var rejected_contextual_client_owned = true;
+    defer if (rejected_contextual_client_owned) {
+        _ = linux.close(rejected_contextual_client);
+    };
+    var turns: usize = 0;
+    while (clone_failures != 0 and turns < 32) : (turns += 1) {
+        try loop.runOnce();
+        try transport_server.dispatch();
+    }
+    try std.testing.expectEqual(@as(usize, 0), clone_failures);
+    try std.testing.expectEqual(@as(usize, 0), transport_server.clientCount());
+    try std.testing.expectEqual(initial_listener_count, transport_server.listenerCount());
+    _ = linux.close(rejected_contextual_client);
+    rejected_contextual_client_owned = false;
+
     const main_client_one = try connectTestClient(main_path);
     var main_client_one_owned = true;
     defer if (main_client_one_owned) {
@@ -635,7 +659,7 @@ test "dynamic listeners isolate lifetime and clone client provenance" {
     defer if (contextual_client_owned) {
         _ = linux.close(contextual_client);
     };
-    var turns: usize = 0;
+    turns = 0;
     while (transport_server.clientCount() < 2 and turns < 32) : (turns += 1) {
         try loop.runOnce();
         try transport_server.dispatch();
