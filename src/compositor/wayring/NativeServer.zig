@@ -30,6 +30,7 @@ const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const IdleNotifyGlobal = @import("IdleNotifyGlobal.zig");
+const IdleInhibitGlobal = @import("IdleInhibitGlobal.zig");
 const PointerCursor = @import("PointerCursor.zig");
 const KeyboardShortcutsInhibitGlobal = @import("KeyboardShortcutsInhibitGlobal.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
@@ -97,6 +98,7 @@ fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 idle_notify_global: IdleNotifyGlobal,
+idle_inhibit_global: IdleInhibitGlobal,
 pointer_cursor: PointerCursor,
 keyboard_shortcuts_inhibit_global: KeyboardShortcutsInhibitGlobal,
 relative_pointer_global: RelativePointerGlobal,
@@ -571,6 +573,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         },
     );
     errdefer self.idle_notify_global.deinit();
+    try self.idle_inhibit_global.init(
+        allocator,
+        &self.server,
+        &self.compositor_global,
+    );
+    errdefer self.idle_inhibit_global.deinit();
     try self.keyboard_shortcuts_inhibit_global.init(
         allocator,
         &self.server,
@@ -871,6 +879,7 @@ pub fn destroy(self: *NativeServer) void {
     self.pointer_warp_global.deinit();
     self.relative_pointer_global.deinit();
     self.keyboard_shortcuts_inhibit_global.deinit();
+    self.idle_inhibit_global.deinit();
     self.idle_notify_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
@@ -946,6 +955,7 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
         self.fifo_progress_needed = false;
         try self.progressTransactions();
     }
+    self.refreshIdleInhibition();
     try self.scheduleCommitTiming();
 }
 
@@ -2112,6 +2122,33 @@ fn surfaceActive(self: *const NativeServer, surface: *const CompositorGlobal.Sur
     if (!surface.resource_alive or self.findState(surface) == null) return false;
     const node = self.surface_tree.find(surface) orelse return false;
     return node.current_active;
+}
+
+fn refreshIdleInhibition(self: *NativeServer) void {
+    self.idle_notify_global.setInhibited(
+        self.idle_inhibit_global.hasVisibleInhibitor(
+            self,
+            idleInhibitorSurfaceVisible,
+        ),
+    );
+}
+
+fn idleInhibitorSurfaceVisible(
+    context: *anyopaque,
+    surface: *const CompositorGlobal.Surface,
+) bool {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    // A synchronized child may participate in the hierarchy without its own
+    // buffer. Match scene painting: require an image and every active ancestor.
+    const state = self.findState(surface) orelse return false;
+    if (state.snapshot == null and state.dmabuf == null) return false;
+    const node = self.surface_tree.find(surface) orelse return false;
+    var current = node;
+    while (true) {
+        if (!current.current_active) return false;
+        current = current.parent orelse break;
+    }
+    return current.surface.resource_alive and !self.isCursorSurface(current.surface);
 }
 
 fn pointerLogicalX(self: *const NativeServer) f64 {
