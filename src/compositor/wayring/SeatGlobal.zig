@@ -41,6 +41,7 @@ repeat_info_set: bool = false,
 selection_serials: [selection_serial_capacity]SelectionSerial = undefined,
 selection_serial_count: usize = 0,
 next_selection_serial: usize = 0,
+latest_pointer_enter: ?SelectionSerial = null,
 
 const selection_serial_capacity = 32;
 
@@ -176,6 +177,10 @@ pub fn pointerEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, x: i3
         _ = try self.pointerLeave();
     try setFocus(&self.pointer_focus, surface);
     const serial = self.server.nextSerial();
+    self.latest_pointer_enter = .{
+        .client_identity = surface.client.identity(),
+        .serial = serial,
+    };
     self.pointer_x = x;
     self.pointer_y = y;
     for (self.children.items) |child| if (matches(child, .pointer, surface)) {
@@ -196,6 +201,7 @@ pub fn pointerLeave(self: *SeatGlobal) !?u32 {
     };
     try self.pointerFrame();
     clearFocus(&self.pointer_focus);
+    self.latest_pointer_enter = null;
     return serial;
 }
 
@@ -450,6 +456,30 @@ pub fn acceptsSelectionSerial(self: *const SeatGlobal, client: *const Server.Cli
     return false;
 }
 
+/// Activation accepts input serials plus the latest pointer-enter serial sent
+/// through this exact seat binding.
+pub fn acceptsActivationSerial(
+    self: *const SeatGlobal,
+    client: *const Server.Client,
+    seat_resource_id: u32,
+    serial: u32,
+) bool {
+    if (!self.ownsResource(client, seat_resource_id)) return false;
+    if (self.acceptsSelectionSerial(client, serial)) return true;
+    const enter = self.latest_pointer_enter orelse return false;
+    return enter.client_identity == client.identity() and enter.serial == serial;
+}
+
+pub fn activationSurfaceFocused(
+    self: *const SeatGlobal,
+    surface: *const CompositorGlobal.Surface,
+) bool {
+    if (!surface.resource_alive) return false;
+    return self.keyboard_focus == surface or
+        self.pointer_focus == surface or
+        (self.touch_focus == surface and !self.touch_finish_pending);
+}
+
 pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u32, id: i32, x: i32, y: i32) !u32 {
     if (self.touch_focus != null and self.touch_focus != surface)
         try self.touchCancel();
@@ -577,6 +607,10 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
         .pointer => if (self.pointer_focus) |surface| {
             if (surface.client == client and surface.resource_alive) {
                 const serial = self.server.nextSerial();
+                self.latest_pointer_enter = .{
+                    .client_identity = client.identity(),
+                    .serial = serial,
+                };
                 try self.sendPointerEnter(child, surface, serial);
                 if (version >= 5)
                     try generated.wl_pointer_types.events.frame(&client.connection, child.resource);
@@ -927,6 +961,17 @@ test "native seat binds child resources and routes focused input" {
         .generation = client.connection.object(surface_handle.id).?.generation,
     });
     const pointer_serial = try seat.pointerEnter(surface, 3 * 256, 4 * 256);
+    try std.testing.expect(seat.acceptsActivationSerial(
+        client,
+        seat_resource.id,
+        pointer_serial,
+    ));
+    try std.testing.expect(!seat.acceptsActivationSerial(
+        client,
+        seat_resource.id,
+        pointer_serial +% 1,
+    ));
+    try std.testing.expect(seat.activationSurfaceFocused(surface));
     _ = try seat.pointerMotion(11, 5 * 256, 6 * 256);
     _ = try seat.pointerButton(
         12,

@@ -320,6 +320,11 @@ pub const Client = struct {
         return self.protocolError(1, 2, "out of memory");
     }
 
+    /// Queues the core wl_display implementation error.
+    pub fn postImplementationError(self: *Client, text: []const u8) anyerror!void {
+        return self.protocolError(1, 3, text);
+    }
+
     pub fn destroyResource(self: *Client, handle: wayring.ObjectHandle) !void {
         if (handle.id == 1) return error.CannotDestroyDisplay;
         const resource = self.resources.getPtr(handle.id) orelse return error.UnknownResource;
