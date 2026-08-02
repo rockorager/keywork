@@ -29,6 +29,7 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const IdleNotifyGlobal = @import("IdleNotifyGlobal.zig");
 const PointerCursor = @import("PointerCursor.zig");
 const KeyboardShortcutsInhibitGlobal = @import("KeyboardShortcutsInhibitGlobal.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
@@ -71,6 +72,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 event_loop: EventLoop,
 repaint_timer: *EventLoop.Timer,
+idle_notify_timer: *EventLoop.Timer,
 commit_timing_timer: *EventLoop.Timer,
 commit_timing_clock: std.Io.Clock,
 commit_timing_armed_target: ?i96 = null,
@@ -94,6 +96,7 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+idle_notify_global: IdleNotifyGlobal,
 pointer_cursor: PointerCursor,
 keyboard_shortcuts_inhibit_global: KeyboardShortcutsInhibitGlobal,
 relative_pointer_global: RelativePointerGlobal,
@@ -380,10 +383,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer allocator.destroy(self);
     self.allocator = allocator;
     self.io = io;
+    self.terminating = false;
     self.event_loop = try EventLoop.init(allocator);
     errdefer self.event_loop.deinit();
     self.repaint_timer = try self.event_loop.addTimer(self, repaintTimer);
     errdefer self.event_loop.removeTimer(self.repaint_timer);
+    self.idle_notify_timer = try self.event_loop.addTimer(self, idleNotifyTimer);
+    errdefer self.event_loop.removeTimer(self.idle_notify_timer);
     self.session_initialized = false;
     self.drm_device_initialized = false;
     self.drm_listener_installed = false;
@@ -554,6 +560,17 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.pointer_cursor.handler(),
     );
     errdefer self.seat_global.deinit();
+    try self.idle_notify_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        .{
+            .context = self,
+            .now = idleNotifyNow,
+            .schedule = scheduleIdleNotify,
+        },
+    );
+    errdefer self.idle_notify_global.deinit();
     try self.keyboard_shortcuts_inhibit_global.init(
         allocator,
         &self.server,
@@ -683,7 +700,6 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.repaint_needed = options.output_kind == .drm;
     self.fifo_progress_needed = false;
     self.output_busy_retries = 0;
-    self.terminating = false;
     self.event_loop.setAfterPlatformHook(self, afterPlatform);
     self.event_loop.setEndTurnHook(self, endTurn);
     if (self.repaint_needed) try self.repaint_timer.arm(0, 0);
@@ -795,6 +811,7 @@ pub fn destroy(self: *NativeServer) void {
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
     self.event_loop.removeTimer(self.repaint_timer);
+    self.event_loop.removeTimer(self.idle_notify_timer);
     self.event_loop.removeTimer(self.commit_timing_timer);
     if (self.drm_listener_installed) {
         self.drm_device.clearListener();
@@ -854,6 +871,7 @@ pub fn destroy(self: *NativeServer) void {
     self.pointer_warp_global.deinit();
     self.relative_pointer_global.deinit();
     self.keyboard_shortcuts_inhibit_global.deinit();
+    self.idle_notify_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
     self.commit_timing_global.deinit();
@@ -1108,6 +1126,7 @@ fn nativeKeyboardKey(
     state: NativeInput.KeyState,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.routeKeyboardKey(device_id, time, key, state) catch self.terminate();
 }
 
@@ -1169,6 +1188,7 @@ fn nativePointerMotion(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const size = self.output.modeSize();
     self.pointer_physical_x = clampPointerCoordinate(x, size.width);
     self.pointer_physical_y = clampPointerCoordinate(y, size.height);
@@ -1188,6 +1208,7 @@ fn nativePointerRelativeMotion(
     dy_unaccelerated: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.relative_pointer_global.motion(
         time_microseconds,
         dx,
@@ -1236,6 +1257,7 @@ fn nativePointerButton(
     state: NativeInput.ButtonState,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.routePointerButton(device_id, time, button, state) catch self.terminate();
 }
 
@@ -1247,6 +1269,7 @@ fn nativePointerAxis(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
     pending.time_milliseconds = time;
@@ -1259,6 +1282,7 @@ fn nativePointerAxisSource(
     source: NativeInput.AxisSource,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.pointer_axis_source = @intFromEnum(source);
 }
 
@@ -1269,6 +1293,7 @@ fn nativePointerAxisStop(
     axis: NativeInput.Axis,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
     pending.time_milliseconds = time;
@@ -1282,6 +1307,7 @@ fn nativePointerAxisDiscrete(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
     pending.discrete = value;
@@ -1294,6 +1320,7 @@ fn nativePointerAxisValue120(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
     pending.value120 = value;
@@ -1320,6 +1347,7 @@ fn nativeTouchDown(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.routeTouchDown(device_id, time, native_id, x, y) catch self.terminate();
 }
 
@@ -1330,6 +1358,7 @@ fn nativeTouchUp(
     native_id: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.routeTouchUp(device_id, time, native_id) catch self.terminate();
 }
 
@@ -1342,6 +1371,7 @@ fn nativeTouchMotion(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.routeTouchMotion(device_id, time, native_id, x, y) catch self.terminate();
 }
 
@@ -1386,11 +1416,13 @@ fn nativeInputDeviceRemoved(context: *anyopaque, device_id: NativeInput.DeviceId
 
 fn nativeSwipeBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.beginGesture(device_id, time, fingers, .swipe) catch self.terminate();
 }
 
 fn nativeSwipeUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const gesture = self.active_gesture orelse return;
     if (gesture.device_id != device_id or gesture.kind != .swipe) return;
     self.pointer_gestures_global.updateSwipe(time, dx, dy) catch self.terminate();
@@ -1398,16 +1430,19 @@ fn nativeSwipeUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time:
 
 fn nativeSwipeEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.endGesture(device_id, time, .swipe, cancelled) catch self.terminate();
 }
 
 fn nativePinchBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.beginGesture(device_id, time, fingers, .pinch) catch self.terminate();
 }
 
 fn nativePinchUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64, scale: f64, rotation: f64) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const gesture = self.active_gesture orelse return;
     if (gesture.device_id != device_id or gesture.kind != .pinch) return;
     self.pointer_gestures_global.updatePinch(
@@ -1421,16 +1456,19 @@ fn nativePinchUpdate(context: *anyopaque, device_id: NativeInput.DeviceId, time:
 
 fn nativePinchEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.endGesture(device_id, time, .pinch, cancelled) catch self.terminate();
 }
 
 fn nativeHoldBegin(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, fingers: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.beginGesture(device_id, time, fingers, .hold) catch self.terminate();
 }
 
 fn nativeHoldEnd(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.endGesture(device_id, time, .hold, cancelled) catch self.terminate();
 }
 
@@ -1493,6 +1531,7 @@ fn nativeTabletToolProximity(
     axes: NativeInput.TabletToolAxes,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const info = self.native_input.tabletToolInfo(tool_id) orelse return;
     const focus = if (in_proximity)
         self.tabletFocus(self.physicalToLogical(x), self.physicalToLogical(y)) catch
@@ -1517,6 +1556,7 @@ fn nativeTabletToolAxis(
     axes: NativeInput.TabletToolAxes,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
     self.tablet_global.axis(device_id, tool_id, time, focus, routed) catch self.terminate();
@@ -1531,6 +1571,7 @@ fn nativeTabletToolTip(
     down: bool,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
     self.tablet_global.tip(device_id, tool_id, time, focus, routed, down) catch self.terminate();
@@ -1546,6 +1587,7 @@ fn nativeTabletToolButton(
     pressed: bool,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
     self.tablet_global.button(
@@ -1561,21 +1603,25 @@ fn nativeTabletToolButton(
 
 fn nativeTabletPadButton(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, button: u32, pressed: bool, group: u32, mode: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.tablet_global.padButton(device_id, time, button, pressed, group, mode) catch self.terminate();
 }
 
 fn nativeTabletPadRing(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, ring: u32, position: f64, finger: bool, group: u32, mode: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.tablet_global.padRing(device_id, time, ring, position, finger, group, mode) catch self.terminate();
 }
 
 fn nativeTabletPadStrip(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, strip: u32, position: f64, finger: bool, group: u32, mode: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.tablet_global.padStrip(device_id, time, strip, position, finger, group, mode) catch self.terminate();
 }
 
 fn nativeTabletPadDial(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, dial: u32, value120: i32, group: u32, mode: u32) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
     self.tablet_global.padDial(device_id, time, dial, value120, group, mode) catch self.terminate();
 }
 
@@ -1617,6 +1663,26 @@ fn readIconBuffer(_: *anyopaque, fd: i32, offset: u64, destination: []u8) !void 
 }
 
 fn repaintTimer(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+
+fn idleNotifyTimer(context: *anyopaque, _: *EventLoop, _: u64) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.handleTimer();
+}
+
+fn idleNotifyNow(context: *anyopaque) i96 {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    return std.Io.Clock.awake.now(self.io).nanoseconds;
+}
+
+fn scheduleIdleNotify(context: *anyopaque, delay_milliseconds: ?u64) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return;
+    if (delay_milliseconds) |delay| {
+        self.idle_notify_timer.arm(delay, 0) catch self.terminate();
+    } else {
+        self.idle_notify_timer.disarm();
+    }
+}
 
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
     self.repaint_needed = true;
