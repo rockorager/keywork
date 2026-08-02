@@ -600,6 +600,7 @@ const TestPeer = struct {
         compositor: wayring.ObjectHandle,
         seat: wayring.ObjectHandle,
         manager: wayring.ObjectHandle,
+        keyboard: wayring.ObjectHandle,
     };
 
     fn init(allocator: std.mem.Allocator) !TestPeer {
@@ -667,7 +668,7 @@ const TestPeer = struct {
         try std.testing.expect(compositor_name != 0);
         try std.testing.expect(seat_name != 0);
         try std.testing.expect(manager_name != 0);
-        const globals: Globals = .{
+        var globals: Globals = .{
             .compositor = .{
                 .id = 3,
                 .generation = try core.bind(
@@ -704,7 +705,12 @@ const TestPeer = struct {
                     &generated.wl_data_device_manager,
                 ),
             },
+            .keyboard = undefined,
         };
+        globals.keyboard = try generated.wl_seat_types.requests.get_keyboard(
+            &self.connection,
+            globals.seat,
+        );
         try self.toServer(client);
         try self.fromServer(client);
         while (self.connection.popMessage()) |popped| {
@@ -753,6 +759,30 @@ fn serverSurface(
         .id = handle.id,
         .generation = object.generation,
     });
+}
+
+fn drainKeyboardFocusEvents(
+    peer: *TestPeer,
+    client: *Server.Client,
+    keyboard: wayring.ObjectHandle,
+) !void {
+    try peer.fromServer(client);
+    var event_count: usize = 0;
+    while (peer.connection.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != keyboard.id)
+            return error.UnexpectedClipboardObject;
+        switch (try generated.wl_keyboard_types.decodeEvent(
+            &peer.connection,
+            keyboard,
+            &message,
+        )) {
+            .enter, .leave => event_count += 1,
+            else => return error.UnexpectedKeyboardEvent,
+        }
+    }
+    try std.testing.expect(event_count > 0);
 }
 
 fn receiveSelectionOffer(
@@ -925,6 +955,11 @@ test "native data device relays focused selections and transfer FDs" {
         "text/plain",
     );
     const first_serial = try seat.keyboardEnter(sender_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
     try generated.wl_data_device_types.requests.set_selection(
         &sender.connection,
         inert_device,
@@ -1058,6 +1093,11 @@ test "native data device relays focused selections and transfer FDs" {
         "text/plain;charset=utf-8",
     );
     const second_serial = try seat.keyboardEnter(sender_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
     try generated.wl_data_device_types.requests.set_selection(
         &sender.connection,
         sender_device,
@@ -1099,6 +1139,16 @@ test "native data device relays focused selections and transfer FDs" {
         "UTF8_STRING",
     );
     const foreign_serial = try seat.keyboardEnter(receiver_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
+    try drainKeyboardFocusEvents(
+        &receiver,
+        receiver_client,
+        receiver_globals.keyboard,
+    );
     try generated.wl_data_device_types.requests.set_selection(
         &sender.connection,
         sender_device,
@@ -1111,6 +1161,16 @@ test "native data device relays focused selections and transfer FDs" {
         data_device.selection.?.resource.id,
     );
     const third_serial = try seat.keyboardEnter(sender_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &receiver,
+        receiver_client,
+        receiver_globals.keyboard,
+    );
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
     try generated.wl_data_device_types.requests.set_selection(
         &sender.connection,
         sender_device,

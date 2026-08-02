@@ -177,14 +177,18 @@ pub fn pointerEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, x: i3
         _ = try self.pointerLeave();
     try setFocus(&self.pointer_focus, surface);
     const serial = self.server.nextSerial();
-    self.latest_pointer_enter = .{
-        .client_identity = surface.client.identity(),
-        .serial = serial,
-    };
     self.pointer_x = x;
     self.pointer_y = y;
+    var delivered = false;
     for (self.children.items) |child| if (matches(child, .pointer, surface)) {
         try self.sendPointerEnter(child, surface, serial);
+        if (!delivered) {
+            self.latest_pointer_enter = .{
+                .client_identity = surface.client.identity(),
+                .serial = serial,
+            };
+            delivered = true;
+        }
     };
     try self.pointerFrame();
     return serial;
@@ -218,9 +222,14 @@ pub fn pointerMotion(self: *SeatGlobal, time: u32, x: i32, y: i32) !bool {
 pub fn pointerButton(self: *SeatGlobal, time: u32, button: u32, state: u32) !?u32 {
     const surface = self.pointer_focus orelse return null;
     const serial = self.server.nextSerial();
-    self.recordSelectionSerial(surface.client, serial);
-    for (self.children.items) |child| if (matches(child, .pointer, surface))
+    var delivered = false;
+    for (self.children.items) |child| if (matches(child, .pointer, surface)) {
         try generated.wl_pointer_types.events.button(&child.client.connection, child.resource, serial, time, button, state);
+        if (!delivered) {
+            self.recordSelectionSerial(surface.client, serial);
+            delivered = true;
+        }
+    };
     return serial;
 }
 
@@ -272,9 +281,9 @@ pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys
     self.keyboard_held_keys.appendSliceAssumeCapacity(keys);
     try setFocus(&self.keyboard_focus, surface);
     const serial = self.server.nextSerial();
-    self.recordSelectionSerial(surface.client, serial);
     try self.notifyKeyboardFocus();
-    for (self.children.items) |child| if (matches(child, .keyboard, surface))
+    var delivered = false;
+    for (self.children.items) |child| if (matches(child, .keyboard, surface)) {
         try generated.wl_keyboard_types.events.enter(
             &child.client.connection,
             child.resource,
@@ -282,6 +291,11 @@ pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys
             surface.resource,
             std.mem.sliceAsBytes(keys),
         );
+        if (!delivered) {
+            self.recordSelectionSerial(surface.client, serial);
+            delivered = true;
+        }
+    };
     return serial;
 }
 
@@ -305,9 +319,14 @@ pub fn keyboardKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
     }
     const surface = self.keyboard_focus orelse return null;
     const serial = self.server.nextSerial();
-    self.recordSelectionSerial(surface.client, serial);
-    for (self.children.items) |child| if (matches(child, .keyboard, surface))
+    var delivered = false;
+    for (self.children.items) |child| if (matches(child, .keyboard, surface)) {
         try generated.wl_keyboard_types.events.key(&child.client.connection, child.resource, serial, time, key, state);
+        if (!delivered) {
+            self.recordSelectionSerial(surface.client, serial);
+            delivered = true;
+        }
+    };
     return serial;
 }
 
@@ -489,18 +508,28 @@ pub fn touchDown(self: *SeatGlobal, surface: *CompositorGlobal.Surface, time: u3
     self.touch_finish_pending = false;
     try setFocus(&self.touch_focus, surface);
     const serial = self.server.nextSerial();
-    self.recordSelectionSerial(surface.client, serial);
-    for (self.children.items) |child| if (matchesTouchSequence(self, child, surface))
+    var delivered = false;
+    for (self.children.items) |child| if (matchesTouchSequence(self, child, surface)) {
         try generated.wl_touch_types.events.down(&child.client.connection, child.resource, serial, time, surface.resource, id, x, y);
+        if (!delivered) {
+            self.recordSelectionSerial(surface.client, serial);
+            delivered = true;
+        }
+    };
     return serial;
 }
 
 pub fn touchUp(self: *SeatGlobal, time: u32, id: i32) !?u32 {
     const surface = self.touch_focus orelse return null;
     const serial = self.server.nextSerial();
-    self.recordSelectionSerial(surface.client, serial);
-    for (self.children.items) |child| if (matchesTouchSequence(self, child, surface))
+    var delivered = false;
+    for (self.children.items) |child| if (matchesTouchSequence(self, child, surface)) {
         try generated.wl_touch_types.events.up(&child.client.connection, child.resource, serial, time, id);
+        if (!delivered) {
+            self.recordSelectionSerial(surface.client, serial);
+            delivered = true;
+        }
+    };
     return serial;
 }
 
@@ -607,11 +636,11 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
         .pointer => if (self.pointer_focus) |surface| {
             if (surface.client == client and surface.resource_alive) {
                 const serial = self.server.nextSerial();
+                try self.sendPointerEnter(child, surface, serial);
                 self.latest_pointer_enter = .{
                     .client_identity = client.identity(),
                     .serial = serial,
                 };
-                try self.sendPointerEnter(child, surface, serial);
                 if (version >= 5)
                     try generated.wl_pointer_types.events.frame(&client.connection, child.resource);
             }
@@ -628,7 +657,6 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
                 if (self.keyboard_focus) |surface| {
                     if (surface.client == client and surface.resource_alive) {
                         const serial = self.server.nextSerial();
-                        self.recordSelectionSerial(client, serial);
                         try generated.wl_keyboard_types.events.enter(
                             &client.connection,
                             child.resource,
@@ -636,6 +664,7 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
                             surface.resource,
                             std.mem.sliceAsBytes(self.keyboard_held_keys.items),
                         );
+                        self.recordSelectionSerial(client, serial);
                         try self.sendKeyboardModifiers(child, serial);
                     }
                 }
