@@ -106,6 +106,8 @@ const Toplevel = struct {
     icon: ?ToplevelIcon = null,
     pending_icon: ?ToplevelIcon = null,
     pending_icon_changed: bool = false,
+    dialog_handler: ?ToplevelDialogHandler = null,
+    modal: bool = false,
     minimum_width: i32 = 0,
     minimum_height: i32 = 0,
     maximum_width: i32 = 0,
@@ -118,6 +120,11 @@ const Toplevel = struct {
         if (self.description) |description| self.allocator.free(description);
         if (self.icon) |*icon| icon.deinit(self.allocator);
         if (self.pending_icon) |*icon| icon.deinit(self.allocator);
+        if (self.dialog_handler) |handler| {
+            self.dialog_handler = null;
+            self.modal = false;
+            handler.toplevel_destroyed(handler.context);
+        }
         self.xdg_surface.unreference();
         self.allocator.destroy(self);
     }
@@ -143,6 +150,16 @@ pub const ToplevelIcon = struct {
 pub const ToplevelIconInfo = struct {
     name: ?[]const u8,
     buffers: []const ToplevelIconBuffer,
+};
+
+pub const ToplevelDialogHandler = struct {
+    context: *anyopaque,
+    toplevel_destroyed: *const fn (*anyopaque) void,
+};
+
+pub const ToplevelDialogState = struct {
+    dialog: bool,
+    modal: bool,
 };
 
 const ToplevelIconCommit = struct {
@@ -290,6 +307,57 @@ pub fn toplevelIcon(
     const toplevel = try self.toplevelFor(client, handle);
     const icon = if (toplevel.icon) |*value| value else return null;
     return .{ .name = icon.name, .buffers = icon.buffers };
+}
+
+/// Attaches one dialog. The handler remains borrowed until detach, or receives
+/// exactly one destruction callback if the toplevel dies first.
+pub fn attachToplevelDialog(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    handler: ToplevelDialogHandler,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    if (toplevel.dialog_handler != null) return error.AlreadyExists;
+    toplevel.dialog_handler = handler;
+    toplevel.modal = false;
+}
+
+/// Updates immediate dialog metadata only for the attached dialog object.
+pub fn setToplevelDialogModal(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    context: *anyopaque,
+    modal: bool,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    const handler = toplevel.dialog_handler orelse return error.DialogMissing;
+    if (handler.context != context) return error.WrongDialog;
+    toplevel.modal = modal;
+}
+
+/// Detaches the matching dialog and resets all dialog metadata.
+pub fn detachToplevelDialog(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    context: *anyopaque,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    const handler = toplevel.dialog_handler orelse return error.DialogMissing;
+    if (handler.context != context) return error.WrongDialog;
+    toplevel.dialog_handler = null;
+    toplevel.modal = false;
+}
+
+pub fn toplevelDialogState(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) !ToplevelDialogState {
+    const toplevel = try self.toplevelFor(client, handle);
+    return .{ .dialog = toplevel.dialog_handler != null, .modal = toplevel.modal };
 }
 
 fn toplevelFor(
