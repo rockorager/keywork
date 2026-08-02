@@ -16,6 +16,9 @@ server: *Server,
 global_name: u32,
 name: []const u8,
 capabilities: u32,
+physical_capabilities: u32,
+virtual_keyboard_count: usize = 0,
+virtual_pointer_count: usize = 0,
 lifecycle: Lifecycle = .active,
 lifecycle_listener: ?LifecycleListener = null,
 capability_generations: [3]u64 = .{ 0, 0, 0 },
@@ -29,8 +32,9 @@ touch_focus: ?*CompositorGlobal.Surface = null,
 cursor_handler: ?CursorHandler = null,
 pointer_x: i32 = 0,
 pointer_y: i32 = 0,
-keyboard_held_keys: std.ArrayList(u32) = .empty,
-keyboard_modifiers: KeyboardModifiers = .{},
+keyboard_keys: std.ArrayList(KeyboardKey) = .empty,
+keyboard_enter_keys: std.ArrayList(u32) = .empty,
+keyboard_modifier_state: KeyboardModifierState = .{},
 next_touch_generation: u64 = 1,
 touch_sequence_generation: ?u64 = null,
 touch_finish_pending: bool = false,
@@ -117,6 +121,46 @@ const KeyboardModifiers = struct {
     group: u32 = 0,
 };
 
+const KeyboardModifierState = struct {
+    current: KeyboardModifiers = .{},
+    physical: KeyboardModifiers = .{},
+    virtual_owner: ?*anyopaque = null,
+
+    fn setPhysical(self: *KeyboardModifierState, modifiers: KeyboardModifiers) void {
+        self.current = modifiers;
+        self.physical = modifiers;
+        self.virtual_owner = null;
+    }
+
+    fn setVirtual(
+        self: *KeyboardModifierState,
+        owner: *anyopaque,
+        modifiers: KeyboardModifiers,
+    ) void {
+        self.current = modifiers;
+        self.virtual_owner = owner;
+    }
+
+    fn clearVirtual(self: *KeyboardModifierState, owner: *anyopaque) bool {
+        if (self.virtual_owner != owner) return false;
+        self.current = self.physical;
+        self.virtual_owner = null;
+        return true;
+    }
+};
+
+const KeyboardKey = struct {
+    key: u32,
+    physical: bool = false,
+    virtual_count: u32 = 0,
+
+    fn held(self: KeyboardKey) bool {
+        return self.physical or self.virtual_count != 0;
+    }
+};
+
+const KeyboardKeySource = enum { physical, virtual };
+
 pub fn init(
     self: *SeatGlobal,
     allocator: std.mem.Allocator,
@@ -131,6 +175,7 @@ pub fn init(
         .global_name = undefined,
         .name = name,
         .capabilities = capabilities,
+        .physical_capabilities = capabilities,
         .cursor_handler = cursor_handler,
     };
     inline for (std.enums.values(ChildKind)) |kind| {
@@ -149,12 +194,15 @@ pub fn deinit(self: *SeatGlobal) void {
     std.debug.assert(self.children.items.len == 0);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
     std.debug.assert(self.lifecycle_listener == null);
+    std.debug.assert(self.virtual_keyboard_count == 0);
+    std.debug.assert(self.virtual_pointer_count == 0);
     if (self.lifecycle == .active) self.removeGlobal() catch unreachable;
     std.debug.assert(self.lifecycle == .finalized);
     clearFocus(&self.pointer_focus);
     clearFocus(&self.keyboard_focus);
     clearFocus(&self.touch_focus);
-    self.keyboard_held_keys.deinit(self.allocator);
+    self.keyboard_enter_keys.deinit(self.allocator);
+    self.keyboard_keys.deinit(self.allocator);
     self.keyboard_focus_listeners.deinit(self.allocator);
     if (self.keymap_fd >= 0) _ = linux.close(self.keymap_fd);
     self.children.deinit(self.allocator);
@@ -165,7 +213,7 @@ pub fn deinit(self: *SeatGlobal) void {
 /// Retires this global once and makes all existing resources inert.
 pub fn removeGlobal(self: *SeatGlobal) !void {
     if (self.lifecycle != .active) return;
-    try self.setCapabilities(0);
+    try self.setEffectiveCapabilities(0);
     self.lifecycle = .retiring;
     try self.server.removeGlobal(self.global_name);
 }
@@ -196,7 +244,61 @@ pub fn globalFinalized(self: *const SeatGlobal) bool {
     return self.lifecycle == .finalized;
 }
 
+/// Replaces the capability contribution owned by physical input backends.
 pub fn setCapabilities(self: *SeatGlobal, capabilities: u32) !void {
+    try self.setPhysicalCapabilities(capabilities);
+}
+
+pub fn setPhysicalCapabilities(self: *SeatGlobal, capabilities: u32) !void {
+    std.debug.assert(self.lifecycle == .active or capabilities == 0);
+    self.physical_capabilities = capabilities;
+    try self.refreshCapabilities();
+}
+
+pub fn addVirtualKeyboard(self: *SeatGlobal) !void {
+    std.debug.assert(self.lifecycle == .active);
+    self.virtual_keyboard_count = std.math.add(
+        usize,
+        self.virtual_keyboard_count,
+        1,
+    ) catch unreachable;
+    try self.refreshCapabilities();
+}
+
+pub fn removeVirtualKeyboard(self: *SeatGlobal) !void {
+    std.debug.assert(self.virtual_keyboard_count != 0);
+    self.virtual_keyboard_count -= 1;
+    try self.refreshCapabilities();
+}
+
+pub fn addVirtualPointer(self: *SeatGlobal) !void {
+    std.debug.assert(self.lifecycle == .active);
+    self.virtual_pointer_count = std.math.add(
+        usize,
+        self.virtual_pointer_count,
+        1,
+    ) catch unreachable;
+    try self.refreshCapabilities();
+}
+
+pub fn removeVirtualPointer(self: *SeatGlobal) !void {
+    std.debug.assert(self.virtual_pointer_count != 0);
+    self.virtual_pointer_count -= 1;
+    try self.refreshCapabilities();
+}
+
+pub fn hasCapability(self: *const SeatGlobal, capability_value: u32) bool {
+    return self.capabilities & capability_value != 0;
+}
+
+fn refreshCapabilities(self: *SeatGlobal) !void {
+    var capabilities = self.physical_capabilities;
+    if (self.virtual_keyboard_count != 0) capabilities |= Capability.keyboard;
+    if (self.virtual_pointer_count != 0) capabilities |= Capability.pointer;
+    try self.setEffectiveCapabilities(capabilities);
+}
+
+fn setEffectiveCapabilities(self: *SeatGlobal, capabilities: u32) !void {
     std.debug.assert(self.lifecycle == .active or capabilities == 0);
     if (self.capabilities == capabilities) return;
     const removed = self.capabilities & ~capabilities;
@@ -204,8 +306,9 @@ pub fn setCapabilities(self: *SeatGlobal, capabilities: u32) !void {
     if (removed & Capability.pointer != 0) _ = try self.pointerLeave();
     if (removed & Capability.keyboard != 0) {
         _ = try self.keyboardLeave();
-        self.keyboard_held_keys.clearRetainingCapacity();
-        self.keyboard_modifiers = .{};
+        self.keyboard_keys.clearRetainingCapacity();
+        self.keyboard_enter_keys.clearRetainingCapacity();
+        self.keyboard_modifier_state = .{};
     }
     if (removed & Capability.touch != 0) try self.touchCancel();
     self.capabilities = capabilities;
@@ -213,11 +316,11 @@ pub fn setCapabilities(self: *SeatGlobal, capabilities: u32) !void {
         if (added & capability(kind) != 0)
             beginCapabilityGeneration(self, kind);
     }
-    for (self.bindings.items) |binding| try generated.wl_seat_types.events.capabilities(
+    for (self.bindings.items) |binding| generated.wl_seat_types.events.capabilities(
         &binding.client.connection,
         binding.resource,
         capabilities,
-    );
+    ) catch poisonNoMemory(binding.client);
 }
 
 pub fn pointerEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, x: i32, y: i32) !u32 {
@@ -248,7 +351,12 @@ pub fn pointerLeave(self: *SeatGlobal) !?u32 {
         clear(handler.context);
     const serial = self.server.nextSerial();
     for (self.children.items) |child| if (matches(child, .pointer, surface)) {
-        try generated.wl_pointer_types.events.leave(&child.client.connection, child.resource, serial, surface.resource);
+        generated.wl_pointer_types.events.leave(
+            &child.client.connection,
+            child.resource,
+            serial,
+            surface.resource,
+        ) catch poisonNoMemory(child.client);
         child.pointer_enter_serial = 0;
     };
     try self.pointerFrame();
@@ -285,7 +393,10 @@ pub fn pointerFrame(self: *SeatGlobal) !void {
     const surface = self.pointer_focus orelse return;
     for (self.children.items) |child| if (matches(child, .pointer, surface) and
         try child.client.resourceVersion(child.resource, &generated.wl_pointer) >= 5)
-        try generated.wl_pointer_types.events.frame(&child.client.connection, child.resource);
+        generated.wl_pointer_types.events.frame(
+            &child.client.connection,
+            child.resource,
+        ) catch poisonNoMemory(child.client);
 }
 
 /// Delivers one axis in the current logical pointer frame. Fixed-point values
@@ -317,16 +428,15 @@ pub fn keyboardKeymap(self: *SeatGlobal, format: u32, fd: std.posix.fd_t, size: 
     self.keymap_size = size;
     for (self.children.items) |child| {
         if (child.kind != .keyboard or !self.childActive(child)) continue;
-        try self.sendKeymap(child);
+        self.sendKeymap(child) catch poisonNoMemory(child.client);
     }
 }
 
 pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys: []const u32) !u32 {
     if (self.keyboard_focus != null and self.keyboard_focus != surface)
         _ = try self.keyboardLeave();
-    try self.keyboard_held_keys.ensureTotalCapacity(self.allocator, keys.len);
-    self.keyboard_held_keys.clearRetainingCapacity();
-    self.keyboard_held_keys.appendSliceAssumeCapacity(keys);
+    try self.setPhysicalKeys(keys);
+    try self.collectHeldKeys();
     try setFocus(&self.keyboard_focus, surface);
     const serial = self.server.nextSerial();
     try self.notifyKeyboardFocus();
@@ -337,7 +447,7 @@ pub fn keyboardEnter(self: *SeatGlobal, surface: *CompositorGlobal.Surface, keys
             child.resource,
             serial,
             surface.resource,
-            std.mem.sliceAsBytes(keys),
+            std.mem.sliceAsBytes(self.keyboard_enter_keys.items),
         );
         if (!delivered) {
             self.recordSelectionSerial(surface.client, serial);
@@ -351,25 +461,68 @@ pub fn keyboardLeave(self: *SeatGlobal) !?u32 {
     const surface = self.keyboard_focus orelse return null;
     const serial = self.server.nextSerial();
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
-        try generated.wl_keyboard_types.events.leave(&child.client.connection, child.resource, serial, surface.resource);
+        generated.wl_keyboard_types.events.leave(
+            &child.client.connection,
+            child.resource,
+            serial,
+            surface.resource,
+        ) catch poisonNoMemory(child.client);
     clearFocus(&self.keyboard_focus);
     try self.notifyKeyboardFocus();
     return serial;
 }
 
 pub fn keyboardKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
-    if (state == @intFromEnum(generated.wl_keyboard_types.key_state.pressed)) {
-        if (std.mem.indexOfScalar(u32, self.keyboard_held_keys.items, key) == null)
-            try self.keyboard_held_keys.append(self.allocator, key);
-    } else if (state == @intFromEnum(generated.wl_keyboard_types.key_state.released)) {
-        if (std.mem.indexOfScalar(u32, self.keyboard_held_keys.items, key)) |index|
-            _ = self.keyboard_held_keys.orderedRemove(index);
+    if (!try self.updateKeyboardKey(key, state, .physical)) return null;
+    return self.sendKeyboardKey(time, key, state);
+}
+
+/// Updates one independently deduplicated virtual-keyboard stream. Callers
+/// retain per-device ownership and release each accepted press on teardown.
+pub fn virtualKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
+    if (!try self.updateKeyboardKey(key, state, .virtual)) return null;
+    return self.sendKeyboardKey(time, key, state);
+}
+
+pub fn clearPhysicalKeys(self: *SeatGlobal, time: u32) !void {
+    var index: usize = 0;
+    while (index < self.keyboard_keys.items.len) {
+        const key = &self.keyboard_keys.items[index];
+        if (!key.physical) {
+            index += 1;
+            continue;
+        }
+        key.physical = false;
+        if (key.virtual_count != 0) {
+            index += 1;
+            continue;
+        }
+        const key_code = key.key;
+        _ = self.keyboard_keys.orderedRemove(index);
+        _ = try self.sendKeyboardKey(
+            time,
+            key_code,
+            @intFromEnum(generated.wl_keyboard_types.key_state.released),
+        );
     }
+}
+
+fn sendKeyboardKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
     const surface = self.keyboard_focus orelse return null;
     const serial = self.server.nextSerial();
     var delivered = false;
     for (self.children.items) |child| if (matches(child, .keyboard, surface)) {
-        try generated.wl_keyboard_types.events.key(&child.client.connection, child.resource, serial, time, key, state);
+        generated.wl_keyboard_types.events.key(
+            &child.client.connection,
+            child.resource,
+            serial,
+            time,
+            key,
+            state,
+        ) catch {
+            poisonNoMemory(child.client);
+            continue;
+        };
         if (!delivered) {
             self.recordSelectionSerial(surface.client, serial);
             delivered = true;
@@ -379,15 +532,144 @@ pub fn keyboardKey(self: *SeatGlobal, time: u32, key: u32, state: u32) !?u32 {
 }
 
 pub fn keyboardModifiers(self: *SeatGlobal, serial: u32, depressed: u32, latched: u32, locked: u32, group: u32) !void {
-    self.keyboard_modifiers = .{
+    try self.setPhysicalModifiers(serial, depressed, latched, locked, group);
+}
+
+pub fn setPhysicalModifiers(self: *SeatGlobal, serial: u32, depressed: u32, latched: u32, locked: u32, group: u32) !void {
+    self.keyboard_modifier_state.setPhysical(.{
         .depressed = depressed,
         .latched = latched,
         .locked = locked,
         .group = group,
-    };
+    });
+    try self.sendCurrentKeyboardModifiers(serial);
+}
+
+pub fn setVirtualModifiers(
+    self: *SeatGlobal,
+    owner: *anyopaque,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) !void {
+    self.keyboard_modifier_state.setVirtual(owner, .{
+        .depressed = depressed,
+        .latched = latched,
+        .locked = locked,
+        .group = group,
+    });
+    try self.sendCurrentKeyboardModifiers(self.server.nextSerial());
+}
+
+pub fn clearVirtualModifiers(self: *SeatGlobal, owner: *anyopaque) !void {
+    if (!self.keyboard_modifier_state.clearVirtual(owner)) return;
+    try self.sendCurrentKeyboardModifiers(self.server.nextSerial());
+}
+
+pub fn sendCurrentKeyboardModifiers(self: *SeatGlobal, serial: u32) !void {
+    const modifiers = self.keyboard_modifier_state.current;
     const surface = self.keyboard_focus orelse return;
     for (self.children.items) |child| if (matches(child, .keyboard, surface))
-        try generated.wl_keyboard_types.events.modifiers(&child.client.connection, child.resource, serial, depressed, latched, locked, group);
+        generated.wl_keyboard_types.events.modifiers(
+            &child.client.connection,
+            child.resource,
+            serial,
+            modifiers.depressed,
+            modifiers.latched,
+            modifiers.locked,
+            modifiers.group,
+        ) catch poisonNoMemory(child.client);
+}
+
+fn updateKeyboardKey(
+    self: *SeatGlobal,
+    key_code: u32,
+    state: u32,
+    source: KeyboardKeySource,
+) !bool {
+    const pressed = state == @intFromEnum(generated.wl_keyboard_types.key_state.pressed);
+    const released = state == @intFromEnum(generated.wl_keyboard_types.key_state.released);
+    if (!pressed and !released) return false;
+    const index = for (self.keyboard_keys.items, 0..) |key, index| {
+        if (key.key == key_code) break index;
+    } else null;
+    if (pressed) {
+        if (index) |found| {
+            const key = &self.keyboard_keys.items[found];
+            const was_held = key.held();
+            switch (source) {
+                .physical => {
+                    if (key.physical) return false;
+                    key.physical = true;
+                },
+                .virtual => key.virtual_count = std.math.add(
+                    u32,
+                    key.virtual_count,
+                    1,
+                ) catch unreachable,
+            }
+            return !was_held;
+        }
+        try self.keyboard_keys.append(self.allocator, .{
+            .key = key_code,
+            .physical = source == .physical,
+            .virtual_count = if (source == .virtual) 1 else 0,
+        });
+        return true;
+    }
+    const found = index orelse return false;
+    const key = &self.keyboard_keys.items[found];
+    switch (source) {
+        .physical => {
+            if (!key.physical) return false;
+            key.physical = false;
+        },
+        .virtual => {
+            if (key.virtual_count == 0) return false;
+            key.virtual_count -= 1;
+        },
+    }
+    if (key.held()) return false;
+    _ = self.keyboard_keys.orderedRemove(found);
+    return true;
+}
+
+fn setPhysicalKeys(self: *SeatGlobal, keys: []const u32) !void {
+    try self.keyboard_keys.ensureTotalCapacity(
+        self.allocator,
+        self.keyboard_keys.items.len + keys.len,
+    );
+    for (self.keyboard_keys.items) |*key| key.physical = false;
+    for (keys) |key_code| {
+        for (self.keyboard_keys.items) |*key| {
+            if (key.key != key_code) continue;
+            key.physical = true;
+            break;
+        } else self.keyboard_keys.appendAssumeCapacity(.{
+            .key = key_code,
+            .physical = true,
+        });
+    }
+    var index: usize = 0;
+    while (index < self.keyboard_keys.items.len) {
+        if (self.keyboard_keys.items[index].held()) {
+            index += 1;
+        } else {
+            _ = self.keyboard_keys.orderedRemove(index);
+        }
+    }
+}
+
+fn collectHeldKeys(self: *SeatGlobal) !void {
+    try self.keyboard_enter_keys.ensureTotalCapacity(
+        self.allocator,
+        self.keyboard_keys.items.len,
+    );
+    self.keyboard_enter_keys.clearRetainingCapacity();
+    for (self.keyboard_keys.items) |key| {
+        if (key.held()) self.keyboard_enter_keys.appendAssumeCapacity(key.key);
+    }
 }
 
 pub fn keyboardRepeatInfo(self: *SeatGlobal, rate: i32, delay: i32) !void {
@@ -397,7 +679,12 @@ pub fn keyboardRepeatInfo(self: *SeatGlobal, rate: i32, delay: i32) !void {
     for (self.children.items) |child| {
         if (child.kind != .keyboard or !self.childActive(child)) continue;
         if (try child.client.resourceVersion(child.resource, &generated.wl_keyboard) >= 4)
-            try generated.wl_keyboard_types.events.repeat_info(&child.client.connection, child.resource, rate, delay);
+            generated.wl_keyboard_types.events.repeat_info(
+                &child.client.connection,
+                child.resource,
+                rate,
+                delay,
+            ) catch poisonNoMemory(child.client);
     }
 }
 
@@ -710,13 +997,14 @@ fn createChild(self: *SeatGlobal, client: *Server.Client, seat: wayring.ObjectHa
                 );
                 if (self.keyboard_focus) |surface| {
                     if (surface.client == client and surface.resource_alive) {
+                        try self.collectHeldKeys();
                         const serial = self.server.nextSerial();
                         try generated.wl_keyboard_types.events.enter(
                             &client.connection,
                             child.resource,
                             serial,
                             surface.resource,
-                            std.mem.sliceAsBytes(self.keyboard_held_keys.items),
+                            std.mem.sliceAsBytes(self.keyboard_enter_keys.items),
                         );
                         self.recordSelectionSerial(client, serial);
                         try self.sendKeyboardModifiers(child, serial);
@@ -768,14 +1056,15 @@ fn sendPointerEnter(
 }
 
 fn sendKeyboardModifiers(self: *SeatGlobal, child: *Child, serial: u32) !void {
+    const modifiers = self.keyboard_modifier_state.current;
     try generated.wl_keyboard_types.events.modifiers(
         &child.client.connection,
         child.resource,
         serial,
-        self.keyboard_modifiers.depressed,
-        self.keyboard_modifiers.latched,
-        self.keyboard_modifiers.locked,
-        self.keyboard_modifiers.group,
+        modifiers.depressed,
+        modifiers.latched,
+        modifiers.locked,
+        modifiers.group,
     );
 }
 
@@ -845,6 +1134,10 @@ fn removeOwned(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayL
         return;
     };
     unreachable;
+}
+
+fn poisonNoMemory(client: *Server.Client) void {
+    client.postNoMemory() catch {};
 }
 
 fn matches(child: *const Child, kind: ChildKind, surface: *const CompositorGlobal.Surface) bool {
@@ -935,6 +1228,62 @@ test "seat capability constants match core protocol" {
     try std.testing.expectEqual(@as(u32, 1), Capability.pointer);
     try std.testing.expectEqual(@as(u32, 2), Capability.keyboard);
     try std.testing.expectEqual(@as(u32, 4), Capability.touch);
+}
+
+test "seat aggregates physical and virtual capabilities keys and modifiers" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var seat: SeatGlobal = undefined;
+    try seat.init(std.testing.allocator, &server, "default", 0, null);
+    defer seat.deinit();
+
+    try seat.setPhysicalCapabilities(Capability.pointer | Capability.keyboard);
+    try seat.addVirtualKeyboard();
+    try seat.addVirtualPointer();
+    try seat.setPhysicalCapabilities(0);
+    try std.testing.expect(seat.hasCapability(Capability.pointer));
+    try std.testing.expect(seat.hasCapability(Capability.keyboard));
+
+    _ = try seat.keyboardKey(
+        1,
+        30,
+        @intFromEnum(generated.wl_keyboard_types.key_state.pressed),
+    );
+    _ = try seat.virtualKey(
+        2,
+        30,
+        @intFromEnum(generated.wl_keyboard_types.key_state.pressed),
+    );
+    _ = try seat.keyboardKey(
+        3,
+        30,
+        @intFromEnum(generated.wl_keyboard_types.key_state.released),
+    );
+    try std.testing.expectEqual(@as(usize, 1), seat.keyboard_keys.items.len);
+    try std.testing.expect(!seat.keyboard_keys.items[0].physical);
+    try std.testing.expectEqual(@as(u32, 1), seat.keyboard_keys.items[0].virtual_count);
+    _ = try seat.virtualKey(
+        4,
+        30,
+        @intFromEnum(generated.wl_keyboard_types.key_state.released),
+    );
+    try std.testing.expectEqual(@as(usize, 0), seat.keyboard_keys.items.len);
+
+    var owner_a: u8 = 0;
+    var owner_b: u8 = 0;
+    try seat.setPhysicalModifiers(1, 1, 2, 3, 4);
+    try seat.setVirtualModifiers(&owner_a, 5, 6, 7, 8);
+    try seat.setVirtualModifiers(&owner_b, 9, 10, 11, 12);
+    try seat.clearVirtualModifiers(&owner_a);
+    try std.testing.expectEqual(@as(u32, 9), seat.keyboard_modifier_state.current.depressed);
+    try seat.clearVirtualModifiers(&owner_b);
+    try std.testing.expectEqual(@as(u32, 1), seat.keyboard_modifier_state.current.depressed);
+    try std.testing.expectEqual(@as(u32, 4), seat.keyboard_modifier_state.current.group);
+
+    try seat.removeVirtualPointer();
+    try seat.removeVirtualKeyboard();
+    try std.testing.expect(!seat.hasCapability(Capability.pointer));
+    try std.testing.expect(!seat.hasCapability(Capability.keyboard));
 }
 
 const LifecycleTestContext = struct {

@@ -31,6 +31,8 @@ const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const TransientSeatGlobal = @import("TransientSeatGlobal.zig");
+const VirtualKeyboardGlobal = @import("VirtualKeyboardGlobal.zig");
+const VirtualPointerGlobal = @import("VirtualPointerGlobal.zig");
 const XdgActivationGlobal = @import("XdgActivationGlobal.zig");
 const IdleNotifyGlobal = @import("IdleNotifyGlobal.zig");
 const IdleInhibitGlobal = @import("IdleInhibitGlobal.zig");
@@ -104,6 +106,8 @@ fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 transient_seat_global: TransientSeatGlobal,
+virtual_keyboard_global: VirtualKeyboardGlobal,
+virtual_pointer_global: VirtualPointerGlobal,
 xdg_activation_global: XdgActivationGlobal,
 idle_notify_global: IdleNotifyGlobal,
 idle_inhibit_global: IdleInhibitGlobal,
@@ -354,8 +358,13 @@ const RoutedKey = struct {
 };
 
 const RoutedButton = struct {
-    device_id: NativeInput.DeviceId,
+    source: PointerSource,
     button: u32,
+};
+
+const PointerSource = union(enum) {
+    physical: NativeInput.DeviceId,
+    virtual: u64,
 };
 
 const GestureKind = enum { swipe, pinch, hold };
@@ -582,6 +591,24 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.security_context_global,
     );
     errdefer self.transient_seat_global.deinit();
+    try self.virtual_keyboard_global.init(
+        allocator,
+        io,
+        &self.server,
+        &self.seat_global,
+        &self.security_context_global,
+        virtualKeyboardListener(self),
+    );
+    errdefer self.virtual_keyboard_global.deinit();
+    try self.virtual_pointer_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        &self.output_global,
+        &self.security_context_global,
+        virtualPointerListener(self),
+    );
+    errdefer self.virtual_pointer_global.deinit();
     var activation_token_key: [std.crypto.auth.hmac.sha2.HmacSha256.key_length]u8 = undefined;
     defer @memset(&activation_token_key, 0);
     try io.randomSecure(&activation_token_key);
@@ -927,6 +954,8 @@ pub fn destroy(self: *NativeServer) void {
     self.idle_inhibit_global.deinit();
     self.idle_notify_global.deinit();
     self.xdg_activation_global.deinit();
+    self.virtual_pointer_global.deinit();
+    self.virtual_keyboard_global.deinit();
     self.transient_seat_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
@@ -1140,6 +1169,44 @@ fn nativeInputDeviceListener(self: *NativeServer) NativeInput.DeviceListener {
     };
 }
 
+fn virtualKeyboardListener(self: *NativeServer) VirtualKeyboardGlobal.Listener {
+    return .{
+        .context = self,
+        .capability_changed = virtualKeyboardCapabilityChanged,
+        .activity = virtualInputActivity,
+        .failed = virtualInputFailed,
+    };
+}
+
+fn virtualPointerListener(self: *NativeServer) VirtualPointerGlobal.Listener {
+    return .{
+        .context = self,
+        .event = virtualPointerEvent,
+        .capability_changed = virtualPointerCapabilityChanged,
+        .failed = virtualInputFailed,
+    };
+}
+
+fn virtualInputActivity(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.idle_notify_global.notifyActivity();
+}
+
+fn virtualInputFailed(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
+fn virtualKeyboardCapabilityChanged(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.refreshKeyboardCapability() catch self.terminate();
+}
+
+fn virtualPointerCapabilityChanged(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.refreshPointerCapability() catch self.terminate();
+}
+
 fn nativeInputClose(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.terminate();
@@ -1149,15 +1216,20 @@ fn nativeKeyboardAvailable(context: *anyopaque, available: bool) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.keyboard_available = available;
     if (!available) {
+        self.seat_global.clearPhysicalKeys(0) catch return self.terminate();
         self.routed_keys.clearRetainingCapacity();
         self.unattributed_keys.clearRetainingCapacity();
         self.keyboard_modifiers = .{};
-        self.last_keyboard_serial = 0;
-        self.data_device_global.setKeyboardFocus(null) catch return self.terminate();
-        self.primary_selection_global.setKeyboardFocus(null) catch return self.terminate();
+        self.seat_global.setPhysicalModifiers(
+            self.server.nextSerial(),
+            0,
+            0,
+            0,
+            0,
+        ) catch return self.terminate();
     }
     self.refreshSeatCapabilities() catch self.terminate();
-    if (available) self.refreshKeyboardFocus(null) catch self.terminate();
+    self.refreshKeyboardCapability() catch self.terminate();
 }
 
 fn nativeKeyboardKeymap(
@@ -1205,8 +1277,11 @@ fn nativeKeyboardModifiers(
         .locked = locked,
         .group = group,
     };
-    if (self.last_keyboard_serial != 0) self.seat_global.keyboardModifiers(
-        self.last_keyboard_serial,
+    self.seat_global.setPhysicalModifiers(
+        if (self.last_keyboard_serial != 0)
+            self.last_keyboard_serial
+        else
+            self.server.nextSerial(),
         depressed,
         latched,
         locked,
@@ -1229,15 +1304,12 @@ fn nativePointerAvailable(context: *anyopaque, available: bool) void {
     self.pointer_available = available;
     if (!available) {
         self.cancelActiveGesture() catch return self.terminate();
-        self.routed_buttons.clearRetainingCapacity();
+        self.releasePhysicalButtons() catch return self.terminate();
         self.pointer_axes = .{ .{}, .{} };
         self.pointer_axis_source = null;
     }
     self.refreshSeatCapabilities() catch self.terminate();
-    if (available) {
-        const moved = self.refreshPointerFocus(0) catch return self.terminate();
-        if (moved) self.seat_global.pointerFrame() catch self.terminate();
-    }
+    self.refreshPointerCapability() catch self.terminate();
 }
 
 fn nativePointerMotion(
@@ -1759,7 +1831,23 @@ fn refreshSeatCapabilities(self: *NativeServer) !void {
     if (self.pointer_available) capabilities |= SeatGlobal.Capability.pointer;
     if (self.keyboard_available) capabilities |= SeatGlobal.Capability.keyboard;
     if (self.touch_available) capabilities |= SeatGlobal.Capability.touch;
-    try self.seat_global.setCapabilities(capabilities);
+    try self.seat_global.setPhysicalCapabilities(capabilities);
+}
+
+fn refreshKeyboardCapability(self: *NativeServer) !void {
+    if (self.seat_global.hasCapability(SeatGlobal.Capability.keyboard)) {
+        try self.refreshKeyboardFocus(null);
+        return;
+    }
+    try self.data_device_global.setKeyboardFocus(null);
+    try self.primary_selection_global.setKeyboardFocus(null);
+    self.last_keyboard_serial = 0;
+}
+
+fn refreshPointerCapability(self: *NativeServer) !void {
+    if (!self.seat_global.hasCapability(SeatGlobal.Capability.pointer)) return;
+    const moved = try self.refreshPointerFocus(0);
+    if (moved) try self.seat_global.pointerFrame();
 }
 
 fn pendingAxis(self: *NativeServer, axis: NativeInput.Axis) ?*PendingAxis {
@@ -1788,6 +1876,149 @@ fn flushPointerFrame(self: *NativeServer) !void {
     try self.seat_global.pointerFrame();
     self.pointer_axes = .{ .{}, .{} };
     self.pointer_axis_source = null;
+}
+
+const VirtualPointerBounds = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+};
+
+fn virtualPointerBounds(
+    self: *const NativeServer,
+    mapped_output: ?*OutputGlobal,
+) VirtualPointerBounds {
+    const output = mapped_output orelse &self.output_global;
+    const position = output.logicalPosition();
+    const size = output.logicalSize();
+    return .{
+        .x = @floatFromInt(position.x),
+        .y = @floatFromInt(position.y),
+        .width = @floatFromInt(size.width),
+        .height = @floatFromInt(size.height),
+    };
+}
+
+fn virtualPointerEvent(
+    context: *anyopaque,
+    mapped_output: ?*OutputGlobal,
+    source: u64,
+    event: VirtualPointerGlobal.Event,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    switch (event) {
+        .motion => |motion| {
+            self.idle_notify_global.notifyActivity();
+            self.relative_pointer_global.motion(
+                @as(u64, motion.time) * std.time.us_per_ms,
+                motion.dx,
+                motion.dy,
+                motion.dx,
+                motion.dy,
+            ) catch return self.terminate();
+            const bounds = self.virtualPointerBounds(mapped_output);
+            const x = clampVirtualPointerCoordinate(
+                self.pointerLogicalX() + motion.dx,
+                bounds.x,
+                bounds.width,
+            );
+            const y = clampVirtualPointerCoordinate(
+                self.pointerLogicalY() + motion.dy,
+                bounds.y,
+                bounds.height,
+            );
+            self.moveVirtualPointer(motion.time, x, y) catch self.terminate();
+        },
+        .motion_absolute => |motion| {
+            self.idle_notify_global.notifyActivity();
+            if (motion.x_extent == 0 or motion.y_extent == 0) return;
+            const bounds = self.virtualPointerBounds(mapped_output);
+            const x = normalizedVirtualPointerCoordinate(
+                motion.x,
+                motion.x_extent,
+                bounds.x,
+                bounds.width,
+            );
+            const y = normalizedVirtualPointerCoordinate(
+                motion.y,
+                motion.y_extent,
+                bounds.y,
+                bounds.height,
+            );
+            self.moveVirtualPointer(motion.time, x, y) catch self.terminate();
+        },
+        .button => |button| {
+            self.idle_notify_global.notifyActivity();
+            self.routePointerButtonFromSource(
+                .{ .virtual = source },
+                button.time,
+                button.button,
+                @enumFromInt(button.state),
+            ) catch self.terminate();
+        },
+        .axis => |axis| {
+            self.idle_notify_global.notifyActivity();
+            self.seat_global.pointerAxisFrame(.{
+                .time_milliseconds = axis.time,
+                .axis = axis.axis,
+                .value = axis.value,
+            }) catch self.terminate();
+        },
+        .frame => self.seat_global.pointerFrame() catch self.terminate(),
+        .axis_source => |axis_source| {
+            self.idle_notify_global.notifyActivity();
+            self.seat_global.pointerAxisFrame(.{
+                .time_milliseconds = 0,
+                .axis = 0,
+                .source = axis_source,
+            }) catch self.terminate();
+        },
+        .axis_stop => |axis| {
+            self.idle_notify_global.notifyActivity();
+            self.seat_global.pointerAxisFrame(.{
+                .time_milliseconds = axis.time,
+                .axis = axis.axis,
+                .stopped = true,
+            }) catch self.terminate();
+        },
+        .axis_discrete => |axis| {
+            self.idle_notify_global.notifyActivity();
+            self.seat_global.pointerAxisFrame(.{
+                .time_milliseconds = axis.time,
+                .axis = axis.axis,
+                .value = axis.value,
+                .discrete = axis.discrete,
+                .value120 = axis.discrete *| 120,
+            }) catch self.terminate();
+        },
+    }
+}
+
+fn moveVirtualPointer(self: *NativeServer, time: u32, x: f64, y: f64) !void {
+    self.pointer_physical_x = logicalToPhysicalScale(x, self.output.scale());
+    self.pointer_physical_y = logicalToPhysicalScale(y, self.output.scale());
+    if (self.native_input_initialized)
+        self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.syncPointerCursorPosition();
+    _ = try self.refreshPointerFocus(time);
+}
+
+fn clampVirtualPointerCoordinate(value: f64, origin: f64, dimension: f64) f64 {
+    std.debug.assert(dimension >= 1);
+    return std.math.clamp(value, origin, origin + dimension - 1);
+}
+
+fn normalizedVirtualPointerCoordinate(
+    value: u32,
+    extent: u32,
+    origin: f64,
+    dimension: f64,
+) f64 {
+    std.debug.assert(extent > 0 and dimension >= 1);
+    const normalized = @as(f64, @floatFromInt(@min(value, extent))) /
+        @as(f64, @floatFromInt(extent));
+    return origin + normalized * (dimension - 1);
 }
 
 fn routeKeyboardKey(
@@ -1859,7 +2090,7 @@ fn refreshKeyboardFocus(
     self: *NativeServer,
     preferred: ?*CompositorGlobal.Surface,
 ) !void {
-    if (!self.keyboard_available) return;
+    if (!self.seat_global.hasCapability(SeatGlobal.Capability.keyboard)) return;
     const target = if (preferred) |surface|
         if (self.surfaceActive(surface)) surface else try self.topmostRoot()
     else
@@ -1884,13 +2115,7 @@ fn refreshKeyboardFocus(
         self.keyboard_enter_keys.items,
     );
     self.last_keyboard_serial = serial;
-    try self.seat_global.keyboardModifiers(
-        serial,
-        self.keyboard_modifiers.depressed,
-        self.keyboard_modifiers.latched,
-        self.keyboard_modifiers.locked,
-        self.keyboard_modifiers.group,
-    );
+    try self.seat_global.sendCurrentKeyboardModifiers(serial);
     try self.data_device_global.setKeyboardFocus(target.?.client);
     try self.primary_selection_global.setKeyboardFocus(target.?.client);
 }
@@ -1912,20 +2137,35 @@ fn routePointerButton(
     button: u32,
     state: NativeInput.ButtonState,
 ) !void {
+    try self.routePointerButtonFromSource(
+        .{ .physical = device_id },
+        time,
+        button,
+        state,
+    );
+}
+
+fn routePointerButtonFromSource(
+    self: *NativeServer,
+    source: PointerSource,
+    time: u32,
+    button: u32,
+    state: NativeInput.ButtonState,
+) !void {
     switch (state) {
         .pressed => {
             _ = try self.refreshPointerFocus(time);
             for (self.routed_buttons.items) |routed|
-                if (routed.device_id == device_id and routed.button == button) return;
+                if (std.meta.eql(routed.source, source) and routed.button == button) return;
             const already_held = self.buttonHeld(button);
-            try self.routed_buttons.append(self.allocator, .{ .device_id = device_id, .button = button });
+            try self.routed_buttons.append(self.allocator, .{ .source = source, .button = button });
             if (already_held) return;
             if (try self.hitTestPointer()) |hit| try self.refreshKeyboardFocus(hit.root);
         },
         .released => {
             var found: ?usize = null;
             for (self.routed_buttons.items, 0..) |routed, index| {
-                if (routed.device_id == device_id and routed.button == button) {
+                if (std.meta.eql(routed.source, source) and routed.button == button) {
                     found = index;
                     break;
                 }
@@ -1946,7 +2186,32 @@ fn releaseDeviceButtons(self: *NativeServer, device_id: NativeInput.DeviceId) !v
     var index: usize = 0;
     while (index < self.routed_buttons.items.len) {
         const routed = self.routed_buttons.items[index];
-        if (routed.device_id != device_id) {
+        if (routed.source != .physical or routed.source.physical != device_id) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_buttons.orderedRemove(index);
+        if (self.buttonHeld(routed.button)) continue;
+        _ = try self.seat_global.pointerButton(
+            0,
+            routed.button,
+            @intFromEnum(NativeInput.ButtonState.released),
+        );
+        sent = true;
+    }
+    const moved = if (self.routed_buttons.items.len == 0)
+        try self.refreshPointerFocus(0)
+    else
+        false;
+    if (sent or moved) try self.seat_global.pointerFrame();
+}
+
+fn releasePhysicalButtons(self: *NativeServer) !void {
+    var sent = false;
+    var index: usize = 0;
+    while (index < self.routed_buttons.items.len) {
+        const routed = self.routed_buttons.items[index];
+        if (routed.source != .physical) {
             index += 1;
             continue;
         }
@@ -1972,7 +2237,7 @@ fn buttonHeld(self: *const NativeServer, button: u32) bool {
 }
 
 fn refreshPointerFocus(self: *NativeServer, time: u32) !bool {
-    if (!self.pointer_available) return false;
+    if (!self.seat_global.hasCapability(SeatGlobal.Capability.pointer)) return false;
     if (self.routed_buttons.items.len != 0) {
         if (self.seat_global.pointerFocus()) |surface| {
             if (self.surfaceLocal(surface, self.pointerLogicalX(), self.pointerLogicalY())) |local|
@@ -2277,9 +2542,11 @@ fn inputTime(self: *const NativeServer) u32 {
 }
 
 fn refreshInputFocus(self: *NativeServer, time: u32) !void {
-    if (self.pointer_available and try self.refreshPointerFocus(time))
+    if (self.seat_global.hasCapability(SeatGlobal.Capability.pointer) and
+        try self.refreshPointerFocus(time))
         try self.seat_global.pointerFrame();
-    if (self.keyboard_available) try self.refreshKeyboardFocus(null);
+    if (self.seat_global.hasCapability(SeatGlobal.Capability.keyboard))
+        try self.refreshKeyboardFocus(null);
     for (self.touch_routes.items) |route| {
         if (!self.surfaceActive(route.surface)) {
             try self.cancelTouches();
@@ -3592,6 +3859,16 @@ test "native input coordinates respect fractional scale and protocol bounds" {
     try std.testing.expectEqual(@as(f64, 120), logicalToPhysicalScale(80, .{ .numerator = 180 }));
     try std.testing.expectEqual(@as(f64, 0), clampPointerCoordinate(-1, 64));
     try std.testing.expectEqual(@as(f64, 63), clampPointerCoordinate(80, 64));
+    try std.testing.expectEqual(@as(f64, 10), clampVirtualPointerCoordinate(-1, 10, 64));
+    try std.testing.expectEqual(@as(f64, 73), clampVirtualPointerCoordinate(80, 10, 64));
+    try std.testing.expectEqual(
+        @as(f64, 41.5),
+        normalizedVirtualPointerCoordinate(50, 100, 10, 64),
+    );
+    try std.testing.expectEqual(
+        @as(f64, 73),
+        normalizedVirtualPointerCoordinate(200, 100, 10, 64),
+    );
     try std.testing.expectEqual(@as(i32, 384), fixedFromDouble(1.5));
     try std.testing.expectEqual(std.math.minInt(i32), fixedFromDouble(-1.0e20));
     try std.testing.expectEqual(std.math.maxInt(i32), fixedFromDouble(1.0e20));
