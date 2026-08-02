@@ -21,6 +21,7 @@ memberships: std.ArrayList(*CompositorGlobal.Surface) = .empty,
 pub const Config = struct {
     position: render.Position = .{},
     mode_size: render.Size,
+    logical_size: render.Size,
     physical_size: render.Size,
     refresh_millihertz: i32,
     scale: u32,
@@ -42,7 +43,8 @@ pub fn init(
     server: *Server,
     config: Config,
 ) !void {
-    if (!validSize(config.mode_size) or !validSize(config.physical_size) or
+    if (!validSize(config.mode_size) or !validSize(config.logical_size) or
+        !validSize(config.physical_size) or
         config.refresh_millihertz <= 0 or config.scale == 0 or
         config.scale > std.math.maxInt(i32))
     {
@@ -63,6 +65,7 @@ pub fn init(
         .config = .{
             .position = config.position,
             .mode_size = config.mode_size,
+            .logical_size = config.logical_size,
             .physical_size = config.physical_size,
             .refresh_millihertz = config.refresh_millihertz,
             .scale = config.scale,
@@ -151,6 +154,35 @@ pub fn sendPresentationSync(
             binding.resource,
         );
     }
+}
+
+/// Captures a live binding belonging to this output and client.
+pub fn bindingHandle(
+    self: *const OutputGlobal,
+    client: *const Server.Client,
+    resource_id: u32,
+) ?wayring.ObjectHandle {
+    for (self.resources.items) |binding| {
+        if (binding.client == client and binding.resource.id == resource_id)
+            return binding.resource;
+    }
+    return null;
+}
+
+pub fn logicalPosition(self: *const OutputGlobal) render.Position {
+    return self.config.position;
+}
+
+pub fn logicalSize(self: *const OutputGlobal) render.Size {
+    return self.config.logical_size;
+}
+
+pub fn outputName(self: *const OutputGlobal) []const u8 {
+    return self.config.name;
+}
+
+pub fn outputDescription(self: *const OutputGlobal) []const u8 {
+    return self.config.description;
 }
 
 fn validSize(size: render.Size) bool {
@@ -280,6 +312,7 @@ test "native output owns advertised identity" {
     var output: OutputGlobal = undefined;
     try output.init(std.testing.allocator, &server, .{
         .mode_size = .{ .width = 1920, .height = 1080 },
+        .logical_size = .{ .width = 1920, .height = 1080 },
         .physical_size = .{ .width = 300, .height = 170 },
         .refresh_millihertz = 60_000,
         .scale = 1,
@@ -300,6 +333,7 @@ test "native output advertises complete version four state" {
     var output: OutputGlobal = undefined;
     try output.init(std.testing.allocator, &server, .{
         .mode_size = .{ .width = 1280, .height = 720 },
+        .logical_size = .{ .width = 640, .height = 360 },
         .physical_size = .{ .width = 1280, .height = 720 },
         .refresh_millihertz = 60_000,
         .scale = 2,

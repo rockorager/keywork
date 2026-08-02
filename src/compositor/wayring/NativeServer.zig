@@ -19,6 +19,7 @@ const LinuxDrmSyncobjGlobal = @import("LinuxDrmSyncobjGlobal.zig");
 const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
+const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
@@ -72,6 +73,7 @@ compositor_global: CompositorGlobal,
 surface_tree: SurfaceTree,
 subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
+xdg_output_global: XdgOutputGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
 alpha_modifier_global: AlphaModifierGlobal,
@@ -459,6 +461,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.event_loop.removeTimer(self.commit_timing_timer);
     try self.output_global.init(allocator, &self.server, .{
         .mode_size = self.output.modeSize(),
+        .logical_size = self.output.logicalSize(),
         .physical_size = self.output.physicalSize(),
         .refresh_millihertz = self.output.refreshMillihertz(),
         .scale = self.output.scale().ceil() catch return error.InvalidScale,
@@ -468,6 +471,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .model = self.output.model(),
     });
     errdefer self.output_global.deinit();
+    try self.xdg_output_global.init(
+        allocator,
+        &self.server,
+        &self.output_global,
+    );
+    errdefer self.xdg_output_global.deinit();
     try self.presentation_global.init(
         allocator,
         &self.server,
@@ -765,6 +774,7 @@ pub fn destroy(self: *NativeServer) void {
     self.alpha_modifier_global.deinit();
     self.content_type_global.deinit();
     self.presentation_global.deinit();
+    self.xdg_output_global.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
     self.xdg_shell.deinit();

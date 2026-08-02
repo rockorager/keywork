@@ -201,6 +201,7 @@ test "native presentation feedback snapshots commits and reports output timing" 
     var output: OutputGlobal = undefined;
     try output.init(std.testing.allocator, &server, .{
         .mode_size = .{ .width = 1280, .height = 720 },
+        .logical_size = .{ .width = 1280, .height = 720 },
         .physical_size = .{ .width = 1280, .height = 720 },
         .refresh_millihertz = 60_000,
         .scale = 1,
