@@ -333,8 +333,8 @@ fn timerLessThan(a: *const Timer, b: *const Timer) bool {
 fn insertTimer(self: *EventLoop, timer: *Timer) !void {
     std.debug.assert(timer.heap_index == null);
     const heap = self.timerHeap(timer.domain);
-    timer.heap_index = heap.items.len;
     try heap.append(self.allocator, timer);
+    timer.heap_index = heap.items.len - 1;
     self.siftTimerUp(heap, timer.heap_index.?);
 }
 
@@ -900,6 +900,29 @@ test "completion-native timer fires and can remove itself" {
     try context.timer.?.arm(1, 0);
     try loop.run();
     try std.testing.expect(context.fired);
+}
+
+test "failed timer heap insertion leaves the timer removable" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: u8 = 0;
+    const timer = try loop.addTimer(&context, Noop.callback);
+    try std.testing.expectError(error.InvalidTimerInterval, timer.arm(0, 0));
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    loop.allocator = failing.allocator();
+    defer loop.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, timer.arm(1, 0));
+    try std.testing.expect(timer.heap_index == null);
+    loop.allocator = std.testing.allocator;
+    loop.removeTimer(timer);
 }
 
 test "shared wall timer read fires and can remove itself" {

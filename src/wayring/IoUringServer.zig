@@ -42,7 +42,8 @@ multishot_accept: bool = true,
 closing: bool = false,
 listener_closed: bool = false,
 
-/// Takes ownership of an already bound and listening Unix stream socket.
+/// Takes ownership of an already bound and listening Unix stream socket,
+/// including when post-adoption initialization fails.
 pub fn init(
     self: *IoUringServer,
     allocator: std.mem.Allocator,
@@ -374,13 +375,13 @@ test "listener accepts a client and completes native display sync" {
     var native_server = Server.init(std.testing.allocator);
     defer native_server.deinit();
     var transport_server: IoUringServer = undefined;
+    listener_owned = false;
     try transport_server.init(
         std.testing.allocator,
         &loop,
         &native_server,
         listener,
     );
-    listener_owned = false;
 
     var connection = wayring.Connection.init(
         std.testing.allocator,
