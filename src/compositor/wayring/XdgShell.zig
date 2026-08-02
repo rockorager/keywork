@@ -98,6 +98,8 @@ const Toplevel = struct {
     resource: wayring.ObjectHandle,
     title: ?[]u8 = null,
     app_id: ?[]u8 = null,
+    tag: ?[]u8 = null,
+    description: ?[]u8 = null,
     minimum_width: i32 = 0,
     minimum_height: i32 = 0,
     maximum_width: i32 = 0,
@@ -106,6 +108,8 @@ const Toplevel = struct {
     fn deinit(self: *Toplevel) void {
         if (self.title) |title| self.allocator.free(title);
         if (self.app_id) |app_id| self.allocator.free(app_id);
+        if (self.tag) |tag| self.allocator.free(tag);
+        if (self.description) |description| self.allocator.free(description);
         self.xdg_surface.unreference();
         self.allocator.destroy(self);
     }
@@ -183,6 +187,53 @@ pub fn deinit(self: *XdgShell) void {
     std.debug.assert(self.popups.items.len == 0);
     self.popups.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub const ToplevelTagField = enum { tag, description };
+
+pub const ToplevelMetadata = struct {
+    tag: ?[]const u8,
+    description: ?[]const u8,
+};
+
+pub fn setToplevelMetadata(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    field: ToplevelTagField,
+    value: []const u8,
+) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+    const toplevel = try self.toplevelFor(client, handle);
+    const destination = switch (field) {
+        .tag => &toplevel.tag,
+        .description => &toplevel.description,
+    };
+    const copy = try toplevel.allocator.dupe(u8, value);
+    if (destination.*) |previous| toplevel.allocator.free(previous);
+    destination.* = copy;
+}
+
+/// Returns metadata borrowed until that field changes or the toplevel dies.
+pub fn toplevelMetadata(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) !ToplevelMetadata {
+    const toplevel = try self.toplevelFor(client, handle);
+    return .{ .tag = toplevel.tag, .description = toplevel.description };
+}
+
+fn toplevelFor(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) !*Toplevel {
+    const toplevel: *Toplevel = @ptrCast(@alignCast(
+        try client.resourceContext(handle, &generated.xdg_toplevel),
+    ));
+    if (toplevel.xdg_surface.binding.owner != self) return error.WrongToplevel;
+    return toplevel;
 }
 
 /// Applies xdg-shell's configure barrier to one atomic surface commit. This

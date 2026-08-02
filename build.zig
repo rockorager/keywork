@@ -76,6 +76,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xdg-system-bell/xdg-system-bell-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/tearing-control/tearing-control-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/fifo/fifo-v1.xml"));

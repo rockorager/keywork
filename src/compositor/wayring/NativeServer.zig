@@ -40,6 +40,7 @@ const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
+const XdgToplevelTagGlobal = @import("XdgToplevelTagGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
 const SubcompositorGlobal = @import("SubcompositorGlobal.zig");
 const AsyncShmCopy = @import("AsyncShmCopy.zig");
@@ -98,6 +99,7 @@ fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
 xdg_shell: XdgShell,
 xdg_system_bell_global: XdgSystemBellGlobal,
+xdg_toplevel_tag_global: XdgToplevelTagGlobal,
 transport: IoUringServer,
 renderer: Renderer,
 output: Output,
@@ -432,6 +434,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .output_bounds = xdgOutputBounds,
     });
     errdefer self.xdg_shell.deinit();
+    try self.xdg_toplevel_tag_global.init(&self.server, &self.xdg_shell);
+    errdefer self.xdg_toplevel_tag_global.deinit();
     try self.xdg_system_bell_global.init(&self.server);
     errdefer self.xdg_system_bell_global.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
@@ -822,6 +826,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_output_global.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
+    self.xdg_toplevel_tag_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
     self.surface_tree.deinit();
