@@ -75,7 +75,10 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
     self.lists.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
     list.resource = client.createResource(id, &generated.ext_foreign_toplevel_list_v1, version, .{ .context = list, .dispatch = dispatchList, .destroy = destroyList }) catch return client.postNoMemory();
     self.lists.appendAssumeCapacity(list);
-    for (self.episodes.items) |episode| self.createHandle(list, episode) catch return client.postNoMemory();
+    for (self.episodes.items) |episode| self.createHandle(list, episode) catch {
+        client.postNoMemory() catch {};
+        return;
+    };
 }
 
 fn dispatchList(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
@@ -426,6 +429,85 @@ test "foreign toplevel list publishes applied XDG mapping episodes" {
     defer direct_closed.deinit();
     try std.testing.expect((try generated.ext_foreign_toplevel_handle_v1_types.decodeEvent(&peer, third.handle, &direct_closed)) == .closed);
     try testDrainDisplay(&peer);
+}
+
+test "foreign toplevel list replay OOM leaves registered resources owning cleanup" {
+    const SurfaceTree = @import("SurfaceTree.zig");
+    const render = @import("../render/types.zig");
+
+    const Geometry = struct {
+        fn surfaceSize(_: *anyopaque, _: *const @import("CompositorGlobal.zig").Surface) ?render.Size {
+            return null;
+        }
+
+        fn outputBounds(_: *anyopaque) render.Rect {
+            return .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+        }
+    };
+
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var tree = SurfaceTree.init(std.testing.allocator);
+    defer tree.deinit();
+    var geometry_context: u8 = 0;
+    var shell: XdgShell = undefined;
+    try shell.init(std.testing.allocator, &server, &tree, .{
+        .context = &geometry_context,
+        .surface_size = Geometry.surfaceSize,
+        .output_bounds = Geometry.outputBounds,
+    });
+    defer shell.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var foreign: ForeignToplevelListGlobal = .{
+        .allocator = allocator,
+        .server = &server,
+        .shell = &shell,
+        .global_name = undefined,
+    };
+    defer foreign.handles.deinit(allocator);
+    defer foreign.episodes.deinit(allocator);
+    defer foreign.lists.deinit(allocator);
+
+    var first: Episode = .{
+        .id = @enumFromInt(1),
+        .identifier = undefined,
+        .identifier_len = 0,
+    };
+    defer first.handles.deinit(allocator);
+    var second: Episode = .{
+        .id = @enumFromInt(2),
+        .identifier = undefined,
+        .identifier_len = 0,
+    };
+    defer second.handles.deinit(allocator);
+    try foreign.episodes.append(allocator, &first);
+    try foreign.episodes.append(allocator, &second);
+    try foreign.lists.ensureUnusedCapacity(allocator, 1);
+    try foreign.handles.ensureUnusedCapacity(allocator, 1);
+    try first.handles.ensureUnusedCapacity(allocator, 1);
+
+    {
+        const client = try server.createClient();
+        defer server.destroyClient(client) catch unreachable;
+
+        // Permit one replayed handle, then fail while constructing the next.
+        // The list and first handle are already registered server resources.
+        failing.fail_index = failing.alloc_index + 3;
+        try bind(&foreign, client, 2, 1);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(Server.ClientState.protocol_error, client.state);
+        try std.testing.expectEqual(@as(usize, 1), foreign.lists.items.len);
+        try std.testing.expectEqual(@as(usize, 1), foreign.handles.items.len);
+        try std.testing.expectEqual(@as(usize, 1), first.handles.items.len);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), foreign.lists.items.len);
+    try std.testing.expectEqual(@as(usize, 0), foreign.handles.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.handles.items.len);
 }
 
 fn testSnapshot(
