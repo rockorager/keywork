@@ -407,8 +407,13 @@ pub fn pointerAxisFrame(self: *SeatGlobal, frame: AxisFrame) !void {
     for (self.children.items) |child| {
         if (!matches(child, .pointer, surface)) continue;
         const version = try child.client.resourceVersion(child.resource, &generated.wl_pointer);
-        if (version >= 5) {
-            if (frame.source) |source| try generated.wl_pointer_types.events.axis_source(&child.client.connection, child.resource, source);
+        if (frame.source) |source| {
+            if (pointerSupportsAxisSource(version, source))
+                try generated.wl_pointer_types.events.axis_source(
+                    &child.client.connection,
+                    child.resource,
+                    source,
+                );
         }
         if (version >= 5 and version < 8) if (frame.discrete) |value|
             try generated.wl_pointer_types.events.axis_discrete(&child.client.connection, child.resource, frame.axis, value);
@@ -417,6 +422,12 @@ pub fn pointerAxisFrame(self: *SeatGlobal, frame: AxisFrame) !void {
         if (version >= 5 and frame.stopped)
             try generated.wl_pointer_types.events.axis_stop(&child.client.connection, child.resource, frame.time_milliseconds, frame.axis);
     }
+}
+
+fn pointerSupportsAxisSource(version: u32, source: u32) bool {
+    if (version < 5) return false;
+    return source != @intFromEnum(generated.wl_pointer_types.axis_source.wheel_tilt) or
+        version >= 6;
 }
 
 /// Takes ownership of fd and retains it as the source for current and future
@@ -1228,6 +1239,15 @@ test "seat capability constants match core protocol" {
     try std.testing.expectEqual(@as(u32, 1), Capability.pointer);
     try std.testing.expectEqual(@as(u32, 2), Capability.keyboard);
     try std.testing.expectEqual(@as(u32, 4), Capability.touch);
+}
+
+test "pointer axis source respects event and enum versions" {
+    const wheel = @intFromEnum(generated.wl_pointer_types.axis_source.wheel);
+    const wheel_tilt = @intFromEnum(generated.wl_pointer_types.axis_source.wheel_tilt);
+    try std.testing.expect(!pointerSupportsAxisSource(4, wheel));
+    try std.testing.expect(pointerSupportsAxisSource(5, wheel));
+    try std.testing.expect(!pointerSupportsAxisSource(5, wheel_tilt));
+    try std.testing.expect(pointerSupportsAxisSource(6, wheel_tilt));
 }
 
 test "seat aggregates physical and virtual capabilities keys and modifiers" {

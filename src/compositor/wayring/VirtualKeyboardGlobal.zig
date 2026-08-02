@@ -11,6 +11,10 @@ const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 
 const maximum_keymap_size = 16 * 1024 * 1024;
+const keymap_seals = linux.F.SEAL_SHRINK |
+    linux.F.SEAL_GROW |
+    linux.F.SEAL_WRITE |
+    linux.F.SEAL_SEAL;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -178,20 +182,27 @@ fn setKeymap(
     fd: std.posix.fd_t,
     size: u32,
 ) !void {
-    var fd_owned = true;
-    defer if (fd_owned) {
+    defer {
         _ = linux.close(fd);
-    };
+    }
     if (format != @intFromEnum(generated.wl_keyboard_types.keymap_format.xkb_v1))
         return client.postError(
             resource,
             @intFromEnum(generated.zwp_virtual_keyboard_v1_types.@"error".invalid_keymap_format),
             "unsupported virtual keyboard keymap format",
         );
-    if (!validKeymap(self.owner.io, fd, size))
-        return client.postImplementationError("invalid virtual keyboard keymap");
-    fd_owned = false;
-    self.owner.seat.keyboardKeymap(format, fd, size) catch {
+    const keymap_fd = copyKeymap(self.owner.io, fd, size) catch |err| {
+        if (err == error.InvalidKeymap)
+            return client.postImplementationError("invalid virtual keyboard keymap");
+        self.owner.listener.failed(self.owner.listener.context);
+        return;
+    };
+    var keymap_owned = true;
+    defer if (keymap_owned) {
+        _ = linux.close(keymap_fd);
+    };
+    keymap_owned = false;
+    self.owner.seat.keyboardKeymap(format, keymap_fd, size) catch {
         self.owner.listener.failed(self.owner.listener.context);
         return;
     };
@@ -285,17 +296,46 @@ fn destroyDevice(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle
     unreachable;
 }
 
-fn validKeymap(io: std.Io, fd: std.posix.fd_t, size: u32) bool {
-    if (size == 0 or size > maximum_keymap_size) return false;
-    const file: std.Io.File = .{
+fn copyKeymap(io: std.Io, fd: std.posix.fd_t, size: u32) !std.posix.fd_t {
+    if (size == 0 or size > maximum_keymap_size) return error.InvalidKeymap;
+    const source: std.Io.File = .{
         .handle = fd,
         .flags = .{ .nonblocking = false },
     };
-    const stat = file.stat(io) catch return false;
-    if (stat.size < size) return false;
-    var terminator: [1]u8 = undefined;
-    const read = file.readPositionalAll(io, &terminator, size - 1) catch return false;
-    return read == 1 and terminator[0] == 0;
+    const stat = source.stat(io) catch return error.InvalidKeymap;
+    if (stat.size < size) return error.InvalidKeymap;
+
+    const copy_fd = try std.posix.memfd_create(
+        "keywork-virtual-keymap",
+        linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
+    );
+    var copy_owned = true;
+    defer if (copy_owned) {
+        _ = linux.close(copy_fd);
+    };
+    const copy: std.Io.File = .{
+        .handle = copy_fd,
+        .flags = .{ .nonblocking = false },
+    };
+    try copy.setLength(io, size);
+    var buffer: [16 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    var last_byte: u8 = undefined;
+    while (offset < size) {
+        const chunk_length: usize = @intCast(@min(buffer.len, size - offset));
+        const chunk = buffer[0..chunk_length];
+        const read = source.readPositionalAll(io, chunk, offset) catch
+            return error.InvalidKeymap;
+        if (read != chunk.len) return error.InvalidKeymap;
+        last_byte = chunk[chunk.len - 1];
+        try copy.writePositionalAll(io, chunk, offset);
+        offset += read;
+    }
+    if (last_byte != 0) return error.InvalidKeymap;
+    if (std.c.fcntl(copy_fd, linux.F.ADD_SEALS, @as(c_int, keymap_seals)) < 0)
+        return error.SealKeymapFailed;
+    copy_owned = false;
+    return copy_fd;
 }
 
 const TestListener = struct {
@@ -328,7 +368,7 @@ const TestListener = struct {
     }
 };
 
-test "virtual keyboard keymap validation enforces bounds stat and terminator" {
+test "virtual keyboard copies validates and seals keymaps" {
     const valid_fd = try std.posix.memfd_create("keywork-virtual-keymap-valid", linux.MFD.CLOEXEC);
     defer _ = linux.close(valid_fd);
     const valid_file: std.Io.File = .{
@@ -336,10 +376,31 @@ test "virtual keyboard keymap validation enforces bounds stat and terminator" {
         .flags = .{ .nonblocking = false },
     };
     try valid_file.writePositionalAll(std.testing.io, "x\x00", 0);
-    try std.testing.expect(validKeymap(std.testing.io, valid_fd, 2));
-    try std.testing.expect(!validKeymap(std.testing.io, valid_fd, 0));
-    try std.testing.expect(!validKeymap(std.testing.io, valid_fd, 3));
-    try std.testing.expect(!validKeymap(
+    const copied_fd = try copyKeymap(std.testing.io, valid_fd, 2);
+    defer _ = linux.close(copied_fd);
+    const copied_file: std.Io.File = .{
+        .handle = copied_fd,
+        .flags = .{ .nonblocking = false },
+    };
+    try valid_file.writePositionalAll(std.testing.io, "y\x00", 0);
+    var copied_bytes: [2]u8 = undefined;
+    try std.testing.expectEqual(
+        copied_bytes.len,
+        try copied_file.readPositionalAll(std.testing.io, &copied_bytes, 0),
+    );
+    try std.testing.expectEqualStrings("x\x00", &copied_bytes);
+    try std.testing.expectEqual(
+        @as(usize, keymap_seals),
+        linux.fcntl(copied_fd, linux.F.GET_SEALS, 0),
+    );
+    try std.testing.expectEqual(
+        linux.E.PERM,
+        linux.errno(linux.ftruncate(copied_fd, 1)),
+    );
+
+    try std.testing.expectError(error.InvalidKeymap, copyKeymap(std.testing.io, valid_fd, 0));
+    try std.testing.expectError(error.InvalidKeymap, copyKeymap(std.testing.io, valid_fd, 3));
+    try std.testing.expectError(error.InvalidKeymap, copyKeymap(
         std.testing.io,
         valid_fd,
         maximum_keymap_size + 1,
@@ -352,7 +413,10 @@ test "virtual keyboard keymap validation enforces bounds stat and terminator" {
         .flags = .{ .nonblocking = false },
     };
     try invalid_file.writePositionalAll(std.testing.io, "xx", 0);
-    try std.testing.expect(!validKeymap(std.testing.io, invalid_fd, 2));
+    try std.testing.expectError(
+        error.InvalidKeymap,
+        copyKeymap(std.testing.io, invalid_fd, 2),
+    );
 }
 
 test "virtual keyboard owns aggregate state and closes rejected keymaps" {

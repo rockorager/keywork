@@ -1093,6 +1093,7 @@ fn drmOutputRemoving(context: *anyopaque, removed: *DrmOutput) void {
         .drm => |output| output,
     } orelse return;
     if (selected != removed) return;
+    self.terminating = true;
     removed.detach();
     self.output.drm = null;
     self.terminate();
@@ -1204,7 +1205,16 @@ fn virtualKeyboardCapabilityChanged(context: *anyopaque) void {
 
 fn virtualPointerCapabilityChanged(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.pointerRoutingAvailable()) return;
     self.refreshPointerCapability() catch self.terminate();
+}
+
+fn pointerRoutingAvailable(self: *const NativeServer) bool {
+    if (self.terminating) return false;
+    return switch (self.output) {
+        .headless => true,
+        .drm => |output| output != null,
+    };
 }
 
 fn nativeInputClose(context: *anyopaque) void {
@@ -1845,6 +1855,7 @@ fn refreshKeyboardCapability(self: *NativeServer) !void {
 }
 
 fn refreshPointerCapability(self: *NativeServer) !void {
+    if (!self.pointerRoutingAvailable()) return;
     if (!self.seat_global.hasCapability(SeatGlobal.Capability.pointer)) return;
     const moved = try self.refreshPointerFocus(0);
     if (moved) try self.seat_global.pointerFrame();
@@ -1907,6 +1918,7 @@ fn virtualPointerEvent(
     event: VirtualPointerGlobal.Event,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.pointerRoutingAvailable()) return;
     switch (event) {
         .motion => |motion| {
             self.idle_notify_global.notifyActivity();
@@ -3872,6 +3884,18 @@ test "native input coordinates respect fractional scale and protocol bounds" {
     try std.testing.expectEqual(@as(i32, 384), fixedFromDouble(1.5));
     try std.testing.expectEqual(std.math.minInt(i32), fixedFromDouble(-1.0e20));
     try std.testing.expectEqual(std.math.maxInt(i32), fixedFromDouble(1.0e20));
+}
+
+test "virtual pointer callbacks are inert during teardown and after output loss" {
+    var server: NativeServer = undefined;
+    server.terminating = true;
+    virtualPointerCapabilityChanged(&server);
+    virtualPointerEvent(&server, null, 1, .frame);
+
+    server.terminating = false;
+    server.output = .{ .drm = null };
+    virtualPointerCapabilityChanged(&server);
+    virtualPointerEvent(&server, null, 1, .frame);
 }
 
 test "surface opaque hints clip to offset buffer bounds and translate globally" {
