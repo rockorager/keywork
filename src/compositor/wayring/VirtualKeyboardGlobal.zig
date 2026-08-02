@@ -1,4 +1,4 @@
-//! Privileged default-seat virtual keyboard producer.
+//! Privileged virtual keyboard producer for default and transient seats.
 
 const VirtualKeyboardGlobal = @This();
 
@@ -9,6 +9,7 @@ const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const TransientSeatGlobal = @import("TransientSeatGlobal.zig");
 
 const maximum_keymap_size = 16 * 1024 * 1024;
 const keymap_seals = linux.F.SEAL_SHRINK |
@@ -20,13 +21,14 @@ allocator: std.mem.Allocator,
 io: std.Io,
 server: *Server,
 seat: *SeatGlobal,
+transient_seat: *TransientSeatGlobal,
 listener: Listener,
 global_name: u32,
 devices: std.ArrayList(*Device) = .empty,
 
 pub const Listener = struct {
     context: *anyopaque,
-    capability_changed: *const fn (*anyopaque) void,
+    capability_changed: *const fn (*anyopaque, *SeatGlobal) void,
     activity: *const fn (*anyopaque) void,
     failed: *const fn (*anyopaque) void,
 };
@@ -34,7 +36,8 @@ pub const Listener = struct {
 const Device = struct {
     owner: *VirtualKeyboardGlobal,
     resource: wayring.ObjectHandle,
-    active: bool,
+    seat: ?*SeatGlobal,
+    retained_transient_seat: bool,
     has_keymap: bool = false,
     registered: bool = false,
     pressed_keys: std.ArrayList(u32) = .empty,
@@ -46,6 +49,7 @@ pub fn init(
     io: std.Io,
     server: *Server,
     seat: *SeatGlobal,
+    transient_seat: *TransientSeatGlobal,
     security: *SecurityContextGlobal,
     listener: Listener,
 ) !void {
@@ -54,6 +58,7 @@ pub fn init(
         .io = io,
         .server = server,
         .seat = seat,
+        .transient_seat = transient_seat,
         .listener = listener,
         .global_name = undefined,
     };
@@ -67,13 +72,26 @@ pub fn init(
             .filter = SecurityContextGlobal.allowUnconfined,
         },
     );
+    errdefer server.removeGlobal(self.global_name) catch unreachable;
+    try transient_seat.addSeatListener(.{
+        .context = self,
+        .removed = transientSeatRemoved,
+    });
 }
 
 pub fn deinit(self: *VirtualKeyboardGlobal) void {
     std.debug.assert(self.devices.items.len == 0);
+    self.transient_seat.removeSeatListener(self);
     self.server.removeGlobal(self.global_name) catch unreachable;
     self.devices.deinit(self.allocator);
     self.* = undefined;
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *SeatGlobal) void {
+    const self: *VirtualKeyboardGlobal = @ptrCast(@alignCast(context));
+    for (self.devices.items) |device| {
+        if (device.seat == seat) deactivate(device);
+    }
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
@@ -101,7 +119,10 @@ fn dispatchManager(
         .create_virtual_keyboard => |request| try self.createDevice(
             client,
             request.id,
-            self.seat.ownsResource(client, request.seat),
+            if (self.seat.ownsResource(client, request.seat))
+                self.seat
+            else
+                self.transient_seat.seatForResource(client, request.seat),
         ),
     }
 }
@@ -110,16 +131,24 @@ fn createDevice(
     self: *VirtualKeyboardGlobal,
     client: *Server.Client,
     id: u32,
-    active: bool,
+    seat: ?*SeatGlobal,
 ) !void {
     self.devices.ensureUnusedCapacity(self.allocator, 1) catch
         return client.postNoMemory();
     const device = self.allocator.create(Device) catch return client.postNoMemory();
     errdefer self.allocator.destroy(device);
+    const retained_transient_seat = if (seat) |target|
+        target != self.seat and self.transient_seat.retainSeat(target)
+    else
+        false;
+    errdefer if (retained_transient_seat) self.transient_seat.releaseSeat(seat.?);
+    if (seat) |target|
+        std.debug.assert(target == self.seat or retained_transient_seat);
     device.* = .{
         .owner = self,
         .resource = undefined,
-        .active = active,
+        .seat = seat,
+        .retained_transient_seat = retained_transient_seat,
     };
     device.resource = client.createResource(
         id,
@@ -149,21 +178,21 @@ fn dispatchDevice(
         .destroy => {},
         .keymap => |request| {
             const fd = try message.takeFd(request.fd);
-            if (!device.active) {
+            if (device.seat == null) {
                 _ = linux.close(fd);
                 return;
             }
             try setKeymap(device, client, resource, request.format, fd, request.size);
         },
         .key => |request| {
-            if (!device.active) return;
+            if (device.seat == null) return;
             try key(device, client, resource, request.time, request.key, request.state);
         },
         .modifiers => |request| {
-            if (!device.active) return;
+            const seat = device.seat orelse return;
             if (!try requireKeymap(device, client, resource)) return;
             device.owner.listener.activity(device.owner.listener.context);
-            device.owner.seat.setVirtualModifiers(
+            seat.setVirtualModifiers(
                 device,
                 request.mods_depressed,
                 request.mods_latched,
@@ -202,16 +231,17 @@ fn setKeymap(
         _ = linux.close(keymap_fd);
     };
     keymap_owned = false;
-    self.owner.seat.keyboardKeymap(format, keymap_fd, size) catch {
+    const seat = self.seat orelse unreachable;
+    seat.keyboardKeymap(format, keymap_fd, size) catch {
         self.owner.listener.failed(self.owner.listener.context);
         return;
     };
     self.has_keymap = true;
     if (self.registered) return;
     self.registered = true;
-    self.owner.seat.addVirtualKeyboard() catch
+    seat.addVirtualKeyboard() catch
         self.owner.listener.failed(self.owner.listener.context);
-    self.owner.listener.capability_changed(self.owner.listener.context);
+    self.owner.listener.capability_changed(self.owner.listener.context, seat);
 }
 
 fn key(
@@ -222,6 +252,7 @@ fn key(
     key_code: u32,
     state: u32,
 ) !void {
+    const seat = self.seat orelse return;
     if (!try requireKeymap(self, client, resource)) return;
     self.owner.listener.activity(self.owner.listener.context);
     switch (state) {
@@ -229,7 +260,7 @@ fn key(
             if (std.mem.indexOfScalar(u32, self.pressed_keys.items, key_code) != null) return;
             self.pressed_keys.append(self.owner.allocator, key_code) catch
                 return client.postNoMemory();
-            _ = self.owner.seat.virtualKey(time, key_code, state) catch {
+            _ = seat.virtualKey(time, key_code, state) catch {
                 _ = self.pressed_keys.pop();
                 return client.postNoMemory();
             };
@@ -238,7 +269,7 @@ fn key(
             const index = std.mem.indexOfScalar(u32, self.pressed_keys.items, key_code) orelse
                 return;
             _ = self.pressed_keys.orderedRemove(index);
-            _ = self.owner.seat.virtualKey(time, key_code, state) catch
+            _ = seat.virtualKey(time, key_code, state) catch
                 self.owner.listener.failed(self.owner.listener.context);
         },
         else => return client.postImplementationError("invalid virtual keyboard key state"),
@@ -263,23 +294,27 @@ fn requireKeymap(
 }
 
 fn deactivate(self: *Device) void {
-    if (!self.active) return;
+    const seat = self.seat orelse return;
     while (self.pressed_keys.pop()) |key_code| {
-        _ = self.owner.seat.virtualKey(
+        _ = seat.virtualKey(
             0,
             key_code,
             @intFromEnum(generated.wl_keyboard_types.key_state.released),
         ) catch self.owner.listener.failed(self.owner.listener.context);
     }
-    self.owner.seat.clearVirtualModifiers(self) catch
+    seat.clearVirtualModifiers(self) catch
         self.owner.listener.failed(self.owner.listener.context);
     if (self.registered) {
-        self.owner.seat.removeVirtualKeyboard() catch
+        seat.removeVirtualKeyboard() catch
             self.owner.listener.failed(self.owner.listener.context);
         self.registered = false;
-        self.owner.listener.capability_changed(self.owner.listener.context);
+        self.owner.listener.capability_changed(self.owner.listener.context, seat);
     }
-    self.active = false;
+    self.seat = null;
+    if (self.retained_transient_seat) {
+        self.retained_transient_seat = false;
+        self.owner.transient_seat.releaseSeat(seat);
+    }
 }
 
 fn destroyDevice(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
@@ -340,12 +375,14 @@ fn copyKeymap(io: std.Io, fd: std.posix.fd_t, size: u32) !std.posix.fd_t {
 
 const TestListener = struct {
     capability_changes: usize = 0,
+    last_capability_seat: ?*SeatGlobal = null,
     activities: usize = 0,
     failures: usize = 0,
 
-    fn capabilityChanged(context: *anyopaque) void {
+    fn capabilityChanged(context: *anyopaque, seat: *SeatGlobal) void {
         const self: *TestListener = @ptrCast(@alignCast(context));
         self.capability_changes += 1;
+        self.last_capability_seat = seat;
     }
 
     fn activity(context: *anyopaque) void {
@@ -426,6 +463,9 @@ test "virtual keyboard owns aggregate state and closes rejected keymaps" {
     try seat.init(std.testing.allocator, &server, "default", 0, null);
     defer seat.deinit();
     var security: SecurityContextGlobal = undefined;
+    var transient_seats: TransientSeatGlobal = undefined;
+    try transient_seats.init(std.testing.allocator, &server, &security);
+    defer transient_seats.deinit();
     var capture: TestListener = .{};
     var keyboards: VirtualKeyboardGlobal = undefined;
     try keyboards.init(
@@ -433,6 +473,7 @@ test "virtual keyboard owns aggregate state and closes rejected keymaps" {
         std.testing.io,
         &server,
         &seat,
+        &transient_seats,
         &security,
         capture.listener(),
     );
@@ -440,7 +481,7 @@ test "virtual keyboard owns aggregate state and closes rejected keymaps" {
     const client = try server.createClient();
     defer server.destroyClient(client) catch {};
 
-    try keyboards.createDevice(client, 2, true);
+    try keyboards.createDevice(client, 2, &seat);
     const device = keyboards.devices.items[0];
     const keymap_fd = try std.posix.memfd_create("keywork-virtual-keymap", linux.MFD.CLOEXEC);
     const keymap_file: std.Io.File = .{
@@ -481,10 +522,11 @@ test "virtual keyboard owns aggregate state and closes rejected keymaps" {
     try std.testing.expectEqual(@as(usize, 0), seat.keyboard_keys.items.len);
     try std.testing.expect(!seat.hasCapability(SeatGlobal.Capability.keyboard));
     try std.testing.expectEqual(@as(usize, 2), capture.capability_changes);
+    try std.testing.expectEqual(&seat, capture.last_capability_seat.?);
     try std.testing.expectEqual(@as(usize, 2), capture.activities);
     try std.testing.expectEqual(@as(usize, 0), capture.failures);
 
-    try keyboards.createDevice(client, 3, false);
+    try keyboards.createDevice(client, 3, null);
     const inert = keyboards.devices.items[0];
     const rejected_fd = try std.posix.memfd_create("keywork-virtual-keymap-rejected", linux.MFD.CLOEXEC);
     try std.testing.expectError(error.ProtocolError, setKeymap(
@@ -501,7 +543,7 @@ test "virtual keyboard owns aggregate state and closes rejected keymaps" {
     );
 }
 
-test "virtual keyboard manager accepts only the exact default seat binding" {
+test "virtual keyboard resolves transient seats and deactivates on retirement" {
     const core = @import("wayring-core");
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
@@ -512,6 +554,9 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
     try other_seat.init(std.testing.allocator, &server, "other", 0, null);
     defer other_seat.deinit();
     var security: SecurityContextGlobal = undefined;
+    var transient_seats: TransientSeatGlobal = undefined;
+    try transient_seats.init(std.testing.allocator, &server, &security);
+    defer transient_seats.deinit();
     var capture: TestListener = .{};
     var keyboards: VirtualKeyboardGlobal = undefined;
     try keyboards.init(
@@ -519,6 +564,7 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
         std.testing.io,
         &server,
         &default_seat,
+        &transient_seats,
         &security,
         capture.listener(),
     );
@@ -541,6 +587,7 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
     var default_name: u32 = 0;
     var other_name: u32 = 0;
     var manager_name: u32 = 0;
+    var transient_manager_name: u32 = 0;
     while (peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
@@ -553,7 +600,13 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
             event.global.interface,
             generated.zwp_virtual_keyboard_manager_v1.name,
         )) manager_name = event.global.name;
+        if (std.mem.eql(
+            u8,
+            event.global.interface,
+            generated.ext_transient_seat_manager_v1.name,
+        )) transient_manager_name = event.global.name;
     }
+    try std.testing.expect(transient_manager_name != 0);
     const default_resource: wayring.ObjectHandle = .{
         .id = 3,
         .generation = try core.bind(
@@ -590,6 +643,69 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
             &generated.zwp_virtual_keyboard_manager_v1,
         ),
     };
+    const transient_manager_resource: wayring.ObjectHandle = .{
+        .id = 6,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            transient_manager_name,
+            generated.ext_transient_seat_manager_v1.name,
+            1,
+            6,
+            &generated.ext_transient_seat_manager_v1,
+        ),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    const transient_resource = try generated.ext_transient_seat_manager_v1_types.requests.create(
+        &peer,
+        transient_manager_resource,
+    );
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var transient_name: u32 = 0;
+    var saw_ready = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == registry.id) {
+            const event = try core.decodeRegistryEvent(&message, registry.id);
+            if (event == .global and
+                std.mem.eql(u8, event.global.interface, generated.wl_seat.name) and
+                event.global.name != default_name and
+                event.global.name != other_name)
+                transient_name = event.global.name;
+            continue;
+        }
+        if (message.object_id != transient_resource.id) continue;
+        const event = try generated.ext_transient_seat_v1_types.decodeEvent(
+            &peer,
+            transient_resource,
+            &message,
+        );
+        switch (event) {
+            .ready => saw_ready = true,
+            .denied => return error.UnexpectedSeatDenial,
+        }
+    }
+    try std.testing.expect(saw_ready and transient_name != 0);
+    const transient_seat_resource: wayring.ObjectHandle = .{
+        .id = 20,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            transient_name,
+            generated.wl_seat.name,
+            10,
+            20,
+            &generated.wl_seat,
+        ),
+    };
     try transferToServer(&peer, client);
     try transferFromServer(&peer, client);
     while (peer.popMessage()) |popped| {
@@ -602,15 +718,23 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
         manager_resource,
         default_resource,
     );
+    const transient = try generated.zwp_virtual_keyboard_manager_v1_types.requests.create_virtual_keyboard(
+        &peer,
+        manager_resource,
+        transient_seat_resource,
+    );
     const inert = try generated.zwp_virtual_keyboard_manager_v1_types.requests.create_virtual_keyboard(
         &peer,
         manager_resource,
         other_resource,
     );
     try transferToServer(&peer, client);
-    try std.testing.expectEqual(@as(usize, 2), keyboards.devices.items.len);
-    try std.testing.expect(keyboards.devices.items[0].active);
-    try std.testing.expect(!keyboards.devices.items[1].active);
+    try std.testing.expectEqual(@as(usize, 3), keyboards.devices.items.len);
+    try std.testing.expectEqual(&default_seat, keyboards.devices.items[0].seat.?);
+    const transient_seat = keyboards.devices.items[1].seat.?;
+    try std.testing.expect(transient_seat != &default_seat);
+    try std.testing.expect(keyboards.devices.items[1].retained_transient_seat);
+    try std.testing.expect(keyboards.devices.items[2].seat == null);
 
     const inert_fd = try std.posix.memfd_create("keywork-inert-virtual-keymap", linux.MFD.CLOEXEC);
     try generated.zwp_virtual_keyboard_v1_types.requests.keymap(
@@ -626,6 +750,64 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
         linux.errno(linux.fcntl(inert_fd, linux.F.GETFD, 0)),
     );
     try std.testing.expect(!default_seat.hasCapability(SeatGlobal.Capability.keyboard));
+
+    const transient_fd = try std.posix.memfd_create(
+        "keywork-transient-virtual-keymap",
+        linux.MFD.CLOEXEC,
+    );
+    const transient_file: std.Io.File = .{
+        .handle = transient_fd,
+        .flags = .{ .nonblocking = false },
+    };
+    try transient_file.writePositionalAll(std.testing.io, "t\x00", 0);
+    try generated.zwp_virtual_keyboard_v1_types.requests.keymap(
+        &peer,
+        transient,
+        @intFromEnum(generated.wl_keyboard_types.keymap_format.xkb_v1),
+        transient_fd,
+        2,
+    );
+    try generated.zwp_virtual_keyboard_v1_types.requests.key(
+        &peer,
+        transient,
+        2,
+        31,
+        @intFromEnum(generated.wl_keyboard_types.key_state.pressed),
+    );
+    try generated.zwp_virtual_keyboard_v1_types.requests.modifiers(
+        &peer,
+        transient,
+        1,
+        2,
+        3,
+        4,
+    );
+    try transferToServer(&peer, client);
+    try std.testing.expect(transient_seat.hasCapability(SeatGlobal.Capability.keyboard));
+    try std.testing.expectEqual(@as(usize, 1), transient_seat.keyboard_keys.items.len);
+
+    try generated.ext_transient_seat_v1_types.requests.destroy(&peer, transient_resource);
+    try transferToServer(&peer, client);
+    try std.testing.expect(keyboards.devices.items[1].seat == null);
+    try std.testing.expect(!keyboards.devices.items[1].retained_transient_seat);
+    try std.testing.expect(!transient_seat.hasCapability(SeatGlobal.Capability.keyboard));
+    try std.testing.expectEqual(@as(usize, 0), transient_seat.keyboard_keys.items.len);
+    const retired_fd = try std.posix.memfd_create(
+        "keywork-retired-virtual-keymap",
+        linux.MFD.CLOEXEC,
+    );
+    try generated.zwp_virtual_keyboard_v1_types.requests.keymap(
+        &peer,
+        transient,
+        @intFromEnum(generated.wl_keyboard_types.keymap_format.xkb_v1),
+        retired_fd,
+        1,
+    );
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(
+        linux.E.BADF,
+        linux.errno(linux.fcntl(retired_fd, linux.F.GETFD, 0)),
+    );
 
     const active_fd = try std.posix.memfd_create("keywork-active-virtual-keymap", linux.MFD.CLOEXEC);
     const active_file: std.Io.File = .{
@@ -652,6 +834,7 @@ test "virtual keyboard manager accepts only the exact default seat binding" {
     try std.testing.expectEqual(@as(usize, 1), default_seat.keyboard_keys.items.len);
 
     try generated.zwp_virtual_keyboard_v1_types.requests.destroy(&peer, inert);
+    try generated.zwp_virtual_keyboard_v1_types.requests.destroy(&peer, transient);
     try generated.zwp_virtual_keyboard_v1_types.requests.destroy(&peer, active);
     try transferToServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 0), keyboards.devices.items.len);

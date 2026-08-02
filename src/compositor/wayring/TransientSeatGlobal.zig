@@ -17,7 +17,27 @@ server: *Server,
 global_name: u32,
 global_finalized: bool,
 seats: std.ArrayList(*TransientSeat) = .empty,
+listeners: std.ArrayList(SeatListener) = .empty,
 next_name: u64 = 1,
+
+pub const SeatListener = struct {
+    context: *anyopaque,
+    removed: *const fn (*anyopaque, *SeatGlobal) void,
+};
+
+pub const SeatIterator = struct {
+    owner: *TransientSeatGlobal,
+    index: usize = 0,
+
+    pub fn next(self: *SeatIterator) ?*SeatGlobal {
+        while (self.index < self.owner.seats.items.len) {
+            const transient = self.owner.seats.items[self.index];
+            self.index += 1;
+            if (transient.active) return &transient.seat;
+        }
+        return null;
+    }
+};
 
 const TransientSeat = struct {
     owner: *TransientSeatGlobal,
@@ -57,10 +77,73 @@ pub fn init(
 
 pub fn deinit(self: *TransientSeatGlobal) void {
     std.debug.assert(self.seats.items.len == 0);
+    std.debug.assert(self.listeners.items.len == 0);
     self.server.removeGlobal(self.global_name) catch unreachable;
     std.debug.assert(self.global_finalized);
+    self.listeners.deinit(self.allocator);
     self.seats.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Copies the listener and retains its context until removeSeatListener.
+pub fn addSeatListener(
+    self: *TransientSeatGlobal,
+    listener: SeatListener,
+) error{OutOfMemory}!void {
+    for (self.listeners.items) |existing|
+        std.debug.assert(existing.context != listener.context);
+    try self.listeners.append(self.allocator, listener);
+}
+
+pub fn removeSeatListener(self: *TransientSeatGlobal, context: *anyopaque) void {
+    for (self.listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+/// Resolves one exact active transient seat binding owned by client.
+pub fn seatForResource(
+    self: *TransientSeatGlobal,
+    client: *const Server.Client,
+    resource_id: u32,
+) ?*SeatGlobal {
+    for (self.seats.items) |transient| {
+        if (transient.active and transient.seat.ownsResource(client, resource_id))
+            return &transient.seat;
+    }
+    return null;
+}
+
+/// Retains an active transient seat across virtual-device lifetime.
+pub fn retainSeat(self: *TransientSeatGlobal, seat: *SeatGlobal) bool {
+    for (self.seats.items) |transient| {
+        if (!transient.active or &transient.seat != seat) continue;
+        transient.virtual_retains = std.math.add(
+            usize,
+            transient.virtual_retains,
+            1,
+        ) catch unreachable;
+        return true;
+    }
+    return false;
+}
+
+pub fn releaseSeat(self: *TransientSeatGlobal, seat: *SeatGlobal) void {
+    for (self.seats.items) |transient| {
+        if (&transient.seat != seat) continue;
+        std.debug.assert(transient.virtual_retains != 0);
+        transient.virtual_retains -= 1;
+        destroyIfUnused(transient);
+        return;
+    }
+    unreachable;
+}
+
+pub fn seatIterator(self: *TransientSeatGlobal) SeatIterator {
+    return .{ .owner = self };
 }
 
 fn managerGlobalFinalized(context: *anyopaque) void {
@@ -189,8 +272,13 @@ fn destroyTransient(
     const transient = self.findByResource(client, resource) orelse return;
     transient.resource = null;
     transient.active = false;
-    // Inputless seats make setCapabilities(0) infallible. Finalization may
-    // synchronously free transient, so this must remain the final access.
+    // Devices must relinquish capabilities while SeatGlobal is still active.
+    // Their release callbacks also drain every seat-scoped input route before
+    // the final virtual retain can be dropped.
+    for (self.listeners.items) |listener|
+        listener.removed(listener.context, &transient.seat);
+    // Finalization may synchronously free transient, so this remains the final
+    // access through it.
     transient.seat.removeGlobal() catch unreachable;
 }
 
@@ -348,9 +436,21 @@ test "client teardown drains transient seat resources in arbitrary order" {
     try transferToServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 1), manager.seats.items.len);
     try std.testing.expectEqual(@as(usize, 1), manager.seats.items[0].resource_count);
+    const transient_seat = manager.seatForResource(client, 4) orelse
+        return error.ExpectedActiveTransientSeat;
+    try std.testing.expectEqual(&manager.seats.items[0].seat, transient_seat);
+    var active_seats = manager.seatIterator();
+    try std.testing.expectEqual(transient_seat, active_seats.next().?);
+    try std.testing.expect(active_seats.next() == null);
+    try std.testing.expect(manager.retainSeat(transient_seat));
+    try std.testing.expectEqual(@as(usize, 1), manager.seats.items[0].virtual_retains);
 
     try server.destroyClient(client);
     client_owned = false;
+    try std.testing.expectEqual(@as(usize, 1), manager.seats.items.len);
+    active_seats = manager.seatIterator();
+    try std.testing.expect(active_seats.next() == null);
+    manager.releaseSeat(transient_seat);
     try std.testing.expectEqual(@as(usize, 0), manager.seats.items.len);
 }
 

@@ -1,4 +1,4 @@
-//! Privileged default-seat virtual pointer producer.
+//! Privileged virtual pointer producer for default and transient seats.
 
 const VirtualPointerGlobal = @This();
 
@@ -8,11 +8,13 @@ const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const TransientSeatGlobal = @import("TransientSeatGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 
 allocator: std.mem.Allocator,
 server: *Server,
 seat: *SeatGlobal,
+transient_seat: *TransientSeatGlobal,
 output: *OutputGlobal,
 listener: Listener,
 global_name: u32,
@@ -38,17 +40,18 @@ pub const Event = union(enum) {
 
 pub const Listener = struct {
     context: *anyopaque,
-    event: *const fn (*anyopaque, ?*OutputGlobal, u64, Event) void,
-    capability_changed: *const fn (*anyopaque) void,
+    event: *const fn (*anyopaque, *SeatGlobal, ?*OutputGlobal, u64, Event) void,
+    capability_changed: *const fn (*anyopaque, *SeatGlobal) void,
     failed: *const fn (*anyopaque) void,
 };
 
 const Device = struct {
     owner: *VirtualPointerGlobal,
     resource: wayring.ObjectHandle,
+    seat: ?*SeatGlobal,
     mapped_output: ?*OutputGlobal,
     source: u64,
-    active: bool,
+    retained_transient_seat: bool,
     registered: bool = false,
     pressed_buttons: std.ArrayList(u32) = .empty,
 };
@@ -58,6 +61,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     server: *Server,
     seat: *SeatGlobal,
+    transient_seat: *TransientSeatGlobal,
     output: *OutputGlobal,
     security: *SecurityContextGlobal,
     listener: Listener,
@@ -66,6 +70,7 @@ pub fn init(
         .allocator = allocator,
         .server = server,
         .seat = seat,
+        .transient_seat = transient_seat,
         .output = output,
         .listener = listener,
         .global_name = undefined,
@@ -80,13 +85,26 @@ pub fn init(
             .filter = SecurityContextGlobal.allowUnconfined,
         },
     );
+    errdefer server.removeGlobal(self.global_name) catch unreachable;
+    try transient_seat.addSeatListener(.{
+        .context = self,
+        .removed = transientSeatRemoved,
+    });
 }
 
 pub fn deinit(self: *VirtualPointerGlobal) void {
     std.debug.assert(self.devices.items.len == 0);
+    self.transient_seat.removeSeatListener(self);
     self.server.removeGlobal(self.global_name) catch unreachable;
     self.devices.deinit(self.allocator);
     self.* = undefined;
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *SeatGlobal) void {
+    const self: *VirtualPointerGlobal = @ptrCast(@alignCast(context));
+    for (self.devices.items) |device| {
+        if (device.seat == seat) deactivate(device);
+    }
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
@@ -137,9 +155,10 @@ fn resolveSeat(
     self: *const VirtualPointerGlobal,
     client: *const Server.Client,
     resource_id: ?u32,
-) bool {
-    const id = resource_id orelse return true;
-    return self.seat.ownsResource(client, id);
+) ?*SeatGlobal {
+    const id = resource_id orelse return self.seat;
+    if (self.seat.ownsResource(client, id)) return self.seat;
+    return self.transient_seat.seatForResource(client, id);
 }
 
 fn resolveOutput(
@@ -156,7 +175,7 @@ fn createDevice(
     client: *Server.Client,
     id: u32,
     version: u32,
-    active: bool,
+    seat: ?*SeatGlobal,
     mapped_output: ?*OutputGlobal,
 ) !void {
     self.devices.ensureUnusedCapacity(self.allocator, 1) catch
@@ -165,12 +184,20 @@ fn createDevice(
     errdefer self.allocator.destroy(device);
     const source = self.next_source;
     self.next_source = std.math.add(u64, source, 1) catch unreachable;
+    const retained_transient_seat = if (seat) |target|
+        target != self.seat and self.transient_seat.retainSeat(target)
+    else
+        false;
+    errdefer if (retained_transient_seat) self.transient_seat.releaseSeat(seat.?);
+    if (seat) |target|
+        std.debug.assert(target == self.seat or retained_transient_seat);
     device.* = .{
         .owner = self,
         .resource = undefined,
+        .seat = seat,
         .mapped_output = mapped_output,
         .source = source,
-        .active = active,
+        .retained_transient_seat = retained_transient_seat,
     };
     device.resource = client.createResource(
         id,
@@ -183,10 +210,10 @@ fn createDevice(
         },
     ) catch return client.postNoMemory();
     self.devices.appendAssumeCapacity(device);
-    if (!active) return;
+    const target = seat orelse return;
     device.registered = true;
-    self.seat.addVirtualPointer() catch self.listener.failed(self.listener.context);
-    self.listener.capability_changed(self.listener.context);
+    target.addVirtualPointer() catch self.listener.failed(self.listener.context);
+    self.listener.capability_changed(self.listener.context, target);
 }
 
 fn dispatchDevice(
@@ -201,7 +228,7 @@ fn dispatchDevice(
         resource,
         message,
     );
-    if (!device.active) return;
+    if (device.seat == null) return;
     switch (request) {
         .destroy => {},
         .motion => |event| emit(device, .{ .motion = .{
@@ -280,8 +307,10 @@ fn button(
 }
 
 fn emit(self: *Device, event: Event) void {
+    const seat = self.seat orelse return;
     self.owner.listener.event(
         self.owner.listener.context,
+        seat,
         self.mapped_output,
         self.source,
         event,
@@ -289,7 +318,7 @@ fn emit(self: *Device, event: Event) void {
 }
 
 fn deactivate(self: *Device) void {
-    if (!self.active) return;
+    const seat = self.seat orelse return;
     const had_buttons = self.pressed_buttons.items.len != 0;
     while (self.pressed_buttons.pop()) |button_code| emit(self, .{ .button = .{
         .time = 0,
@@ -298,12 +327,16 @@ fn deactivate(self: *Device) void {
     } });
     if (had_buttons) emit(self, .frame);
     if (self.registered) {
-        self.owner.seat.removeVirtualPointer() catch
+        seat.removeVirtualPointer() catch
             self.owner.listener.failed(self.owner.listener.context);
         self.registered = false;
-        self.owner.listener.capability_changed(self.owner.listener.context);
+        self.owner.listener.capability_changed(self.owner.listener.context, seat);
     }
-    self.active = false;
+    self.seat = null;
+    if (self.retained_transient_seat) {
+        self.retained_transient_seat = false;
+        self.owner.transient_seat.releaseSeat(seat);
+    }
 }
 
 fn destroyDevice(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
@@ -356,6 +389,7 @@ fn fixedToDouble(value: i32) f64 {
 
 const TestListener = struct {
     events: [8]Event = undefined,
+    seats: [8]*SeatGlobal = undefined,
     outputs: [8]?*OutputGlobal = undefined,
     sources: [8]u64 = undefined,
     event_count: usize = 0,
@@ -364,18 +398,20 @@ const TestListener = struct {
 
     fn event(
         context: *anyopaque,
+        seat: *SeatGlobal,
         output: ?*OutputGlobal,
         source: u64,
         value: Event,
     ) void {
         const self: *TestListener = @ptrCast(@alignCast(context));
         self.events[self.event_count] = value;
+        self.seats[self.event_count] = seat;
         self.outputs[self.event_count] = output;
         self.sources[self.event_count] = source;
         self.event_count += 1;
     }
 
-    fn capabilityChanged(context: *anyopaque) void {
+    fn capabilityChanged(context: *anyopaque, _: *SeatGlobal) void {
         const self: *TestListener = @ptrCast(@alignCast(context));
         self.capability_changes += 1;
     }
@@ -403,12 +439,16 @@ test "virtual pointer deduplicates buttons and releases before teardown frame" {
     defer seat.deinit();
     var output: OutputGlobal = undefined;
     var security: SecurityContextGlobal = undefined;
+    var transient_seats: TransientSeatGlobal = undefined;
+    try transient_seats.init(std.testing.allocator, &server, &security);
+    defer transient_seats.deinit();
     var capture: TestListener = .{};
     var pointers: VirtualPointerGlobal = undefined;
     try pointers.init(
         std.testing.allocator,
         &server,
         &seat,
+        &transient_seats,
         &output,
         &security,
         capture.listener(),
@@ -417,7 +457,7 @@ test "virtual pointer deduplicates buttons and releases before teardown frame" {
     const client = try server.createClient();
     defer server.destroyClient(client) catch {};
 
-    try pointers.createDevice(client, 2, 2, true, null);
+    try pointers.createDevice(client, 2, 2, &seat, null);
     const device = pointers.devices.items[0];
     const pressed = @intFromEnum(generated.wl_pointer_types.button_state.pressed);
     const released = @intFromEnum(generated.wl_pointer_types.button_state.released);
@@ -436,8 +476,8 @@ test "virtual pointer deduplicates buttons and releases before teardown frame" {
     try std.testing.expect(!seat.hasCapability(SeatGlobal.Capability.pointer));
     try std.testing.expectEqual(@as(usize, 2), capture.capability_changes);
     try std.testing.expectEqual(@as(usize, 0), capture.failures);
-    try std.testing.expect(pointers.resolveSeat(client, null));
-    try std.testing.expect(!pointers.resolveSeat(client, 99));
+    try std.testing.expectEqual(&seat, pointers.resolveSeat(client, null).?);
+    try std.testing.expect(pointers.resolveSeat(client, 99) == null);
 }
 
 test "virtual pointer fixed conversion preserves protocol units" {
@@ -445,7 +485,7 @@ test "virtual pointer fixed conversion preserves protocol units" {
     try std.testing.expectEqual(@as(f64, -0.5), fixedToDouble(-128));
 }
 
-test "virtual pointer manager resolves default seat and exact mapped output" {
+test "virtual pointer resolves transient seats and deactivates on retirement" {
     const core = @import("wayring-core");
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
@@ -480,12 +520,16 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
     });
     defer other_output.deinit();
     var security: SecurityContextGlobal = undefined;
+    var transient_seats: TransientSeatGlobal = undefined;
+    try transient_seats.init(std.testing.allocator, &server, &security);
+    defer transient_seats.deinit();
     var capture: TestListener = .{};
     var pointers: VirtualPointerGlobal = undefined;
     try pointers.init(
         std.testing.allocator,
         &server,
         &default_seat,
+        &transient_seats,
         &output,
         &security,
         capture.listener(),
@@ -511,6 +555,7 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
     var output_names: [2]u32 = .{ 0, 0 };
     var output_count: usize = 0;
     var manager_name: u32 = 0;
+    var transient_manager_name: u32 = 0;
     while (peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
@@ -529,7 +574,13 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
             event.global.interface,
             generated.zwlr_virtual_pointer_manager_v1.name,
         )) manager_name = event.global.name;
+        if (std.mem.eql(
+            u8,
+            event.global.interface,
+            generated.ext_transient_seat_manager_v1.name,
+        )) transient_manager_name = event.global.name;
     }
+    try std.testing.expect(transient_manager_name != 0);
     const default_seat_resource: wayring.ObjectHandle = .{
         .id = 3,
         .generation = try core.bind(
@@ -590,6 +641,69 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
             &generated.zwlr_virtual_pointer_manager_v1,
         ),
     };
+    const transient_manager_resource: wayring.ObjectHandle = .{
+        .id = 8,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            transient_manager_name,
+            generated.ext_transient_seat_manager_v1.name,
+            1,
+            8,
+            &generated.ext_transient_seat_manager_v1,
+        ),
+    };
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    const transient_resource = try generated.ext_transient_seat_manager_v1_types.requests.create(
+        &peer,
+        transient_manager_resource,
+    );
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var transient_name: u32 = 0;
+    var saw_ready = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == registry.id) {
+            const event = try core.decodeRegistryEvent(&message, registry.id);
+            if (event == .global and
+                std.mem.eql(u8, event.global.interface, generated.wl_seat.name) and
+                event.global.name != default_seat_name and
+                event.global.name != other_seat_name)
+                transient_name = event.global.name;
+            continue;
+        }
+        if (message.object_id != transient_resource.id) continue;
+        const event = try generated.ext_transient_seat_v1_types.decodeEvent(
+            &peer,
+            transient_resource,
+            &message,
+        );
+        switch (event) {
+            .ready => saw_ready = true,
+            .denied => return error.UnexpectedSeatDenial,
+        }
+    }
+    try std.testing.expect(saw_ready and transient_name != 0);
+    const transient_seat_resource: wayring.ObjectHandle = .{
+        .id = 20,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            transient_name,
+            generated.wl_seat.name,
+            10,
+            20,
+            &generated.wl_seat,
+        ),
+    };
     try transferToServer(&peer, client);
     try transferFromServer(&peer, client);
     while (peer.popMessage()) |popped| {
@@ -603,6 +717,11 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
         default_seat_resource,
         output_resource,
     );
+    const transient = try generated.zwlr_virtual_pointer_manager_v1_types.requests.create_virtual_pointer(
+        &peer,
+        manager_resource,
+        transient_seat_resource,
+    );
     const inert = try generated.zwlr_virtual_pointer_manager_v1_types.requests.create_virtual_pointer(
         &peer,
         manager_resource,
@@ -615,13 +734,17 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
         other_output_resource,
     );
     try transferToServer(&peer, client);
-    try std.testing.expectEqual(@as(usize, 3), pointers.devices.items.len);
-    try std.testing.expect(pointers.devices.items[0].active);
+    try std.testing.expectEqual(@as(usize, 4), pointers.devices.items.len);
+    try std.testing.expectEqual(&default_seat, pointers.devices.items[0].seat.?);
     try std.testing.expectEqual(&output, pointers.devices.items[0].mapped_output.?);
-    try std.testing.expect(!pointers.devices.items[1].active);
-    try std.testing.expect(pointers.devices.items[2].active);
-    try std.testing.expect(pointers.devices.items[2].mapped_output == null);
+    const transient_seat = pointers.devices.items[1].seat.?;
+    try std.testing.expect(transient_seat != &default_seat);
+    try std.testing.expect(pointers.devices.items[1].retained_transient_seat);
+    try std.testing.expect(pointers.devices.items[2].seat == null);
+    try std.testing.expectEqual(&default_seat, pointers.devices.items[3].seat.?);
+    try std.testing.expect(pointers.devices.items[3].mapped_output == null);
     try std.testing.expect(default_seat.hasCapability(SeatGlobal.Capability.pointer));
+    try std.testing.expect(transient_seat.hasCapability(SeatGlobal.Capability.pointer));
 
     try generated.zwlr_virtual_pointer_v1_types.requests.motion(&peer, inert, 1, 256, 256);
     try generated.zwlr_virtual_pointer_v1_types.requests.motion_absolute(
@@ -635,22 +758,58 @@ test "virtual pointer manager resolves default seat and exact mapped output" {
     );
     try generated.zwlr_virtual_pointer_v1_types.requests.motion(
         &peer,
-        fallback,
+        transient,
         3,
+        256,
+        512,
+    );
+    try generated.zwlr_virtual_pointer_v1_types.requests.button(
+        &peer,
+        transient,
+        4,
+        0x110,
+        @intFromEnum(generated.wl_pointer_types.button_state.pressed),
+    );
+    try generated.zwlr_virtual_pointer_v1_types.requests.motion(
+        &peer,
+        fallback,
+        5,
         -128,
         384,
     );
     try transferToServer(&peer, client);
-    try std.testing.expectEqual(@as(usize, 2), capture.event_count);
+    try std.testing.expectEqual(@as(usize, 4), capture.event_count);
     try std.testing.expect(capture.events[0] == .motion_absolute);
+    try std.testing.expectEqual(&default_seat, capture.seats[0]);
     try std.testing.expectEqual(&output, capture.outputs[0].?);
     try std.testing.expect(capture.events[1] == .motion);
-    try std.testing.expectEqual(@as(f64, -0.5), capture.events[1].motion.dx);
-    try std.testing.expectEqual(@as(f64, 1.5), capture.events[1].motion.dy);
-    try std.testing.expect(capture.outputs[1] == null);
+    try std.testing.expectEqual(transient_seat, capture.seats[1]);
+    try std.testing.expectEqual(@as(f64, 1), capture.events[1].motion.dx);
+    try std.testing.expectEqual(@as(f64, 2), capture.events[1].motion.dy);
+    try std.testing.expect(capture.events[2] == .button);
+    try std.testing.expectEqual(transient_seat, capture.seats[2]);
+    try std.testing.expect(capture.events[3] == .motion);
+    try std.testing.expectEqual(&default_seat, capture.seats[3]);
+    try std.testing.expectEqual(@as(f64, -0.5), capture.events[3].motion.dx);
+    try std.testing.expectEqual(@as(f64, 1.5), capture.events[3].motion.dy);
+    try std.testing.expect(capture.outputs[3] == null);
     try std.testing.expect(capture.sources[0] != capture.sources[1]);
 
+    try generated.ext_transient_seat_v1_types.requests.destroy(&peer, transient_resource);
+    try transferToServer(&peer, client);
+    try std.testing.expect(pointers.devices.items[1].seat == null);
+    try std.testing.expect(!pointers.devices.items[1].retained_transient_seat);
+    try std.testing.expect(!transient_seat.hasCapability(SeatGlobal.Capability.pointer));
+    try std.testing.expectEqual(@as(usize, 6), capture.event_count);
+    try std.testing.expect(capture.events[4] == .button);
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(generated.wl_pointer_types.button_state.released)),
+        capture.events[4].button.state,
+    );
+    try std.testing.expect(capture.events[5] == .frame);
+
     try generated.zwlr_virtual_pointer_v1_types.requests.destroy(&peer, mapped);
+    try generated.zwlr_virtual_pointer_v1_types.requests.destroy(&peer, transient);
     try generated.zwlr_virtual_pointer_v1_types.requests.destroy(&peer, inert);
     try generated.zwlr_virtual_pointer_v1_types.requests.destroy(&peer, fallback);
     try transferToServer(&peer, client);

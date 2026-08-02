@@ -30,6 +30,8 @@ keyboard_focus: ?*CompositorGlobal.Surface = null,
 keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener) = .empty,
 touch_focus: ?*CompositorGlobal.Surface = null,
 cursor_handler: ?CursorHandler = null,
+logical_pointer_x: f64 = 0,
+logical_pointer_y: f64 = 0,
 pointer_x: i32 = 0,
 pointer_y: i32 = 0,
 keyboard_keys: std.ArrayList(KeyboardKey) = .empty,
@@ -94,6 +96,11 @@ pub const AxisFrame = struct {
     stopped: bool = false,
     discrete: ?i32 = null,
     value120: ?i32 = null,
+};
+
+pub const LogicalPointerPosition = struct {
+    x: f64,
+    y: f64,
 };
 
 const Binding = struct {
@@ -702,6 +709,19 @@ pub fn keyboardRepeatInfo(self: *SeatGlobal, rate: i32, delay: i32) !void {
 /// Returns a borrowed focus retained until the next focus or capability change.
 pub fn pointerFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.pointer_focus;
+}
+
+/// Stores the compositor-owned output-space position for this seat. Native
+/// physical input keeps its authoritative coordinates outside SeatGlobal;
+/// transient virtual seats use this independent logical position directly.
+pub fn setLogicalPointerPosition(self: *SeatGlobal, x: f64, y: f64) void {
+    std.debug.assert(std.math.isFinite(x) and std.math.isFinite(y));
+    self.logical_pointer_x = x;
+    self.logical_pointer_y = y;
+}
+
+pub fn logicalPointerPosition(self: *const SeatGlobal) LogicalPointerPosition {
+    return .{ .x = self.logical_pointer_x, .y = self.logical_pointer_y };
 }
 
 /// Captures a live pointer resource without retaining its owning seat child.
