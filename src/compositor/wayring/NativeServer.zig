@@ -694,13 +694,16 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         allocator.free(selection.path);
     }
     const listener = try bindListener(selection.path, options.listen_backlog);
-    var listener_owned = true;
-    errdefer if (listener_owned) {
-        _ = linux.close(listener);
+    var listener_fd_owned = true;
+    errdefer {
+        if (listener_fd_owned) _ = linux.close(listener);
         _ = std.c.unlink(selection.path.ptr);
-    };
+    }
+    // Keep the transport ownership transfer after every fallible startup
+    // operation: its listener can only be drained by the normal destroy path.
+    if (options.output_kind == .drm) try self.repaint_timer.arm(1, 0);
+    listener_fd_owned = false;
     try self.transport.init(allocator, self.event_loop.ioLoop(), &self.server, listener);
-    listener_owned = false;
 
     self.display_name = selection.name;
     self.socket_path = selection.path;
@@ -710,7 +713,6 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.output_busy_retries = 0;
     self.event_loop.setAfterPlatformHook(self, afterPlatform);
     self.event_loop.setEndTurnHook(self, endTurn);
-    if (self.repaint_needed) try self.repaint_timer.arm(0, 0);
     if (self.drm_device_initialized) {
         self.drm_device.setListener(drmDeviceListener(self));
         self.drm_listener_installed = true;
@@ -1696,7 +1698,7 @@ fn scheduleIdleNotify(context: *anyopaque, delay_milliseconds: ?u64) void {
 
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
     self.repaint_needed = true;
-    self.repaint_timer.arm(delay_milliseconds, 0) catch self.terminate();
+    self.repaint_timer.arm(@max(delay_milliseconds, 1), 0) catch self.terminate();
 }
 
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
@@ -3725,6 +3727,22 @@ test "native presentation reports only renderer-sampled surfaces" {
     try std.testing.expectEqual(@as(usize, 1), upper_counter.presented_count);
     try std.testing.expectEqual(@as(usize, 0), upper_counter.discarded_count);
     try std.testing.expectEqual(@as(usize, 0), off_output_counter.presented_count);
+}
+
+test "native immediate repaint uses the next timer tick" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const native = try NativeServer.create(std.testing.allocator, std.testing.io, .{
+        .runtime_directory = path_buffer[0..path_length],
+        .output_size = .{ .width = 8, .height = 4 },
+    });
+    defer native.destroy();
+
+    native.scheduleRepaint(0);
+    try std.testing.expect(!native.event_loop.stop_requested);
+    try std.testing.expect(native.repaint_timer.heap_index != null);
 }
 
 test "native compositor owns and drains its io_uring listener" {
