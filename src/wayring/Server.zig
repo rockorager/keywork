@@ -51,6 +51,14 @@ pub const GlobalImplementation = struct {
 
 pub const ClientState = enum { active, protocol_error, closing };
 
+/// One immutable, policy-neutral provenance value owned by a client. The key
+/// is an address-stable namespace token; destroy releases data exactly once.
+pub const OwnedProvenance = struct {
+    key: *const anyopaque,
+    data: *anyopaque,
+    destroy: *const fn (*anyopaque) void,
+};
+
 const Resource = struct {
     handle: wayring.ObjectHandle,
     interface: *const wayring.Interface,
@@ -84,14 +92,25 @@ pub const Client = struct {
     dispatch_depth: usize = 0,
     references: usize = 1,
     transport_attached: bool = true,
+    owned_provenance: ?OwnedProvenance,
 
-    fn init(allocator: std.mem.Allocator, server: *Server, identity_value: u64) !Client {
+    /// Consumes owned_provenance on every return path.
+    fn init(
+        allocator: std.mem.Allocator,
+        server: *Server,
+        identity_value: u64,
+        owned_provenance: ?OwnedProvenance,
+    ) !Client {
         var client: Client = .{
             .allocator = allocator,
             .server = server,
             .identity_value = identity_value,
             .connection = wayring.Connection.init(allocator, .server, wayring.default_max_frame_size),
+            .owned_provenance = owned_provenance,
         };
+        errdefer if (client.owned_provenance) |owned|
+            owned.destroy(owned.data);
+        errdefer client.resources.deinit(allocator);
         errdefer client.connection.deinit();
         try client.resources.ensureUnusedCapacity(allocator, 1);
         const generation = try core.bootstrapDisplay(&client.connection);
@@ -127,6 +146,8 @@ pub const Client = struct {
         self.retired_ids.deinit(self.allocator);
         self.registries.deinit(self.allocator);
         self.resources.deinit(self.allocator);
+        if (self.owned_provenance) |owned|
+            owned.destroy(owned.data);
         self.connection.deinit();
         self.* = undefined;
     }
@@ -145,6 +166,12 @@ pub const Client = struct {
     /// Unique for this client's lifetime and never reused by its server.
     pub fn identity(self: *const Client) u64 {
         return self.identity_value;
+    }
+
+    /// Returns the immutable value for this exact provenance namespace.
+    pub fn provenance(self: *const Client, key: *const anyopaque) ?*const anyopaque {
+        const owned = self.owned_provenance orelse return null;
+        return if (owned.key == key) owned.data else null;
     }
 
     /// Feeds one transport receive and dispatches every complete request.
@@ -416,6 +443,18 @@ pub fn deinit(self: *Server) void {
 
 /// Allocates a stable client address suitable for completion callback context.
 pub fn createClient(self: *Server) !*Client {
+    return self.createClientWithProvenance(null);
+}
+
+/// Allocates a stable client and consumes owned_provenance on every return
+/// path. Provenance is installed before the client can be observed by policy.
+pub fn createClientWithProvenance(
+    self: *Server,
+    owned_provenance: ?OwnedProvenance,
+) !*Client {
+    var provenance_owner = owned_provenance;
+    errdefer if (provenance_owner) |provenance|
+        provenance.destroy(provenance.data);
     const identity_value = self.next_client_identity;
     self.next_client_identity = std.math.add(
         u64,
@@ -424,7 +463,14 @@ pub fn createClient(self: *Server) !*Client {
     ) catch return error.ClientIdentityExhausted;
     const client = try self.allocator.create(Client);
     errdefer self.allocator.destroy(client);
-    client.* = try Client.init(self.allocator, self, identity_value);
+    const transferred_provenance = provenance_owner;
+    provenance_owner = null;
+    client.* = try Client.init(
+        self.allocator,
+        self,
+        identity_value,
+        transferred_provenance,
+    );
     errdefer client.deinit();
     try self.clients.append(self.allocator, client);
     return client;
@@ -619,6 +665,46 @@ const test_factory: wayring.Interface = .{
     .version = 2,
     .requests = &test_factory_requests,
 };
+
+var test_provenance_key: u8 = 0;
+var test_other_provenance_key: u8 = 0;
+
+const TestProvenance = struct {
+    allocator: std.mem.Allocator,
+    destroyed: *bool,
+    sandbox_engine: ?[]const u8 = null,
+    app_id: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+
+    fn destroy(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.destroyed.* = true;
+        self.allocator.destroy(self);
+    }
+};
+
+const TestProvenanceResource = struct {
+    saw_provenance_before_destroy: bool = false,
+
+    fn destroy(
+        context: *anyopaque,
+        client: *Client,
+        _: wayring.ObjectHandle,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const raw = client.provenance(&test_provenance_key) orelse return;
+        const provenance: *const TestProvenance = @ptrCast(@alignCast(raw));
+        self.saw_provenance_before_destroy =
+            !provenance.destroyed.* and
+            provenance.sandbox_engine == null and
+            provenance.app_id == null and
+            provenance.instance_id == null;
+    }
+};
+
+fn unprovenancedFilter(context: *anyopaque, client: *const Client) bool {
+    return client.provenance(context) == null;
+}
 
 const TestContext = struct {
     factory_dispatches: usize = 0,
@@ -821,6 +907,78 @@ test "global filters gate advertisement and bind" {
     );
     try std.testing.expectError(error.ProtocolError, denied_peer.transferToServer(denied));
     try std.testing.expectEqual(ClientState.protocol_error, denied.state);
+}
+
+test "owned client provenance is immutable and available through resource teardown" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var context: TestContext = .{};
+    const ordinary = try server.createClient();
+    defer server.destroyClient(ordinary) catch unreachable;
+    var provenance_destroyed = false;
+    const provenance = try std.testing.allocator.create(TestProvenance);
+    provenance.* = .{
+        .allocator = std.testing.allocator,
+        .destroyed = &provenance_destroyed,
+    };
+    const contextual = try server.createClientWithProvenance(.{
+        .key = &test_provenance_key,
+        .data = provenance,
+        .destroy = TestProvenance.destroy,
+    });
+    var resource_capture: TestProvenanceResource = .{};
+    _ = try contextual.createResource(4, &test_child, 1, .{
+        .context = &resource_capture,
+        .destroy = TestProvenanceResource.destroy,
+    });
+    try std.testing.expect(ordinary.provenance(&test_provenance_key) == null);
+    try std.testing.expect(contextual.provenance(&test_other_provenance_key) == null);
+    const stored: *const TestProvenance = @ptrCast(@alignCast(
+        contextual.provenance(&test_provenance_key).?,
+    ));
+    try std.testing.expect(stored.sandbox_engine == null);
+
+    const global_name = try server.createGlobal(&test_factory, 1, .{
+        .context = &context,
+        .bind = TestContext.bind,
+        .filter_context = &test_provenance_key,
+        .filter = unprovenancedFilter,
+    });
+    var ordinary_peer = try TestPeer.init(std.testing.allocator);
+    defer ordinary_peer.deinit();
+    var contextual_peer = try TestPeer.init(std.testing.allocator);
+    defer contextual_peer.deinit();
+    try ordinary_peer.getRegistry();
+    try contextual_peer.getRegistry();
+    try ordinary_peer.transferToServer(ordinary);
+    try contextual_peer.transferToServer(contextual);
+    try ordinary_peer.transferFromServer(ordinary);
+    try contextual_peer.transferFromServer(contextual);
+    var advertised = ordinary_peer.connection.popMessage() orelse
+        return error.MissingGlobal;
+    defer advertised.deinit();
+    try std.testing.expectEqual(
+        global_name,
+        (try core.decodeRegistryEvent(&advertised, 2)).global.name,
+    );
+    try std.testing.expect(contextual_peer.connection.popMessage() == null);
+
+    _ = try core.bind(
+        &contextual_peer.connection,
+        contextual_peer.registry.?.id,
+        global_name,
+        test_factory.name,
+        1,
+        3,
+        &test_factory,
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        contextual_peer.transferToServer(contextual),
+    );
+    try server.destroyClient(contextual);
+    try std.testing.expect(resource_capture.saw_provenance_before_destroy);
+    try std.testing.expect(provenance_destroyed);
 }
 
 test "sync retires callback IDs until delete-id output drains" {
