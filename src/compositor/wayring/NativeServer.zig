@@ -49,6 +49,7 @@ const XdgDecorationGlobal = @import("XdgDecorationGlobal.zig");
 const XdgDialogGlobal = @import("XdgDialogGlobal.zig");
 const GtkShellGlobal = @import("GtkShellGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
+const ForeignToplevelListGlobal = @import("ForeignToplevelListGlobal.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
 const XdgToplevelIconGlobal = @import("XdgToplevelIconGlobal.zig");
 const XdgToplevelTagGlobal = @import("XdgToplevelTagGlobal.zig");
@@ -120,6 +121,7 @@ xdg_decoration_global: XdgDecorationGlobal,
 xdg_dialog_global: XdgDialogGlobal,
 gtk_shell_global: GtkShellGlobal,
 xdg_shell: XdgShell,
+foreign_toplevel_list_global: ForeignToplevelListGlobal,
 xdg_system_bell_global: XdgSystemBellGlobal,
 xdg_toplevel_icon_global: XdgToplevelIconGlobal,
 xdg_toplevel_tag_global: XdgToplevelTagGlobal,
@@ -462,6 +464,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .output_bounds = xdgOutputBounds,
     });
     errdefer self.xdg_shell.deinit();
+    try self.foreign_toplevel_list_global.init(allocator, &self.server, &self.xdg_shell, &self.security_context_global);
+    errdefer self.foreign_toplevel_list_global.deinit();
     try self.gtk_shell_global.init(
         allocator,
         &self.server,
@@ -933,6 +937,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_toplevel_icon_global.deinit();
     self.xdg_toplevel_tag_global.deinit();
     self.gtk_shell_global.deinit();
+    self.foreign_toplevel_list_global.deinit();
     self.xdg_shell.deinit();
     self.subcompositor_global.deinit();
     self.surface_tree.deinit();
@@ -2807,7 +2812,9 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
             update.active = false;
             self.xdg_shell.deactivateFailedBuffer(commit.surface);
         }
+        const current = update.isCurrent();
         update.apply();
+        if (current) try self.xdg_shell.applied(commit.surface, update.active);
         has_direct_update = true;
     };
     try self.refreshInputFocus(inputTime(self));

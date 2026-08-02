@@ -20,6 +20,9 @@ global_name: u32,
 tree: *SurfaceTree,
 geometry_provider: GeometryProvider,
 toplevel_configure_handler: ?ToplevelConfigureHandler = null,
+toplevel_observer: ?ToplevelObserver = null,
+toplevels: std.ArrayList(*Toplevel) = .empty,
+next_toplevel_id: u64 = 1,
 popups: std.ArrayList(*Popup) = .empty,
 next_popup_order: u64 = 1,
 
@@ -32,6 +35,17 @@ pub const GeometryProvider = struct {
 pub const ToplevelConfigureHandler = struct {
     context: *anyopaque,
     configure: *const fn (*anyopaque, *CompositorGlobal.Surface) anyerror!void,
+};
+
+/// Identifies one live XDG toplevel role and is never reused by this shell.
+pub const ToplevelId = enum(u64) { _ };
+pub const ToplevelInfo = struct { title: ?[]const u8, app_id: ?[]const u8, published: bool };
+pub const ToplevelMetadataField = enum { title, app_id };
+pub const ToplevelObserver = struct {
+    context: *anyopaque,
+    published: *const fn (*anyopaque, ToplevelId) anyerror!void,
+    unpublished: *const fn (*anyopaque, ToplevelId) void,
+    metadata_changed: *const fn (*anyopaque, ToplevelId, ToplevelMetadataField) void,
 };
 
 pub const CommitResult = struct {
@@ -109,6 +123,8 @@ const Toplevel = struct {
     allocator: std.mem.Allocator,
     xdg_surface: *XdgSurface,
     resource: wayring.ObjectHandle,
+    id: ToplevelId,
+    published: bool = false,
     title: ?[]u8 = null,
     app_id: ?[]u8 = null,
     tag: ?[]u8 = null,
@@ -127,6 +143,10 @@ const Toplevel = struct {
     maximum_height: i32 = 0,
 
     fn deinit(self: *Toplevel) void {
+        const owner = self.xdg_surface.binding.owner;
+        owner.unpublish(self);
+        const index = std.mem.indexOfScalar(*Toplevel, owner.toplevels.items, self) orelse unreachable;
+        _ = owner.toplevels.swapRemove(index);
         if (self.title) |title| self.allocator.free(title);
         if (self.app_id) |app_id| self.allocator.free(app_id);
         if (self.tag) |tag| self.allocator.free(tag);
@@ -284,10 +304,60 @@ pub fn init(
 
 pub fn deinit(self: *XdgShell) void {
     std.debug.assert(self.toplevel_configure_handler == null);
+    std.debug.assert(self.toplevel_observer == null and self.toplevels.items.len == 0);
     self.server.removeGlobal(self.global_name) catch unreachable;
     std.debug.assert(self.popups.items.len == 0);
     self.popups.deinit(self.allocator);
+    self.toplevels.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Installs one borrowed observer for applied visibility and metadata changes.
+/// It must be cleared before its context is destroyed.
+pub fn setToplevelObserver(self: *XdgShell, observer: ToplevelObserver) void {
+    std.debug.assert(self.toplevel_observer == null);
+    self.toplevel_observer = observer;
+}
+
+pub fn clearToplevelObserver(self: *XdgShell, context: *anyopaque) void {
+    std.debug.assert(self.toplevel_observer.?.context == context);
+    self.toplevel_observer = null;
+}
+
+/// Returns a borrowed view while the toplevel role and this shell remain live.
+pub fn toplevelInfo(self: *const XdgShell, id: ToplevelId) ?ToplevelInfo {
+    for (self.toplevels.items) |toplevel| if (toplevel.id == id) return .{
+        .title = toplevel.title,
+        .app_id = toplevel.app_id,
+        .published = toplevel.published,
+    };
+    return null;
+}
+
+/// Publishes the effective visibility only after its retained-tree update has
+/// applied. Failed publication leaves the toplevel unpublished.
+pub fn applied(self: *XdgShell, surface: *CompositorGlobal.Surface, active: bool) !void {
+    if (surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return;
+    const xdg_surface: *XdgSurface = @ptrCast(@alignCast(surface.role_context orelse return));
+    if (xdg_surface.binding.owner != self or xdg_surface.role != .toplevel) return;
+    const toplevel = xdg_surface.role.toplevel;
+    if (active == toplevel.published) return;
+    if (active) {
+        toplevel.published = true;
+        errdefer toplevel.published = false;
+        if (self.toplevel_observer) |observer|
+            try observer.published(observer.context, toplevel.id);
+    } else {
+        toplevel.published = false;
+        if (self.toplevel_observer) |observer|
+            observer.unpublished(observer.context, toplevel.id);
+    }
+}
+
+fn unpublish(self: *XdgShell, toplevel: *Toplevel) void {
+    if (!toplevel.published) return;
+    toplevel.published = false;
+    if (self.toplevel_observer) |observer| observer.unpublished(observer.context, toplevel.id);
 }
 
 /// Installs the one borrowed observer for supplemental toplevel configure
@@ -1210,7 +1280,12 @@ fn dispatchXdgSurface(
                 .allocator = xdg_surface.allocator,
                 .xdg_surface = xdg_surface,
                 .resource = undefined,
+                .id = @enumFromInt(xdg_surface.binding.owner.next_toplevel_id),
             };
+            xdg_surface.binding.owner.next_toplevel_id = std.math.add(u64, xdg_surface.binding.owner.next_toplevel_id, 1) catch
+                return client.postNoMemory();
+            xdg_surface.binding.owner.toplevels.append(xdg_surface.allocator, toplevel) catch return client.postNoMemory();
+            errdefer _ = xdg_surface.binding.owner.toplevels.pop();
             const version = @min(
                 try client.resourceVersion(resource, &generated.xdg_surface),
                 generated.xdg_toplevel.version,
@@ -1283,6 +1358,8 @@ fn destroyXdgSurface(
 fn surfaceDestroyed(context: *anyopaque) void {
     const xdg_surface: *XdgSurface = @ptrCast(@alignCast(context));
     xdg_surface.surface_alive = false;
+    if (xdg_surface.role == .toplevel)
+        xdg_surface.binding.owner.unpublish(xdg_surface.role.toplevel);
     dismissChildren(xdg_surface.binding.owner, xdg_surface);
     if (xdg_surface.role == .popup) dismissPopup(xdg_surface.role.popup);
     if (!xdg_surface.resource_alive) return;
@@ -1310,12 +1387,14 @@ fn dispatchToplevel(
             toplevel,
             &toplevel.title,
             request.title,
+            .title,
             client,
         ),
         .set_app_id => |request| try replaceText(
             toplevel,
             &toplevel.app_id,
             request.app_id,
+            .app_id,
             client,
         ),
         .set_max_size => |request| {
@@ -1353,11 +1432,14 @@ fn replaceText(
     toplevel: *Toplevel,
     destination: *?[]u8,
     source: []const u8,
+    field: ToplevelMetadataField,
     client: *Server.Client,
 ) !void {
     const copy = toplevel.allocator.dupe(u8, source) catch return client.postNoMemory();
     if (destination.*) |previous| toplevel.allocator.free(previous);
     destination.* = copy;
+    if (toplevel.xdg_surface.binding.owner.toplevel_observer) |observer|
+        observer.metadata_changed(observer.context, toplevel.id, field);
 }
 
 fn destroyToplevel(

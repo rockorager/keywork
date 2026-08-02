@@ -74,8 +74,12 @@ pub const DirectUpdate = struct {
     position: Position,
     active: bool,
 
+    pub fn isCurrent(self: DirectUpdate) bool {
+        return self.node.parent == self.parent and self.node.link_serial == self.link_serial;
+    }
+
     pub fn apply(self: DirectUpdate) void {
-        if (self.node.parent != self.parent or self.node.link_serial != self.link_serial) return;
+        if (!self.isCurrent()) return;
         if (self.parent) |parent| {
             if (std.mem.indexOfScalar(*Node, parent.current_children.items, self.node) == null)
                 parent.current_children.appendAssumeCapacity(self.node);
@@ -395,12 +399,15 @@ test "direct updates reserve shared capacity and reject stale hierarchy generati
 
     const first_update = try tree.captureDirect(&first, .{ .x = 2, .y = 3 }, true);
     const second_update = try tree.captureDirect(&second, .{ .x = 5, .y = 7 }, true);
+    try std.testing.expect(first_update.isCurrent());
+    try std.testing.expect(second_update.isCurrent());
     first_update.apply();
     second_update.apply();
     try std.testing.expectEqualSlices(*Node, &.{ &first, &second }, parent.current_children.items);
 
     const stale = try tree.captureDirect(&first, .{ .x = 17, .y = 19 }, false);
     tree.deactivateNow(&first);
+    try std.testing.expect(!stale.isCurrent());
     stale.apply();
     try std.testing.expectEqual(Position{ .x = 2, .y = 3 }, first.current_position);
     try std.testing.expect(!first.current_active);
