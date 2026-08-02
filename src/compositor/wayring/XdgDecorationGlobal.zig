@@ -420,6 +420,71 @@ test "decorations configure client side and survive manager and toplevel lifetim
     );
     try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
     try generated.wl_surface_types.requests.commit(&peer, surface);
+    try generated.zxdg_toplevel_decoration_v1_types.requests.set_mode(
+        &peer,
+        decoration,
+        @intFromEnum(generated.zxdg_toplevel_decoration_v1_types.mode.server_side),
+    );
+    try transferToServer(&peer, client);
+    var coalesced_unmap = compositor.popTransaction() orelse return error.MissingCommit;
+    defer coalesced_unmap.deinit();
+    _ = try shell.handleCommit(&coalesced_unmap.entries[0]);
+    try std.testing.expectEqual(
+        XdgShell.ToplevelDecorationState{
+            .preference = .prefers_ssd,
+            .configure_sent = true,
+        },
+        try shell.toplevelDecorationState(client, toplevel_handle),
+    );
+    try transferFromServer(&peer, client);
+    const coalesced_serial = try expectConfigureSequence(
+        &peer,
+        decoration,
+        toplevel,
+        xdg_surface,
+    );
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        xdg_surface,
+        coalesced_serial,
+    );
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(Server.ClientState.active, client.state);
+
+    try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try generated.zxdg_toplevel_decoration_v1_types.requests.unset_mode(
+        &peer,
+        decoration,
+    );
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    const preapplied_serial = try expectConfigureSequence(
+        &peer,
+        decoration,
+        toplevel,
+        xdg_surface,
+    );
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        xdg_surface,
+        preapplied_serial,
+    );
+    try transferToServer(&peer, client);
+    var delayed_unmap = compositor.popTransaction() orelse return error.MissingCommit;
+    defer delayed_unmap.deinit();
+    _ = try shell.handleCommit(&delayed_unmap.entries[0]);
+    try std.testing.expectEqual(
+        XdgShell.ToplevelDecorationState{
+            .preference = .no_preference,
+            .configure_sent = true,
+        },
+        try shell.toplevelDecorationState(client, toplevel_handle),
+    );
+    try std.testing.expectEqual(Server.ClientState.active, client.state);
+
+    try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToServer(&peer, client);
     var unmap = compositor.popTransaction() orelse return error.MissingCommit;
     defer unmap.deinit();
@@ -465,6 +530,8 @@ test "decorations configure client side and survive manager and toplevel lifetim
             &generated.zxdg_decoration_manager_v1,
         ),
     };
+    try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
     try generated.zxdg_toplevel_decoration_v1_types.requests.destroy(
         &peer,
         decoration,
@@ -472,6 +539,9 @@ test "decorations configure client side and survive manager and toplevel lifetim
     const replacement = try generated.zxdg_decoration_manager_v1_types.requests
         .get_toplevel_decoration(&peer, replacement_manager, toplevel);
     try transferToServer(&peer, client);
+    var late_creation_unmap = compositor.popTransaction() orelse return error.MissingCommit;
+    defer late_creation_unmap.deinit();
+    _ = try shell.handleCommit(&late_creation_unmap.entries[0]);
     try std.testing.expectEqual(
         XdgShell.ToplevelDecorationState{
             .preference = .no_preference,
