@@ -64,6 +64,7 @@ const Offer = struct {
     device: ?*Device,
     source: ?*Source,
     generation: u64,
+    valid: bool = true,
 };
 
 pub fn init(
@@ -340,7 +341,7 @@ fn setSelection(
     if (self.selection_serial) |current| {
         if (serialIsOlder(serial, current)) return;
     }
-    if (self.selection == source) {
+    if (self.selection == source and self.external_selection == null) {
         self.selection_serial = serial;
         return;
     }
@@ -468,6 +469,7 @@ fn receiveOffer(
     defer if (fd_owned) {
         _ = linux.close(fd);
     };
+    if (!offer.valid or offer.device == null) return;
     if (offer.generation != offer.owner.selection_generation) return;
     if (!offer.owner.hasCurrentMime(mime_type)) return;
     offer.owner.sendSelection(mime_type, fd) catch return;
@@ -570,7 +572,9 @@ fn queueSelectionToDevice(
 
 fn sourceDestroyed(self: *PrimarySelectionGlobal, source: *Source) void {
     for (self.offers.items) |offer| {
-        if (offer.source == source) offer.source = null;
+        if (offer.source != source) continue;
+        offer.source = null;
+        offer.valid = false;
     }
     if (self.selection == source) self.replaceSelection(
         null,
@@ -585,11 +589,15 @@ fn deviceDestroyed(self: *PrimarySelectionGlobal, device: *Device) void {
         if (offer.device != device) continue;
         offer.device = null;
         offer.source = null;
+        offer.valid = false;
     }
 }
 
 fn invalidateOffers(self: *PrimarySelectionGlobal) void {
-    for (self.offers.items) |offer| offer.source = null;
+    for (self.offers.items) |offer| {
+        offer.source = null;
+        offer.valid = false;
+    }
 }
 
 fn destroySource(
@@ -1112,6 +1120,46 @@ test "native primary selection follows focus and relays transfer FDs" {
     if (linux.errno(received_len) != .SUCCESS) return error.ReadFailed;
     try std.testing.expectEqualStrings(payload, received[0..received_len]);
 
+    // Losing focus invalidates the old offer without changing the selection
+    // generation. Receiving through it must close the FD without relaying.
+    try primary_selection.setKeyboardFocus(null);
+    try receiver.fromServer(receiver_client);
+    try expectNullSelection(&receiver, receiver_device);
+    var invalidated_pipe: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(
+        &invalidated_pipe,
+        .{ .CLOEXEC = true },
+    )) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(invalidated_pipe[0]);
+    var invalidated_write_owned = true;
+    defer if (invalidated_write_owned) {
+        _ = linux.close(invalidated_pipe[1]);
+    };
+    try generated.zwp_primary_selection_offer_v1_types.requests.receive(
+        &receiver.connection,
+        first_offer,
+        "text/plain",
+        invalidated_pipe[1],
+    );
+    invalidated_write_owned = false;
+    try receiver.toServer(receiver_client);
+    try sender.fromServer(sender_client);
+    try std.testing.expect(sender.connection.popMessage() == null);
+    const invalidated_len = linux.read(
+        invalidated_pipe[0],
+        &received,
+        received.len,
+    );
+    if (linux.errno(invalidated_len) != .SUCCESS) return error.ReadFailed;
+    try std.testing.expectEqual(@as(usize, 0), invalidated_len);
+    try primary_selection.setKeyboardFocus(receiver_client);
+    try receiver.fromServer(receiver_client);
+    _ = try receiveSelectionOffer(
+        &receiver,
+        receiver_device,
+        &.{ "text/plain", "text/html" },
+    );
+
     const source_two = try generated.zwp_primary_selection_device_manager_v1_types.requests.create_source(
         &sender.connection,
         sender_globals.manager,
@@ -1225,4 +1273,41 @@ test "native primary selection follows focus and relays transfer FDs" {
     try primary_selection.setKeyboardFocus(null);
     try sender.fromServer(sender_client);
     try expectNullSelection(&sender, sender_device);
+
+    const External = struct {
+        cancellations: usize = 0,
+
+        fn mimeTypes(_: *anyopaque) []const []const u8 {
+            return &.{};
+        }
+
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) !void {
+            return error.UnexpectedTransfer;
+        }
+
+        fn cancel(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.cancellations += 1;
+        }
+    };
+    var external_context: External = .{};
+    var external: SelectionSource = .{
+        .context = &external_context,
+        .mime_types = External.mimeTypes,
+        .send = External.send,
+        .cancel = External.cancel,
+    };
+    primary_selection.setExternalSelection(&external);
+    const external_generation = primary_selection.selection_generation;
+    try primary_selection.setSelection(
+        null,
+        primary_selection.selection_serial.? +% 1,
+        sender_client,
+    );
+    try std.testing.expect(primary_selection.external_selection == null);
+    try std.testing.expectEqual(
+        external_generation +% 1,
+        primary_selection.selection_generation,
+    );
+    try std.testing.expectEqual(@as(usize, 1), external_context.cancellations);
 }
