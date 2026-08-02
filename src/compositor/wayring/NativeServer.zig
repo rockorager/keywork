@@ -39,6 +39,7 @@ const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
 const ViewporterGlobal = @import("ViewporterGlobal.zig");
+const XdgDecorationGlobal = @import("XdgDecorationGlobal.zig");
 const XdgDialogGlobal = @import("XdgDialogGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
@@ -101,6 +102,7 @@ data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
 fractional_scale_global: FractionalScaleGlobal,
 viewporter_global: ViewporterGlobal,
+xdg_decoration_global: XdgDecorationGlobal,
 xdg_dialog_global: XdgDialogGlobal,
 xdg_shell: XdgShell,
 xdg_system_bell_global: XdgSystemBellGlobal,
@@ -451,6 +453,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.xdg_toplevel_icon_global.deinit();
     try self.xdg_dialog_global.init(allocator, &self.server, &self.xdg_shell);
     errdefer self.xdg_dialog_global.deinit();
+    try self.xdg_decoration_global.init(allocator, &self.server, &self.xdg_shell);
+    errdefer self.xdg_decoration_global.deinit();
     try self.xdg_system_bell_global.init(&self.server);
     errdefer self.xdg_system_bell_global.deinit();
     try self.linux_dmabuf_global.init(allocator, &self.server, self.renderer.dmabufSourceFormats(), self.renderer.dmabufSourceValidator());
@@ -849,6 +853,7 @@ pub fn destroy(self: *NativeServer) void {
     self.xdg_output_global.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
+    self.xdg_decoration_global.deinit();
     self.xdg_dialog_global.deinit();
     self.xdg_toplevel_icon_global.deinit();
     self.xdg_toplevel_tag_global.deinit();

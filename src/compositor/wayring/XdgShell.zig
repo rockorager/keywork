@@ -108,6 +108,9 @@ const Toplevel = struct {
     pending_icon_changed: bool = false,
     dialog_handler: ?ToplevelDialogHandler = null,
     modal: bool = false,
+    decoration_handler: ?ToplevelDecorationHandler = null,
+    decoration_preference: DecorationPreference = .only_csd,
+    decoration_configure_sent: bool = false,
     minimum_width: i32 = 0,
     minimum_height: i32 = 0,
     maximum_width: i32 = 0,
@@ -123,6 +126,12 @@ const Toplevel = struct {
         if (self.dialog_handler) |handler| {
             self.dialog_handler = null;
             self.modal = false;
+            handler.toplevel_destroyed(handler.context);
+        }
+        if (self.decoration_handler) |handler| {
+            self.decoration_handler = null;
+            self.decoration_preference = .only_csd;
+            self.decoration_configure_sent = false;
             handler.toplevel_destroyed(handler.context);
         }
         self.xdg_surface.unreference();
@@ -160,6 +169,25 @@ pub const ToplevelDialogHandler = struct {
 pub const ToplevelDialogState = struct {
     dialog: bool,
     modal: bool,
+};
+
+pub const DecorationPreference = enum {
+    only_csd,
+    prefers_csd,
+    prefers_ssd,
+    no_preference,
+};
+
+pub const ToplevelDecorationHandler = struct {
+    context: *anyopaque,
+    resource: wayring.ObjectHandle,
+    version: u32,
+    toplevel_destroyed: *const fn (*anyopaque) void,
+};
+
+pub const ToplevelDecorationState = struct {
+    preference: DecorationPreference,
+    configure_sent: bool,
 };
 
 const ToplevelIconCommit = struct {
@@ -360,6 +388,90 @@ pub fn toplevelDialogState(
     return .{ .dialog = toplevel.dialog_handler != null, .modal = toplevel.modal };
 }
 
+/// Attaches one decoration object. The handler remains borrowed until detach,
+/// or receives exactly one destruction callback if the toplevel dies first.
+pub fn attachToplevelDecoration(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    handler: ToplevelDecorationHandler,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    if (toplevel.decoration_handler != null) return error.AlreadyExists;
+    if (handler.version == 1 and toplevelHasBuffer(toplevel))
+        return error.BufferAttached;
+    toplevel.decoration_handler = handler;
+    toplevel.decoration_preference = .no_preference;
+    toplevel.decoration_configure_sent = false;
+}
+
+pub fn configureToplevelDecoration(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    context: *anyopaque,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    const handler = toplevel.decoration_handler orelse return error.DecorationMissing;
+    if (handler.context != context) return error.WrongDecoration;
+    if (toplevel.xdg_surface.initial_configure_sent)
+        try sendToplevelConfigure(toplevel.xdg_surface, false);
+}
+
+pub fn setToplevelDecorationPreference(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    context: *anyopaque,
+    preference: DecorationPreference,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    const handler = toplevel.decoration_handler orelse return error.DecorationMissing;
+    if (handler.context != context) return error.WrongDecoration;
+    toplevel.decoration_preference = preference;
+    if (toplevel.xdg_surface.initial_configure_sent)
+        try sendToplevelConfigure(toplevel.xdg_surface, false);
+}
+
+/// Detaches the matching decoration and restores implicit client-side policy.
+pub fn detachToplevelDecoration(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    context: *anyopaque,
+) !void {
+    const toplevel = try self.toplevelFor(client, handle);
+    const handler = toplevel.decoration_handler orelse return error.DecorationMissing;
+    if (handler.context != context) return error.WrongDecoration;
+    toplevel.decoration_handler = null;
+    toplevel.decoration_preference = .only_csd;
+    toplevel.decoration_configure_sent = false;
+}
+
+pub fn toplevelDecorationState(
+    self: *XdgShell,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+) !ToplevelDecorationState {
+    const toplevel = try self.toplevelFor(client, handle);
+    return .{
+        .preference = toplevel.decoration_preference,
+        .configure_sent = toplevel.decoration_configure_sent,
+    };
+}
+
+fn toplevelHasBuffer(toplevel: *const Toplevel) bool {
+    if (toplevel.xdg_surface.mapped or
+        toplevel.xdg_surface.surface.current_buffer_format != null)
+    {
+        return true;
+    }
+    return switch (toplevel.xdg_surface.surface.pending_attachment) {
+        .buffer => true,
+        .unchanged, .removed => false,
+    };
+}
+
 fn toplevelFor(
     self: *XdgShell,
     client: *const Server.Client,
@@ -399,6 +511,21 @@ pub fn handleCommit(self: *XdgShell, commit: *CompositorGlobal.Commit) !CommitRe
     if (xdg_surface.pending_geometry) |geometry| {
         xdg_surface.current_geometry = geometry;
         xdg_surface.pending_geometry = null;
+    }
+    if (xdg_surface.role == .toplevel and commit.attachment == .buffer) {
+        const toplevel = xdg_surface.role.toplevel;
+        if (toplevel.decoration_handler) |handler| {
+            if (handler.version == 1 and !toplevel.decoration_configure_sent) {
+                try xdg_surface.surface.client.postError(
+                    handler.resource,
+                    @intFromEnum(
+                        generated.zxdg_toplevel_decoration_v1_types.@"error".unconfigured_buffer,
+                    ),
+                    "buffer committed before the initial decoration configure",
+                );
+                return .{};
+            }
+        }
     }
     if (!xdg_surface.initial_configure_sent) {
         if (commit.attachment == .buffer) {
@@ -512,6 +639,8 @@ fn resetConfigureState(xdg_surface: *XdgSurface) void {
     xdg_surface.configures.clearRetainingCapacity();
     xdg_surface.initial_configure_sent = false;
     xdg_surface.configured = false;
+    if (xdg_surface.role == .toplevel)
+        xdg_surface.role.toplevel.decoration_configure_sent = false;
 }
 
 fn commitToplevelIcon(
@@ -1172,21 +1301,7 @@ fn destroyToplevel(
 fn sendInitialConfigure(xdg_surface: *XdgSurface) !void {
     const client = xdg_surface.surface.client;
     switch (xdg_surface.role) {
-        .toplevel => |toplevel| {
-            xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch
-                return client.postNoMemory();
-            const version = try client.resourceVersion(toplevel.resource, &generated.xdg_toplevel);
-            if (version >= 5) generated.xdg_toplevel_types.events.wm_capabilities(&client.connection, toplevel.resource, &.{}) catch return client.postNoMemory();
-            generated.xdg_toplevel_types.events.configure(&client.connection, toplevel.resource, 0, 0, &.{}) catch return client.postNoMemory();
-            const serial = xdg_surface.surface.owner.server.nextSerial();
-            generated.xdg_surface_types.events.configure(
-                &client.connection,
-                xdg_surface.resource,
-                serial,
-            ) catch return client.postNoMemory();
-            xdg_surface.configures.appendAssumeCapacity(.{ .serial = serial });
-            xdg_surface.initial_configure_sent = true;
-        },
+        .toplevel => try sendToplevelConfigure(xdg_surface, true),
         .popup => |popup| {
             if (!parentMapped(popup)) return invalidPopupParent(xdg_surface, "xdg_popup parent is not mapped");
             sendPopupConfigure(popup, popup.rules, null) catch |err| switch (err) {
@@ -1198,6 +1313,49 @@ fn sendInitialConfigure(xdg_surface: *XdgSurface) !void {
         },
         .none => unreachable,
     }
+}
+
+fn sendToplevelConfigure(xdg_surface: *XdgSurface, initial: bool) !void {
+    const toplevel = switch (xdg_surface.role) {
+        .toplevel => |value| value,
+        .none, .popup => unreachable,
+    };
+    const client = xdg_surface.surface.client;
+    xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch
+        return client.postNoMemory();
+    if (initial) {
+        const version = try client.resourceVersion(toplevel.resource, &generated.xdg_toplevel);
+        if (version >= 5) generated.xdg_toplevel_types.events.wm_capabilities(
+            &client.connection,
+            toplevel.resource,
+            &.{},
+        ) catch return client.postNoMemory();
+    }
+    if (toplevel.decoration_handler) |handler| {
+        generated.zxdg_toplevel_decoration_v1_types.events.configure(
+            &client.connection,
+            handler.resource,
+            @intFromEnum(
+                generated.zxdg_toplevel_decoration_v1_types.mode.client_side,
+            ),
+        ) catch return client.postNoMemory();
+        toplevel.decoration_configure_sent = true;
+    }
+    generated.xdg_toplevel_types.events.configure(
+        &client.connection,
+        toplevel.resource,
+        0,
+        0,
+        &.{},
+    ) catch return client.postNoMemory();
+    const serial = xdg_surface.surface.owner.server.nextSerial();
+    generated.xdg_surface_types.events.configure(
+        &client.connection,
+        xdg_surface.resource,
+        serial,
+    ) catch return client.postNoMemory();
+    xdg_surface.configures.appendAssumeCapacity(.{ .serial = serial });
+    if (initial) xdg_surface.initial_configure_sent = true;
 }
 
 const TestGeometryProvider = struct {
