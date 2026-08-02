@@ -1205,11 +1205,11 @@ fn virtualKeyboardCapabilityChanged(context: *anyopaque) void {
 
 fn virtualPointerCapabilityChanged(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
-    if (!self.pointerRoutingAvailable()) return;
+    if (!self.inputRoutingAvailable()) return;
     self.refreshPointerCapability() catch self.terminate();
 }
 
-fn pointerRoutingAvailable(self: *const NativeServer) bool {
+fn inputRoutingAvailable(self: *const NativeServer) bool {
     if (self.terminating) return false;
     return switch (self.output) {
         .headless => true,
@@ -1330,6 +1330,7 @@ fn nativePointerMotion(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const size = self.output.modeSize();
     self.pointer_physical_x = clampPointerCoordinate(x, size.width);
@@ -1350,6 +1351,7 @@ fn nativePointerRelativeMotion(
     dy_unaccelerated: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     self.relative_pointer_global.motion(
         time_microseconds,
@@ -1375,6 +1377,7 @@ fn pointerWarp(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     const node = self.surface_tree.find(surface) orelse return;
     const position = SurfaceTree.globalPosition(node);
     const logical_x = @as(f64, @floatFromInt(position.x)) + x;
@@ -1399,6 +1402,7 @@ fn nativePointerButton(
     state: NativeInput.ButtonState,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     self.routePointerButton(device_id, time, button, state) catch self.terminate();
 }
@@ -1411,6 +1415,7 @@ fn nativePointerAxis(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
@@ -1424,6 +1429,7 @@ fn nativePointerAxisSource(
     source: NativeInput.AxisSource,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     self.pointer_axis_source = @intFromEnum(source);
 }
@@ -1435,6 +1441,7 @@ fn nativePointerAxisStop(
     axis: NativeInput.Axis,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
@@ -1449,6 +1456,7 @@ fn nativePointerAxisDiscrete(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
@@ -1462,6 +1470,7 @@ fn nativePointerAxisValue120(
     value: i32,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const pending = self.pendingAxis(axis) orelse return;
     pending.active = true;
@@ -1470,6 +1479,7 @@ fn nativePointerAxisValue120(
 
 fn nativePointerFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.flushPointerFrame() catch self.terminate();
 }
 
@@ -1489,6 +1499,7 @@ fn nativeTouchDown(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     self.routeTouchDown(device_id, time, native_id, x, y) catch self.terminate();
 }
@@ -1513,6 +1524,7 @@ fn nativeTouchMotion(
     y: f64,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     self.routeTouchMotion(device_id, time, native_id, x, y) catch self.terminate();
 }
@@ -1673,6 +1685,7 @@ fn nativeTabletToolProximity(
     axes: NativeInput.TabletToolAxes,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const info = self.native_input.tabletToolInfo(tool_id) orelse return;
     const focus = if (in_proximity)
@@ -1698,6 +1711,7 @@ fn nativeTabletToolAxis(
     axes: NativeInput.TabletToolAxes,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
@@ -1713,6 +1727,7 @@ fn nativeTabletToolTip(
     down: bool,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
@@ -1729,6 +1744,7 @@ fn nativeTabletToolButton(
     pressed: bool,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (!self.inputRoutingAvailable()) return;
     self.idle_notify_global.notifyActivity();
     const routed = self.routeTabletAxes(axes);
     const focus = self.tabletAxesFocus(routed) catch return self.terminate();
@@ -1855,7 +1871,7 @@ fn refreshKeyboardCapability(self: *NativeServer) !void {
 }
 
 fn refreshPointerCapability(self: *NativeServer) !void {
-    if (!self.pointerRoutingAvailable()) return;
+    if (!self.inputRoutingAvailable()) return;
     if (!self.seat_global.hasCapability(SeatGlobal.Capability.pointer)) return;
     const moved = try self.refreshPointerFocus(0);
     if (moved) try self.seat_global.pointerFrame();
@@ -1918,7 +1934,7 @@ fn virtualPointerEvent(
     event: VirtualPointerGlobal.Event,
 ) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
-    if (!self.pointerRoutingAvailable()) return;
+    if (!self.inputRoutingAvailable()) return;
     switch (event) {
         .motion => |motion| {
             self.idle_notify_global.notifyActivity();
@@ -2164,6 +2180,7 @@ fn routePointerButtonFromSource(
     button: u32,
     state: NativeInput.ButtonState,
 ) !void {
+    if (!self.inputRoutingAvailable()) return;
     switch (state) {
         .pressed => {
             _ = try self.refreshPointerFocus(time);
@@ -2249,6 +2266,7 @@ fn buttonHeld(self: *const NativeServer, button: u32) bool {
 }
 
 fn refreshPointerFocus(self: *NativeServer, time: u32) !bool {
+    if (!self.inputRoutingAvailable()) return false;
     if (!self.seat_global.hasCapability(SeatGlobal.Capability.pointer)) return false;
     if (self.routed_buttons.items.len != 0) {
         if (self.seat_global.pointerFocus()) |surface| {
@@ -2285,6 +2303,7 @@ fn routeTouchDown(
     physical_x: f64,
     physical_y: f64,
 ) !void {
+    if (!self.inputRoutingAvailable()) return;
     const x = self.physicalToLogical(physical_x);
     const y = self.physicalToLogical(physical_y);
     const hit = (try self.hitTest(x, y)) orelse return;
@@ -2330,6 +2349,7 @@ fn routeTouchMotion(
     physical_x: f64,
     physical_y: f64,
 ) !void {
+    if (!self.inputRoutingAvailable()) return;
     const index = self.touchRouteIndex(device_id, native_id) orelse return;
     const route = self.touch_routes.items[index];
     const local = self.surfaceLocal(
@@ -2371,6 +2391,7 @@ fn allocateTouchId(self: *NativeServer) i32 {
 }
 
 fn hitTestPointer(self: *NativeServer) !?Hit {
+    if (!self.inputRoutingAvailable()) return null;
     return self.hitTest(self.pointerLogicalX(), self.pointerLogicalY());
 }
 
@@ -2523,6 +2544,7 @@ fn tabletAxesFocus(
 }
 
 fn tabletFocus(self: *NativeServer, x: f64, y: f64) !?TabletGlobal.Focus {
+    if (!self.inputRoutingAvailable()) return null;
     const hit = (try self.hitTest(x, y)) orelse return null;
     return .{ .surface = hit.surface, .x = hit.local_x, .y = hit.local_y };
 }
@@ -3886,16 +3908,42 @@ test "native input coordinates respect fractional scale and protocol bounds" {
     try std.testing.expectEqual(std.math.maxInt(i32), fixedFromDouble(1.0e20));
 }
 
-test "virtual pointer callbacks are inert during teardown and after output loss" {
+test "output-dependent input callbacks are inert after output loss" {
+    const invoke = struct {
+        fn callbacks(server: *NativeServer) void {
+            nativePointerMotion(server, 1, 0, 1, 2);
+            nativePointerRelativeMotion(server, 1, 0, 1, 2, 1, 2);
+            nativePointerButton(server, 1, 0, 0x110, .pressed);
+            nativeTouchDown(server, 1, 0, 1, 1, 2);
+            nativeTouchMotion(server, 1, 0, 1, 2, 3);
+            nativeTabletToolProximity(server, 1, 1, 0, 1, 2, true, .{});
+            nativeTabletToolAxis(server, 1, 1, 0, .{ .position = .{ .x = 1, .y = 2 } });
+            nativeTabletToolTip(server, 1, 1, 0, .{ .position = .{ .x = 1, .y = 2 } }, true);
+            nativeTabletToolButton(
+                server,
+                1,
+                1,
+                0,
+                .{ .position = .{ .x = 1, .y = 2 } },
+                1,
+                true,
+            );
+            virtualPointerCapabilityChanged(server);
+            virtualPointerEvent(server, null, 1, .frame);
+        }
+    }.callbacks;
+
     var server: NativeServer = undefined;
     server.terminating = true;
-    virtualPointerCapabilityChanged(&server);
-    virtualPointerEvent(&server, null, 1, .frame);
+    invoke(&server);
 
     server.terminating = false;
     server.output = .{ .drm = null };
-    virtualPointerCapabilityChanged(&server);
-    virtualPointerEvent(&server, null, 1, .frame);
+    invoke(&server);
+    try std.testing.expect(!try server.refreshPointerFocus(0));
+    try server.routeTouchDown(1, 0, 1, 1, 2);
+    try server.routeTouchMotion(1, 0, 1, 2, 3);
+    try std.testing.expect(try server.tabletFocus(1, 2) == null);
 }
 
 test "surface opaque hints clip to offset buffer bounds and translate globally" {
@@ -4091,6 +4139,7 @@ test "native immediate repaint uses the next timer tick" {
     });
     defer native.destroy();
 
+    try std.testing.expect(native.inputRoutingAvailable());
     native.scheduleRepaint(0);
     try std.testing.expect(!native.event_loop.stop_requested);
     try std.testing.expect(native.repaint_timer.heap_index != null);
