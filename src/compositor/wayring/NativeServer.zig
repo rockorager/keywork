@@ -24,6 +24,7 @@ const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const ColorRepresentationGlobal = @import("ColorRepresentationGlobal.zig");
 const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
+const BackgroundEffectGlobal = @import("BackgroundEffectGlobal.zig");
 const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
@@ -88,6 +89,7 @@ presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
 color_representation_global: ColorRepresentationGlobal,
 alpha_modifier_global: AlphaModifierGlobal,
+background_effect_global: BackgroundEffectGlobal,
 tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
@@ -531,6 +533,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.color_representation_global.deinit();
     try self.alpha_modifier_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.alpha_modifier_global.deinit();
+    try self.background_effect_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.background_effect_global.deinit();
     try self.tearing_control_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.tearing_control_global.deinit();
     try self.fifo_global.init(allocator, &self.server, &self.compositor_global);
@@ -855,6 +859,7 @@ pub fn destroy(self: *NativeServer) void {
     self.commit_timing_global.deinit();
     self.fifo_global.deinit();
     self.tearing_control_global.deinit();
+    self.background_effect_global.deinit();
     self.alpha_modifier_global.deinit();
     self.color_representation_global.deinit();
     self.content_type_global.deinit();

@@ -346,6 +346,11 @@ pub const AlphaModifierHandler = struct {
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
+pub const BackgroundEffectHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const TearingControlHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -378,6 +383,7 @@ pub const Surface = struct {
     content_type_handler: ?ContentTypeHandler = null,
     color_representation_handler: ?ColorRepresentationHandler = null,
     alpha_modifier_handler: ?AlphaModifierHandler = null,
+    background_effect_handler: ?BackgroundEffectHandler = null,
     tearing_control_handler: ?TearingControlHandler = null,
     fifo_handler: ?FifoHandler = null,
     commit_timer_handler: ?CommitTimerHandler = null,
@@ -495,6 +501,20 @@ pub const Surface = struct {
         std.debug.assert(handler.context == context);
         self.alpha_modifier_handler = null;
         self.pending_alpha_multiplier = std.math.maxInt(u32);
+    }
+
+    pub fn setBackgroundEffectHandler(
+        self: *Surface,
+        handler: BackgroundEffectHandler,
+    ) !void {
+        if (self.background_effect_handler != null) return error.AlreadyExists;
+        self.background_effect_handler = handler;
+    }
+
+    pub fn clearBackgroundEffectHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.background_effect_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.background_effect_handler = null;
     }
 
     pub fn setTearingControlHandler(self: *Surface, handler: TearingControlHandler) !void {
@@ -1075,6 +1095,10 @@ fn destroySurface(
     if (surface.alpha_modifier_handler) |handler| {
         handler.surface_destroyed(handler.context);
         surface.alpha_modifier_handler = null;
+    }
+    if (surface.background_effect_handler) |handler| {
+        handler.surface_destroyed(handler.context);
+        surface.background_effect_handler = null;
     }
     if (surface.tearing_control_handler) |handler| {
         surface.tearing_control_handler = null;

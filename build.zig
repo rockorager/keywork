@@ -72,6 +72,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/alpha-modifier/alpha-modifier-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-background-effect/ext-background-effect-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/single-pixel-buffer/single-pixel-buffer-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/xdg-system-bell/xdg-system-bell-v1.xml"));
