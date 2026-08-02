@@ -71,6 +71,7 @@ pub const Commit = struct {
     frame_callbacks: []wayring.ObjectHandle,
     presentation_feedbacks: []*PresentationFeedback,
     content_type: ContentType,
+    color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
     presentation_hint: PresentationHint,
     fifo_set: bool,
@@ -272,6 +273,52 @@ pub const ContentTypeHandler = struct {
 
 pub const ContentType = generated.wp_content_type_v1_types.type;
 
+pub const ColorRepresentationState = struct {
+    alpha_mode: ?generated.wp_color_representation_surface_v1_types.alpha_mode = null,
+    coefficients: ?generated.wp_color_representation_surface_v1_types.coefficients = null,
+    range: ?generated.wp_color_representation_surface_v1_types.range = null,
+    chroma_location: ?generated.wp_color_representation_surface_v1_types.chroma_location = null,
+
+    pub fn toRender(
+        self: ColorRepresentationState,
+        format: render.DmabufFormat,
+    ) render.ColorRepresentation {
+        if (format.isPackedRgb()) return .{};
+        const coefficients: render.ColorCoefficients = switch (self.coefficients orelse .bt709) {
+            .identity => .identity,
+            .bt601 => .bt601,
+            .bt709 => .bt709,
+            .bt2020 => .bt2020,
+            else => unreachable,
+        };
+        const range: render.ColorRange = switch (self.range orelse .limited) {
+            .full => .full,
+            .limited => .limited,
+            else => unreachable,
+        };
+        const chroma_location: render.ChromaLocation = switch (self.chroma_location orelse .type_0) {
+            .type_0 => .type_0,
+            .type_1 => .type_1,
+            .type_2 => .type_2,
+            .type_3 => .type_3,
+            .type_4 => .type_4,
+            .type_5 => .type_5,
+            else => unreachable,
+        };
+        return .{
+            .coefficients = coefficients,
+            .range = range,
+            .chroma_location = chroma_location,
+        };
+    }
+};
+
+pub const ColorRepresentationHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+    validate_commit: *const fn (*anyopaque, ColorRepresentationState, ?render.DmabufFormat) bool,
+};
+
 pub const AlphaModifierHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -306,6 +353,7 @@ pub const Surface = struct {
     role_destroyed: ?*const fn (*anyopaque) void = null,
     explicit_sync_handler: ?ExplicitSyncHandler = null,
     content_type_handler: ?ContentTypeHandler = null,
+    color_representation_handler: ?ColorRepresentationHandler = null,
     alpha_modifier_handler: ?AlphaModifierHandler = null,
     tearing_control_handler: ?TearingControlHandler = null,
     fifo_handler: ?FifoHandler = null,
@@ -317,6 +365,9 @@ pub const Surface = struct {
     pending_presentation_feedbacks: std.ArrayList(*PresentationFeedback) = .empty,
     pending_content_type: ContentType = .none,
     current_content_type: ContentType = .none,
+    pending_color_representation: ColorRepresentationState = .{},
+    current_color_representation: ColorRepresentationState = .{},
+    current_buffer_format: ?render.DmabufFormat = null,
     pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
     pending_presentation_hint: PresentationHint = .vsync,
@@ -381,6 +432,21 @@ pub const Surface = struct {
         std.debug.assert(handler.context == context);
         self.content_type_handler = null;
         self.pending_content_type = .none;
+    }
+
+    pub fn setColorRepresentationHandler(
+        self: *Surface,
+        handler: ColorRepresentationHandler,
+    ) !void {
+        if (self.color_representation_handler != null) return error.AlreadyExists;
+        self.color_representation_handler = handler;
+    }
+
+    pub fn clearColorRepresentationHandler(self: *Surface, context: *anyopaque) void {
+        const handler = self.color_representation_handler orelse unreachable;
+        std.debug.assert(handler.context == context);
+        self.color_representation_handler = null;
+        self.pending_color_representation = .{};
     }
 
     pub fn setAlphaModifierHandler(self: *Surface, handler: AlphaModifierHandler) !void {
@@ -791,6 +857,14 @@ fn queueCommit(surface: *Surface) !void {
     if (surface.explicit_sync_handler) |handler| {
         if (!handler.validate_commit(handler.context, attachment_kind)) return;
     }
+    const buffer_format = effectiveBufferFormat(surface);
+    if (surface.color_representation_handler) |handler| {
+        if (!handler.validate_commit(
+            handler.context,
+            surface.pending_color_representation,
+            buffer_format,
+        )) return;
+    }
     const commit = takeCommit(surface, attachment_kind) catch
         return surface.client.postNoMemory();
     if (owner.hierarchy_handler) |handler| {
@@ -861,6 +935,8 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
 
     surface.current_scale = surface.pending_scale;
     surface.current_content_type = surface.pending_content_type;
+    surface.current_color_representation = surface.pending_color_representation;
+    surface.current_buffer_format = effectiveBufferFormat(surface);
     surface.current_alpha_multiplier = surface.pending_alpha_multiplier;
     surface.current_presentation_hint = surface.pending_presentation_hint;
     surface.current_transform = surface.pending_transform;
@@ -892,6 +968,7 @@ fn takeCommit(surface: *Surface, attachment_kind: PendingAttachment) !Commit {
         .frame_callbacks = frame_callbacks,
         .presentation_feedbacks = presentation_feedbacks,
         .content_type = surface.current_content_type,
+        .color_representation = surface.current_color_representation,
         .alpha_multiplier = surface.current_alpha_multiplier,
         .presentation_hint = surface.current_presentation_hint,
         .fifo_set = fifo_set,
@@ -919,6 +996,17 @@ fn pendingAttachment(attachment: Attachment) PendingAttachment {
     };
 }
 
+fn effectiveBufferFormat(surface: *const Surface) ?render.DmabufFormat {
+    return switch (surface.pending_attachment) {
+        .unchanged => surface.current_buffer_format,
+        .removed => null,
+        .buffer => |attachment| switch (attachment.buffer.content) {
+            .shm, .single_pixel => .argb8888,
+            .dmabuf => |dmabuf| render.DmabufFormat.fromFourcc(dmabuf.source.format),
+        },
+    };
+}
+
 fn destroySurface(
     context: *anyopaque,
     _: *Server.Client,
@@ -936,6 +1024,10 @@ fn destroySurface(
     if (surface.content_type_handler) |handler| {
         handler.surface_destroyed(handler.context);
         surface.content_type_handler = null;
+    }
+    if (surface.color_representation_handler) |handler| {
+        handler.surface_destroyed(handler.context);
+        surface.color_representation_handler = null;
     }
     if (surface.alpha_modifier_handler) |handler| {
         handler.surface_destroyed(handler.context);

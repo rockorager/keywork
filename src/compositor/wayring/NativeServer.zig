@@ -22,6 +22,7 @@ const OutputGlobal = @import("OutputGlobal.zig");
 const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
+const ColorRepresentationGlobal = @import("ColorRepresentationGlobal.zig");
 const AlphaModifierGlobal = @import("AlphaModifierGlobal.zig");
 const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
@@ -79,6 +80,7 @@ output_global: OutputGlobal,
 xdg_output_global: XdgOutputGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
+color_representation_global: ColorRepresentationGlobal,
 alpha_modifier_global: AlphaModifierGlobal,
 tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
@@ -180,6 +182,7 @@ const SurfaceState = struct {
     opaque_region: Region,
     input_region: CompositorGlobal.InputRegion,
     content_type: CompositorGlobal.ContentType = .none,
+    color_representation: CompositorGlobal.ColorRepresentationState = .{},
     alpha_multiplier: u32 = std.math.maxInt(u32),
     // Native XdgShell cannot yet represent fullscreen, so output submission
     // remains vsync-only while retaining this future policy input.
@@ -492,6 +495,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     errdefer self.presentation_global.deinit();
     try self.content_type_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.content_type_global.deinit();
+    try self.color_representation_global.init(allocator, &self.server, &self.compositor_global);
+    errdefer self.color_representation_global.deinit();
     try self.alpha_modifier_global.init(allocator, &self.server, &self.compositor_global);
     errdefer self.alpha_modifier_global.deinit();
     try self.tearing_control_global.init(allocator, &self.server, &self.compositor_global);
@@ -811,6 +816,7 @@ pub fn destroy(self: *NativeServer) void {
     self.fifo_global.deinit();
     self.tearing_control_global.deinit();
     self.alpha_modifier_global.deinit();
+    self.color_representation_global.deinit();
     self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.xdg_output_global.deinit();
@@ -2136,6 +2142,7 @@ fn applyEntry(
     );
     state.full_damage = state.full_damage or
         state.scale != commit.scale or
+        !std.meta.eql(state.color_representation, commit.color_representation) or
         state.alpha_multiplier != commit.alpha_multiplier or
         state.transform != commit.transform or
         state.x != commit.offset_x or
@@ -2143,6 +2150,7 @@ fn applyEntry(
         !std.meta.eql(state.viewport, commit.viewport);
     state.scale = commit.scale;
     state.content_type = commit.content_type;
+    state.color_representation = commit.color_representation;
     state.alpha_multiplier = commit.alpha_multiplier;
     state.presentation_hint = commit.presentation_hint;
     state.transform = commit.transform;
@@ -2859,7 +2867,7 @@ fn appendSurfaceCommands(
     for (paint_entries) |paint_entry| {
         const state = self.findState(paint_entry.surface) orelse continue;
         if (!state.surface.resource_alive) continue;
-        const pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
+        var pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
             const dmabuf = dmabuf_state.buffer.content.dmabuf;
             const format = render.DmabufFormat.fromFourcc(dmabuf.source.format) orelse continue;
             break :blk .{
@@ -2872,6 +2880,11 @@ fn appendSurfaceCommands(
                 .source_cache = dmabuf_state.source_cache,
             };
         } else if (state.snapshot) |*value| value.pixelBuffer() else continue;
+        const format = if (pixel_buffer.dmabuf) |dmabuf|
+            render.DmabufFormat.fromFourcc(dmabuf.format) orelse continue
+        else
+            render.DmabufFormat.argb8888;
+        pixel_buffer.color_representation = state.color_representation.toRender(format);
         const transform = bufferTransform(state.transform);
         const geometry = surface_geometry.calculate(
             pixel_buffer.size,
