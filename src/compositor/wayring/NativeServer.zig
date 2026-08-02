@@ -29,6 +29,7 @@ const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const PointerCursor = @import("PointerCursor.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
+const PointerWarpGlobal = @import("PointerWarpGlobal.zig");
 const PointerGesturesGlobal = @import("PointerGesturesGlobal.zig");
 const TabletGlobal = @import("TabletGlobal.zig");
 const CursorShapeGlobal = @import("CursorShapeGlobal.zig");
@@ -85,6 +86,7 @@ commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
 pointer_cursor: PointerCursor,
 relative_pointer_global: RelativePointerGlobal,
+pointer_warp_global: PointerWarpGlobal,
 pointer_gestures_global: PointerGesturesGlobal,
 tablet_global: TabletGlobal,
 cursor_shape_global: CursorShapeGlobal,
@@ -517,6 +519,16 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.seat_global,
     );
     errdefer self.relative_pointer_global.deinit();
+    try self.pointer_warp_global.init(
+        &self.server,
+        &self.seat_global,
+        .{
+            .context = self,
+            .surface_size = xdgSurfaceSize,
+            .warp = pointerWarp,
+        },
+    );
+    errdefer self.pointer_warp_global.deinit();
     try self.pointer_gestures_global.init(
         allocator,
         &self.server,
@@ -791,6 +803,7 @@ pub fn destroy(self: *NativeServer) void {
     self.cursor_shape_global.deinit();
     self.tablet_global.deinit();
     self.pointer_gestures_global.deinit();
+    self.pointer_warp_global.deinit();
     self.relative_pointer_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
@@ -1134,6 +1147,29 @@ fn nativePointerRelativeMotion(
     self.syncPointerCursorPosition();
     _ = self.refreshPointerFocus(@truncate(time_microseconds / std.time.us_per_ms)) catch
         return self.terminate();
+}
+
+fn pointerWarp(
+    context: *anyopaque,
+    surface: *const CompositorGlobal.Surface,
+    x: f64,
+    y: f64,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    const node = self.surface_tree.find(surface) orelse return;
+    const position = SurfaceTree.globalPosition(node);
+    const logical_x = @as(f64, @floatFromInt(position.x)) + x;
+    const logical_y = @as(f64, @floatFromInt(position.y)) + y;
+    if (!self.seat_global.warpPointer(
+        surface,
+        fixedFromDouble(x),
+        fixedFromDouble(y),
+    )) return;
+    self.pointer_physical_x = logicalToPhysicalScale(logical_x, self.output.scale());
+    self.pointer_physical_y = logicalToPhysicalScale(logical_y, self.output.scale());
+    if (self.native_input_initialized)
+        self.native_input.setPointerPosition(self.pointer_physical_x, self.pointer_physical_y);
+    self.syncPointerCursorPosition();
 }
 
 fn nativePointerButton(
@@ -1988,6 +2024,11 @@ fn tabletFocus(self: *NativeServer, x: f64, y: f64) !?TabletGlobal.Focus {
 fn physicalToLogicalScale(value: f64, scale: render.Scale) f64 {
     std.debug.assert(scale.numerator > 0);
     return value * render.Scale.denominator / @as(f64, @floatFromInt(scale.numerator));
+}
+
+fn logicalToPhysicalScale(value: f64, scale: render.Scale) f64 {
+    std.debug.assert(scale.numerator > 0);
+    return value * @as(f64, @floatFromInt(scale.numerator)) / render.Scale.denominator;
 }
 
 fn clampPointerCoordinate(value: f64, dimension: u32) f64 {
@@ -3310,6 +3351,7 @@ test "buffer damage maps scales positions and output clipping conservatively" {
 
 test "native input coordinates respect fractional scale and protocol bounds" {
     try std.testing.expectEqual(@as(f64, 80), physicalToLogicalScale(120, .{ .numerator = 180 }));
+    try std.testing.expectEqual(@as(f64, 120), logicalToPhysicalScale(80, .{ .numerator = 180 }));
     try std.testing.expectEqual(@as(f64, 0), clampPointerCoordinate(-1, 64));
     try std.testing.expectEqual(@as(f64, 63), clampPointerCoordinate(80, 64));
     try std.testing.expectEqual(@as(i32, 384), fixedFromDouble(1.5));

@@ -362,7 +362,20 @@ pub fn acceptsPointerCursorSerial(
     serial: u32,
 ) bool {
     const focus = self.pointer_focus orelse return false;
-    if (!focus.resource_alive or focus.client != client) return false;
+    return self.acceptsPointerEnterSerial(client, handle, focus, serial);
+}
+
+/// Validates an enter serial for one pointer and its exact focused surface.
+pub fn acceptsPointerEnterSerial(
+    self: *const SeatGlobal,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    surface: *const CompositorGlobal.Surface,
+    serial: u32,
+) bool {
+    if (self.pointer_focus != surface or
+        !surface.resource_alive or
+        surface.client != client) return false;
     for (self.children.items) |child| {
         if (child.kind == .pointer and
             child.client == client and
@@ -371,6 +384,19 @@ pub fn acceptsPointerCursorSerial(
             return self.childActive(child) and child.pointer_enter_serial == serial;
     }
     return false;
+}
+
+/// Updates focused pointer coordinates without emitting a motion event.
+pub fn warpPointer(
+    self: *SeatGlobal,
+    surface: *const CompositorGlobal.Surface,
+    x: i32,
+    y: i32,
+) bool {
+    if (self.pointer_focus != surface or !surface.resource_alive) return false;
+    self.pointer_x = x;
+    self.pointer_y = y;
+    return true;
 }
 
 /// Returns a borrowed focus retained until the next focus or capability change.
