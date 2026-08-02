@@ -8,6 +8,7 @@ const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const render = @import("../render/types.zig");
 
 allocator: std.mem.Allocator,
 listener: Listener,
@@ -21,11 +22,18 @@ pub const Listener = struct {
     repaint: *const fn (*anyopaque) void,
 };
 
-pub const Cursor = struct {
-    surface: *CompositorGlobal.Surface,
-    root: *CompositorGlobal.Surface,
-    x: i32,
-    y: i32,
+pub const Cursor = union(enum) {
+    surface: struct {
+        surface: *CompositorGlobal.Surface,
+        root: *CompositorGlobal.Surface,
+        x: i32,
+        y: i32,
+    },
+    shape: struct {
+        buffer: render.PixelBuffer,
+        x: i32,
+        y: i32,
+    },
 };
 
 const Role = struct {
@@ -33,10 +41,21 @@ const Role = struct {
     surface: *CompositorGlobal.Surface,
 };
 
-const Selected = struct {
+const SurfaceSelection = struct {
     surface: *CompositorGlobal.Surface,
     hotspot_x: i32,
     hotspot_y: i32,
+};
+
+const ShapeSelection = struct {
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+const Selected = union(enum) {
+    surface: SurfaceSelection,
+    shape: ShapeSelection,
 };
 
 pub fn init(self: *PointerCursor, allocator: std.mem.Allocator, listener: Listener) void {
@@ -71,13 +90,36 @@ pub fn setPosition(self: *PointerCursor, x: f64, y: f64) void {
 
 pub fn current(self: *const PointerCursor) ?Cursor {
     const selected = self.selected orelse return null;
-    if (!selected.surface.resource_alive) return null;
-    return .{
-        .surface = selected.surface,
-        .root = selected.surface,
-        .x = cursorCoordinate(self.position_x, selected.hotspot_x),
-        .y = cursorCoordinate(self.position_y, selected.hotspot_y),
+    return switch (selected) {
+        .surface => |surface| if (surface.surface.resource_alive) .{ .surface = .{
+            .surface = surface.surface,
+            .root = surface.surface,
+            .x = cursorCoordinate(self.position_x, surface.hotspot_x),
+            .y = cursorCoordinate(self.position_y, surface.hotspot_y),
+        } } else null,
+        .shape => |shape| .{ .shape = .{
+            .buffer = shape.buffer,
+            .x = cursorCoordinate(self.position_x, shape.hotspot_x),
+            .y = cursorCoordinate(self.position_y, shape.hotspot_y),
+        } },
     };
+}
+
+pub fn setShape(
+    self: *PointerCursor,
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) void {
+    self.select(.{ .shape = .{
+        .buffer = buffer,
+        .hotspot_x = hotspot_x,
+        .hotspot_y = hotspot_y,
+    } });
+}
+
+pub fn clearShapes(self: *PointerCursor) void {
+    if (self.selected) |selected| if (selected == .shape) self.select(null);
 }
 
 pub fn isCursorSurface(
@@ -108,11 +150,11 @@ fn handleIntent(context: *anyopaque, intent: SeatGlobal.CursorIntent) !void {
         };
         self.roles.appendAssumeCapacity(role);
     }
-    self.select(.{
+    self.select(.{ .surface = .{
         .surface = surface,
         .hotspot_x = intent.hotspot_x,
         .hotspot_y = intent.hotspot_y,
-    });
+    } });
 }
 
 fn clearSelection(context: *anyopaque) void {
@@ -138,7 +180,10 @@ fn cursorSurfaceDestroyed(context: *anyopaque) void {
     const role: *Role = @ptrCast(@alignCast(context));
     const self = role.owner;
     if (self.selected) |selected| {
-        if (selected.surface == role.surface) self.select(null);
+        switch (selected) {
+            .surface => |surface| if (surface.surface == role.surface) self.select(null),
+            .shape => {},
+        }
     }
     for (self.roles.items, 0..) |candidate, index| {
         if (candidate != role) continue;
@@ -288,7 +333,7 @@ test "pointer cursor role follows focus serial, position, and surface lifetime" 
     try std.testing.expect(cursor.isCursorSurface(cursor_surface));
     try std.testing.expectEqual(@as(usize, 1), cursor.roles.items.len);
     try std.testing.expectEqual(@as(usize, 1), repaint.count);
-    const first = cursor.current().?;
+    const first = cursor.current().?.surface;
     try std.testing.expect(first.surface == cursor_surface);
     try std.testing.expectEqual(@as(i32, 7), first.x);
     try std.testing.expectEqual(@as(i32, 16), first.y);
@@ -297,7 +342,7 @@ test "pointer cursor role follows focus serial, position, and surface lifetime" 
         @floatFromInt(std.math.minInt(i32)),
         @floatFromInt(std.math.maxInt(i32)),
     );
-    const saturated = cursor.current().?;
+    const saturated = cursor.current().?.surface;
     try std.testing.expectEqual(std.math.minInt(i32), saturated.x);
     try std.testing.expectEqual(std.math.maxInt(i32) - 4, saturated.y);
     try std.testing.expectEqual(@as(usize, 2), repaint.count);
@@ -324,6 +369,21 @@ test "pointer cursor role follows focus serial, position, and surface lifetime" 
     try std.testing.expect(!cursor.isCursorSurface(cursor_surface));
     try std.testing.expectEqual(@as(usize, 0), cursor.roles.items.len);
     try std.testing.expectEqual(@as(usize, 5), repaint.count);
+
+    var shape_pixels = [_]u32{0xffffffff} ** 4;
+    const shape_buffer: render.PixelBuffer = .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = &shape_pixels,
+    };
+    cursor.setShape(shape_buffer, 1, 2);
+    const shape = cursor.current().?.shape;
+    try std.testing.expectEqual(shape_buffer.size, shape.buffer.size);
+    try std.testing.expectEqual(std.math.minInt(i32), shape.x);
+    try std.testing.expectEqual(std.math.maxInt(i32) - 2, shape.y);
+    cursor.clearShapes();
+    try std.testing.expect(cursor.current() == null);
+    try std.testing.expectEqual(@as(usize, 7), repaint.count);
 
     var foreign_role: u8 = 0;
     try focus.setRole(&foreign_role, &foreign_role, ignoreRoleDestroyed);

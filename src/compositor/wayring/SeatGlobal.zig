@@ -354,6 +354,25 @@ pub fn pointerHandleIsActive(
     return false;
 }
 
+/// Validates a cursor-shape serial against one exact live pointer resource.
+pub fn acceptsPointerCursorSerial(
+    self: *const SeatGlobal,
+    client: *const Server.Client,
+    handle: wayring.ObjectHandle,
+    serial: u32,
+) bool {
+    const focus = self.pointer_focus orelse return false;
+    if (!focus.resource_alive or focus.client != client) return false;
+    for (self.children.items) |child| {
+        if (child.kind == .pointer and
+            child.client == client and
+            child.resource.id == handle.id and
+            child.resource.generation == handle.generation)
+            return self.childActive(child) and child.pointer_enter_serial == serial;
+    }
+    return false;
+}
+
 /// Returns a borrowed focus retained until the next focus or capability change.
 pub fn keyboardFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.keyboard_focus;

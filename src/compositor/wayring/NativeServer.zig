@@ -31,6 +31,7 @@ const PointerCursor = @import("PointerCursor.zig");
 const RelativePointerGlobal = @import("RelativePointerGlobal.zig");
 const PointerGesturesGlobal = @import("PointerGesturesGlobal.zig");
 const TabletGlobal = @import("TabletGlobal.zig");
+const CursorShapeGlobal = @import("CursorShapeGlobal.zig");
 const DataDeviceGlobal = @import("DataDeviceGlobal.zig");
 const PrimarySelectionGlobal = @import("PrimarySelectionGlobal.zig");
 const FractionalScaleGlobal = @import("FractionalScaleGlobal.zig");
@@ -86,6 +87,7 @@ pointer_cursor: PointerCursor,
 relative_pointer_global: RelativePointerGlobal,
 pointer_gestures_global: PointerGesturesGlobal,
 tablet_global: TabletGlobal,
+cursor_shape_global: CursorShapeGlobal,
 data_device_global: DataDeviceGlobal,
 primary_selection_global: PrimarySelectionGlobal,
 fractional_scale_global: FractionalScaleGlobal,
@@ -532,6 +534,14 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         },
     );
     errdefer self.tablet_global.deinit();
+    try self.cursor_shape_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        &self.pointer_cursor,
+        &self.tablet_global,
+    );
+    errdefer self.cursor_shape_global.deinit();
     try self.data_device_global.init(allocator, &self.server, &self.seat_global);
     errdefer self.data_device_global.deinit();
     try self.primary_selection_global.init(allocator, &self.server, &self.seat_global);
@@ -778,6 +788,7 @@ pub fn destroy(self: *NativeServer) void {
     self.fractional_scale_global.deinit();
     self.primary_selection_global.deinit();
     self.data_device_global.deinit();
+    self.cursor_shape_global.deinit();
     self.tablet_global.deinit();
     self.pointer_gestures_global.deinit();
     self.relative_pointer_global.deinit();
@@ -2701,73 +2712,37 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
         if (node.parent == null and !self.isCursorSurface(state.surface))
             try self.surface_tree.paint(node, &paint_entries);
     }
-    if (self.pointer_cursor.current()) |cursor|
-        try self.appendCursorPaint(cursor.root, cursor.x, cursor.y, &paint_entries);
+    try self.appendSurfaceCommands(paint_entries.items, &commands);
+    paint_entries.clearRetainingCapacity();
+    if (self.pointer_cursor.current()) |cursor| switch (cursor) {
+        .surface => |surface| {
+            try self.appendCursorPaint(surface.root, surface.x, surface.y, &paint_entries);
+            try self.appendSurfaceCommands(paint_entries.items, &commands);
+            paint_entries.clearRetainingCapacity();
+        },
+        .shape => |shape| try appendShapeCursorCommand(
+            shape.buffer,
+            shape.x,
+            shape.y,
+            &commands,
+            self.allocator,
+        ),
+    };
     var cursors = self.tablet_global.cursorIterator();
-    while (cursors.next()) |cursor|
-        try self.appendCursorPaint(cursor.root, cursor.x, cursor.y, &paint_entries);
-    for (paint_entries.items) |paint_entry| {
-        const state = self.findState(paint_entry.surface) orelse continue;
-        if (!state.surface.resource_alive) continue;
-        const pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
-            const dmabuf = dmabuf_state.buffer.content.dmabuf;
-            const format = render.DmabufFormat.fromFourcc(dmabuf.source.format) orelse continue;
-            break :blk .{
-                .size = dmabuf.size,
-                .stride_pixels = if (format.isPackedRgb())
-                    dmabuf.source.planes[0].stride / @sizeOf(u32)
-                else
-                    dmabuf.size.width,
-                .dmabuf = dmabuf.source,
-                .source_cache = dmabuf_state.source_cache,
-            };
-        } else if (state.snapshot) |*value| value.pixelBuffer() else continue;
-        const transform = bufferTransform(state.transform);
-        const geometry = surface_geometry.calculate(
-            pixel_buffer.size,
-            state.scale,
-            @intCast(state.transform),
-            state.viewport,
-            false,
-        ) catch continue;
-        const image_x = paint_entry.x +| state.x;
-        const image_y = paint_entry.y +| state.y;
-        const force_opaque = if (pixel_buffer.dmabuf) |source|
-            source.force_opaque
-        else
-            state.snapshot.?.force_opaque;
-        const region_covers_buffer = state.opaque_region.coversRectangle(
-            state.x,
-            state.y,
-            geometry.logical_size.width,
-            geometry.logical_size.height,
-        );
-        try commands.append(self.allocator, .{ .image = .{
-            .x = image_x,
-            .y = image_y,
-            .size = geometry.logical_size,
-            .buffer = pixel_buffer,
-            .sample_tag = state.sample_tag,
-            .source = geometry.source,
-            .transform = transform,
-            .is_opaque = force_opaque or region_covers_buffer,
-            .alpha_multiplier = state.alpha_multiplier,
-            .opaque_region = if (force_opaque or region_covers_buffer)
-                .{}
-            else
-                surfaceOpaqueRegion(
-                    &state.opaque_region,
-                    .{
-                        .x = state.x,
-                        .y = state.y,
-                        .width = geometry.logical_size.width,
-                        .height = geometry.logical_size.height,
-                    },
-                    paint_entry.x,
-                    paint_entry.y,
-                ),
-        } });
-    }
+    while (cursors.next()) |cursor| switch (cursor) {
+        .surface => |surface| {
+            try self.appendCursorPaint(surface.root, surface.x, surface.y, &paint_entries);
+            try self.appendSurfaceCommands(paint_entries.items, &commands);
+            paint_entries.clearRetainingCapacity();
+        },
+        .shape => |shape| try appendShapeCursorCommand(
+            shape.buffer,
+            shape.x,
+            shape.y,
+            &commands,
+            self.allocator,
+        ),
+    };
     var damage_storage: [1]render.Rect = undefined;
     const damage = if (damage_state) |state| self.frameDamage(state, &damage_storage) else null;
     switch (self.output) {
@@ -2833,6 +2808,90 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     self.frame_count +%= 1;
     try self.finishFrameCallbacks();
     if (immediate_presentation) |info| self.finishSubmittedPresentation(info);
+}
+
+fn appendSurfaceCommands(
+    self: *NativeServer,
+    paint_entries: []const SurfaceTree.PaintEntry,
+    commands: *std.ArrayList(render.Command),
+) !void {
+    for (paint_entries) |paint_entry| {
+        const state = self.findState(paint_entry.surface) orelse continue;
+        if (!state.surface.resource_alive) continue;
+        const pixel_buffer: render.PixelBuffer = if (state.dmabuf) |dmabuf_state| blk: {
+            const dmabuf = dmabuf_state.buffer.content.dmabuf;
+            const format = render.DmabufFormat.fromFourcc(dmabuf.source.format) orelse continue;
+            break :blk .{
+                .size = dmabuf.size,
+                .stride_pixels = if (format.isPackedRgb())
+                    dmabuf.source.planes[0].stride / @sizeOf(u32)
+                else
+                    dmabuf.size.width,
+                .dmabuf = dmabuf.source,
+                .source_cache = dmabuf_state.source_cache,
+            };
+        } else if (state.snapshot) |*value| value.pixelBuffer() else continue;
+        const transform = bufferTransform(state.transform);
+        const geometry = surface_geometry.calculate(
+            pixel_buffer.size,
+            state.scale,
+            @intCast(state.transform),
+            state.viewport,
+            false,
+        ) catch continue;
+        const image_x = paint_entry.x +| state.x;
+        const image_y = paint_entry.y +| state.y;
+        const force_opaque = if (pixel_buffer.dmabuf) |source|
+            source.force_opaque
+        else
+            state.snapshot.?.force_opaque;
+        const region_covers_buffer = state.opaque_region.coversRectangle(
+            state.x,
+            state.y,
+            geometry.logical_size.width,
+            geometry.logical_size.height,
+        );
+        try commands.append(self.allocator, .{ .image = .{
+            .x = image_x,
+            .y = image_y,
+            .size = geometry.logical_size,
+            .buffer = pixel_buffer,
+            .sample_tag = state.sample_tag,
+            .source = geometry.source,
+            .transform = transform,
+            .is_opaque = force_opaque or region_covers_buffer,
+            .alpha_multiplier = state.alpha_multiplier,
+            .opaque_region = if (force_opaque or region_covers_buffer)
+                .{}
+            else
+                surfaceOpaqueRegion(
+                    &state.opaque_region,
+                    .{
+                        .x = state.x,
+                        .y = state.y,
+                        .width = geometry.logical_size.width,
+                        .height = geometry.logical_size.height,
+                    },
+                    paint_entry.x,
+                    paint_entry.y,
+                ),
+        } });
+    }
+}
+
+fn appendShapeCursorCommand(
+    buffer: render.PixelBuffer,
+    x: i32,
+    y: i32,
+    commands: *std.ArrayList(render.Command),
+    allocator: std.mem.Allocator,
+) !void {
+    try commands.append(allocator, .{ .image = .{
+        .x = x,
+        .y = y,
+        .size = buffer.size,
+        .buffer = buffer,
+    } });
 }
 
 fn appendCursorPaint(

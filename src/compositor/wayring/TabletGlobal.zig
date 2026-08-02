@@ -9,6 +9,7 @@ const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const NativeInput = @import("../backend/native_input.zig");
+const render = @import("../render/types.zig");
 
 const advertised_version: u32 = 2;
 
@@ -46,11 +47,18 @@ pub const Focus = struct {
     y: f64,
 };
 
-pub const Cursor = struct {
-    surface: *CompositorGlobal.Surface,
-    root: *CompositorGlobal.Surface,
-    x: i32,
-    y: i32,
+pub const Cursor = union(enum) {
+    surface: struct {
+        surface: *CompositorGlobal.Surface,
+        root: *CompositorGlobal.Surface,
+        x: i32,
+        y: i32,
+    },
+    shape: struct {
+        buffer: render.PixelBuffer,
+        x: i32,
+        y: i32,
+    },
 };
 
 pub const CursorIterator = struct {
@@ -64,12 +72,19 @@ pub const CursorIterator = struct {
             const cursor = tool.cursor orelse continue;
             const focus = tool.focus orelse continue;
             const position = tool.position orelse continue;
-            if (!tool.in_proximity or !cursor.surface.resource_alive or !focus.surface.resource_alive) continue;
-            return .{
-                .surface = cursor.surface,
-                .root = cursor.surface,
-                .x = cursorCoordinate(position.x, cursor.hotspot_x),
-                .y = cursorCoordinate(position.y, cursor.hotspot_y),
+            if (!tool.in_proximity or !focus.surface.resource_alive) continue;
+            return switch (cursor) {
+                .surface => |surface| if (surface.surface.resource_alive) .{ .surface = .{
+                    .surface = surface.surface,
+                    .root = surface.surface,
+                    .x = cursorCoordinate(position.x, surface.hotspot_x),
+                    .y = cursorCoordinate(position.y, surface.hotspot_y),
+                } } else continue,
+                .shape => |shape| .{ .shape = .{
+                    .buffer = shape.buffer,
+                    .x = cursorCoordinate(position.x, shape.hotspot_x),
+                    .y = cursorCoordinate(position.y, shape.hotspot_y),
+                } },
             };
         }
         return null;
@@ -147,10 +162,17 @@ const CursorRole = struct {
     hotspot_y: i32 = 0,
 };
 
-const SelectedCursor = struct {
-    surface: *CompositorGlobal.Surface,
-    hotspot_x: i32,
-    hotspot_y: i32,
+const SelectedCursor = union(enum) {
+    surface: struct {
+        surface: *CompositorGlobal.Surface,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+    shape: struct {
+        buffer: render.PixelBuffer,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
 };
 
 const Tool = struct {
@@ -421,6 +443,54 @@ pub fn cursorIterator(self: *TabletGlobal) CursorIterator {
     return .{ .owner = self };
 }
 
+/// Captures one native tablet-tool resource without retaining its adapter.
+pub fn toolHandle(
+    self: *const TabletGlobal,
+    client: *const Server.Client,
+    resource_id: u32,
+) ?wayring.ObjectHandle {
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.binding.client == client and adapter.resource.id == resource_id)
+            return adapter.resource;
+    }
+    return null;
+}
+
+pub fn setCursorShape(
+    self: *TabletGlobal,
+    client: *Server.Client,
+    handle: wayring.ObjectHandle,
+    serial: u32,
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) void {
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.resource.id != handle.id or
+            adapter.resource.generation != handle.generation) continue;
+        const tool = activeToolResource(adapter, client, serial) orelse return;
+        tool.cursor = .{ .shape = .{
+            .buffer = buffer,
+            .hotspot_x = hotspot_x,
+            .hotspot_y = hotspot_y,
+        } };
+        self.listener.repaint(self.listener.context);
+        return;
+    }
+}
+
+pub fn clearCursorShapes(self: *TabletGlobal) void {
+    var changed = false;
+    for (self.tools.items) |tool| if (tool.cursor) |cursor| switch (cursor) {
+        .surface => {},
+        .shape => {
+            tool.cursor = null;
+            changed = true;
+        },
+    };
+    if (changed) self.listener.repaint(self.listener.context);
+}
+
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
     const self: *TabletGlobal = @ptrCast(@alignCast(context));
     _ = client.createResource(id, &generated.zwp_tablet_manager_v2, version, .{ .context = self, .dispatch = dispatchManager }) catch return client.postNoMemory();
@@ -684,7 +754,11 @@ fn dispatchTool(context: *anyopaque, client: *Server.Client, resource: wayring.O
                 };
                 role.hotspot_x = request.hotspot_x;
                 role.hotspot_y = request.hotspot_y;
-                tool.cursor = .{ .surface = cursor_surface, .hotspot_x = request.hotspot_x, .hotspot_y = request.hotspot_y };
+                tool.cursor = .{ .surface = .{
+                    .surface = cursor_surface,
+                    .hotspot_x = request.hotspot_x,
+                    .hotspot_y = request.hotspot_y,
+                } };
             } else tool.cursor = null;
             tool.owner.listener.repaint(tool.owner.listener.context);
         },
@@ -799,10 +873,15 @@ fn cursorSurfaceDestroyed(context: *anyopaque) void {
     const role: *CursorRole = @ptrCast(@alignCast(context));
     const owner = role.owner;
     for (owner.tools.items) |tool| {
-        if (tool.owner_id == role.tool_owner_id and tool.cursor != null and tool.cursor.?.surface == role.surface) {
-            clearToolCursor(tool);
-            break;
-        }
+        if (tool.owner_id != role.tool_owner_id) continue;
+        if (tool.cursor) |cursor| switch (cursor) {
+            .surface => |surface| if (surface.surface == role.surface) {
+                clearToolCursor(tool);
+                break;
+            },
+            .shape => {},
+        };
+        break;
     }
     for (owner.cursor_roles.items, 0..) |candidate, index| if (candidate == role) {
         _ = owner.cursor_roles.orderedRemove(index);
@@ -1376,7 +1455,7 @@ test "tablet v2 advertises topology and routes tool, cursor, pad, and removal wi
     const cursor_surface = try CompositorGlobal.surfaceFor(client, .{ .id = cursor_handle.id, .generation = client.connection.object(cursor_handle.id).?.generation });
     try std.testing.expect(tablet_global.isCursorSurface(cursor_surface));
     var iterator = tablet_global.cursorIterator();
-    const cursor = iterator.next().?;
+    const cursor = iterator.next().?.surface;
     try std.testing.expectEqual(@as(i32, 7), cursor.x);
     try std.testing.expectEqual(@as(i32, 16), cursor.y);
     try generated.zwp_tablet_tool_v2_types.requests.set_cursor(&peer, tool_resource, proximity_serial - 1, null, 0, 0);
@@ -1394,6 +1473,28 @@ test "tablet v2 advertises topology and routes tool, cursor, pad, and removal wi
         try std.testing.expectEqual(@as(u32, 1), message.object_id);
         _ = try core.decodeDisplayEvent(&message);
     }
+
+    const tool_handle = tablet_global.toolHandle(client, tool_resource.id).?;
+    var shape_pixels = [_]u32{0xffffffff} ** 4;
+    const shape_buffer: render.PixelBuffer = .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = &shape_pixels,
+    };
+    tablet_global.setCursorShape(client, tool_handle, proximity_serial, shape_buffer, 1, 2);
+    var shape_iterator = tablet_global.cursorIterator();
+    const shape = shape_iterator.next().?.shape;
+    try std.testing.expectEqual(@as(i32, 9), shape.x);
+    try std.testing.expectEqual(@as(i32, 18), shape.y);
+    try std.testing.expectEqual(shape_buffer.size, shape.buffer.size);
+    tablet_global.setCursorShape(client, tool_handle, proximity_serial - 1, shape_buffer, 4, 4);
+    var unchanged_iterator = tablet_global.cursorIterator();
+    const unchanged = unchanged_iterator.next().?.shape;
+    try std.testing.expectEqual(@as(i32, 9), unchanged.x);
+    try std.testing.expectEqual(@as(i32, 18), unchanged.y);
+    tablet_global.clearCursorShapes();
+    var cleared_iterator = tablet_global.cursorIterator();
+    try std.testing.expect(cleared_iterator.next() == null);
 
     try tablet_global.padButton(pad_id, 110, 1, true, 0, 1);
     try tablet_global.padRing(pad_id, 111, 0, 30, true, 0, 1);
