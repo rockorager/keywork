@@ -23,6 +23,7 @@ const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
 const OutputPowerGlobal = @import("OutputPowerGlobal.zig");
+const WorkspaceManagerGlobal = @import("WorkspaceManagerGlobal.zig");
 const ScreencopyGlobal = @import("ScreencopyGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
@@ -101,6 +102,7 @@ subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 xdg_output_global: XdgOutputGlobal,
 output_power_global: OutputPowerGlobal,
+workspace_manager_global: WorkspaceManagerGlobal,
 screencopy_global: ScreencopyGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
@@ -602,6 +604,13 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         },
     );
     errdefer self.output_power_global.deinit();
+    try self.workspace_manager_global.init(
+        allocator,
+        &self.server,
+        &self.output_global,
+        &self.security_context_global,
+    );
+    errdefer self.workspace_manager_global.deinit();
     try self.screencopy_global.init(
         allocator,
         &self.server,
@@ -1043,6 +1052,7 @@ pub fn destroy(self: *NativeServer) void {
     self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.screencopy_global.deinit();
+    self.workspace_manager_global.deinit();
     self.output_power_global.deinit();
     self.xdg_output_global.deinit();
     self.layer_shell.deinit();

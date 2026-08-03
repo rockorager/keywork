@@ -17,6 +17,12 @@ global_name: u32,
 config: Config,
 resources: std.ArrayList(*Binding) = .empty,
 memberships: std.ArrayList(*CompositorGlobal.Surface) = .empty,
+bind_observer: ?BindObserver = null,
+
+pub const BindObserver = struct {
+    context: *anyopaque,
+    bound: *const fn (*anyopaque, *Server.Client, wayring.ObjectHandle) anyerror!void,
+};
 
 pub const Config = struct {
     position: render.Position = .{},
@@ -83,6 +89,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *OutputGlobal) void {
+    std.debug.assert(self.bind_observer == null);
     std.debug.assert(self.resources.items.len == 0);
     self.server.removeGlobal(self.global_name) catch unreachable;
     for (self.memberships.items) |surface| surface.unreference();
@@ -90,6 +97,17 @@ pub fn deinit(self: *OutputGlobal) void {
     self.resources.deinit(self.allocator);
     self.deinitConfig();
     self.* = undefined;
+}
+
+/// Retains the observer context until clearBindObserver or deinit.
+pub fn setBindObserver(self: *OutputGlobal, observer: BindObserver) void {
+    std.debug.assert(self.bind_observer == null);
+    self.bind_observer = observer;
+}
+
+pub fn clearBindObserver(self: *OutputGlobal) void {
+    std.debug.assert(self.bind_observer != null);
+    self.bind_observer = null;
 }
 
 fn deinitConfig(self: *OutputGlobal) void {
@@ -169,6 +187,19 @@ pub fn bindingHandle(
     return null;
 }
 
+/// Visits each live wl_output resource for one client without exposing binding
+/// ownership outside this global.
+pub fn forEachBinding(
+    self: *const OutputGlobal,
+    client: *const Server.Client,
+    context: *anyopaque,
+    visitor: *const fn (*anyopaque, wayring.ObjectHandle) anyerror!void,
+) !void {
+    for (self.resources.items) |binding| {
+        if (binding.client == client) try visitor(context, binding.resource);
+    }
+}
+
 pub fn logicalPosition(self: *const OutputGlobal) render.Position {
     return self.config.position;
 }
@@ -193,7 +224,8 @@ fn validSize(size: render.Size) bool {
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
     const self: *OutputGlobal = @ptrCast(@alignCast(context));
     const binding = self.allocator.create(Binding) catch return client.postNoMemory();
-    errdefer self.allocator.destroy(binding);
+    var binding_owned = true;
+    errdefer if (binding_owned) self.allocator.destroy(binding);
     self.resources.ensureUnusedCapacity(self.allocator, 1) catch
         return client.postNoMemory();
     binding.* = .{
@@ -207,6 +239,8 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
         .destroy = destroyBinding,
     }) catch return client.postNoMemory();
     self.resources.appendAssumeCapacity(binding);
+    binding_owned = false;
+    errdefer client.destroyResource(binding.resource) catch {};
     try self.sendState(binding);
     for (self.memberships.items) |surface| {
         if (surface.resource_alive and surface.client == client) {
@@ -216,6 +250,10 @@ fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !voi
                 binding.resource,
             );
         }
+    }
+    if (self.bind_observer) |observer| {
+        observer.bound(observer.context, client, binding.resource) catch
+            return client.postNoMemory();
     }
 }
 
