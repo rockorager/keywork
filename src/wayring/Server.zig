@@ -209,10 +209,19 @@ pub const Client = struct {
         while (self.connection.popMessage()) |popped| {
             var message = popped;
             defer message.deinit();
-            self.dispatchOne(&message) catch |err| {
-                if (self.state == .protocol_error) return error.ProtocolError;
-                if (err == error.UnknownResource or err == error.UnknownObject or err == error.StaleObject)
+            const resource = self.resources.get(message.object_id) orelse
+                return self.protocolError(message.object_id, 0, "invalid Wayland request object");
+            _ = self.connection.objectForHandle(resource.handle, resource.interface) catch
+                return self.protocolError(message.object_id, 0, "invalid Wayland request object");
+            self.validateArguments(&message) catch |err| {
+                if (err == error.UnknownObject or err == error.StaleObject)
                     return self.protocolError(message.object_id, 0, "invalid Wayland request object");
+                return self.protocolError(message.object_id, 3, "Wayland request validation failed");
+            };
+            const dispatch = resource.implementation.dispatch orelse
+                return self.protocolError(message.object_id, 3, "unhandled Wayland request");
+            dispatch(resource.implementation.context, self, resource.handle, &message) catch {
+                if (self.state == .protocol_error) return error.ProtocolError;
                 return self.protocolError(message.object_id, 3, "Wayland request dispatch failed");
             };
             if (hasConstructor(message.descriptor)) {
@@ -221,8 +230,8 @@ pub const Client = struct {
                 };
             }
             if (message.descriptor.destructor) {
-                if (self.resources.get(message.object_id)) |resource|
-                    self.destroyResource(resource.handle) catch {
+                if (self.resources.get(message.object_id)) |destructor_resource|
+                    self.destroyResource(destructor_resource.handle) catch {
                         return self.protocolError(message.object_id, 2, "resource destruction failed");
                     };
             }
@@ -236,14 +245,6 @@ pub const Client = struct {
                 };
             }
         }
-    }
-
-    fn dispatchOne(self: *Client, message: *wayring.Message) !void {
-        const resource = self.resources.get(message.object_id) orelse return error.UnknownResource;
-        _ = try self.connection.objectForHandle(resource.handle, resource.interface);
-        try self.validateArguments(message);
-        const dispatch = resource.implementation.dispatch orelse return error.UnhandledRequest;
-        try dispatch(resource.implementation.context, self, resource.handle, message);
     }
 
     fn validateArguments(self: *const Client, message: *const wayring.Message) !void {
@@ -789,6 +790,22 @@ const test_factory: wayring.Interface = .{
     .requests = &test_factory_requests,
 };
 
+const TestDispatchError = enum { unknown_resource, unknown_object, stale_object };
+
+fn collidingErrorDispatch(
+    context: *anyopaque,
+    _: *Client,
+    _: wayring.ObjectHandle,
+    _: *wayring.Message,
+) !void {
+    const selected: *const TestDispatchError = @ptrCast(@alignCast(context));
+    return switch (selected.*) {
+        .unknown_resource => error.UnknownResource,
+        .unknown_object => error.UnknownObject,
+        .stale_object => error.StaleObject,
+    };
+}
+
 var test_provenance_key: u8 = 0;
 var test_other_provenance_key: u8 = 0;
 
@@ -955,6 +972,34 @@ const TestPeer = struct {
         try client.outputDrained();
     }
 };
+
+test "handler error names cannot impersonate invalid request objects" {
+    for (std.enums.values(TestDispatchError)) |selected_value| {
+        var selected = selected_value;
+        var server = Server.init(std.testing.allocator);
+        defer server.deinit();
+        const client = try server.createClient();
+        defer server.destroyClient(client) catch unreachable;
+        var peer = try TestPeer.init(std.testing.allocator);
+        defer peer.deinit();
+        const server_resource = try client.createResource(2, &test_child, 1, .{
+            .context = &selected,
+            .dispatch = collidingErrorDispatch,
+        });
+        const peer_resource: wayring.ObjectHandle = .{
+            .id = server_resource.id,
+            .generation = try peer.connection.registerObject(server_resource.id, &test_child, 1),
+        };
+        try peer.connection.queueObject(peer_resource, &test_child, 0, &.{.{ .uint = 77 }});
+        try std.testing.expectError(error.ProtocolError, peer.transferToServer(client));
+        try peer.transferFromServer(client);
+        var event_message = peer.connection.popMessage() orelse return error.MissingProtocolError;
+        defer event_message.deinit();
+        const event = (try core.decodeDisplayEvent(&event_message)).error_event;
+        try std.testing.expectEqual(peer_resource.id, event.object_id);
+        try std.testing.expectEqual(@as(u32, 3), event.code);
+    }
+}
 
 test "registry advertises globals and bind dispatches resources" {
     var server = Server.init(std.testing.allocator);
