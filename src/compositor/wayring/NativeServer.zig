@@ -5715,6 +5715,27 @@ test "native wlr screencopy streams whole-output SHM damage frames" {
     try testDrainScreencopy(native);
     try std.testing.expect(!native.screencopy_global.hasPendingIo());
 
+    const destroyed_active_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(
+        &peer,
+        destroyed_active_frame,
+        buffer,
+    );
+    try testTransferToNative(&peer, client);
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expect(native.screencopy_global.hasPendingIo());
+    try generated.zwlr_screencopy_frame_v1_types.requests.destroy(&peer, destroyed_active_frame);
+    try testTransferToNative(&peer, client);
+    try testDrainScreencopy(native);
+    try std.testing.expect(!native.screencopy_global.hasPendingIo());
+
     const stale_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
         &peer,
         screencopy_manager,

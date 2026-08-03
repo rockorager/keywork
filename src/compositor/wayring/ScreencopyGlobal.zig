@@ -455,6 +455,7 @@ fn readbackReady(
     completion: IoUringLoop.Completion,
 ) !void {
     const frame: *Frame = @ptrCast(@alignCast(context));
+    const owner = frame.owner;
     frame.sync_handle = null;
     if (completion.result < 0) frame.aborted = true;
     const fd = frame.sync_fd;
@@ -464,10 +465,10 @@ fn readbackReady(
         frame.aborted or !frame.resource_alive)
     {
         finish(frame, false);
-        frame.owner.scheduleEligible();
+        owner.scheduleEligible();
         return;
     }
-    frame.owner.startWrite(frame);
+    owner.startWrite(frame);
 }
 
 fn startWrite(self: *ScreencopyGlobal, frame: *Frame) void {
@@ -499,24 +500,18 @@ fn startWrite(self: *ScreencopyGlobal, frame: *Frame) void {
     };
     frame.write = write;
     frame.state = .writing;
-    write.start() catch {
-        if (frame.write == write and !write.isTerminal()) {
-            write.deinit();
-            frame.write = null;
-            finish(frame, false);
-            self.scheduleEligible();
-        }
-    };
+    write.start() catch return;
 }
 
 fn writeComplete(context: ?*anyopaque, write: *AsyncShmWrite) void {
     const frame: *Frame = @ptrCast(@alignCast(context.?));
+    const owner = frame.owner;
     const succeeded = if (write.result()) |_| true else |_| false;
     std.debug.assert(frame.write == write);
     frame.write = null;
     write.deinit();
     finish(frame, succeeded and !frame.aborted);
-    frame.owner.scheduleEligible();
+    owner.scheduleEligible();
 }
 
 fn finish(frame: *Frame, succeeded: bool) void {

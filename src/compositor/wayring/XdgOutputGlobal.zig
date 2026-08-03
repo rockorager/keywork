@@ -100,7 +100,9 @@ pub fn publishLogicalUpdate(self: *XdgOutputGlobal) void {
 }
 
 fn sendLogicalUpdate(self: *OutputResource) !void {
-    if (self.output == null) return;
+    const output_resource = self.output orelse return;
+    const version = try self.client.resourceVersion(self.resource, &generated.zxdg_output_v1);
+    if (version >= 3 and !self.owner.output.bindingIsLive(self.client, output_resource)) return;
     const position = self.owner.output.logicalPosition();
     const size = self.owner.output.logicalSize();
     try generated.zxdg_output_v1_types.events.logical_position(
@@ -115,7 +117,6 @@ fn sendLogicalUpdate(self: *OutputResource) !void {
         @intCast(size.width),
         @intCast(size.height),
     );
-    const version = try self.client.resourceVersion(self.resource, &generated.zxdg_output_v1);
     if (version < 3) try generated.zxdg_output_v1_types.events.done(
         &self.client.connection,
         self.resource,
@@ -146,7 +147,8 @@ fn dispatchManager(
         .get_xdg_output => |request| {
             const managed = self.allocator.create(OutputResource) catch
                 return client.postNoMemory();
-            errdefer self.allocator.destroy(managed);
+            var managed_owned = true;
+            errdefer if (managed_owned) self.allocator.destroy(managed);
             self.resources.ensureUnusedCapacity(self.allocator, 1) catch
                 return client.postNoMemory();
             const version = try client.resourceVersion(
@@ -170,6 +172,8 @@ fn dispatchManager(
                 },
             ) catch return client.postNoMemory();
             self.resources.appendAssumeCapacity(managed);
+            managed_owned = false;
+            errdefer client.destroyResource(managed.resource) catch {};
             managed.sendInitialState() catch return client.postNoMemory();
         },
     }
@@ -365,6 +369,26 @@ test "native xdg output versions send logical metadata and matching done events"
     try std.testing.expectEqualSlices(usize, &.{ 3, 5, 4 }, &stages);
     // Initial v3 state is committed by wl_output.done.
     try std.testing.expectEqual(@as(usize, 1), output_done_count);
+
+    try generated.wl_output_types.requests.release(&peer, output_resource);
+    try transferToServer(&peer, client);
+    xdg_output.publishLogicalUpdate();
+    try transferFromServer(&peer, client);
+    var update_counts: [3]usize = .{ 0, 0, 0 };
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == 1) {
+            _ = try core.decodeDisplayEvent(&message);
+            continue;
+        }
+        const child_index = for (children, 0..) |child, index| {
+            if (message.object_id == child.id) break index;
+        } else return error.UnexpectedXdgOutputEvent;
+        _ = try generated.zxdg_output_v1_types.decodeEvent(&peer, children[child_index], &message);
+        update_counts[child_index] += 1;
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 3, 3, 0 }, &update_counts);
 
     for (children) |child| try generated.zxdg_output_v1_types.requests.destroy(
         &peer,

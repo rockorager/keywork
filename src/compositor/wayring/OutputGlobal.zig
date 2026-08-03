@@ -196,6 +196,18 @@ pub fn bindingHandle(
     return null;
 }
 
+pub fn bindingIsLive(
+    self: *const OutputGlobal,
+    client: *const Server.Client,
+    resource: wayring.ObjectHandle,
+) bool {
+    for (self.resources.items) |binding| {
+        if (binding.client == client and binding.resource.id == resource.id and
+            binding.resource.generation == resource.generation) return true;
+    }
+    return false;
+}
+
 /// Visits each live wl_output resource for one client without exposing binding
 /// ownership outside this global.
 pub fn forEachBinding(
