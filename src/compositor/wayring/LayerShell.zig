@@ -129,6 +129,7 @@ const LayerSurface = struct {
 const CapturedState = struct {
     allocator: std.mem.Allocator,
     state: State,
+    configured: bool,
     fn destroy(context: *anyopaque) void {
         const self: *CapturedState = @ptrCast(@alignCast(context));
         self.allocator.destroy(self);
@@ -213,7 +214,11 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
     if (!item.resource_alive) return .{};
     const role_state = commit.takeRoleState(self);
     defer if (role_state) |value| value.deinit(value.context);
-    const state = if (role_state) |value| @as(*CapturedState, @ptrCast(@alignCast(value.context))).state else item.current;
+    const captured: ?*const CapturedState = if (role_state) |value|
+        @ptrCast(@alignCast(value.context))
+    else
+        null;
+    const state = if (captured) |value| value.state else item.current;
     if (!validState(state)) {
         try postLayerError(item, .invalid_size, "invalid layer surface size or anchor");
         return .{};
@@ -250,7 +255,7 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
         };
         return .{ .staged = staged };
     }
-    if (commit.attachment == .buffer and !item.configured) {
+    if (commit.attachment == .buffer and !(if (captured) |value| value.configured else item.configured)) {
         try postLayerError(item, .invalid_surface_state, "buffer committed before configure acknowledgement");
         return .{};
     }
@@ -446,7 +451,11 @@ fn dispatchSurface(context: *anyopaque, client: *Server.Client, resource: wayrin
 fn captureCommit(context: *anyopaque) !?CompositorGlobal.RoleCommitState {
     const item: *LayerSurface = @ptrCast(@alignCast(context));
     const captured = try item.allocator.create(CapturedState);
-    captured.* = .{ .allocator = item.allocator, .state = item.pending };
+    captured.* = .{
+        .allocator = item.allocator,
+        .state = item.pending,
+        .configured = item.configured,
+    };
     if (item.initial_configure_sent and item.surface.pendingBufferRemoved()) {
         // Request dispatch may capture multiple commits before the first is
         // prepared. Reset now so a same-batch remap captures construction
@@ -454,6 +463,8 @@ fn captureCommit(context: *anyopaque) !?CompositorGlobal.RoleCommitState {
         // state remains valid for earlier queued commits until this unmap is
         // applied in transaction order.
         item.pending = .{ .layer = item.initial_layer };
+        item.configured = false;
+        item.configures.clearRetainingCapacity();
     }
     return .{ .owner = item.binding.owner, .context = captured, .deinit = CapturedState.destroy };
 }
@@ -909,7 +920,6 @@ test "native layer surface configures transactionally and outlives its manager" 
     var prior_transaction = compositor.popTransaction() orelse return error.MissingPriorCommit;
     defer prior_transaction.deinit();
     const prior = (try shell.handleCommit(&prior_transaction.entries[0])).?;
-    try std.testing.expect(shell.surfaces.items[0].configured);
     try shell.apply(prior.staged orelse return error.MissingStagedPriorCommit);
     var unmap_transaction = compositor.popTransaction() orelse return error.MissingUnmapCommit;
     defer unmap_transaction.deinit();
@@ -936,6 +946,157 @@ test "native layer surface configures transactionally and outlives its manager" 
     try generated.wl_surface_types.requests.destroy(&peer, surface);
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 0), shell.surfaces.items.len);
+
+    try expectLateAckRejected(
+        core,
+        &server,
+        &compositor,
+        &shell,
+        compositor_name,
+        shell_name,
+        shm_name,
+    );
+    try std.testing.expectEqual(@as(usize, 0), shell.surfaces.items.len);
+}
+
+fn expectLateAckRejected(
+    comptime core: type,
+    server: *Server,
+    compositor: *CompositorGlobal,
+    shell: *LayerShell,
+    compositor_name: u32,
+    shell_name: u32,
+    shm_name: u32,
+) !void {
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try transferToLayerServer(&peer, client);
+    try transferFromLayerServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+    const compositor_resource: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            compositor_name,
+            generated.wl_compositor.name,
+            6,
+            3,
+            &generated.wl_compositor,
+        ),
+    };
+    const shell_resource: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shell_name,
+            generated.zwlr_layer_shell_v1.name,
+            advertised_version,
+            4,
+            &generated.zwlr_layer_shell_v1,
+        ),
+    };
+    const shm_resource: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shm_name,
+            generated.wl_shm.name,
+            2,
+            5,
+            &generated.wl_shm,
+        ),
+    };
+    try transferToLayerServer(&peer, client);
+    try transferFromLayerServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    const fd = try std.posix.memfd_create("keywork-layer-late-ack-test", std.os.linux.MFD.CLOEXEC);
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = std.os.linux.close(fd);
+    };
+    if (std.os.linux.errno(std.os.linux.ftruncate(fd, 64)) != .SUCCESS)
+        return error.TruncateFailed;
+    const pool = try generated.wl_shm_types.requests.create_pool(&peer, shm_resource, fd, 64);
+    fd_owned = false;
+    const buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        0,
+        4,
+        4,
+        16,
+        @intFromEnum(shm.Format.argb8888),
+    );
+    const surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor_resource,
+    );
+    const layer_surface = try generated.zwlr_layer_shell_v1_types.requests.get_layer_surface(
+        &peer,
+        shell_resource,
+        surface,
+        null,
+        @intFromEnum(generated.zwlr_layer_shell_v1_types.layer.top),
+        "keywork-late-ack-test",
+    );
+    try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 4, 4);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    var initial_transaction = compositor.popTransaction() orelse return error.MissingCommit;
+    defer initial_transaction.deinit();
+    const initial = (try shell.handleCommit(&initial_transaction.entries[0])).?;
+    try shell.apply(initial.staged orelse return error.MissingStagedInitialCommit);
+    try transferFromLayerServer(&peer, client);
+    var configure_serial: ?u32 = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != layer_surface.id) continue;
+        configure_serial = (try generated.zwlr_layer_surface_v1_types.decodeEvent(
+            &peer,
+            layer_surface,
+            &message,
+        )).configure.serial;
+    }
+
+    // The acknowledgement is intentionally after the commit in request
+    // order and must not authorize that already-captured buffer commit.
+    try generated.wl_surface_types.requests.attach(&peer, surface, buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try generated.zwlr_layer_surface_v1_types.requests.ack_configure(
+        &peer,
+        layer_surface,
+        configure_serial orelse return error.MissingConfigure,
+    );
+    try transferToLayerServer(&peer, client);
+    var late_transaction = compositor.popTransaction() orelse return error.MissingLateCommit;
+    defer late_transaction.deinit();
+    try std.testing.expectError(
+        error.ProtocolError,
+        shell.handleCommit(&late_transaction.entries[0]),
+    );
+    try std.testing.expectEqual(Server.ClientState.protocol_error, client.state);
 }
 
 fn transferToLayerServer(connection: *wayring.Connection, client: *Server.Client) !void {
