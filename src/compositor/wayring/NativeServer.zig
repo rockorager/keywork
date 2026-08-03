@@ -4019,7 +4019,7 @@ fn xdgOutputBounds(context: *anyopaque) render.Rect {
 fn layerShellChanged(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.repaint_needed = true;
-    self.refreshKeyboardFocus(null) catch self.terminate();
+    self.refreshInputFocus(inputTime(self)) catch self.terminate();
 }
 
 fn layerShellDeactivated(
@@ -4608,6 +4608,184 @@ test "native immediate repaint uses the next timer tick" {
     native.scheduleRepaint(0);
     try std.testing.expect(!native.event_loop.stop_requested);
     try std.testing.expect(native.repaint_timer.heap_index != null);
+}
+
+test "layer role deactivation reconciles pointer and touch focus" {
+    const core = @import("wayring-core");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const native = try NativeServer.create(std.testing.allocator, std.testing.io, .{
+        .runtime_directory = path_buffer[0..path_length],
+        .output_size = .{ .width = 8, .height = 4 },
+    });
+    defer native.destroy();
+
+    const client = try native.server.createClient();
+    var client_owned = true;
+    defer if (client_owned) native.server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var compositor_name: u32 = 0;
+    var seat_name: u32 = 0;
+    var layer_shell_name: u32 = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const global = (try core.decodeRegistryEvent(&message, registry.id)).global;
+        if (std.mem.eql(u8, global.interface, generated.wl_compositor.name))
+            compositor_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_seat.name))
+            seat_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.zwlr_layer_shell_v1.name))
+            layer_shell_name = global.name;
+    }
+    const compositor: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            compositor_name,
+            generated.wl_compositor.name,
+            6,
+            3,
+            &generated.wl_compositor,
+        ),
+    };
+    const seat: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            seat_name,
+            generated.wl_seat.name,
+            10,
+            4,
+            &generated.wl_seat,
+        ),
+    };
+    const layer_shell: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            layer_shell_name,
+            generated.zwlr_layer_shell_v1.name,
+            4,
+            5,
+            &generated.zwlr_layer_shell_v1,
+        ),
+    };
+    try testTransferToNative(&peer, client);
+    try native.seat_global.setPhysicalCapabilities(
+        SeatGlobal.Capability.pointer | SeatGlobal.Capability.touch,
+    );
+    const pointer = try generated.wl_seat_types.requests.get_pointer(&peer, seat);
+    const touch = try generated.wl_seat_types.requests.get_touch(&peer, seat);
+    const surface_handle = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor,
+    );
+    const layer_surface = try generated.zwlr_layer_shell_v1_types.requests.get_layer_surface(
+        &peer,
+        layer_shell,
+        surface_handle,
+        null,
+        @intFromEnum(generated.zwlr_layer_shell_v1_types.layer.overlay),
+        "keywork-input-teardown-test",
+    );
+    try generated.zwlr_layer_surface_v1_types.requests.set_size(
+        &peer,
+        layer_surface,
+        8,
+        4,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, surface_handle);
+    try testTransferToNative(&peer, client);
+    const surface = try testNativeSurface(client, surface_handle.id);
+    _ = try native.stateFor(surface);
+    const node = try native.surface_tree.nodeFor(surface);
+    var transaction = native.compositor_global.popTransaction() orelse
+        return error.MissingLayerCommit;
+    defer transaction.deinit();
+    const result = (try native.layer_shell.handleCommit(&transaction.entries[0])) orelse
+        return error.MissingLayerCommitResult;
+    const staged = result.staged orelse return error.MissingStagedLayerCommit;
+    node.current_active = true;
+
+    _ = try native.seat_global.pointerEnter(surface, 0, 0);
+    _ = try native.seat_global.touchDown(surface, 0, 1, 0, 0);
+    try surface.reference();
+    try native.touch_routes.append(native.allocator, .{
+        .device_id = 1,
+        .native_id = 1,
+        .protocol_id = 1,
+        .surface = surface,
+    });
+    try testDrainNativePeer(&peer, client);
+    try std.testing.expectEqual(surface, native.seat_global.pointerFocus().?);
+    try std.testing.expectEqual(@as(usize, 1), native.touch_routes.items.len);
+
+    try generated.zwlr_layer_surface_v1_types.requests.destroy(&peer, layer_surface);
+    try testTransferToNative(&peer, client);
+    try std.testing.expect(native.seat_global.pointerFocus() == null);
+    try std.testing.expectEqual(@as(usize, 0), native.touch_routes.items.len);
+
+    transaction.entries[0].fifo_set = true;
+    var pending_entries = [_]PendingEntry{.{
+        .prepared = true,
+        .protocol_prepared = true,
+        .release_needed = false,
+        .layer_shell_commit = staged,
+    }};
+    var pending: PendingTransaction = .{
+        .transaction = transaction,
+        .entries = &pending_entries,
+    };
+    try native.applyTransaction(&pending);
+    try std.testing.expect(pending.entries[0].skip_application);
+    try std.testing.expect(pending.entries[0].layer_shell_commit == null);
+    try std.testing.expect(native.fifoWaitReady(surface));
+
+    try testTransferFromNative(&peer, client);
+    var pointer_left = false;
+    var touch_cancelled = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == pointer.id) switch (try generated.wl_pointer_types.decodeEvent(
+            &peer,
+            pointer,
+            &message,
+        )) {
+            .leave => |leave| pointer_left = leave.surface == surface_handle.id,
+            else => {},
+        } else if (message.object_id == touch.id) switch (try generated.wl_touch_types.decodeEvent(
+            &peer,
+            touch,
+            &message,
+        )) {
+            .cancel => touch_cancelled = true,
+            else => {},
+        };
+    }
+    try std.testing.expect(pointer_left);
+    try std.testing.expect(touch_cancelled);
+
+    try native.server.destroyClient(client);
+    client_owned = false;
 }
 
 test "native XDG activation raises and focuses only proven mapped toplevels" {
