@@ -218,6 +218,7 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
     const item: *LayerSurface = @ptrCast(@alignCast(commit.surface.role_context orelse return .{}));
     if (!item.resource_alive) return .{ .disposition = .inert };
     const role_state = commit.takeRoleState(self);
+    if (role_state == null) return null;
     defer if (role_state) |value| value.deinit(value.context);
     const captured: ?*const CapturedState = if (role_state) |value|
         @ptrCast(@alignCast(value.context))
@@ -855,6 +856,7 @@ test "native layer surface configures transactionally and outlives its manager" 
         &peer,
         compositor_resource,
     );
+    try generated.wl_surface_types.requests.commit(&peer, surface);
     const layer_surface = try generated.zwlr_layer_shell_v1_types.requests.get_layer_surface(
         &peer,
         shell_resource,
@@ -874,6 +876,11 @@ test "native layer surface configures transactionally and outlives its manager" 
     try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToLayerServer(&peer, client);
+    var pre_role_transaction = compositor.popTransaction() orelse return error.MissingPreRoleCommit;
+    defer pre_role_transaction.deinit();
+    try std.testing.expect(
+        try shell.handleCommit(&pre_role_transaction.entries[0]) == null,
+    );
     var initial_transaction = compositor.popTransaction() orelse return error.MissingCommit;
     defer initial_transaction.deinit();
     const initial = (try shell.handleCommit(&initial_transaction.entries[0])).?;

@@ -2754,9 +2754,8 @@ fn surfaceLocal(
     x: f64,
     y: f64,
 ) ?struct { x: f64, y: f64 } {
-    if (!surface.resource_alive or self.findState(surface) == null) return null;
+    if (!self.surfaceActive(surface)) return null;
     const node = self.surface_tree.find(surface) orelse return null;
-    if (!node.current_active) return null;
     const position = SurfaceTree.globalPosition(node);
     return .{
         .x = x - @as(f64, @floatFromInt(position.x)),
@@ -2765,9 +2764,12 @@ fn surfaceLocal(
 }
 
 fn surfaceActive(self: *const NativeServer, surface: *const CompositorGlobal.Surface) bool {
-    if (!surface.resource_alive or self.findState(surface) == null) return false;
-    const node = self.surface_tree.find(surface) orelse return false;
-    return node.current_active;
+    var node = self.surface_tree.find(surface) orelse return false;
+    while (true) {
+        if (!node.current_active or !node.surface.resource_alive or
+            self.findState(node.surface) == null) return false;
+        node = node.parent orelse return true;
+    }
 }
 
 fn refreshIdleInhibition(self: *NativeServer) void {
@@ -4641,6 +4643,7 @@ test "layer role deactivation reconciles pointer and touch focus" {
     var compositor_name: u32 = 0;
     var seat_name: u32 = 0;
     var layer_shell_name: u32 = 0;
+    var subcompositor_name: u32 = 0;
     while (peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
@@ -4651,6 +4654,8 @@ test "layer role deactivation reconciles pointer and touch focus" {
             seat_name = global.name;
         if (std.mem.eql(u8, global.interface, generated.zwlr_layer_shell_v1.name))
             layer_shell_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_subcompositor.name))
+            subcompositor_name = global.name;
     }
     const compositor: wayring.ObjectHandle = .{
         .id = 3,
@@ -4688,6 +4693,18 @@ test "layer role deactivation reconciles pointer and touch focus" {
             &generated.zwlr_layer_shell_v1,
         ),
     };
+    const subcompositor: wayring.ObjectHandle = .{
+        .id = 6,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            subcompositor_name,
+            generated.wl_subcompositor.name,
+            1,
+            6,
+            &generated.wl_subcompositor,
+        ),
+    };
     try testTransferToNative(&peer, client);
     try native.seat_global.setPhysicalCapabilities(
         SeatGlobal.Capability.pointer | SeatGlobal.Capability.touch,
@@ -4697,6 +4714,16 @@ test "layer role deactivation reconciles pointer and touch focus" {
     const surface_handle = try generated.wl_compositor_types.requests.create_surface(
         &peer,
         compositor,
+    );
+    const child_handle = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor,
+    );
+    _ = try generated.wl_subcompositor_types.requests.get_subsurface(
+        &peer,
+        subcompositor,
+        child_handle,
+        surface_handle,
     );
     const layer_surface = try generated.zwlr_layer_shell_v1_types.requests.get_layer_surface(
         &peer,
@@ -4715,8 +4742,11 @@ test "layer role deactivation reconciles pointer and touch focus" {
     try generated.wl_surface_types.requests.commit(&peer, surface_handle);
     try testTransferToNative(&peer, client);
     const surface = try testNativeSurface(client, surface_handle.id);
+    const child = try testNativeSurface(client, child_handle.id);
     _ = try native.stateFor(surface);
+    _ = try native.stateFor(child);
     const node = try native.surface_tree.nodeFor(surface);
+    const child_node = try native.surface_tree.nodeFor(child);
     var transaction = native.compositor_global.popTransaction() orelse
         return error.MissingLayerCommit;
     defer transaction.deinit();
@@ -4724,23 +4754,31 @@ test "layer role deactivation reconciles pointer and touch focus" {
         return error.MissingLayerCommitResult;
     const staged = result.staged orelse return error.MissingStagedLayerCommit;
     node.current_active = true;
+    child_node.current_active = true;
 
-    _ = try native.seat_global.pointerEnter(surface, 0, 0);
-    _ = try native.seat_global.touchDown(surface, 0, 1, 0, 0);
-    try surface.reference();
+    _ = try native.seat_global.pointerEnter(child, 0, 0);
+    try native.routed_buttons.append(native.allocator, .{
+        .seat = &native.seat_global,
+        .source = .{ .physical = 1 },
+        .button = 0x110,
+    });
+    _ = try native.seat_global.touchDown(child, 0, 1, 0, 0);
+    try child.reference();
     try native.touch_routes.append(native.allocator, .{
         .device_id = 1,
         .native_id = 1,
         .protocol_id = 1,
-        .surface = surface,
+        .surface = child,
     });
     try testDrainNativePeer(&peer, client);
-    try std.testing.expectEqual(surface, native.seat_global.pointerFocus().?);
+    try std.testing.expectEqual(child, native.seat_global.pointerFocus().?);
+    try std.testing.expectEqual(@as(usize, 1), native.routed_buttons.items.len);
     try std.testing.expectEqual(@as(usize, 1), native.touch_routes.items.len);
 
     try generated.zwlr_layer_surface_v1_types.requests.destroy(&peer, layer_surface);
     try testTransferToNative(&peer, client);
     try std.testing.expect(native.seat_global.pointerFocus() == null);
+    try std.testing.expectEqual(@as(usize, 0), native.routed_buttons.items.len);
     try std.testing.expectEqual(@as(usize, 0), native.touch_routes.items.len);
 
     transaction.entries[0].fifo_set = true;
@@ -4770,7 +4808,7 @@ test "layer role deactivation reconciles pointer and touch focus" {
             pointer,
             &message,
         )) {
-            .leave => |leave| pointer_left = leave.surface == surface_handle.id,
+            .leave => |leave| pointer_left = leave.surface == child_handle.id,
             else => {},
         } else if (message.object_id == touch.id) switch (try generated.wl_touch_types.decodeEvent(
             &peer,
