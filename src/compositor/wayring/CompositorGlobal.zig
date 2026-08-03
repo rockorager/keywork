@@ -453,6 +453,16 @@ pub const Surface = struct {
         return self.explicit_sync_handler != null;
     }
 
+    /// Whether assigning a shell role is forbidden because a buffer is
+    /// already pending or committed on this surface.
+    pub fn hasBuffer(self: *const Surface) bool {
+        if (self.current_buffer_format != null) return true;
+        return switch (self.pending_attachment) {
+            .buffer => true,
+            .unchanged, .removed => false,
+        };
+    }
+
     pub fn setExplicitSyncHandler(self: *Surface, handler: ExplicitSyncHandler) !void {
         if (self.explicit_sync_handler != null) return error.AlreadyExists;
         self.explicit_sync_handler = handler;

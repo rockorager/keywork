@@ -54,6 +54,7 @@ const XdgDecorationGlobal = @import("XdgDecorationGlobal.zig");
 const XdgDialogGlobal = @import("XdgDialogGlobal.zig");
 const GtkShellGlobal = @import("GtkShellGlobal.zig");
 const XdgShell = @import("XdgShell.zig");
+const LayerShell = @import("LayerShell.zig");
 const ForeignToplevelListGlobal = @import("ForeignToplevelListGlobal.zig");
 const XdgSystemBellGlobal = @import("XdgSystemBellGlobal.zig");
 const XdgToplevelIconGlobal = @import("XdgToplevelIconGlobal.zig");
@@ -130,6 +131,7 @@ xdg_decoration_global: XdgDecorationGlobal,
 xdg_dialog_global: XdgDialogGlobal,
 gtk_shell_global: GtkShellGlobal,
 xdg_shell: XdgShell,
+layer_shell: LayerShell,
 foreign_toplevel_list_global: ForeignToplevelListGlobal,
 xdg_system_bell_global: XdgSystemBellGlobal,
 xdg_toplevel_icon_global: XdgToplevelIconGlobal,
@@ -359,6 +361,7 @@ const PendingEntry = struct {
     result: i32 = 0,
     cancel_requested: bool = false,
     direct_update: ?SurfaceTree.DirectUpdate = null,
+    layer_shell_commit: ?*LayerShell.StagedCommit = null,
     configure_only: bool = false,
 };
 
@@ -556,6 +559,14 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .model = self.output.model(),
     });
     errdefer self.output_global.deinit();
+    try self.layer_shell.init(
+        allocator,
+        &self.server,
+        &self.surface_tree,
+        &self.output_global,
+        .{ .context = self, .changed = layerShellChanged },
+    );
+    errdefer self.layer_shell.deinit();
     try self.xdg_output_global.init(
         allocator,
         &self.server,
@@ -998,6 +1009,7 @@ pub fn destroy(self: *NativeServer) void {
     self.presentation_global.deinit();
     self.screencopy_global.deinit();
     self.xdg_output_global.deinit();
+    self.layer_shell.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
     self.xdg_decoration_global.deinit();
@@ -2258,10 +2270,13 @@ fn refreshKeyboardFocus(
     preferred: ?*CompositorGlobal.Surface,
 ) !void {
     if (!self.seat_global.hasCapability(SeatGlobal.Capability.keyboard)) return;
-    const target = if (preferred) |surface|
-        if (self.surfaceActive(surface)) surface else try self.topmostRoot()
+    const target = self.layer_shell.exclusiveKeyboardSurface() orelse if (preferred) |surface|
+        if (self.surfaceActive(surface) and self.layer_shell.rootClass(surface) == .desktop)
+            surface
+        else
+            try self.topmostDesktopRoot()
     else
-        try self.topmostRoot();
+        try self.topmostDesktopRoot();
     if (self.seat_global.keyboardFocus() == target) {
         self.xdg_shell.setActivatedSurface(target);
         return;
@@ -2638,7 +2653,7 @@ fn hitTest(self: *NativeServer, x: f64, y: f64) !?Hit {
     return null;
 }
 
-fn topmostRoot(self: *NativeServer) !?*CompositorGlobal.Surface {
+fn topmostDesktopRoot(self: *NativeServer) !?*CompositorGlobal.Surface {
     try self.collectInputPaintEntries();
     var index = self.input_paint_entries.items.len;
     while (index > 0) {
@@ -2646,7 +2661,8 @@ fn topmostRoot(self: *NativeServer) !?*CompositorGlobal.Surface {
         const surface = self.input_paint_entries.items[index].surface;
         if (!surface.resource_alive or self.findState(surface) == null) continue;
         const node = self.surface_tree.find(surface) orelse continue;
-        return SurfaceTree.root(node).surface;
+        const root = SurfaceTree.root(node).surface;
+        if (self.layer_shell.rootClass(root) == .desktop) return root;
     }
     return null;
 }
@@ -2662,11 +2678,13 @@ fn activateToplevel(
 }
 
 fn raiseRoot(self: *NativeServer, root: *CompositorGlobal.Surface) bool {
+    if (self.layer_shell.rootClass(root) != .desktop) return false;
     var root_index: ?usize = null;
     var topmost_root_index: ?usize = null;
     for (self.surfaces.items, 0..) |state, index| {
         const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent != null or self.isCursorSurface(state.surface)) continue;
+        if (node.parent != null or self.isCursorSurface(state.surface) or
+            self.layer_shell.rootClass(state.surface) != .desktop) continue;
         topmost_root_index = index;
         if (state.surface == root) root_index = index;
     }
@@ -2679,10 +2697,17 @@ fn raiseRoot(self: *NativeServer, root: *CompositorGlobal.Surface) bool {
 
 fn collectInputPaintEntries(self: *NativeServer) !void {
     self.input_paint_entries.clearRetainingCapacity();
-    for (self.surfaces.items) |state| {
-        const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null and !self.isCursorSurface(state.surface))
-            try self.surface_tree.paint(node, &self.input_paint_entries);
+    try self.collectRootPaintEntries(&self.input_paint_entries);
+}
+
+fn collectRootPaintEntries(self: *NativeServer, entries: *std.ArrayList(SurfaceTree.PaintEntry)) !void {
+    inline for (std.meta.tags(LayerShell.RootClass)) |class| {
+        for (self.surfaces.items) |state| {
+            const node = self.surface_tree.find(state.surface) orelse continue;
+            if (node.parent == null and !self.isCursorSurface(state.surface) and
+                self.layer_shell.rootClass(state.surface) == class)
+                try self.surface_tree.paint(node, entries);
+        }
     }
 }
 
@@ -2893,6 +2918,11 @@ fn retainedRoot(self: *const NativeServer, surface: *CompositorGlobal.Surface) *
 }
 
 fn prepareCommit(self: *NativeServer, commit: *CompositorGlobal.Commit, entry: *PendingEntry) !bool {
+    if (try self.layer_shell.handleCommit(commit)) |result| {
+        entry.layer_shell_commit = result.staged;
+        entry.configure_only = result.disposition == .configure_only;
+        return commit.surface.client.state == .active;
+    }
     const result = try self.xdg_shell.handleCommit(commit);
     entry.direct_update = result.direct_update;
     entry.configure_only = result.disposition == .configure_only;
@@ -3367,6 +3397,13 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         if (entry.configure_only) continue;
         try self.applyEntry(commit, entry);
     }
+    var layer_shell_changed = false;
+    for (pending.entries) |*entry| if (entry.layer_shell_commit) |staged| {
+        entry.layer_shell_commit = null;
+        if (entry.copy_failed) staged.mapped = false;
+        try self.layer_shell.apply(staged);
+        layer_shell_changed = true;
+    };
     for (pending.transaction.hierarchy_updates) |update| update.apply(update.context);
     var has_direct_update = false;
     for (pending.transaction.entries, pending.entries) |*commit, *entry| if (entry.direct_update) |captured| {
@@ -3374,6 +3411,7 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         if (entry.copy_failed and commit.attachment == .buffer) {
             update.active = false;
             self.xdg_shell.deactivateFailedBuffer(commit.surface);
+            self.layer_shell.deactivateFailedBuffer(commit.surface);
         }
         const current = update.isCurrent();
         update.apply();
@@ -3384,6 +3422,10 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         has_direct_update = true;
     };
     try self.refreshInputFocus(inputTime(self));
+    if (layer_shell_changed) {
+        self.repaint_needed = true;
+        try self.refreshKeyboardFocus(null);
+    }
     const damage_state = if (!self.repaint_needed and
         pending.transaction.entries.len == 1 and
         pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
@@ -3503,6 +3545,7 @@ fn destroyPending(self: *NativeServer, index: usize) void {
         if (entry.event_fd >= 0) _ = linux.close(entry.event_fd);
         if (entry.copy) |copy| copy.deinit();
         if (entry.snapshot) |*snapshot| snapshot.deinit();
+        if (entry.layer_shell_commit) |staged| staged.discard();
     }
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
         if (entry.dmabuf_reference_held) {
@@ -3538,11 +3581,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     try commands.append(self.allocator, .{ .clear = render.Color.rgba(0, 0, 0, 0) });
     var paint_entries: std.ArrayList(SurfaceTree.PaintEntry) = .empty;
     defer paint_entries.deinit(self.allocator);
-    for (self.surfaces.items) |state| {
-        const node = self.surface_tree.find(state.surface) orelse continue;
-        if (node.parent == null and !self.isCursorSurface(state.surface))
-            try self.surface_tree.paint(node, &paint_entries);
-    }
+    try self.collectRootPaintEntries(&paint_entries);
     try self.appendSurfaceCommands(paint_entries.items, &commands);
     paint_entries.clearRetainingCapacity();
     const desktop_command_count = commands.items.len;
@@ -3928,8 +3967,13 @@ fn xdgSurfaceSize(context: *anyopaque, surface: *const CompositorGlobal.Surface)
 
 fn xdgOutputBounds(context: *anyopaque) render.Rect {
     const self: *const NativeServer = @ptrCast(@alignCast(context));
-    const size = self.output.logicalSize();
-    return .{ .x = 0, .y = 0, .width = size.width, .height = size.height };
+    return self.layer_shell.usableBounds();
+}
+
+fn layerShellChanged(context: *anyopaque) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.repaint_needed = true;
+    self.refreshKeyboardFocus(null) catch self.terminate();
 }
 
 fn pruneSurfaces(self: *NativeServer) bool {
