@@ -22,6 +22,7 @@ const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
+const OutputPowerGlobal = @import("OutputPowerGlobal.zig");
 const ScreencopyGlobal = @import("ScreencopyGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
@@ -99,6 +100,7 @@ surface_tree: SurfaceTree,
 subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 xdg_output_global: XdgOutputGlobal,
+output_power_global: OutputPowerGlobal,
 screencopy_global: ScreencopyGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
@@ -581,6 +583,18 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.output_global,
     );
     errdefer self.xdg_output_global.deinit();
+    try self.output_power_global.init(
+        allocator,
+        &self.server,
+        &self.output_global,
+        &self.security_context_global,
+        .{
+            .context = self,
+            .mode = outputPowerMode,
+            .set_mode = setOutputPowerMode,
+        },
+    );
+    errdefer self.output_power_global.deinit();
     try self.screencopy_global.init(
         allocator,
         &self.server,
@@ -1022,6 +1036,7 @@ pub fn destroy(self: *NativeServer) void {
     self.content_type_global.deinit();
     self.presentation_global.deinit();
     self.screencopy_global.deinit();
+    self.output_power_global.deinit();
     self.xdg_output_global.deinit();
     self.layer_shell.deinit();
     self.output_global.deinit();
@@ -1151,6 +1166,7 @@ fn drmOutputRemoving(context: *anyopaque, removed: *DrmOutput) void {
     } orelse return;
     if (selected != removed) return;
     self.terminating = true;
+    self.output_power_global.outputRemoved();
     self.screencopy_global.outputRemoved();
     removed.detach();
     self.output.drm = null;
@@ -1935,6 +1951,31 @@ fn scheduleIdleNotify(context: *anyopaque, delay_milliseconds: ?u64) void {
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
     self.repaint_needed = true;
     self.repaint_timer.arm(@max(delay_milliseconds, 1), 0) catch self.terminate();
+}
+
+fn outputPowerMode(context: *anyopaque) ?bool {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return null;
+    return switch (self.output) {
+        .headless => null,
+        .drm => |output| if (output) |drm_output| drm_output.powered else null,
+    };
+}
+
+fn setOutputPowerMode(context: *anyopaque, powered: bool) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return error.OutputUnavailable;
+    const output = switch (self.output) {
+        .headless => return error.Unsupported,
+        .drm => |output| output orelse return error.OutputUnavailable,
+    };
+    try self.drm_device.setOutputPowered(output, powered);
+    if (powered) {
+        self.scheduleRepaint(0);
+    } else {
+        self.repaint_needed = false;
+        self.repaint_timer.disarm();
+    }
 }
 
 fn screencopyConstraints(context: *anyopaque) ?render.Size {
