@@ -3634,6 +3634,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     // unmapped set->wait sequence from blocking its first buffer forever.
     self.clearFifoBarriers();
     self.submitPendingPresentation();
+    self.repaint_needed = false;
     self.screencopy_global.composedFrame(
         commands.items[0..desktop_command_count],
         commands.items,
@@ -3641,7 +3642,6 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
         self.output.modeSize(),
         presentation.Info.now(self.io).timestamp,
     );
-    self.repaint_needed = false;
     self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
     self.frame_count +%= 1;
@@ -5113,6 +5113,73 @@ test "native wlr screencopy streams whole-output SHM damage frames" {
     }
     try std.testing.expect(second_flags and second_damage and second_ready);
 
+    const failed_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    const queued_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(
+        &peer,
+        failed_frame,
+        buffer,
+    );
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(
+        &peer,
+        queued_frame,
+        buffer,
+    );
+    try testTransferToNative(&peer, client);
+    native.screencopy_global.listener.capture = failTestScreencopyCapture;
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expect(native.repaint_needed);
+    try testTransferFromNative(&peer, client);
+    var first_failed = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != failed_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(
+            &peer,
+            failed_frame,
+            &message,
+        )) {
+            .failed => first_failed = true,
+            else => return error.UnexpectedScreencopyFailureEvent,
+        }
+    }
+    try std.testing.expect(first_failed);
+
+    native.screencopy_global.listener.capture = captureScreencopy;
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expect(native.screencopy_global.hasPendingIo());
+    try testDrainScreencopy(native);
+    try testTransferFromNative(&peer, client);
+    var queued_ready = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != queued_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(
+            &peer,
+            queued_frame,
+            &message,
+        )) {
+            .flags => {},
+            .ready => queued_ready = true,
+            else => return error.UnexpectedQueuedScreencopyEvent,
+        }
+    }
+    try std.testing.expect(queued_ready);
+
     const canceled_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
         &peer,
         screencopy_manager,
@@ -5230,6 +5297,15 @@ fn testDrainScreencopy(native: *NativeServer) !void {
         if (attempts == 8) return error.ScreencopyDidNotComplete;
         try native.event_loop.ioLoop().runOnce();
     }
+}
+
+fn failTestScreencopyCapture(
+    _: *anyopaque,
+    _: []const render.Command,
+    _: render.Scale,
+    _: render.PixelBuffer,
+) !?std.posix.fd_t {
+    return error.TestCaptureFailure;
 }
 
 fn testTransferToNative(
