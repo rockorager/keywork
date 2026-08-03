@@ -564,7 +564,11 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.server,
         &self.surface_tree,
         &self.output_global,
-        .{ .context = self, .changed = layerShellChanged },
+        .{
+            .context = self,
+            .changed = layerShellChanged,
+            .surface_size = xdgSurfaceSize,
+        },
     );
     errdefer self.layer_shell.deinit();
     try self.xdg_output_global.init(

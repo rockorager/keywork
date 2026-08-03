@@ -463,6 +463,10 @@ pub const Surface = struct {
         };
     }
 
+    pub fn pendingBufferRemoved(self: *const Surface) bool {
+        return self.pending_attachment == .removed;
+    }
+
     pub fn setExplicitSyncHandler(self: *Surface, handler: ExplicitSyncHandler) !void {
         if (self.explicit_sync_handler != null) return error.AlreadyExists;
         self.explicit_sync_handler = handler;

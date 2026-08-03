@@ -25,6 +25,7 @@ surfaces: std.ArrayList(*LayerSurface) = .empty,
 pub const Listener = struct {
     context: *anyopaque,
     changed: *const fn (*anyopaque) void,
+    surface_size: *const fn (*anyopaque, *const CompositorGlobal.Surface) ?render.Size,
 };
 
 pub const Layer = enum(u2) { background, bottom, top, overlay };
@@ -195,12 +196,26 @@ pub fn usableBounds(self: *const LayerShell) render.Rect {
 pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?CommitResult {
     if (commit.surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return null;
     const item: *LayerSurface = @ptrCast(@alignCast(commit.surface.role_context orelse return .{}));
+    if (!item.resource_alive) return .{};
     const role_state = commit.takeRoleState(self);
     defer if (role_state) |value| value.deinit(value.context);
     const state = if (role_state) |value| @as(*CapturedState, @ptrCast(@alignCast(value.context))).state else item.current;
     if (!validState(state)) {
         try postLayerError(item, .invalid_size, "invalid layer surface size or anchor");
         return .{};
+    }
+    if (commit.attachment == .removed) {
+        _ = try self.tree.nodeFor(item.surface);
+        const staged = try self.allocator.create(StagedCommit);
+        errdefer self.allocator.destroy(staged);
+        try item.reference();
+        staged.* = .{
+            .allocator = self.allocator,
+            .item = item,
+            .state = .{ .layer = item.initial_layer },
+            .mapped = false,
+        };
+        return .{ .staged = staged };
     }
     if (!item.initial_configure_sent) {
         if (commit.attachment == .buffer) {
@@ -234,14 +249,6 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
             .unchanged => item.mapped,
         },
     };
-    if (commit.attachment == .removed) {
-        // Reset protocol-pending state now so commits submitted after this
-        // unmap start from construction defaults even if application waits.
-        item.pending = .{ .layer = item.initial_layer };
-        item.configured = false;
-        item.initial_configure_sent = false;
-        item.configures.clearRetainingCapacity();
-    }
     return .{ .staged = staged };
 }
 
@@ -264,14 +271,22 @@ fn arrange(self: *LayerShell) !void {
     // the final usable rectangle.
     for (self.surfaces.items) |item| if (item.mapped and item.current.exclusive_zone > 0) {
         const node = try self.tree.nodeFor(item.surface);
-        const geometry = geometryFor(item.current, full);
+        const geometry = geometryForSize(
+            item.current,
+            full,
+            self.listener.surface_size(self.listener.context, item.surface),
+        );
         var update = try self.tree.captureDirect(node, .{ .x = geometry.x, .y = geometry.y }, true);
         update.apply();
         reserve(&usable, item.current);
     };
     for (self.surfaces.items) |item| if (item.mapped and item.current.exclusive_zone <= 0) {
         const bounds = if (item.current.exclusive_zone == -1) render.Rect{ .x = 0, .y = 0, .width = full.width, .height = full.height } else usable;
-        const geometry = geometryIn(item.current, bounds);
+        const geometry = geometryInSize(
+            item.current,
+            bounds,
+            self.listener.surface_size(self.listener.context, item.surface),
+        );
         const node = try self.tree.nodeFor(item.surface);
         var update = try self.tree.captureDirect(node, .{ .x = geometry.x, .y = geometry.y }, true);
         update.apply();
@@ -402,6 +417,15 @@ fn captureCommit(context: *anyopaque) !?CompositorGlobal.RoleCommitState {
     const item: *LayerSurface = @ptrCast(@alignCast(context));
     const captured = try item.allocator.create(CapturedState);
     captured.* = .{ .allocator = item.allocator, .state = item.pending };
+    if (item.surface.pendingBufferRemoved()) {
+        // Request dispatch may capture multiple commits before the first is
+        // prepared. Reset now so a same-batch remap captures construction
+        // defaults rather than the pre-unmap pending role state.
+        item.pending = .{ .layer = item.initial_layer };
+        item.configured = false;
+        item.initial_configure_sent = false;
+        item.configures.clearRetainingCapacity();
+    }
     return .{ .owner = item.binding.owner, .context = captured, .deinit = CapturedState.destroy };
 }
 
@@ -421,20 +445,76 @@ fn validState(state: State) bool {
 }
 
 fn geometryFor(state: State, output: render.Size) render.Rect {
-    return geometryIn(state, .{ .x = 0, .y = 0, .width = output.width, .height = output.height });
+    return geometryForSize(state, output, null);
 }
 
 fn geometryIn(state: State, bounds: render.Rect) render.Rect {
+    return geometryInSize(state, bounds, null);
+}
+
+fn geometryForSize(state: State, output: render.Size, content_size: ?render.Size) render.Rect {
+    return geometryInSize(
+        state,
+        .{ .x = 0, .y = 0, .width = output.width, .height = output.height },
+        content_size,
+    );
+}
+
+fn geometryInSize(state: State, bounds: render.Rect, content_size: ?render.Size) render.Rect {
     const output: render.Size = .{ .width = bounds.width, .height = bounds.height };
-    var width = if (state.width == 0) output.width else @min(output.width, state.width);
-    var height = if (state.height == 0) output.height else @min(output.height, state.height);
-    if (state.width == 0) width -|= @intCast(@max(0, state.margin_left) +| @max(0, state.margin_right));
-    if (state.height == 0) height -|= @intCast(@max(0, state.margin_top) +| @max(0, state.margin_bottom));
-    var x: i32 = @divTrunc(@as(i32, @intCast(output.width - width)), 2);
-    var y: i32 = @divTrunc(@as(i32, @intCast(output.height - height)), 2);
-    if (state.anchor & 4 != 0) x = state.margin_left else if (state.anchor & 8 != 0) x = @as(i32, @intCast(output.width - width)) -| state.margin_right;
-    if (state.anchor & 1 != 0) y = state.margin_top else if (state.anchor & 2 != 0) y = @as(i32, @intCast(output.height - height)) -| state.margin_bottom;
+    var width = if (content_size) |size|
+        @min(output.width, size.width)
+    else if (state.width == 0)
+        output.width
+    else
+        @min(output.width, state.width);
+    var height = if (content_size) |size|
+        @min(output.height, size.height)
+    else if (state.height == 0)
+        output.height
+    else
+        @min(output.height, state.height);
+    if (content_size == null and state.width == 0)
+        width -|= @intCast(@max(0, state.margin_left) +| @max(0, state.margin_right));
+    if (content_size == null and state.height == 0)
+        height -|= @intCast(@max(0, state.margin_top) +| @max(0, state.margin_bottom));
+    const x = axisPosition(
+        output.width,
+        width,
+        state.margin_left,
+        state.margin_right,
+        state.anchor & 4 != 0,
+        state.anchor & 8 != 0,
+    );
+    const y = axisPosition(
+        output.height,
+        height,
+        state.margin_top,
+        state.margin_bottom,
+        state.anchor & 1 != 0,
+        state.anchor & 2 != 0,
+    );
     return .{ .x = x +| bounds.x, .y = y +| bounds.y, .width = width, .height = height };
+}
+
+fn axisPosition(
+    extent: u32,
+    content: u32,
+    start_margin: i32,
+    end_margin: i32,
+    anchored_start: bool,
+    anchored_end: bool,
+) i32 {
+    const available: i64 = @as(i64, extent) - start_margin - end_margin - content;
+    const position: i64 = if (anchored_start and anchored_end)
+        @as(i64, start_margin) + @divTrunc(available, 2)
+    else if (anchored_start)
+        start_margin
+    else if (anchored_end)
+        @as(i64, extent) - content - end_margin
+    else
+        @divTrunc(@as(i64, extent) - content, 2);
+    return @intCast(std.math.clamp(position, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
 fn exclusiveEdge(state: State) ?u32 {
@@ -488,12 +568,31 @@ test "geometry covers shell placements and exclusive usable area edge" {
     reserve(&usable, .{ .anchor = 1 | 4 | 8, .exclusive_zone = 40, .margin_top = 8, .layer = .top });
     try std.testing.expectEqual(render.Rect{ .x = 0, .y = 48, .width = 1280, .height = 672 }, usable);
     try std.testing.expectEqual(render.Rect{ .x = 440, .y = 284, .width = 400, .height = 200 }, geometryIn(.{ .width = 400, .height = 200, .layer = .overlay }, usable));
+    try std.testing.expectEqual(
+        render.Rect{ .x = 140, .y = 0, .width = 1000, .height = 40 },
+        geometryForSize(
+            .{ .width = 0, .height = 40, .anchor = 1 | 4 | 8, .layer = .top },
+            output,
+            .{ .width = 1000, .height = 40 },
+        ),
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 880, .y = 16, .width = 380, .height = 180 },
+        geometryForSize(
+            .{ .width = 380, .height = 200, .anchor = 1 | 8, .margin_top = 16, .margin_right = 20, .layer = .overlay },
+            output,
+            .{ .width = 380, .height = 180 },
+        ),
+    );
 }
 
 test "native layer surface configures transactionally and outlives its manager" {
     const core = @import("wayring-core");
     const Changed = struct {
         fn changed(_: *anyopaque) void {}
+        fn surfaceSize(_: *anyopaque, _: *const CompositorGlobal.Surface) ?render.Size {
+            return null;
+        }
     };
 
     var server = Server.init(std.testing.allocator);
@@ -521,7 +620,11 @@ test "native layer surface configures transactionally and outlives its manager" 
         &server,
         &tree,
         &output,
-        .{ .context = &shell, .changed = Changed.changed },
+        .{
+            .context = &shell,
+            .changed = Changed.changed,
+            .surface_size = Changed.surfaceSize,
+        },
     );
     defer shell.deinit();
     const client = try server.createClient();
@@ -636,10 +739,35 @@ test "native layer surface configures transactionally and outlives its manager" 
     try shell.apply(staged);
     try std.testing.expectEqual(@as(u32, 48), shell.surfaces.items[0].current.height);
 
+    // Both commits arrive in one server receive turn. The null-buffer commit
+    // resets pending role state before the following remap commit captures it.
+    try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 200, 50);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    try std.testing.expectEqual(@as(u32, 200), shell.surfaces.items[0].pending.width);
+    try std.testing.expectEqual(@as(u32, 50), shell.surfaces.items[0].pending.height);
+    var unmap_transaction = compositor.popTransaction() orelse return error.MissingUnmapCommit;
+    defer unmap_transaction.deinit();
+    const unmap = (try shell.handleCommit(&unmap_transaction.entries[0])).?;
+    try shell.apply(unmap.staged orelse return error.MissingStagedUnmap);
+    var remap_transaction = compositor.popTransaction() orelse return error.MissingRemapCommit;
+    defer remap_transaction.deinit();
+    try std.testing.expectEqual(
+        .configure_only,
+        (try shell.handleCommit(&remap_transaction.entries[0])).?.disposition,
+    );
+
     try generated.zwlr_layer_shell_v1_types.requests.destroy(&peer, shell_resource);
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 1), shell.surfaces.items.len);
     try generated.zwlr_layer_surface_v1_types.requests.destroy(&peer, layer_surface);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    var inert_transaction = compositor.popTransaction() orelse return error.MissingInertCommit;
+    defer inert_transaction.deinit();
+    try std.testing.expect((try shell.handleCommit(&inert_transaction.entries[0])) != null);
     try generated.wl_surface_types.requests.destroy(&peer, surface);
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 0), shell.surfaces.items.len);
