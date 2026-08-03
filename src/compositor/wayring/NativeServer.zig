@@ -1029,7 +1029,8 @@ fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
     try self.progressTransactions();
     self.discardDeadFrameCallbacks();
     const pruned = self.pruneSurfaces();
-    if (pruned) try self.refreshInputFocus(inputTime(self));
+    if (pruned or self.surface_tree.needsRedraw())
+        try self.refreshInputFocus(inputTime(self));
     if (pruned or self.surface_tree.needsRedraw() or self.repaint_needed)
         try self.renderScene(null);
     // A successful latch may be the only event that releases a blocked wait.
@@ -4760,6 +4761,41 @@ test "native XDG activation raises and focuses only proven mapped toplevels" {
     try std.testing.expect(native.pruneSurfaces());
     try std.testing.expectEqual(first_state, native.surfaces.items[0]);
     try std.testing.expectEqual(second_state, native.surfaces.items[1]);
+
+    try testDrainNativePeer(&peer, client);
+    try generated.xdg_toplevel_types.requests.destroy(&peer, second_toplevel);
+    try testTransferToNative(&peer, client);
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expectEqual(first, native.seat_global.keyboardFocus().?);
+    try testTransferFromNative(&peer, client);
+    var left_destroyed_role = false;
+    var entered_remaining_toplevel = false;
+    var remaining_toplevel_activated = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == keyboard.id) switch (try generated.wl_keyboard_types.decodeEvent(
+            &peer,
+            keyboard,
+            &message,
+        )) {
+            .leave => |leave| left_destroyed_role = leave.surface == second_surface.id,
+            .enter => |enter| entered_remaining_toplevel = enter.surface == first_surface.id,
+            else => {},
+        } else if (message.object_id == first_toplevel.id) switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            first_toplevel,
+            &message,
+        )) {
+            .configure => |configure| remaining_toplevel_activated = testConfigureActivated(
+                configure.states,
+            ),
+            else => {},
+        };
+    }
+    try std.testing.expect(left_destroyed_role);
+    try std.testing.expect(entered_remaining_toplevel);
+    try std.testing.expect(remaining_toplevel_activated);
 
     try native.server.destroyClient(client);
     client_owned = false;
