@@ -28,6 +28,7 @@ surfaces: std.ArrayList(*LayerSurface) = .empty,
 pub const Listener = struct {
     context: *anyopaque,
     changed: *const fn (*anyopaque) void,
+    deactivated: *const fn (*anyopaque, *CompositorGlobal.Surface) void,
     surface_size: *const fn (*anyopaque, *const CompositorGlobal.Surface) ?render.Size,
 };
 
@@ -48,6 +49,10 @@ pub const StagedCommit = struct {
     pub fn discard(self: *StagedCommit) void {
         self.item.unreference();
         self.allocator.destroy(self);
+    }
+
+    pub fn isApplicable(self: *const StagedCommit) bool {
+        return self.item.surface_alive and self.item.resource_alive;
     }
 };
 
@@ -585,8 +590,14 @@ fn destroyLayerSurface(context: *anyopaque, _: *Server.Client, _: wayring.Object
     const item: *LayerSurface = @ptrCast(@alignCast(context));
     item.resource_alive = false;
     item.mapped = false;
-    if (item.surface.role_commit_handler != null)
-        item.surface.clearRoleCommitHandler(item);
+    if (item.surface_alive) {
+        if (item.surface.role_commit_handler != null)
+            item.surface.clearRoleCommitHandler(item);
+        item.binding.owner.listener.deactivated(
+            item.binding.owner.listener.context,
+            item.surface,
+        );
+    }
     item.binding.owner.arrange() catch {};
     item.binding.owner.listener.changed(item.binding.owner.listener.context);
     item.releaseLifetime();
@@ -653,7 +664,13 @@ test "geometry covers shell placements and exclusive usable area edge" {
 test "native layer surface configures transactionally and outlives its manager" {
     const core = @import("wayring-core");
     const Changed = struct {
+        deactivated_count: usize = 0,
+
         fn changed(_: *anyopaque) void {}
+        fn deactivated(context: *anyopaque, _: *CompositorGlobal.Surface) void {
+            const tracking: *@This() = @ptrCast(@alignCast(context));
+            tracking.deactivated_count += 1;
+        }
         fn surfaceSize(_: *anyopaque, _: *const CompositorGlobal.Surface) ?render.Size {
             return null;
         }
@@ -686,6 +703,7 @@ test "native layer surface configures transactionally and outlives its manager" 
     var tree = SurfaceTree.init(std.testing.allocator);
     defer tree.deinit();
     var shell: LayerShell = undefined;
+    var changed: Changed = .{};
     try shell.init(
         std.testing.allocator,
         &server,
@@ -693,8 +711,9 @@ test "native layer surface configures transactionally and outlives its manager" 
         &output,
         &security,
         .{
-            .context = &shell,
+            .context = &changed,
             .changed = Changed.changed,
+            .deactivated = Changed.deactivated,
             .surface_size = Changed.surfaceSize,
         },
     );
@@ -937,7 +956,47 @@ test "native layer surface configures transactionally and outlives its manager" 
     try generated.zwlr_layer_shell_v1_types.requests.destroy(&peer, shell_resource);
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 1), shell.surfaces.items.len);
+
+    try transferFromLayerServer(&peer, client);
+    configure_serial = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != layer_surface.id) continue;
+        configure_serial = (try generated.zwlr_layer_surface_v1_types.decodeEvent(
+            &peer,
+            layer_surface,
+            &message,
+        )).configure.serial;
+    }
+    try generated.zwlr_layer_surface_v1_types.requests.ack_configure(
+        &peer,
+        layer_surface,
+        configure_serial orelse return error.MissingRemapConfigure,
+    );
+    try generated.wl_surface_types.requests.attach(&peer, surface, buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    var mapped_transaction = compositor.popTransaction() orelse return error.MissingMappedCommit;
+    defer mapped_transaction.deinit();
+    const mapped = (try shell.handleCommit(&mapped_transaction.entries[0])).?;
+    try shell.apply(mapped.staged orelse return error.MissingStagedMappedCommit);
+    try std.testing.expect(shell.surfaces.items[0].mapped);
+
+    try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 300, 60);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    var stale_transaction = compositor.popTransaction() orelse return error.MissingStaleCommit;
+    defer stale_transaction.deinit();
+    const stale_result = (try shell.handleCommit(&stale_transaction.entries[0])).?;
+    const stale = stale_result.staged orelse return error.MissingStagedStaleCommit;
+    try std.testing.expect(stale.isApplicable());
     try generated.zwlr_layer_surface_v1_types.requests.destroy(&peer, layer_surface);
+    try transferToLayerServer(&peer, client);
+    try std.testing.expectEqual(@as(usize, 1), changed.deactivated_count);
+    try std.testing.expect(!stale.isApplicable());
+    stale.discard();
+
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToLayerServer(&peer, client);
     var inert_transaction = compositor.popTransaction() orelse return error.MissingInertCommit;

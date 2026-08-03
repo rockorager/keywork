@@ -570,6 +570,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         .{
             .context = self,
             .changed = layerShellChanged,
+            .deactivated = layerShellDeactivated,
             .surface_size = xdgSurfaceSize,
         },
     );
@@ -3425,6 +3426,13 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         };
     try self.frame_callbacks.ensureUnusedCapacity(self.allocator, callback_batch_count);
     try self.presentation_pending.ensureUnusedCapacity(self.allocator, feedback_batch_count);
+    for (pending.entries) |*entry| if (entry.layer_shell_commit) |staged| {
+        if (!staged.isApplicable()) {
+            staged.discard();
+            entry.layer_shell_commit = null;
+            entry.skip_application = true;
+        }
+    };
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
         if (entry.skip_application) continue;
@@ -4012,6 +4020,28 @@ fn layerShellChanged(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.repaint_needed = true;
     self.refreshKeyboardFocus(null) catch self.terminate();
+}
+
+fn layerShellDeactivated(
+    context: *anyopaque,
+    surface: *CompositorGlobal.Surface,
+) void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.deactivateLayerSurface(surface) catch self.terminate();
+}
+
+fn deactivateLayerSurface(
+    self: *NativeServer,
+    surface: *CompositorGlobal.Surface,
+) !void {
+    const state = self.findState(surface) orelse return;
+    if (state.snapshot) |*snapshot| snapshot.deinit();
+    state.snapshot = null;
+    if (state.dmabuf) |*dmabuf| dmabuf.deinit(surface.client, true);
+    state.dmabuf = null;
+    state.fifo_barrier = false;
+    self.discardPendingPresentationFor(surface);
+    try self.output_global.setSurfaceVisible(surface, false);
 }
 
 fn pruneSurfaces(self: *NativeServer) bool {
