@@ -125,6 +125,8 @@ const Toplevel = struct {
     resource: wayring.ObjectHandle,
     id: ToplevelId,
     published: bool = false,
+    activated: bool = false,
+    activation_pending: bool = false,
     title: ?[]u8 = null,
     app_id: ?[]u8 = null,
     tag: ?[]u8 = null,
@@ -334,27 +336,97 @@ pub fn toplevelInfo(self: *const XdgShell, id: ToplevelId) ?ToplevelInfo {
     return null;
 }
 
-/// Publishes the effective visibility only after its retained-tree update has
-/// applied. Failed publication leaves the toplevel unpublished.
-pub fn applied(self: *XdgShell, surface: *CompositorGlobal.Surface, active: bool) !void {
-    if (surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return;
-    const xdg_surface: *XdgSurface = @ptrCast(@alignCast(surface.role_context orelse return));
-    if (xdg_surface.binding.owner != self or xdg_surface.role != .toplevel) return;
-    const toplevel = xdg_surface.role.toplevel;
-    if (active == toplevel.published) return;
-    if (active) {
+/// Publishes effective visibility only after its retained-tree update has
+/// applied and returns one deferred activation exactly once. Failed
+/// publication leaves both publication and deferred activation intact.
+pub fn applied(self: *XdgShell, surface: *CompositorGlobal.Surface, active: bool) !bool {
+    const toplevel = self.toplevelForSurface(surface) orelse return false;
+    if (!active) {
+        toplevel.activation_pending = false;
+        const send_deactivated = toplevel.activated and
+            toplevel.xdg_surface.initial_configure_sent;
+        toplevel.activated = false;
+        if (toplevel.published) {
+            toplevel.published = false;
+            if (self.toplevel_observer) |observer|
+                observer.unpublished(observer.context, toplevel.id);
+        }
+        // A configure emitted after the unmap commit's captured boundary is
+        // retained for the next map. Supersede activated state rather than
+        // silently clearing only the compositor's copy.
+        if (send_deactivated)
+            sendToplevelConfigure(toplevel.xdg_surface, false) catch {};
+        return false;
+    }
+    if (!toplevel.published) {
         toplevel.published = true;
         errdefer toplevel.published = false;
         if (self.toplevel_observer) |observer|
             try observer.published(observer.context, toplevel.id);
-    } else {
-        toplevel.published = false;
-        if (self.toplevel_observer) |observer|
-            observer.unpublished(observer.context, toplevel.id);
     }
+    const activation_pending = toplevel.activation_pending;
+    toplevel.activation_pending = false;
+    return activation_pending;
+}
+
+/// Returns true only for the exact root wl_surface of a live XDG toplevel.
+pub fn isToplevelSurface(
+    self: *XdgShell,
+    surface: *const CompositorGlobal.Surface,
+) bool {
+    return self.toplevelForSurface(surface) != null;
+}
+
+/// Defers a proven activation until the retained-tree mapping becomes active.
+pub fn deferActivation(
+    self: *XdgShell,
+    surface: *CompositorGlobal.Surface,
+) bool {
+    const toplevel = self.toplevelForSurface(surface) orelse return false;
+    toplevel.activation_pending = true;
+    return true;
+}
+
+/// Synchronizes xdg_toplevel.activated with default-seat keyboard focus.
+/// Per-client configure failures poison only that client and do not prevent
+/// the remaining toplevels from converging on the compositor-owned state.
+pub fn setActivatedSurface(
+    self: *XdgShell,
+    surface: ?*CompositorGlobal.Surface,
+) void {
+    const target = if (surface) |value| self.toplevelForSurface(value) else null;
+    var activated_count: usize = 0;
+    for (self.toplevels.items) |toplevel| {
+        const activated = toplevel == target and toplevel.published;
+        if (toplevel.activated == activated) continue;
+        toplevel.activated = activated;
+        if (toplevel.published and toplevel.xdg_surface.initial_configure_sent)
+            sendToplevelConfigure(toplevel.xdg_surface, false) catch {};
+        if (activated) activated_count += 1;
+    }
+    if (activated_count == 0) {
+        for (self.toplevels.items) |toplevel| {
+            if (toplevel.activated) activated_count += 1;
+        }
+    }
+    std.debug.assert(activated_count <= 1);
+}
+
+fn toplevelForSurface(
+    self: *const XdgShell,
+    surface: *const CompositorGlobal.Surface,
+) ?*Toplevel {
+    if (surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return null;
+    const xdg_surface: *XdgSurface = @ptrCast(@alignCast(surface.role_context orelse return null));
+    if (xdg_surface.binding.owner != self or xdg_surface.role != .toplevel) return null;
+    const toplevel = xdg_surface.role.toplevel;
+    if (toplevel.xdg_surface != xdg_surface) return null;
+    return toplevel;
 }
 
 fn unpublish(self: *XdgShell, toplevel: *Toplevel) void {
+    toplevel.activation_pending = false;
+    toplevel.activated = false;
     if (!toplevel.published) return;
     toplevel.published = false;
     if (self.toplevel_observer) |observer| observer.unpublished(observer.context, toplevel.id);
@@ -1482,6 +1554,7 @@ fn sendToplevelConfigure(xdg_surface: *XdgSurface, initial: bool) !void {
         .none, .popup => unreachable,
     };
     const client = xdg_surface.surface.client;
+    if (!xdg_surface.resource_alive or client.state != .active) return;
     xdg_surface.configures.ensureUnusedCapacity(xdg_surface.allocator, 1) catch
         return client.postNoMemory();
     if (initial) {
@@ -1504,12 +1577,19 @@ fn sendToplevelConfigure(xdg_surface: *XdgSurface, initial: bool) !void {
     }
     if (xdg_surface.binding.owner.toplevel_configure_handler) |handler|
         try handler.configure(handler.context, xdg_surface.surface);
+    const activated_state = [_]u32{@intFromEnum(
+        generated.xdg_toplevel_types.state.activated,
+    )};
+    const states: []const u8 = if (toplevel.activated)
+        std.mem.sliceAsBytes(activated_state[0..])
+    else
+        &.{};
     generated.xdg_toplevel_types.events.configure(
         &client.connection,
         toplevel.resource,
         0,
         0,
-        &.{},
+        states,
     ) catch return client.postNoMemory();
     const serial = xdg_surface.surface.owner.server.nextSerial();
     generated.xdg_surface_types.events.configure(
@@ -1851,6 +1931,83 @@ test "native xdg popups map nested trees and apply reposition on acked commit" {
     const parent_server_surface = try serverSurface(client, parent_surface.id);
     const parent_node = tree.find(parent_server_surface) orelse return error.MissingParentNode;
     try std.testing.expect(parent_node.current_active);
+    try std.testing.expect(shell.isToplevelSurface(parent_server_surface));
+    try std.testing.expect(shell.deferActivation(parent_server_surface));
+    try std.testing.expect(try shell.applied(parent_server_surface, true));
+    try std.testing.expect(!try shell.applied(parent_server_surface, true));
+    shell.setActivatedSurface(parent_server_surface);
+    try transferFromServer(&peer, client);
+    var activated_serial: ?u32 = null;
+    var saw_activated = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == parent_toplevel.id) switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            parent_toplevel,
+            &message,
+        )) {
+            .configure => |configure| {
+                const activated_state: u32 = @intFromEnum(
+                    generated.xdg_toplevel_types.state.activated,
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.asBytes(&activated_state),
+                    configure.states,
+                );
+                saw_activated = true;
+            },
+            else => {},
+        } else if (message.object_id == parent_xdg.id) {
+            activated_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                parent_xdg,
+                &message,
+            )).configure.serial;
+        } else if (message.object_id == parent_buffer.id) {
+            _ = try generated.wl_buffer_types.decodeEvent(&peer, parent_buffer, &message);
+        }
+    }
+    try std.testing.expect(saw_activated);
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        parent_xdg,
+        activated_serial orelse return error.MissingActivatedConfigure,
+    );
+    try transferToServer(&peer, client);
+    shell.setActivatedSurface(null);
+    try transferFromServer(&peer, client);
+    var deactivated_serial: ?u32 = null;
+    var saw_deactivated = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == parent_toplevel.id) switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            parent_toplevel,
+            &message,
+        )) {
+            .configure => |configure| {
+                try std.testing.expectEqual(@as(usize, 0), configure.states.len);
+                saw_deactivated = true;
+            },
+            else => {},
+        } else if (message.object_id == parent_xdg.id) {
+            deactivated_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                parent_xdg,
+                &message,
+            )).configure.serial;
+        }
+    }
+    try std.testing.expect(saw_deactivated);
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        parent_xdg,
+        deactivated_serial orelse return error.MissingDeactivatedConfigure,
+    );
+    try transferToServer(&peer, client);
 
     const positioner = try generated.xdg_wm_base_types.requests.create_positioner(&peer, wm_base);
     try generated.xdg_positioner_types.requests.set_size(&peer, positioner, 40, 30);

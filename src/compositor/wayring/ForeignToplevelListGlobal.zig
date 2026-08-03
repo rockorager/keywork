@@ -310,7 +310,7 @@ test "foreign toplevel list publishes applied XDG mapping episodes" {
     try std.testing.expect(peer.popMessage() == null);
 
     const server_surface = try testServerSurface(client, surface.id);
-    try shell.applied(server_surface, true);
+    _ = try shell.applied(server_surface, true);
     try testTransferFromServer(&peer, client);
     const first = try testSnapshot(&peer, list_handle, "Initial title", "org.example.App");
     try std.testing.expectEqualStrings("keywork-1", first.identifier[0..first.identifier_len]);
@@ -355,7 +355,7 @@ test "foreign toplevel list publishes applied XDG mapping episodes" {
     defer app_done.deinit();
     try std.testing.expect((try generated.ext_foreign_toplevel_handle_v1_types.decodeEvent(&peer, first.handle, &app_done)) == .done);
 
-    try shell.applied(server_surface, false);
+    _ = try shell.applied(server_surface, false);
     try testTransferFromServer(&peer, client);
     var closed_message = peer.popMessage() orelse return error.MissingClosed;
     defer closed_message.deinit();
@@ -363,7 +363,7 @@ test "foreign toplevel list publishes applied XDG mapping episodes" {
 
     // A remap creates a fresh episode. A new list receives it through initial
     // replay, and destroying that handle never recreates it for the episode.
-    try shell.applied(server_surface, true);
+    _ = try shell.applied(server_surface, true);
     const list_two: wayring.ObjectHandle = .{
         .id = 20,
         .generation = try core.bind(
@@ -398,8 +398,8 @@ test "foreign toplevel list publishes applied XDG mapping episodes" {
     var second_finished = peer.popMessage() orelse return error.MissingFinished;
     defer second_finished.deinit();
     try std.testing.expect((try generated.ext_foreign_toplevel_list_v1_types.decodeEvent(&peer, list_two, &second_finished)) == .finished);
-    try shell.applied(server_surface, false);
-    try shell.applied(server_surface, true);
+    _ = try shell.applied(server_surface, false);
+    _ = try shell.applied(server_surface, true);
     try testTransferFromServer(&peer, client);
     try std.testing.expect(peer.popMessage() == null);
 

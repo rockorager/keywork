@@ -8,6 +8,7 @@ const NativeServer = @This();
 const std = @import("std");
 const linux = std.os.linux;
 const wayring = @import("wayring");
+const generated = @import("wayring-protocols");
 const keywork_loop = @import("keywork-loop");
 const Server = @import("wayring-server");
 const IoUringServer = @import("wayring-server-uring");
@@ -622,7 +623,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.seat_global,
         activation_token_key,
         .{ .context = self, .now = idleNotifyNow },
-        null,
+        .{ .context = self, .requested = xdgActivationRequested },
     );
     errdefer self.xdg_activation_global.deinit();
     try self.idle_notify_global.init(
@@ -1199,6 +1200,27 @@ fn virtualInputActivity(context: *anyopaque) void {
 fn virtualInputFailed(context: *anyopaque) void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.terminate();
+}
+
+fn xdgActivationRequested(
+    context: *anyopaque,
+    surface: *CompositorGlobal.Surface,
+    proven_interaction: bool,
+) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    // Attention/urgency publication is deferred to native workspace parity.
+    // Unproven requests must never steal focus in the meantime.
+    if (!proven_interaction) return;
+    const root = if (self.surface_tree.find(surface)) |node|
+        SurfaceTree.root(node).surface
+    else
+        surface;
+    if (!self.xdg_shell.isToplevelSurface(root)) return;
+    if (!self.surfaceActive(root)) {
+        _ = self.xdg_shell.deferActivation(root);
+        return;
+    }
+    try self.activateToplevel(root);
 }
 
 fn virtualKeyboardCapabilityChanged(context: *anyopaque, seat: *SeatGlobal) void {
@@ -1882,6 +1904,7 @@ fn refreshKeyboardCapability(self: *NativeServer, seat: *SeatGlobal) !void {
         try self.refreshKeyboardFocus(null);
         return;
     }
+    self.xdg_shell.setActivatedSurface(null);
     try self.data_device_global.setKeyboardFocus(null);
     try self.primary_selection_global.setKeyboardFocus(null);
     self.last_keyboard_serial = 0;
@@ -2168,9 +2191,13 @@ fn refreshKeyboardFocus(
         if (self.surfaceActive(surface)) surface else try self.topmostRoot()
     else
         try self.topmostRoot();
-    if (self.seat_global.keyboardFocus() == target) return;
+    if (self.seat_global.keyboardFocus() == target) {
+        self.xdg_shell.setActivatedSurface(target);
+        return;
+    }
     if (target == null) {
         _ = try self.seat_global.keyboardLeave();
+        self.xdg_shell.setActivatedSurface(null);
         try self.data_device_global.setKeyboardFocus(null);
         try self.primary_selection_global.setKeyboardFocus(null);
         self.last_keyboard_serial = 0;
@@ -2189,6 +2216,7 @@ fn refreshKeyboardFocus(
     );
     self.last_keyboard_serial = serial;
     try self.seat_global.sendCurrentKeyboardModifiers(serial);
+    self.xdg_shell.setActivatedSurface(target);
     try self.data_device_global.setKeyboardFocus(target.?.client);
     try self.primary_selection_global.setKeyboardFocus(target.?.client);
 }
@@ -2550,6 +2578,32 @@ fn topmostRoot(self: *NativeServer) !?*CompositorGlobal.Surface {
         return SurfaceTree.root(node).surface;
     }
     return null;
+}
+
+fn activateToplevel(
+    self: *NativeServer,
+    root: *CompositorGlobal.Surface,
+) !void {
+    std.debug.assert(self.surfaceActive(root));
+    std.debug.assert(self.xdg_shell.isToplevelSurface(root));
+    if (self.raiseRoot(root)) self.repaint_needed = true;
+    try self.refreshKeyboardFocus(root);
+}
+
+fn raiseRoot(self: *NativeServer, root: *CompositorGlobal.Surface) bool {
+    var root_index: ?usize = null;
+    var topmost_root_index: ?usize = null;
+    for (self.surfaces.items, 0..) |state, index| {
+        const node = self.surface_tree.find(state.surface) orelse continue;
+        if (node.parent != null or self.isCursorSurface(state.surface)) continue;
+        topmost_root_index = index;
+        if (state.surface == root) root_index = index;
+    }
+    const index = root_index orelse return false;
+    if (topmost_root_index == index) return false;
+    const state = self.surfaces.orderedRemove(index);
+    self.surfaces.appendAssumeCapacity(state);
+    return true;
 }
 
 fn collectInputPaintEntries(self: *NativeServer) !void {
@@ -3252,7 +3306,10 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
         }
         const current = update.isCurrent();
         update.apply();
-        if (current) try self.xdg_shell.applied(commit.surface, update.active);
+        if (current) {
+            const activate = try self.xdg_shell.applied(commit.surface, update.active);
+            if (activate) try self.activateToplevel(commit.surface);
+        }
         has_direct_update = true;
     };
     try self.refreshInputFocus(inputTime(self));
@@ -3813,7 +3870,7 @@ fn pruneSurfaces(self: *NativeServer) bool {
         }
         self.output_global.setSurfaceVisible(state.surface, false) catch {};
         state.deinit(self.allocator);
-        _ = self.surfaces.swapRemove(index);
+        _ = self.surfaces.orderedRemove(index);
         removed = true;
     }
     return removed;
@@ -4362,6 +4419,352 @@ test "native immediate repaint uses the next timer tick" {
     try std.testing.expect(native.repaint_timer.heap_index != null);
 }
 
+test "native XDG activation raises and focuses only proven mapped toplevels" {
+    const core = @import("wayring-core");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const native = try NativeServer.create(std.testing.allocator, std.testing.io, .{
+        .runtime_directory = path_buffer[0..path_length],
+        .output_size = .{ .width = 8, .height = 4 },
+    });
+    defer native.destroy();
+
+    const client = try native.server.createClient();
+    var client_owned = true;
+    defer if (client_owned) native.server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var compositor_name: u32 = 0;
+    var shell_name: u32 = 0;
+    var seat_name: u32 = 0;
+    var activation_name: u32 = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const global = (try core.decodeRegistryEvent(&message, registry.id)).global;
+        if (std.mem.eql(u8, global.interface, generated.wl_compositor.name))
+            compositor_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.xdg_wm_base.name))
+            shell_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_seat.name))
+            seat_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.xdg_activation_v1.name))
+            activation_name = global.name;
+    }
+    const compositor: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            compositor_name,
+            generated.wl_compositor.name,
+            6,
+            3,
+            &generated.wl_compositor,
+        ),
+    };
+    const shell: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shell_name,
+            generated.xdg_wm_base.name,
+            6,
+            4,
+            &generated.xdg_wm_base,
+        ),
+    };
+    const seat: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            seat_name,
+            generated.wl_seat.name,
+            10,
+            5,
+            &generated.wl_seat,
+        ),
+    };
+    const activation: wayring.ObjectHandle = .{
+        .id = 6,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            activation_name,
+            generated.xdg_activation_v1.name,
+            1,
+            6,
+            &generated.xdg_activation_v1,
+        ),
+    };
+    try testTransferToNative(&peer, client);
+    try native.seat_global.setPhysicalCapabilities(SeatGlobal.Capability.keyboard);
+    const keyboard = try generated.wl_seat_types.requests.get_keyboard(&peer, seat);
+    try testTransferToNative(&peer, client);
+
+    const first_surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor,
+    );
+    const first_xdg = try generated.xdg_wm_base_types.requests.get_xdg_surface(
+        &peer,
+        shell,
+        first_surface,
+    );
+    const first_toplevel = try generated.xdg_surface_types.requests.get_toplevel(
+        &peer,
+        first_xdg,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, first_surface);
+    const second_surface = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor,
+    );
+    const second_xdg = try generated.xdg_wm_base_types.requests.get_xdg_surface(
+        &peer,
+        shell,
+        second_surface,
+    );
+    const second_toplevel = try generated.xdg_surface_types.requests.get_toplevel(
+        &peer,
+        second_xdg,
+    );
+    try generated.wl_surface_types.requests.commit(&peer, second_surface);
+    try testTransferToNative(&peer, client);
+    try testConfigureNextToplevel(native);
+    try testConfigureNextToplevel(native);
+    try testTransferFromNative(&peer, client);
+    var first_serial: ?u32 = null;
+    var second_serial: ?u32 = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == first_toplevel.id) {
+            _ = try generated.xdg_toplevel_types.decodeEvent(&peer, first_toplevel, &message);
+        } else if (message.object_id == second_toplevel.id) {
+            _ = try generated.xdg_toplevel_types.decodeEvent(&peer, second_toplevel, &message);
+        } else if (message.object_id == first_xdg.id) {
+            first_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                first_xdg,
+                &message,
+            )).configure.serial;
+        } else if (message.object_id == second_xdg.id) {
+            second_serial = (try generated.xdg_surface_types.decodeEvent(
+                &peer,
+                second_xdg,
+                &message,
+            )).configure.serial;
+        }
+    }
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        first_xdg,
+        first_serial orelse return error.MissingFirstConfigure,
+    );
+    try generated.xdg_surface_types.requests.ack_configure(
+        &peer,
+        second_xdg,
+        second_serial orelse return error.MissingSecondConfigure,
+    );
+    try testTransferToNative(&peer, client);
+
+    const first = try testNativeSurface(client, first_surface.id);
+    const second = try testNativeSurface(client, second_surface.id);
+    const first_state = try native.stateFor(first);
+    const second_state = try native.stateFor(second);
+    const first_node = try native.surface_tree.nodeFor(first);
+    const second_node = try native.surface_tree.nodeFor(second);
+    first_node.current_active = true;
+    second_node.current_active = true;
+    _ = try native.xdg_shell.applied(first, true);
+    _ = try native.xdg_shell.applied(second, true);
+    try native.refreshKeyboardCapability(&native.seat_global);
+    try std.testing.expectEqual(second, native.seat_global.keyboardFocus().?);
+    try std.testing.expectEqual(first_state, native.surfaces.items[0]);
+    try std.testing.expectEqual(second_state, native.surfaces.items[1]);
+    try testTransferFromNative(&peer, client);
+    var focus_serial: ?u32 = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != keyboard.id) continue;
+        switch (try generated.wl_keyboard_types.decodeEvent(&peer, keyboard, &message)) {
+            .enter => |enter| focus_serial = enter.serial,
+            else => {},
+        }
+    }
+    const proven_serial = focus_serial orelse return error.MissingActivationFocusSerial;
+
+    native.repaint_needed = false;
+    const unproven_resource = try generated.xdg_activation_v1_types.requests.get_activation_token(
+        &peer,
+        activation,
+    );
+    try generated.xdg_activation_token_v1_types.requests.commit(&peer, unproven_resource);
+    try testTransferToNative(&peer, client);
+    const unproven_token = try testReceiveActivationToken(&peer, client, unproven_resource);
+    try generated.xdg_activation_v1_types.requests.activate(
+        &peer,
+        activation,
+        &unproven_token,
+        first_surface,
+    );
+    try testTransferToNative(&peer, client);
+    try std.testing.expectEqual(second, native.seat_global.keyboardFocus().?);
+    try std.testing.expectEqual(first_state, native.surfaces.items[0]);
+    try std.testing.expect(!native.repaint_needed);
+    try testTransferFromNative(&peer, client);
+    try std.testing.expect(peer.popMessage() == null);
+
+    const proven_resource = try generated.xdg_activation_v1_types.requests.get_activation_token(
+        &peer,
+        activation,
+    );
+    try generated.xdg_activation_token_v1_types.requests.set_serial(
+        &peer,
+        proven_resource,
+        proven_serial,
+        seat,
+    );
+    try generated.xdg_activation_token_v1_types.requests.set_surface(
+        &peer,
+        proven_resource,
+        second_surface,
+    );
+    try generated.xdg_activation_token_v1_types.requests.commit(&peer, proven_resource);
+    try testTransferToNative(&peer, client);
+    const proven_token = try testReceiveActivationToken(&peer, client, proven_resource);
+    try generated.xdg_activation_v1_types.requests.activate(
+        &peer,
+        activation,
+        &proven_token,
+        first_surface,
+    );
+    try testTransferToNative(&peer, client);
+    try std.testing.expectEqual(first, native.seat_global.keyboardFocus().?);
+    try std.testing.expectEqual(second_state, native.surfaces.items[0]);
+    try std.testing.expectEqual(first_state, native.surfaces.items[1]);
+    try std.testing.expect(native.repaint_needed);
+    try testTransferFromNative(&peer, client);
+    var first_activated = false;
+    var second_deactivated = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == first_toplevel.id) switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            first_toplevel,
+            &message,
+        )) {
+            .configure => |configure| first_activated = testConfigureActivated(configure.states),
+            else => {},
+        } else if (message.object_id == second_toplevel.id) switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            second_toplevel,
+            &message,
+        )) {
+            .configure => |configure| second_deactivated = configure.states.len == 0,
+            else => {},
+        };
+    }
+    try std.testing.expect(first_activated and second_deactivated);
+
+    second_node.current_active = false;
+    native.repaint_needed = false;
+    try xdgActivationRequested(native, second, true);
+    try std.testing.expectEqual(first, native.seat_global.keyboardFocus().?);
+    try std.testing.expectEqual(first_state, native.surfaces.items[1]);
+    try std.testing.expect(!native.repaint_needed);
+    second_node.current_active = true;
+    try std.testing.expect(try native.xdg_shell.applied(second, true));
+    try native.activateToplevel(second);
+    try std.testing.expect(!try native.xdg_shell.applied(second, true));
+    try std.testing.expectEqual(second, native.seat_global.keyboardFocus().?);
+    try std.testing.expectEqual(second_state, native.surfaces.items[1]);
+
+    try testDrainNativePeer(&peer, client);
+    try generated.wl_surface_types.requests.attach(&peer, first_surface, null, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, first_surface);
+    try testTransferToNative(&peer, client);
+    native.xdg_shell.setActivatedSurface(first);
+    var unmap = native.compositor_global.popTransaction() orelse
+        return error.MissingUnmapCommit;
+    defer {
+        unmap.releaseBuffers();
+        unmap.deinit();
+    }
+    const unmap_result = try native.xdg_shell.handleCommit(&unmap.entries[0]);
+    var unmap_update = unmap_result.direct_update orelse
+        return error.MissingUnmapUpdate;
+    try std.testing.expect(unmap_update.isCurrent());
+    unmap_update.apply();
+    try std.testing.expect(!try native.xdg_shell.applied(first, false));
+    try testTransferFromNative(&peer, client);
+    var first_state_count: usize = 0;
+    var first_configure_states: [2]bool = undefined;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != first_toplevel.id) continue;
+        switch (try generated.xdg_toplevel_types.decodeEvent(
+            &peer,
+            first_toplevel,
+            &message,
+        )) {
+            .configure => |configure| {
+                if (first_state_count < first_configure_states.len)
+                    first_configure_states[first_state_count] = testConfigureActivated(
+                        configure.states,
+                    );
+                first_state_count += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), first_state_count);
+    try std.testing.expect(first_configure_states[0]);
+    try std.testing.expect(!first_configure_states[1]);
+
+    try xdgActivationRequested(native, first, true);
+    try std.testing.expect(!try native.xdg_shell.applied(first, false));
+    first_node.current_active = true;
+    try std.testing.expect(!try native.xdg_shell.applied(first, true));
+
+    const disposable_handle = try generated.wl_compositor_types.requests.create_surface(
+        &peer,
+        compositor,
+    );
+    try testTransferToNative(&peer, client);
+    const disposable = try testNativeSurface(client, disposable_handle.id);
+    const disposable_state = try native.stateFor(disposable);
+    _ = native.surfaces.orderedRemove(2);
+    native.surfaces.insertAssumeCapacity(1, disposable_state);
+    try generated.wl_surface_types.requests.destroy(&peer, disposable_handle);
+    try testTransferToNative(&peer, client);
+    try std.testing.expect(native.pruneSurfaces());
+    try std.testing.expectEqual(first_state, native.surfaces.items[0]);
+    try std.testing.expectEqual(second_state, native.surfaces.items[1]);
+
+    try native.server.destroyClient(client);
+    client_owned = false;
+}
+
 test "native compositor owns and drains its io_uring listener" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -4385,4 +4788,89 @@ test "native compositor owns and drains its io_uring listener" {
 fn stopTestServer(context: *anyopaque, _: *EventLoop, _: u64) !void {
     const self: *NativeServer = @ptrCast(@alignCast(context));
     self.terminate();
+}
+
+fn testConfigureNextToplevel(native: *NativeServer) !void {
+    var transaction = native.compositor_global.popTransaction() orelse
+        return error.MissingToplevelCommit;
+    defer {
+        transaction.releaseBuffers();
+        transaction.deinit();
+    }
+    if (transaction.entries.len != 1) return error.UnexpectedToplevelTransaction;
+    try std.testing.expectEqual(
+        .configure_only,
+        (try native.xdg_shell.handleCommit(&transaction.entries[0])).disposition,
+    );
+}
+
+fn testNativeSurface(
+    client: *Server.Client,
+    id: u32,
+) !*CompositorGlobal.Surface {
+    const object = client.connection.object(id) orelse return error.MissingNativeSurface;
+    return CompositorGlobal.surfaceFor(client, .{ .id = id, .generation = object.generation });
+}
+
+fn testConfigureActivated(states: []const u8) bool {
+    if (states.len != @sizeOf(u32)) return false;
+    const activated: u32 = @intFromEnum(generated.xdg_toplevel_types.state.activated);
+    return std.mem.eql(u8, states, std.mem.asBytes(&activated));
+}
+
+fn testReceiveActivationToken(
+    peer: *wayring.Connection,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+) ![32]u8 {
+    try testTransferFromNative(peer, client);
+    var token: [32]u8 = undefined;
+    var found = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != resource.id) continue;
+        const event = try generated.xdg_activation_token_v1_types.decodeEvent(
+            peer,
+            resource,
+            &message,
+        );
+        if (event.done.token.len != token.len) return error.UnexpectedActivationTokenLength;
+        @memcpy(&token, event.done.token);
+        found = true;
+    }
+    if (!found) return error.MissingActivationToken;
+    return token;
+}
+
+fn testDrainNativePeer(
+    peer: *wayring.Connection,
+    client: *Server.Client,
+) !void {
+    try testTransferFromNative(peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+}
+
+fn testTransferToNative(
+    connection: *wayring.Connection,
+    client: *Server.Client,
+) !void {
+    while (connection.nextBatch()) |batch| {
+        try client.receive(batch.bytes, batch.fds);
+        try connection.acknowledge(batch.token, batch.bytes.len);
+    }
+}
+
+fn testTransferFromNative(
+    connection: *wayring.Connection,
+    client: *Server.Client,
+) !void {
+    while (client.connection.nextBatch()) |batch| {
+        try connection.feed(batch.bytes, batch.fds);
+        try client.connection.acknowledge(batch.token, batch.bytes.len);
+    }
+    try client.outputDrained();
 }
