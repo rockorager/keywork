@@ -15,7 +15,7 @@ output: *OutputGlobal,
 listener: Listener,
 global_name: u32,
 serial: u32 = 1,
-next_snapshot_id: u64 = 1,
+next_binding_id: u64 = 1,
 scale: render.Scale,
 managers: std.ArrayList(*Manager) = .empty,
 heads: std.ArrayList(*Head) = .empty,
@@ -27,14 +27,16 @@ pub const Listener = struct {
     validate: *const fn (*anyopaque, render.Size, render.Scale) anyerror!void,
     resize: *const fn (*anyopaque, render.Size, render.Scale) anyerror!bool,
 };
-const Manager = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, stopped: bool = false };
-const Head = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, manager: ?*Manager, snapshot_id: u64, mode: ?*Mode = null };
-const Mode = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, manager: ?*Manager, snapshot_id: u64, head: ?*Head = null };
+const Manager = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, binding_id: u64, last_serial: ?u32 = null, stopped: bool = false };
+const Head = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, manager: ?*Manager, binding_id: u64, mode: ?*Mode = null };
+const Mode = struct { owner: *OutputManagementGlobal, client: *Server.Client, resource: wayring.ObjectHandle, manager: ?*Manager, binding_id: u64, size: render.Size, refresh: i32, head: ?*Head = null };
 const Config = struct {
     owner: *OutputManagementGlobal,
     client: *Server.Client,
     resource: wayring.ObjectHandle,
     serial: u32,
+    binding_id: u64,
+    serial_valid: bool,
     used: bool = false,
     configured: bool = false,
     disabled: bool = false,
@@ -44,7 +46,7 @@ const ConfigHead = struct {
     owner: *OutputManagementGlobal,
     config: ?*Config,
     resource: wayring.ObjectHandle,
-    snapshot_id: u64,
+    binding_id: u64,
     mode_set: bool = false,
     size: ?render.Size = null,
     refresh: i32 = 0,
@@ -85,13 +87,17 @@ fn bind(ctx: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
     var manager_owned = true;
     errdefer if (manager_owned) self.allocator.destroy(manager);
     self.managers.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
-    manager.* = .{ .owner = self, .client = client, .resource = undefined };
+    if (self.next_binding_id == std.math.maxInt(u64)) return client.postNoMemory();
+    const binding_id = self.next_binding_id;
+    self.next_binding_id += 1;
+    manager.* = .{ .owner = self, .client = client, .resource = undefined, .binding_id = binding_id };
     manager.resource = client.createResource(id, &generated.zwlr_output_manager_v1, version, .{ .context = manager, .dispatch = dispatchManager, .destroy = destroyManager }) catch return client.postNoMemory();
     self.managers.appendAssumeCapacity(manager);
     manager_owned = false;
     errdefer client.destroyResource(manager.resource) catch {};
     createHead(manager) catch return client.postNoMemory();
     generated.zwlr_output_manager_v1_types.events.done(&client.connection, manager.resource, self.serial) catch return client.postNoMemory();
+    manager.last_serial = self.serial;
 }
 
 fn createHead(manager: *Manager) !void {
@@ -105,14 +111,19 @@ fn createHead(manager: *Manager) !void {
     try self.heads.ensureUnusedCapacity(self.allocator, 1);
     try self.modes.ensureUnusedCapacity(self.allocator, 1);
     const version = try manager.client.resourceVersion(manager.resource, &generated.zwlr_output_manager_v1);
-    const snapshot_id = self.next_snapshot_id;
-    self.next_snapshot_id +%= 1;
-    if (self.next_snapshot_id == 0) self.next_snapshot_id = 1;
-    head.* = .{ .owner = self, .client = manager.client, .resource = undefined, .manager = manager, .snapshot_id = snapshot_id };
+    head.* = .{ .owner = self, .client = manager.client, .resource = undefined, .manager = manager, .binding_id = manager.binding_id };
     head.resource = try manager.client.createServerResource(&generated.zwlr_output_head_v1, version, .{ .context = head, .dispatch = dispatchHead, .destroy = destroyHead });
     self.heads.appendAssumeCapacity(head);
     head_owned = false;
-    mode.* = .{ .owner = self, .client = manager.client, .resource = undefined, .manager = manager, .snapshot_id = snapshot_id };
+    mode.* = .{
+        .owner = self,
+        .client = manager.client,
+        .resource = undefined,
+        .manager = manager,
+        .binding_id = manager.binding_id,
+        .size = self.output.currentMode(),
+        .refresh = self.output.currentRefreshMillihertz(),
+    };
     mode.resource = manager.client.createServerResource(&generated.zwlr_output_mode_v1, @min(version, 3), .{ .context = mode, .dispatch = dispatchMode, .destroy = destroyMode }) catch |err| {
         manager.client.destroyResource(head.resource) catch {};
         return err;
@@ -149,9 +160,12 @@ fn sendMode(mode: *Mode) !void {
     const o = mode.owner.output;
     const c = &mode.client.connection;
     const size = o.currentMode();
+    const refresh = o.currentRefreshMillihertz();
     try generated.zwlr_output_mode_v1_types.events.size(c, mode.resource, @intCast(size.width), @intCast(size.height));
-    try generated.zwlr_output_mode_v1_types.events.refresh(c, mode.resource, o.currentRefreshMillihertz());
+    try generated.zwlr_output_mode_v1_types.events.refresh(c, mode.resource, refresh);
     try generated.zwlr_output_mode_v1_types.events.preferred(c, mode.resource);
+    mode.size = size;
+    mode.refresh = refresh;
 }
 fn dispatchManager(ctx: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, msg: *wayring.Message) !void {
     const m: *Manager = @ptrCast(@alignCast(ctx));
@@ -159,8 +173,8 @@ fn dispatchManager(ctx: *anyopaque, client: *Server.Client, resource: wayring.Ob
         .create_configuration => |r| try createConfig(m, r.id, r.serial),
         .stop => {
             m.stopped = true;
-            try generated.zwlr_output_manager_v1_types.events.finished(&client.connection, resource);
-            try client.destroyResource(resource);
+            generated.zwlr_output_manager_v1_types.events.finished(&client.connection, resource) catch return client.postNoMemory();
+            client.destroyResource(resource) catch return client.postNoMemory();
         },
     }
 }
@@ -169,7 +183,14 @@ fn createConfig(manager: *Manager, id: u32, serial: u32) !void {
     const c = self.allocator.create(Config) catch return manager.client.postNoMemory();
     errdefer self.allocator.destroy(c);
     self.configs.ensureUnusedCapacity(self.allocator, 1) catch return manager.client.postNoMemory();
-    c.* = .{ .owner = self, .client = manager.client, .resource = undefined, .serial = serial };
+    c.* = .{
+        .owner = self,
+        .client = manager.client,
+        .resource = undefined,
+        .serial = serial,
+        .binding_id = manager.binding_id,
+        .serial_valid = manager.last_serial == serial and self.serial == serial,
+    };
     const version = try manager.client.resourceVersion(manager.resource, &generated.zwlr_output_manager_v1);
     c.resource = manager.client.createResource(id, &generated.zwlr_output_configuration_v1, version, .{ .context = c, .dispatch = dispatchConfig, .destroy = destroyConfig }) catch return manager.client.postNoMemory();
     self.configs.appendAssumeCapacity(c);
@@ -182,12 +203,14 @@ fn dispatchConfig(ctx: *anyopaque, client: *Server.Client, resource: wayring.Obj
             if (c.used) return client.postError(resource, @intFromEnum(E.already_used), "configuration already used");
             if (c.configured) return client.postError(resource, @intFromEnum(E.already_configured_head), "head already configured");
             const h = findHead(c.owner, client, r.head) orelse return client.postError(resource, @intFromEnum(E.already_configured_head), "invalid head");
-            try createConfigHead(c, r.id, h.snapshot_id);
+            if (h.binding_id != c.binding_id) return client.postError(resource, @intFromEnum(E.already_configured_head), "head belongs to another manager binding");
+            try createConfigHead(c, r.id, h.binding_id);
             c.configured = true;
         },
         .disable_head => |r| {
             if (c.used) return client.postError(resource, @intFromEnum(E.already_used), "configuration already used");
-            _ = findHead(c.owner, client, r.head) orelse return client.postError(resource, @intFromEnum(E.already_configured_head), "invalid head");
+            const h = findHead(c.owner, client, r.head) orelse return client.postError(resource, @intFromEnum(E.already_configured_head), "invalid head");
+            if (h.binding_id != c.binding_id) return client.postError(resource, @intFromEnum(E.already_configured_head), "head belongs to another manager binding");
             if (c.configured) return client.postError(resource, @intFromEnum(E.already_configured_head), "head already configured");
             c.configured = true;
             c.disabled = true;
@@ -197,10 +220,10 @@ fn dispatchConfig(ctx: *anyopaque, client: *Server.Client, resource: wayring.Obj
         .destroy => {},
     }
 }
-fn createConfigHead(c: *Config, id: u32, snapshot_id: u64) !void {
+fn createConfigHead(c: *Config, id: u32, binding_id: u64) !void {
     const h = c.owner.allocator.create(ConfigHead) catch return c.client.postNoMemory();
     errdefer c.owner.allocator.destroy(h);
-    h.* = .{ .owner = c.owner, .config = c, .resource = undefined, .snapshot_id = snapshot_id };
+    h.* = .{ .owner = c.owner, .config = c, .resource = undefined, .binding_id = binding_id };
     const version = try c.client.resourceVersion(c.resource, &generated.zwlr_output_configuration_v1);
     h.resource = c.client.createResource(id, &generated.zwlr_output_configuration_head_v1, version, .{ .context = h, .dispatch = dispatchConfigHead, .destroy = destroyConfigHead }) catch return c.client.postNoMemory();
     c.child = h;
@@ -214,9 +237,10 @@ fn dispatchConfigHead(ctx: *anyopaque, client: *Server.Client, resource: wayring
             if (config.used) return client.postError(config.resource, @intFromEnum(generated.zwlr_output_configuration_v1_types.@"error".already_used), "configuration already used");
             if (h.mode_set) return client.postError(resource, @intFromEnum(E.already_set), "mode already set");
             const m = findMode(config.owner, client, r.mode) orelse return client.postError(resource, @intFromEnum(E.invalid_mode), "invalid mode");
-            if (m.snapshot_id != h.snapshot_id) return client.postError(resource, @intFromEnum(E.invalid_mode), "mode does not belong to head");
+            if (m.binding_id != h.binding_id) return client.postError(resource, @intFromEnum(E.invalid_mode), "mode does not belong to head");
             h.mode_set = true;
-            h.size = m.owner.output.currentMode();
+            h.size = m.size;
+            h.refresh = m.refresh;
         },
         .set_custom_mode => |r| {
             if (config.used) return client.postError(config.resource, @intFromEnum(generated.zwlr_output_configuration_v1_types.@"error".already_used), "configuration already used");
@@ -260,18 +284,27 @@ fn finishConfig(c: *Config, apply: bool) !void {
     if (c.used) return c.client.postError(c.resource, @intFromEnum(E.already_used), "configuration already used");
     c.used = true;
     if (!c.configured) return c.client.postError(c.resource, @intFromEnum(E.unconfigured_head), "head not configured");
-    if (c.serial != c.owner.serial) return generated.zwlr_output_configuration_v1_types.events.cancelled(&c.client.connection, c.resource);
+    if (!c.serial_valid or c.serial != c.owner.serial)
+        return generated.zwlr_output_configuration_v1_types.events.cancelled(&c.client.connection, c.resource) catch c.client.postNoMemory();
     const h = c.child;
-    if (c.disabled or h == null or !valid(h.?)) return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource);
+    if (c.disabled or h == null or !valid(h.?))
+        return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource) catch c.client.postNoMemory();
     const size = h.?.size orelse c.owner.output.currentMode();
     const scale: render.Scale = h.?.scale orelse c.owner.scale;
-    c.owner.listener.validate(c.owner.listener.context, size, scale) catch return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource);
-    if (!apply) return generated.zwlr_output_configuration_v1_types.events.succeeded(&c.client.connection, c.resource);
-    const changed = c.owner.listener.resize(c.owner.listener.context, size, scale) catch return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource);
+    c.owner.listener.validate(c.owner.listener.context, size, scale) catch
+        return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource) catch c.client.postNoMemory();
+    if (!apply)
+        return generated.zwlr_output_configuration_v1_types.events.succeeded(&c.client.connection, c.resource) catch c.client.postNoMemory();
+    const changed = c.owner.listener.resize(c.owner.listener.context, size, scale) catch
+        return generated.zwlr_output_configuration_v1_types.events.failed(&c.client.connection, c.resource) catch c.client.postNoMemory();
     if (changed) {
         c.owner.scale = scale;
-        c.owner.serial +%= 1;
-        if (c.owner.serial == 0) c.owner.serial = 1;
+        if (c.owner.serial == std.math.maxInt(u32)) {
+            for (c.owner.configs.items) |config| config.serial_valid = false;
+            c.owner.serial = 1;
+        } else {
+            c.owner.serial += 1;
+        }
         for (c.owner.modes.items) |m| {
             if (m.manager == null or m.manager.?.stopped) continue;
             sendMode(m) catch m.client.postNoMemory() catch {};
@@ -283,9 +316,14 @@ fn finishConfig(c: *Config, apply: bool) !void {
             const mode = head.mode orelse continue;
             generated.zwlr_output_head_v1_types.events.current_mode(&head.client.connection, head.resource, mode.resource) catch head.client.postNoMemory() catch {};
         }
-        for (c.owner.managers.items) |m| if (!m.stopped) generated.zwlr_output_manager_v1_types.events.done(&m.client.connection, m.resource, c.owner.serial) catch {
-            m.client.postNoMemory() catch {};
-        };
+        for (c.owner.managers.items) |m| {
+            if (m.stopped) continue;
+            generated.zwlr_output_manager_v1_types.events.done(&m.client.connection, m.resource, c.owner.serial) catch {
+                m.client.postNoMemory() catch {};
+                continue;
+            };
+            m.last_serial = c.owner.serial;
+        }
     }
     generated.zwlr_output_configuration_v1_types.events.succeeded(&c.client.connection, c.resource) catch c.client.postNoMemory() catch {};
 }
@@ -384,6 +422,7 @@ const TestResize = struct {
     calls: usize = 0,
     size: render.Size = .{ .width = 0, .height = 0 },
     scale: render.Scale = .{ .numerator = render.Scale.denominator },
+    output: ?*OutputGlobal = null,
 
     fn validate(_: *anyopaque, _: render.Size, _: render.Scale) !void {}
 
@@ -392,6 +431,14 @@ const TestResize = struct {
         self.calls += 1;
         self.size = size;
         self.scale = scale;
+        if (self.output) |output| output.applyGeometry(.{
+            .position = output.logicalPosition(),
+            .mode_size = size,
+            .logical_size = size,
+            .physical_size = output.physicalSize(),
+            .refresh_millihertz = output.currentRefreshMillihertz(),
+            .scale = @max(1, (scale.numerator + render.Scale.denominator - 1) / render.Scale.denominator),
+        });
         return true;
     }
 
@@ -422,6 +469,7 @@ const TestGlobals = struct {
             .model = "Test Panel",
         });
         errdefer self.output.deinit();
+        self.resize.output = &self.output;
         try self.management.init(std.testing.allocator, server, &self.output, .{ .numerator = 150 }, &self.security, self.resize.listener());
     }
 
@@ -566,6 +614,9 @@ test "output management wire apply stale and test transactions" {
     defer peer.deinit();
     const bound = try bindAndCheckSnapshot(&peer, client, &globals, 2);
 
+    const future = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, bound.manager, 2);
+    const future_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, future, bound.head);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_custom_mode(&peer, future_head, 800, 450, 0);
     const config = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, bound.manager, 1);
     const config_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, config, bound.head);
     try generated.zwlr_output_configuration_head_v1_types.requests.set_custom_mode(&peer, config_head, 640, 360, 0);
@@ -591,6 +642,14 @@ test "output management wire apply stale and test transactions" {
     }
     try std.testing.expectEqual(@as(usize, 7), event_index);
 
+    try generated.zwlr_output_configuration_v1_types.requests.apply(&peer, future);
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var future_message = peer.popMessage() orelse return error.MissingCancelledEvent;
+    defer future_message.deinit();
+    try std.testing.expect((try generated.zwlr_output_configuration_v1_types.decodeEvent(&peer, future, &future_message)) == .cancelled);
+    try std.testing.expectEqual(@as(usize, 1), globals.resize.calls);
+
     const stale = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, bound.manager, 1);
     _ = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, stale, bound.head);
     try generated.zwlr_output_configuration_v1_types.requests.apply(&peer, stale);
@@ -607,6 +666,60 @@ test "output management wire apply stale and test transactions" {
     try transferFromServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 1), globals.resize.calls);
     try std.testing.expectEqual(@as(u32, 2), globals.management.serial);
+}
+
+test "output management serial wrap never revalidates a retained configuration" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var globals: TestGlobals = .{};
+    try globals.init(&server);
+    defer globals.deinit();
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch {};
+    var peer = wayring.Connection.init(std.testing.allocator, .client, wayring.default_max_frame_size);
+    defer peer.deinit();
+    const bound = try bindAndCheckSnapshot(&peer, client, &globals, 2);
+
+    const retained = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, bound.manager, 1);
+    const retained_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, retained, bound.head);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_custom_mode(&peer, retained_head, 800, 450, 0);
+    try transferToServer(&peer, client);
+
+    const manager = globals.management.managers.items[0];
+    globals.management.serial = std.math.maxInt(u32);
+    manager.last_serial = globals.management.serial;
+    try generated.zwlr_output_manager_v1_types.events.done(&client.connection, manager.resource, globals.management.serial);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+    }
+
+    const wrapping = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, bound.manager, std.math.maxInt(u32));
+    const wrapping_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, wrapping, bound.head);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_custom_mode(&peer, wrapping_head, 640, 360, 0);
+    try generated.zwlr_output_configuration_v1_types.requests.apply(&peer, wrapping);
+    try transferToServer(&peer, client);
+    try std.testing.expectEqual(@as(u32, 1), globals.management.serial);
+    try std.testing.expectEqual(@as(usize, 1), globals.resize.calls);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+    }
+
+    try generated.zwlr_output_configuration_v1_types.requests.apply(&peer, retained);
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    var cancelled = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == retained.id)
+            cancelled = (try generated.zwlr_output_configuration_v1_types.decodeEvent(&peer, retained, &message)) == .cancelled;
+    }
+    try std.testing.expect(cancelled);
+    try std.testing.expectEqual(@as(usize, 1), globals.resize.calls);
 }
 
 test "output management changed state preserves each bound head mode pair" {
@@ -675,6 +788,33 @@ test "output management rejects a mode introduced by another head" {
     try expectDisplayError(&peer, config_head.id, @intFromEnum(HeadError.invalid_mode));
 }
 
+test "output management rejects a head introduced by another manager binding" {
+    const ConfigError = generated.zwlr_output_configuration_v1_types.@"error";
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    var globals: TestGlobals = .{};
+    try globals.init(&server);
+    defer globals.deinit();
+    const client = try server.createClient();
+    defer server.destroyClient(client) catch {};
+    var peer = wayring.Connection.init(std.testing.allocator, .client, wayring.default_max_frame_size);
+    defer peer.deinit();
+    const first = try bindAndCheckSnapshot(&peer, client, &globals, 2);
+    const second = try bindAndCheckSnapshotOnRegistry(&peer, client, &globals, first.registry, 20);
+    try generated.zwlr_output_manager_v1_types.requests.stop(&peer, first.manager);
+    try transferToServer(&peer, client);
+    try transferFromServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+    }
+    const config = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, second.manager, 1);
+    _ = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, config, first.head);
+    try std.testing.expectError(error.ProtocolError, transferToServer(&peer, client));
+    try transferFromServer(&peer, client);
+    try expectDisplayError(&peer, config.id, @intFromEnum(ConfigError.already_configured_head));
+}
+
 test "output management stopped snapshot receives no uncommitted updates" {
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
@@ -711,6 +851,8 @@ test "output management stopped snapshot receives no uncommitted updates" {
             active_done = (try generated.zwlr_output_manager_v1_types.decodeEvent(&peer, active.manager, &message)) == .done;
     }
     try std.testing.expect(active_done);
+    try std.testing.expectEqual(@as(u32, 1280), findMode(&globals.management, client, stopped.mode.id).?.size.width);
+    try std.testing.expectEqual(@as(u32, 640), findMode(&globals.management, client, active.mode.id).?.size.width);
 }
 
 test "output management wire reports parent already-used and head invalid-transform errors" {
