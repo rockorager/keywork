@@ -56,6 +56,24 @@ pub const StagedCommit = struct {
     }
 };
 
+pub const ResizePlan = struct {
+    allocator: std.mem.Allocator,
+    updates: []SurfaceTree.DirectUpdate,
+    configures: []Configure,
+
+    const Configure = struct {
+        item: *LayerSurface,
+        serial: u32,
+        size: render.Size,
+    };
+
+    pub fn deinit(self: *ResizePlan) void {
+        self.allocator.free(self.configures);
+        self.allocator.free(self.updates);
+        self.* = undefined;
+    }
+};
+
 const State = struct {
     width: u32 = 0,
     height: u32 = 0,
@@ -211,6 +229,65 @@ pub fn usableBounds(self: *const LayerShell) render.Rect {
         reserve(&result, item.current);
     }
     return result;
+}
+
+/// Preflights every allocation needed to rearrange live layers for a resize.
+pub fn prepareResize(self: *LayerShell, full: render.Size) !ResizePlan {
+    var update_list: std.ArrayList(SurfaceTree.DirectUpdate) = .empty;
+    defer update_list.deinit(self.allocator);
+    var configure_list: std.ArrayList(ResizePlan.Configure) = .empty;
+    defer configure_list.deinit(self.allocator);
+    try update_list.ensureTotalCapacity(self.allocator, self.surfaces.items.len);
+    try configure_list.ensureTotalCapacity(self.allocator, self.surfaces.items.len);
+    var usable: render.Rect = .{ .x = 0, .y = 0, .width = full.width, .height = full.height };
+    for (self.surfaces.items) |item| if (item.mapped and item.current.exclusive_zone > 0) {
+        const content = self.listener.surface_size(self.listener.context, item.surface);
+        try appendResizeItem(self, &update_list, &configure_list, item, geometryForSize(item.current, full, content), geometryForSize(item.current, full, null));
+        reserve(&usable, item.current);
+    };
+    for (self.surfaces.items) |item| if (item.mapped and item.current.exclusive_zone <= 0) {
+        const bounds = if (item.current.exclusive_zone == -1) render.Rect{ .x = 0, .y = 0, .width = full.width, .height = full.height } else usable;
+        const content = self.listener.surface_size(self.listener.context, item.surface);
+        try appendResizeItem(self, &update_list, &configure_list, item, geometryInSize(item.current, bounds, content), geometryInSize(item.current, bounds, null));
+    };
+    for (self.surfaces.items) |item| if (!item.mapped) {
+        const node = self.tree.find(item.surface) orelse continue;
+        update_list.appendAssumeCapacity(try self.tree.captureDirect(node, .{}, false));
+    };
+    for (configure_list.items) |configure|
+        try configure.item.configures.ensureUnusedCapacity(configure.item.allocator, 1);
+    const updates = try update_list.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(updates);
+    const configures = try configure_list.toOwnedSlice(self.allocator);
+    return .{ .allocator = self.allocator, .updates = updates, .configures = configures };
+}
+
+fn appendResizeItem(self: *LayerShell, updates: *std.ArrayList(SurfaceTree.DirectUpdate), configures: *std.ArrayList(ResizePlan.Configure), item: *LayerSurface, geometry: render.Rect, suggestion: render.Rect) !void {
+    const node = try self.tree.nodeFor(item.surface);
+    updates.appendAssumeCapacity(try self.tree.captureDirect(node, .{ .x = geometry.x, .y = geometry.y }, true));
+    configures.appendAssumeCapacity(.{
+        .item = item,
+        .serial = self.server.nextSerial(),
+        .size = .{ .width = suggestion.width, .height = suggestion.height },
+    });
+}
+
+/// Applies a prepared plan without allocating. Configure failures are local
+/// to their client and do not prevent the remaining transaction publication.
+pub fn applyResize(_: *LayerShell, plan: *ResizePlan) void {
+    for (plan.updates) |update| update.apply();
+    for (plan.configures) |configure| {
+        if (!configure.item.resource_alive or !configure.item.surface_alive) continue;
+        configure.item.configures.appendAssumeCapacity(configure.serial);
+        configure.item.initial_configure_sent = true;
+        generated.zwlr_layer_surface_v1_types.events.configure(
+            &configure.item.surface.client.connection,
+            configure.item.resource,
+            configure.serial,
+            configure.size.width,
+            configure.size.height,
+        ) catch configure.item.surface.client.postNoMemory() catch {};
+    }
 }
 
 pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?CommitResult {
@@ -920,6 +997,27 @@ test "native layer surface configures transactionally and outlives its manager" 
     try shell.apply(map_staged);
     try std.testing.expect(shell.surfaces.items[0].mapped);
     try std.testing.expectEqual(@as(u32, 40), shell.surfaces.items[0].current.height);
+
+    var resize_plan = try shell.prepareResize(.{ .width = 1400, .height = 720 });
+    defer resize_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resize_plan.configures.len);
+    try std.testing.expectEqual(render.Size{ .width = 1400, .height = 40 }, resize_plan.configures[0].size);
+    const resize_serial = resize_plan.configures[0].serial;
+    shell.applyResize(&resize_plan);
+    try std.testing.expectEqual(resize_serial, shell.surfaces.items[0].configures.getLast());
+    try transferFromLayerServer(&peer, client);
+    var saw_resize_configure = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != layer_surface.id) continue;
+        const configure = (try generated.zwlr_layer_surface_v1_types.decodeEvent(&peer, layer_surface, &message)).configure;
+        try std.testing.expectEqual(resize_serial, configure.serial);
+        try std.testing.expectEqual(@as(u32, 1400), configure.width);
+        try std.testing.expectEqual(@as(u32, 40), configure.height);
+        saw_resize_configure = true;
+    }
+    try std.testing.expect(saw_resize_configure);
 
     try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 0, 48);
     try generated.wl_surface_types.requests.commit(&peer, surface);

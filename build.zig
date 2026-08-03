@@ -84,6 +84,8 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(b.path("protocols/wayland/wlr-screencopy-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(b.path("protocols/wayland/wlr-output-management-unstable-v1.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "stable/presentation-time/presentation-time.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/content-type/content-type-v1.xml"));

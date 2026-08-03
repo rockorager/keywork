@@ -1,4 +1,4 @@
-//! Native xdg-output logical metadata for one immutable output.
+//! Native xdg-output logical metadata for one output.
 
 const XdgOutputGlobal = @This();
 
@@ -59,14 +59,8 @@ const OutputResource = struct {
                 &self.client.connection,
                 self.resource,
             );
-        } else if (try self.client.resourceVersion(
-            output_resource,
-            &generated.wl_output,
-        ) >= 2) {
-            try generated.wl_output_types.events.done(
-                &self.client.connection,
-                output_resource,
-            );
+        } else if (try self.client.resourceVersion(output_resource, &generated.wl_output) >= 2) {
+            try generated.wl_output_types.events.done(&self.client.connection, output_resource);
         }
     }
 };
@@ -95,6 +89,37 @@ pub fn deinit(self: *XdgOutputGlobal) void {
     self.server.removeGlobal(self.global_name) catch unreachable;
     self.resources.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Publishes logical metadata and xdg-output done for protocol v1/v2 only.
+/// NativeServer publishes the transaction's wl_output.done separately.
+pub fn publishLogicalUpdate(self: *XdgOutputGlobal) void {
+    for (self.resources.items) |resource| sendLogicalUpdate(resource) catch {
+        resource.client.postNoMemory() catch {};
+    };
+}
+
+fn sendLogicalUpdate(self: *OutputResource) !void {
+    if (self.output == null) return;
+    const position = self.owner.output.logicalPosition();
+    const size = self.owner.output.logicalSize();
+    try generated.zxdg_output_v1_types.events.logical_position(
+        &self.client.connection,
+        self.resource,
+        position.x,
+        position.y,
+    );
+    try generated.zxdg_output_v1_types.events.logical_size(
+        &self.client.connection,
+        self.resource,
+        @intCast(size.width),
+        @intCast(size.height),
+    );
+    const version = try self.client.resourceVersion(self.resource, &generated.zxdg_output_v1);
+    if (version < 3) try generated.zxdg_output_v1_types.events.done(
+        &self.client.connection,
+        self.resource,
+    );
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {
@@ -338,6 +363,7 @@ test "native xdg output versions send logical metadata and matching done events"
         stages[child_index] += 1;
     }
     try std.testing.expectEqualSlices(usize, &.{ 3, 5, 4 }, &stages);
+    // Initial v3 state is committed by wl_output.done.
     try std.testing.expectEqual(@as(usize, 1), output_done_count);
 
     for (children) |child| try generated.zxdg_output_v1_types.requests.destroy(

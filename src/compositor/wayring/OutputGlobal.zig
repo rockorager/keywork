@@ -37,6 +37,15 @@ pub const Config = struct {
     model: []const u8,
 };
 
+pub const Geometry = struct {
+    position: render.Position,
+    mode_size: render.Size,
+    logical_size: render.Size,
+    physical_size: render.Size,
+    refresh_millihertz: i32,
+    scale: u32,
+};
+
 const Binding = struct {
     owner: *OutputGlobal,
     client: *Server.Client,
@@ -208,12 +217,93 @@ pub fn logicalSize(self: *const OutputGlobal) render.Size {
     return self.config.logical_size;
 }
 
+pub fn currentMode(self: *const OutputGlobal) render.Size {
+    return self.config.mode_size;
+}
+
+pub fn currentRefreshMillihertz(self: *const OutputGlobal) i32 {
+    return self.config.refresh_millihertz;
+}
+
+pub fn currentScale(self: *const OutputGlobal) u32 {
+    return self.config.scale;
+}
+
 pub fn outputName(self: *const OutputGlobal) []const u8 {
     return self.config.name;
 }
-
 pub fn outputDescription(self: *const OutputGlobal) []const u8 {
     return self.config.description;
+}
+pub fn outputMake(self: *const OutputGlobal) []const u8 {
+    return self.config.make;
+}
+pub fn outputModel(self: *const OutputGlobal) []const u8 {
+    return self.config.model;
+}
+pub fn physicalSize(self: *const OutputGlobal) render.Size {
+    return self.config.physical_size;
+}
+
+pub fn validateGeometry(geometry: Geometry) !void {
+    if (!validSize(geometry.mode_size) or !validSize(geometry.logical_size) or
+        !validSize(geometry.physical_size) or geometry.refresh_millihertz <= 0 or
+        geometry.scale == 0 or geometry.scale > std.math.maxInt(i32))
+        return error.InvalidOutput;
+}
+
+/// Applies already validated scalar geometry without allocating or publishing.
+pub fn applyGeometry(self: *OutputGlobal, geometry: Geometry) void {
+    validateGeometry(geometry) catch unreachable;
+    self.config.position = geometry.position;
+    self.config.mode_size = geometry.mode_size;
+    self.config.logical_size = geometry.logical_size;
+    self.config.physical_size = geometry.physical_size;
+    self.config.refresh_millihertz = geometry.refresh_millihertz;
+    self.config.scale = geometry.scale;
+}
+
+/// Publishes changed wl_output properties, deliberately excluding done.
+pub fn publishGeometry(self: *OutputGlobal, previous: Geometry) void {
+    for (self.resources.items) |binding| self.publishGeometryTo(binding, previous) catch {
+        binding.client.postNoMemory() catch {};
+    };
+}
+
+pub fn publishDone(self: *OutputGlobal) void {
+    for (self.resources.items) |binding| {
+        const version = binding.client.resourceVersion(binding.resource, &generated.wl_output) catch continue;
+        if (version >= 2) generated.wl_output_types.events.done(
+            &binding.client.connection,
+            binding.resource,
+        ) catch binding.client.postNoMemory() catch {};
+    }
+}
+
+pub fn publishPreferredBufferScale(self: *OutputGlobal) void {
+    for (self.memberships.items) |surface| {
+        if (!surface.resource_alive) continue;
+        const version = surface.client.resourceVersion(surface.resource, &generated.wl_surface) catch continue;
+        if (version >= 6) generated.wl_surface_types.events.preferred_buffer_scale(
+            &surface.client.connection,
+            surface.resource,
+            @intCast(self.config.scale),
+        ) catch surface.client.postNoMemory() catch {};
+    }
+}
+
+fn publishGeometryTo(self: *const OutputGlobal, binding: *const Binding, previous: Geometry) !void {
+    const connection = &binding.client.connection;
+    const resource = binding.resource;
+    if (!std.meta.eql(previous.position, self.config.position) or
+        !std.meta.eql(previous.physical_size, self.config.physical_size))
+        try generated.wl_output_types.events.geometry(connection, resource, self.config.position.x, self.config.position.y, @intCast(self.config.physical_size.width), @intCast(self.config.physical_size.height), @intFromEnum(generated.wl_output_types.subpixel.unknown), self.config.make, self.config.model, @intFromEnum(generated.wl_output_types.transform.normal));
+    if (!std.meta.eql(previous.mode_size, self.config.mode_size) or
+        previous.refresh_millihertz != self.config.refresh_millihertz)
+        try generated.wl_output_types.events.mode(connection, resource, generated.wl_output_types.mode.current | generated.wl_output_types.mode.preferred, @intCast(self.config.mode_size.width), @intCast(self.config.mode_size.height), self.config.refresh_millihertz);
+    const version = try binding.client.resourceVersion(resource, &generated.wl_output);
+    if (version >= 2 and previous.scale != self.config.scale)
+        try generated.wl_output_types.events.scale(connection, resource, @intCast(self.config.scale));
 }
 
 fn validSize(size: render.Size) bool {

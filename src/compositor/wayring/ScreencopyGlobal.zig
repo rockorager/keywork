@@ -165,6 +165,23 @@ pub fn outputRemoved(self: *ScreencopyGlobal) void {
     }
 }
 
+/// Invalidates old-size work that has not started. Active readback/write work
+/// keeps its old composition and staging storage until completion.
+pub fn outputResized(self: *ScreencopyGlobal) void {
+    for (self.managers.items) |manager| manager.baseline = null;
+    var index: usize = 0;
+    while (index < self.frames.items.len) {
+        const frame = self.frames.items[index];
+        if (frame.state == .advertised or frame.state == .armed) {
+            finish(frame, false);
+            if (index < self.frames.items.len and self.frames.items[index] == frame)
+                index += 1;
+        } else {
+            index += 1;
+        }
+    }
+}
+
 pub fn hasPendingIo(self: *const ScreencopyGlobal) bool {
     return self.active != null;
 }

@@ -51,11 +51,11 @@ pub fn setPreferredScale(self: *FractionalScaleGlobal, preferred_scale: u32) !vo
     if (preferred_scale == 0) return error.InvalidScale;
     if (self.preferred_scale == preferred_scale) return;
     self.preferred_scale = preferred_scale;
-    for (self.resources.items) |resource| try generated.wp_fractional_scale_v1_types.events.preferred_scale(
+    for (self.resources.items) |resource| generated.wp_fractional_scale_v1_types.events.preferred_scale(
         &resource.surface.client.connection,
         resource.resource,
         preferred_scale,
-    );
+    ) catch resource.surface.client.postNoMemory() catch {};
 }
 
 fn bind(context: *anyopaque, client: *Server.Client, id: u32, version: u32) !void {

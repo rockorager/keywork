@@ -23,6 +23,7 @@ const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
 const OutputPowerGlobal = @import("OutputPowerGlobal.zig");
+const OutputManagementGlobal = @import("OutputManagementGlobal.zig");
 const WorkspaceManagerGlobal = @import("WorkspaceManagerGlobal.zig");
 const ScreencopyGlobal = @import("ScreencopyGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
@@ -102,6 +103,7 @@ subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 xdg_output_global: XdgOutputGlobal,
 output_power_global: OutputPowerGlobal,
+output_management_global: OutputManagementGlobal,
 workspace_manager_global: WorkspaceManagerGlobal,
 screencopy_global: ScreencopyGlobal,
 presentation_global: PresentationGlobal,
@@ -604,6 +606,15 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         },
     );
     errdefer self.output_power_global.deinit();
+    try self.output_management_global.init(
+        allocator,
+        &self.server,
+        &self.output_global,
+        self.output.scale(),
+        &self.security_context_global,
+        .{ .context = self, .validate = validateManagedOutput, .resize = resizeManagedOutput },
+    );
+    errdefer self.output_management_global.deinit();
     try self.workspace_manager_global.init(
         allocator,
         &self.server,
@@ -872,6 +883,86 @@ pub fn displayName(self: *const NativeServer) []const u8 {
     return self.display_name;
 }
 
+/// Atomically resizes the native headless output. Backend allocation is the
+/// commit point; all compositor allocations are preflighted before it.
+fn resizeHeadlessOutput(self: *NativeServer, size: render.Size, scale: render.Scale) !bool {
+    try validateManagedOutput(self, size, scale);
+    const logical_size = scale.logicalSize(size) catch unreachable;
+    const client_scale = scale.ceil() catch unreachable;
+    const geometry: OutputGlobal.Geometry = .{
+        .position = self.output_global.logicalPosition(),
+        .mode_size = size,
+        .logical_size = logical_size,
+        .physical_size = self.output_global.physicalSize(),
+        .refresh_millihertz = self.output.refreshMillihertz(),
+        .scale = client_scale,
+    };
+    if (std.meta.eql(size, self.output.modeSize()) and
+        scale.numerator == self.output.scale().numerator) return false;
+
+    var layer_plan = try self.layer_shell.prepareResize(logical_size);
+    defer layer_plan.deinit();
+    const previous: OutputGlobal.Geometry = .{
+        .position = self.output_global.logicalPosition(),
+        .mode_size = self.output_global.currentMode(),
+        .logical_size = self.output_global.logicalSize(),
+        .physical_size = self.output_global.physicalSize(),
+        .refresh_millihertz = self.output_global.currentRefreshMillihertz(),
+        .scale = self.output_global.currentScale(),
+    };
+    const scale_changed = self.output.scale().numerator != scale.numerator;
+    const size_changed = !std.meta.eql(self.output.modeSize(), size);
+    if (!try self.output.headless.resize(size, scale)) return false;
+
+    self.output_global.applyGeometry(geometry);
+    self.output_global.publishGeometry(previous);
+    self.xdg_output_global.publishLogicalUpdate();
+    self.output_global.publishDone();
+    if (scale_changed) {
+        self.fractional_scale_global.setPreferredScale(scale.numerator) catch unreachable;
+        self.output_global.publishPreferredBufferScale();
+    }
+    self.layer_shell.applyResize(&layer_plan);
+    if (size_changed) self.screencopy_global.outputResized();
+
+    self.pointer_physical_x = clampPointerCoordinate(self.pointer_physical_x, size.width);
+    self.pointer_physical_y = clampPointerCoordinate(self.pointer_physical_y, size.height);
+    self.syncPointerCursorPosition();
+    var transient_seats = self.transient_seat_global.seatIterator();
+    while (transient_seats.next()) |seat| {
+        const position = seat.logicalPointerPosition();
+        seat.setLogicalPointerPosition(
+            clampPointerCoordinate(position.x, logical_size.width),
+            clampPointerCoordinate(position.y, logical_size.height),
+        );
+    }
+    self.refreshInputFocus(inputTime(self)) catch self.terminate();
+    self.repaint_needed = true;
+    self.scheduleRepaint(0);
+    return true;
+}
+
+fn resizeManagedOutput(context: *anyopaque, size: render.Size, scale: render.Scale) !bool {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    return self.resizeHeadlessOutput(size, scale);
+}
+
+fn validateManagedOutput(context: *anyopaque, size: render.Size, scale: render.Scale) !void {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return error.OutputUnavailable;
+    if (self.output != .headless) return error.Unsupported;
+    const logical_size = scale.logicalSize(size) catch return error.InvalidOutput;
+    const client_scale = scale.ceil() catch return error.InvalidOutput;
+    try OutputGlobal.validateGeometry(.{
+        .position = self.output_global.logicalPosition(),
+        .mode_size = size,
+        .logical_size = logical_size,
+        .physical_size = self.output_global.physicalSize(),
+        .refresh_millihertz = self.output.refreshMillihertz(),
+        .scale = client_scale,
+    });
+}
+
 /// Runs EventLoop's native submit/wait/drain loop until terminate is called.
 pub fn run(self: *NativeServer) !void {
     try self.installSignals();
@@ -1053,6 +1144,7 @@ pub fn destroy(self: *NativeServer) void {
     self.presentation_global.deinit();
     self.screencopy_global.deinit();
     self.workspace_manager_global.deinit();
+    self.output_management_global.deinit();
     self.output_power_global.deinit();
     self.xdg_output_global.deinit();
     self.layer_shell.deinit();
@@ -5620,10 +5712,173 @@ test "native wlr screencopy streams whole-output SHM damage frames" {
     try testTransferToNative(&peer, client);
     try afterPlatform(native, &native.event_loop);
     try std.testing.expect(native.screencopy_global.hasPendingIo());
-    try native.server.destroyClient(client);
-    client_owned = false;
     try testDrainScreencopy(native);
     try std.testing.expect(!native.screencopy_global.hasPendingIo());
+
+    const stale_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(&peer, stale_frame, buffer);
+    try testTransferToNative(&peer, client);
+    try std.testing.expect(try native.resizeHeadlessOutput(.{ .width = 3, .height = 2 }, native.output.scale()));
+    try testTransferFromNative(&peer, client);
+    var stale_failed = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == stale_frame.id)
+            stale_failed = (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(&peer, stale_frame, &message)) == .failed;
+    }
+    try std.testing.expect(stale_failed);
+
+    const resized_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(&peer, screencopy_manager, 0, output_resource);
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var saw_resized_buffer = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != resized_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(&peer, resized_frame, &message)) {
+            .buffer => |event| {
+                try std.testing.expectEqual(@as(u32, 3), event.width);
+                try std.testing.expectEqual(@as(u32, 2), event.height);
+                saw_resized_buffer = true;
+            },
+            .buffer_done => {},
+            else => return error.UnexpectedResizedScreencopyEvent,
+        }
+    }
+    try std.testing.expect(saw_resized_buffer);
+    try native.server.destroyClient(client);
+    client_owned = false;
+}
+
+test "native output management apply resizes headless output and publishes wire transaction" {
+    const core = @import("wayring-core");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const native = try NativeServer.create(std.testing.allocator, std.testing.io, .{
+        .runtime_directory = path_buffer[0..path_length],
+        .output_size = .{ .width = 800, .height = 450 },
+    });
+    defer native.destroy();
+    const physical_before = native.output_global.physicalSize();
+
+    const client = try native.server.createClient();
+    defer native.server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(std.testing.allocator, .client, wayring.default_max_frame_size);
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{ .id = 2, .generation = try core.getRegistry(&peer, 2) };
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+
+    const output: wayring.ObjectHandle = .{ .id = 3, .generation = try core.bind(&peer, registry.id, native.output_global.global_name, generated.wl_output.name, 4, 3, &generated.wl_output) };
+    const xdg_manager: wayring.ObjectHandle = .{ .id = 4, .generation = try core.bind(&peer, registry.id, native.xdg_output_global.global_name, generated.zxdg_output_manager_v1.name, 3, 4, &generated.zxdg_output_manager_v1) };
+    const manager: wayring.ObjectHandle = .{ .id = 5, .generation = try core.bind(&peer, registry.id, native.output_management_global.global_name, generated.zwlr_output_manager_v1.name, 4, 5, &generated.zwlr_output_manager_v1) };
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var maybe_head: ?wayring.ObjectHandle = null;
+    var maybe_mode: ?wayring.ObjectHandle = null;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == manager.id) switch (try generated.zwlr_output_manager_v1_types.decodeEvent(&peer, manager, &message)) {
+            .head => |event| maybe_head = try testRegisterServerObject(&peer, event.head, &generated.zwlr_output_head_v1, 4),
+            .done => {},
+            else => {},
+        } else if (maybe_head) |head| if (message.object_id == head.id) {
+            switch (try generated.zwlr_output_head_v1_types.decodeEvent(&peer, head, &message)) {
+                .mode => |event| maybe_mode = try testRegisterServerObject(&peer, event.mode, &generated.zwlr_output_mode_v1, 3),
+                else => {},
+            }
+        };
+    }
+    const head = maybe_head orelse return error.MissingOutputManagementHead;
+    const mode = maybe_mode orelse return error.MissingOutputManagementMode;
+    const xdg_output = try generated.zxdg_output_manager_v1_types.requests.get_xdg_output(&peer, xdg_manager, output);
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+
+    const config = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, manager, 1);
+    const config_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, config, head);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_custom_mode(&peer, config_head, 640, 360, 0);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_scale(&peer, config_head, 256);
+    try generated.zwlr_output_configuration_v1_types.requests.apply(&peer, config);
+    try testTransferToNative(&peer, client);
+
+    try std.testing.expectEqual(render.Size{ .width = 640, .height = 360 }, native.output.modeSize());
+    try std.testing.expectEqual(@as(u32, 120), native.output.scale().numerator);
+    try std.testing.expectEqual(render.Size{ .width = 640, .height = 360 }, native.output_global.logicalSize());
+    try std.testing.expectEqual(physical_before, native.output_global.physicalSize());
+    try std.testing.expect(native.repaint_needed);
+    try std.testing.expectEqual(@as(usize, 640 * 360), native.output.headless.pixels.len);
+
+    try testTransferFromNative(&peer, client);
+    var stage: usize = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id == output.id) switch (try generated.wl_output_types.decodeEvent(&peer, output, &message)) {
+            .mode => |event| {
+                try std.testing.expectEqual(@as(usize, 0), stage);
+                try std.testing.expectEqual(@as(i32, 640), event.width);
+                try std.testing.expectEqual(@as(i32, 360), event.height);
+                stage = 1;
+            },
+            .done => {
+                try std.testing.expectEqual(@as(usize, 2), stage);
+                stage = 3;
+            },
+            else => return error.UnexpectedNativeOutputResizeEvent,
+        } else if (message.object_id == xdg_output.id) switch (try generated.zxdg_output_v1_types.decodeEvent(&peer, xdg_output, &message)) {
+            .logical_position => try std.testing.expectEqual(@as(usize, 1), stage),
+            .logical_size => |event| {
+                try std.testing.expectEqual(@as(usize, 1), stage);
+                try std.testing.expectEqual(@as(i32, 640), event.width);
+                try std.testing.expectEqual(@as(i32, 360), event.height);
+                stage = 2;
+            },
+            else => return error.UnexpectedNativeXdgResizeEvent,
+        } else if (message.object_id == mode.id) {
+            try std.testing.expect(stage >= 3 and stage < 6);
+            _ = try generated.zwlr_output_mode_v1_types.decodeEvent(&peer, mode, &message);
+            stage += 1;
+        } else if (message.object_id == head.id) {
+            try std.testing.expect(stage >= 6 and stage < 8);
+            _ = try generated.zwlr_output_head_v1_types.decodeEvent(&peer, head, &message);
+            stage += 1;
+        } else if (message.object_id == manager.id) {
+            try std.testing.expectEqual(@as(usize, 8), stage);
+            try std.testing.expectEqual(@as(u32, 2), (try generated.zwlr_output_manager_v1_types.decodeEvent(&peer, manager, &message)).done.serial);
+            stage = 9;
+        } else if (message.object_id == config.id) {
+            try std.testing.expectEqual(@as(usize, 9), stage);
+            try std.testing.expect((try generated.zwlr_output_configuration_v1_types.decodeEvent(&peer, config, &message)) == .succeeded);
+            stage = 10;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10), stage);
+
+    const impossible = try generated.zwlr_output_manager_v1_types.requests.create_configuration(&peer, manager, 2);
+    const impossible_head = try generated.zwlr_output_configuration_v1_types.requests.enable_head(&peer, impossible, head);
+    try generated.zwlr_output_configuration_head_v1_types.requests.set_scale(&peer, impossible_head, std.math.maxInt(i32));
+    try generated.zwlr_output_configuration_v1_types.requests.@"test"(&peer, impossible);
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var result = peer.popMessage() orelse return error.MissingOutputManagementTestResult;
+    defer result.deinit();
+    try std.testing.expect((try generated.zwlr_output_configuration_v1_types.decodeEvent(&peer, impossible, &result)) == .failed);
+    try std.testing.expectEqual(render.Size{ .width = 640, .height = 360 }, native.output.modeSize());
+    try std.testing.expectEqual(@as(u32, 2), native.output_management_global.serial);
 }
 
 test "native compositor owns and drains its io_uring listener" {
@@ -5713,6 +5968,12 @@ fn testDrainNativePeer(
         var message = popped;
         message.deinit();
     }
+}
+
+fn testRegisterServerObject(connection: *wayring.Connection, id: u32, interface: *const wayring.Interface, version: u32) !wayring.ObjectHandle {
+    const handle: wayring.ObjectHandle = .{ .id = id, .generation = try connection.registerObject(id, interface, version) };
+    try connection.resumeParsing();
+    return handle;
 }
 
 fn testDrainScreencopy(native: *NativeServer) !void {
