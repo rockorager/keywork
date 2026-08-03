@@ -34,7 +34,7 @@ pub const Listener = struct {
 pub const Layer = enum(u2) { background, bottom, top, overlay };
 pub const RootClass = enum { background, bottom, desktop, top, overlay };
 pub const CommitResult = struct {
-    disposition: enum { configure_only, render } = .render,
+    disposition: enum { configure_only, render, inert } = .render,
     staged: ?*StagedCommit = null,
 };
 
@@ -211,7 +211,7 @@ pub fn usableBounds(self: *const LayerShell) render.Rect {
 pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?CommitResult {
     if (commit.surface.role_owner != @as(*const anyopaque, @ptrCast(self))) return null;
     const item: *LayerSurface = @ptrCast(@alignCast(commit.surface.role_context orelse return .{}));
-    if (!item.resource_alive) return .{};
+    if (!item.resource_alive) return .{ .disposition = .inert };
     const role_state = commit.takeRoleState(self);
     defer if (role_state) |value| value.deinit(value.context);
     const captured: ?*const CapturedState = if (role_state) |value|
@@ -942,7 +942,10 @@ test "native layer surface configures transactionally and outlives its manager" 
     try transferToLayerServer(&peer, client);
     var inert_transaction = compositor.popTransaction() orelse return error.MissingInertCommit;
     defer inert_transaction.deinit();
-    try std.testing.expect((try shell.handleCommit(&inert_transaction.entries[0])) != null);
+    try std.testing.expectEqual(
+        .inert,
+        (try shell.handleCommit(&inert_transaction.entries[0])).?.disposition,
+    );
     try generated.wl_surface_types.requests.destroy(&peer, surface);
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(usize, 0), shell.surfaces.items.len);

@@ -171,6 +171,8 @@ pointer_physical_x: f64 = 0,
 pointer_physical_y: f64 = 0,
 keyboard_modifiers: NativeInput.Modifiers = .{},
 last_keyboard_serial: u32 = 0,
+exclusive_focus_active: bool = false,
+exclusive_focus_restore: ?*CompositorGlobal.Surface = null,
 next_touch_id: u32 = 1,
 frame_count: u64 = 0,
 repaint_needed: bool = false,
@@ -362,7 +364,7 @@ const PendingEntry = struct {
     cancel_requested: bool = false,
     direct_update: ?SurfaceTree.DirectUpdate = null,
     layer_shell_commit: ?*LayerShell.StagedCommit = null,
-    configure_only: bool = false,
+    skip_application: bool = false,
 };
 
 const RoutedKey = struct {
@@ -762,6 +764,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
     self.syncPointerCursorPosition();
     self.keyboard_modifiers = .{};
     self.last_keyboard_serial = 0;
+    self.exclusive_focus_active = false;
+    self.exclusive_focus_restore = null;
     self.next_touch_id = 1;
     self.surfaces = .empty;
     self.pending = .empty;
@@ -931,6 +935,10 @@ pub fn pixel(self: *const NativeServer, x: u32, y: u32) u32 {
 /// EventLoop. This may submit/wait for cancellation CQEs, but never sleeps.
 pub fn destroy(self: *NativeServer) void {
     self.terminating = true;
+    if (self.exclusive_focus_restore) |surface| {
+        surface.unreference();
+        self.exclusive_focus_restore = null;
+    }
     self.screencopy_global.shutdown();
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
@@ -2275,7 +2283,30 @@ fn refreshKeyboardFocus(
     preferred: ?*CompositorGlobal.Surface,
 ) !void {
     if (!self.seat_global.hasCapability(SeatGlobal.Capability.keyboard)) return;
-    const target = self.layer_shell.exclusiveKeyboardSurface() orelse if (preferred) |surface|
+    const exclusive = self.layer_shell.exclusiveKeyboardSurface();
+    const restore = if (exclusive == null and self.exclusive_focus_active)
+        self.exclusive_focus_restore
+    else
+        null;
+    defer if (restore) |surface| surface.unreference();
+    if (exclusive != null and !self.exclusive_focus_active) {
+        self.exclusive_focus_active = true;
+        if (self.seat_global.keyboardFocus()) |surface| {
+            if (self.surfaceActive(surface) and self.layer_shell.rootClass(surface) == .desktop) {
+                try surface.reference();
+                self.exclusive_focus_restore = surface;
+            }
+        }
+    } else if (exclusive == null and self.exclusive_focus_active) {
+        self.exclusive_focus_active = false;
+        self.exclusive_focus_restore = null;
+    }
+    const target = exclusive orelse if (restore) |surface|
+        if (self.surfaceActive(surface) and self.layer_shell.rootClass(surface) == .desktop)
+            surface
+        else
+            try self.topmostDesktopRoot()
+    else if (preferred) |surface|
         if (self.surfaceActive(surface) and self.layer_shell.rootClass(surface) == .desktop)
             surface
         else
@@ -2925,12 +2956,12 @@ fn retainedRoot(self: *const NativeServer, surface: *CompositorGlobal.Surface) *
 fn prepareCommit(self: *NativeServer, commit: *CompositorGlobal.Commit, entry: *PendingEntry) !bool {
     if (try self.layer_shell.handleCommit(commit)) |result| {
         entry.layer_shell_commit = result.staged;
-        entry.configure_only = result.disposition == .configure_only;
+        entry.skip_application = result.disposition != .render;
         return commit.surface.client.state == .active;
     }
     const result = try self.xdg_shell.handleCommit(commit);
     entry.direct_update = result.direct_update;
-    entry.configure_only = result.disposition == .configure_only;
+    entry.skip_application = result.disposition == .configure_only;
     return commit.surface.client.state == .active;
 }
 
@@ -3028,6 +3059,7 @@ fn applyEntry(
 
 fn prepareApplication(self: *NativeServer, pending: *PendingTransaction) !void {
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+        if (entry.skip_application) continue;
         const state = try self.stateFor(commit.surface);
         const size: ?render.Size = switch (commit.attachment) {
             .buffer => |attachment| switch (attachment.buffer.content) {
@@ -3395,11 +3427,11 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     try self.presentation_pending.ensureUnusedCapacity(self.allocator, feedback_batch_count);
     try self.prepareApplication(pending);
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
+        if (entry.skip_application) continue;
         if (commit.fifo_set) {
             const state = self.findState(commit.surface) orelse unreachable;
             state.fifo_barrier = true;
         }
-        if (entry.configure_only) continue;
         try self.applyEntry(commit, entry);
     }
     var layer_shell_changed = false;
@@ -3434,6 +3466,7 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
     const damage_state = if (!self.repaint_needed and
         pending.transaction.entries.len == 1 and
         pending.transaction.hierarchy_updates.len == 0 and !has_direct_update and
+        !pending.entries[0].skip_application and
         !self.isCursorSurface(pending.transaction.entries[0].surface) and
         (self.surface_tree.find(pending.transaction.entries[0].surface) orelse unreachable).parent == null)
         self.findState(pending.transaction.entries[0].surface)
@@ -3444,7 +3477,7 @@ fn applyTransaction(self: *NativeServer, pending: *PendingTransaction) !void {
             self.frame_callbacks.appendAssumeCapacity(callbacks);
     }
     for (pending.transaction.entries, pending.entries) |*commit, *entry| {
-        if (entry.configure_only) {
+        if (entry.skip_application) {
             if (commit.takePresentationFeedbacks()) |feedbacks_value| {
                 var feedbacks = feedbacks_value;
                 feedbacks.deinit();
@@ -4825,6 +4858,21 @@ test "native XDG activation raises and focuses only proven mapped toplevels" {
     try std.testing.expect(!try native.xdg_shell.applied(second, true));
     try std.testing.expectEqual(second, native.seat_global.keyboardFocus().?);
     try std.testing.expectEqual(second_state, native.surfaces.items[1]);
+
+    // An exclusive layer epoch restores the desktop it displaced, even if a
+    // different desktop was raised while the layer retained keyboard focus.
+    try native.activateToplevel(first);
+    try first.reference();
+    native.exclusive_focus_active = true;
+    native.exclusive_focus_restore = first;
+    try std.testing.expect(native.raiseRoot(second));
+    _ = try native.seat_global.keyboardEnter(second, &.{});
+    try native.refreshKeyboardFocus(null);
+    try std.testing.expectEqual(first, native.seat_global.keyboardFocus().?);
+    try std.testing.expect(!native.exclusive_focus_active);
+    try std.testing.expect(native.exclusive_focus_restore == null);
+    _ = try native.seat_global.keyboardEnter(second, &.{});
+    native.xdg_shell.setActivatedSurface(second);
 
     try testDrainNativePeer(&peer, client);
     try generated.wl_surface_types.requests.attach(&peer, first_surface, null, 0, 0);
