@@ -684,7 +684,7 @@ local NotificationStack = kw.component({
     hot_version = 2,
     build = function(self)
         local children = {}
-        for _, notification in ipairs(self.props.notifications) do
+        for _, notification in ipairs(self.props.server.notifications()) do
             children[#children + 1] = NotificationCard({
                 key = "notification:" .. notification.id,
                 server = self.props.server,

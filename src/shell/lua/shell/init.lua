@@ -238,7 +238,6 @@ function M.app(options)
                     child = notifications.Stack({
                         key = "notification-stack",
                         server = notification_server,
-                        notifications = visible_notifications,
                     }),
                 })
             end
