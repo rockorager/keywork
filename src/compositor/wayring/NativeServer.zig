@@ -22,6 +22,7 @@ const BufferResource = @import("BufferResource.zig");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const XdgOutputGlobal = @import("XdgOutputGlobal.zig");
+const ScreencopyGlobal = @import("ScreencopyGlobal.zig");
 const PresentationGlobal = @import("PresentationGlobal.zig");
 const ContentTypeGlobal = @import("ContentTypeGlobal.zig");
 const ColorRepresentationGlobal = @import("ColorRepresentationGlobal.zig");
@@ -97,6 +98,7 @@ surface_tree: SurfaceTree,
 subcompositor_global: SubcompositorGlobal,
 output_global: OutputGlobal,
 xdg_output_global: XdgOutputGlobal,
+screencopy_global: ScreencopyGlobal,
 presentation_global: PresentationGlobal,
 content_type_global: ContentTypeGlobal,
 color_representation_global: ColorRepresentationGlobal,
@@ -262,6 +264,13 @@ const Output = union(OutputKind) {
         return switch (self.*) {
             .headless => |output| output.scale,
             .drm => |output| output.?.scale,
+        };
+    }
+
+    fn colorDescription(self: *const Output) render.ColorDescription {
+        return switch (self.*) {
+            .headless => .{},
+            .drm => |output| output.?.colorDescription(),
         };
     }
 
@@ -553,6 +562,21 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.output_global,
     );
     errdefer self.xdg_output_global.deinit();
+    try self.screencopy_global.init(
+        allocator,
+        &self.server,
+        self.event_loop.ioLoop(),
+        &self.output_global,
+        &self.security_context_global,
+        .{
+            .context = self,
+            .constraints = screencopyConstraints,
+            .schedule = scheduleScreencopy,
+            .capture = captureScreencopy,
+            .complete = completeScreencopy,
+        },
+    );
+    errdefer self.screencopy_global.deinit();
     try self.presentation_global.init(
         allocator,
         &self.server,
@@ -891,6 +915,7 @@ pub fn pixel(self: *const NativeServer, x: u32, y: u32) u32 {
 /// EventLoop. This may submit/wait for cancellation CQEs, but never sleeps.
 pub fn destroy(self: *NativeServer) void {
     self.terminating = true;
+    self.screencopy_global.shutdown();
     self.event_loop.clearAfterPlatformHook();
     self.event_loop.clearEndTurnHook();
     self.event_loop.removeTimer(self.repaint_timer);
@@ -971,6 +996,7 @@ pub fn destroy(self: *NativeServer) void {
     self.color_representation_global.deinit();
     self.content_type_global.deinit();
     self.presentation_global.deinit();
+    self.screencopy_global.deinit();
     self.xdg_output_global.deinit();
     self.output_global.deinit();
     self.xdg_system_bell_global.deinit();
@@ -1017,7 +1043,7 @@ pub fn destroy(self: *NativeServer) void {
 fn hasPendingIo(self: *const NativeServer) bool {
     for (self.pending.items) |pending| for (pending.entries) |entry|
         if (entry.handle != null or (entry.copy != null and !entry.copy.?.isTerminal())) return true;
-    return false;
+    return self.screencopy_global.hasPendingIo();
 }
 
 fn afterPlatform(context: *anyopaque, _: *EventLoop) !void {
@@ -1099,6 +1125,7 @@ fn drmOutputRemoving(context: *anyopaque, removed: *DrmOutput) void {
     } orelse return;
     if (selected != removed) return;
     self.terminating = true;
+    self.screencopy_global.outputRemoved();
     removed.detach();
     self.output.drm = null;
     self.terminate();
@@ -1882,6 +1909,49 @@ fn scheduleIdleNotify(context: *anyopaque, delay_milliseconds: ?u64) void {
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
     self.repaint_needed = true;
     self.repaint_timer.arm(@max(delay_milliseconds, 1), 0) catch self.terminate();
+}
+
+fn screencopyConstraints(context: *anyopaque) ?render.Size {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (self.terminating) return null;
+    return switch (self.output) {
+        .headless => self.output.modeSize(),
+        .drm => |output| if (output != null) self.output.modeSize() else null,
+    };
+}
+
+fn scheduleScreencopy(context: *anyopaque, wait_for_damage: bool) bool {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    if (screencopyConstraints(self) == null) return false;
+    if (!wait_for_damage) self.scheduleRepaint(0);
+    return true;
+}
+
+fn captureScreencopy(
+    context: *anyopaque,
+    commands: []const render.Command,
+    scale: render.Scale,
+    destination: render.PixelBuffer,
+) !?std.posix.fd_t {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    try self.renderer.beginFrame(
+        .{ .pixels = destination },
+        scale,
+        .{},
+        null,
+        self.output.colorDescription(),
+    );
+    var active = true;
+    errdefer if (active) self.renderer.cancelFrame();
+    try self.renderer.append(commands);
+    active = false;
+    return (try self.renderer.finishFrameReadback()).sync_file_fd;
+}
+
+fn completeScreencopy(context: *anyopaque, staging: render.PixelBuffer) bool {
+    const self: *NativeServer = @ptrCast(@alignCast(context));
+    self.renderer.completeFrameReadback(staging, staging) catch return false;
+    return true;
 }
 
 fn endTurn(context: *anyopaque, _: *EventLoop) !void {
@@ -3475,6 +3545,7 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     }
     try self.appendSurfaceCommands(paint_entries.items, &commands);
     paint_entries.clearRetainingCapacity();
+    const desktop_command_count = commands.items.len;
     if (self.pointer_cursor.current()) |cursor| switch (cursor) {
         .surface => |surface| {
             try self.appendCursorPaint(surface.root, surface.x, surface.y, &paint_entries);
@@ -3563,6 +3634,13 @@ fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     // unmapped set->wait sequence from blocking its first buffer forever.
     self.clearFifoBarriers();
     self.submitPendingPresentation();
+    self.screencopy_global.composedFrame(
+        commands.items[0..desktop_command_count],
+        commands.items,
+        self.output.scale(),
+        self.output.modeSize(),
+        presentation.Info.now(self.io).timestamp,
+    );
     self.repaint_needed = false;
     self.surface_tree.redrawHandled();
     if (damage_state) |state| state.full_damage = false;
@@ -4801,6 +4879,262 @@ test "native XDG activation raises and focuses only proven mapped toplevels" {
     client_owned = false;
 }
 
+test "native wlr screencopy streams whole-output SHM damage frames" {
+    const core = @import("wayring-core");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const native = try NativeServer.create(std.testing.allocator, std.testing.io, .{
+        .runtime_directory = path_buffer[0..path_length],
+        .output_size = .{ .width = 2, .height = 2 },
+    });
+    defer native.destroy();
+
+    const client = try native.server.createClient();
+    var client_owned = true;
+    defer if (client_owned) native.server.destroyClient(client) catch unreachable;
+    var peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer peer.deinit();
+    _ = try core.bootstrapDisplay(&peer);
+    const registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&peer, 2),
+    };
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var shm_name: u32 = 0;
+    var output_name: u32 = 0;
+    var screencopy_name: u32 = 0;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const global = (try core.decodeRegistryEvent(&message, registry.id)).global;
+        if (std.mem.eql(u8, global.interface, generated.wl_shm.name)) shm_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_output.name)) output_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.zwlr_screencopy_manager_v1.name))
+            screencopy_name = global.name;
+    }
+    try std.testing.expect(shm_name != 0 and output_name != 0 and screencopy_name != 0);
+    const shm_resource: wayring.ObjectHandle = .{
+        .id = 3,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shm_name,
+            generated.wl_shm.name,
+            2,
+            3,
+            &generated.wl_shm,
+        ),
+    };
+    const output_resource: wayring.ObjectHandle = .{
+        .id = 4,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            output_name,
+            generated.wl_output.name,
+            4,
+            4,
+            &generated.wl_output,
+        ),
+    };
+    const screencopy_manager: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            screencopy_name,
+            generated.zwlr_screencopy_manager_v1.name,
+            3,
+            5,
+            &generated.zwlr_screencopy_manager_v1,
+        ),
+    };
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+
+    const fd = try std.posix.memfd_create("keywork-screencopy-test", linux.MFD.CLOEXEC);
+    var fd_owned = true;
+    defer {
+        if (fd_owned) _ = linux.close(fd);
+    }
+    if (linux.errno(linux.ftruncate(fd, 16)) != .SUCCESS) return error.TruncateFailed;
+    const duplicate_result = linux.dup(fd);
+    if (linux.errno(duplicate_result) != .SUCCESS) return error.DuplicateFailed;
+    const inspect_fd: i32 = @intCast(duplicate_result);
+    defer _ = linux.close(inspect_fd);
+    const pool = try generated.wl_shm_types.requests.create_pool(
+        &peer,
+        shm_resource,
+        fd,
+        16,
+    );
+    fd_owned = false;
+    const buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        0,
+        2,
+        2,
+        8,
+        @intFromEnum(shm.Format.argb8888),
+    );
+    try generated.wl_shm_pool_types.requests.destroy(&peer, pool);
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+
+    const first_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testTransferFromNative(&peer, client);
+    var saw_buffer = false;
+    var saw_buffer_done = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != first_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(
+            &peer,
+            first_frame,
+            &message,
+        )) {
+            .buffer => |event| {
+                try std.testing.expectEqual(@intFromEnum(shm.Format.argb8888), event.format);
+                try std.testing.expectEqual(@as(u32, 2), event.width);
+                try std.testing.expectEqual(@as(u32, 2), event.height);
+                try std.testing.expectEqual(@as(u32, 8), event.stride);
+                saw_buffer = true;
+            },
+            .buffer_done => saw_buffer_done = true,
+            else => return error.UnexpectedScreencopyConstraintEvent,
+        }
+    }
+    try std.testing.expect(saw_buffer and saw_buffer_done);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(
+        &peer,
+        first_frame,
+        buffer,
+    );
+    try testTransferToNative(&peer, client);
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expect(native.screencopy_global.hasPendingIo());
+    try testDrainScreencopy(native);
+    try testTransferFromNative(&peer, client);
+    var first_flags = false;
+    var first_ready = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != first_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(
+            &peer,
+            first_frame,
+            &message,
+        )) {
+            .flags => |event| {
+                try std.testing.expectEqual(@as(u32, 0), event.flags);
+                first_flags = true;
+            },
+            .ready => first_ready = true,
+            else => return error.UnexpectedScreencopyReadyEvent,
+        }
+    }
+    try std.testing.expect(first_flags and first_ready);
+    var captured: [4]u32 = undefined;
+    const read_result = linux.pread(
+        inspect_fd,
+        std.mem.asBytes(&captured).ptr,
+        @sizeOf(@TypeOf(captured)),
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read_result));
+    try std.testing.expectEqual(@as(usize, @sizeOf(@TypeOf(captured))), read_result);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, &captured);
+
+    try generated.zwlr_screencopy_frame_v1_types.requests.destroy(&peer, first_frame);
+    const second_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy_with_damage(
+        &peer,
+        second_frame,
+        buffer,
+    );
+    try testTransferToNative(&peer, client);
+    try afterPlatform(native, &native.event_loop);
+    try testTransferFromNative(&peer, client);
+    try std.testing.expect(peer.popMessage() == null);
+
+    native.scheduleRepaint(0);
+    try afterPlatform(native, &native.event_loop);
+    try testDrainScreencopy(native);
+    try testTransferFromNative(&peer, client);
+    var second_flags = false;
+    var second_damage = false;
+    var second_ready = false;
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != second_frame.id) continue;
+        switch (try generated.zwlr_screencopy_frame_v1_types.decodeEvent(
+            &peer,
+            second_frame,
+            &message,
+        )) {
+            .flags => |event| {
+                try std.testing.expectEqual(@as(u32, 0), event.flags);
+                second_flags = true;
+            },
+            .damage => |event| {
+                try std.testing.expectEqual(@as(u32, 0), event.x);
+                try std.testing.expectEqual(@as(u32, 0), event.y);
+                try std.testing.expectEqual(@as(u32, 2), event.width);
+                try std.testing.expectEqual(@as(u32, 2), event.height);
+                second_damage = true;
+            },
+            .ready => second_ready = true,
+            else => return error.UnexpectedScreencopyDamageEvent,
+        }
+    }
+    try std.testing.expect(second_flags and second_damage and second_ready);
+
+    const canceled_frame = try generated.zwlr_screencopy_manager_v1_types.requests.capture_output(
+        &peer,
+        screencopy_manager,
+        0,
+        output_resource,
+    );
+    try testTransferToNative(&peer, client);
+    try testDrainNativePeer(&peer, client);
+    try generated.zwlr_screencopy_frame_v1_types.requests.copy(
+        &peer,
+        canceled_frame,
+        buffer,
+    );
+    try testTransferToNative(&peer, client);
+    try afterPlatform(native, &native.event_loop);
+    try std.testing.expect(native.screencopy_global.hasPendingIo());
+    try native.server.destroyClient(client);
+    client_owned = false;
+    try testDrainScreencopy(native);
+    try std.testing.expect(!native.screencopy_global.hasPendingIo());
+}
+
 test "native compositor owns and drains its io_uring listener" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -4890,12 +5224,33 @@ fn testDrainNativePeer(
     }
 }
 
+fn testDrainScreencopy(native: *NativeServer) !void {
+    var attempts: usize = 0;
+    while (native.screencopy_global.hasPendingIo()) : (attempts += 1) {
+        if (attempts == 8) return error.ScreencopyDidNotComplete;
+        try native.event_loop.ioLoop().runOnce();
+    }
+}
+
 fn testTransferToNative(
     connection: *wayring.Connection,
     client: *Server.Client,
 ) !void {
     while (connection.nextBatch()) |batch| {
-        try client.receive(batch.bytes, batch.fds);
+        var duplicated: [wayring.max_fds_per_batch]i32 = undefined;
+        var count: usize = 0;
+        errdefer {
+            for (duplicated[0..count]) |fd| _ = linux.close(fd);
+        }
+        for (batch.fds) |fd| {
+            const result = linux.dup(fd);
+            if (linux.errno(result) != .SUCCESS) return error.DuplicateFdFailed;
+            duplicated[count] = @intCast(result);
+            count += 1;
+        }
+        const received_fds = duplicated[0..count];
+        count = 0;
+        try client.receive(batch.bytes, received_fds);
         try connection.acknowledge(batch.token, batch.bytes.len);
     }
 }
