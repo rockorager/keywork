@@ -209,8 +209,10 @@ pub const Client = struct {
         while (self.connection.popMessage()) |popped| {
             var message = popped;
             defer message.deinit();
-            self.dispatchOne(&message) catch {
+            self.dispatchOne(&message) catch |err| {
                 if (self.state == .protocol_error) return error.ProtocolError;
+                if (err == error.UnknownResource or err == error.UnknownObject or err == error.StaleObject)
+                    return self.protocolError(message.object_id, 0, "invalid Wayland request object");
                 return self.protocolError(message.object_id, 3, "Wayland request dispatch failed");
             };
             if (hasConstructor(message.descriptor)) {

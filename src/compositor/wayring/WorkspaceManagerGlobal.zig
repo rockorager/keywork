@@ -457,7 +457,7 @@ test "workspace requests buffer through commit and resources have independent li
                 .delete_id => |id| if (id == bound.manager.id) {
                     deleted = true;
                 },
-                .error_event => |event| if (event.object_id == bound.manager.id) {
+                .error_event => |event| if (event.object_id == bound.manager.id and event.code == 0) {
                     protocol_error = true;
                 },
             }
