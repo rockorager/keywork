@@ -23,6 +23,18 @@ pub const Metadata = struct {
     instance_id: ?[]const u8,
 };
 
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn confinedProvenance(allocator: std.mem.Allocator) !Server.OwnedProvenance {
+        const metadata = try allocator.create(OwnedMetadata);
+        metadata.* = .{ .allocator = allocator };
+        return .{
+            .key = &provenance_key,
+            .data = metadata,
+            .destroy = destroyClientMetadata,
+        };
+    }
+} else struct {};
+
 const OwnedMetadata = struct {
     allocator: std.mem.Allocator,
     sandbox_engine: ?[]u8 = null,

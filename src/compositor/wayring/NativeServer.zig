@@ -564,6 +564,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         &self.server,
         &self.surface_tree,
         &self.output_global,
+        &self.security_context_global,
         .{
             .context = self,
             .changed = layerShellChanged,

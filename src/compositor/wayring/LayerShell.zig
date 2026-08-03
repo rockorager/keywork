@@ -8,6 +8,7 @@ const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
+const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
 const render = @import("../render/types.zig");
 
@@ -40,6 +41,7 @@ pub const StagedCommit = struct {
     item: *LayerSurface,
     state: State,
     mapped: bool,
+    resets_lifecycle: bool = false,
 
     pub fn discard(self: *StagedCommit) void {
         self.item.unreference();
@@ -137,6 +139,7 @@ pub fn init(
     server: *Server,
     tree: *SurfaceTree,
     output: *OutputGlobal,
+    security: *SecurityContextGlobal,
     listener: Listener,
 ) !void {
     self.* = .{
@@ -147,7 +150,16 @@ pub fn init(
         .listener = listener,
         .global_name = undefined,
     };
-    self.global_name = try server.createGlobal(&generated.zwlr_layer_shell_v1, advertised_version, .{ .context = self, .bind = bind });
+    self.global_name = try server.createGlobal(
+        &generated.zwlr_layer_shell_v1,
+        advertised_version,
+        .{
+            .context = self,
+            .bind = bind,
+            .filter_context = security,
+            .filter = SecurityContextGlobal.allowUnconfined,
+        },
+    );
 }
 
 pub fn deinit(self: *LayerShell) void {
@@ -204,6 +216,14 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
         try postLayerError(item, .invalid_size, "invalid layer surface size or anchor");
         return .{};
     }
+    if (!item.initial_configure_sent) {
+        if (commit.attachment == .buffer) {
+            try postLayerError(item, .invalid_surface_state, "buffer committed before initial configure");
+            return .{};
+        }
+        try sendConfigure(item, state);
+        return .{ .disposition = .configure_only };
+    }
     if (commit.attachment == .removed) {
         _ = try self.tree.nodeFor(item.surface);
         const staged = try self.allocator.create(StagedCommit);
@@ -214,16 +234,9 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
             .item = item,
             .state = .{ .layer = item.initial_layer },
             .mapped = false,
+            .resets_lifecycle = true,
         };
         return .{ .staged = staged };
-    }
-    if (!item.initial_configure_sent) {
-        if (commit.attachment == .buffer) {
-            try postLayerError(item, .invalid_surface_state, "buffer committed before initial configure");
-            return .{};
-        }
-        try sendConfigure(item, state);
-        return .{ .disposition = .configure_only };
     }
     if (commit.attachment == .buffer and !item.configured) {
         try postLayerError(item, .invalid_surface_state, "buffer committed before configure acknowledgement");
@@ -261,6 +274,11 @@ pub fn apply(self: *LayerShell, staged: *StagedCommit) !void {
     if (!item.surface_alive or !item.resource_alive) return;
     item.current = staged.state;
     item.mapped = staged.mapped;
+    if (staged.resets_lifecycle) {
+        item.configured = false;
+        item.initial_configure_sent = false;
+        item.configures.clearRetainingCapacity();
+    }
     try self.arrange();
 }
 
@@ -420,11 +438,10 @@ fn captureCommit(context: *anyopaque) !?CompositorGlobal.RoleCommitState {
     if (item.surface.pendingBufferRemoved()) {
         // Request dispatch may capture multiple commits before the first is
         // prepared. Reset now so a same-batch remap captures construction
-        // defaults rather than the pre-unmap pending role state.
+        // defaults rather than the pre-unmap pending role state. Handshake
+        // state remains valid for earlier queued commits until this unmap is
+        // applied in transaction order.
         item.pending = .{ .layer = item.initial_layer };
-        item.configured = false;
-        item.initial_configure_sent = false;
-        item.configures.clearRetainingCapacity();
     }
     return .{ .owner = item.binding.owner, .context = captured, .deinit = CapturedState.destroy };
 }
@@ -597,6 +614,10 @@ test "native layer surface configures transactionally and outlives its manager" 
 
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
+    var transport: @import("wayring-server-uring") = undefined;
+    var security: SecurityContextGlobal = undefined;
+    try security.init(std.testing.allocator, &server, &transport);
+    defer security.deinit();
     var compositor: CompositorGlobal = undefined;
     try compositor.init(std.testing.allocator, &server);
     defer compositor.deinit();
@@ -620,6 +641,7 @@ test "native layer surface configures transactionally and outlives its manager" 
         &server,
         &tree,
         &output,
+        &security,
         .{
             .context = &shell,
             .changed = Changed.changed,
@@ -627,6 +649,49 @@ test "native layer surface configures transactionally and outlives its manager" 
         },
     );
     defer shell.deinit();
+
+    const confined = try server.createClientWithProvenance(
+        try SecurityContextGlobal.Testing.confinedProvenance(std.testing.allocator),
+    );
+    defer server.destroyClient(confined) catch {};
+    var confined_peer = wayring.Connection.init(
+        std.testing.allocator,
+        .client,
+        wayring.default_max_frame_size,
+    );
+    defer confined_peer.deinit();
+    _ = try core.bootstrapDisplay(&confined_peer);
+    const confined_registry: wayring.ObjectHandle = .{
+        .id = 2,
+        .generation = try core.getRegistry(&confined_peer, 2),
+    };
+    try transferToLayerServer(&confined_peer, confined);
+    try transferFromLayerServer(&confined_peer, confined);
+    while (confined_peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        const event = try core.decodeRegistryEvent(&message, confined_registry.id);
+        if (event == .global)
+            try std.testing.expect(!std.mem.eql(
+                u8,
+                event.global.interface,
+                generated.zwlr_layer_shell_v1.name,
+            ));
+    }
+    _ = try core.bind(
+        &confined_peer,
+        confined_registry.id,
+        shell.global_name,
+        generated.zwlr_layer_shell_v1.name,
+        advertised_version,
+        3,
+        &generated.zwlr_layer_shell_v1,
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        transferToLayerServer(&confined_peer, confined),
+    );
+
     const client = try server.createClient();
     defer server.destroyClient(client) catch unreachable;
 
@@ -699,6 +764,7 @@ test "native layer surface configures transactionally and outlives its manager" 
             generated.zwlr_layer_surface_v1_types.anchor.left |
             generated.zwlr_layer_surface_v1_types.anchor.right,
     );
+    try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToLayerServer(&peer, client);
     var initial_transaction = compositor.popTransaction() orelse return error.MissingCommit;
@@ -728,6 +794,13 @@ test "native layer surface configures transactionally and outlives its manager" 
         configure_serial orelse return error.MissingConfigure,
     );
     try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 0, 48);
+    try generated.zwlr_layer_surface_v1_types.requests.set_anchor(
+        &peer,
+        layer_surface,
+        generated.zwlr_layer_surface_v1_types.anchor.top |
+            generated.zwlr_layer_surface_v1_types.anchor.left |
+            generated.zwlr_layer_surface_v1_types.anchor.right,
+    );
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToLayerServer(&peer, client);
     var resize_transaction = compositor.popTransaction() orelse return error.MissingResizeCommit;
@@ -739,8 +812,10 @@ test "native layer surface configures transactionally and outlives its manager" 
     try shell.apply(staged);
     try std.testing.expectEqual(@as(u32, 48), shell.surfaces.items[0].current.height);
 
-    // Both commits arrive in one server receive turn. The null-buffer commit
-    // resets pending role state before the following remap commit captures it.
+    // All three commits arrive in one server receive turn. The null-buffer
+    // commit resets pending role state for the following remap without
+    // invalidating the handshake used by the earlier queued commit.
+    try generated.wl_surface_types.requests.commit(&peer, surface);
     try generated.wl_surface_types.requests.attach(&peer, surface, null, 0, 0);
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 200, 50);
@@ -748,6 +823,11 @@ test "native layer surface configures transactionally and outlives its manager" 
     try transferToLayerServer(&peer, client);
     try std.testing.expectEqual(@as(u32, 200), shell.surfaces.items[0].pending.width);
     try std.testing.expectEqual(@as(u32, 50), shell.surfaces.items[0].pending.height);
+    var prior_transaction = compositor.popTransaction() orelse return error.MissingPriorCommit;
+    defer prior_transaction.deinit();
+    const prior = (try shell.handleCommit(&prior_transaction.entries[0])).?;
+    try std.testing.expect(shell.surfaces.items[0].configured);
+    try shell.apply(prior.staged orelse return error.MissingStagedPriorCommit);
     var unmap_transaction = compositor.popTransaction() orelse return error.MissingUnmapCommit;
     defer unmap_transaction.deinit();
     const unmap = (try shell.handleCommit(&unmap_transaction.entries[0])).?;
