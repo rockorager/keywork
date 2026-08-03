@@ -9,8 +9,10 @@ const Server = @import("wayring-server");
 const CompositorGlobal = @import("CompositorGlobal.zig");
 const OutputGlobal = @import("OutputGlobal.zig");
 const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
+const ShmGlobal = @import("ShmGlobal.zig");
 const SurfaceTree = @import("SurfaceTree.zig");
 const render = @import("../render/types.zig");
+const shm = @import("shm.zig");
 
 const advertised_version: u32 = 4;
 const all_anchors: u32 = 15;
@@ -221,8 +223,18 @@ pub fn handleCommit(self: *LayerShell, commit: *CompositorGlobal.Commit) !?Commi
             try postLayerError(item, .invalid_surface_state, "buffer committed before initial configure");
             return .{};
         }
+        try item.reference();
+        errdefer item.unreference();
+        const staged = try self.allocator.create(StagedCommit);
+        errdefer self.allocator.destroy(staged);
+        staged.* = .{
+            .allocator = self.allocator,
+            .item = item,
+            .state = state,
+            .mapped = false,
+        };
         try sendConfigure(item, state);
-        return .{ .disposition = .configure_only };
+        return .{ .disposition = .configure_only, .staged = staged };
     }
     if (commit.attachment == .removed) {
         _ = try self.tree.nodeFor(item.surface);
@@ -435,7 +447,7 @@ fn captureCommit(context: *anyopaque) !?CompositorGlobal.RoleCommitState {
     const item: *LayerSurface = @ptrCast(@alignCast(context));
     const captured = try item.allocator.create(CapturedState);
     captured.* = .{ .allocator = item.allocator, .state = item.pending };
-    if (item.surface.pendingBufferRemoved()) {
+    if (item.initial_configure_sent and item.surface.pendingBufferRemoved()) {
         // Request dispatch may capture multiple commits before the first is
         // prepared. Reset now so a same-batch remap captures construction
         // defaults rather than the pre-unmap pending role state. Handshake
@@ -480,13 +492,13 @@ fn geometryForSize(state: State, output: render.Size, content_size: ?render.Size
 fn geometryInSize(state: State, bounds: render.Rect, content_size: ?render.Size) render.Rect {
     const output: render.Size = .{ .width = bounds.width, .height = bounds.height };
     var width = if (content_size) |size|
-        @min(output.width, size.width)
+        size.width
     else if (state.width == 0)
         output.width
     else
         @min(output.width, state.width);
     var height = if (content_size) |size|
-        @min(output.height, size.height)
+        size.height
     else if (state.height == 0)
         output.height
     else
@@ -601,6 +613,30 @@ test "geometry covers shell placements and exclusive usable area edge" {
             .{ .width = 380, .height = 180 },
         ),
     );
+    try std.testing.expectEqual(
+        render.Rect{ .x = -720, .y = 0, .width = 2000, .height = 40 },
+        geometryForSize(
+            .{ .width = 2000, .height = 40, .anchor = 1 | 8, .layer = .overlay },
+            output,
+            .{ .width = 2000, .height = 40 },
+        ),
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = -290, .width = 40, .height = 1000 },
+        geometryForSize(
+            .{ .width = 40, .height = 1000, .anchor = 2 | 4, .margin_bottom = 10, .layer = .overlay },
+            output,
+            .{ .width = 40, .height = 1000 },
+        ),
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = -360, .y = 0, .width = 2000, .height = 40 },
+        geometryForSize(
+            .{ .width = 0, .height = 40, .anchor = 1 | 4 | 8, .layer = .top },
+            output,
+            .{ .width = 2000, .height = 40 },
+        ),
+    );
 }
 
 test "native layer surface configures transactionally and outlives its manager" {
@@ -618,6 +654,9 @@ test "native layer surface configures transactionally and outlives its manager" 
     var security: SecurityContextGlobal = undefined;
     try security.init(std.testing.allocator, &server, &transport);
     defer security.deinit();
+    var shm_global: ShmGlobal = undefined;
+    try shm_global.init(std.testing.allocator, &server);
+    defer shm_global.deinit();
     var compositor: CompositorGlobal = undefined;
     try compositor.init(std.testing.allocator, &server);
     defer compositor.deinit();
@@ -710,6 +749,7 @@ test "native layer surface configures transactionally and outlives its manager" 
     try transferFromLayerServer(&peer, client);
     var compositor_name: u32 = 0;
     var shell_name: u32 = 0;
+    var shm_name: u32 = 0;
     while (peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
@@ -718,6 +758,8 @@ test "native layer surface configures transactionally and outlives its manager" 
             compositor_name = global.name;
         if (std.mem.eql(u8, global.interface, generated.zwlr_layer_shell_v1.name))
             shell_name = global.name;
+        if (std.mem.eql(u8, global.interface, generated.wl_shm.name))
+            shm_name = global.name;
     }
     const compositor_resource: wayring.ObjectHandle = .{
         .id = 3,
@@ -743,7 +785,42 @@ test "native layer surface configures transactionally and outlives its manager" 
             &generated.zwlr_layer_shell_v1,
         ),
     };
+    const shm_resource: wayring.ObjectHandle = .{
+        .id = 5,
+        .generation = try core.bind(
+            &peer,
+            registry.id,
+            shm_name,
+            generated.wl_shm.name,
+            2,
+            5,
+            &generated.wl_shm,
+        ),
+    };
     try transferToLayerServer(&peer, client);
+    try transferFromLayerServer(&peer, client);
+    while (peer.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+    const fd = try std.posix.memfd_create("keywork-layer-shell-test", std.os.linux.MFD.CLOEXEC);
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = std.os.linux.close(fd);
+    };
+    if (std.os.linux.errno(std.os.linux.ftruncate(fd, 64)) != .SUCCESS)
+        return error.TruncateFailed;
+    const pool = try generated.wl_shm_types.requests.create_pool(&peer, shm_resource, fd, 64);
+    fd_owned = false;
+    const buffer = try generated.wl_shm_pool_types.requests.create_buffer(
+        &peer,
+        pool,
+        0,
+        4,
+        4,
+        16,
+        @intFromEnum(shm.Format.argb8888),
+    );
     const surface = try generated.wl_compositor_types.requests.create_surface(
         &peer,
         compositor_resource,
@@ -769,10 +846,13 @@ test "native layer surface configures transactionally and outlives its manager" 
     try transferToLayerServer(&peer, client);
     var initial_transaction = compositor.popTransaction() orelse return error.MissingCommit;
     defer initial_transaction.deinit();
+    const initial = (try shell.handleCommit(&initial_transaction.entries[0])).?;
     try std.testing.expectEqual(
         .configure_only,
-        (try shell.handleCommit(&initial_transaction.entries[0])).?.disposition,
+        initial.disposition,
     );
+    try shell.apply(initial.staged orelse return error.MissingStagedInitialCommit);
+    try std.testing.expectEqual(@as(u32, 40), shell.surfaces.items[0].current.height);
     try transferFromLayerServer(&peer, client);
     var configure_serial: ?u32 = null;
     while (peer.popMessage()) |popped| {
@@ -793,22 +873,25 @@ test "native layer surface configures transactionally and outlives its manager" 
         layer_surface,
         configure_serial orelse return error.MissingConfigure,
     );
+    try generated.wl_surface_types.requests.attach(&peer, surface, buffer, 0, 0);
+    try generated.wl_surface_types.requests.commit(&peer, surface);
+    try transferToLayerServer(&peer, client);
+    var map_transaction = compositor.popTransaction() orelse return error.MissingMapCommit;
+    defer map_transaction.deinit();
+    const map_result = (try shell.handleCommit(&map_transaction.entries[0])).?;
+    const map_staged = map_result.staged orelse return error.MissingStagedMapCommit;
+    try shell.apply(map_staged);
+    try std.testing.expect(shell.surfaces.items[0].mapped);
+    try std.testing.expectEqual(@as(u32, 40), shell.surfaces.items[0].current.height);
+
     try generated.zwlr_layer_surface_v1_types.requests.set_size(&peer, layer_surface, 0, 48);
-    try generated.zwlr_layer_surface_v1_types.requests.set_anchor(
-        &peer,
-        layer_surface,
-        generated.zwlr_layer_surface_v1_types.anchor.top |
-            generated.zwlr_layer_surface_v1_types.anchor.left |
-            generated.zwlr_layer_surface_v1_types.anchor.right,
-    );
     try generated.wl_surface_types.requests.commit(&peer, surface);
     try transferToLayerServer(&peer, client);
     var resize_transaction = compositor.popTransaction() orelse return error.MissingResizeCommit;
     defer resize_transaction.deinit();
-    const result = (try shell.handleCommit(&resize_transaction.entries[0])).?;
-    const staged = result.staged orelse return error.MissingStagedLayerCommit;
-    try std.testing.expectEqual(@as(u32, 0), shell.surfaces.items[0].current.width);
-    try std.testing.expectEqual(@as(u32, 0), shell.surfaces.items[0].current.height);
+    const resize_result = (try shell.handleCommit(&resize_transaction.entries[0])).?;
+    const staged = resize_result.staged orelse return error.MissingStagedLayerCommit;
+    try std.testing.expectEqual(@as(u32, 40), shell.surfaces.items[0].current.height);
     try shell.apply(staged);
     try std.testing.expectEqual(@as(u32, 48), shell.surfaces.items[0].current.height);
 
@@ -834,10 +917,12 @@ test "native layer surface configures transactionally and outlives its manager" 
     try shell.apply(unmap.staged orelse return error.MissingStagedUnmap);
     var remap_transaction = compositor.popTransaction() orelse return error.MissingRemapCommit;
     defer remap_transaction.deinit();
+    const remap = (try shell.handleCommit(&remap_transaction.entries[0])).?;
     try std.testing.expectEqual(
         .configure_only,
-        (try shell.handleCommit(&remap_transaction.entries[0])).?.disposition,
+        remap.disposition,
     );
+    try shell.apply(remap.staged orelse return error.MissingStagedRemap);
 
     try generated.zwlr_layer_shell_v1_types.requests.destroy(&peer, shell_resource);
     try transferToLayerServer(&peer, client);
