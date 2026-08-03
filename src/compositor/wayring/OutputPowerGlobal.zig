@@ -97,7 +97,8 @@ fn dispatchManager(
 
 fn createControl(self: *OutputPowerGlobal, client: *Server.Client, id: u32, output_id: u32) !void {
     const control = self.allocator.create(Control) catch return client.postNoMemory();
-    errdefer self.allocator.destroy(control);
+    var control_owned = true;
+    errdefer if (control_owned) self.allocator.destroy(control);
     self.controls.ensureUnusedCapacity(self.allocator, 1) catch return client.postNoMemory();
     const mode = self.listener.mode(self.listener.context);
     control.* = .{
@@ -113,11 +114,15 @@ fn createControl(self: *OutputPowerGlobal, client: *Server.Client, id: u32, outp
         .destroy = destroyControl,
     }) catch return client.postNoMemory();
     self.controls.appendAssumeCapacity(control);
+    control_owned = false;
     if (control.valid) {
         self.active = control;
-        try sendMode(control, mode.?);
+        sendMode(control, mode.?) catch return client.postNoMemory();
     } else {
-        try generated.zwlr_output_power_v1_types.events.failed(&client.connection, control.resource);
+        generated.zwlr_output_power_v1_types.events.failed(
+            &client.connection,
+            control.resource,
+        ) catch return client.postNoMemory();
     }
 }
 
@@ -151,7 +156,7 @@ fn dispatchControl(
                 fail(control);
                 return;
             };
-            try sendMode(control, powered);
+            sendMode(control, powered) catch return client.postNoMemory();
         },
     }
 }

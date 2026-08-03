@@ -294,6 +294,13 @@ const Output = union(OutputKind) {
         };
     }
 
+    fn powered(self: *const Output) bool {
+        return switch (self.*) {
+            .headless => true,
+            .drm => |output| if (output) |drm_output| drm_output.powered else false,
+        };
+    }
+
     fn name(self: *const Output) []const u8 {
         return switch (self.*) {
             .headless => "HEADLESS-1",
@@ -1949,6 +1956,10 @@ fn scheduleIdleNotify(context: *anyopaque, delay_milliseconds: ?u64) void {
 }
 
 fn scheduleRepaint(self: *NativeServer, delay_milliseconds: u64) void {
+    if (!self.output.powered()) {
+        self.repaint_needed = false;
+        return;
+    }
     self.repaint_needed = true;
     self.repaint_timer.arm(@max(delay_milliseconds, 1), 0) catch self.terminate();
 }
@@ -3655,6 +3666,10 @@ fn copyComplete(_: ?*anyopaque, _: *AsyncShmCopy) void {
 fn renderScene(self: *NativeServer, damage_state: ?*SurfaceState) !void {
     if (self.output == .drm) {
         const output = self.output.drm orelse return;
+        if (!output.powered) {
+            self.repaint_needed = false;
+            return;
+        }
         if (!output.ready()) {
             self.repaint_needed = true;
             return;
@@ -4651,6 +4666,21 @@ test "native immediate repaint uses the next timer tick" {
     native.scheduleRepaint(0);
     try std.testing.expect(!native.event_loop.stop_requested);
     try std.testing.expect(native.repaint_timer.heap_index != null);
+}
+
+test "native powered-off DRM output suppresses repaint requests" {
+    var drm_output: DrmOutput = undefined;
+    drm_output.powered = false;
+    var native: NativeServer = undefined;
+    native.output = .{ .drm = &drm_output };
+    native.repaint_needed = true;
+
+    native.scheduleRepaint(0);
+    try std.testing.expect(!native.repaint_needed);
+
+    native.repaint_needed = true;
+    try native.renderScene(null);
+    try std.testing.expect(!native.repaint_needed);
 }
 
 test "layer role deactivation reconciles pointer and touch focus" {
