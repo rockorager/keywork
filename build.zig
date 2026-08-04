@@ -129,6 +129,29 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_wayring_example.addArgs(args);
     const run_wayring_example_step = b.step("run-wayring-example", "Run the once-only Wayring server example");
     run_wayring_example_step.dependOn(&run_wayring_example.step);
+    const benchmark_client = b.addExecutable(.{
+        .name = "wayring-benchmark-client",
+        .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseFast, .link_libc = true }),
+    });
+    benchmark_client.root_module.addCSourceFile(.{ .file = b.path("scripts/wayring_benchmark_client.c"), .flags = &.{"-std=c11"} });
+    benchmark_client.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
+    const install_benchmark_client = b.addInstallArtifact(benchmark_client, .{ .dest_dir = .{ .override = .{ .custom = "wayring-benchmark" } } });
+    const benchmark_server = b.addExecutable(.{
+        .name = "wayring-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wayring/example_server.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{ .{ .name = "wayring", .module = wayring }, .{ .name = "core_protocol", .module = core_protocol } },
+        }),
+    });
+    const install_benchmark_server = b.addInstallArtifact(benchmark_server, .{ .dest_dir = .{ .override = .{ .custom = "wayring-benchmark" } } });
+    const benchmark_run = b.addSystemCommand(&.{ "python3", "scripts/wayring_benchmark.py" });
+    benchmark_run.step.dependOn(&install_benchmark_client.step);
+    benchmark_run.step.dependOn(&install_benchmark_server.step);
+    if (b.args) |args| benchmark_run.addArgs(args);
+    const benchmark_step = b.step("benchmark-wayring", "Benchmark Wayring against headless Sway (writes review artifacts)");
+    benchmark_step.dependOn(&benchmark_run.step);
     const checkpoint3_test_module = b.createModule(.{
         .root_source_file = b.path("src/wayring/checkpoint3_test.zig"),
         .target = target,

@@ -374,6 +374,12 @@ Keywork event loop or compositor code is involved.
 Exit: the example is sufficient API documentation and interoperates with an
 external client.
 
+For a repeatable core-protocol CPU, wall-time, and syscall comparison against
+headless Sway, run `zig build benchmark-wayring`. The ReleaseFast binaries are
+placed under `zig-out/wayring-benchmark/`; results and methodology are written
+to `.amp/in/artifacts/wayring-benchmark/`. Run
+`zig build benchmark-wayring -- --help` for workload and sample controls.
+
 ### 6. Keywork integration
 
 Adapt Keywork's existing protocol implementations in place behind a temporary
