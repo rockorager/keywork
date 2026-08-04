@@ -530,7 +530,7 @@ test "input method parent teardown keeps children valid when deferral allocation
         .available = true,
     };
     method.resource = try client.createResource(
-        0xff000000,
+        100,
         &generated.zwp_input_method_v2,
         1,
         .{ .context = method, .dispatch = dispatchMethod, .destroy = destroyMethod },
@@ -543,7 +543,7 @@ test "input method parent teardown keeps children valid when deferral allocation
         .allocator = std.testing.allocator,
         .method = method,
         .resource = try client.createResource(
-            0xff000001,
+            101,
             &generated.zwp_input_method_keyboard_grab_v2,
             1,
             .{ .context = undefined, .dispatch = dispatchChild, .destroy = destroyChild },
@@ -552,6 +552,7 @@ test "input method parent teardown keeps children valid when deferral allocation
     const registered_child = client.resources.getPtr(child.resource.id).?;
     registered_child.implementation.context = child;
     try method.children.append(std.testing.allocator, child);
+    try client.retired_ids.ensureUnusedCapacity(std.testing.allocator, 2);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     client.allocator = failing.allocator();
