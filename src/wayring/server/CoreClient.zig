@@ -210,6 +210,30 @@ test "display sync emits callback done before delete_id and tears down cleanly" 
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[20..24], .little));
 }
 
+test "managed client destruction notifies borrowed observers" {
+    const Context = struct {
+        called: bool = false,
+
+        fn observe(self: *@This(), client_value: *Client, _: *Client.Observer) void {
+            self.called = true;
+            const credentials = client_value.credentials().?;
+            std.testing.expectEqual(@as(std.os.linux.pid_t, 41), credentials.pid) catch unreachable;
+            std.testing.expectEqual(@as(std.os.linux.uid_t, 42), credentials.uid) catch unreachable;
+            std.testing.expectEqual(@as(std.os.linux.gid_t, 43), credentials.gid) catch unreachable;
+        }
+    };
+
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const managed = try CoreClient.create(std.testing.allocator, &host, .{
+        .credentials = .{ .pid = 41, .uid = 42, .gid = 43 },
+    });
+    var context: Context = .{};
+    _ = try managed.client().addDestroyObserver(Context, &context, Context.observe);
+    managed.destroy();
+    try std.testing.expect(context.called);
+}
+
 test "invalid registry bind posts protocol fatal without entering binder" {
     const Fixture = struct {
         pub const interface: wire.Interface = .{ .name = "wl_fixture", .version = 1 };

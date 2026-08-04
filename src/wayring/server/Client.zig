@@ -2,7 +2,8 @@
 //!
 //! Resources and handler contexts are borrowed. They must remain stable while
 //! live; Client never deinitializes or frees them. A handler that takes an FD
-//! owns it even when that handler subsequently returns an error.
+//! owns it even when that handler subsequently returns an error. Client storage
+//! must remain stable after registering a destruction observer.
 
 const Client = @This();
 
@@ -21,6 +22,18 @@ pub const Credentials = struct {
 pub const Options = struct {
     max_objects: usize = 4096,
     credentials: ?Credentials = null,
+};
+
+/// Opaque, runtime-owned destruction registration handle.
+pub const Observer = opaque {};
+
+const ObserverNode = struct {
+    client: *Client,
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, *Client, *Observer) void,
+    previous: ?*ObserverNode = null,
+    next: ?*ObserverNode = null,
+    active: bool = true,
 };
 
 const delete_id_descriptor: wire.MessageDescriptor = .{
@@ -46,6 +59,10 @@ credentials_value: ?Credentials,
 fatal_state: Fatal = .{},
 dispatching: bool = false,
 active_new_ids: ?[]NewIdExpectation = null,
+observer_head: ?*ObserverNode = null,
+observer_tail: ?*ObserverNode = null,
+notifying_destroy: bool = false,
+destroying: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, options: Options) Client {
     return .{
@@ -57,8 +74,20 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Client {
     };
 }
 
-/// Releases connection-owned queues and tables, but never borrowed Resources.
+/// Notifies destruction observers, then releases connection-owned queues and
+/// tables, but never borrowed Resources.
 pub fn deinit(self: *Client) void {
+    if (self.destroying) return;
+    self.destroying = true;
+    self.notifying_destroy = true;
+    var current = self.observer_head;
+    while (current) |observer| {
+        const next = observer.next;
+        if (observer.active) observer.notify(observer.context, self, @ptrCast(observer));
+        current = next;
+    }
+    self.notifying_destroy = false;
+    self.freeAllObservers();
     self.input.deinit();
     self.output.deinit();
     self.objects.deinit();
@@ -77,6 +106,40 @@ pub fn objectCount(self: *const Client) usize {
 /// Consumers remain responsible for any authorization decision.
 pub fn credentials(self: *const Client) ?Credentials {
     return self.credentials_value;
+}
+
+pub fn addDestroyObserver(
+    self: *Client,
+    comptime Context: type,
+    context: *Context,
+    comptime callback: *const fn (*Context, *Client, *Observer) void,
+) !*Observer {
+    if (self.destroying) return error.ClientDestroying;
+    const observer = try self.allocator.create(ObserverNode);
+    observer.* = .{
+        .client = self,
+        .context = context,
+        .notify = struct {
+            fn call(erased: *anyopaque, client: *Client, handle: *Observer) void {
+                callback(@ptrCast(@alignCast(erased)), client, handle);
+            }
+        }.call,
+        .previous = self.observer_tail,
+    };
+    if (self.observer_tail) |tail| tail.next = observer else self.observer_head = observer;
+    self.observer_tail = observer;
+    return @ptrCast(observer);
+}
+
+/// The handle is invalid immediately after removal, except during destruction
+/// notification, when reclamation is deferred until all callbacks complete.
+pub fn removeDestroyObserver(observer: *Observer) void {
+    const node: *ObserverNode = @ptrCast(@alignCast(observer));
+    if (!node.active) return;
+    const self = node.client;
+    node.active = false;
+    if (self.notifying_destroy) return;
+    self.unlinkAndFreeObserver(node);
 }
 
 /// Records an application-detected protocol violation without allocating and
@@ -405,6 +468,57 @@ fn recordDetails(self: *Client, details: Fatal.Details) void {
     std.mem.writeInt(u32, frame[16..20], @intCast(string_len), .native);
     @memcpy(frame[20..][0..terminal_fatal.detail().len], terminal_fatal.detail());
     self.output.sealWithTerminal(frame[0..frame_len]) catch unreachable;
+}
+
+fn unlinkAndFreeObserver(self: *Client, observer: *ObserverNode) void {
+    if (observer.previous) |previous| previous.next = observer.next else self.observer_head = observer.next;
+    if (observer.next) |next| next.previous = observer.previous else self.observer_tail = observer.previous;
+    self.allocator.destroy(observer);
+}
+
+fn freeAllObservers(self: *Client) void {
+    var current = self.observer_head;
+    while (current) |observer| {
+        const next = observer.next;
+        self.allocator.destroy(observer);
+        current = next;
+    }
+    self.observer_head = null;
+    self.observer_tail = null;
+}
+
+test "Client destruction observers retain order and can remove registrations" {
+    const Context = struct {
+        order: *std.ArrayList(u8),
+        future: ?*Observer = null,
+        label: u8,
+
+        fn observe(self: *@This(), client: *Client, handle: *Observer) void {
+            self.order.append(std.testing.allocator, self.label) catch unreachable;
+            std.testing.expectError(error.ClientDestroying, client.addDestroyObserver(@This(), self, observe)) catch unreachable;
+            if (self.label == 'a') {
+                removeDestroyObserver(handle);
+                removeDestroyObserver(self.future.?);
+                client.deinit();
+            }
+        }
+    };
+
+    var client: Client = .init(std.testing.allocator, .{});
+    var order: std.ArrayList(u8) = .empty;
+    defer order.deinit(std.testing.allocator);
+    var first: Context = .{ .order = &order, .label = 'a' };
+    var second: Context = .{ .order = &order, .label = 'b' };
+    var third: Context = .{ .order = &order, .label = 'c' };
+    var removed: Context = .{ .order = &order, .label = 'x' };
+    _ = try client.addDestroyObserver(Context, &first, Context.observe);
+    _ = try client.addDestroyObserver(Context, &second, Context.observe);
+    first.future = try client.addDestroyObserver(Context, &third, Context.observe);
+    const removed_handle = try client.addDestroyObserver(Context, &removed, Context.observe);
+    removeDestroyObserver(removed_handle);
+
+    client.deinit();
+    try std.testing.expectEqualStrings("ab", order.items);
 }
 
 test "Client fatal terminal frames are allocation independent and follow in-flight output" {
