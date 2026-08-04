@@ -12,7 +12,7 @@ const std = @import("std");
 const core = @import("wayring-core-protocol");
 const wayring = @import("wayring");
 const slot_map = @import("../slot_map.zig");
-const CopiedBufferSnapshot = @import("CopiedBufferSnapshot.zig");
+const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const Region = @import("../region.zig");
 const render = @import("../render/types.zig");
 

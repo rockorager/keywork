@@ -3,8 +3,8 @@
 const CopiedBufferSnapshot = @This();
 
 const std = @import("std");
-const render = @import("../render/types.zig");
-const Region = @import("../region.zig");
+const render = @import("render/types.zig");
+const Region = @import("region.zig");
 
 pub const Format = enum { argb8888, xrgb8888 };
 
