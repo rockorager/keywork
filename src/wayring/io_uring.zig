@@ -210,6 +210,17 @@ const OperationTable = struct {
         return false;
     }
 
+    fn nextCancelable(self: *const OperationTable) ?OperationToken {
+        for (self.slots.items, 0..) |slot, index| if (slot.operation) |operation| {
+            const eligible = switch (operation) {
+                inline .accept, .recv, .send => |value| value.cancel == .none,
+                .cancel => false,
+            };
+            if (eligible) return .{ .slot = @intCast(index), .generation = slot.generation };
+        };
+        return null;
+    }
+
     fn slotFor(self: *OperationTable, token: OperationToken) !*Slot {
         if (token.slot >= self.slots.items.len) return error.ForeignToken;
         const slot = &self.slots.items[token.slot];
@@ -284,6 +295,7 @@ pub const CompleteResult = union(enum) {
     peer_disconnected: *Connection,
     terminal: *Connection,
     listener_error: linux.E,
+    cancellation,
     retry,
 };
 
@@ -297,6 +309,7 @@ pub const Server = struct {
     prefer_accept: bool = true,
     prefer_send: bool = true,
     connection_cursor: usize = 0,
+    shutting_down: bool = false,
 
     /// Takes ownership of an already-bound, listening Unix socket descriptor.
     pub fn init(allocator: std.mem.Allocator, sans_io: *server.Server, listener_fd: linux.fd_t) !Server {
@@ -309,8 +322,6 @@ pub const Server = struct {
         };
     }
 
-    /// Shutdown cancellation is deliberately not simulated: the host must
-    /// complete all operations and explicitly release all connections first.
     pub fn deinit(self: *Server) !void {
         if (self.operations.live_count != 0 or self.operations.prepared != null) return error.OperationsInFlight;
         if (self.connections.items.len != 0) return error.ConnectionsLive;
@@ -318,6 +329,27 @@ pub const Server = struct {
         self.connections.deinit(self.allocator);
         self.operations.deinit();
         self.* = undefined;
+    }
+
+    /// Stops new transport work. Kernel-owned operation storage remains alive
+    /// until the corresponding CQEs are completed.
+    pub fn beginShutdown(self: *Server) void {
+        if (self.shutting_down) return;
+        self.shutting_down = true;
+        for (self.connections.items) |connection| {
+            if (connection.state_value != .terminal) {
+                connection.state_value = .peer_disconnected;
+                connection.client().peerDisconnected();
+            }
+        }
+    }
+
+    pub fn isDrained(self: *const Server) bool {
+        if (!self.shutting_down or self.operations.live_count != 0 or self.operations.prepared != null) return false;
+        for (self.connections.items) |connection| {
+            if (connection.recv_pending or connection.send_pending) return false;
+        }
+        return !self.accept_pending;
     }
 
     /// Destroys transport/core storage only at an explicit application
@@ -344,6 +376,18 @@ pub const Server = struct {
     /// Reserves all fallible operation-table state before acquiring an SQE.
     /// Successful SQE preparation is followed only by infallible commit.
     pub fn prepareNext(self: *Server, ring: *linux.IoUring, external_user_data: u64) !PrepareResult {
+        if (self.shutting_down) {
+            const target = self.operations.nextCancelable() orelse return .idle;
+            try self.operations.prepareCancel(target, self, external_user_data);
+            const original = self.operations.lookup(target) catch unreachable;
+            _ = ring.cancel(external_user_data, original.external(), 0) catch |err| switch (err) {
+                error.SubmissionQueueFull => {
+                    self.operations.abortPrepared() catch unreachable;
+                    return .submission_queue_full;
+                },
+            };
+            return .{ .prepared = self.operations.commitPrepared() };
+        }
         const connection = self.nextConnection();
         const choose_accept = !self.accept_pending and (connection == null or self.prefer_accept);
         if (!choose_accept and connection == null) {
@@ -434,12 +478,22 @@ pub const Server = struct {
             .accept => self.completeAccept(res),
             .recv => |value| self.completeRecv(@ptrCast(@alignCast(value.owner)), res),
             .send => |value| self.completeSend(@ptrCast(@alignCast(value.owner)), value.batch, res),
-            .cancel => error.UnsupportedOperation,
+            .cancel => {
+                if (completionError(res)) |err| switch (err) {
+                    .ALREADY, .NOENT => {},
+                    else => return error.UnexpectedCancellationResult,
+                };
+                return .cancellation;
+            },
         };
     }
 
     fn completeAccept(self: *Server, res: i32) !CompleteResult {
         self.accept_pending = false;
+        if (self.shutting_down) {
+            if (res >= 0) _ = linux.close(@as(linux.fd_t, @intCast(res)));
+            return .cancellation;
+        }
         if (completionError(res)) |err| return switch (err) {
             .INTR, .AGAIN, .CONNABORTED => .retry,
             else => .{ .listener_error = err },
@@ -457,6 +511,7 @@ pub const Server = struct {
 
     fn completeRecv(self: *Server, connection: *Connection, res: i32) !CompleteResult {
         defer connection.recv_pending = false;
+        if (self.shutting_down and completionError(res) == .CANCELED) return .{ .peer_disconnected = connection };
         if (connection.state_value == .peer_disconnected) {
             if (res > 0) {
                 const received: usize = @intCast(res);
@@ -500,6 +555,10 @@ pub const Server = struct {
             self.allocator.free(control);
             connection.send_control = null;
         };
+        if (self.shutting_down and completionError(res) == .CANCELED) {
+            try connection.client().completeSend(token, 0);
+            return .{ .peer_disconnected = connection };
+        }
         if (completionError(res)) |err| switch (err) {
             .INTR, .AGAIN => {
                 try connection.client().completeSend(token, 0);
@@ -754,6 +813,31 @@ test "retryable send completion reports an earlier peer disconnect" {
     try transport.deinit();
 }
 
+test "canceled send completion unwinds the wire batch" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const connection = (try transport.completeAccept(accepted)).accepted;
+
+    try connection.client().receive(&.{
+        1, 0, 0, 0, 0, 0, 12, 0,
+        2, 0, 0, 0,
+    }, &.{});
+    try connection.client().dispatch();
+    const batch = (try connection.client().beginSend()).?;
+    connection.send_pending = true;
+    transport.beginShutdown();
+    const result = try transport.completeSend(connection, batch.token, -@as(i32, @intFromEnum(linux.E.CANCELED)));
+    try std.testing.expect(result == .peer_disconnected);
+    try std.testing.expect(!connection.send_pending);
+    try std.testing.expect(connection.send_control == null);
+
+    try transport.release(connection);
+    try transport.deinit();
+}
+
 fn testOwner(value: *u8) *anyopaque {
     return value;
 }
@@ -824,6 +908,48 @@ test "cancel completion orders preserve references and abort restores intent" {
         try table.prepare(.accept(testOwner(&byte)), 30);
         const reused = table.commitPrepared();
         _ = try table.take(reused);
+    }
+}
+
+test "shutdown with no operations is immediately drained" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    try std.testing.expect(!transport.isDrained());
+    transport.beginShutdown();
+    transport.beginShutdown();
+    try std.testing.expect(transport.isDrained());
+    const raced_accept: linux.fd_t = @intCast(linux.dup(0));
+    try std.testing.expect((try transport.completeAccept(raced_accept)) == .cancellation);
+    try std.testing.expect(linux.fcntl(raced_accept, linux.F.GETFD, 0) > std.math.maxInt(isize));
+    try transport.deinit();
+}
+
+test "shutdown drain requires original and cancellation CQEs in either order" {
+    inline for (.{ false, true }) |cancel_first| {
+        var host: server.Server = .init(std.testing.allocator);
+        defer host.deinit();
+        const listener: linux.fd_t = @intCast(linux.dup(0));
+        var transport = try Server.init(std.testing.allocator, &host, listener);
+        transport.beginShutdown();
+
+        try transport.operations.prepare(.accept(&transport), 40);
+        const original = transport.operations.commitPrepared();
+        transport.accept_pending = true;
+        try transport.operations.prepareCancel(original, &transport, 41);
+        const cancellation = transport.operations.commitPrepared();
+        try std.testing.expect(!transport.isDrained());
+
+        const first = if (cancel_first) cancellation else original;
+        const first_res: i32 = if (cancel_first) -@as(i32, @intFromEnum(linux.E.NOENT)) else -@as(i32, @intFromEnum(linux.E.CANCELED));
+        _ = try transport.complete(first, first_res, 0);
+        try std.testing.expect(!transport.isDrained());
+        const second = if (cancel_first) original else cancellation;
+        const second_res: i32 = if (cancel_first) -@as(i32, @intFromEnum(linux.E.CANCELED)) else 0;
+        _ = try transport.complete(second, second_res, 0);
+        try std.testing.expect(transport.isDrained());
+        try transport.deinit();
     }
 }
 
