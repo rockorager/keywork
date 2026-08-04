@@ -287,4 +287,17 @@ fi
 echo "Prefetching Zig package dependencies"
 zig build --fetch
 
+profile_marker="# keywork orb session bus"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<'EOF'
+
+# keywork orb session bus
+if [[ -r "$HOME/.cache/keywork-orb/dbus-session-address" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="$(<"$HOME/.cache/keywork-orb/dbus-session-address")"
+fi
+EOF
+fi
+
+"$repo_root/.agents/resume"
+
 echo "Orb setup complete"

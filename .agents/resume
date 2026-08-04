@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ensure_session_bus() {
+    local runtime_dir="$HOME/.cache/keywork-orb"
+    local address_file="$runtime_dir/dbus-session-address"
+    local pid_file="$runtime_dir/dbus-session-pid"
+    local bus_address="unix:path=$runtime_dir/dbus-session-bus"
+
+    if [[ -r "$address_file" ]] \
+        && dbus-send --bus="$(<"$address_file")" --print-reply \
+            --reply-timeout=1000 --dest=org.freedesktop.DBus \
+            / org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+        return
+    fi
+
+    if [[ -r "$pid_file" ]]; then
+        local old_pid
+        old_pid="$(<"$pid_file")"
+        if [[ "$old_pid" =~ ^[0-9]+$ ]] \
+            && [[ "$(cat "/proc/$old_pid/comm" 2>/dev/null || true)" == dbus-daemon ]]; then
+            kill "$old_pid" 2>/dev/null || true
+        fi
+    fi
+
+    echo "Starting orb D-Bus session bus"
+    install -d -m0700 "$runtime_dir"
+    rm -f "$runtime_dir/dbus-session-bus" "$address_file" "$pid_file"
+    dbus-daemon --session --fork --nopidfile --address="$bus_address" \
+        --print-pid=1 > "$pid_file"
+    printf '%s\n' "$bus_address" > "$address_file"
+}
+
+ensure_session_bus
+
 if [[ -s /etc/resolv.conf ]] \
     && [[ "$(tail -c 1 /etc/resolv.conf | od -An -tuC | tr -d ' ')" != 10 ]]; then
     printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
