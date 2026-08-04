@@ -82,6 +82,7 @@ const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const Surface = @import("wayland/surface.zig");
+const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -1931,6 +1932,7 @@ pub fn destroy(self: *Self) void {
     self.compositor.deinit();
     std.debug.assert(self.headless_surfaces.items.len == 0);
     self.headless_surfaces.deinit(allocator);
+    std.debug.assert(self.surface_registry.len() == 0);
     self.surface_registry.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
     if (self.session_initialized) self.session.deinit();
@@ -3630,6 +3632,27 @@ pub fn eventLoop(self: *Self) *wl.EventLoop {
     return self.display.getEventLoop();
 }
 
+pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
+    return &self.surface_registry;
+}
+
+/// Phase 1 presentation policy is deliberately limited to the headless
+/// backend. Other experimental sidecars share registry identity and buffer
+/// lifetime without becoming visible.
+pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationListener {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
+    return .{
+        .context = self,
+        .added = wayringSurfaceAdded,
+        .committed = wayringSurfaceCommitted,
+        .removing = wayringSurfaceRemoving,
+    };
+}
+
+fn wayringPresentationEnabled(output_kind: OutputBackend.Kind) bool {
+    return output_kind == .headless;
+}
+
 pub fn run(self: *Self) void {
     std.debug.assert(self.listening);
     std.debug.assert(self.configuration != null);
@@ -3684,6 +3707,35 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
         }, index);
     }
     _ = self.headless_surfaces.orderedRemove(index);
+}
+
+fn wayringSurfaceAdded(context: *anyopaque, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(self.surface_registry.contains(id));
+    std.debug.assert(self.surface_registry.renderState(id) == null);
+    try self.addHeadlessSurface(id);
+}
+
+fn wayringSurfaceCommitted(context: *anyopaque, id: SurfaceRegistry.Id, size: ?render.Size) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_state = self.surface_registry.renderState(id);
+    if (size) |mapped_size| {
+        std.debug.assert(render_state != null);
+        std.debug.assert(std.meta.eql(mapped_size, render_state.?.logical_size));
+    } else {
+        std.debug.assert(render_state == null);
+    }
+    self.commitHeadlessSurface(id, size);
+}
+
+fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const index = self.headlessSurfaceIndex(id) orelse unreachable;
+    if (self.headless_surfaces.items[index].size) |mapped_size| {
+        const render_state = self.surface_registry.renderState(id) orelse unreachable;
+        std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
+    }
+    self.removeHeadlessSurface(id);
 }
 
 fn headlessSurfaceIndex(self: *const Self, id: SurfaceRegistry.Id) ?usize {
@@ -11233,6 +11285,455 @@ test "server headless surface list tears down empty" {
     const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
     server.destroy();
+}
+
+test "Wayring listener rollback removes an unpublished headless entry" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
+    defer server.destroy();
+    var provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 1, .height = 1 },
+        .available = false,
+    };
+    const id = try server.surface_registry.add(provider.provider());
+    const listener = server.wayringPresentationListener().?;
+
+    try listener.added(listener.context, id);
+    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{.{ .id = id }}, server.headless_surfaces.items);
+    listener.removing(listener.context, id);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    server.surface_registry.remove(id);
+}
+
+test "Wayring presentation policy excludes DRM and nested sidecars" {
+    try std.testing.expect(wayringPresentationEnabled(.headless));
+    try std.testing.expect(!wayringPresentationEnabled(.drm));
+    try std.testing.expect(!wayringPresentationEnabled(.nested));
+}
+
+const WayringHeadlessClient = struct {
+    const Stage = enum(u8) {
+        starting,
+        initial_released,
+        replacement_released,
+        unmapped,
+        remapped_released,
+        disconnected,
+        failed,
+    };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*wayland.client.wl.Compositor = null,
+    shm: ?*wayland.client.wl.Shm = null,
+    release_count: std.atomic.Value(u8) = .init(0),
+
+    fn run(self: *WayringHeadlessClient) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *WayringHeadlessClient) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |state| {
+            _ = std.os.linux.close(wake_fd);
+            std.debug.assert(state == -2);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try wayland.client.wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*WayringHeadlessClient, registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        const shm = self.shm orelse return error.ShmMissing;
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+
+        const shm_fd = try std.posix.memfd_create("keywork-wayring-headless", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(shm_fd);
+        const byte_count = 2 * @sizeOf(u32);
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, byte_count)) != .SUCCESS)
+            return error.ShmResizeFailed;
+        const pool = try shm.createPool(shm_fd, byte_count);
+        defer pool.destroy();
+        const buffer = try pool.createBuffer(0, 2, 1, byte_count, .xrgb8888);
+        defer buffer.destroy();
+        buffer.setListener(*WayringHeadlessClient, bufferEvent, self);
+
+        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0011_2233, 0x0044_5566 }, 1);
+        self.stage.store(@intFromEnum(Stage.initial_released), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0066_7788, 0x0099_aabb }, 2);
+        self.stage.store(@intFromEnum(Stage.replacement_released), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        surface.attach(null, 0, 0);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 2) return error.UnexpectedBufferRelease;
+        self.stage.store(@intFromEnum(Stage.unmapped), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 3);
+        self.stage.store(@intFromEnum(Stage.remapped_released), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn commitBuffer(
+        self: *WayringHeadlessClient,
+        display: *wayland.client.wl.Display,
+        surface: *wayland.client.wl.Surface,
+        buffer: *wayland.client.wl.Buffer,
+        shm_fd: std.posix.fd_t,
+        pixels: [2]u32,
+        expected_releases: u8,
+    ) !void {
+        try writeWayringTestPixels(shm_fd, pixels);
+        surface.attach(buffer, 0, 0);
+        surface.damage(0, 0, 2, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != expected_releases)
+            return error.UnexpectedBufferRelease;
+        // The release permits immediate source reuse. Poisoning the memfd
+        // before notifying the test proves subsequent rendering is borrowed
+        // from the published copy rather than client storage.
+        try writeWayringTestPixels(shm_fd, .{ 0x00de_ad00, 0x00be_ef00 });
+    }
+
+    fn registryEvent(
+        registry: *wayland.client.wl.Registry,
+        event: wayland.client.wl.Registry.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor") and self.compositor == null) {
+                    self.compositor = registry.bind(
+                        global.name,
+                        wayland.client.wl.Compositor,
+                        global.version,
+                    ) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_shm") and self.shm == null) {
+                    self.shm = registry.bind(
+                        global.name,
+                        wayland.client.wl.Shm,
+                        global.version,
+                    ) catch null;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn bufferEvent(
+        _: *wayland.client.wl.Buffer,
+        event: wayland.client.wl.Buffer.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .release => _ = self.release_count.fetchAdd(1, .acq_rel),
+        }
+    }
+
+    fn closeWake(self: *WayringHeadlessClient, shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(if (shutdown_requested) -2 else -1, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *WayringHeadlessClient) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
+    const linux = std.os.linux;
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    if (path.len >= address.path.len) return error.InvalidSocketPath;
+    @memcpy(address.path[0..path.len], path);
+    const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(raw_fd);
+    errdefer _ = linux.close(fd);
+    const length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    if (linux.errno(linux.connect(fd, @ptrCast(&address), length)) != .SUCCESS)
+        return error.ConnectFailed;
+    return fd;
+}
+
+fn expectClientRoundtrip(display: *wayland.client.wl.Display) !void {
+    if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+}
+
+fn writeWayringTestPixels(fd: std.posix.fd_t, pixels: [2]u32) !void {
+    const bytes = std.mem.asBytes(&pixels);
+    if (std.c.pwrite(fd, bytes.ptr, bytes.len, 0) != bytes.len)
+        return error.ShmWriteFailed;
+}
+
+fn waitForWayringCommand(fd: std.posix.fd_t) !void {
+    var command: u64 = 0;
+    while (true) {
+        const bytes = std.mem.asBytes(&command);
+        const result = std.c.read(fd, bytes.ptr, bytes.len);
+        if (result == bytes.len) return;
+        if (result < 0 and std.posix.errno(result) == .INTR) continue;
+        return error.CommandReadFailed;
+    }
+}
+
+fn signalWayringCommand(fd: std.posix.fd_t) !void {
+    var command: u64 = 1;
+    while (true) {
+        const bytes = std.mem.asBytes(&command);
+        const result = std.c.write(fd, bytes.ptr, bytes.len);
+        if (result == bytes.len) return;
+        if (result < 0 and std.posix.errno(result) == .INTR) continue;
+        return error.CommandWriteFailed;
+    }
+}
+
+fn waitForWayringClientStage(
+    server: *Self,
+    host: anytype,
+    client: *WayringHeadlessClient,
+    expected: WayringHeadlessClient.Stage,
+) !void {
+    for (0..1_000) |_| {
+        const stage: WayringHeadlessClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    }
+    return error.WayringClientTimedOut;
+}
+
+fn waitForWayringDisconnect(server: *Self, host: anytype, compositor: *WayringCompositor) !void {
+    for (0..1_000) |_| {
+        if (host.connectionCount() == 0 and compositor.surfaceCount() == 0 and
+            server.headless_surfaces.items.len == 0) return;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    }
+    return error.WayringDisconnectTimedOut;
+}
+
+fn expectWayringSnapshot(
+    server: *Self,
+    expected_pixels: [2]u32,
+    expected_version: u64,
+) !void {
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surfaces.items.len);
+    const state = server.surface_registry.renderState(server.headless_surfaces.items[0].id).?;
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, state.logical_size);
+    try std.testing.expectEqual(expected_version, state.buffer.source_cache.?.version);
+    const normalized = [2]u32{
+        expected_pixels[0] | 0xff00_0000,
+        expected_pixels[1] | 0xff00_0000,
+    };
+    try std.testing.expectEqualSlices(u32, &normalized, state.buffer.pixels[0..2]);
+}
+
+fn expectWayringHeadlessPixels(server: *Self, expected_surface: ?[2]u32) !void {
+    const target = switch (server.primaryRenderOutput().backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    var expected: [8]u32 = @splat(renderColor(server.palette.desktop_background).argb8888());
+    if (expected_surface) |pixels| {
+        expected[0] = pixels[0] | 0xff00_0000;
+        expected[1] = pixels[1] | 0xff00_0000;
+    }
+    try std.testing.expectEqualSlices(u32, &expected, target.pixels);
+}
+
+fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64) !void {
+    const output = server.primaryRenderOutput();
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.render_scheduled);
+    try output.timer.?.timerUpdate(1);
+    for (0..100) |_| {
+        try server.eventLoop().dispatch(50);
+        if (host.failure()) |err| return err;
+        if (output.frame_statistics.frames_presented > previous_frames) return;
+    }
+    return error.WayringFrameTimedOut;
+}
+
+test "Wayring libwayland SHM reaches persistent headless pixels and repairs lifecycle damage" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-headless-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{
+            .size = .{ .width = 4, .height = 2 },
+            // Keep presentation behind the client release handshake. The
+            // test advances this real refresh timer explicitly afterward.
+            .refresh_millihertz = 1,
+        },
+    );
+    var server_live = true;
+    defer if (server_live) server.destroy();
+    const registry_baseline = server.surface_registry.len();
+    try std.testing.expectEqual(@as(usize, 0), registry_baseline);
+    const output = server.primaryRenderOutput();
+    try std.testing.expect(server.wayringPresentationListener() != null);
+
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    var protocol_server_live = true;
+    defer if (protocol_server_live) protocol_server.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.surfaceRegistry(),
+        server.wayringPresentationListener(),
+    );
+    var compositor_live = true;
+    defer if (compositor_live) compositor.deinit();
+    const Lifecycle = struct {
+        fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
+            const owner: *WayringCompositor = @ptrCast(@alignCast(erased));
+            owner.destroyClientResources(client);
+        }
+    };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{ .context = &compositor, .destroy_resources = Lifecycle.destroy },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var client: WayringHeadlessClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, WayringHeadlessClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    var previous_frames = output.frame_statistics.frames_presented;
+    try waitForWayringClientStage(server, host, &client, .initial_released);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 1), client.release_count.load(.acquire));
+    try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
+    try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
+    try expectWayringSnapshot(server, .{ 0x0011_2233, 0x0044_5566 }, 1);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x0011_2233, 0x0044_5566 });
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .replacement_released);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try expectWayringSnapshot(server, .{ 0x0066_7788, 0x0099_aabb }, 2);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x0066_7788, 0x0099_aabb });
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .unmapped);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expect(server.surface_registry.renderState(server.headless_surfaces.items[0].id) == null);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, null);
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .remapped_released);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try expectWayringSnapshot(server, .{ 0x00cc_ddee, 0x0001_0203 }, 3);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x00cc_ddee, 0x0001_0203 });
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .disconnected);
+    thread.join();
+    joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, null);
+
+    host.beginShutdown();
+    for (0..100) |_| {
+        if (host.route_count == 0 and host.connectionCount() == 0) break;
+        try server.eventLoop().dispatch(50);
+        if (host.failure()) |err| return err;
+    } else return error.WayringTransportDrainTimedOut;
+    try host.destroy();
+    host_live = false;
+    compositor.deinit();
+    compositor_live = false;
+    protocol_server.deinit();
+    protocol_server_live = false;
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    server.destroy();
+    server_live = false;
 }
 
 test "server creates and destroys protocol globals" {

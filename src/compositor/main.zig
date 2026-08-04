@@ -10,7 +10,6 @@ const Logging = @import("logging.zig");
 const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
-const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
@@ -173,8 +172,6 @@ pub fn main(init: std.process.Init) !void {
 
     const socket_name = try server.listen();
     var wayring_protocol_server: ?wayring.server.Server = null;
-    var wayring_surface_registry: SurfaceRegistry = undefined;
-    var wayring_surface_registry_initialized = false;
     var wayring_compositor: WayringCompositor = undefined;
     var wayring_compositor_initialized = false;
     var wayring_host: ?*WayringHost = null;
@@ -183,18 +180,18 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_compositor_initialized) wayring_compositor.deinit();
-        if (wayring_surface_registry_initialized) wayring_surface_registry.deinit();
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
     if (options.experimental_wayring) {
         wayring_protocol_server = .init(init.gpa);
-        wayring_surface_registry = .init(init.gpa);
-        wayring_surface_registry_initialized = true;
         try wayring_compositor.init(
             init.gpa,
             &wayring_protocol_server.?,
-            &wayring_surface_registry,
-            null,
+            server.surfaceRegistry(),
+            // Phase 1 exposes scanner-backed surfaces only on headless
+            // output. DRM and nested sidecars still copy and release through
+            // the canonical registry without acquiring presentation policy.
+            server.wayringPresentationListener(),
         );
         wayring_compositor_initialized = true;
         const Lifecycle = struct {
