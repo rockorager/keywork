@@ -11,6 +11,9 @@ const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
+const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringHost = @import("wayland/WayringHost.zig");
+const wayring = @import("wayring");
 
 pub const std_options: std.Options = .{
     // Compile every level in; Logging applies the selected level at runtime.
@@ -31,6 +34,7 @@ const usage =
     \\  --headless-scale SCALE
     \\  --headless-refresh HZ
     \\  --drm-device PATH         use an explicit DRM device
+    \\  --experimental-wayring    open a scanner-backed sidecar socket
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
     \\  --help                    show this help
@@ -47,6 +51,7 @@ const StartupOptions = struct {
     headless_scale: ?render.Scale = null,
     headless_refresh_millihertz: ?i32 = null,
     drm_device: ?[]const u8 = null,
+    experimental_wayring: bool = false,
     log_level: ?ControlProtocol.LogLevel = null,
 
     fn outputKind(self: StartupOptions) OutputBackend.Kind {
@@ -166,6 +171,36 @@ pub fn main(init: std.process.Init) !void {
     defer child_signal.remove();
 
     const socket_name = try server.listen();
+    var wayring_protocol_server: ?wayring.server.Server = null;
+    var wayring_compositor: WayringCompositor = undefined;
+    var wayring_compositor_initialized = false;
+    var wayring_host: ?*WayringHost = null;
+    defer {
+        if (wayring_host) |host| host.destroy() catch |err| {
+            log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
+        };
+        if (wayring_compositor_initialized) wayring_compositor.deinit();
+        if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
+    }
+    if (options.experimental_wayring) {
+        wayring_protocol_server = .init(init.gpa);
+        try wayring_compositor.init(init.gpa, &wayring_protocol_server.?);
+        wayring_compositor_initialized = true;
+        const Lifecycle = struct {
+            fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
+                const compositor: *WayringCompositor = @ptrCast(@alignCast(erased));
+                compositor.destroyClientResources(client);
+            }
+        };
+        wayring_host = try WayringHost.create(
+            init.gpa,
+            server.eventLoop(),
+            &wayring_protocol_server.?,
+            init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
+            .{ .context = &wayring_compositor, .destroy_resources = Lifecycle.destroy },
+        );
+        if (wayring_host.?.failure()) |err| return err;
+    }
     try server.configureXdgSessionStorage(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
         if (native_session) "session" else socket_name,
@@ -184,6 +219,8 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
+    if (wayring_host) |host|
+        try writer.interface.print("KEYWORK_WAYRING_DISPLAY={s}\n", .{host.displayName()});
     if (xwayland_display) |display_name|
         try writer.interface.print("DISPLAY={s}\n", .{display_name});
     try writer.interface.flush();
@@ -242,6 +279,9 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             if (value.len == 0) return error.InvalidDrmDevice;
             options.drm_device = value;
+        } else if (std.mem.eql(u8, argument, "--experimental-wayring")) {
+            if (options.experimental_wayring) return error.DuplicateArgument;
+            options.experimental_wayring = true;
         } else if (std.mem.eql(u8, argument, "--log-level")) {
             if (options.log_level != null) return error.DuplicateArgument;
             const value = arguments.next() orelse return error.MissingArgument;
@@ -383,6 +423,7 @@ test "startup options replace environment backend controls" {
         "1.5",
         "--headless-refresh",
         "120",
+        "--experimental-wayring",
         "--log-level",
         "debug",
     } };
@@ -393,6 +434,7 @@ test "startup options replace environment backend controls" {
     try std.testing.expectEqual(render.Size{ .width = 2880, .height = 1800 }, options.headless_size.?);
     try std.testing.expectEqual(@as(u32, 180), options.headless_scale.?.numerator);
     try std.testing.expectEqual(@as(i32, 120_000), options.headless_refresh_millihertz.?);
+    try std.testing.expect(options.experimental_wayring);
     try std.testing.expectEqual(ControlProtocol.LogLevel.debug, options.log_level.?);
 
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
@@ -412,6 +454,9 @@ test "startup options reject duplicates and backend-specific misuse" {
 
     var missing: TestArguments = .{ .values = &.{"--renderer"} };
     try std.testing.expectError(error.MissingArgument, parseArguments(&missing));
+
+    var duplicate_wayring: TestArguments = .{ .values = &.{ "--experimental-wayring", "--experimental-wayring" } };
+    try std.testing.expectError(error.DuplicateArgument, parseArguments(&duplicate_wayring));
 
     var invalid_output: TestArguments = .{ .values = &.{ "--output", "windowed" } };
     try std.testing.expectError(error.InvalidOutputBackend, parseArguments(&invalid_output));
