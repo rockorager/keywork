@@ -63,11 +63,9 @@ pub fn objectCount(self: *const Client) usize {
 }
 
 /// Records an application-detected protocol violation without allocating and
-/// prevents any further request dispatch. Emitting the terminal
-/// `wl_display.error` event is intentionally deferred to transport work.
+/// prevents any further request dispatch.
 pub fn postProtocolError(self: *Client, resource: *Resource, code: u32, detail: []const u8) void {
-    self.input.discardAfterFatal();
-    _ = self.fatal_state.record(.{
+    self.recordDetails(.{
         .kind = .protocol,
         .object_id = resource.id(),
         .protocol_code = code,
@@ -329,8 +327,113 @@ fn failProtocol(self: *Client, id: u32, opcode: u16, interface: ?*const wire.Int
 }
 
 fn record(self: *Client, kind: Fatal.Kind, id: u32, opcode: ?u16, interface: ?*const wire.Interface, detail: []const u8) void {
+    self.recordDetails(.{ .kind = kind, .object_id = id, .opcode = opcode, .interface = interface, .detail = detail });
+}
+
+fn recordDetails(self: *Client, details: Fatal.Details) void {
     self.input.discardAfterFatal();
-    _ = self.fatal_state.record(.{ .kind = kind, .object_id = id, .opcode = opcode, .interface = interface, .detail = detail });
+    if (!self.fatal_state.record(details)) return;
+    if (details.kind == .peer_disconnect) return;
+    const display = self.lookup(1) orelse return;
+    if (!std.mem.eql(u8, display.interface().name, "wl_display")) return;
+
+    const terminal_fatal = &self.fatal_state;
+    const error_code: u32 = terminal_fatal.protocol_code orelse switch (terminal_fatal.kind) {
+        .malformed_wire, .protocol => 1,
+        .out_of_memory => 2,
+        .implementation => 3,
+        .peer_disconnect => return,
+    };
+    const string_len = terminal_fatal.detail().len + 1;
+    const padded_len = std.mem.alignForward(usize, string_len, 4);
+    const frame_len = 20 + padded_len;
+    var frame: [wire.Output.terminal_capacity]u8 = @splat(0);
+    std.mem.writeInt(u32, frame[0..4], 1, .native);
+    std.mem.writeInt(u32, frame[4..8], (@as(u32, @intCast(frame_len)) << 16), .native);
+    std.mem.writeInt(u32, frame[8..12], terminal_fatal.object_id, .native);
+    std.mem.writeInt(u32, frame[12..16], error_code, .native);
+    std.mem.writeInt(u32, frame[16..20], @intCast(string_len), .native);
+    @memcpy(frame[20..][0..terminal_fatal.detail().len], terminal_fatal.detail());
+    self.output.sealWithTerminal(frame[0..frame_len]) catch unreachable;
+}
+
+test "Client fatal terminal frames are allocation independent and follow in-flight output" {
+    comptime {
+        std.debug.assert(wire.Output.terminal_capacity >= 20 + std.mem.alignForward(usize, Fatal.max_detail_len + 1, 4));
+    }
+    const event: wire.MessageDescriptor = .{ .name = "ordinary", .arguments = &.{} };
+    const Case = struct {
+        kind: Fatal.Kind,
+        explicit_code: ?u32 = null,
+        expected_code: u32,
+        detail: []const u8,
+
+        fn run(case: @This()) !void {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var client: Client = .init(failing.allocator(), .{});
+            var display: Resource = .init(failing.allocator(), 1, 1, &test_display_interface, &.{}, .client, client.ownerHooks());
+            try client.installClientInitial(1, &display);
+            try display.emit(7, &event, &.{});
+            const ordinary = (try client.beginSend()).?;
+
+            failing.fail_index = failing.alloc_index;
+            if (case.explicit_code) |code|
+                client.postProtocolError(&display, code, case.detail)
+            else
+                client.record(case.kind, 41, 6, null, case.detail);
+
+            const recorded_fatal = client.fatal().?;
+            try std.testing.expectEqual(case.kind, recorded_fatal.kind);
+            try std.testing.expectEqualSlices(u8, case.detail, recorded_fatal.detail());
+            client.record(.implementation, 99, 9, null, "competing later fatal");
+            try std.testing.expectEqual(case.kind, client.fatal().?.kind);
+            try std.testing.expectEqualSlices(u8, case.detail, client.fatal().?.detail());
+
+            try client.completeSend(ordinary.token, 1);
+            const remainder = (try client.beginSend()).?;
+            try std.testing.expectEqual(@as(usize, 0), remainder.fds.len);
+            try client.completeSend(remainder.token, remainder.bytes.len);
+            const terminal = (try client.beginSend()).?;
+            const expected_id: u32 = if (case.explicit_code != null) 1 else 41;
+            const string_len = case.detail.len + 1;
+            const expected_len = 20 + std.mem.alignForward(usize, string_len, 4);
+            try std.testing.expectEqual(expected_len, terminal.bytes.len);
+            try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, terminal.bytes[0..4], .native));
+            const size_opcode = std.mem.readInt(u32, terminal.bytes[4..8], .native);
+            try std.testing.expectEqual(@as(u16, 0), @as(u16, @truncate(size_opcode)));
+            try std.testing.expectEqual(@as(u16, @intCast(expected_len)), @as(u16, @truncate(size_opcode >> 16)));
+            try std.testing.expectEqual(expected_id, std.mem.readInt(u32, terminal.bytes[8..12], .native));
+            try std.testing.expectEqual(case.expected_code, std.mem.readInt(u32, terminal.bytes[12..16], .native));
+            try std.testing.expectEqual(@as(u32, @intCast(string_len)), std.mem.readInt(u32, terminal.bytes[16..20], .native));
+            try std.testing.expectEqualSlices(u8, case.detail, terminal.bytes[20 .. 20 + case.detail.len]);
+            try std.testing.expectEqual(@as(u8, 0), terminal.bytes[20 + case.detail.len]);
+            for (terminal.bytes[20 + string_len ..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+            try std.testing.expectEqual(@as(usize, 0), terminal.fds.len);
+            try client.completeSend(terminal.token, terminal.bytes.len);
+            try std.testing.expect((try client.beginSend()) == null);
+            display.destroy();
+            display.deinit();
+            client.deinit();
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+    };
+
+    inline for ([_]Case{
+        .{ .kind = .malformed_wire, .expected_code = 1, .detail = "malformed" },
+        .{ .kind = .protocol, .expected_code = 1, .detail = "protocol default" },
+        .{ .kind = .protocol, .explicit_code = 0, .expected_code = 0, .detail = "protocol zero" },
+        .{ .kind = .protocol, .explicit_code = 73, .expected_code = 73, .detail = "protocol exact" },
+        .{ .kind = .out_of_memory, .expected_code = 2, .detail = "oom" },
+        .{ .kind = .implementation, .expected_code = 3, .detail = "implementation" },
+    }) |case| try case.run();
+}
+
+test "Client fatal without display records but has no terminal output" {
+    var client: Client = .init(std.testing.allocator, .{});
+    defer client.deinit();
+    client.record(.implementation, 4, null, null, "no display");
+    try std.testing.expectEqual(Fatal.Kind.implementation, client.fatal().?.kind);
+    try std.testing.expect((try client.beginSend()) == null);
 }
 
 test "fragmented frames dispatch twice and recursive client dispatch is rejected" {
@@ -578,7 +681,10 @@ test "Client retirement and emit require exact installed resource identity" {
     impostor.destroy();
     try std.testing.expectEqual(Fatal.Kind.implementation, client.fatal().?.kind);
     try std.testing.expectEqual(&installed, client.lookup(1).?);
-    try std.testing.expect((try client.beginSend()) == null);
+    const terminal = (try client.beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, terminal.bytes[0..4], .native));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, terminal.bytes[12..16], .native));
+    try client.completeSend(terminal.token, terminal.bytes.len);
     impostor.deinit();
 }
 

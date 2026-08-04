@@ -198,4 +198,30 @@ test "invalid registry bind posts protocol fatal without entering binder" {
     try std.testing.expectEqual(@as(?u32, 0), fatal.protocol_code);
     try std.testing.expectEqualStrings("wl_registry", fatal.interface.?.name);
     try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
+
+    var batch_count: usize = 0;
+    var terminal_batch_index: ?usize = null;
+    while (try managed.client().beginSend()) |batch| {
+        const batch_index = batch_count;
+        batch_count += 1;
+        if (std.mem.readInt(u32, batch.bytes[0..4], .native) == 1 and
+            @as(u16, @truncate(std.mem.readInt(u32, batch.bytes[4..8], .native))) == 0)
+        {
+            terminal_batch_index = batch_index;
+            try std.testing.expectEqual(@as(u16, 0), @as(u16, @truncate(std.mem.readInt(u32, batch.bytes[4..8], .native))));
+            try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, batch.bytes[8..12], .native));
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, batch.bytes[12..16], .native));
+            const detail_len = std.mem.readInt(u32, batch.bytes[16..20], .native);
+            const expected_len = 20 + std.mem.alignForward(usize, detail_len, 4);
+            try std.testing.expectEqual(batch.bytes.len, expected_len);
+            try std.testing.expectEqual(@as(u16, @intCast(batch.bytes.len)), @as(u16, @truncate(std.mem.readInt(u32, batch.bytes[4..8], .native) >> 16)));
+            try std.testing.expectEqualStrings("invalid wl_registry.bind\x00", batch.bytes[20..][0..detail_len]);
+            try std.testing.expectEqual(@as(u8, 0), batch.bytes[20 + detail_len - 1]);
+            for (batch.bytes[20 + detail_len ..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+            try std.testing.expectEqual(@as(usize, 0), batch.fds.len);
+        }
+        try managed.client().completeSend(batch.token, batch.bytes.len);
+    }
+    try std.testing.expect(terminal_batch_index != null);
+    try std.testing.expectEqual(batch_count - 1, terminal_batch_index.?);
 }

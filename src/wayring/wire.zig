@@ -265,10 +265,20 @@ const QueuedBatch = struct {
 /// Ordered output queue. Enqueue duplicates borrowed descriptors before the
 /// message becomes visible, making ownership transfer transactional.
 pub const Output = struct {
+    /// Large enough for the bounded terminal diagnostic reserved by the
+    /// server, while keeping terminal delivery independent of the allocator.
+    pub const terminal_capacity = 280;
+    const AttemptTarget = enum { ordinary, terminal };
+
     allocator: std.mem.Allocator,
     batches: std.ArrayList(QueuedBatch) = .empty,
     next_token: u64 = 1,
     in_flight: ?BatchToken = null,
+    in_flight_target: ?AttemptTarget = null,
+    sealed: bool = false,
+    terminal: [terminal_capacity]u8 = undefined,
+    terminal_len: u16 = 0,
+    terminal_offset: u16 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Output {
         return .{ .allocator = allocator };
@@ -287,6 +297,7 @@ pub const Output = struct {
         descriptor: *const MessageDescriptor,
         values: []const Value,
     ) !void {
+        if (self.sealed) return error.OutputSealed;
         if (values.len != descriptor.arguments.len) return error.ArgumentCountMismatch;
 
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -322,33 +333,60 @@ pub const Output = struct {
         });
     }
 
+    /// Seals the queue with one caller-encoded terminal frame. The frame is
+    /// copied into inline storage and therefore requires no allocation.
+    pub fn sealWithTerminal(self: *Output, bytes: []const u8) !void {
+        if (bytes.len > self.terminal.len) return error.TerminalFrameTooLarge;
+        if (self.sealed) return error.OutputSealed;
+        @memcpy(self.terminal[0..bytes.len], bytes);
+        self.terminal_len = @intCast(bytes.len);
+        self.sealed = true;
+    }
+
     /// Begins one send attempt. The returned view remains valid only until
     /// `completeSend` or `deinit`; only one attempt may be in flight.
     pub fn beginSend(self: *Output) !?SendBatch {
         if (self.in_flight != null) return error.SendAlreadyInFlight;
-        if (self.batches.items.len == 0) return null;
+        const target: AttemptTarget = if (self.batches.items.len != 0)
+            .ordinary
+        else if (self.sealed and self.terminal_offset < self.terminal_len)
+            .terminal
+        else
+            return null;
         if (self.next_token == 0) return error.BatchTokenExhausted;
-        const batch = self.batches.items[0];
         const token: BatchToken = .{ .value = self.next_token };
         self.next_token +%= 1;
         self.in_flight = token;
-        return .{
-            .token = token,
-            .bytes = batch.bytes[batch.byte_offset..],
-            .fds = batch.fds,
+        self.in_flight_target = target;
+        return switch (target) {
+            .ordinary => blk: {
+                const batch = self.batches.items[0];
+                break :blk .{ .token = token, .bytes = batch.bytes[batch.byte_offset..], .fds = batch.fds };
+            },
+            .terminal => .{ .token = token, .bytes = self.terminal[self.terminal_offset..self.terminal_len], .fds = &.{} },
         };
     }
 
     /// Records a successful send attempt. Any positive byte count consumes
     /// the complete FD payload, even when message bytes remain.
     pub fn completeSend(self: *Output, token: BatchToken, bytes_written: usize) !void {
-        if (self.batches.items.len == 0) return error.NoPendingBatch;
         const in_flight = self.in_flight orelse return error.NoSendInFlight;
         if (in_flight.value != token.value) return error.StaleBatchToken;
+        const target = self.in_flight_target.?;
+        if (target == .terminal) {
+            const remaining = self.terminal_len - self.terminal_offset;
+            if (bytes_written > remaining) return error.InvalidWriteCount;
+            self.in_flight = null;
+            self.in_flight_target = null;
+            self.terminal_offset += @intCast(bytes_written);
+            return;
+        }
+        if (self.batches.items.len == 0) return error.NoPendingBatch;
         const batch = &self.batches.items[0];
         const remaining = batch.bytes.len - batch.byte_offset;
         if (bytes_written > remaining) return error.InvalidWriteCount;
         self.in_flight = null;
+        self.in_flight_target = null;
         if (bytes_written == 0) return;
 
         for (batch.fds) |fd| closeFd(fd);
@@ -878,6 +916,46 @@ test "send attempts reject overlap and stale completion tokens" {
     try std.testing.expect((try output.beginSend()) == null);
 }
 
+test "sealed terminal output follows ordinary bytes and has independent attempts" {
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+    try output.enqueue(7, 2, &descriptor, &.{});
+
+    const ordinary = (try output.beginSend()).?;
+    try output.sealWithTerminal("terminal");
+    try std.testing.expectError(error.OutputSealed, output.enqueue(7, 3, &descriptor, &.{}));
+    try output.completeSend(ordinary.token, 1);
+    const remainder = (try output.beginSend()).?;
+    try std.testing.expectError(error.StaleBatchToken, output.completeSend(ordinary.token, 1));
+    try output.completeSend(remainder.token, remainder.bytes.len);
+
+    const terminal = (try output.beginSend()).?;
+    try std.testing.expectEqualStrings("terminal", terminal.bytes);
+    try std.testing.expectEqual(@as(usize, 0), terminal.fds.len);
+    try std.testing.expectError(error.StaleBatchToken, output.completeSend(ordinary.token, 1));
+    try output.completeSend(terminal.token, 0);
+    const retry = (try output.beginSend()).?;
+    try std.testing.expect(terminal.token.value != retry.token.value);
+    try std.testing.expectError(error.StaleBatchToken, output.completeSend(terminal.token, 1));
+    try output.completeSend(retry.token, 3);
+    const final = (try output.beginSend()).?;
+    try std.testing.expectEqualStrings("minal", final.bytes);
+    try output.completeSend(final.token, final.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "terminal seal is first wins and oversize does not seal" {
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+    const oversize = [_]u8{0} ** (Output.terminal_capacity + 1);
+    try std.testing.expectError(error.TerminalFrameTooLarge, output.sealWithTerminal(&oversize));
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    try output.enqueue(1, 0, &descriptor, &.{});
+    try output.sealWithTerminal("first");
+    try std.testing.expectError(error.OutputSealed, output.sealWithTerminal("second"));
+}
+
 test "generic new-id has the specified expanded wire representation" {
     const arguments = [_]ArgumentDescriptor{.{ .name = "id", .kind = .{ .new_id = null } }};
     const descriptor: MessageDescriptor = .{ .name = "bind", .arguments = &arguments };
@@ -897,7 +975,7 @@ test "generic new-id has the specified expanded wire representation" {
     }, batch.bytes);
 }
 
-test "positive send progress releases every duplicated FD once" {
+test "positive send progress releases every duplicated FD once before sealed terminal" {
     const arguments = [_]ArgumentDescriptor{
         .{ .name = "first", .kind = .fd },
         .{ .name = "second", .kind = .fd },
@@ -921,13 +999,22 @@ test "positive send progress releases every duplicated FD once" {
     const first = (try output.beginSend()).?;
     try std.testing.expectEqual(@as(usize, 2), first.fds.len);
     const duplicates = [2]std.posix.fd_t{ first.fds[0], first.fds[1] };
+    const open_with_duplicates = try countOpenFds();
+    try output.sealWithTerminal("terminal");
     try output.completeSend(first.token, 1);
     try std.testing.expect(std.c.fcntl(duplicates[0], std.c.F.GETFD) < 0);
     try std.testing.expect(std.c.fcntl(duplicates[1], std.c.F.GETFD) < 0);
+    try std.testing.expectEqual(open_with_duplicates - 2, try countOpenFds());
 
     const remainder = (try output.beginSend()).?;
     try std.testing.expectEqual(@as(usize, 0), remainder.fds.len);
-    // Teardown owns the remaining bytes but has no descriptors left to close.
+    try output.completeSend(remainder.token, remainder.bytes.len);
+    const terminal = (try output.beginSend()).?;
+    try std.testing.expectEqualStrings("terminal", terminal.bytes);
+    try std.testing.expectEqual(@as(usize, 0), terminal.fds.len);
+    try output.completeSend(terminal.token, terminal.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
+    try std.testing.expectEqual(open_with_duplicates - 2, try countOpenFds());
 }
 
 test "FD duplication failure rolls back earlier duplicates" {
