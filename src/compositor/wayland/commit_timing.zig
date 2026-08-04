@@ -167,7 +167,10 @@ fn handleTimer(self: *Self) c_int {
         self.fail();
         return 0;
     };
-    Surface.releaseTimedCommits(self.surfaces, now);
+    Surface.releaseTimedCommits(self.surfaces, self.allocator, now) catch {
+        self.fail();
+        return 0;
+    };
     self.scheduleTimer(now) catch self.fail();
     return 0;
 }

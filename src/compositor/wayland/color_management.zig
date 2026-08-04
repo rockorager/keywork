@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const Surface = @import("surface.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
@@ -850,6 +851,8 @@ test "surface color state survives extension recreation and becomes inert" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
     var outputs: OutputLayout = undefined;
     outputs.init(std.testing.allocator, display, &surfaces);
     defer outputs.deinit();
@@ -871,7 +874,14 @@ test "surface color state survives extension recreation and becomes inert" {
     const bt2020_identity = try manager.identityForDescription(bt2020);
     try std.testing.expect(p3_identity != bt2020_identity);
 
-    const surface = try Surface.create(std.testing.allocator, &surfaces, client, 7, 1);
+    const surface = try Surface.create(
+        std.testing.allocator,
+        &surface_registry,
+        &surfaces,
+        client,
+        7,
+        1,
+    );
     const manager_resource = try wp.ColorManagerV1.create(client, 3, 2);
 
     SurfaceState.create(&manager, manager_resource, 3, surface);

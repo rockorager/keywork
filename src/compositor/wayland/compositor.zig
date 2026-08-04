@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Surface = @import("surface.zig");
 const WaylandRegion = @import("region.zig");
 
@@ -11,12 +12,19 @@ const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+surface_registry: *SurfaceRegistry,
 surfaces: Surface.Store,
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    display: *wl.Server,
+    surface_registry: *SurfaceRegistry,
+) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .surface_registry = surface_registry,
         .surfaces = .{},
     };
     errdefer self.surfaces.deinit(allocator);
@@ -57,6 +65,7 @@ fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self:
 fn createSurface(self: *Self, compositor: *wl.Compositor, id: u32) void {
     _ = Surface.create(
         self.allocator,
+        self.surface_registry,
         &self.surfaces,
         compositor.getClient(),
         compositor.getVersion(),
