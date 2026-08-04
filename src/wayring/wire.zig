@@ -257,12 +257,18 @@ pub const SendBatch = struct {
 };
 
 const QueuedBatch = struct {
-    bytes: []u8,
+    const Kind = enum { coalesced, file_descriptors };
+
+    bytes: std.ArrayList(u8),
     byte_offset: usize = 0,
     fds: []std.posix.fd_t,
+    kind: Kind,
 };
 
-/// Ordered output queue. Enqueue duplicates borrowed descriptors before the
+/// Ordered output queue. Consecutive descriptor-free messages share one
+/// growable tail batch. A batch is frozen while a send attempt borrows it, so
+/// concurrently produced output starts a new tail instead of invalidating the
+/// in-flight pointer. Enqueue duplicates borrowed descriptors before the
 /// message becomes visible, making ownership transfer transactional.
 pub const Output = struct {
     /// Large enough for the bounded terminal diagnostic reserved by the
@@ -325,12 +331,30 @@ pub const Output = struct {
             duplicated += 1;
         }
 
-        const bytes = try writer.toOwnedSlice();
-        errdefer self.allocator.free(bytes);
+        if (owned_fds.len == 0) {
+            if (self.appendableTail()) |tail| {
+                try tail.bytes.appendSlice(self.allocator, encoded);
+                self.allocator.free(owned_fds);
+                return;
+            }
+        }
+
+        var bytes = writer.toArrayList();
+        errdefer bytes.deinit(self.allocator);
         try self.batches.append(self.allocator, .{
             .bytes = bytes,
             .fds = owned_fds,
+            .kind = if (owned_fds.len == 0) .coalesced else .file_descriptors,
         });
+    }
+
+    fn appendableTail(self: *Output) ?*QueuedBatch {
+        if (self.batches.items.len == 0) return null;
+        const tail_index = self.batches.items.len - 1;
+        const tail = &self.batches.items[tail_index];
+        if (tail.kind != .coalesced) return null;
+        if (self.in_flight_target == .ordinary and tail_index == 0) return null;
+        return tail;
     }
 
     /// Seals the queue with one caller-encoded terminal frame. The frame is
@@ -361,7 +385,7 @@ pub const Output = struct {
         return switch (target) {
             .ordinary => blk: {
                 const batch = self.batches.items[0];
-                break :blk .{ .token = token, .bytes = batch.bytes[batch.byte_offset..], .fds = batch.fds };
+                break :blk .{ .token = token, .bytes = batch.bytes.items[batch.byte_offset..], .fds = batch.fds };
             },
             .terminal => .{ .token = token, .bytes = self.terminal[self.terminal_offset..self.terminal_len], .fds = &.{} },
         };
@@ -391,7 +415,7 @@ pub const Output = struct {
         }
         if (self.batches.items.len == 0) return error.NoPendingBatch;
         const batch = &self.batches.items[0];
-        const remaining = batch.bytes.len - batch.byte_offset;
+        const remaining = batch.bytes.items.len - batch.byte_offset;
         if (bytes_written > remaining) return error.InvalidWriteCount;
         self.in_flight = null;
         self.in_flight_target = null;
@@ -401,7 +425,7 @@ pub const Output = struct {
         if (batch.fds.len > 0) self.allocator.free(batch.fds);
         batch.fds = &.{};
         batch.byte_offset += bytes_written;
-        if (batch.byte_offset != batch.bytes.len) return;
+        if (batch.byte_offset != batch.bytes.items.len) return;
 
         const finished = self.batches.orderedRemove(0);
         self.freeBatch(finished);
@@ -410,7 +434,8 @@ pub const Output = struct {
     fn freeBatch(self: *Output, batch: QueuedBatch) void {
         for (batch.fds) |fd| closeFd(fd);
         if (batch.fds.len > 0) self.allocator.free(batch.fds);
-        self.allocator.free(batch.bytes);
+        var bytes = batch.bytes;
+        bytes.deinit(self.allocator);
     }
 };
 
@@ -901,9 +926,11 @@ test "send attempts reject overlap and stale completion tokens" {
     var output = Output.init(std.testing.allocator);
     defer output.deinit();
     try output.enqueue(1, 0, &descriptor, &.{});
-    try output.enqueue(1, 1, &descriptor, &.{});
 
     const first = (try output.beginSend()).?;
+    // Output produced while the head is in flight must use a new tail so the
+    // borrowed send pointer and length remain stable.
+    try output.enqueue(1, 1, &descriptor, &.{});
     try std.testing.expectError(error.SendAlreadyInFlight, output.beginSend());
     try output.completeSend(first.token, 0);
     const first_retry = (try output.beginSend()).?;
@@ -922,6 +949,94 @@ test "send attempts reject overlap and stale completion tokens" {
     try std.testing.expectError(error.StaleBatchToken, output.completeSend(first.token, 1));
     try output.completeSend(second.token, second.bytes.len);
     try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "descriptor-free messages coalesce without mutating an in-flight head" {
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+    try output.enqueue(1, 0, &descriptor, &.{});
+    try output.enqueue(2, 1, &descriptor, &.{});
+
+    const head = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 16), head.bytes.len);
+    try std.testing.expectEqual(@as(u32, 1), readU32(head.bytes[0..4]));
+    try std.testing.expectEqual(@as(u32, 2), readU32(head.bytes[8..12]));
+    const head_pointer = head.bytes.ptr;
+    try output.enqueue(3, 2, &descriptor, &.{});
+    try std.testing.expectEqual(@as(usize, 2), output.batches.items.len);
+    try std.testing.expectEqual(@as(usize, 16), output.batches.items[0].bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 8), output.batches.items[1].bytes.items.len);
+    try std.testing.expectEqual(head_pointer, head.bytes.ptr);
+    try std.testing.expectEqual(@as(usize, 16), head.bytes.len);
+    try std.testing.expectEqual(@as(u32, 1), readU32(head.bytes[0..4]));
+    try std.testing.expectEqual(@as(u32, 2), readU32(head.bytes[8..12]));
+
+    try output.completeSend(head.token, head.bytes.len);
+    const tail = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 8), tail.bytes.len);
+    try std.testing.expectEqual(@as(u32, 3), readU32(tail.bytes[0..4]));
+    try output.completeSend(tail.token, tail.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "partially sent FD batch remains isolated from later coalesced output" {
+    const fd_arguments = [_]ArgumentDescriptor{.{ .name = "fd", .kind = .fd }};
+    const fd_descriptor: MessageDescriptor = .{ .name = "fd", .arguments = &fd_arguments };
+    const plain_descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer closeFd(pipe_fds[0]);
+    defer closeFd(pipe_fds[1]);
+
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+    try output.enqueue(1, 0, &fd_descriptor, &.{.{ .fd = pipe_fds[0] }});
+    const first = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 1), first.fds.len);
+    try output.completeSend(first.token, 1);
+    try output.enqueue(2, 0, &plain_descriptor, &.{});
+    try output.enqueue(3, 0, &plain_descriptor, &.{});
+
+    const remainder = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 7), remainder.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), remainder.fds.len);
+    try output.completeSend(remainder.token, remainder.bytes.len);
+    const plain = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 16), plain.bytes.len);
+    try std.testing.expectEqual(@as(u32, 2), readU32(plain.bytes[0..4]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(plain.bytes[8..12]));
+    try output.completeSend(plain.token, plain.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "failed coalesced-tail growth leaves existing output unchanged" {
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var output = Output.init(failing.allocator());
+    defer output.deinit();
+    try output.enqueue(1, 0, &descriptor, &.{});
+    while (output.batches.items[0].bytes.capacity - output.batches.items[0].bytes.items.len >= 8) {
+        try output.enqueue(1, 0, &descriptor, &.{});
+    }
+    const before = try std.testing.allocator.dupe(u8, output.batches.items[0].bytes.items);
+    defer std.testing.allocator.free(before);
+
+    // The temporary frame allocation succeeds; force both forms of growing
+    // the existing tail (remap and fallback allocation) to fail.
+    failing.resize_fail_index = failing.resize_index;
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, output.enqueue(2, 1, &descriptor, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), output.batches.items.len);
+    try std.testing.expectEqualSlices(u8, before, output.batches.items[0].bytes.items);
+
+    failing.resize_fail_index = std.math.maxInt(usize);
+    failing.fail_index = std.math.maxInt(usize);
+    try output.enqueue(2, 1, &descriptor, &.{});
+    const batch = (try output.beginSend()).?;
+    try std.testing.expectEqual(before.len + 8, batch.bytes.len);
+    try std.testing.expectEqual(@as(u32, 2), readU32(batch.bytes[before.len..][0..4]));
+    try output.completeSend(batch.token, batch.bytes.len);
 }
 
 test "sealed terminal output follows ordinary bytes and has independent attempts" {

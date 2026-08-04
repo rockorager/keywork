@@ -697,12 +697,11 @@ test "Client destructor orders delete_id retires once and permits reuse" {
     const first = (try client.beginSend()).?;
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, first.bytes[0..4], @import("builtin").cpu.arch.endian()));
     try std.testing.expectEqual(@as(u16, 7), @as(u16, @truncate(std.mem.readInt(u32, first.bytes[4..8], @import("builtin").cpu.arch.endian()))));
+    try std.testing.expectEqual(@as(usize, 24), first.bytes.len);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, first.bytes[12..16], @import("builtin").cpu.arch.endian()));
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, first.bytes[16..20], @import("builtin").cpu.arch.endian()))));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, first.bytes[20..24], @import("builtin").cpu.arch.endian()));
     try client.completeSend(first.token, first.bytes.len);
-    const second = (try client.beginSend()).?;
-    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, second.bytes[0..4], @import("builtin").cpu.arch.endian()));
-    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, second.bytes[4..8], @import("builtin").cpu.arch.endian()))));
-    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, second.bytes[8..12], @import("builtin").cpu.arch.endian()));
-    try client.completeSend(second.token, second.bytes.len);
     try std.testing.expect((try client.beginSend()) == null);
     try testDispatch(&client, &create_request, &.{.{ .new_id = .{ .typed = 2 } }});
     try std.testing.expectEqual(&create_context.created.?, client.lookup(2).?);
