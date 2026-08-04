@@ -206,7 +206,8 @@ pub const Input = struct {
         };
     }
 
-    fn discardAfterFatal(self: *Input) void {
+    /// Clears all pending input and closes every accepted, unclaimed FD.
+    pub fn discardAfterFatal(self: *Input) void {
         self.closeUnclaimedFds();
         self.bytes.clearRetainingCapacity();
         self.byte_offset = 0;

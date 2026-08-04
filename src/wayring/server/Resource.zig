@@ -53,6 +53,7 @@ allocator: std.mem.Allocator,
 object_id: u32,
 negotiated_version: u32,
 interface_descriptor: *const wire.Interface,
+request_descriptors: []const wire.MessageDescriptor,
 object_origin: ObjectMap.Origin,
 owner: OwnerHooks,
 resource_state: State = .live,
@@ -67,6 +68,7 @@ pub fn init(
     object_id: u32,
     negotiated_version: u32,
     interface_descriptor: *const wire.Interface,
+    request_descriptors_value: []const wire.MessageDescriptor,
     object_origin_value: ObjectMap.Origin,
     owner: OwnerHooks,
 ) Resource {
@@ -77,9 +79,14 @@ pub fn init(
         .object_id = object_id,
         .negotiated_version = negotiated_version,
         .interface_descriptor = interface_descriptor,
+        .request_descriptors = request_descriptors_value,
         .object_origin = object_origin_value,
         .owner = owner,
     };
+}
+
+pub fn requests(self: *const Resource) []const wire.MessageDescriptor {
+    return self.request_descriptors;
 }
 
 pub fn id(self: *const Resource) u32 {
@@ -100,6 +107,13 @@ pub fn origin(self: *const Resource) ObjectMap.Origin {
 
 pub fn state(self: *const Resource) State {
     return self.resource_state;
+}
+
+/// Tests the complete owner identity; mixing a context with foreign function
+/// hooks is never considered ownership by this Resource.
+pub fn ownedBy(self: *const Resource, hooks: OwnerHooks) bool {
+    return self.owner.context == hooks.context and
+        self.owner.retire == hooks.retire and self.owner.emit == hooks.emit;
 }
 
 pub fn setHandler(
@@ -302,7 +316,7 @@ test "typed borrowed handler can destroy itself and context destructor runs once
     };
     var owner: TestOwner = .{};
     defer owner.order.deinit(std.testing.allocator);
-    var resource = init(std.testing.allocator, 71, 2, &test_interface, .client, owner.hooks());
+    var resource = init(std.testing.allocator, 71, 2, &test_interface, &.{test_message}, .client, owner.hooks());
     var message = testDecoded();
     var trace: Trace = .{};
     var context: Context = .{ .expected_message = &message, .trace = &trace };
@@ -331,7 +345,7 @@ test "observers retain order and removal during notification skips future observ
     };
     var owner: TestOwner = .{};
     defer owner.order.deinit(std.testing.allocator);
-    var resource = init(std.testing.allocator, 71, 1, &test_interface, .server, owner.hooks());
+    var resource = init(std.testing.allocator, 71, 1, &test_interface, &.{test_message}, .server, owner.hooks());
     var order: std.ArrayList(u8) = .empty;
     defer order.deinit(std.testing.allocator);
     var first: Context = .{ .order = &order, .label = 'a' };
@@ -355,7 +369,7 @@ test "recursive dispatch no handler and dead dispatch are rejected" {
     };
     var owner: TestOwner = .{};
     defer owner.order.deinit(std.testing.allocator);
-    var resource = init(std.testing.allocator, 71, 1, &test_interface, .client, owner.hooks());
+    var resource = init(std.testing.allocator, 71, 1, &test_interface, &.{test_message}, .client, owner.hooks());
     var message = testDecoded();
     try std.testing.expectError(error.NoHandler, resource.dispatchErased(0, &message));
     var context: Context = .{};
@@ -380,7 +394,7 @@ test "destroy orders observers destructor and retirement and retires once" {
     };
     var owner: TestOwner = .{};
     defer owner.order.deinit(std.testing.allocator);
-    var resource = init(std.testing.allocator, 71, 1, &test_interface, .client, owner.hooks());
+    var resource = init(std.testing.allocator, 71, 1, &test_interface, &.{test_message}, .client, owner.hooks());
     var context: Context = .{ .order = &owner.order };
     try resource.setHandler(Context, &context, Context.handle, Context.deinit);
     _ = try resource.addDestroyObserver(Context, &context, Context.observe);
@@ -401,7 +415,7 @@ test "emit forwards while live and rejects destroying and dead resources" {
     const descriptor: wire.MessageDescriptor = .{ .name = "event", .arguments = &.{.{ .name = "value", .kind = .uint }} };
     var owner: TestOwner = .{};
     defer owner.order.deinit(std.testing.allocator);
-    var resource = init(std.testing.allocator, 71, 1, &test_interface, .server, owner.hooks());
+    var resource = init(std.testing.allocator, 71, 1, &test_interface, &.{test_message}, .server, owner.hooks());
     try resource.emit(9, &descriptor, &.{.{ .uint = 44 }});
     try std.testing.expect(owner.emitted);
     var context: Context = .{};

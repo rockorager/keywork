@@ -6,6 +6,7 @@ const wire = @import("wire.zig");
 pub const ObjectMap = @import("server/object_map.zig");
 pub const Fatal = @import("server/fatal.zig");
 pub const Resource = @import("server/Resource.zig");
+pub const Client = @import("server/Client.zig");
 
 /// Stable caller-owned server resource specialized to a generated interface.
 /// Handler contexts are borrowed and must outlive registration. Request data
@@ -24,7 +25,7 @@ pub fn TypedResource(comptime ProtocolInterface: type) type {
             owner: Resource.OwnerHooks,
         ) Self {
             return .{
-                .runtime = .init(allocator, object_id, negotiated_version, &ProtocolInterface.interface, object_origin, owner),
+                .runtime = .init(allocator, object_id, negotiated_version, &ProtocolInterface.interface, &ProtocolInterface.request_messages, object_origin, owner),
             };
         }
 
@@ -83,5 +84,6 @@ test {
     _ = ObjectMap;
     _ = Fatal;
     _ = Resource;
+    _ = Client;
     _ = TypedResource;
 }
