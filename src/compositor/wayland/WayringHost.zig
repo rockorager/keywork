@@ -677,6 +677,8 @@ test "completion read failure and stalled destroy are undrainable without repeat
 
 test "existing event loop drives scanner-backed Wayring client lifecycle" {
     const WayringCompositor = @import("WayringCompositor.zig");
+    const SurfaceRegistry = @import("../SurfaceRegistry.zig");
+    const render = @import("../render/types.zig");
     var marker: u8 = 0;
     const runtime_directory = try std.fmt.allocPrintSentinel(
         std.testing.allocator,
@@ -692,8 +694,52 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
     defer event_loop.destroy();
     var protocol_server: server.Server = .init(std.testing.allocator);
     defer protocol_server.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    const PresentationProbe = struct {
+        registry: *SurfaceRegistry,
+        added_count: usize = 0,
+        committed_count: usize = 0,
+        removing_count: usize = 0,
+
+        fn listener(self: *@This()) WayringCompositor.PresentationListener {
+            return .{
+                .context = self,
+                .added = added,
+                .committed = committed,
+                .removing = removing,
+            };
+        }
+
+        fn added(context: *anyopaque, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.registry.contains(id));
+            std.debug.assert(self.registry.renderState(id) == null);
+            self.added_count += 1;
+        }
+
+        fn committed(context: *anyopaque, id: SurfaceRegistry.Id, size: ?render.Size) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.registry.contains(id));
+            std.debug.assert(size != null and self.registry.renderState(id) != null);
+            self.committed_count += 1;
+        }
+
+        fn removing(context: *anyopaque, id: SurfaceRegistry.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.registry.contains(id));
+            std.debug.assert(self.registry.renderState(id) != null);
+            self.removing_count += 1;
+        }
+    };
+    var presentation_probe: PresentationProbe = .{ .registry = &surface_registry };
     var compositor: WayringCompositor = undefined;
-    try compositor.init(std.testing.allocator, &protocol_server);
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        &surface_registry,
+        presentation_probe.listener(),
+    );
     defer compositor.deinit();
     const Lifecycle = struct {
         fn destroy(erased: *anyopaque, client: *server.Client) void {
@@ -732,6 +778,9 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 1), presentation_probe.added_count);
+    try std.testing.expectEqual(@as(usize, 1), presentation_probe.committed_count);
+    try std.testing.expectEqual(@as(usize, 1), presentation_probe.removing_count);
     host_live = false;
     try host.destroy();
 }
