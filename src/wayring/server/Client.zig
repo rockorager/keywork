@@ -20,11 +20,13 @@ const delete_id_descriptor: wire.MessageDescriptor = .{
 };
 
 const NewIdExpectation = struct {
+    const State = enum { pending, binding, materialized };
+
     id: u32,
     interface: ?*const wire.Interface,
     generic_name: ?[]const u8,
     generic_version: ?u32,
-    materialized: bool = false,
+    state: State = .pending,
 };
 
 allocator: std.mem.Allocator,
@@ -76,6 +78,21 @@ pub fn ownerHooks(self: *Client) Resource.OwnerHooks {
     return .{ .context = self, .retire = retire, .emit = emit };
 }
 
+/// Claims a generic new_id for one registry bind. The claim prevents binder
+/// reentrancy and remains held until materialization or request failure.
+pub fn claimPendingGenericNewId(self: *Client, id: u32, interface_name: []const u8, version: u32) !void {
+    const expectations = self.active_new_ids orelse return error.OutsideDispatch;
+    for (expectations) |*expectation| if (expectation.id == id) {
+        if (expectation.state != .pending) return error.NotExpectedNewId;
+        if (expectation.interface != null) return error.ExpectedTypedNewId;
+        if (!std.mem.eql(u8, expectation.generic_name.?, interface_name) or expectation.generic_version.? != version)
+            return error.WrongGenericNewId;
+        expectation.state = .binding;
+        return;
+    };
+    return error.NotExpectedNewId;
+}
+
 /// Materializes an ID reserved by the currently dispatched request.
 pub fn materialize(self: *Client, resource: *Resource) !void {
     if (resource.origin() != .client or resource.state() != .live or !resource.ownedBy(self.ownerHooks()))
@@ -87,7 +104,7 @@ pub fn materialize(self: *Client, resource: *Resource) !void {
         break;
     };
     const expected = expectation orelse return error.NotExpectedNewId;
-    if (expected.materialized) return error.NotExpectedNewId;
+    if (expected.state == .materialized) return error.NotExpectedNewId;
     if (expected.interface) |interface| {
         if (!sameInterface(interface, resource.interface())) return error.WrongNewIdInterface;
     } else {
@@ -95,7 +112,7 @@ pub fn materialize(self: *Client, resource: *Resource) !void {
             expected.generic_version.? != resource.version()) return error.WrongGenericNewId;
     }
     try self.objects.materializeClient(resource.id(), resource);
-    expected.materialized = true;
+    expected.state = .materialized;
 }
 
 /// Installs a bootstrap client object (not a request-provided new_id).
@@ -199,7 +216,7 @@ pub fn dispatch(self: *Client) !void {
             self.record(if (err == error.OutOfMemory) .out_of_memory else .implementation, header.object_id, header.opcode, interface, "request handler failed");
             return;
         };
-        for (expectations) |expectation| if (!expectation.materialized) {
+        for (expectations) |expectation| if (expectation.state != .materialized) {
             self.record(.implementation, header.object_id, header.opcode, interface, "handler did not materialize new id");
             return;
         };

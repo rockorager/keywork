@@ -7,6 +7,7 @@ pub const ObjectMap = @import("server/object_map.zig");
 pub const Fatal = @import("server/fatal.zig");
 pub const Resource = @import("server/Resource.zig");
 pub const Client = @import("server/Client.zig");
+pub const Server = @import("server/Server.zig");
 
 /// Stable caller-owned server resource specialized to a generated interface.
 /// Handler contexts are borrowed and must outlive registration. Request data
@@ -85,5 +86,6 @@ test {
     _ = Fatal;
     _ = Resource;
     _ = Client;
+    _ = Server;
     _ = TypedResource;
 }
