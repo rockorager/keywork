@@ -1,8 +1,8 @@
 //! Managed, sans-I/O implementation of the Wayland core display objects.
 //!
 //! The handwritten descriptors deliberately do not depend on generated
-//! bindings. Registry publication is an initial snapshot; hot global
-//! add/remove notification is deferred. Application resources created by
+//! bindings. Registry publication includes an initial snapshot and live
+//! add/remove notifications. Application resources created by
 //! binders are not owned here and must be destroyed before CoreClient.
 
 const CoreClient = @This();
@@ -31,6 +31,9 @@ const registry_global: wire.MessageDescriptor = .{ .name = "global", .arguments 
     .{ .name = "interface", .kind = .{ .string = .required } },
     .{ .name = "version", .kind = .uint },
 } };
+const registry_global_remove: wire.MessageDescriptor = .{ .name = "global_remove", .arguments = &.{
+    .{ .name = "name", .kind = .uint },
+} };
 const display_sync: wire.MessageDescriptor = .{ .name = "sync", .arguments = &.{.{ .name = "callback", .kind = .{ .new_id = &callback_interface } }} };
 const display_get_registry: wire.MessageDescriptor = .{ .name = "get_registry", .arguments = &.{.{ .name = "registry", .kind = .{ .new_id = &registry_interface } }} };
 const display_requests = [_]wire.MessageDescriptor{ display_sync, display_get_registry };
@@ -43,6 +46,7 @@ server: *Server,
 connection: Client,
 display: Resource,
 registries: std.ArrayList(*Registry) = .empty,
+publication_observer: *Server.PublicationObserver,
 serial: u32 = 0,
 
 pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !*CoreClient {
@@ -53,17 +57,24 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
         .server = server,
         .connection = .init(allocator, options),
         .display = undefined,
+        .publication_observer = undefined,
     };
     errdefer self.connection.deinit();
     self.display = .init(allocator, 1, 1, &display_interface, &display_requests, .client, self.connection.ownerHooks());
     try self.display.setHandler(CoreClient, self, handleDisplay, null);
     try self.connection.installClientInitial(1, &self.display);
+    errdefer {
+        self.display.destroy();
+        self.display.deinit();
+    }
+    self.publication_observer = try server.addPublicationObserver(CoreClient, self, publicationChanged);
     return self;
 }
 
 /// Synchronously retires core objects and discards unsent teardown events.
 /// Every application-owned resource must already have been destroyed.
 pub fn destroy(self: *CoreClient) void {
+    self.server.removePublicationObserver(self.publication_observer);
     for (self.registries.items) |registry| {
         registry.resource.destroy();
         registry.resource.deinit();
@@ -77,6 +88,25 @@ pub fn destroy(self: *CoreClient) void {
     const allocator = self.allocator;
     self.* = undefined;
     allocator.destroy(self);
+}
+
+fn publicationChanged(self: *CoreClient, publication: Server.Publication, global: *const Server.Global) void {
+    for (self.registries.items) |registry| {
+        if (self.connection.fatal() != null) break;
+        const result = switch (publication) {
+            .added => registry.resource.emit(0, &registry_global, &.{
+                .{ .uint = global.name() },
+                .{ .string = global.interface().name },
+                .{ .uint = global.version() },
+            }),
+            .removed => registry.resource.emit(1, &registry_global_remove, &.{.{ .uint = global.name() }}),
+        };
+        result catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => self.connection.postOutOfMemory(&registry.resource, "queueing registry publication"),
+            error.OutputSealed, error.ClientFatal => {},
+            else => self.connection.postImplementationError(&registry.resource, "queueing registry publication"),
+        };
+    }
 }
 
 pub fn client(self: *CoreClient) *Client {
@@ -224,4 +254,70 @@ test "invalid registry bind posts protocol fatal without entering binder" {
     }
     try std.testing.expect(terminal_batch_index != null);
     try std.testing.expectEqual(batch_count - 1, terminal_batch_index.?);
+}
+
+test "live globals emit exact add remove and later registry sees current monotonic snapshot" {
+    const Fixture = struct {
+        pub const interface: wire.Interface = .{ .name = "wl_fixture", .version = 1 };
+        fn bind(_: *Client, _: u32, _: u32, _: *@This()) !void {}
+    };
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const managed = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer managed.destroy();
+    try testSend(managed.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    var fixture: Fixture = .{};
+    const first = try host.addGlobal(Fixture, 1, Fixture, &fixture, Fixture.bind);
+    const add = (try managed.client().beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, add.bytes[0..4], .native));
+    try std.testing.expectEqual(@as(u16, 0), @as(u16, @truncate(std.mem.readInt(u32, add.bytes[4..8], .native))));
+    try std.testing.expectEqual(first.name(), std.mem.readInt(u32, add.bytes[8..12], .native));
+    try managed.client().completeSend(add.token, add.bytes.len);
+    try host.removeGlobal(first);
+    const removed = (try managed.client().beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, removed.bytes[0..4], .native));
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, removed.bytes[4..8], .native))));
+    try std.testing.expectEqual(first.name(), std.mem.readInt(u32, removed.bytes[8..12], .native));
+    try managed.client().completeSend(removed.token, removed.bytes.len);
+    const second = try host.addGlobal(Fixture, 1, Fixture, &fixture, Fixture.bind);
+    try std.testing.expectEqual(first.name() + 1, second.name());
+    const live = (try managed.client().beginSend()).?;
+    try managed.client().completeSend(live.token, live.bytes.len);
+    try testSend(managed.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 3 } }});
+    const snapshot = (try managed.client().beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, snapshot.bytes[0..4], .native));
+    try std.testing.expectEqual(second.name(), std.mem.readInt(u32, snapshot.bytes[8..12], .native));
+    try managed.client().completeSend(snapshot.token, snapshot.bytes.len);
+    try std.testing.expect((try managed.client().beginSend()) == null);
+}
+
+test "live notification OOM is client local and observer teardown leaves survivor" {
+    const Fixture = struct {
+        pub const interface: wire.Interface = .{ .name = "wl_fixture", .version = 1 };
+        fn bind(_: *Client, _: u32, _: u32, _: *@This()) !void {}
+    };
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const affected = try CoreClient.create(failing.allocator(), &host, .{});
+    var affected_live = true;
+    defer if (affected_live) affected.destroy();
+    const healthy = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer healthy.destroy();
+    try testSend(affected.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    try testSend(healthy.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    failing.fail_index = failing.alloc_index;
+    var fixture: Fixture = .{};
+    const global = try host.addGlobal(Fixture, 1, Fixture, &fixture, Fixture.bind);
+    try std.testing.expectEqual(@import("fatal.zig").Kind.out_of_memory, affected.client().fatal().?.kind);
+    try std.testing.expect(global.published());
+    const add = (try healthy.client().beginSend()).?;
+    try std.testing.expectEqual(global.name(), std.mem.readInt(u32, add.bytes[8..12], .native));
+    try healthy.client().completeSend(add.token, add.bytes.len);
+    affected.destroy();
+    affected_live = false;
+    try host.removeGlobal(global);
+    const removed = (try healthy.client().beginSend()).?;
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, removed.bytes[4..8], .native))));
+    try healthy.client().completeSend(removed.token, removed.bytes.len);
 }

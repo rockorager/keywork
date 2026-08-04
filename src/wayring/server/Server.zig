@@ -29,6 +29,20 @@ pub const Global = opaque {
     }
 };
 
+pub const Publication = enum { added, removed };
+
+/// Opaque registration owned by Server. It remains a valid removal handle
+/// until Server.deinit, even after it has been removed.
+pub const PublicationObserver = opaque {};
+
+const ObserverRecord = struct {
+    server: *Server,
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, Publication, *const Global) void,
+    active: bool = true,
+    next: ?*ObserverRecord = null,
+};
+
 const GlobalRecord = struct {
     global_name: u32,
     interface_descriptor: *const wire.Interface,
@@ -57,12 +71,20 @@ allocator: std.mem.Allocator,
 globals: std.ArrayList(*GlobalRecord) = .empty,
 next_name: u32 = 1,
 names_exhausted: bool = false,
+observer_head: ?*ObserverRecord = null,
+observer_tail: ?*ObserverRecord = null,
 
 pub fn init(allocator: std.mem.Allocator) Server {
     return .{ .allocator = allocator };
 }
 
 pub fn deinit(self: *Server) void {
+    var observer = self.observer_head;
+    while (observer) |record| {
+        const next = record.next;
+        self.allocator.destroy(record);
+        observer = next;
+    }
     for (self.globals.items) |global| self.allocator.destroy(global);
     self.globals.deinit(self.allocator);
     self.* = undefined;
@@ -95,6 +117,7 @@ pub fn addGlobal(
     };
     try self.globals.append(self.allocator, global);
     if (self.next_name == std.math.maxInt(u32)) self.names_exhausted = true else self.next_name += 1;
+    self.notifyObservers(.added, globalHandle(global));
     return globalHandle(global);
 }
 
@@ -104,9 +127,51 @@ pub fn removeGlobal(self: *Server, global: *const Global) !void {
     for (self.globals.items) |owned| if (globalHandle(owned) == global) {
         if (!owned.is_published) return error.AlreadyRemoved;
         owned.is_published = false;
+        self.notifyObservers(.removed, globalHandle(owned));
         return;
     };
     return error.ForeignGlobal;
+}
+
+/// Registers a borrowed callback context. Registrations made by a callback do
+/// not observe the publication currently being delivered.
+pub fn addPublicationObserver(
+    self: *Server,
+    comptime Context: type,
+    context: *Context,
+    comptime callback: *const fn (*Context, Publication, *const Global) void,
+) !*PublicationObserver {
+    const record = try self.allocator.create(ObserverRecord);
+    record.* = .{
+        .server = self,
+        .context = context,
+        .notify = struct {
+            fn call(erased: *anyopaque, publication: Publication, global: *const Global) void {
+                callback(@ptrCast(@alignCast(erased)), publication, global);
+            }
+        }.call,
+    };
+    if (self.observer_tail) |tail| tail.next = record else self.observer_head = record;
+    self.observer_tail = record;
+    return @ptrCast(record);
+}
+
+/// Identity-safe and idempotent while both Server and handle are alive.
+pub fn removePublicationObserver(self: *Server, handle: *PublicationObserver) void {
+    const record: *ObserverRecord = @ptrCast(@alignCast(handle));
+    if (record.server != self) return;
+    record.active = false;
+}
+
+fn notifyObservers(self: *Server, publication: Publication, global: *const Global) void {
+    const last = self.observer_tail orelse return;
+    var current = self.observer_head;
+    while (current) |record| {
+        const next = record.next;
+        if (record.active) record.notify(record.context, publication, global);
+        if (record == last) break;
+        current = next;
+    }
 }
 
 pub fn iterator(self: *const Server) Iterator {
@@ -176,6 +241,56 @@ test "globals validate versions preserve stable monotonic publication order and 
     try std.testing.expect(iter.next() == null);
     server.deinit();
     try std.testing.expectEqual(@as(usize, 0), context.value);
+}
+
+test "publication observers preserve mutation order and reentrant registration removal boundaries" {
+    const Context = struct {
+        server: *Server,
+        events: *std.ArrayList(u8),
+        label: u8,
+        own: ?*PublicationObserver = null,
+        future: ?*PublicationObserver = null,
+        added: ?*PublicationObserver = null,
+
+        fn observe(self: *@This(), publication: Publication, _: *const Global) void {
+            self.events.append(std.testing.allocator, self.label + @as(u8, if (publication == .removed) 32 else 0)) catch unreachable;
+            if (self.label == 'A' and self.added == null) {
+                self.server.removePublicationObserver(self.own.?);
+                self.server.removePublicationObserver(self.future.?);
+                self.added = self.server.addPublicationObserver(@This(), self, observeAdded) catch unreachable;
+            }
+        }
+
+        fn observeAdded(self: *@This(), _: Publication, _: *const Global) void {
+            self.events.append(std.testing.allocator, 'C') catch unreachable;
+        }
+
+        fn bind(_: *Client, _: u32, _: u32, _: *@This()) !void {}
+    };
+    var server: Server = .init(std.testing.allocator);
+    defer server.deinit();
+    var events: std.ArrayList(u8) = .empty;
+    defer events.deinit(std.testing.allocator);
+    var first: Context = .{ .server = &server, .events = &events, .label = 'A' };
+    var second: Context = .{ .server = &server, .events = &events, .label = 'B' };
+    const first_handle = try server.addPublicationObserver(Context, &first, Context.observe);
+    first.own = first_handle;
+    first.future = try server.addPublicationObserver(Context, &second, Context.observe);
+    var foreign: Server = .init(std.testing.allocator);
+    defer foreign.deinit();
+    foreign.removePublicationObserver(first_handle);
+    var context: Context = .{ .server = &server, .events = &events, .label = 'X' };
+    const global = try server.addGlobal(TestProtocol, 1, Context, &context, Context.bind);
+    try std.testing.expectEqualStrings("A", events.items);
+    server.removePublicationObserver(first_handle);
+    server.removePublicationObserver(first_handle);
+    const next = try server.addGlobal(TestProtocol, 1, Context, &context, Context.bind);
+    try std.testing.expectEqualStrings("AC", events.items);
+    try server.removeGlobal(global);
+    try server.removeGlobal(next);
+    try std.testing.expectEqualStrings("ACCC", events.items);
+    try std.testing.expectError(error.AlreadyRemoved, server.removeGlobal(global));
+    try std.testing.expectEqualStrings("ACCC", events.items);
 }
 
 test "bind rejects each validation boundary before binder entry" {

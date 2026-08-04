@@ -74,6 +74,16 @@ pub fn postProtocolError(self: *Client, resource: *Resource, code: u32, detail: 
     });
 }
 
+/// Records allocation failure associated with a resource. First fatal wins.
+pub fn postOutOfMemory(self: *Client, resource: *Resource, detail: []const u8) void {
+    self.record(.out_of_memory, resource.id(), null, resource.interface(), detail);
+}
+
+/// Records an implementation failure associated with a resource. First fatal wins.
+pub fn postImplementationError(self: *Client, resource: *Resource, detail: []const u8) void {
+    self.record(.implementation, resource.id(), null, resource.interface(), detail);
+}
+
 pub fn receive(self: *Client, bytes: []const u8, fds: []const wire.FileDescriptor) !void {
     if (self.fatal_state.recorded) return error.ClientFatal;
     self.input.receive(bytes, fds) catch |err| {
