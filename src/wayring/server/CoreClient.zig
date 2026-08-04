@@ -13,7 +13,10 @@ const Client = @import("Client.zig");
 const Resource = @import("Resource.zig");
 const Server = @import("Server.zig");
 
-pub const Options = Client.Options;
+pub const Options = struct {
+    max_objects: usize = 4096,
+    credentials: ?Client.Credentials = null,
+};
 
 const callback_interface: wire.Interface = .{ .name = "wl_callback", .version = 1 };
 const registry_interface: wire.Interface = .{ .name = "wl_registry", .version = 1 };
@@ -55,7 +58,11 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
     self.* = .{
         .allocator = allocator,
         .server = server,
-        .connection = .init(allocator, options),
+        .connection = .init(allocator, .{
+            .max_objects = options.max_objects,
+            .credentials = options.credentials,
+            .protocol_log_sink = server.protocolLogSink(),
+        }),
         .display = undefined,
         .publication_observer = undefined,
     };
@@ -232,6 +239,55 @@ test "managed client destruction notifies borrowed observers" {
     _ = try managed.client().addDestroyObserver(Context, &context, Context.observe);
     managed.destroy();
     try std.testing.expect(context.called);
+}
+
+test "server protocol logger observes requests queued events and fatal diagnostics" {
+    const Entry = struct {
+        direction: Client.ProtocolDirection,
+        object_id: u32,
+        opcode: u16,
+        name: []const u8,
+    };
+    const Context = struct {
+        entries: std.ArrayList(Entry) = .empty,
+        fatal_detail_seen: bool = false,
+
+        fn observe(self: *@This(), _: *Client, message: Client.ProtocolMessage) void {
+            self.entries.append(std.testing.allocator, .{
+                .direction = message.direction,
+                .object_id = message.resource.id(),
+                .opcode = message.opcode,
+                .name = message.descriptor.name,
+            }) catch unreachable;
+            if (std.mem.eql(u8, message.descriptor.name, "error")) {
+                std.testing.expectEqual(@as(usize, 3), message.values.len) catch unreachable;
+                std.testing.expectEqual(@as(?u32, 1), message.values[0].object) catch unreachable;
+                std.testing.expectEqual(@as(u32, 3), message.values[1].uint) catch unreachable;
+                std.testing.expectEqualStrings("logger fixture", message.values[2].string.?) catch unreachable;
+                self.fatal_detail_seen = true;
+            }
+        }
+    };
+
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var context: Context = .{};
+    defer context.entries.deinit(std.testing.allocator);
+    const logger = try host.addProtocolLogger(Context, &context, Context.observe);
+    const managed = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer managed.destroy();
+
+    try testSend(managed.client(), 1, 0, &display_sync, &.{.{ .new_id = .{ .typed = 2 } }});
+    try std.testing.expectEqual(@as(usize, 3), context.entries.items.len);
+    try std.testing.expectEqualDeep(Entry{ .direction = .request, .object_id = 1, .opcode = 0, .name = "sync" }, context.entries.items[0]);
+    try std.testing.expectEqualDeep(Entry{ .direction = .event, .object_id = 2, .opcode = 0, .name = "done" }, context.entries.items[1]);
+    try std.testing.expectEqualDeep(Entry{ .direction = .event, .object_id = 1, .opcode = 1, .name = "delete_id" }, context.entries.items[2]);
+
+    managed.client().postImplementationError(&managed.display, "logger fixture");
+    try std.testing.expectEqual(@as(usize, 4), context.entries.items.len);
+    try std.testing.expectEqualDeep(Entry{ .direction = .event, .object_id = 1, .opcode = 0, .name = "error" }, context.entries.items[3]);
+    try std.testing.expect(context.fatal_detail_seen);
+    host.removeProtocolLogger(logger);
 }
 
 test "invalid registry bind posts protocol fatal without entering binder" {

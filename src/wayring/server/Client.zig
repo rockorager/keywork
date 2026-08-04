@@ -19,9 +19,25 @@ pub const Credentials = struct {
     gid: std.os.linux.gid_t,
 };
 
+pub const ProtocolDirection = enum { request, event };
+
+pub const ProtocolMessage = struct {
+    direction: ProtocolDirection,
+    resource: *Resource,
+    opcode: u16,
+    descriptor: *const wire.MessageDescriptor,
+    values: []const wire.Value,
+};
+
+pub const ProtocolLogSink = struct {
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, *Client, ProtocolMessage) void,
+};
+
 pub const Options = struct {
     max_objects: usize = 4096,
     credentials: ?Credentials = null,
+    protocol_log_sink: ?ProtocolLogSink = null,
 };
 
 /// Opaque, runtime-owned destruction registration handle.
@@ -41,6 +57,15 @@ const delete_id_descriptor: wire.MessageDescriptor = .{
     .arguments = &.{.{ .name = "id", .kind = .uint }},
 };
 
+const display_error_descriptor: wire.MessageDescriptor = .{
+    .name = "error",
+    .arguments = &.{
+        .{ .name = "object_id", .kind = .{ .object = .{} } },
+        .{ .name = "code", .kind = .uint },
+        .{ .name = "message", .kind = .{ .string = .required } },
+    },
+};
+
 const NewIdExpectation = struct {
     const State = enum { pending, binding, materialized };
 
@@ -56,6 +81,7 @@ input: wire.Input,
 output: wire.Output,
 objects: ObjectMap,
 credentials_value: ?Credentials,
+protocol_log_sink: ?ProtocolLogSink,
 fatal_state: Fatal = .{},
 dispatching: bool = false,
 active_new_ids: ?[]NewIdExpectation = null,
@@ -71,6 +97,7 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         .output = .init(allocator),
         .objects = .init(allocator, .{ .max_objects = options.max_objects }),
         .credentials_value = options.credentials,
+        .protocol_log_sink = options.protocol_log_sink,
     };
 }
 
@@ -307,6 +334,14 @@ pub fn dispatch(self: *Client) !void {
         };
         defer message.deinit();
 
+        self.logProtocol(.{
+            .direction = .request,
+            .resource = target,
+            .opcode = header.opcode,
+            .descriptor = descriptor,
+            .values = message.values,
+        });
+
         if (!self.validateObjects(descriptor, &message)) {
             self.failProtocol(header.object_id, header.opcode, interface, "invalid object argument");
             return;
@@ -405,6 +440,13 @@ fn retire(erased: *anyopaque, resource: *Resource) void {
             self.record(if (err == error.OutOfMemory) .out_of_memory else .implementation, id, null, resource.interface(), "queueing delete_id");
             return;
         };
+        if (self.lookup(1)) |display| self.logProtocol(.{
+            .direction = .event,
+            .resource = display,
+            .opcode = 1,
+            .descriptor = &delete_id_descriptor,
+            .values = &.{.{ .uint = id }},
+        });
         self.objects.retireClientAfterDeleteIdQueued(id, resource) catch {
             self.objects.discardLive(id, resource);
             self.record(.implementation, id, null, resource.interface(), "retiring client object");
@@ -426,7 +468,14 @@ fn emit(erased: *anyopaque, resource: *Resource, opcode: u16, descriptor: *const
     const installed = self.objects.lookup(resource.id()) orelse return error.InvalidResourceIdentity;
     if (installed.resource != @as(*anyopaque, @ptrCast(resource)) or installed.origin != resource.origin())
         return error.InvalidResourceIdentity;
-    return self.output.enqueue(resource.id(), opcode, descriptor, values);
+    try self.output.enqueue(resource.id(), opcode, descriptor, values);
+    self.logProtocol(.{
+        .direction = .event,
+        .resource = resource,
+        .opcode = opcode,
+        .descriptor = descriptor,
+        .values = values,
+    });
 }
 
 fn failMalformed(self: *Client, id: u32, opcode: ?u16, detail: []const u8) void {
@@ -468,6 +517,22 @@ fn recordDetails(self: *Client, details: Fatal.Details) void {
     std.mem.writeInt(u32, frame[16..20], @intCast(string_len), .native);
     @memcpy(frame[20..][0..terminal_fatal.detail().len], terminal_fatal.detail());
     self.output.sealWithTerminal(frame[0..frame_len]) catch unreachable;
+    self.logProtocol(.{
+        .direction = .event,
+        .resource = display,
+        .opcode = 0,
+        .descriptor = &display_error_descriptor,
+        .values = &.{
+            .{ .object = terminal_fatal.object_id },
+            .{ .uint = error_code },
+            .{ .string = terminal_fatal.detail() },
+        },
+    });
+}
+
+fn logProtocol(self: *Client, message: ProtocolMessage) void {
+    const sink = self.protocol_log_sink orelse return;
+    sink.notify(sink.context, self, message);
 }
 
 fn unlinkAndFreeObserver(self: *Client, observer: *ObserverNode) void {

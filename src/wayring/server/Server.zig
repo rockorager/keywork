@@ -35,12 +35,23 @@ pub const Publication = enum { added, removed };
 /// until Server.deinit, even after it has been removed.
 pub const PublicationObserver = opaque {};
 
+/// Opaque server-wide protocol logger registration.
+pub const ProtocolLogger = opaque {};
+
 const ObserverRecord = struct {
     server: *Server,
     context: *anyopaque,
     notify: *const fn (*anyopaque, Publication, *const Global) void,
     active: bool = true,
     next: ?*ObserverRecord = null,
+};
+
+const LoggerRecord = struct {
+    server: *Server,
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, *Client, Client.ProtocolMessage) void,
+    active: bool = true,
+    next: ?*LoggerRecord = null,
 };
 
 const GlobalRecord = struct {
@@ -73,6 +84,8 @@ next_name: u32 = 1,
 names_exhausted: bool = false,
 observer_head: ?*ObserverRecord = null,
 observer_tail: ?*ObserverRecord = null,
+logger_head: ?*LoggerRecord = null,
+logger_tail: ?*LoggerRecord = null,
 
 pub fn init(allocator: std.mem.Allocator) Server {
     return .{ .allocator = allocator };
@@ -84,6 +97,12 @@ pub fn deinit(self: *Server) void {
         const next = record.next;
         self.allocator.destroy(record);
         observer = next;
+    }
+    var logger = self.logger_head;
+    while (logger) |record| {
+        const next = record.next;
+        self.allocator.destroy(record);
+        logger = next;
     }
     for (self.globals.items) |global| self.allocator.destroy(global);
     self.globals.deinit(self.allocator);
@@ -163,12 +182,60 @@ pub fn removePublicationObserver(self: *Server, handle: *PublicationObserver) vo
     record.active = false;
 }
 
+/// Registers a borrowed synchronous logger for decoded requests and queued
+/// events across every managed client. Message values are callback-scoped;
+/// callbacks may update logger registrations but must not mutate the Client or
+/// Resource being reported.
+pub fn addProtocolLogger(
+    self: *Server,
+    comptime Context: type,
+    context: *Context,
+    comptime callback: *const fn (*Context, *Client, Client.ProtocolMessage) void,
+) !*ProtocolLogger {
+    const record = try self.allocator.create(LoggerRecord);
+    record.* = .{
+        .server = self,
+        .context = context,
+        .notify = struct {
+            fn call(erased: *anyopaque, client: *Client, message: Client.ProtocolMessage) void {
+                callback(@ptrCast(@alignCast(erased)), client, message);
+            }
+        }.call,
+    };
+    if (self.logger_tail) |tail| tail.next = record else self.logger_head = record;
+    self.logger_tail = record;
+    return @ptrCast(record);
+}
+
+/// Identity-safe and idempotent while both Server and handle are alive.
+pub fn removeProtocolLogger(self: *Server, handle: *ProtocolLogger) void {
+    const record: *LoggerRecord = @ptrCast(@alignCast(handle));
+    if (record.server != self) return;
+    record.active = false;
+}
+
+pub fn protocolLogSink(self: *Server) Client.ProtocolLogSink {
+    return .{ .context = self, .notify = notifyClientProtocol };
+}
+
 fn notifyObservers(self: *Server, publication: Publication, global: *const Global) void {
     const last = self.observer_tail orelse return;
     var current = self.observer_head;
     while (current) |record| {
         const next = record.next;
         if (record.active) record.notify(record.context, publication, global);
+        if (record == last) break;
+        current = next;
+    }
+}
+
+fn notifyClientProtocol(erased: *anyopaque, client: *Client, message: Client.ProtocolMessage) void {
+    const self: *Server = @ptrCast(@alignCast(erased));
+    const last = self.logger_tail orelse return;
+    var current = self.logger_head;
+    while (current) |record| {
+        const next = record.next;
+        if (record.active) record.notify(record.context, client, message);
         if (record == last) break;
         current = next;
     }
