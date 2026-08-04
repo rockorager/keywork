@@ -54,6 +54,11 @@ const LoggerRecord = struct {
     next: ?*LoggerRecord = null,
 };
 
+const GlobalFilter = struct {
+    context: *anyopaque,
+    allow: *const fn (*anyopaque, *const Client, *const Global) bool,
+};
+
 const GlobalRecord = struct {
     global_name: u32,
     interface_descriptor: *const wire.Interface,
@@ -86,6 +91,7 @@ observer_head: ?*ObserverRecord = null,
 observer_tail: ?*ObserverRecord = null,
 logger_head: ?*LoggerRecord = null,
 logger_tail: ?*LoggerRecord = null,
+global_filter: ?GlobalFilter = null,
 
 pub fn init(allocator: std.mem.Allocator) Server {
     return .{ .allocator = allocator };
@@ -218,6 +224,34 @@ pub fn protocolLogSink(self: *Server) Client.ProtocolLogSink {
     return .{ .context = self, .notify = notifyClientProtocol };
 }
 
+/// Replaces the borrowed per-client visibility predicate. Changes affect
+/// future registry advertisements and binds; they do not synthesize registry
+/// events for globals whose visibility changed in place.
+pub fn setGlobalFilter(
+    self: *Server,
+    comptime Context: type,
+    context: *Context,
+    comptime allow: *const fn (*Context, *const Client, *const Global) bool,
+) void {
+    self.global_filter = .{
+        .context = context,
+        .allow = struct {
+            fn call(erased: *anyopaque, client: *const Client, global: *const Global) bool {
+                return allow(@ptrCast(@alignCast(erased)), client, global);
+            }
+        }.call,
+    };
+}
+
+pub fn clearGlobalFilter(self: *Server) void {
+    self.global_filter = null;
+}
+
+pub fn globalVisible(self: *const Server, client: *const Client, global: *const Global) bool {
+    const filter = self.global_filter orelse return true;
+    return filter.allow(filter.context, client, global);
+}
+
 fn notifyObservers(self: *Server, publication: Publication, global: *const Global) void {
     const last = self.observer_tail orelse return;
     var current = self.observer_head;
@@ -255,6 +289,7 @@ pub fn bind(self: *Server, client: *Client, name_value: u32, requested_interface
     };
     const global = found orelse return error.UnknownGlobal;
     if (!global.is_published) return error.RemovedGlobal;
+    if (!self.globalVisible(client, globalHandle(global))) return error.HiddenGlobal;
     if (!std.mem.eql(u8, global.interface_descriptor.name, requested_interface)) return error.InterfaceMismatch;
     if (requested_version == 0) return error.ZeroVersion;
     if (requested_version > global.advertised_version) return error.VersionTooHigh;
@@ -375,8 +410,18 @@ test "bind rejects each validation boundary before binder entry" {
     const live = try server.addGlobal(TestProtocol, 2, Context, &context, Context.bind);
     const removed = try server.addGlobal(TestProtocol, 2, Context, &context, Context.bind);
     try server.removeGlobal(removed);
+    const Filter = struct {
+        hidden: *const Global,
+        fn allow(self: *@This(), _: *const Client, global: *const Global) bool {
+            return global != self.hidden;
+        }
+    };
+    var filter: Filter = .{ .hidden = live };
+    server.setGlobalFilter(Filter, &filter, Filter.allow);
     try std.testing.expectError(error.UnknownGlobal, server.bind(&client, 99, "wl_test", 1, 2));
     try std.testing.expectError(error.RemovedGlobal, server.bind(&client, removed.name(), "wl_test", 1, 2));
+    try std.testing.expectError(error.HiddenGlobal, server.bind(&client, live.name(), "wl_test", 1, 2));
+    server.clearGlobalFilter();
     try std.testing.expectError(error.InterfaceMismatch, server.bind(&client, live.name(), "wl_other", 1, 2));
     try std.testing.expectError(error.ZeroVersion, server.bind(&client, live.name(), "wl_test", 0, 2));
     try std.testing.expectError(error.VersionTooHigh, server.bind(&client, live.name(), "wl_test", 3, 2));

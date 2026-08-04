@@ -41,7 +41,10 @@ const display_sync: wire.MessageDescriptor = .{ .name = "sync", .arguments = &.{
 const display_get_registry: wire.MessageDescriptor = .{ .name = "get_registry", .arguments = &.{.{ .name = "registry", .kind = .{ .new_id = &registry_interface } }} };
 const display_requests = [_]wire.MessageDescriptor{ display_sync, display_get_registry };
 
-const Registry = struct { resource: Resource };
+const Registry = struct {
+    resource: Resource,
+    advertised_globals: std.AutoHashMapUnmanaged(u32, void) = .empty,
+};
 const Callback = struct { resource: Resource };
 
 allocator: std.mem.Allocator,
@@ -83,6 +86,7 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
 pub fn destroy(self: *CoreClient) void {
     self.server.removePublicationObserver(self.publication_observer);
     for (self.registries.items) |registry| {
+        registry.advertised_globals.deinit(self.allocator);
         registry.resource.destroy();
         registry.resource.deinit();
         self.allocator.destroy(registry);
@@ -101,12 +105,8 @@ fn publicationChanged(self: *CoreClient, publication: Server.Publication, global
     for (self.registries.items) |registry| {
         if (self.connection.fatal() != null) break;
         const result = switch (publication) {
-            .added => registry.resource.emit(0, &registry_global, &.{
-                .{ .uint = global.name() },
-                .{ .string = global.interface().name },
-                .{ .uint = global.version() },
-            }),
-            .removed => registry.resource.emit(1, &registry_global_remove, &.{.{ .uint = global.name() }}),
+            .added => self.advertiseGlobal(registry, global),
+            .removed => self.removeAdvertisedGlobal(registry, global),
         };
         result catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed => self.connection.postOutOfMemory(&registry.resource, "queueing registry publication"),
@@ -157,6 +157,7 @@ fn getRegistry(self: *CoreClient, id: u32) !void {
     const registry = try self.allocator.create(Registry);
     errdefer self.allocator.destroy(registry);
     registry.* = .{ .resource = .init(self.allocator, id, 1, &registry_interface, &registry_requests, .client, self.connection.ownerHooks()) };
+    errdefer registry.advertised_globals.deinit(self.allocator);
     try registry.resource.setHandler(CoreClient, self, handleRegistry, null);
     try self.connection.materialize(&registry.resource);
     var live = true;
@@ -165,20 +166,34 @@ fn getRegistry(self: *CoreClient, id: u32) !void {
         registry.resource.deinit();
     };
     var globals = self.server.iterator();
-    while (globals.next()) |global| try registry.resource.emit(0, &registry_global, &.{
+    while (globals.next()) |global| try self.advertiseGlobal(registry, global);
+    try self.registries.append(self.allocator, registry);
+    live = false;
+}
+
+fn advertiseGlobal(self: *CoreClient, registry: *Registry, global: *const Server.Global) !void {
+    if (!self.server.globalVisible(&self.connection, global)) return;
+    if (registry.advertised_globals.contains(global.name())) return;
+    try registry.advertised_globals.ensureUnusedCapacity(self.allocator, 1);
+    try registry.resource.emit(0, &registry_global, &.{
         .{ .uint = global.name() },
         .{ .string = global.interface().name },
         .{ .uint = global.version() },
     });
-    try self.registries.append(self.allocator, registry);
-    live = false;
+    registry.advertised_globals.putAssumeCapacity(global.name(), {});
+}
+
+fn removeAdvertisedGlobal(_: *CoreClient, registry: *Registry, global: *const Server.Global) !void {
+    if (!registry.advertised_globals.contains(global.name())) return;
+    try registry.resource.emit(1, &registry_global_remove, &.{.{ .uint = global.name() }});
+    std.debug.assert(registry.advertised_globals.remove(global.name()));
 }
 
 fn handleRegistry(self: *CoreClient, resource: *Resource, _: u16, message: *wire.DecodedMessage) !void {
     const name = message.values[0].uint;
     const generic = message.values[1].new_id.generic;
     self.server.bind(&self.connection, name, generic.interface, generic.version, generic.id) catch |err| switch (err) {
-        error.UnknownGlobal, error.RemovedGlobal, error.InterfaceMismatch, error.ZeroVersion, error.VersionTooHigh => {
+        error.UnknownGlobal, error.RemovedGlobal, error.HiddenGlobal, error.InterfaceMismatch, error.ZeroVersion, error.VersionTooHigh => {
             self.connection.postProtocolError(resource, 0, "invalid wl_registry.bind");
             return;
         },
@@ -375,6 +390,67 @@ test "live globals emit exact add remove and later registry sees current monoton
     try std.testing.expectEqual(second.name(), std.mem.readInt(u32, snapshot.bytes[8..12], .native));
     try managed.client().completeSend(snapshot.token, snapshot.bytes.len);
     try std.testing.expect((try managed.client().beginSend()) == null);
+}
+
+test "global filter controls each registry snapshot removal and bind" {
+    const Fixture = struct {
+        pub const interface: wire.Interface = .{ .name = "wl_fixture", .version = 1 };
+        calls: usize = 0,
+        fn bind(_: *Client, _: u32, _: u32, self: *@This()) !void {
+            self.calls += 1;
+        }
+    };
+    const Filter = struct {
+        hidden: *const Server.Global,
+        fn allow(self: *@This(), client_value: *const Client, global: *const Server.Global) bool {
+            return global != self.hidden or client_value.credentials().?.uid == 7;
+        }
+    };
+
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var fixture: Fixture = .{};
+    const public = try host.addGlobal(Fixture, 1, Fixture, &fixture, Fixture.bind);
+    const hidden = try host.addGlobal(Fixture, 1, Fixture, &fixture, Fixture.bind);
+    var filter: Filter = .{ .hidden = hidden };
+    host.setGlobalFilter(Filter, &filter, Filter.allow);
+    defer host.clearGlobalFilter();
+    const allowed = try CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 1, .uid = 7, .gid = 1 } });
+    defer allowed.destroy();
+    const restricted = try CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 2, .uid = 8, .gid = 2 } });
+    defer restricted.destroy();
+
+    try testSend(allowed.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    try testSend(restricted.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    const allowed_snapshot = (try allowed.client().beginSend()).?;
+    try std.testing.expectEqual(public.name(), std.mem.readInt(u32, allowed_snapshot.bytes[8..12], .native));
+    const second_offset: usize = @intCast(std.mem.readInt(u32, allowed_snapshot.bytes[4..8], .native) >> 16);
+    try std.testing.expect(second_offset < allowed_snapshot.bytes.len);
+    try std.testing.expectEqual(hidden.name(), std.mem.readInt(u32, allowed_snapshot.bytes[second_offset + 8 ..][0..4], .native));
+    try allowed.client().completeSend(allowed_snapshot.token, allowed_snapshot.bytes.len);
+    const restricted_public = (try restricted.client().beginSend()).?;
+    try std.testing.expectEqual(public.name(), std.mem.readInt(u32, restricted_public.bytes[8..12], .native));
+    try restricted.client().completeSend(restricted_public.token, restricted_public.bytes.len);
+    try std.testing.expect((try restricted.client().beginSend()) == null);
+
+    const attacker = try CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 3, .uid = 8, .gid = 2 } });
+    defer attacker.destroy();
+    try testSend(attacker.client(), 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    const attacker_public = (try attacker.client().beginSend()).?;
+    try attacker.client().completeSend(attacker_public.token, attacker_public.bytes.len);
+    try testSend(attacker.client(), 2, 0, &registry_bind, &.{
+        .{ .uint = hidden.name() },
+        .{ .new_id = .{ .generic = .{ .interface = "wl_fixture", .version = 1, .id = 3 } } },
+    });
+    try std.testing.expectEqual(@import("fatal.zig").Kind.protocol, attacker.client().fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+
+    try host.removeGlobal(hidden);
+    const allowed_remove = (try allowed.client().beginSend()).?;
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, allowed_remove.bytes[4..8], .native))));
+    try std.testing.expectEqual(hidden.name(), std.mem.readInt(u32, allowed_remove.bytes[8..12], .native));
+    try allowed.client().completeSend(allowed_remove.token, allowed_remove.bytes.len);
+    try std.testing.expect((try restricted.client().beginSend()) == null);
 }
 
 test "live notification OOM is client local and observer teardown leaves survivor" {
