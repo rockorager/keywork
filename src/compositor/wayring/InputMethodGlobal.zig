@@ -5,6 +5,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const generated = @import("wayring-protocols");
 const Server = @import("wayring-server");
+const CompositorGlobal = @import("CompositorGlobal.zig");
 const SecurityContextGlobal = @import("SecurityContextGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
 const TextInputGlobal = @import("TextInputGlobal.zig");
@@ -32,7 +33,13 @@ const Method = struct {
     delete_after: u32 = 0,
     children: std.ArrayList(*Child) = .empty,
 };
-const Child = struct { owner: *InputMethodGlobal, method: ?*Method, resource: wayring.ObjectHandle };
+const Child = struct {
+    allocator: std.mem.Allocator,
+    method: ?*Method,
+    resource: wayring.ObjectHandle,
+    surface: ?*CompositorGlobal.Surface = null,
+    surface_alive: bool = false,
+};
 
 pub fn init(self: *InputMethodGlobal, allocator: std.mem.Allocator, server: *Server, seat: *SeatGlobal, text_input: *TextInputGlobal, security: *SecurityContextGlobal) !void {
     self.* = .{ .allocator = allocator, .server = server, .seat = seat, .text_input = text_input, .global_name = undefined };
@@ -74,11 +81,7 @@ fn createMethod(self: *InputMethodGlobal, client: *Server.Client, id: u32, wrong
 fn dispatchMethod(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
     const method: *Method = @ptrCast(@alignCast(context));
     const request = try generated.zwp_input_method_v2_types.decodeRequest(&client.connection, resource, message);
-    if (!method.available) return switch (request) {
-        .get_input_popup_surface => |r| createChild(method, r.id, &generated.zwp_input_popup_surface_v2),
-        .grab_keyboard => |r| createChild(method, r.keyboard, &generated.zwp_input_method_keyboard_grab_v2),
-        else => {},
-    };
+    if (!method.available) return;
     switch (request) {
         .destroy => {},
         .commit_string => |r| try setText(method, &method.commit_text, r.text),
@@ -92,8 +95,8 @@ fn dispatchMethod(context: *anyopaque, client: *Server.Client, resource: wayring
             method.delete_after = r.after_length;
         },
         .commit => |r| relay(method, r.serial),
-        .get_input_popup_surface => |r| try createChild(method, r.id, &generated.zwp_input_popup_surface_v2),
-        .grab_keyboard => |r| try createChild(method, r.keyboard, &generated.zwp_input_method_keyboard_grab_v2),
+        .get_input_popup_surface => |r| try createPopup(method, resource, r.id, r.surface),
+        .grab_keyboard => |r| try createGrab(method, r.keyboard),
     }
 }
 fn setText(method: *Method, slot: *?[]u8, text: []const u8) !void {
@@ -135,38 +138,73 @@ fn textChanged(context: *anyopaque) void {
     const self: *InputMethodGlobal = @ptrCast(@alignCast(context));
     if (self.available) |method| sync(method) catch method.client.postNoMemory() catch {};
 }
-fn createChild(method: *Method, id: u32, interface: *const wayring.Interface) !void {
-    method.children.ensureUnusedCapacity(method.owner.allocator, 1) catch return method.client.postNoMemory();
-    const child = method.owner.allocator.create(Child) catch return method.client.postNoMemory();
+fn createChild(method: *Method, id: u32, interface: *const wayring.Interface) !*Child {
+    method.children.ensureUnusedCapacity(method.owner.allocator, 1) catch {
+        try method.client.postNoMemory();
+        return error.OutOfMemory;
+    };
+    const child = method.owner.allocator.create(Child) catch {
+        try method.client.postNoMemory();
+        return error.OutOfMemory;
+    };
     errdefer method.owner.allocator.destroy(child);
-    child.* = .{ .owner = method.owner, .method = method, .resource = undefined };
-    child.resource = method.client.createResource(id, interface, 1, .{ .context = child, .dispatch = dispatchChild, .destroy = destroyChild }) catch return method.client.postNoMemory();
+    child.* = .{ .allocator = method.owner.allocator, .method = method, .resource = undefined };
+    child.resource = method.client.createResource(id, interface, 1, .{ .context = child, .dispatch = dispatchChild, .destroy = destroyChild }) catch {
+        try method.client.postNoMemory();
+        return error.OutOfMemory;
+    };
+    errdefer method.client.destroyResource(child.resource) catch {};
     method.children.appendAssumeCapacity(child);
+    return child;
+}
+fn createGrab(method: *Method, id: u32) !void {
+    const child = try createChild(method, id, &generated.zwp_input_method_keyboard_grab_v2);
+    const repeat = method.owner.seat.currentKeyboardRepeatInfo();
+    generated.zwp_input_method_keyboard_grab_v2_types.events.repeat_info(
+        &method.client.connection,
+        child.resource,
+        repeat.rate,
+        repeat.delay,
+    ) catch return method.client.postNoMemory();
+}
+fn createPopup(method: *Method, method_resource: wayring.ObjectHandle, id: u32, surface_id: u32) !void {
+    const object = method.client.connection.object(surface_id) orelse return error.UnknownSurface;
+    const surface = try CompositorGlobal.surfaceFor(method.client, .{ .id = surface_id, .generation = object.generation });
+    const child = try createChild(method, id, &generated.zwp_input_popup_surface_v2);
+    surface.reference() catch return method.client.postNoMemory();
+    child.surface = surface;
+    child.surface_alive = true;
+    surface.setRole(method.owner, child, popupSurfaceDestroyed) catch return method.client.postError(
+        method_resource,
+        @intFromEnum(generated.zwp_input_method_v2_types.@"error".role),
+        "wl_surface already has a role",
+    );
 }
 fn dispatchChild(_: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle, _: *wayring.Message) !void {}
 fn destroyChild(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const child: *Child = @ptrCast(@alignCast(context));
-    const method = child.method orelse {
-        child.owner.allocator.destroy(child);
-        return;
-    };
-    for (method.children.items, 0..) |item, i| if (item == child) {
+    if (child.method) |method| for (method.children.items, 0..) |item, i| if (item == child) {
         _ = method.children.orderedRemove(i);
         break;
     };
-    child.owner.allocator.destroy(child);
+    if (child.surface) |surface| {
+        if (surface.role_context == @as(*anyopaque, @ptrCast(child))) surface.clearRole(child);
+        surface.unreference();
+    }
+    child.allocator.destroy(child);
+}
+fn popupSurfaceDestroyed(context: *anyopaque) void {
+    const child: *Child = @ptrCast(@alignCast(context));
+    child.surface_alive = false;
 }
 fn destroyMethod(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const method: *Method = @ptrCast(@alignCast(context));
     if (method.owner.available == method) method.owner.available = null;
     reset(method);
     while (method.children.items.len != 0) {
-        const child = method.children.items[method.children.items.len - 1];
-        method.client.destroyResource(child.resource) catch {
-            method.client.postNoMemory() catch {};
-            child.method = null;
-            _ = method.children.pop();
-        };
+        const child = method.children.pop().?;
+        child.method = null;
+        method.client.deferResourceDestroy(child.resource) catch method.client.postNoMemory() catch {};
     }
     finalizeMethod(method);
 }
@@ -213,7 +251,6 @@ test "input method validates UTF-8 and edit bounds" {
 
 test "input method relays a focused text input stream and isolates lifetimes" {
     const core = @import("wayring-core");
-    const CompositorGlobal = @import("CompositorGlobal.zig");
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
     var compositor: CompositorGlobal = undefined;
@@ -243,7 +280,7 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     defer ime_peer.deinit();
 
     const AppGlobals = struct { registry: wayring.ObjectHandle, compositor: u32, seat: u32, text: u32 };
-    const ImeGlobals = struct { registry: wayring.ObjectHandle, seat: u32, other_seat: u32, method: u32 };
+    const ImeGlobals = struct { registry: wayring.ObjectHandle, compositor: u32, seat: u32, other_seat: u32, method: u32 };
     const app_registry: wayring.ObjectHandle = .{ .id = 2, .generation = blk: {
         _ = try core.bootstrapDisplay(&app_peer);
         break :blk try core.getRegistry(&app_peer, 2);
@@ -266,18 +303,19 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     } };
     try transferToServer(&ime_peer, ime);
     try transferFromServer(&ime_peer, ime);
-    var ime_globals: ImeGlobals = .{ .registry = ime_registry, .seat = 0, .other_seat = 0, .method = 0 };
+    var ime_globals: ImeGlobals = .{ .registry = ime_registry, .compositor = 0, .seat = 0, .other_seat = 0, .method = 0 };
     while (ime_peer.popMessage()) |popped| {
         var message = popped;
         defer message.deinit();
         const event = try core.decodeRegistryEvent(&message, ime_registry.id);
         if (event != .global) continue;
+        if (std.mem.eql(u8, event.global.interface, generated.wl_compositor.name)) ime_globals.compositor = event.global.name;
         if (event.global.name == seat.globalName()) ime_globals.seat = event.global.name;
         if (event.global.name == other_seat.globalName()) ime_globals.other_seat = event.global.name;
         if (std.mem.eql(u8, event.global.interface, generated.zwp_input_method_manager_v2.name)) ime_globals.method = event.global.name;
     }
     try std.testing.expect(app_globals.compositor != 0 and app_globals.seat != 0 and app_globals.text != 0);
-    try std.testing.expect(ime_globals.seat != 0 and ime_globals.other_seat != 0 and ime_globals.method != 0);
+    try std.testing.expect(ime_globals.compositor != 0 and ime_globals.seat != 0 and ime_globals.other_seat != 0 and ime_globals.method != 0);
 
     const app_compositor = try bindGlobal(core, &app_peer, app_registry, app_globals.compositor, &generated.wl_compositor, 3);
     const app_seat = try bindGlobal(core, &app_peer, app_registry, app_globals.seat, &generated.wl_seat, 4);
@@ -296,6 +334,7 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     }
     try std.testing.expect(entered);
 
+    const ime_compositor = try bindGlobal(core, &ime_peer, ime_registry, ime_globals.compositor, &generated.wl_compositor, 6);
     const ime_seat = try bindGlobal(core, &ime_peer, ime_registry, ime_globals.seat, &generated.wl_seat, 3);
     const method_manager = try bindGlobal(core, &ime_peer, ime_registry, ime_globals.method, &generated.zwp_input_method_manager_v2, 4);
     const ime_other_seat = try bindGlobal(core, &ime_peer, ime_registry, ime_globals.other_seat, &generated.wl_seat, 5);
@@ -427,9 +466,32 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     }
     try std.testing.expect(destroyed_surface_deactivated);
 
-    // Managers, products, and text inputs have independent protocol lifetimes.
+    // Inert grabs still receive their mandatory initialization, and popup
+    // surfaces retain their role until the parent method destroys its children.
+    try seat.keyboardRepeatInfo(25, 600);
     const grab = try generated.zwp_input_method_v2_types.requests.grab_keyboard(&ime_peer, method);
+    const popup_surface = try generated.wl_compositor_types.requests.create_surface(&ime_peer, ime_compositor);
+    const popup = try generated.zwp_input_method_v2_types.requests.get_input_popup_surface(&ime_peer, method, popup_surface);
     try transferToServer(&ime_peer, ime);
+    try transferFromServer(&ime_peer, ime);
+    var got_repeat = false;
+    while (ime_peer.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != grab.id) continue;
+        switch (try generated.zwp_input_method_keyboard_grab_v2_types.decodeEvent(&ime_peer, grab, &message)) {
+            .repeat_info => |event| got_repeat = event.rate == 25 and event.delay == 600,
+            else => {},
+        }
+    }
+    try std.testing.expect(got_repeat);
+    const popup_surface_context = try CompositorGlobal.surfaceFor(ime, .{
+        .id = popup_surface.id,
+        .generation = ime.connection.object(popup_surface.id).?.generation,
+    });
+    try std.testing.expect(popup_surface_context.role_context != null);
+
+    // Managers, products, and text inputs have independent protocol lifetimes.
     try generated.zwp_input_method_manager_v2_types.requests.destroy(&ime_peer, method_manager);
     try generated.zwp_text_input_manager_v3_types.requests.destroy(&app_peer, text_manager);
     try generated.zwp_input_method_v2_types.requests.destroy(&ime_peer, duplicate);
@@ -439,8 +501,71 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     try transferToServer(&ime_peer, ime);
     try transferToServer(&app_peer, app);
     try std.testing.expectError(error.UnknownResource, ime.resourceContext(grab, &generated.zwp_input_method_keyboard_grab_v2));
+    try std.testing.expectError(error.UnknownResource, ime.resourceContext(popup, &generated.zwp_input_popup_surface_v2));
+    try std.testing.expect(popup_surface_context.role_context == null);
     try std.testing.expectEqual(@as(usize, 0), input_methods.methods.items.len);
     try std.testing.expectEqual(@as(usize, 0), text_inputs.inputs.items.len);
+}
+
+test "input method parent teardown keeps children valid when deferral allocation fails" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+    const client = try server.createClient();
+    var client_owned = true;
+    defer if (client_owned) server.destroyClient(client) catch unreachable;
+
+    var owner: InputMethodGlobal = .{
+        .allocator = std.testing.allocator,
+        .server = &server,
+        .seat = undefined,
+        .text_input = undefined,
+        .global_name = 0,
+    };
+    defer owner.methods.deinit(std.testing.allocator);
+    const method = try std.testing.allocator.create(Method);
+    method.* = .{
+        .owner = &owner,
+        .client = client,
+        .resource = undefined,
+        .available = true,
+    };
+    method.resource = try client.createResource(
+        0xff000000,
+        &generated.zwp_input_method_v2,
+        1,
+        .{ .context = method, .dispatch = dispatchMethod, .destroy = destroyMethod },
+    );
+    try owner.methods.append(std.testing.allocator, method);
+    owner.available = method;
+
+    const child = try std.testing.allocator.create(Child);
+    child.* = .{
+        .allocator = std.testing.allocator,
+        .method = method,
+        .resource = try client.createResource(
+            0xff000001,
+            &generated.zwp_input_method_keyboard_grab_v2,
+            1,
+            .{ .context = undefined, .dispatch = dispatchChild, .destroy = destroyChild },
+        ),
+    };
+    const registered_child = client.resources.getPtr(child.resource.id).?;
+    registered_child.implementation.context = child;
+    try method.children.append(std.testing.allocator, child);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    client.allocator = failing.allocator();
+    try client.destroyResource(method.resource);
+    client.allocator = std.testing.allocator;
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(Server.ClientState.protocol_error, client.state);
+    try std.testing.expectEqual(@as(usize, 0), owner.methods.items.len);
+    try std.testing.expect(child.method == null);
+    try std.testing.expect((try client.resourceContext(child.resource, &generated.zwp_input_method_keyboard_grab_v2)) == child);
+
+    try server.destroyClient(client);
+    client_owned = false;
 }
 
 test "input method global rejects confined and guessed binds" {

@@ -706,6 +706,10 @@ pub fn keyboardRepeatInfo(self: *SeatGlobal, rate: i32, delay: i32) !void {
     }
 }
 
+pub fn currentKeyboardRepeatInfo(self: *const SeatGlobal) struct { rate: i32, delay: i32 } {
+    return .{ .rate = self.repeat_rate, .delay = self.repeat_delay };
+}
+
 /// Returns a borrowed focus retained until the next focus or capability change.
 pub fn pointerFocus(self: *const SeatGlobal) ?*CompositorGlobal.Surface {
     return self.pointer_focus;
