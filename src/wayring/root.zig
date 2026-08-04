@@ -4,7 +4,9 @@
 //! Product policy and event-loop ownership remain with consumers.
 
 pub const wire = @import("wire.zig");
+pub const protocol = @import("protocol.zig");
 
 test {
     _ = wire;
+    _ = protocol;
 }
