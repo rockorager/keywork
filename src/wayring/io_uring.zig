@@ -245,6 +245,10 @@ pub const Connection = struct {
     core: *server.CoreClient,
     state_value: State = .ready,
     recv_pending: bool = false,
+    send_pending: bool = false,
+    send_control: ?[]align(@alignOf(linux.cmsghdr)) u8 = null,
+    send_iov: std.posix.iovec_const = undefined,
+    send_msg: linux.msghdr_const = undefined,
     data: [wire.max_message_size]u8 = undefined,
     control: [cmsgSpace(max_received_fds * @sizeOf(wire.FileDescriptor))]u8 align(@alignOf(linux.cmsghdr)) = undefined,
     iov: std.posix.iovec = undefined,
@@ -276,6 +280,7 @@ pub const Connection = struct {
 pub const CompleteResult = union(enum) {
     accepted: *Connection,
     received: *Connection,
+    sent: *Connection,
     peer_disconnected: *Connection,
     terminal: *Connection,
     listener_error: linux.E,
@@ -290,6 +295,8 @@ pub const Server = struct {
     connections: std.ArrayList(*Connection) = .empty,
     accept_pending: bool = false,
     prefer_accept: bool = true,
+    prefer_send: bool = true,
+    connection_cursor: usize = 0,
 
     /// Takes ownership of an already-bound, listening Unix socket descriptor.
     pub fn init(allocator: std.mem.Allocator, sans_io: *server.Server, listener_fd: linux.fd_t) !Server {
@@ -317,11 +324,17 @@ pub const Server = struct {
     /// boundary. All application resources must already have been destroyed.
     pub fn release(self: *Server, connection: *Connection) !void {
         for (self.connections.items, 0..) |candidate, index| if (candidate == connection) {
-            if (connection.recv_pending) return error.OperationInFlight;
+            if (connection.recv_pending or connection.send_pending or connection.send_control != null) return error.OperationInFlight;
             if (!connection.core.canDestroy()) return error.ApplicationResourcesLive;
             _ = linux.close(connection.fd);
             connection.core.destroy();
             _ = self.connections.orderedRemove(index);
+            if (self.connections.items.len == 0) {
+                self.connection_cursor = 0;
+            } else {
+                if (index < self.connection_cursor) self.connection_cursor -= 1;
+                if (self.connection_cursor >= self.connections.items.len) self.connection_cursor = 0;
+            }
             self.allocator.destroy(connection);
             return;
         };
@@ -331,14 +344,18 @@ pub const Server = struct {
     /// Reserves all fallible operation-table state before acquiring an SQE.
     /// Successful SQE preparation is followed only by infallible commit.
     pub fn prepareNext(self: *Server, ring: *linux.IoUring, external_user_data: u64) !PrepareResult {
-        const connection = self.nextReceivable();
+        const connection = self.nextConnection();
         const choose_accept = !self.accept_pending and (connection == null or self.prefer_accept);
         if (!choose_accept and connection == null) {
             if (self.accept_pending) return .idle;
             return self.prepareAccept(ring, external_user_data);
         }
         if (choose_accept) return self.prepareAccept(ring, external_user_data);
-        return self.prepareRecv(ring, connection.?, external_user_data);
+        const selected = connection.?;
+        const can_send = !selected.send_pending and selected.client().hasPendingOutput();
+        const can_recv = selected.state_value == .ready and !selected.recv_pending;
+        if (can_send and (!can_recv or self.prefer_send)) return self.prepareSend(ring, selected, external_user_data);
+        return self.prepareRecv(ring, selected, external_user_data);
     }
 
     fn prepareAccept(self: *Server, ring: *linux.IoUring, external: u64) !PrepareResult {
@@ -367,6 +384,46 @@ pub const Server = struct {
         const token = self.operations.commitPrepared();
         connection.recv_pending = true;
         self.prefer_accept = true;
+        self.prefer_send = true;
+        return .{ .prepared = token };
+    }
+
+    fn prepareSend(self: *Server, ring: *linux.IoUring, connection: *Connection, external: u64) !PrepareResult {
+        const batch = (try connection.client().beginSend()) orelse unreachable;
+        errdefer connection.client().completeSend(batch.token, 0) catch unreachable;
+
+        const control_len = if (batch.fds.len == 0) 0 else cmsgSpace(batch.fds.len * @sizeOf(wire.FileDescriptor));
+        const control = if (control_len == 0) null else try self.allocator.alignedAlloc(u8, .of(linux.cmsghdr), control_len);
+        errdefer if (control) |owned| self.allocator.free(owned);
+        if (control) |owned| encodeRights(owned, batch.fds);
+
+        connection.send_control = control;
+        connection.send_iov = .{ .base = batch.bytes.ptr, .len = batch.bytes.len };
+        connection.send_msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&connection.send_iov),
+            .iovlen = 1,
+            .control = if (control) |owned| owned.ptr else null,
+            .controllen = control_len,
+            .flags = 0,
+        };
+        errdefer connection.send_control = null;
+        try self.operations.prepare(.send(connection, batch.token), external);
+        errdefer self.operations.abortPrepared() catch unreachable;
+        _ = ring.sendmsg(external, connection.fd, &connection.send_msg, linux.MSG.NOSIGNAL) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.operations.abortPrepared() catch unreachable;
+                connection.send_control = null;
+                if (control) |owned| self.allocator.free(owned);
+                connection.client().completeSend(batch.token, 0) catch unreachable;
+                return .submission_queue_full;
+            },
+        };
+        const token = self.operations.commitPrepared();
+        connection.send_pending = true;
+        self.prefer_send = false;
+        self.prefer_accept = true;
         return .{ .prepared = token };
     }
 
@@ -376,7 +433,8 @@ pub const Server = struct {
         return switch (operation) {
             .accept => self.completeAccept(res),
             .recv => |value| self.completeRecv(@ptrCast(@alignCast(value.owner)), res),
-            else => error.UnsupportedOperation,
+            .send => |value| self.completeSend(@ptrCast(@alignCast(value.owner)), value.batch, res),
+            .cancel => error.UnsupportedOperation,
         };
     }
 
@@ -399,6 +457,15 @@ pub const Server = struct {
 
     fn completeRecv(self: *Server, connection: *Connection, res: i32) !CompleteResult {
         defer connection.recv_pending = false;
+        if (connection.state_value == .peer_disconnected) {
+            if (res > 0) {
+                const received: usize = @intCast(res);
+                if (received > connection.data.len) return error.InvalidCompletionResult;
+                const count = parseRights(connection, connection.msg.controllen, connection.msg.flags) catch return .{ .peer_disconnected = connection };
+                closeFds(connection.fd_scratch[0..count]);
+            }
+            return .{ .peer_disconnected = connection };
+        }
         if (completionError(res)) |err| return switch (err) {
             .INTR, .AGAIN => .retry,
             else => self.disconnect(connection),
@@ -427,15 +494,53 @@ pub const Server = struct {
         return if (connection.state_value == .terminal) .{ .terminal = connection } else .{ .received = connection };
     }
 
+    fn completeSend(self: *Server, connection: *Connection, token: wire.BatchToken, res: i32) !CompleteResult {
+        defer connection.send_pending = false;
+        defer if (connection.send_control) |control| {
+            self.allocator.free(control);
+            connection.send_control = null;
+        };
+        if (completionError(res)) |err| switch (err) {
+            .INTR, .AGAIN => {
+                try connection.client().completeSend(token, 0);
+                self.prefer_send = true;
+                if (connection.state_value == .peer_disconnected) return .{ .peer_disconnected = connection };
+                return .retry;
+            },
+            else => {
+                try connection.client().completeSend(token, 0);
+                return self.disconnect(connection);
+            },
+        };
+        const written: usize = @intCast(res);
+        if (written > connection.send_iov.len) {
+            try connection.client().completeSend(token, 0);
+            return error.InvalidCompletionResult;
+        }
+        try connection.client().completeSend(token, written);
+        self.prefer_send = true;
+        if (connection.state_value == .peer_disconnected) return .{ .peer_disconnected = connection };
+        return if (written == 0) .retry else .{ .sent = connection };
+    }
+
     fn disconnect(_: *Server, connection: *Connection) CompleteResult {
         connection.state_value = .peer_disconnected;
         connection.client().peerDisconnected();
         return .{ .peer_disconnected = connection };
     }
 
-    fn nextReceivable(self: *Server) ?*Connection {
-        for (self.connections.items) |connection|
-            if (!connection.recv_pending and connection.state_value == .ready) return connection;
+    fn nextConnection(self: *Server) ?*Connection {
+        for (0..self.connections.items.len) |offset| {
+            const index = (self.connection_cursor + offset) % self.connections.items.len;
+            const connection = self.connections.items[index];
+            if (connection.state_value == .peer_disconnected) continue;
+            const can_recv = connection.state_value == .ready and !connection.recv_pending;
+            const can_send = !connection.send_pending and connection.client().hasPendingOutput();
+            if (can_recv or can_send) {
+                self.connection_cursor = (index + 1) % self.connections.items.len;
+                return connection;
+            }
+        }
         return null;
     }
 };
@@ -501,6 +606,34 @@ fn parseRights(connection: *Connection, control_len: usize, message_flags: u32) 
 fn writeControlHeader(bytes: []u8, len: usize, level: i32, kind: i32) void {
     const header: *align(1) linux.cmsghdr = @ptrCast(bytes.ptr);
     header.* = .{ .len = len, .level = level, .type = kind };
+}
+
+fn encodeRights(control: []u8, fds: []const wire.FileDescriptor) void {
+    @memset(control, 0);
+    const header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const payload_len = fds.len * @sizeOf(wire.FileDescriptor);
+    std.debug.assert(control.len == cmsgSpace(payload_len));
+    writeControlHeader(control, header_len + payload_len, linux.SOL.SOCKET, linux.SCM.RIGHTS);
+    for (fds, 0..) |fd, index| {
+        const start = header_len + index * @sizeOf(wire.FileDescriptor);
+        @memcpy(control[start..][0..@sizeOf(wire.FileDescriptor)], std.mem.asBytes(&fd));
+    }
+}
+
+test "SCM_RIGHTS encoder emits one ordered descriptor message" {
+    const fds = [_]wire.FileDescriptor{ 19, 7, 42 };
+    var control: [cmsgSpace(fds.len * @sizeOf(wire.FileDescriptor))]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    encodeRights(&control, &fds);
+
+    const header: *const linux.cmsghdr = @ptrCast(&control);
+    const payload_start = cmsgAlign(@sizeOf(linux.cmsghdr));
+    try std.testing.expectEqual(linux.SOL.SOCKET, header.level);
+    try std.testing.expectEqual(linux.SCM.RIGHTS, header.type);
+    try std.testing.expectEqual(payload_start + fds.len * @sizeOf(wire.FileDescriptor), header.len);
+    for (fds, 0..) |expected, index| {
+        const start = payload_start + index * @sizeOf(wire.FileDescriptor);
+        try std.testing.expectEqual(expected, std.mem.bytesToValue(wire.FileDescriptor, control[start..][0..@sizeOf(wire.FileDescriptor)]));
+    }
 }
 
 test "SCM_RIGHTS parser preserves order and closes parsed descriptors on truncation" {
@@ -594,6 +727,30 @@ test "recv completion transfers SCM_RIGHTS ownership into the core" {
     try std.testing.expect(!connection.recv_pending);
     try transport.release(connection);
     try std.testing.expect(linux.fcntl(received_fd, linux.F.GETFD, 0) > std.math.maxInt(isize));
+    try transport.deinit();
+}
+
+test "retryable send completion reports an earlier peer disconnect" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const connection = (try transport.completeAccept(accepted)).accepted;
+
+    try connection.client().receive(&.{
+        1, 0, 0, 0, 0, 0, 12, 0,
+        2, 0, 0, 0,
+    }, &.{});
+    try connection.client().dispatch();
+    const batch = (try connection.client().beginSend()).?;
+    connection.send_pending = true;
+    _ = transport.disconnect(connection);
+    const result = try transport.completeSend(connection, batch.token, -@as(i32, @intFromEnum(linux.E.AGAIN)));
+    try std.testing.expect(result == .peer_disconnected);
+    try std.testing.expect(!connection.send_pending);
+
+    try transport.release(connection);
     try transport.deinit();
 }
 

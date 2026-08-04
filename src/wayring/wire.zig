@@ -367,6 +367,14 @@ pub const Output = struct {
         };
     }
 
+    /// Reports whether a new send attempt can be started without mutating the
+    /// queue or consuming a batch token.
+    pub fn hasPendingOutput(self: *const Output) bool {
+        if (self.in_flight != null) return false;
+        return self.batches.items.len != 0 or
+            (self.sealed and self.terminal_offset < self.terminal_len);
+    }
+
     /// Records a successful send attempt. Any positive byte count consumes
     /// the complete FD payload, even when message bytes remain.
     pub fn completeSend(self: *Output, token: BatchToken, bytes_written: usize) !void {

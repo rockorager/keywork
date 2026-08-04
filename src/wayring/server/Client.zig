@@ -111,6 +111,10 @@ pub fn beginSend(self: *Client) !?wire.SendBatch {
     return self.output.beginSend();
 }
 
+pub fn hasPendingOutput(self: *const Client) bool {
+    return self.output.hasPendingOutput();
+}
+
 pub fn completeSend(self: *Client, token: wire.BatchToken, bytes_written: usize) !void {
     return self.output.completeSend(token, bytes_written);
 }
