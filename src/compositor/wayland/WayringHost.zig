@@ -14,6 +14,7 @@ const linux = std.os.linux;
 const server = wayring.server;
 const wl = wayland.server.wl;
 
+const log = std.log.scoped(.wayring_host);
 const submission_capacity = 64;
 const route_capacity = submission_capacity * 2;
 
@@ -31,6 +32,24 @@ const ManagedConnection = struct {
     connection: *wayring.io_uring.Connection,
     retiring: bool = false,
     resources_destroyed: bool = false,
+};
+
+const CompletionSource = struct {
+    context: *anyopaque,
+    copy: *const fn (*anyopaque, *linux.IoUring, []linux.io_uring_cqe, u32) anyerror!u32,
+
+    fn fromRing(host: *WayringHost) CompletionSource {
+        return .{ .context = host, .copy = copyFromRing };
+    }
+
+    fn copyFromRing(_: *anyopaque, ring: *linux.IoUring, cqes: []linux.io_uring_cqe, wait_nr: u32) !u32 {
+        return ring.copy_cqes(cqes, wait_nr);
+    }
+};
+
+const DrainResult = union(enum) {
+    complete,
+    undrainable: anyerror,
 };
 
 allocator: std.mem.Allocator,
@@ -82,30 +101,63 @@ pub fn create(
     return self;
 }
 
+/// Returns only after every client resource and transport operation is gone
+/// and all host-owned storage has been freed. Kernel failures that make that
+/// guarantee impossible terminate the process instead of returning to owners
+/// borrowed by lifecycle callbacks. A lifecycle callback that leaves
+/// application resources live is likewise fatal because its connection cannot
+/// be released safely.
 pub fn destroy(self: *WayringHost) !void {
+    self.beginDestroy();
+    switch (self.drainForDestroy(.fromRing(self))) {
+        .complete => {},
+        .undrainable => |err| fatalDestroy(err),
+    }
+    return self.finishDestroy();
+}
+
+fn beginDestroy(self: *WayringHost) void {
     if (self.event_source) |source| {
         source.remove();
         self.event_source = null;
     }
     self.beginShutdown();
+}
+
+fn drainForDestroy(self: *WayringHost, completions: CompletionSource) DrainResult {
     var cqes: [route_capacity]linux.io_uring_cqe = undefined;
     while (!self.transport.isDrained() or self.route_count != 0 or self.connections.items.len != 0) {
         self.releaseReady(true) catch |err| self.recordFailure(err);
-        self.prepareAndSubmit() catch |err| self.recordFailure(err);
-        if (self.submission_pending) continue;
+        self.prepareAndSubmit() catch |err| {
+            self.recordFailure(err);
+            return .{ .undrainable = err };
+        };
+        std.debug.assert(!self.submission_pending);
         if (self.route_count == 0) {
             if (self.transport.isDrained() and self.connections.items.len == 0) break;
-            return error.TransportCleanupStalled;
+            self.recordFailure(error.TransportCleanupStalled);
+            return .{ .undrainable = error.TransportCleanupStalled };
         }
-        const count = self.ring.copy_cqes(&cqes, 1) catch |err| switch (err) {
+        const count = completions.copy(completions.context, &self.ring, &cqes, 1) catch |err| switch (err) {
             error.SignalInterrupt => continue,
-            else => return err,
+            else => {
+                self.recordFailure(err);
+                return .{ .undrainable = err };
+            },
         };
         self.completeBatch(cqes[0..count]) catch |err| self.recordFailure(err);
     }
+    return .complete;
+}
+
+fn finishDestroy(self: *WayringHost) !void {
+    std.debug.assert(self.transport.isDrained());
+    std.debug.assert(self.route_count == 0);
+    std.debug.assert(self.connections.items.len == 0);
     var transport_failure: ?anyerror = null;
     self.transport.deinit() catch |err| {
-        transport_failure = err;
+        if (err != error.SocketCleanupFailed) fatalDestroy(err);
+        transport_failure = error.SocketCleanupFailed;
     };
     self.ring.deinit();
     self.connections.deinit(self.allocator);
@@ -115,6 +167,11 @@ pub fn destroy(self: *WayringHost) !void {
     allocator.destroy(self);
     if (host_failure) |err| return err;
     if (transport_failure) |err| return err;
+}
+
+fn fatalDestroy(err: anyerror) noreturn {
+    log.err("cannot safely destroy Wayring host because kernel cleanup is undrainable: {t}", .{err});
+    std.process.abort();
 }
 
 pub fn displayName(self: *const WayringHost) []const u8 {
@@ -250,6 +307,7 @@ fn retire(self: *WayringHost, connection: *wayring.io_uring.Connection) void {
 
 fn releaseReady(self: *WayringHost, release_all: bool) !void {
     var index: usize = 0;
+    var first_failure: ?anyerror = null;
     while (index < self.connections.items.len) {
         const managed = self.connections.items[index];
         if (!release_all and !managed.retiring) {
@@ -265,11 +323,16 @@ fn releaseReady(self: *WayringHost, release_all: bool) !void {
                 index += 1;
                 continue;
             },
-            else => return err,
+            else => {
+                if (first_failure == null) first_failure = err;
+                index += 1;
+                continue;
+            },
         };
         self.allocator.destroy(managed);
         _ = self.connections.orderedRemove(index);
     }
+    if (first_failure) |err| return err;
 }
 
 fn takeRoute(self: *WayringHost, external: u64) ?wayring.io_uring.OperationToken {
@@ -377,6 +440,239 @@ fn connectSocket(path: [:0]const u8) !linux.fd_t {
     const length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
     if (linux.errno(linux.connect(fd, @ptrCast(&address), length)) != .SUCCESS) return error.ConnectFailed;
     return fd;
+}
+
+const CleanupProbe = struct {
+    callback_count: usize = 0,
+    callback_client: ?*server.Client = null,
+    resource: ?*server.Resource = null,
+    destroy_on_callback: bool = true,
+
+    fn destroy(erased: *anyopaque, client: *server.Client) void {
+        const self: *CleanupProbe = @ptrCast(@alignCast(erased));
+        self.callback_count += 1;
+        self.callback_client = client;
+        if (self.destroy_on_callback) self.destroyResource();
+    }
+
+    fn destroyResource(self: *CleanupProbe) void {
+        const resource = self.resource orelse return;
+        resource.destroy();
+        resource.deinit();
+        self.resource = null;
+    }
+};
+
+const cleanup_test_interface: wayring.wire.Interface = .{
+    .name = "keywork_cleanup_test",
+    .version = 1,
+};
+
+fn waitForManagedConnection(event_loop: *wl.EventLoop, host: *WayringHost) !*ManagedConnection {
+    for (0..200) |_| {
+        try event_loop.dispatch(50);
+        if (host.failure()) |err| return err;
+        if (host.connections.items.len != 0) return host.connections.items[0];
+    }
+    return error.HostBridgeTimedOut;
+}
+
+const CompletionErrorInjector = struct {
+    injected: bool = false,
+
+    fn copy(erased: *anyopaque, ring: *linux.IoUring, cqes: []linux.io_uring_cqe, wait_nr: u32) !u32 {
+        const self: *CompletionErrorInjector = @ptrCast(@alignCast(erased));
+        const count = try ring.copy_cqes(cqes, wait_nr);
+        if (!self.injected) for (cqes[0..count]) |*cqe| {
+            const cancellation_result = cqe.res == 0 or
+                cqe.res == -@as(i32, @intFromEnum(linux.E.ALREADY)) or
+                cqe.res == -@as(i32, @intFromEnum(linux.E.NOENT));
+            if (!cancellation_result) continue;
+            cqe.res = -@as(i32, @intFromEnum(linux.E.IO));
+            self.injected = true;
+            break;
+        };
+        return count;
+    }
+};
+
+const CompletionReadErrorInjector = struct {
+    injected: bool = false,
+
+    fn copy(erased: *anyopaque, _: *linux.IoUring, _: []linux.io_uring_cqe, _: u32) !u32 {
+        const self: *CompletionReadErrorInjector = @ptrCast(@alignCast(erased));
+        self.injected = true;
+        return error.FileDescriptorInvalid;
+    }
+};
+
+test "destroy drains resources and routes after a completion error" {
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-host-completion-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var cleanup: CleanupProbe = .{};
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        event_loop,
+        &protocol_server,
+        runtime_directory,
+        .{ .context = &cleanup, .destroy_resources = CleanupProbe.destroy },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, host.displayName() },
+        0,
+    );
+    defer std.testing.allocator.free(path);
+    const peer_fd = try connectSocket(path);
+    defer _ = linux.close(peer_fd);
+    const managed = try waitForManagedConnection(event_loop, host);
+    const client = managed.connection.client();
+    var resource: server.Resource = .init(
+        std.testing.allocator,
+        2,
+        1,
+        &cleanup_test_interface,
+        &.{},
+        .client,
+        client.ownerHooks(),
+    );
+    try client.installClientInitial(2, &resource);
+    cleanup.resource = &resource;
+
+    host.beginDestroy();
+    var injector: CompletionErrorInjector = .{};
+    const drain_result = host.drainForDestroy(.{ .context = &injector, .copy = CompletionErrorInjector.copy });
+    const drained = drain_result == .complete;
+    const routes_before_return = host.route_count;
+    const connections_before_return = host.connections.items.len;
+    const transport_drained_before_return = host.transport.isDrained();
+    host_live = false;
+    var destroy_failure: ?anyerror = null;
+    host.finishDestroy() catch |err| {
+        destroy_failure = err;
+    };
+
+    try std.testing.expect(injector.injected);
+    try std.testing.expect(drained);
+    try std.testing.expectEqual(@as(usize, 1), cleanup.callback_count);
+    try std.testing.expectEqual(client, cleanup.callback_client.?);
+    try std.testing.expect(cleanup.resource == null);
+    try std.testing.expectEqual(@as(usize, 0), routes_before_return);
+    try std.testing.expectEqual(@as(usize, 0), connections_before_return);
+    try std.testing.expect(transport_drained_before_return);
+    try std.testing.expectEqual(error.UnexpectedCancellationResult, destroy_failure.?);
+}
+
+test "completion read failure and stalled destroy are undrainable without repeated callbacks" {
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-host-stall-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var cleanup: CleanupProbe = .{ .destroy_on_callback = false };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        event_loop,
+        &protocol_server,
+        runtime_directory,
+        .{ .context = &cleanup, .destroy_resources = CleanupProbe.destroy },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, host.displayName() },
+        0,
+    );
+    defer std.testing.allocator.free(path);
+    const peer_fd = try connectSocket(path);
+    defer _ = linux.close(peer_fd);
+    const managed = try waitForManagedConnection(event_loop, host);
+    const client = managed.connection.client();
+    var resource: server.Resource = .init(
+        std.testing.allocator,
+        2,
+        1,
+        &cleanup_test_interface,
+        &.{},
+        .client,
+        client.ownerHooks(),
+    );
+    try client.installClientInitial(2, &resource);
+    cleanup.resource = &resource;
+
+    host.beginDestroy();
+    var read_error: CompletionReadErrorInjector = .{};
+    const read_error_result = host.drainForDestroy(.{ .context = &read_error, .copy = CompletionReadErrorInjector.copy });
+    const read_failure: ?anyerror = switch (read_error_result) {
+        .complete => null,
+        .undrainable => |err| err,
+    };
+    const routes_after_read_failure = host.route_count;
+    const connections_after_read_failure = host.connections.items.len;
+    const stalled_result = host.drainForDestroy(.fromRing(host));
+    const stalled_failure: ?anyerror = switch (stalled_result) {
+        .complete => null,
+        .undrainable => |err| err,
+    };
+    const routes_at_stall = host.route_count;
+    const connections_at_stall = host.connections.items.len;
+    cleanup.destroyResource();
+    const resumed_result = host.drainForDestroy(.fromRing(host));
+    const resumed = resumed_result == .complete;
+    const callback_count_after_resume = cleanup.callback_count;
+    const routes_before_return = host.route_count;
+    const connections_before_return = host.connections.items.len;
+    const transport_drained_before_return = host.transport.isDrained();
+    host_live = false;
+    var destroy_failure: ?anyerror = null;
+    host.finishDestroy() catch |err| {
+        destroy_failure = err;
+    };
+
+    try std.testing.expect(read_error.injected);
+    try std.testing.expectEqual(error.FileDescriptorInvalid, read_failure.?);
+    try std.testing.expect(routes_after_read_failure > 0);
+    try std.testing.expectEqual(@as(usize, 1), connections_after_read_failure);
+    try std.testing.expectEqual(error.TransportCleanupStalled, stalled_failure.?);
+    try std.testing.expectEqual(@as(usize, 0), routes_at_stall);
+    try std.testing.expectEqual(@as(usize, 1), connections_at_stall);
+    try std.testing.expect(resumed);
+    try std.testing.expectEqual(@as(usize, 1), callback_count_after_resume);
+    try std.testing.expectEqual(client, cleanup.callback_client.?);
+    try std.testing.expectEqual(@as(usize, 0), routes_before_return);
+    try std.testing.expectEqual(@as(usize, 0), connections_before_return);
+    try std.testing.expect(transport_drained_before_return);
+    try std.testing.expectEqual(error.FileDescriptorInvalid, destroy_failure.?);
 }
 
 test "existing event loop drives scanner-backed Wayring client lifecycle" {
