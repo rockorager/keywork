@@ -9,6 +9,7 @@ const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
+const CopiedBufferSnapshot = @import("CopiedBufferSnapshot.zig");
 const surface_geometry = @import("surface_geometry.zig");
 const WaylandRegion = @import("region.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
@@ -2314,19 +2315,17 @@ const DmabufUse = struct {
 };
 
 pub const BufferSnapshot = struct {
-    allocator: std.mem.Allocator,
     buffer_size: render_types.Size,
     logical_size: render_types.Size,
     scale: i32,
     transform: wl.Output.Transform,
     source: ?render_types.SourceRect,
     force_opaque: bool,
-    pixels: []u32,
+    copied: ?CopiedBufferSnapshot,
     dmabuf: ?*DmabufUse = null,
     color_description: render_types.ColorDescription = .{},
     color_representation: render_types.ColorRepresentation = .{},
     source_cache: render_types.SourceCache,
-    source_damage: ?[]const render_types.Rect,
 
     const Error = error{
         OutOfMemory,
@@ -2365,21 +2364,16 @@ pub const BufferSnapshot = struct {
             viewport,
             allow_non_divisible_scale,
         ) catch |err| return err;
-        const row_bytes = std.math.mul(usize, buffer_size.width, @sizeOf(u32)) catch
-            return error.InvalidBuffer;
-        if (stride < row_bytes) return error.InvalidBuffer;
-
         const format = shm_buffer.getFormat();
         const argb8888: u32 = @intCast(@intFromEnum(wl.Shm.Format.argb8888));
         const xrgb8888: u32 = @intCast(@intFromEnum(wl.Shm.Format.xrgb8888));
         if (format != argb8888 and format != xrgb8888) return error.InvalidBuffer;
 
-        const pixel_count = buffer_size.pixelCount() catch return error.InvalidBuffer;
         shm_buffer.beginAccess();
         defer shm_buffer.endAccess();
         const data = shm_buffer.getData() orelse return error.InvalidBuffer;
         const can_update_partially = if (reusable) |snapshot|
-            snapshot.pixels.len == pixel_count and
+            snapshot.copied != null and
                 std.meta.eql(snapshot.buffer_size, buffer_size) and
                 std.meta.eql(snapshot.logical_size, geometry.logical_size) and
                 snapshot.transform == transform and
@@ -2387,41 +2381,41 @@ pub const BufferSnapshot = struct {
                 surface_damage.isEmpty()
         else
             false;
-        const source_damage = if (can_update_partially)
-            try copyBufferDamage(allocator, buffer_damage, buffer_size)
+        const source_stride: usize = @intCast(stride);
+        const row_bytes = std.math.mul(usize, buffer_size.width, @sizeOf(u32)) catch
+            return error.InvalidBuffer;
+        const preceding_rows = std.math.mul(usize, buffer_size.height - 1, source_stride) catch
+            return error.InvalidBuffer;
+        const source_len = std.math.add(usize, preceding_rows, row_bytes) catch
+            return error.InvalidBuffer;
+        const source_bytes: [*]const u8 = @ptrCast(data);
+        const reusable_copy = if (reusable) |snapshot|
+            if (snapshot.copied) |*copied| copied else null
         else
             null;
-        errdefer if (source_damage) |damage| {
-            if (damage.len > 0) allocator.free(damage);
-        };
-        const pixels = if (reusable) |snapshot|
-            snapshot.takePixels(pixel_count) orelse
-                allocator.alloc(u32, pixel_count) catch return error.OutOfMemory
-        else
-            allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
-        const source: [*]const u8 = @ptrCast(data);
-        const source_stride: usize = @intCast(stride);
-        copyShmPixels(
-            pixels,
-            source,
-            source_stride,
-            buffer_size,
-            format == xrgb8888,
+        const copied = CopiedBufferSnapshot.copy(
+            allocator,
+            .{
+                .bytes = source_bytes[0..source_len],
+                .size = buffer_size,
+                .stride_bytes = source_stride,
+                .format = if (format == xrgb8888) .xrgb8888 else .argb8888,
+            },
+            reusable_copy,
             if (can_update_partially) buffer_damage else null,
-        );
+            source_cache,
+        ) catch |err| return err;
 
         return .{
-            .allocator = allocator,
             .buffer_size = buffer_size,
             .logical_size = geometry.logical_size,
             .scale = scale,
             .transform = transform,
             .source = geometry.source,
-            .force_opaque = format == xrgb8888,
-            .pixels = pixels,
+            .force_opaque = copied.forceOpaque(),
+            .copied = copied,
             .dmabuf = null,
             .source_cache = source_cache,
-            .source_damage = source_damage,
         };
     }
 
@@ -2445,19 +2439,18 @@ pub const BufferSnapshot = struct {
         );
         const dmabuf = try DmabufUse.create(buffer, owned_synchronization);
         owned_synchronization = null;
+        const source_cache = buffer.acquireSourceCache();
 
         return .{
-            .allocator = buffer.manager.allocator,
             .buffer_size = buffer_size,
             .logical_size = geometry.logical_size,
             .scale = scale,
             .transform = transform,
             .source = geometry.source,
             .force_opaque = buffer.renderSource().force_opaque,
-            .pixels = &.{},
+            .copied = null,
             .dmabuf = dmabuf,
-            .source_cache = buffer.acquireSourceCache(),
-            .source_damage = null,
+            .source_cache = source_cache,
         };
     }
 
@@ -2479,24 +2472,27 @@ pub const BufferSnapshot = struct {
             viewport,
             allow_non_divisible_scale,
         );
-        const pixels = if (reusable) |snapshot|
-            snapshot.takePixels(1) orelse
-                allocator.alloc(u32, 1) catch return error.OutOfMemory
+        const reusable_copy = if (reusable) |snapshot|
+            if (snapshot.copied) |*copied| copied else null
         else
-            allocator.alloc(u32, 1) catch return error.OutOfMemory;
-        pixels[0] = pixel;
+            null;
+        const bytes = std.mem.asBytes(&pixel);
+        const copied = CopiedBufferSnapshot.copy(allocator, .{
+            .bytes = bytes,
+            .size = buffer_size,
+            .stride_bytes = @sizeOf(u32),
+            .format = .argb8888,
+        }, reusable_copy, null, source_cache) catch |err| return err;
         return .{
-            .allocator = allocator,
             .buffer_size = buffer_size,
             .logical_size = geometry.logical_size,
             .scale = scale,
             .transform = transform,
             .source = geometry.source,
             .force_opaque = pixel >> 24 == 0xff,
-            .pixels = pixels,
+            .copied = copied,
             .dmabuf = null,
             .source_cache = source_cache,
-            .source_damage = null,
         };
     }
 
@@ -2520,18 +2516,8 @@ pub const BufferSnapshot = struct {
         self.source = geometry.source;
     }
 
-    fn takePixels(self: *BufferSnapshot, pixel_count: usize) ?[]u32 {
-        if (self.pixels.len != pixel_count) return null;
-        const pixels = self.pixels;
-        self.pixels = &.{};
-        return pixels;
-    }
-
     pub fn deinit(self: *BufferSnapshot) void {
-        if (self.pixels.len > 0) self.allocator.free(self.pixels);
-        if (self.source_damage) |damage| {
-            if (damage.len > 0) self.allocator.free(damage);
-        }
+        if (self.copied) |*copied| copied.deinit();
         if (self.dmabuf) |dmabuf| dmabuf.unreference();
         self.* = undefined;
     }
@@ -2552,6 +2538,10 @@ pub const BufferSnapshot = struct {
     }
 
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {
+        if (self.copied) |*copied| return copied.pixelBuffer(
+            self.color_description,
+            self.color_representation,
+        );
         const dmabuf_source = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null;
         return .{
             .size = self.buffer_size,
@@ -2562,103 +2552,14 @@ pub const BufferSnapshot = struct {
                     self.buffer_size.width
             else
                 self.buffer_size.width,
-            .pixels = self.pixels,
+            .pixels = &.{},
             .dmabuf = dmabuf_source,
             .color_description = self.color_description,
             .color_representation = self.color_representation,
             .source_cache = self.source_cache,
-            .source_damage = self.source_damage,
         };
     }
 };
-
-fn copyBufferDamage(
-    allocator: std.mem.Allocator,
-    damage: *const Region,
-    size: render_types.Size,
-) error{OutOfMemory}![]const render_types.Rect {
-    var rectangles: std.ArrayList(render_types.Rect) = .empty;
-    defer rectangles.deinit(allocator);
-    var iterator = damage.rectangleIterator();
-    while (iterator.next()) |rectangle| {
-        const clipped = (render_types.Rect{
-            .x = rectangle.x,
-            .y = rectangle.y,
-            .width = rectangle.width,
-            .height = rectangle.height,
-        }).clipTo(size) orelse continue;
-        rectangles.append(allocator, clipped) catch return error.OutOfMemory;
-    }
-    return rectangles.toOwnedSlice(allocator) catch return error.OutOfMemory;
-}
-
-fn copyShmPixels(
-    destination: []u32,
-    source: [*]const u8,
-    source_stride: usize,
-    size: render_types.Size,
-    force_opaque: bool,
-    damage: ?*const Region,
-) void {
-    const row_bytes = @as(usize, size.width) * @sizeOf(u32);
-    std.debug.assert(source_stride >= row_bytes);
-    std.debug.assert(destination.len >= @as(usize, size.width) * size.height);
-    if (damage) |region| {
-        var rectangles = region.rectangleIterator();
-        while (rectangles.next()) |rectangle| {
-            const clipped = (render_types.Rect{
-                .x = rectangle.x,
-                .y = rectangle.y,
-                .width = rectangle.width,
-                .height = rectangle.height,
-            }).clipTo(size) orelse continue;
-            copyShmRectangle(
-                destination,
-                source,
-                source_stride,
-                size.width,
-                clipped,
-                force_opaque,
-            );
-        }
-        return;
-    }
-    copyShmRectangle(
-        destination,
-        source,
-        source_stride,
-        size.width,
-        .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
-        force_opaque,
-    );
-}
-
-fn copyShmRectangle(
-    destination: []u32,
-    source: [*]const u8,
-    source_stride: usize,
-    destination_stride: u32,
-    rectangle: render_types.Rect,
-    force_opaque: bool,
-) void {
-    std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
-    const x: usize = @intCast(rectangle.x);
-    const y: usize = @intCast(rectangle.y);
-    const copy_bytes = @as(usize, rectangle.width) * @sizeOf(u32);
-    for (0..rectangle.height) |row| {
-        const source_offset = (y + row) * source_stride + x * @sizeOf(u32);
-        const destination_offset = (y + row) * destination_stride + x;
-        @memcpy(
-            std.mem.sliceAsBytes(destination[destination_offset..][0..rectangle.width]),
-            source[source_offset..][0..copy_bytes],
-        );
-        if (force_opaque) {
-            for (destination[destination_offset..][0..rectangle.width]) |*pixel| {
-                pixel.* |= 0xff000000;
-            }
-        }
-    }
-}
 
 const FrameCallback = struct {
     allocator: std.mem.Allocator,
@@ -2791,7 +2692,7 @@ test "single pixel snapshots use viewporter destination without changing color" 
         render_types.Size{ .width = 320, .height = 180 },
         snapshot.logical_size,
     );
-    try std.testing.expectEqualSlices(u32, &.{0x8040_2000}, snapshot.pixels);
+    try std.testing.expectEqualSlices(u32, &.{0x8040_2000}, snapshot.copied.?.pixels);
 }
 
 test "same-size snapshots recycle pixel storage" {
@@ -2806,7 +2707,7 @@ test "same-size snapshots recycle pixel storage" {
         .{ .id = 1, .version = 1 },
     );
     defer first.deinit();
-    const original_pointer = first.pixels.ptr;
+    const original_pointer = first.copied.?.pixels.ptr;
 
     var second = try BufferSnapshot.copySinglePixel(
         std.testing.allocator,
@@ -2820,23 +2721,21 @@ test "same-size snapshots recycle pixel storage" {
     );
     defer second.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), first.pixels.len);
-    try std.testing.expectEqual(original_pointer, second.pixels.ptr);
-    try std.testing.expectEqualSlices(u32, &.{0x5566_7788}, second.pixels);
+    try std.testing.expectEqual(@as(usize, 0), first.copied.?.pixels.len);
+    try std.testing.expectEqual(original_pointer, second.copied.?.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, &.{0x5566_7788}, second.copied.?.pixels);
 }
 
 test "buffer damage maps into logical surface coordinates" {
     const buffer: BufferSnapshot = .{
-        .allocator = std.testing.allocator,
         .buffer_size = .{ .width = 200, .height = 100 },
         .logical_size = .{ .width = 100, .height = 50 },
         .scale = 2,
         .transform = .normal,
         .source = null,
         .force_opaque = false,
-        .pixels = &.{},
+        .copied = null,
         .source_cache = .{ .id = 1, .version = 1 },
-        .source_damage = null,
     };
     var buffer_damage = Region.init();
     defer buffer_damage.deinit();
@@ -2901,36 +2800,6 @@ test "detached buffers remain in surface commit history" {
     surface.state().has_committed_buffer = true;
     try std.testing.expect(!surface.hasBufferAttached());
     try std.testing.expect(surface.hasBufferAttachedOrCommitted());
-}
-
-test "SHM snapshot copying updates only damaged rows" {
-    const source = [_]u32{
-        0x0011_2233, 0x0044_5566, 0x0077_8899,
-        0x00aa_bbcc, 0x00dd_eeff, 0x0001_0203,
-    };
-    const untouched = 0x1234_5678;
-    var destination = [_]u32{untouched} ** source.len;
-    var damage = Region.init();
-    defer damage.deinit();
-    try damage.add(1, 0, 1, 2);
-
-    copyShmPixels(
-        &destination,
-        @ptrCast(&source),
-        3 * @sizeOf(u32),
-        .{ .width = 3, .height = 2 },
-        true,
-        &damage,
-    );
-
-    try std.testing.expectEqualSlices(
-        u32,
-        &.{
-            untouched, 0xff44_5566, untouched,
-            untouched, 0xffdd_eeff, untouched,
-        },
-        &destination,
-    );
 }
 
 test "FIFO waits block only while a relevant barrier is active" {
