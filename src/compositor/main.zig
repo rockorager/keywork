@@ -544,6 +544,7 @@ test {
     _ = @import("capture_geometry.zig");
     _ = @import("damage_geometry.zig");
     _ = @import("FrameStatistics.zig");
+    _ = @import("SurfaceRegistry.zig");
     _ = @import("input_configuration.zig");
     _ = @import("output_configuration.zig");
     _ = @import("region.zig");
