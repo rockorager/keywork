@@ -249,7 +249,7 @@ A pool resource and every buffer hold independent pool references. Destroying
 the pool resource cannot invalidate existing buffers. Consumers may retain an
 explicit `Buffer.Pin` after the protocol resource is destroyed, and access
 mapped data only through an `Access` guard that pins pointer stability. Resize
-must preserve old mappings while pins or access guards exist. Truncated backing
+must preserve old mappings while access guards exist. Truncated backing
 storage must become a protocol error rather than an unhandled process fault.
 
 ### Allocation-independent fatal state

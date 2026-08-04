@@ -2,6 +2,8 @@
 //!
 //! The initial public boundary is a transport-independent server foundation.
 //! Product policy and event-loop ownership remain with consumers.
+//! Shared-memory access does not yet guard against SIGBUS if a mapped backing
+//! file is truncated after pool creation.
 
 pub const wire = @import("wire.zig");
 pub const protocol = @import("protocol.zig");
