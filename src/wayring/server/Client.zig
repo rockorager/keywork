@@ -261,6 +261,10 @@ pub fn dispatch(self: *Client) !void {
             self.record(if (err == error.OutOfMemory) .out_of_memory else .implementation, header.object_id, header.opcode, interface, "request handler failed");
             return;
         };
+        // A handler may reject a request containing new_ids before creating
+        // them. Preserve that first fatal and let the reservation defer undo
+        // every ID that was not materialized.
+        if (self.fatal_state.recorded) return;
         for (expectations) |expectation| if (expectation.state != .materialized) {
             self.record(.implementation, header.object_id, header.opcode, interface, "handler did not materialize new id");
             return;
@@ -658,6 +662,34 @@ test "Client typed and generic new ids materialize atomically and reject invalid
     try ReservationCase.run(.{ 2, 2 }, .protocol);
     try ReservationCase.run(.{ 1, 2 }, .protocol);
     try ReservationCase.run(.{ 2, 4 }, .protocol);
+}
+
+test "Client preserves handler protocol fatal and rolls back unmaterialized new id" {
+    const request: wire.MessageDescriptor = .{ .name = "reject", .arguments = &.{.{ .name = "id", .kind = .{ .new_id = &test_child_interface } }} };
+    const Context = struct {
+        client: *Client,
+
+        fn handle(self: *@This(), resource: *Resource, _: u16, _: *wire.DecodedMessage) !void {
+            self.client.postProtocolError(resource, 73, "chosen rejection");
+        }
+    };
+
+    var client: Client = .init(std.testing.allocator, .{});
+    defer client.deinit();
+    var target: Resource = .init(std.testing.allocator, 1, 1, &test_display_interface, &.{request}, .client, client.ownerHooks());
+    defer {
+        target.destroy();
+        target.deinit();
+    }
+    var context: Context = .{ .client = &client };
+    try target.setHandler(Context, &context, Context.handle, null);
+    try client.installClientInitial(1, &target);
+
+    try testDispatch(&client, &request, &.{.{ .new_id = .{ .typed = 2 } }});
+    const recorded_fatal = client.fatal().?;
+    try std.testing.expectEqual(Fatal.Kind.protocol, recorded_fatal.kind);
+    try std.testing.expectEqual(@as(?u32, 73), recorded_fatal.protocol_code);
+    try std.testing.expect(client.lookup(2) == null);
 }
 
 test "Client destructor orders delete_id retires once and permits reuse" {

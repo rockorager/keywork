@@ -17,6 +17,9 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const Client = @import("Client.zig");
+const Resource = @import("Resource.zig");
+const Server = @import("Server.zig");
 
 var handler_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
 var handler_installed = false;
@@ -86,6 +89,292 @@ pub const Format = enum(u32) {
     }
 };
 
+/// Generated core-protocol adapter. `Core` is supplied by the consumer so
+/// Wayring remains independent of generated modules which themselves import
+/// Wayring.
+pub fn Protocol(comptime Core: type) type {
+    return struct {
+        const Adapter = @This();
+        const Shm = Core.wl_shm;
+        const ShmPool = Core.wl_shm_pool;
+        const WlBuffer = Core.wl_buffer;
+
+        const ManagerResource = struct {
+            resource: Shm.Resource,
+            manager: *Adapter,
+            client: *Client,
+            next: ?*ManagerResource = null,
+        };
+        const PoolResource = struct {
+            resource: ShmPool.Resource,
+            manager: *Adapter,
+            client: *Client,
+            storage: *Pool,
+            next: ?*PoolResource = null,
+        };
+        const BufferResource = struct {
+            resource: WlBuffer.Resource,
+            manager: *Adapter,
+            client: *Client,
+            storage: *Buffer,
+            next: ?*BufferResource = null,
+        };
+
+        allocator: std.mem.Allocator,
+        host: ?*Server = null,
+        global: ?*const Server.Global = null,
+        managers: ?*ManagerResource = null,
+        pools: ?*PoolResource = null,
+        buffers: ?*BufferResource = null,
+
+        pub fn init(allocator: std.mem.Allocator) Adapter {
+            return .{ .allocator = allocator };
+        }
+
+        /// Publishes wl_shm, clamping the requested maximum to generated API.
+        pub fn publish(self: *Adapter, host: *Server, max_version: u32) !*const Server.Global {
+            if (max_version == 0) return error.InvalidGlobalVersion;
+            if (self.global != null) return error.AlreadyPublished;
+            const global = try host.addGlobal(Shm, @min(max_version, Shm.interface.version), Adapter, self, bind);
+            self.host = host;
+            self.global = global;
+            return global;
+        }
+
+        /// Removes the borrowed global context before this adapter is moved or
+        /// destroyed. Existing bound resources remain valid.
+        pub fn unpublish(self: *Adapter) !void {
+            const global = self.global orelse return error.NotPublished;
+            const host = self.host.?;
+            host.removeGlobal(global) catch |err| switch (err) {
+                error.AlreadyRemoved => {},
+                error.ForeignGlobal => return err,
+            };
+            self.global = null;
+            self.host = null;
+        }
+
+        /// Destroys any remaining protocol resources and reclaims wrappers.
+        /// Call after application clients have stopped dispatching.
+        pub fn deinit(self: *Adapter) void {
+            if (self.global != null) self.unpublish() catch unreachable;
+            var buffer = self.buffers;
+            while (buffer) |item| {
+                const next = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+                buffer = next;
+            }
+            var pool = self.pools;
+            while (pool) |item| {
+                const next = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+                pool = next;
+            }
+            var manager = self.managers;
+            while (manager) |item| {
+                const next = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+                manager = next;
+            }
+            self.* = undefined;
+        }
+
+        /// Retires only one client's resources so a shared adapter can outlive
+        /// ordinary disconnects. Call before destroying that client's core.
+        pub fn destroyClientResources(self: *Adapter, connection: *Client) void {
+            var buffer_link = &self.buffers;
+            while (buffer_link.*) |item| {
+                if (item.client != connection) {
+                    buffer_link = &item.next;
+                    continue;
+                }
+                buffer_link.* = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+            }
+            var pool_link = &self.pools;
+            while (pool_link.*) |item| {
+                if (item.client != connection) {
+                    pool_link = &item.next;
+                    continue;
+                }
+                pool_link.* = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+            }
+            var manager_link = &self.managers;
+            while (manager_link.*) |item| {
+                if (item.client != connection) {
+                    manager_link = &item.next;
+                    continue;
+                }
+                manager_link.* = item.next;
+                item.resource.destroy();
+                item.resource.deinit();
+                self.allocator.destroy(item);
+            }
+        }
+
+        /// Pins a live wl_buffer created by this adapter. A consumer retaining
+        /// `resource` for later release must install a Resource destroy observer
+        /// and invalidate that borrowed pointer when notified.
+        pub fn pin(self: *Adapter, resource: *Resource) ?Buffer.Pin {
+            if (resource.state() != .live) return null;
+            var current = self.buffers;
+            while (current) |item| : (current = item.next) {
+                if (&item.resource.runtime == resource and item.storage.resource_live) return item.storage.pin();
+            }
+            return null;
+        }
+
+        /// Emits wl_buffer.release without imposing release policy.
+        pub fn sendRelease(self: *Adapter, resource: *Resource) !void {
+            var current = self.buffers;
+            while (current) |item| : (current = item.next) {
+                if (&item.resource.runtime == resource and resource.state() == .live)
+                    return WlBuffer.@"send:release"(&item.resource);
+            }
+            return error.NotShmBuffer;
+        }
+
+        fn bind(connection: *Client, id: u32, version: u32, self: *Adapter) !void {
+            const wrapper = try self.allocator.create(ManagerResource);
+            errdefer self.allocator.destroy(wrapper);
+            wrapper.* = .{ .resource = .init(self.allocator, id, version, .client, connection.ownerHooks()), .manager = self, .client = connection, .next = self.managers };
+            errdefer {
+                wrapper.resource.destroy();
+                wrapper.resource.deinit();
+            }
+            try wrapper.resource.setHandler(ManagerResource, wrapper, handleShm, managerDestroyed);
+            try connection.materialize(&wrapper.resource.runtime);
+            try Shm.@"send:format"(&wrapper.resource, @intFromEnum(Format.argb8888));
+            try Shm.@"send:format"(&wrapper.resource, @intFromEnum(Format.xrgb8888));
+            self.managers = wrapper;
+        }
+
+        fn handleShm(resource: *Shm.Resource, request: Shm.Request, wrapper: *ManagerResource) !void {
+            switch (request) {
+                .create_pool => |args| try wrapper.manager.createPool(resource, wrapper.client, args.id, args.fd, args.size),
+                .release => resource.destroy(),
+            }
+        }
+
+        fn createPool(self: *Adapter, parent: *Shm.Resource, connection: *Client, id: u32, fd: std.posix.fd_t, size: i32) !void {
+            var adopted = false;
+            defer if (!adopted) {
+                _ = std.c.close(fd);
+            };
+            const storage = Pool.create(self.allocator, fd, size) catch |err| {
+                const code = if (err == error.InvalidPoolSize) Shm.@"error".invalid_stride else Shm.@"error".invalid_fd;
+                classify(parent, err, code, "creating shm pool");
+                return;
+            };
+            adopted = true;
+            const wrapper = self.allocator.create(PoolResource) catch {
+                storage.dropResource();
+                connection.postOutOfMemory(&parent.runtime, "allocating shm pool resource");
+                return;
+            };
+            wrapper.* = .{ .resource = .init(self.allocator, id, @min(parent.version(), ShmPool.interface.version), .client, connection.ownerHooks()), .manager = self, .client = connection, .storage = storage, .next = self.pools };
+            wrapper.resource.setHandler(PoolResource, wrapper, handlePool, poolDestroyed) catch |err| {
+                wrapper.resource.destroy();
+                wrapper.resource.deinit();
+                storage.dropResource();
+                self.allocator.destroy(wrapper);
+                classify(parent, err, Shm.@"error".invalid_fd, "installing shm pool handler");
+                return;
+            };
+            connection.materialize(&wrapper.resource.runtime) catch |err| {
+                wrapper.resource.destroy();
+                wrapper.resource.deinit();
+                self.allocator.destroy(wrapper);
+                classify(parent, err, Shm.@"error".invalid_fd, "materializing shm pool");
+                return;
+            };
+            self.pools = wrapper;
+        }
+
+        fn handlePool(resource: *ShmPool.Resource, request: ShmPool.Request, wrapper: *PoolResource) !void {
+            switch (request) {
+                .destroy => resource.destroy(),
+                .resize => |args| wrapper.storage.resize(args.size) catch |err|
+                    classifyPool(resource, err, "resizing shm pool"),
+                .create_buffer => |args| try wrapper.manager.createBuffer(resource, wrapper.client, wrapper.storage, args),
+            }
+        }
+
+        fn createBuffer(self: *Adapter, parent: *ShmPool.Resource, connection: *Client, storage_pool: *Pool, args: anytype) !void {
+            const storage = storage_pool.createBuffer(args.offset, args.width, args.height, args.stride, args.format) catch |err| {
+                const code = if (err == error.UnsupportedFormat) ShmPool.@"error".invalid_format else ShmPool.@"error".invalid_stride;
+                classifyPoolCode(parent, err, code, "creating shm buffer");
+                return;
+            };
+            const wrapper = self.allocator.create(BufferResource) catch {
+                storage.dropResource();
+                connection.postOutOfMemory(&parent.runtime, "allocating shm buffer resource");
+                return;
+            };
+            wrapper.* = .{ .resource = .init(self.allocator, args.id, @min(parent.version(), WlBuffer.interface.version), .client, connection.ownerHooks()), .manager = self, .client = connection, .storage = storage, .next = self.buffers };
+            wrapper.resource.setHandler(BufferResource, wrapper, handleBuffer, bufferDestroyed) catch |err| {
+                wrapper.resource.destroy();
+                wrapper.resource.deinit();
+                storage.dropResource();
+                self.allocator.destroy(wrapper);
+                classifyPoolCode(parent, err, ShmPool.@"error".invalid_stride, "installing shm buffer handler");
+                return;
+            };
+            connection.materialize(&wrapper.resource.runtime) catch |err| {
+                wrapper.resource.destroy();
+                wrapper.resource.deinit();
+                self.allocator.destroy(wrapper);
+                classifyPoolCode(parent, err, ShmPool.@"error".invalid_stride, "materializing shm buffer");
+                return;
+            };
+            self.buffers = wrapper;
+        }
+
+        fn handleBuffer(resource: *WlBuffer.Resource, request: WlBuffer.Request, _: *BufferResource) !void {
+            _ = request.destroy;
+            resource.destroy();
+        }
+        fn managerDestroyed(_: *Shm.Resource, _: *ManagerResource) void {}
+        fn poolDestroyed(_: *ShmPool.Resource, wrapper: *PoolResource) void {
+            wrapper.storage.dropResource();
+        }
+        fn bufferDestroyed(_: *WlBuffer.Resource, wrapper: *BufferResource) void {
+            wrapper.storage.dropResource();
+        }
+
+        fn classify(resource: *Shm.Resource, err: anyerror, protocol_code: i64, detail: []const u8) void {
+            const wrapper: *ManagerResource = @fieldParentPtr("resource", resource);
+            const connection = wrapper.client;
+            if (err == error.OutOfMemory) connection.postOutOfMemory(&resource.runtime, detail) else if (isStorageInvalid(err)) connection.postProtocolError(&resource.runtime, @intCast(protocol_code), detail) else connection.postImplementationError(&resource.runtime, detail);
+        }
+        fn classifyPool(resource: *ShmPool.Resource, err: anyerror, detail: []const u8) void {
+            classifyPoolCode(resource, err, Shm.@"error".invalid_fd, detail);
+        }
+        fn classifyPoolCode(resource: *ShmPool.Resource, err: anyerror, code: i64, detail: []const u8) void {
+            const wrapper: *PoolResource = @fieldParentPtr("resource", resource);
+            const connection = wrapper.client;
+            if (err == error.OutOfMemory) connection.postOutOfMemory(&resource.runtime, detail) else if (isStorageInvalid(err)) connection.postProtocolError(&resource.runtime, @intCast(code), detail) else connection.postImplementationError(&resource.runtime, detail);
+        }
+        fn isStorageInvalid(err: anyerror) bool {
+            return switch (err) {
+                error.InvalidPoolSize, error.BackingFileTooSmall, error.StatFailed, error.MappingFailed, error.NotGrowing, error.UnsupportedFormat, error.InvalidGeometry, error.OutOfBounds => true,
+                else => false,
+            };
+        }
+    };
+}
+
 pub const Geometry = struct {
     offset: usize,
     width: usize,
@@ -113,7 +402,7 @@ pub const Pool = struct {
         if (size <= 0) return error.InvalidPoolSize;
         const map_size: usize = std.math.cast(usize, size) orelse return error.InvalidPoolSize;
         try requireFileSize(fd, map_size);
-        const mapping = try std.posix.mmap(null, map_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        const mapping = try mapFile(fd, map_size);
         errdefer std.posix.munmap(mapping);
         const self = try allocator.create(Pool);
         self.* = .{ .allocator = allocator, .fd = fd, .mapping = mapping, .logical_size = map_size };
@@ -162,7 +451,7 @@ pub const Pool = struct {
     }
 
     fn map(self: *Pool, size: usize) ![]align(std.heap.page_size_min) u8 {
-        return std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, self.fd, 0);
+        return mapFile(self.fd, size);
     }
 
     fn installMapping(self: *Pool, replacement: []align(std.heap.page_size_min) u8) void {
@@ -330,6 +619,11 @@ fn requireFileSize(fd: std.posix.fd_t, required: usize) !void {
     const result = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stat);
     if (std.os.linux.errno(result) != .SUCCESS) return error.StatFailed;
     if (stat.size < required) return error.BackingFileTooSmall;
+}
+
+fn mapFile(fd: std.posix.fd_t, size: usize) error{MappingFailed}![]align(std.heap.page_size_min) u8 {
+    return std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch
+        return error.MappingFailed;
 }
 
 fn testFd(size: usize) !std.posix.fd_t {

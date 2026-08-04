@@ -163,6 +163,16 @@ pub fn build(b: *std.Build) void {
     const run_checkpoint3_tests = b.addRunArtifact(checkpoint3_tests);
     test_wayring_step.dependOn(&run_checkpoint3_tests.step);
     test_step.dependOn(&run_checkpoint3_tests.step);
+    const shm_protocol_test_module = b.createModule(.{
+        .root_source_file = b.path("src/wayring/shm_protocol_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shm_protocol_test_module.addImport("core_protocol", core_protocol);
+    shm_protocol_test_module.addImport("wayring", wayring);
+    const run_shm_protocol_tests = b.addRunArtifact(b.addTest(.{ .root_module = shm_protocol_test_module }));
+    test_wayring_step.dependOn(&run_shm_protocol_tests.step);
+    test_step.dependOn(&run_shm_protocol_tests.step);
     const checkpoint4_test_module = b.createModule(.{
         .root_source_file = b.path("src/wayring/checkpoint4_test.zig"),
         .target = target,
