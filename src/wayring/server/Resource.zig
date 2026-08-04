@@ -46,7 +46,7 @@ const ObserverNode = struct {
 const ErasedHandler = struct {
     context: *anyopaque,
     dispatch: *const fn (*anyopaque, *Resource, u16, *wire.DecodedMessage) anyerror!void,
-    destroy_context: ?*const fn (*anyopaque) void,
+    destroy_context: ?*const fn (*anyopaque, *Resource) void,
 };
 
 allocator: std.mem.Allocator,
@@ -107,7 +107,7 @@ pub fn setHandler(
     comptime Context: type,
     context: *Context,
     comptime handler: *const fn (*Context, *Resource, u16, *wire.DecodedMessage) anyerror!void,
-    comptime destructor: ?*const fn (*Context) void,
+    comptime destructor: ?*const fn (*Resource, *Context) void,
 ) !void {
     if (self.resource_state != .live) return error.ResourceNotLive;
     if (self.handler != null) return error.HandlerAlreadySet;
@@ -119,8 +119,8 @@ pub fn setHandler(
             }
         }.call,
         .destroy_context = if (destructor) |destroy_typed| struct {
-            fn call(erased: *anyopaque) void {
-                destroy_typed(@ptrCast(@alignCast(erased)));
+            fn call(erased: *anyopaque, resource: *Resource) void {
+                destroy_typed(resource, @ptrCast(@alignCast(erased)));
             }
         }.call else null,
     };
@@ -132,7 +132,7 @@ pub fn setHandler(
 pub fn clearHandler(self: *Resource) void {
     const handler = self.handler orelse return;
     self.handler = null;
-    if (handler.destroy_context) |destroy_context| destroy_context(handler.context);
+    if (handler.destroy_context) |destroy_context| destroy_context(handler.context, self);
 }
 
 /// Dispatch errors identify lifecycle misuse; handler errors pass through.
@@ -296,7 +296,7 @@ test "typed borrowed handler can destroy itself and context destructor runs once
             resource.destroy();
             trace.metadata_after_destroy = resource.id() == 71 and resource.interface() == &test_interface and resource.state() == .dead;
         }
-        fn deinit(self: *@This()) void {
+        fn deinit(_: *Resource, self: *@This()) void {
             self.trace.destroyed += 1;
         }
     };
@@ -374,7 +374,7 @@ test "destroy orders observers destructor and retirement and retires once" {
             self.order.append(std.testing.allocator, 'o') catch unreachable;
         }
         fn handle(_: *@This(), _: *Resource, _: u16, _: *wire.DecodedMessage) !void {}
-        fn deinit(self: *@This()) void {
+        fn deinit(_: *Resource, self: *@This()) void {
             self.order.append(std.testing.allocator, 'd') catch unreachable;
         }
     };

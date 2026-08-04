@@ -26,7 +26,7 @@ pub const Error = error{
 /// is deinitialized. Request file descriptors are transferred to the caller.
 pub fn generate(allocator: std.mem.Allocator, protocols: []const *const protocol.Protocol, writer: *std.Io.Writer) Error!void {
     try validate(allocator, protocols);
-    try writer.writeAll("const wayring = @import(\"wayring\");\nconst wire = wayring.wire;\n\n");
+    try writer.writeAll("const wayring = @import(\"wayring\");\nconst wire = wayring.wire;\nconst server = wayring.server;\n\n");
     for (protocols) |model| {
         for (model.interfaces) |*interface| try emitInterface(writer, interface);
     }
@@ -37,7 +37,7 @@ pub fn validate(allocator: std.mem.Allocator, protocols: []const *const protocol
     defer interfaces.deinit(allocator);
     for (protocols) |model| {
         for (model.interfaces) |*interface| {
-            if (std.mem.eql(u8, interface.name, "wayring") or std.mem.eql(u8, interface.name, "wire")) return error.DeclarationCollision;
+            if (std.mem.eql(u8, interface.name, "wayring") or std.mem.eql(u8, interface.name, "wire") or std.mem.eql(u8, interface.name, "server")) return error.DeclarationCollision;
             if (try interfaces.fetchPut(allocator, interface.name, interface) != null) return error.DuplicateInterface;
         }
     }
@@ -60,7 +60,7 @@ pub fn validate(allocator: std.mem.Allocator, protocols: []const *const protocol
             const declaration_allocator = declaration_arena.allocator();
             var declarations: std.StringHashMapUnmanaged(void) = .empty;
             defer declarations.deinit(allocator);
-            for ([_][]const u8{ "interface", "Request", "decodeRequest", "request_messages", "event_messages" }) |name| try reserveDeclaration(allocator, &declarations, name);
+            for ([_][]const u8{ "interface", "Resource", "Request", "decodeRequest", "request_messages", "event_messages" }) |name| try reserveDeclaration(allocator, &declarations, name);
             for (interface.requests, 0..) |message, i| {
                 const descriptor = try std.fmt.allocPrint(declaration_allocator, "request_{d}_arguments", .{i});
                 try reserveDeclaration(allocator, &declarations, descriptor);
@@ -138,6 +138,7 @@ fn emitInterface(w: *std.Io.Writer, interface: *const protocol.Interface) !void 
     try ident(w, interface.name);
     try w.writeAll(" = struct {\n");
     try w.print("    pub const interface: wire.Interface = .{{ .name = \"{f}\", .version = {d} }};\n", .{ std.zig.fmtString(interface.name), interface.version });
+    try w.writeAll("    pub const Resource = server.TypedResource(@This());\n");
     for (interface.enums) |enum_model| {
         try w.writeAll("    pub const ");
         try ident(w, enum_model.name);
@@ -288,14 +289,11 @@ fn emitSender(w: *std.Io.Writer, message: protocol.Message, opcode: usize) !void
     try w.writeAll("    pub fn @\"send:");
     try w.print("{f}", .{std.zig.fmtString(message.name)});
     try w.writeAll("\"");
-    const output_suffix = internalNameSuffix(message, "__wayring_output");
-    const object_suffix = internalNameSuffixWithReserved(message, "__wayring_object_id", "__wayring_output", output_suffix);
+    const resource_suffix = internalNameSuffix(message, "__wayring_resource");
     const values_suffix = internalNameSuffix(message, "__wayring_values");
     try w.writeAll("(");
-    try writeInternalName(w, "__wayring_output", output_suffix);
-    try w.writeAll(": *wire.Output, ");
-    try writeInternalName(w, "__wayring_object_id", object_suffix);
-    try w.writeAll(": u32");
+    try writeInternalName(w, "__wayring_resource", resource_suffix);
+    try w.writeAll(": *Resource");
     for (message.arguments) |arg| {
         try w.writeAll(", ");
         try ident(w, arg.name);
@@ -319,10 +317,8 @@ fn emitSender(w: *std.Io.Writer, message: protocol.Message, opcode: usize) !void
         try w.writeAll(" },\n");
     }
     try w.writeAll("        };\n        try ");
-    try writeInternalName(w, "__wayring_output", output_suffix);
-    try w.writeAll(".enqueue(");
-    try writeInternalName(w, "__wayring_object_id", object_suffix);
-    try w.print(", {d}, &event_messages[{d}], &", .{ opcode, opcode });
+    try writeInternalName(w, "__wayring_resource", resource_suffix);
+    try w.print(".runtime.emit({d}, &event_messages[{d}], &", .{ opcode, opcode });
     try writeInternalName(w, "__wayring_values", values_suffix);
     try w.writeAll(");\n    }\n");
 }
