@@ -66,6 +66,10 @@ pub fn build(b: *std.Build) void {
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "unstable/primary-selection/primary-selection-unstable-v1.xml"));
     generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "unstable/text-input/text-input-unstable-v3.xml"));
+    generate_wayring_protocols.addArg("-i");
+    generate_wayring_protocols.addFileArg(b.path("protocols/wayland/upstream/input-method-unstable-v2.xml"));
+    generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-data-control/ext-data-control-v1.xml"));
     generate_wayring_protocols.addArg("-i");
     generate_wayring_protocols.addFileArg(wayland.protocols.path(b, "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"));

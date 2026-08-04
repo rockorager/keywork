@@ -35,6 +35,8 @@ const TearingControlGlobal = @import("TearingControlGlobal.zig");
 const FifoGlobal = @import("FifoGlobal.zig");
 const CommitTimingGlobal = @import("CommitTimingGlobal.zig");
 const SeatGlobal = @import("SeatGlobal.zig");
+const TextInputGlobal = @import("TextInputGlobal.zig");
+const InputMethodGlobal = @import("InputMethodGlobal.zig");
 const TransientSeatGlobal = @import("TransientSeatGlobal.zig");
 const VirtualKeyboardGlobal = @import("VirtualKeyboardGlobal.zig");
 const VirtualPointerGlobal = @import("VirtualPointerGlobal.zig");
@@ -115,6 +117,8 @@ tearing_control_global: TearingControlGlobal,
 fifo_global: FifoGlobal,
 commit_timing_global: CommitTimingGlobal,
 seat_global: SeatGlobal,
+text_input_global: TextInputGlobal,
+input_method_global: InputMethodGlobal,
 transient_seat_global: TransientSeatGlobal,
 virtual_keyboard_global: VirtualKeyboardGlobal,
 virtual_pointer_global: VirtualPointerGlobal,
@@ -671,6 +675,16 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Nati
         self.pointer_cursor.handler(),
     );
     errdefer self.seat_global.deinit();
+    try self.text_input_global.init(allocator, &self.server, &self.seat_global);
+    errdefer self.text_input_global.deinit();
+    try self.input_method_global.init(
+        allocator,
+        &self.server,
+        &self.seat_global,
+        &self.text_input_global,
+        &self.security_context_global,
+    );
+    errdefer self.input_method_global.deinit();
     try self.transient_seat_global.init(
         allocator,
         &self.server,
@@ -1132,6 +1146,8 @@ pub fn destroy(self: *NativeServer) void {
     self.virtual_pointer_global.deinit();
     self.virtual_keyboard_global.deinit();
     self.transient_seat_global.deinit();
+    self.input_method_global.deinit();
+    self.text_input_global.deinit();
     self.seat_global.deinit();
     self.pointer_cursor.deinit();
     self.commit_timing_global.deinit();
