@@ -9865,20 +9865,17 @@ fn renderSurfaceTreeContents(
     clip: ?render.Rect,
     capture_id: ?u32,
 ) Renderer.Error!void {
-    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
+    if (self.surface_registry.renderState(surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
         .parent => {
-            const buffer = Surface.currentBuffer(
-                self.compositor.surfaceStore(),
-                surface_id,
-            ) orelse continue;
+            const render_state = self.surface_registry.renderState(surface_id) orelse continue;
             const surface_rect: render.Rect = .{
                 .x = x,
                 .y = y,
-                .width = buffer.logical_size.width,
-                .height = buffer.logical_size.height,
+                .width = render_state.logical_size.width,
+                .height = render_state.logical_size.height,
             };
             const visible_rect = surface_rect.intersection(frame.visible_rect) orelse continue;
             if (clip) |clip_rect| {
@@ -9894,47 +9891,19 @@ fn renderSurfaceTreeContents(
             }
             try self.renderSurfaceBackgroundEffect(
                 frame,
-                surface_id,
+                render_state,
                 x,
                 y,
-                buffer.logical_size,
                 rounded_clip,
                 clip,
                 capture_id,
             );
-            const pixel_buffer = buffer.pixelBuffer();
-            const alpha_multiplier = Surface.currentAlphaMultiplier(
-                self.compositor.surfaceStore(),
-                surface_id,
-            ) orelse std.math.maxInt(u32);
             const image_command = [_]render.Command{
-                .{ .image = .{
-                    .x = x,
-                    .y = y,
-                    .size = buffer.logical_size,
-                    .buffer = pixel_buffer,
-                    .sample_tag = surfaceSampleTag(surface_id),
-                    .source = buffer.source,
-                    .transform = renderBufferTransform(buffer.transform),
+                .{ .image = imageFromRenderState(surface_id, render_state, .{
+                    .position = .{ .x = x, .y = y },
                     .rounded_clip = rounded_clip,
                     .clip = clip,
-                    .is_opaque = surfaceFullyOpaque(
-                        self.compositor.surfaceStore(),
-                        surface_id,
-                        buffer,
-                    ),
-                    .opaque_region = surfaceOpaqueRegion(
-                        self.compositor.surfaceStore(),
-                        surface_id,
-                        buffer,
-                        x,
-                        y,
-                        rounded_clip,
-                        clip,
-                        alpha_multiplier,
-                    ),
-                    .alpha_multiplier = alpha_multiplier,
-                } },
+                }) },
             };
             try self.renderCommands(frame, &image_command);
         },
@@ -9959,18 +9928,17 @@ fn surfaceTreeBlurBounds(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
 ) ?render.Rect {
-    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return null;
+    if (self.surface_registry.renderState(surface_id) == null) return null;
     var result: ?render.Rect = null;
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
         .parent => {
-            const surfaces = self.compositor.surfaceStore();
-            const buffer = Surface.currentBuffer(surfaces, surface_id) orelse continue;
-            if (surfaceFullyOpaque(surfaces, surface_id, buffer)) continue;
-            const region = Surface.currentBlurRegion(surfaces, surface_id) orelse continue;
+            const render_state = self.surface_registry.renderState(surface_id) orelse continue;
+            if (renderStateFullyOpaque(render_state)) continue;
+            const region = render_state.blur_region orelse continue;
             var rectangles = region.rectangleIterator();
             while (rectangles.next()) |rectangle| {
-                var effect = (surfaceEffectRect(rectangle, buffer.logical_size) orelse continue).translated(x, y);
+                var effect = (surfaceEffectRect(rectangle, render_state.logical_size) orelse continue).translated(x, y);
                 effect = effect.intersection(frame.visible_rect) orelse continue;
                 if (rounded_clip) |rounded| effect = effect.intersection(rounded.rect) orelse continue;
                 if (clip) |clip_rect| effect = effect.intersection(clip_rect) orelse continue;
@@ -9994,22 +9962,19 @@ fn surfaceTreeBlurBounds(
 fn renderSurfaceBackgroundEffect(
     self: *Self,
     frame: *const OutputFrame,
-    surface_id: Surface.Id,
+    render_state: SurfaceRegistry.RenderState,
     x: i32,
     y: i32,
-    size: render.Size,
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
     capture_id: ?u32,
 ) Renderer.Error!void {
     const blur = Scene.background_blur;
-    const surfaces = self.compositor.surfaceStore();
-    const buffer = Surface.currentBuffer(surfaces, surface_id) orelse return;
-    if (surfaceFullyOpaque(surfaces, surface_id, buffer)) return;
-    const region = Surface.currentBlurRegion(surfaces, surface_id) orelse return;
+    if (renderStateFullyOpaque(render_state)) return;
+    const region = render_state.blur_region orelse return;
     var rectangles = region.rectangleIterator();
     while (rectangles.next()) |rectangle| {
-        var effect_rect = surfaceEffectRect(rectangle, size) orelse continue;
+        var effect_rect = surfaceEffectRect(rectangle, render_state.logical_size) orelse continue;
         effect_rect = effect_rect.translated(x, y);
         if (effect_rect.intersection(frame.visible_rect) == null) continue;
         if (clip) |clip_rect| {
@@ -10034,6 +9999,343 @@ fn renderSurfaceBackgroundEffect(
     }
 }
 
+const ImagePlacement = struct {
+    position: render.Position,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+};
+
+fn imageFromRenderState(
+    surface_id: SurfaceRegistry.Id,
+    render_state: SurfaceRegistry.RenderState,
+    placement: ImagePlacement,
+) render.Image {
+    return .{
+        .x = placement.position.x,
+        .y = placement.position.y,
+        .size = render_state.logical_size,
+        .buffer = render_state.buffer,
+        .sample_tag = surfaceSampleTag(surface_id),
+        .source = render_state.source,
+        .transform = render_state.transform,
+        .rounded_clip = placement.rounded_clip,
+        .clip = placement.clip,
+        .is_opaque = renderStateFullyOpaque(render_state),
+        .opaque_region = renderStateOpaqueRegion(render_state, placement),
+        .alpha_multiplier = render_state.alpha_multiplier,
+    };
+}
+
+fn renderStateFullyOpaque(render_state: SurfaceRegistry.RenderState) bool {
+    if (render_state.alpha_multiplier != std.math.maxInt(u32)) return false;
+    if (render_state.force_opaque) return true;
+    const region = render_state.opaque_region orelse return false;
+    return region.coversRectangle(
+        0,
+        0,
+        render_state.logical_size.width,
+        render_state.logical_size.height,
+    );
+}
+
+fn renderStateOpaqueRegion(
+    render_state: SurfaceRegistry.RenderState,
+    placement: ImagePlacement,
+) render.OpaqueRegion {
+    var result: render.OpaqueRegion = .{};
+    if (render_state.alpha_multiplier != std.math.maxInt(u32) or
+        placement.rounded_clip != null or render_state.force_opaque)
+    {
+        return result;
+    }
+    const region = render_state.opaque_region orelse return result;
+    if (region.coversRectangle(
+        0,
+        0,
+        render_state.logical_size.width,
+        render_state.logical_size.height,
+    )) return result;
+    var rectangles = region.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        var opaque_rect = (surfaceEffectRect(
+            rectangle,
+            render_state.logical_size,
+        ) orelse continue).translated(placement.position.x, placement.position.y);
+        if (placement.clip) |clip_rect| {
+            opaque_rect = opaque_rect.intersection(clip_rect) orelse continue;
+        }
+        if (!result.append(opaque_rect)) break;
+    }
+    return result;
+}
+
+fn expectImagesEquivalent(expected: render.Image, actual: render.Image) !void {
+    try std.testing.expectEqual(expected.x, actual.x);
+    try std.testing.expectEqual(expected.y, actual.y);
+    try std.testing.expectEqual(expected.size, actual.size);
+    try std.testing.expect(std.meta.eql(expected.buffer, actual.buffer));
+    try std.testing.expectEqual(expected.sample_tag, actual.sample_tag);
+    try std.testing.expectEqual(expected.source, actual.source);
+    try std.testing.expectEqual(expected.transform, actual.transform);
+    try std.testing.expectEqual(expected.rounded_clip, actual.rounded_clip);
+    try std.testing.expectEqual(expected.clip, actual.clip);
+    try std.testing.expectEqual(expected.is_opaque, actual.is_opaque);
+    try std.testing.expectEqualSlices(
+        render.Rect,
+        expected.opaque_region.slice(),
+        actual.opaque_region.slice(),
+    );
+    try std.testing.expectEqual(expected.alpha_multiplier, actual.alpha_multiplier);
+}
+
+test "reproducible scene: render-state surface images preserve mature commands and scanout" {
+    const DmabufCallbacks = struct {
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn beginCpuRead(_: *anyopaque) bool {
+            return true;
+        }
+        fn endCpuRead(_: *anyopaque) bool {
+            return true;
+        }
+        fn exportReadFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
+            return null;
+        }
+    };
+
+    const surface_id: SurfaceRegistry.Id = .{
+        .index = 0x1234_5678,
+        .generation = 0x9abc_def0,
+    };
+    const sample_tag: u64 = 0x9abc_def0_1234_5678;
+    var copied_xrgb_pixels = [_]u32{
+        0xff10_2030,
+        0xff40_5060,
+        0xff70_8090,
+        0xffa0_b0c0,
+    };
+    const copied_xrgb_damage = [_]render.Rect{.{
+        .x = 1,
+        .y = 0,
+        .width = 1,
+        .height = 2,
+    }};
+    const copied_xrgb: render.PixelBuffer = .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = &copied_xrgb_pixels,
+        .source_cache = .{ .id = 41, .version = 7 },
+        .source_damage = &copied_xrgb_damage,
+    };
+    const rounded_placement: ImagePlacement = .{
+        .position = .{ .x = -4, .y = 9 },
+        .rounded_clip = .{
+            .rect = .{ .x = -4, .y = 9, .width = 2, .height = 2 },
+            .radius = 1,
+        },
+        .clip = .{ .x = -3, .y = 9, .width = 1, .height = 2 },
+    };
+    try expectImagesEquivalent(.{
+        .x = -4,
+        .y = 9,
+        .size = .{ .width = 2, .height = 2 },
+        .buffer = copied_xrgb,
+        .sample_tag = sample_tag,
+        .rounded_clip = rounded_placement.rounded_clip,
+        .clip = rounded_placement.clip,
+        .is_opaque = true,
+    }, imageFromRenderState(surface_id, .{
+        .buffer = copied_xrgb,
+        .logical_size = .{ .width = 2, .height = 2 },
+        .force_opaque = true,
+    }, rounded_placement));
+
+    var partial_opaque = Region.init();
+    defer partial_opaque.deinit();
+    try partial_opaque.add(-2, 1, 4, 4);
+    var copied_argb_pixels = [_]u32{0x8010_2030} ** 48;
+    const copied_argb_damage = [_]render.Rect{
+        .{ .x = 0, .y = 1, .width = 3, .height = 2 },
+        .{ .x = 6, .y = 4, .width = 2, .height = 2 },
+    };
+    const p3: render.ColorDescription = .{
+        .primaries = render.display_p3_chromaticities,
+        .named_primaries = .display_p3,
+        .transfer_function = .srgb,
+        .max_luminance = 120,
+        .reference_luminance = 100,
+    };
+    const copied_argb: render.PixelBuffer = .{
+        .size = .{ .width = 8, .height = 6 },
+        .stride_pixels = 8,
+        .pixels = &copied_argb_pixels,
+        .color_description = p3,
+        .source_cache = .{ .id = 52, .version = 9 },
+        .source_damage = &copied_argb_damage,
+    };
+    const crop: render.SourceRect = .{
+        .x = 0.25,
+        .y = 0.5,
+        .width = 5.5,
+        .height = 3.5,
+    };
+    const clipped_placement: ImagePlacement = .{
+        .position = .{ .x = 10, .y = 20 },
+        .rounded_clip = null,
+        .clip = .{ .x = 11, .y = 20, .width = 3, .height = 3 },
+    };
+    var expected_partial_opaque: render.OpaqueRegion = .{};
+    try std.testing.expect(expected_partial_opaque.append(.{
+        .x = 11,
+        .y = 21,
+        .width = 1,
+        .height = 2,
+    }));
+    const transformed_state: SurfaceRegistry.RenderState = .{
+        .buffer = copied_argb,
+        .logical_size = .{ .width = 4, .height = 3 },
+        .source = crop,
+        .transform = .flipped_90,
+        .opaque_region = &partial_opaque,
+    };
+    const transformed_expected: render.Image = .{
+        .x = 10,
+        .y = 20,
+        .size = .{ .width = 4, .height = 3 },
+        .buffer = copied_argb,
+        .sample_tag = sample_tag,
+        .source = crop,
+        .transform = .flipped_90,
+        .clip = clipped_placement.clip,
+        .opaque_region = expected_partial_opaque,
+    };
+    try expectImagesEquivalent(
+        transformed_expected,
+        imageFromRenderState(surface_id, transformed_state, clipped_placement),
+    );
+
+    var partial_alpha_state = transformed_state;
+    partial_alpha_state.alpha_multiplier = 0x8000_0000;
+    var partial_alpha_expected = transformed_expected;
+    partial_alpha_expected.opaque_region = .{};
+    partial_alpha_expected.alpha_multiplier = 0x8000_0000;
+    try expectImagesEquivalent(
+        partial_alpha_expected,
+        imageFromRenderState(surface_id, partial_alpha_state, clipped_placement),
+    );
+
+    var full_opaque = Region.init();
+    defer full_opaque.deinit();
+    try full_opaque.add(0, 0, 4, 3);
+    var full_opaque_state = transformed_state;
+    full_opaque_state.opaque_region = &full_opaque;
+    var full_opaque_expected = transformed_expected;
+    full_opaque_expected.is_opaque = true;
+    full_opaque_expected.opaque_region = .{};
+    try expectImagesEquivalent(
+        full_opaque_expected,
+        imageFromRenderState(surface_id, full_opaque_state, clipped_placement),
+    );
+
+    const dmabuf_size: render.Size = .{ .width = 4, .height = 3 };
+    var dmabuf_context: u8 = 0;
+    const dmabuf_damage = [_]render.Rect{.{
+        .x = 0,
+        .y = 0,
+        .width = 4,
+        .height = 1,
+    }};
+    const dmabuf_buffer: render.PixelBuffer = .{
+        .size = dmabuf_size,
+        .stride_pixels = dmabuf_size.width,
+        .dmabuf = .{
+            .context = &dmabuf_context,
+            .format = @intFromEnum(render.DmabufFormat.xrgb8888),
+            .modifier = 0x1234,
+            .planes = .{
+                .{
+                    .fd = -1,
+                    .stride = dmabuf_size.width * @sizeOf(u32),
+                    .offset = 32,
+                    .required_bytes = 80,
+                },
+                .{},
+                .{},
+                .{},
+            },
+            .plane_count = 1,
+            .y_inverted = false,
+            .force_opaque = true,
+            .retain = DmabufCallbacks.retain,
+            .release = DmabufCallbacks.release,
+            .begin_cpu_read = DmabufCallbacks.beginCpuRead,
+            .end_cpu_read = DmabufCallbacks.endCpuRead,
+            .export_read_fence = DmabufCallbacks.exportReadFence,
+        },
+        .color_description = p3,
+        .color_representation = .{
+            .coefficients = .identity,
+            .range = .full,
+        },
+        .source_cache = .{ .id = 63, .version = 11 },
+        .source_damage = &dmabuf_damage,
+    };
+    const dmabuf_state: SurfaceRegistry.RenderState = .{
+        .buffer = dmabuf_buffer,
+        .logical_size = dmabuf_size,
+        .force_opaque = true,
+    };
+    const scanout_placement: ImagePlacement = .{
+        .position = .{},
+        .rounded_clip = null,
+        .clip = null,
+    };
+    const dmabuf_image: render.Image = imageFromRenderState(
+        surface_id,
+        dmabuf_state,
+        scanout_placement,
+    );
+    try expectImagesEquivalent(.{
+        .x = 0,
+        .y = 0,
+        .size = dmabuf_size,
+        .buffer = dmabuf_buffer,
+        .sample_tag = sample_tag,
+        .is_opaque = true,
+    }, dmabuf_image);
+
+    var target_pixels = [_]u32{0} ** 12;
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    try renderer.beginFrame(.{ .pixels = .{
+        .size = dmabuf_size,
+        .stride_pixels = dmabuf_size.width,
+        .pixels = &target_pixels,
+    } }, .{}, .{}, null, p3);
+    try renderer.append(&.{.{ .image = dmabuf_image }});
+    switch (renderer.directScanoutCandidate()) {
+        .candidate => |candidate| try std.testing.expect(std.meta.eql(dmabuf_buffer, candidate)),
+        .rejected => |reason| {
+            std.debug.print("unexpected direct scanout rejection: {t}\n", .{reason});
+            return error.TestUnexpectedResult;
+        },
+    }
+    switch (renderer.overlayScanoutCandidate()) {
+        .candidate => |candidate| {
+            try std.testing.expect(std.meta.eql(dmabuf_buffer, candidate.buffer));
+            try std.testing.expectEqual(
+                render.Rect{ .x = 0, .y = 0, .width = 4, .height = 3 },
+                candidate.destination,
+            );
+        },
+        .rejected => |reason| {
+            std.debug.print("unexpected overlay scanout rejection: {t}\n", .{reason});
+            return error.TestUnexpectedResult;
+        },
+    }
+    renderer.cancelFrame();
+}
+
 fn surfaceFullyOpaque(
     surfaces: *Surface.Store,
     surface_id: Surface.Id,
@@ -10041,35 +10343,6 @@ fn surfaceFullyOpaque(
 ) bool {
     return Surface.currentAlphaMultiplier(surfaces, surface_id) == std.math.maxInt(u32) and
         (buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id));
-}
-
-fn surfaceOpaqueRegion(
-    surfaces: *Surface.Store,
-    surface_id: Surface.Id,
-    buffer: *const Surface.BufferSnapshot,
-    x: i32,
-    y: i32,
-    rounded_clip: ?render.RoundedClip,
-    clip: ?render.Rect,
-    alpha_multiplier: u32,
-) render.OpaqueRegion {
-    var result: render.OpaqueRegion = .{};
-    if (alpha_multiplier != std.math.maxInt(u32) or rounded_clip != null or
-        buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id))
-    {
-        return result;
-    }
-    const region = Surface.currentOpaque(surfaces, surface_id) orelse return result;
-    var rectangles = region.rectangleIterator();
-    while (rectangles.next()) |rectangle| {
-        var opaque_rect = (surfaceEffectRect(rectangle, buffer.logical_size) orelse continue)
-            .translated(x, y);
-        if (clip) |clip_rect| {
-            opaque_rect = opaque_rect.intersection(clip_rect) orelse continue;
-        }
-        if (!result.append(opaque_rect)) break;
-    }
-    return result;
 }
 
 fn surfaceEffectRect(rectangle: Region.Rectangle, size: render.Size) ?render.Rect {
@@ -10096,20 +10369,6 @@ test "background effect rectangles are clipped to the surface" {
             .{ .width = 10, .height = 8 },
         ),
     );
-}
-
-fn renderBufferTransform(transform: wl.Output.Transform) render.BufferTransform {
-    return switch (transform) {
-        .normal => .normal,
-        .@"90" => .rotate_90,
-        .@"180" => .rotate_180,
-        .@"270" => .rotate_270,
-        .flipped => .flipped,
-        .flipped_90 => .flipped_90,
-        .flipped_180 => .flipped_180,
-        .flipped_270 => .flipped_270,
-        else => unreachable,
-    };
 }
 
 fn renderBorders(
