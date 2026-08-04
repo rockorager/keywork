@@ -1,4 +1,4 @@
-//! Host-boundary state for a future Linux io_uring transport adapter.
+//! Linux io_uring transport state for a caller-owned ring.
 //!
 //! The host owns the ring and ring-wide external `user_data` values. Those
 //! values must be monotonic or generation-bearing and must not be reused while
@@ -9,11 +9,12 @@
 //! submits, waits on, or drains the host's ring.
 //!
 //! Tokens are generation-checked table references and are deliberately not
-//! packed into kernel `user_data`. The table is currently private: this module
-//! exposes no socket or ring adapter yet.
+//! packed into kernel `user_data`.
 
 const std = @import("std");
 const wire = @import("wire.zig");
+const server = @import("server.zig");
+const linux = std.os.linux;
 
 pub const OperationToken = struct { slot: u32, generation: u32 };
 
@@ -232,6 +233,369 @@ const OperationTable = struct {
         self.slots.items[token.slot].generation = generation;
     }
 };
+
+/// A heap-stable transport connection. Fields are private so an outstanding
+/// recvmsg can safely retain pointers into this record.
+pub const Connection = struct {
+    /// This is an adapter resource bound, not a Wayland protocol limit.
+    pub const max_received_fds = 32;
+    pub const State = enum { ready, peer_disconnected, terminal };
+
+    fd: linux.fd_t,
+    core: *server.CoreClient,
+    state_value: State = .ready,
+    recv_pending: bool = false,
+    data: [wire.max_message_size]u8 = undefined,
+    control: [cmsgSpace(max_received_fds * @sizeOf(wire.FileDescriptor))]u8 align(@alignOf(linux.cmsghdr)) = undefined,
+    iov: std.posix.iovec = undefined,
+    msg: linux.msghdr = undefined,
+    fd_scratch: [max_received_fds]wire.FileDescriptor = undefined,
+
+    pub fn client(self: *Connection) *server.Client {
+        return self.core.client();
+    }
+
+    pub fn state(self: *const Connection) State {
+        return self.state_value;
+    }
+
+    fn resetMessage(self: *Connection) void {
+        self.iov = .{ .base = &self.data, .len = self.data.len };
+        self.msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&self.iov),
+            .iovlen = 1,
+            .control = &self.control,
+            .controllen = self.control.len,
+            .flags = 0,
+        };
+    }
+};
+
+pub const CompleteResult = union(enum) {
+    accepted: *Connection,
+    received: *Connection,
+    peer_disconnected: *Connection,
+    terminal: *Connection,
+    listener_error: linux.E,
+    retry,
+};
+
+pub const Server = struct {
+    allocator: std.mem.Allocator,
+    sans_io: *server.Server,
+    listener_fd: linux.fd_t,
+    operations: OperationTable,
+    connections: std.ArrayList(*Connection) = .empty,
+    accept_pending: bool = false,
+    prefer_accept: bool = true,
+
+    /// Takes ownership of an already-bound, listening Unix socket descriptor.
+    pub fn init(allocator: std.mem.Allocator, sans_io: *server.Server, listener_fd: linux.fd_t) !Server {
+        if (listener_fd < 0) return error.InvalidListener;
+        return .{
+            .allocator = allocator,
+            .sans_io = sans_io,
+            .listener_fd = listener_fd,
+            .operations = .init(allocator),
+        };
+    }
+
+    /// Shutdown cancellation is deliberately not simulated: the host must
+    /// complete all operations and explicitly release all connections first.
+    pub fn deinit(self: *Server) !void {
+        if (self.operations.live_count != 0 or self.operations.prepared != null) return error.OperationsInFlight;
+        if (self.connections.items.len != 0) return error.ConnectionsLive;
+        _ = linux.close(self.listener_fd);
+        self.connections.deinit(self.allocator);
+        self.operations.deinit();
+        self.* = undefined;
+    }
+
+    /// Destroys transport/core storage only at an explicit application
+    /// boundary. All application resources must already have been destroyed.
+    pub fn release(self: *Server, connection: *Connection) !void {
+        for (self.connections.items, 0..) |candidate, index| if (candidate == connection) {
+            if (connection.recv_pending) return error.OperationInFlight;
+            if (!connection.core.canDestroy()) return error.ApplicationResourcesLive;
+            _ = linux.close(connection.fd);
+            connection.core.destroy();
+            _ = self.connections.orderedRemove(index);
+            self.allocator.destroy(connection);
+            return;
+        };
+        return error.ForeignConnection;
+    }
+
+    /// Reserves all fallible operation-table state before acquiring an SQE.
+    /// Successful SQE preparation is followed only by infallible commit.
+    pub fn prepareNext(self: *Server, ring: *linux.IoUring, external_user_data: u64) !PrepareResult {
+        const connection = self.nextReceivable();
+        const choose_accept = !self.accept_pending and (connection == null or self.prefer_accept);
+        if (!choose_accept and connection == null) {
+            if (self.accept_pending) return .idle;
+            return self.prepareAccept(ring, external_user_data);
+        }
+        if (choose_accept) return self.prepareAccept(ring, external_user_data);
+        return self.prepareRecv(ring, connection.?, external_user_data);
+    }
+
+    fn prepareAccept(self: *Server, ring: *linux.IoUring, external: u64) !PrepareResult {
+        try self.operations.prepare(.accept(self), external);
+        _ = ring.accept(external, self.listener_fd, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.operations.abortPrepared() catch unreachable;
+                return .submission_queue_full;
+            },
+        };
+        const token = self.operations.commitPrepared();
+        self.accept_pending = true;
+        self.prefer_accept = false;
+        return .{ .prepared = token };
+    }
+
+    fn prepareRecv(self: *Server, ring: *linux.IoUring, connection: *Connection, ring_external: u64) !PrepareResult {
+        connection.resetMessage();
+        try self.operations.prepare(.recv(connection), ring_external);
+        _ = ring.recvmsg(ring_external, connection.fd, &connection.msg, linux.MSG.CMSG_CLOEXEC) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.operations.abortPrepared() catch unreachable;
+                return .submission_queue_full;
+            },
+        };
+        const token = self.operations.commitPrepared();
+        connection.recv_pending = true;
+        self.prefer_accept = true;
+        return .{ .prepared = token };
+    }
+
+    pub fn complete(self: *Server, token: OperationToken, res: i32, flags: u32) !CompleteResult {
+        _ = flags;
+        const operation = try self.operations.take(token);
+        return switch (operation) {
+            .accept => self.completeAccept(res),
+            .recv => |value| self.completeRecv(@ptrCast(@alignCast(value.owner)), res),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    fn completeAccept(self: *Server, res: i32) !CompleteResult {
+        self.accept_pending = false;
+        if (completionError(res)) |err| return switch (err) {
+            .INTR, .AGAIN, .CONNABORTED => .retry,
+            else => .{ .listener_error = err },
+        };
+        const fd: linux.fd_t = @intCast(res);
+        errdefer _ = linux.close(fd);
+        const connection = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(connection);
+        const core = try server.CoreClient.create(self.allocator, self.sans_io, .{});
+        errdefer core.destroy();
+        connection.* = .{ .fd = fd, .core = core };
+        try self.connections.append(self.allocator, connection);
+        return .{ .accepted = connection };
+    }
+
+    fn completeRecv(self: *Server, connection: *Connection, res: i32) !CompleteResult {
+        defer connection.recv_pending = false;
+        if (completionError(res)) |err| return switch (err) {
+            .INTR, .AGAIN => .retry,
+            else => self.disconnect(connection),
+        };
+        if (res == 0) {
+            return self.disconnect(connection);
+        }
+        const received: usize = @intCast(res);
+        if (received > connection.data.len) return error.InvalidCompletionResult;
+        const count = parseRights(connection, connection.msg.controllen, connection.msg.flags) catch {
+            connection.state_value = .terminal;
+            connection.client().transportMalformed();
+            return .{ .terminal = connection };
+        };
+        connection.client().receive(connection.data[0..received], connection.fd_scratch[0..count]) catch {
+            closeFds(connection.fd_scratch[0..count]);
+            connection.state_value = .terminal;
+            connection.client().transportOutOfMemory();
+            return .{ .terminal = connection };
+        };
+        connection.client().dispatch() catch {
+            connection.state_value = .terminal;
+            return .{ .terminal = connection };
+        };
+        if (connection.client().fatal() != null) connection.state_value = .terminal;
+        return if (connection.state_value == .terminal) .{ .terminal = connection } else .{ .received = connection };
+    }
+
+    fn disconnect(_: *Server, connection: *Connection) CompleteResult {
+        connection.state_value = .peer_disconnected;
+        connection.client().peerDisconnected();
+        return .{ .peer_disconnected = connection };
+    }
+
+    fn nextReceivable(self: *Server) ?*Connection {
+        for (self.connections.items) |connection|
+            if (!connection.recv_pending and connection.state_value == .ready) return connection;
+        return null;
+    }
+};
+
+fn cmsgAlign(value: usize) usize {
+    return std.mem.alignForward(usize, value, @sizeOf(usize));
+}
+
+fn cmsgSpace(data_len: usize) usize {
+    return cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(data_len);
+}
+
+fn closeFds(fds: []const wire.FileDescriptor) void {
+    for (fds) |fd| _ = linux.close(fd);
+}
+
+fn completionError(res: i32) ?linux.E {
+    if (res >= 0) return null;
+    if (res <= -4096) return .IO;
+    return @enumFromInt(@as(u16, @intCast(-@as(i64, res))));
+}
+
+fn parseRights(connection: *Connection, control_len: usize, message_flags: u32) !usize {
+    var count: usize = 0;
+    errdefer closeFds(connection.fd_scratch[0..count]);
+    const control_overflow = control_len > connection.control.len;
+    const bytes = connection.control[0..@min(control_len, connection.control.len)];
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (bytes.len - offset < @sizeOf(linux.cmsghdr)) return error.MalformedControl;
+        const header: *align(1) const linux.cmsghdr = @ptrCast(bytes[offset..].ptr);
+        if (header.len < @sizeOf(linux.cmsghdr) or header.len > bytes.len - offset) return error.MalformedControl;
+        const payload_start = offset + cmsgAlign(@sizeOf(linux.cmsghdr));
+        if (payload_start > offset + header.len) return error.MalformedControl;
+        const payload = bytes[payload_start .. offset + header.len];
+        if (header.level == linux.SOL.SOCKET and header.type == linux.SCM.RIGHTS) {
+            const fd_count = payload.len / @sizeOf(wire.FileDescriptor);
+            const overflow = fd_count > connection.fd_scratch.len - count;
+            for (0..fd_count) |index| {
+                const start = index * @sizeOf(wire.FileDescriptor);
+                const fd = std.mem.bytesToValue(wire.FileDescriptor, payload[start..][0..@sizeOf(wire.FileDescriptor)]);
+                if (count == connection.fd_scratch.len) {
+                    _ = linux.close(fd);
+                } else {
+                    connection.fd_scratch[count] = fd;
+                    count += 1;
+                }
+            }
+            if (overflow or payload.len % @sizeOf(wire.FileDescriptor) != 0)
+                return error.MalformedControl;
+        }
+        const next = cmsgAlign(offset + header.len);
+        if (next <= offset) return error.MalformedControl;
+        if (next > bytes.len) {
+            if (offset + header.len != bytes.len) return error.MalformedControl;
+            offset = bytes.len;
+        } else offset = next;
+    }
+    if (control_overflow or (message_flags & linux.MSG.CTRUNC) != 0) return error.TruncatedControl;
+    return count;
+}
+
+fn writeControlHeader(bytes: []u8, len: usize, level: i32, kind: i32) void {
+    const header: *align(1) linux.cmsghdr = @ptrCast(bytes.ptr);
+    header.* = .{ .len = len, .level = level, .type = kind };
+}
+
+test "SCM_RIGHTS parser preserves order and closes parsed descriptors on truncation" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const core = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    defer core.destroy();
+    var connection: Connection = .{ .fd = -1, .core = core };
+
+    var fds = [_]wire.FileDescriptor{ @intCast(linux.dup(0)), @intCast(linux.dup(0)) };
+    var fds_owned = true;
+    defer if (fds_owned) closeFds(&fds);
+    const header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const payload_len = fds.len * @sizeOf(wire.FileDescriptor);
+    writeControlHeader(&connection.control, header_len + payload_len, linux.SOL.SOCKET, linux.SCM.RIGHTS);
+    for (&fds, 0..) |*fd, index| {
+        const start = header_len + index * @sizeOf(wire.FileDescriptor);
+        @memcpy(connection.control[start..][0..@sizeOf(wire.FileDescriptor)], std.mem.asBytes(fd));
+    }
+    const count = try parseRights(&connection, header_len + payload_len, 0);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(fds[0], connection.fd_scratch[0]);
+    try std.testing.expectEqual(fds[1], connection.fd_scratch[1]);
+
+    try std.testing.expectError(error.TruncatedControl, parseRights(&connection, header_len + payload_len, linux.MSG.CTRUNC));
+    fds_owned = false;
+    for (fds) |fd| try std.testing.expect(linux.fcntl(fd, linux.F.GETFD, 0) > std.math.maxInt(isize));
+}
+
+test "SCM_RIGHTS parser rejects malformed control after closing earlier rights" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const core = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    defer core.destroy();
+    var connection: Connection = .{ .fd = -1, .core = core };
+    var fd: wire.FileDescriptor = @intCast(linux.dup(0));
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = linux.close(fd);
+    };
+    const header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const first_len = header_len + @sizeOf(wire.FileDescriptor);
+    writeControlHeader(&connection.control, first_len, linux.SOL.SOCKET, linux.SCM.RIGHTS);
+    @memcpy(connection.control[header_len..][0..@sizeOf(wire.FileDescriptor)], std.mem.asBytes(&fd));
+    const second = cmsgAlign(first_len);
+    writeControlHeader(connection.control[second..], 1, linux.SOL.SOCKET, linux.SCM.RIGHTS);
+    try std.testing.expectError(error.MalformedControl, parseRights(&connection, second + @sizeOf(linux.cmsghdr), 0));
+    fd_owned = false;
+    try std.testing.expect(linux.fcntl(fd, linux.F.GETFD, 0) > std.math.maxInt(isize));
+}
+
+test "accepted connection is stable and requires explicit release" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const result = try transport.completeAccept(accepted);
+    const connection = result.accepted;
+    try std.testing.expect(connection.client() == connection.core.client());
+    try std.testing.expectError(error.ConnectionsLive, transport.deinit());
+    const interface: wire.Interface = .{ .name = "test_application", .version = 1 };
+    var resource: server.Resource = .init(std.testing.allocator, 2, 1, &interface, &.{}, .client, connection.client().ownerHooks());
+    try connection.client().installClientInitial(2, &resource);
+    try std.testing.expectError(error.ApplicationResourcesLive, transport.release(connection));
+    try std.testing.expect(linux.fcntl(accepted, linux.F.GETFD, 0) <= std.math.maxInt(isize));
+    resource.destroy();
+    resource.deinit();
+    try transport.release(connection);
+    try transport.deinit();
+}
+
+test "recv completion transfers SCM_RIGHTS ownership into the core" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const connection = (try transport.completeAccept(accepted)).accepted;
+
+    var received_fd: wire.FileDescriptor = @intCast(linux.dup(0));
+    const header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const control_len = header_len + @sizeOf(wire.FileDescriptor);
+    writeControlHeader(&connection.control, control_len, linux.SOL.SOCKET, linux.SCM.RIGHTS);
+    @memcpy(connection.control[header_len..][0..@sizeOf(wire.FileDescriptor)], std.mem.asBytes(&received_fd));
+    connection.msg.controllen = control_len;
+    connection.msg.flags = 0;
+    connection.data[0..4].* = .{ 1, 0, 0, 0 };
+    connection.recv_pending = true;
+    try std.testing.expect((try transport.completeRecv(connection, 4)) == .received);
+    try std.testing.expect(!connection.recv_pending);
+    try transport.release(connection);
+    try std.testing.expect(linux.fcntl(received_fd, linux.F.GETFD, 0) > std.math.maxInt(isize));
+    try transport.deinit();
+}
 
 fn testOwner(value: *u8) *anyopaque {
     return value;

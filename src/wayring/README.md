@@ -137,10 +137,14 @@ message.
 ```zig
 var transport = try wayring.io_uring.Server.init(allocator, &server, listener_fd);
 
-while (transport.nextSubmission(&host_ring, host_tokens.next(.wayring))) {}
+const external = try host_tokens.reserve();
+switch (try transport.prepareNext(&host_ring, external)) {
+    .prepared => |token| host_tokens.installWayring(external, token),
+    .idle, .submission_queue_full => host_tokens.release(external),
+}
 
 for (host_cqes) |cqe| switch (host_tokens.route(cqe.user_data)) {
-    .wayring => |token| try transport.complete(token, cqe.res, cqe.flags),
+    .wayring => |token| _ = try transport.complete(token, cqe.res, cqe.flags),
     .other => |token| try host.complete(token, cqe.res, cqe.flags),
 };
 ```
@@ -158,6 +162,12 @@ original and cancellation completions until the adapter reports that it is
 drained, and only then deinitializes it. Operation tokens use generation-
 checked slots or equivalently stable records and remain valid through terminal
 completion.
+
+Accepted connections are stable pointers. Completion results notify the
+application when a connection is accepted, receives input, becomes terminal,
+or disconnects. The application retires its own resources and then explicitly
+releases the connection; the adapter never guesses how application resources
+should be destroyed.
 
 ## Wire processing layers
 

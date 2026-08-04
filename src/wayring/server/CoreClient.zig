@@ -113,6 +113,12 @@ pub fn client(self: *CoreClient) *Client {
     return &self.connection;
 }
 
+/// Reports whether only CoreClient-owned objects remain. Applications must
+/// retire their resources before the transport releases this client.
+pub fn canDestroy(self: *const CoreClient) bool {
+    return self.connection.objectCount() == 1 + self.registries.items.len;
+}
+
 fn handleDisplay(self: *CoreClient, _: *Resource, opcode: u16, message: *wire.DecodedMessage) !void {
     switch (opcode) {
         0 => try self.sync(message.values[0].new_id.typed),
