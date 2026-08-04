@@ -1,32 +1,37 @@
 //! Scanner-backed Wayring ownership slice for wl_compositor, wl_surface, and
 //! wl_shm.
 //!
-//! This deliberately owns a distinct surface identity namespace. Copied SHM
-//! commits use the compositor's protocol-neutral snapshot contract, while
-//! render-tree integration and other surface state remain separate from the
-//! libwayland implementation.
+//! Surfaces use the compositor-wide registry for identity and borrowed render
+//! state. Wayring object ownership remains isolated per client; presentation
+//! policy is delegated through the minimal optional lifecycle listener.
 
 const WayringCompositor = @This();
 
 const std = @import("std");
 const core = @import("wayring-core-protocol");
 const wayring = @import("wayring");
-const slot_map = @import("../slot_map.zig");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const Region = @import("../region.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const render = @import("../render/types.zig");
 
 const server = wayring.server;
 const wire = wayring.wire;
 const Shm = server.shm.Protocol(core);
 
-const SurfaceIdentity = struct {
-    client: *server.Client,
-    object_id: u32,
-};
+pub const SurfaceId = SurfaceRegistry.Id;
 
-const SurfaceStore = slot_map.SlotMap(SurfaceIdentity, enum { wayring_surface });
-pub const SurfaceId = SurfaceStore.Id;
+/// Presentation lifecycle copied by init. The context remains borrowed until
+/// compositor deinit; callbacks never receive Wayland resources or policy and
+/// must not reenter surface lifecycle. During creation rollback, `removing`
+/// can resolve the provider through SurfaceRegistry but the Wayring object has
+/// not been published in its per-client list.
+pub const PresentationListener = struct {
+    context: *anyopaque,
+    added: *const fn (*anyopaque, SurfaceId) error{OutOfMemory}!void,
+    committed: *const fn (*anyopaque, SurfaceId, ?render.Size) void,
+    removing: *const fn (*anyopaque, SurfaceId) void,
+};
 
 const Surface = struct {
     resource: core.wl_surface.Resource,
@@ -68,15 +73,27 @@ const ClientObjects = struct {
 
 allocator: std.mem.Allocator,
 protocol_server: *server.Server,
+surface_registry: *SurfaceRegistry,
+presentation_listener: ?PresentationListener,
 global: *const server.Server.Global,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
-surfaces: SurfaceStore = .{},
+owned_provider_count: usize = 0,
 
-pub fn init(self: *WayringCompositor, allocator: std.mem.Allocator, protocol_server: *server.Server) !void {
+/// Borrows the shared registry and copies the optional presentation listener.
+/// Both the registry and listener context must outlive this adapter.
+pub fn init(
+    self: *WayringCompositor,
+    allocator: std.mem.Allocator,
+    protocol_server: *server.Server,
+    surface_registry: *SurfaceRegistry,
+    presentation_listener: ?PresentationListener,
+) !void {
     self.* = .{
         .allocator = allocator,
         .protocol_server = protocol_server,
+        .surface_registry = surface_registry,
+        .presentation_listener = presentation_listener,
         .global = undefined,
         .shm = .init(allocator),
     };
@@ -87,13 +104,12 @@ pub fn init(self: *WayringCompositor, allocator: std.mem.Allocator, protocol_ser
 
 pub fn deinit(self: *WayringCompositor) void {
     std.debug.assert(self.clients.items.len == 0);
-    std.debug.assert(self.surfaces.len() == 0);
+    std.debug.assert(self.owned_provider_count == 0);
     self.protocol_server.removeGlobal(self.global) catch |err| switch (err) {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
     };
     self.shm.deinit();
-    self.surfaces.deinit(self.allocator);
     self.clients.deinit(self.allocator);
     self.* = undefined;
 }
@@ -117,11 +133,13 @@ pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) 
 }
 
 pub fn surfaceCount(self: *const WayringCompositor) usize {
-    return self.surfaces.len();
+    var count: usize = 0;
+    for (self.clients.items) |objects| count += objects.surfaces.items.len;
+    return count;
 }
 
 pub fn containsSurface(self: *const WayringCompositor, id: SurfaceId) bool {
-    return self.surfaces.getConst(id) != null;
+    return self.surfaceForId(id) != null;
 }
 
 pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, object_id: u32) ?SurfaceId {
@@ -136,13 +154,8 @@ pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, o
 }
 
 pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnapshot {
-    const identity = self.surfaces.getConst(id) orelse return null;
-    const objects = self.findClient(identity.client) orelse return null;
-    for (objects.surfaces.items) |surface| {
-        if (!std.meta.eql(surface.id, id)) continue;
-        return if (surface.current) |*current| current else null;
-    }
-    return null;
+    const surface = self.surfaceForId(id) orelse return null;
+    return if (surface.current) |*current| current else null;
 }
 
 fn bind(client: *server.Client, id: u32, version: u32, self: *WayringCompositor) !void {
@@ -178,25 +191,55 @@ fn handleCompositor(
 fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resource, object_id: u32) !void {
     const client = self.clientForResource(&compositor.runtime) orelse return error.UntrackedClient;
     const objects = self.findClient(client) orelse return error.UntrackedClient;
-    try objects.surfaces.ensureUnusedCapacity(self.allocator, 1);
     const surface = try self.allocator.create(Surface);
     errdefer self.allocator.destroy(surface);
     surface.* = .{
-        .resource = .init(self.allocator, object_id, 1, .client, client.ownerHooks()),
+        .resource = undefined,
         .id = undefined,
         .pending_damage = .init(),
         .source_cache_id = render.allocateSourceCacheId(),
     };
     errdefer surface.pending_damage.deinit();
+    surface.id = try self.surface_registry.add(.{
+        .context = surface,
+        .render_state = surfaceRenderState,
+    });
+    self.owned_provider_count += 1;
     errdefer {
-        surface.resource.destroy();
-        surface.resource.deinit();
+        self.surface_registry.remove(surface.id);
+        self.owned_provider_count -= 1;
     }
-    surface.id = try self.surfaces.insert(self.allocator, .{ .client = client, .object_id = object_id });
-    errdefer _ = self.surfaces.remove(surface.id);
-    try surface.resource.setHandler(WayringCompositor, self, handleSurface, null);
-    try client.materialize(&surface.resource.runtime);
+    var listener_added = false;
+    errdefer if (listener_added) {
+        const listener = self.presentation_listener.?;
+        listener.removing(listener.context, surface.id);
+    };
+    if (self.presentation_listener) |listener| {
+        try listener.added(listener.context, surface.id);
+        listener_added = true;
+    }
+    try objects.surfaces.ensureUnusedCapacity(self.allocator, 1);
+    surface.resource = .init(self.allocator, object_id, 1, .client, client.ownerHooks());
+    surface.resource.setHandler(WayringCompositor, self, handleSurface, null) catch unreachable;
+    // Dispatch reserved and type-checked this new_id before calling us;
+    // materialization only replaces that reservation and cannot allocate.
+    client.materialize(&surface.resource.runtime) catch unreachable;
     objects.surfaces.appendAssumeCapacity(surface);
+}
+
+fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
+    const surface: *Surface = @ptrCast(@alignCast(context));
+    const current = if (surface.current) |*snapshot| snapshot else return null;
+    return .{
+        .buffer = current.pixelBuffer(.{}, .{}),
+        .logical_size = current.size,
+        .source = null,
+        .transform = .normal,
+        .force_opaque = current.forceOpaque(),
+        .alpha_multiplier = std.math.maxInt(u32),
+        .opaque_region = null,
+        .blur_region = null,
+    };
 }
 
 fn handleSurface(
@@ -264,6 +307,8 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     const pending = if (surface.pending_attachment) |*attachment| attachment else {
         if (surface.current) |*current| current.deinit();
         surface.current = null;
+        if (self.presentation_listener) |listener|
+            listener.committed(listener.context, surface.id, null);
         return;
     };
     defer self.clearPendingAttachment(surface, false);
@@ -315,6 +360,8 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     surface.current = candidate;
     candidate_owned = false;
     surface.next_source_version +%= 1;
+    if (self.presentation_listener) |listener|
+        listener.committed(listener.context, surface.id, surface.current.?.size);
 }
 
 fn clearPendingAttachment(self: *WayringCompositor, surface: *Surface, release: bool) void {
@@ -340,6 +387,15 @@ fn findClient(self: *WayringCompositor, client: *const server.Client) ?*ClientOb
     return null;
 }
 
+fn surfaceForId(self: *const WayringCompositor, id: SurfaceId) ?*Surface {
+    for (self.clients.items) |objects| {
+        for (objects.surfaces.items) |surface| {
+            if (std.meta.eql(surface.id, id)) return surface;
+        }
+    }
+    return null;
+}
+
 fn clientForResource(self: *WayringCompositor, resource: *server.Resource) ?*server.Client {
     for (self.clients.items) |objects| {
         if (resource.ownedBy(objects.client.ownerHooks())) return objects.client;
@@ -348,8 +404,13 @@ fn clientForResource(self: *WayringCompositor, resource: *server.Resource) ?*ser
 }
 
 fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
-    const identity = self.surfaces.remove(surface.id) orelse unreachable;
-    const objects = self.findClient(identity.client) orelse unreachable;
+    const client = self.clientForResource(&surface.resource.runtime) orelse unreachable;
+    const objects = self.findClient(client) orelse unreachable;
+    if (self.presentation_listener) |listener|
+        listener.removing(listener.context, surface.id);
+    self.surface_registry.remove(surface.id);
+    std.debug.assert(self.owned_provider_count > 0);
+    self.owned_provider_count -= 1;
     removePointer(Surface, &objects.surfaces, surface);
     self.clearPendingAttachment(surface, false);
     if (surface.current) |*current| current.deinit();
@@ -451,11 +512,174 @@ fn bindCompositor(client: *server.Client, compositor_id: u32) !void {
     });
 }
 
-test "scanner-backed Keywork compositor owns distinct surface identities" {
+fn bindShm(self: *WayringCompositor, client: *server.Client, shm_id: u32) !void {
+    try send(client, 2, 0, &core.wl_registry.request_messages[0], &.{
+        .{ .uint = self.shm.global.?.name() },
+        .{ .new_id = .{ .generic = .{ .interface = "wl_shm", .version = 1, .id = shm_id } } },
+    });
+    const formats = try drain(client);
+    defer std.testing.allocator.free(formats);
+}
+
+fn createSurfaceResource(client: *server.Client, compositor_id: u32, surface_id: u32) !void {
+    try send(client, compositor_id, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = surface_id } }});
+}
+
+fn createShmPool(client: *server.Client, shm_id: u32, pool_id: u32, fd: std.posix.fd_t, size: usize) !void {
+    try sendWithFds(client, shm_id, 0, &core.wl_shm.request_messages[0], &.{
+        .{ .new_id = .{ .typed = pool_id } }, .{ .fd = fd }, .{ .int = @intCast(size) },
+    });
+}
+
+fn createShmBuffer(
+    client: *server.Client,
+    pool_id: u32,
+    buffer_id: u32,
+    offset: usize,
+    size: render.Size,
+    stride_bytes: usize,
+    format: server.shm.Format,
+) !void {
+    try send(client, pool_id, 0, &core.wl_shm_pool.request_messages[0], &.{
+        .{ .new_id = .{ .typed = buffer_id } },
+        .{ .int = @intCast(offset) },
+        .{ .int = @intCast(size.width) },
+        .{ .int = @intCast(size.height) },
+        .{ .int = @intCast(stride_bytes) },
+        .{ .uint = @intFromEnum(format) },
+    });
+}
+
+fn attachBuffer(client: *server.Client, surface_id: u32, buffer_id: ?u32) !void {
+    try send(client, surface_id, 1, &core.wl_surface.request_messages[1], &.{
+        .{ .object = buffer_id }, .{ .int = 0 }, .{ .int = 0 },
+    });
+}
+
+fn damageSurface(client: *server.Client, surface_id: u32, rectangle: render.Rect) !void {
+    try send(client, surface_id, 2, &core.wl_surface.request_messages[2], &.{
+        .{ .int = rectangle.x },
+        .{ .int = rectangle.y },
+        .{ .int = @intCast(rectangle.width) },
+        .{ .int = @intCast(rectangle.height) },
+    });
+}
+
+fn commitSurfaceResource(client: *server.Client, surface_id: u32) !void {
+    try send(client, surface_id, 6, &core.wl_surface.request_messages[6], &.{});
+}
+
+const SyntheticRegistryProvider = struct {
+    pixel: u32,
+
+    fn provider(self: *SyntheticRegistryProvider) SurfaceRegistry.Provider {
+        return .{ .context = self, .render_state = renderState };
+    }
+
+    fn renderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
+        const self: *SyntheticRegistryProvider = @ptrCast(@alignCast(context));
+        return .{
+            .buffer = .{
+                .size = .{ .width = 1, .height = 1 },
+                .stride_pixels = 1,
+                .pixels = @as([*]u32, @ptrCast(&self.pixel))[0..1],
+            },
+            .logical_size = .{ .width = 1, .height = 1 },
+        };
+    }
+};
+
+const TestPresentationListener = struct {
+    const Event = enum { added, committed, removing };
+
+    registry: *SurfaceRegistry,
+    compositor: ?*WayringCompositor = null,
+    fail_added: bool = false,
+    require_owned_lookup_on_remove: bool = true,
+    events: [16]Event = undefined,
+    event_count: usize = 0,
+    added_count: usize = 0,
+    committed_count: usize = 0,
+    removing_count: usize = 0,
+    last_id: ?SurfaceId = null,
+    last_size: ?render.Size = null,
+    last_source_cache: ?render.SourceCache = null,
+    last_pixel_pointer: ?[*]u32 = null,
+    last_first_pixel: ?u32 = null,
+    removing_had_render_state: bool = false,
+
+    fn listener(self: *TestPresentationListener) PresentationListener {
+        return .{
+            .context = self,
+            .added = added,
+            .committed = committed,
+            .removing = removing,
+        };
+    }
+
+    fn added(context: *anyopaque, id: SurfaceId) error{OutOfMemory}!void {
+        const self: *TestPresentationListener = @ptrCast(@alignCast(context));
+        std.debug.assert(self.registry.contains(id));
+        std.debug.assert(self.registry.renderState(id) == null);
+        self.record(.added);
+        self.added_count += 1;
+        self.last_id = id;
+        if (self.fail_added) return error.OutOfMemory;
+    }
+
+    fn committed(context: *anyopaque, id: SurfaceId, size: ?render.Size) void {
+        const self: *TestPresentationListener = @ptrCast(@alignCast(context));
+        std.debug.assert(self.registry.contains(id));
+        const state = self.registry.renderState(id);
+        if (size) |mapped_size| {
+            std.debug.assert(state != null);
+            std.debug.assert(std.meta.eql(mapped_size, state.?.logical_size));
+            self.last_source_cache = state.?.buffer.source_cache;
+            self.last_pixel_pointer = state.?.buffer.pixels.ptr;
+            self.last_first_pixel = state.?.buffer.pixels[0];
+        } else {
+            std.debug.assert(state == null);
+            self.last_source_cache = null;
+            self.last_pixel_pointer = null;
+            self.last_first_pixel = null;
+        }
+        self.record(.committed);
+        self.committed_count += 1;
+        self.last_id = id;
+        self.last_size = size;
+    }
+
+    fn removing(context: *anyopaque, id: SurfaceId) void {
+        const self: *TestPresentationListener = @ptrCast(@alignCast(context));
+        std.debug.assert(self.registry.contains(id));
+        self.removing_had_render_state = self.registry.renderState(id) != null;
+        if (self.require_owned_lookup_on_remove) {
+            const compositor = self.compositor.?;
+            std.debug.assert(compositor.containsSurface(id));
+            std.debug.assert((compositor.currentBuffer(id) != null) == self.removing_had_render_state);
+        }
+        self.record(.removing);
+        self.removing_count += 1;
+        self.last_id = id;
+    }
+
+    fn record(self: *TestPresentationListener, event: Event) void {
+        std.debug.assert(self.event_count < self.events.len);
+        self.events[self.event_count] = event;
+        self.event_count += 1;
+    }
+};
+
+test "scanner-backed surfaces use canonical registry IDs without Wayring lookup confusion" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var synthetic: SyntheticRegistryProvider = .{ .pixel = 0xff11_2233 };
+    const synthetic_id = try surface_registry.add(synthetic.provider());
+    defer surface_registry.remove(synthetic_id);
     var compositor: WayringCompositor = undefined;
-    try compositor.init(std.testing.allocator, &host);
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
     defer compositor.deinit();
     const first = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const second = try server.CoreClient.create(std.testing.allocator, &host, .{});
@@ -472,11 +696,18 @@ test "scanner-backed Keywork compositor owns distinct surface identities" {
     try send(second.client(), 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 4 } }});
     const first_id = compositor.surfaceId(first.client(), 4).?;
     const second_id = compositor.surfaceId(second.client(), 4).?;
+    try std.testing.expect(!std.meta.eql(first_id, synthetic_id));
     try std.testing.expect(!std.meta.eql(first_id, second_id));
+    try std.testing.expect(!compositor.containsSurface(synthetic_id));
+    try std.testing.expectEqual(@as(?*CopiedBufferSnapshot, null), compositor.currentBuffer(synthetic_id));
+    try std.testing.expectEqual(@as(u32, 0xff11_2233), surface_registry.renderState(synthetic_id).?.buffer.pixels[0]);
+    try std.testing.expect(surface_registry.contains(first_id));
+    try std.testing.expect(surface_registry.contains(second_id));
     try std.testing.expectEqual(@as(usize, 2), compositor.surfaceCount());
 
     try send(first.client(), 4, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(!compositor.containsSurface(first_id));
+    try std.testing.expect(!surface_registry.contains(first_id));
     try std.testing.expect(compositor.containsSurface(second_id));
     const events = try drain(first.client());
     defer std.testing.allocator.free(events);
@@ -488,6 +719,8 @@ test "scanner-backed Keywork compositor owns distinct surface identities" {
     try send(first.client(), 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 4 } }});
     const replacement_id = compositor.surfaceId(first.client(), 4).?;
     try std.testing.expect(!std.meta.eql(first_id, replacement_id));
+    try std.testing.expectEqual(first_id.index, replacement_id.index);
+    try std.testing.expect(first_id.generation != replacement_id.generation);
     try std.testing.expect(!compositor.containsSurface(first_id));
     try std.testing.expect(compositor.containsSurface(replacement_id));
 
@@ -501,12 +734,155 @@ test "scanner-backed Keywork compositor owns distinct surface identities" {
     try std.testing.expectEqual(@as(?*CopiedBufferSnapshot, null), compositor.currentBuffer(second_id));
 }
 
+test "surface creation OOM before registration leaves no provider or listener entry" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    const live_before = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    compositor_allocator.fail_index = compositor_allocator.alloc_index;
+    try createSurfaceResource(client, 3, 4);
+
+    try std.testing.expect(compositor_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.added_count);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.removing_count);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
+    try std.testing.expect(client.lookup(4) == null);
+    try std.testing.expectEqual(live_before, compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes);
+}
+
+test "surface registry allocation failure rolls back stable provider context before listener" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var surface_registry = SurfaceRegistry.init(registry_allocator.allocator());
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    registry_allocator.fail_index = registry_allocator.alloc_index;
+    try createSurfaceResource(client, 3, 4);
+
+    try std.testing.expect(registry_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.added_count);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.removing_count);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
+    try std.testing.expect(client.lookup(4) == null);
+}
+
+test "listener-added failure unregisters provider without calling removing" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{
+        .registry = &surface_registry,
+        .fail_added = true,
+        .require_owned_lookup_on_remove = false,
+    };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.added_count);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.removing_count);
+    try std.testing.expectEqualSlices(TestPresentationListener.Event, &.{.added}, listener_state.events[0..listener_state.event_count]);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
+    try std.testing.expect(client.lookup(4) == null);
+}
+
+test "post-added resource-list materialization OOM removes listener before provider rollback" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var listener_state: TestPresentationListener = .{
+        .registry = &surface_registry,
+        .require_owned_lookup_on_remove = false,
+    };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    const live_before = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    compositor_allocator.fail_index = compositor_allocator.alloc_index + 1;
+    try createSurfaceResource(client, 3, 4);
+
+    try std.testing.expect(compositor_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.added_count);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.removing_count);
+    try std.testing.expectEqualSlices(
+        TestPresentationListener.Event,
+        &.{ .added, .removing },
+        listener_state.events[0..listener_state.event_count],
+    );
+    try std.testing.expect(!listener_state.removing_had_render_state);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
+    try std.testing.expect(client.lookup(4) == null);
+    try std.testing.expectEqual(live_before, compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes);
+}
+
 test "scanner-backed surface commits copied SHM and releases the buffer" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
     var compositor: WayringCompositor = undefined;
-    try compositor.init(std.testing.allocator, &host);
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
     defer compositor.deinit();
+    listener_state.compositor = &compositor;
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -523,6 +899,7 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     defer std.testing.allocator.free(formats);
     try send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
     const surface_id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.findClient(client).?.surfaces.items[0];
 
     const pixels = [_]u32{ 0x0011_2233, 0x0044_5566 };
     const fd = try memfdWithPixels(&pixels);
@@ -549,6 +926,23 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     const current = compositor.currentBuffer(surface_id).?;
     try std.testing.expect(current.forceOpaque());
     try std.testing.expectEqualSlices(u32, &.{ 0xff11_2233, 0xff44_5566 }, current.pixels);
+    const render_state = surface_registry.renderState(surface_id).?;
+    try std.testing.expectEqual(current.pixels.ptr, render_state.buffer.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, current.pixels, render_state.buffer.pixels);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, render_state.buffer.size);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, render_state.logical_size);
+    try std.testing.expectEqual(@as(u32, 2), render_state.buffer.stride_pixels);
+    try std.testing.expectEqual(render.SourceCache{ .id = surface.source_cache_id, .version = 1 }, render_state.buffer.source_cache.?);
+    try std.testing.expect(render_state.buffer.source_damage == null);
+    try std.testing.expect(render_state.source == null);
+    try std.testing.expectEqual(render.BufferTransform.normal, render_state.transform);
+    try std.testing.expect(render_state.force_opaque);
+    try std.testing.expectEqual(std.math.maxInt(u32), render_state.alpha_multiplier);
+    try std.testing.expect(render_state.opaque_region == null);
+    try std.testing.expect(render_state.blur_region == null);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expectEqual(render.SourceCache{ .id = surface.source_cache_id, .version = 1 }, listener_state.last_source_cache.?);
+    try std.testing.expectEqual(current.pixels.ptr, listener_state.last_pixel_pointer.?);
     const release = try drain(client);
     defer std.testing.allocator.free(release);
     try std.testing.expectEqual(@as(usize, 8), release.len);
@@ -570,6 +964,11 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     defer std.testing.allocator.free(delete_id);
     try send(client, 5, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expectEqualSlices(u32, &pixels, compositor.currentBuffer(surface_id).?.pixels);
+    const second_state = surface_registry.renderState(surface_id).?;
+    try std.testing.expectEqual(render.SourceCache{ .id = surface.source_cache_id, .version = 2 }, second_state.buffer.source_cache.?);
+    try std.testing.expect(!second_state.force_opaque);
+    try std.testing.expectEqual(compositor.currentBuffer(surface_id).?.pixels.ptr, second_state.buffer.pixels.ptr);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
     const no_release = try drain(client);
     defer std.testing.allocator.free(no_release);
     try std.testing.expectEqual(@as(usize, 0), no_release.len);
@@ -589,15 +988,119 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     try send(client, 5, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expectEqual(server.Fatal.Kind.implementation, client.fatal().?.kind);
     try std.testing.expectEqualSlices(u32, &pixels, compositor.currentBuffer(surface_id).?.pixels);
+    try std.testing.expectEqual(render.SourceCache{ .id = surface.source_cache_id, .version = 2 }, surface_registry.renderState(surface_id).?.buffer.source_cache.?);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+}
+
+test "listener observes published equal-size resize null and damage-only transactions" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    try std.testing.expectEqual(@as(usize, 1), listener_state.added_count);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+
+    const pixels = [_]u32{
+        0xff11_0001,
+        0xff11_0002,
+        0xff22_0001,
+        0xff22_0002,
+        0xff33_0001,
+        0xff33_0002,
+    };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 2, .height = 1 }, 2 * @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 8, 2 * @sizeOf(u32), .{ .width = 2, .height = 1 }, 2 * @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 9, 4 * @sizeOf(u32), .{ .width = 1, .height = 2 }, @sizeOf(u32), .argb8888);
+
+    try attachBuffer(client, 5, 7);
+    try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 2, .height = 1 });
+    try commitSurfaceResource(client, 5);
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+    try std.testing.expectEqual(@as(usize, 8), first_release.len);
+    const first_pointer = listener_state.last_pixel_pointer.?;
+    const source_id = listener_state.last_source_cache.?.id;
+    try std.testing.expectEqual(render.SourceCache{ .id = source_id, .version = 1 }, listener_state.last_source_cache.?);
+    try std.testing.expectEqual(@as(u32, pixels[0]), listener_state.last_first_pixel.?);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+
+    try damageSurface(client, 5, .{ .x = 1, .y = 0, .width = 1, .height = 1 });
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expectEqual(first_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+
+    try attachBuffer(client, 5, 8);
+    try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 2, .height = 1 });
+    try commitSurfaceResource(client, 5);
+    const second_release = try drain(client);
+    defer std.testing.allocator.free(second_release);
+    try std.testing.expectEqual(@as(usize, 8), second_release.len);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, listener_state.last_size.?);
+    try std.testing.expectEqual(render.SourceCache{ .id = source_id, .version = 2 }, listener_state.last_source_cache.?);
+    try std.testing.expectEqual(@as(u32, pixels[2]), listener_state.last_first_pixel.?);
+    try std.testing.expect(first_pointer != listener_state.last_pixel_pointer.?);
+    try std.testing.expect(surface_registry.renderState(id).?.buffer.source_damage == null);
+
+    try attachBuffer(client, 5, 9);
+    try commitSurfaceResource(client, 5);
+    const third_release = try drain(client);
+    defer std.testing.allocator.free(third_release);
+    try std.testing.expectEqual(@as(usize, 8), third_release.len);
+    try std.testing.expectEqual(@as(usize, 3), listener_state.committed_count);
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, listener_state.last_size.?);
+    try std.testing.expectEqual(render.SourceCache{ .id = source_id, .version = 3 }, listener_state.last_source_cache.?);
+    try std.testing.expectEqualSlices(u32, pixels[4..6], surface_registry.renderState(id).?.buffer.pixels);
+
+    try attachBuffer(client, 5, null);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
+    try std.testing.expect(listener_state.last_size == null);
+    try std.testing.expect(compositor.currentBuffer(id) == null);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+
+    try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
+    try std.testing.expectEqualSlices(
+        TestPresentationListener.Event,
+        &.{ .added, .committed, .committed, .committed, .committed },
+        listener_state.events[0..listener_state.event_count],
+    );
 }
 
 test "scanner-backed release failure cleans pending attachment and preserves current pixels" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
     var compositor: WayringCompositor = undefined;
-    try compositor.init(compositor_allocator.allocator(), &host);
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
     defer compositor.deinit();
+    listener_state.compositor = &compositor;
     var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const managed = try server.CoreClient.create(client_allocator.allocator(), &host, .{});
     const client = managed.client();
@@ -654,6 +1157,7 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     const old_pixels = old_current.pixels.ptr;
     const old_version = surface.next_source_version;
     try std.testing.expectEqualSlices(u32, pixels[0..2], old_current.pixels);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
 
     const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
     const candidate_resource = client.lookup(8).?;
@@ -679,6 +1183,7 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     try std.testing.expectEqual(old_pixels, preserved.pixels.ptr);
     try std.testing.expectEqualSlices(u32, pixels[0..2], preserved.pixels);
     try std.testing.expectEqual(old_version, surface.next_source_version);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
 
     const live_before_buffer_destroy = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
     candidate_resource.destroy();
@@ -688,4 +1193,175 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     );
     try std.testing.expect(surface.pending_attachment == null);
     try std.testing.expectEqualSlices(u32, pixels[0..2], compositor.currentBuffer(surface_id).?.pixels);
+}
+
+test "copied snapshot OOM preserves published current and suppresses committed" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    const pixels = [_]u32{ 0xff11_2233, 0xff44_5566 };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+    const old_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+    const old_source_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+
+    try attachBuffer(client, 5, 8);
+    try std.testing.expect(surface.pending_attachment != null);
+    compositor_allocator.fail_index = compositor_allocator.alloc_index;
+    try commitSurfaceResource(client, 5);
+
+    try std.testing.expect(compositor_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expect(surface.pending_attachment == null);
+    try std.testing.expect(!surface.has_pending_attachment);
+    try std.testing.expectEqual(old_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqual(old_source_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+}
+
+test "explicit destroy and client disconnect remove listeners once while providers resolve" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const first = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var first_live = true;
+    defer if (first_live) {
+        compositor.destroyClientResources(first.client());
+        first.destroy();
+    };
+    const second = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var second_live = true;
+    defer if (second_live) {
+        compositor.destroyClientResources(second.client());
+        second.destroy();
+    };
+
+    try bindCompositor(first.client(), 3);
+    try bindShm(&compositor, first.client(), 4);
+    try createSurfaceResource(first.client(), 3, 5);
+    const first_id = compositor.surfaceId(first.client(), 5).?;
+    const first_pixels = [_]u32{0xff11_2233};
+    const first_fd = try memfdWithPixels(&first_pixels);
+    defer _ = std.c.close(first_fd);
+    try createShmPool(first.client(), 4, 6, first_fd, @sizeOf(@TypeOf(first_pixels)));
+    try createShmBuffer(first.client(), 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try attachBuffer(first.client(), 5, 7);
+    try commitSurfaceResource(first.client(), 5);
+    const first_release = try drain(first.client());
+    defer std.testing.allocator.free(first_release);
+
+    try bindCompositor(second.client(), 3);
+    try bindShm(&compositor, second.client(), 4);
+    try createSurfaceResource(second.client(), 3, 5);
+    const second_id = compositor.surfaceId(second.client(), 5).?;
+    const second_pixels = [_]u32{0xff44_5566};
+    const second_fd = try memfdWithPixels(&second_pixels);
+    defer _ = std.c.close(second_fd);
+    try createShmPool(second.client(), 4, 6, second_fd, @sizeOf(@TypeOf(second_pixels)));
+    try createShmBuffer(second.client(), 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try attachBuffer(second.client(), 5, 7);
+    try commitSurfaceResource(second.client(), 5);
+    const second_release = try drain(second.client());
+    defer std.testing.allocator.free(second_release);
+
+    try send(first.client(), 5, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 1), listener_state.removing_count);
+    try std.testing.expect(listener_state.removing_had_render_state);
+    try std.testing.expect(!surface_registry.contains(first_id));
+    try std.testing.expect(!compositor.containsSurface(first_id));
+    try std.testing.expect(surface_registry.contains(second_id));
+
+    compositor.destroyClientResources(second.client());
+    second.destroy();
+    second_live = false;
+    try std.testing.expectEqual(@as(usize, 2), listener_state.removing_count);
+    try std.testing.expect(listener_state.removing_had_render_state);
+    try std.testing.expect(!surface_registry.contains(second_id));
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+
+    compositor.destroyClientResources(first.client());
+    first.destroy();
+    first_live = false;
+    try std.testing.expectEqual(@as(usize, 2), listener_state.removing_count);
+    try std.testing.expectEqualSlices(
+        TestPresentationListener.Event,
+        &.{ .added, .committed, .added, .committed, .removing, .removing },
+        listener_state.events[0..listener_state.event_count],
+    );
+}
+
+test "null listener teardown leaves unrelated registry provider for compositor deinit" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var synthetic: SyntheticRegistryProvider = .{ .pixel = 0xffaa_bbcc };
+    const synthetic_id = try surface_registry.add(synthetic.provider());
+    var synthetic_live = true;
+    defer if (synthetic_live) surface_registry.remove(synthetic_id);
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+    var compositor_live = true;
+    defer if (compositor_live) compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var client_live = true;
+    defer if (client_live) {
+        compositor.destroyClientResources(managed.client());
+        managed.destroy();
+    };
+
+    try bindCompositor(managed.client(), 3);
+    try createSurfaceResource(managed.client(), 3, 4);
+    const id = compositor.surfaceId(managed.client(), 4).?;
+    try std.testing.expect(surface_registry.contains(id));
+    try std.testing.expectEqual(@as(usize, 2), surface_registry.len());
+
+    compositor.destroyClientResources(managed.client());
+    managed.destroy();
+    client_live = false;
+    try std.testing.expect(!surface_registry.contains(id));
+    try std.testing.expect(surface_registry.contains(synthetic_id));
+    try std.testing.expectEqual(@as(usize, 1), surface_registry.len());
+
+    compositor.deinit();
+    compositor_live = false;
+    try std.testing.expect(surface_registry.contains(synthetic_id));
+    try std.testing.expectEqual(@as(u32, synthetic.pixel), surface_registry.renderState(synthetic_id).?.buffer.pixels[0]);
+    surface_registry.remove(synthetic_id);
+    synthetic_live = false;
 }
