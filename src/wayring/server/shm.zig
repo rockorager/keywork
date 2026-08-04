@@ -2,8 +2,12 @@
 //!
 //! This module owns descriptors and mappings, but not protocol resources or
 //! events. Access is intentionally mediated by `Buffer.Access`. A backing file
-//! truncated after it is mapped can still cause SIGBUS; the Access boundary is
-//! designed to admit guarded fault handling in a later increment.
+//! truncated after it is mapped is guarded while an Access is active. The
+//! process-global SIGBUS handler is installed once and coexists conservatively:
+//! another subsystem replacing it afterward disables this protection, while an
+//! unrelated SIGBUS restores and redelivers to the action captured at install.
+//! The fault-recovery model follows the MIT-licensed Wayland 1.26 reference;
+//! its provenance and license notice are recorded in `licenses/wayland.txt`.
 //!
 //! Pool and buffer state is externally serialized. Pins are owning lifetime
 //! references and may cross threads only under host synchronization. An Access
@@ -12,6 +16,62 @@
 //! be copied.
 
 const std = @import("std");
+const linux = std.os.linux;
+
+var handler_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var handler_installed = false;
+var previous_sigbus: linux.Sigaction = .{
+    .handler = .{ .handler = std.posix.SIG.DFL },
+    .mask = std.mem.zeroes(linux.sigset_t),
+    .flags = 0,
+};
+
+threadlocal var active_pool_address: std.atomic.Value(usize) = .init(0);
+threadlocal var access_depth: usize = 0;
+threadlocal var backing_faulted: std.atomic.Value(bool) = .init(false);
+
+fn ensureHandler() error{SignalSetupFailed}!void {
+    std.debug.assert(std.c.pthread_mutex_lock(&handler_mutex) == .SUCCESS);
+    defer std.debug.assert(std.c.pthread_mutex_unlock(&handler_mutex) == .SUCCESS);
+    if (handler_installed) return;
+
+    const action: linux.Sigaction = .{
+        .handler = .{ .sigaction = handleSigbus },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = linux.SA.SIGINFO | linux.SA.NODEFER,
+    };
+    var old_action: linux.Sigaction = undefined;
+    if (linux.errno(linux.sigaction(.BUS, null, &old_action)) != .SUCCESS)
+        return error.SignalSetupFailed;
+    previous_sigbus = old_action;
+    if (linux.errno(linux.sigaction(.BUS, &action, null)) != .SUCCESS)
+        return error.SignalSetupFailed;
+    handler_installed = true;
+}
+
+fn handleSigbus(_: linux.SIG, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    const pool_address = active_pool_address.load(.acquire);
+    if (pool_address != 0) {
+        const pool: *Pool = @ptrFromInt(pool_address);
+        const address = @intFromPtr(info.fields.sigfault.addr);
+        const start = @intFromPtr(pool.mapping.ptr);
+        const end = std.math.add(usize, start, pool.mapping.len) catch 0;
+        if (end != 0 and address >= start and address < end) {
+            backing_faulted.store(true, .release);
+            const result = linux.mmap(pool.mapping.ptr, pool.mapping.len, .{ .READ = true, .WRITE = true }, .{
+                .TYPE = .PRIVATE,
+                .FIXED = true,
+                .ANONYMOUS = true,
+            }, -1, 0);
+            if (linux.errno(result) == .SUCCESS and result == start) return;
+        }
+    }
+
+    // The handler cannot safely interpret this fault. Restore process state
+    // and ask the kernel to deliver it again to this exact thread.
+    _ = linux.sigaction(.BUS, &previous_sigbus, null);
+    _ = linux.tkill(linux.gettid(), .BUS);
+}
 
 pub const Format = enum(u32) {
     argb8888 = 0,
@@ -44,6 +104,7 @@ pub const Pool = struct {
     stability_refs: usize = 0,
     pending_mapping: ?[]align(std.heap.page_size_min) u8 = null,
     resource_live: bool = true,
+    invalid_backing: bool = false,
 
     /// On success the pool adopts `fd`. On every error the caller retains it.
     /// `size` must be positive and the backing file must already be at least
@@ -149,7 +210,7 @@ pub const Buffer = struct {
 
         /// Begins scoped access after the protocol resource has been
         /// destroyed. The pin must remain live until the returned guard ends.
-        pub fn access(self: *Pin) error{ResizePending}!Access {
+        pub fn access(self: *Pin) AccessError!Access {
             const buffer = self.buffer orelse @panic("Buffer.Pin used after deinit");
             return buffer.beginAccess();
         }
@@ -166,15 +227,27 @@ pub const Buffer = struct {
         bytes: []u8,
         geometry: Geometry,
 
-        /// Ends access and invalidates `bytes`. A later SIGBUS guard will
-        /// report a fault as `InvalidBacking` only after releasing all owned
-        /// state, allowing a protocol wrapper to post the client error.
+        /// Ends access and invalidates `bytes`. A guarded fault is reported
+        /// only after releasing all owned state, allowing a protocol wrapper
+        /// to post the client error.
         pub fn end(self: *Access) error{InvalidBacking}!void {
             const buffer = self.buffer orelse @panic("Buffer.Access deinitialized twice");
+            std.debug.assert(active_pool_address.load(.acquire) == @intFromPtr(buffer.pool) and access_depth > 0);
+            access_depth -= 1;
+            const outermost = access_depth == 0;
+            var faulted = false;
+            if (outermost) {
+                // The sequentially consistent RMWs delimit all mapped access
+                // before retiring the handler context and sampling its mark.
+                _ = active_pool_address.swap(0, .seq_cst);
+                faulted = backing_faulted.swap(false, .seq_cst);
+                if (faulted) buffer.pool.invalid_backing = true;
+            }
             self.buffer = null;
             self.bytes = &.{};
             buffer.pool.releaseStability();
             buffer.release();
+            if (faulted) return error.InvalidBacking;
         }
     };
 
@@ -189,15 +262,31 @@ pub const Buffer = struct {
         return .{ .buffer = self };
     }
 
-    pub fn access(self: *Buffer) error{ResizePending}!Access {
+    pub const AccessError = error{ ResizePending, AccessConflict, InvalidBacking, SignalSetupFailed };
+
+    pub fn access(self: *Buffer) AccessError!Access {
         return self.beginAccess();
     }
 
-    fn beginAccess(self: *Buffer) error{ResizePending}!Access {
+    fn beginAccess(self: *Buffer) AccessError!Access {
+        if (self.pool.invalid_backing) return error.InvalidBacking;
+        const pool_address = active_pool_address.load(.acquire);
+        if (pool_address != 0) {
+            const pool: *Pool = @ptrFromInt(pool_address);
+            if (pool != self.pool) return error.AccessConflict;
+        } else {
+            try ensureHandler();
+        }
         const end = self.geometry.offset + self.geometry.byte_len;
         if (end > self.pool.mapping.len) return error.ResizePending;
         self.retain();
         self.pool.acquireStability();
+        if (pool_address == 0) {
+            backing_faulted.store(false, .seq_cst);
+            // Publish the handler context before callers can touch bytes.
+            _ = active_pool_address.swap(@intFromPtr(self.pool), .seq_cst);
+        }
+        access_depth += 1;
         return .{
             .buffer = self,
             .bytes = self.pool.mapping[self.geometry.offset..end],
@@ -326,6 +415,107 @@ test "latest deferred resize wins while an old access remains stable" {
     try replacement_access.end();
     buffer.dropResource();
     pool.dropResource();
+}
+
+test "truncated backing is replaced and invalidates future access" {
+    const page_size = std.heap.page_size_min;
+    const pool_size = page_size * 3;
+    const fd = try testFd(pool_size);
+    const pool = try Pool.create(std.testing.allocator, fd, @intCast(pool_size));
+    const buffer = try pool.createBuffer(0, 1, 3, @intCast(page_size), 0);
+    var access = try buffer.access();
+    const original_pointer = access.bytes.ptr;
+    const first: *volatile u8 = @ptrCast(&access.bytes[0]);
+    first.* = 23;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, @intCast(page_size))));
+    const faulting: *volatile u8 = @ptrCast(&access.bytes[page_size]);
+    faulting.* = 42;
+    try std.testing.expectEqual(original_pointer, access.bytes.ptr);
+    try std.testing.expectEqual(@as(u8, 0), first.*);
+    try std.testing.expectEqual(@as(u8, 42), faulting.*);
+    try std.testing.expectError(error.InvalidBacking, access.end());
+    try std.testing.expectError(error.InvalidBacking, buffer.access());
+    buffer.dropResource();
+    pool.dropResource();
+}
+
+test "nested guards defer backing failure until the outermost end" {
+    const fd = try testFd(64);
+    const pool = try Pool.create(std.testing.allocator, fd, 64);
+    const buffer = try pool.createBuffer(0, 1, 1, 4, 0);
+    var outer = try buffer.access();
+    var inner = try buffer.access();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 0)));
+    inner.bytes[0] = 1;
+    try inner.end();
+    try std.testing.expectError(error.InvalidBacking, outer.end());
+    buffer.dropResource();
+    pool.dropResource();
+}
+
+test "nested access to another pool conflicts without disturbing guards" {
+    const first_fd = try testFd(64);
+    const first_pool = try Pool.create(std.testing.allocator, first_fd, 64);
+    const first = try first_pool.createBuffer(0, 1, 1, 4, 0);
+    const second_fd = try testFd(64);
+    const second_pool = try Pool.create(std.testing.allocator, second_fd, 64);
+    const second = try second_pool.createBuffer(0, 1, 1, 4, 0);
+
+    var first_access = try first.access();
+    try std.testing.expectError(error.AccessConflict, second.access());
+    first_access.bytes[0] = 7;
+    try first_access.end();
+    var second_access = try second.access();
+    second_access.bytes[0] = 9;
+    try second_access.end();
+
+    first.dropResource();
+    first_pool.dropResource();
+    second.dropResource();
+    second_pool.dropResource();
+}
+
+test "guard state is isolated between threads accessing different pools" {
+    const Context = struct {
+        ready: *std.atomic.Value(u32),
+        buffer: *Buffer,
+        fd: std.posix.fd_t,
+        recovered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var access = self.buffer.access() catch return;
+            _ = self.ready.fetchAdd(1, .acq_rel);
+            while (self.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+            if (linux.errno(linux.ftruncate(self.fd, 0)) != .SUCCESS) return;
+            const faulting: *volatile u8 = @ptrCast(&access.bytes[0]);
+            faulting.* = 1;
+            access.end() catch |err| {
+                if (err == error.InvalidBacking) self.recovered.store(true, .release);
+                return;
+            };
+        }
+    };
+
+    const first_fd = try testFd(std.heap.page_size_min);
+    const first_pool = try Pool.create(std.testing.allocator, first_fd, std.heap.page_size_min);
+    const first = try first_pool.createBuffer(0, 1, 1, 4, 0);
+    const second_fd = try testFd(std.heap.page_size_min);
+    const second_pool = try Pool.create(std.testing.allocator, second_fd, std.heap.page_size_min);
+    const second = try second_pool.createBuffer(0, 1, 1, 4, 0);
+    var ready: std.atomic.Value(u32) = .init(0);
+    var first_context: Context = .{ .ready = &ready, .buffer = first, .fd = first_fd };
+    var second_context: Context = .{ .ready = &ready, .buffer = second, .fd = second_fd };
+    const first_thread = try std.Thread.spawn(.{}, Context.run, .{&first_context});
+    const second_thread = try std.Thread.spawn(.{}, Context.run, .{&second_context});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(first_context.recovered.load(.acquire));
+    try std.testing.expect(second_context.recovered.load(.acquire));
+
+    first.dropResource();
+    first_pool.dropResource();
+    second.dropResource();
+    second_pool.dropResource();
 }
 
 test "initial undersized file is rejected without adopting fd" {
