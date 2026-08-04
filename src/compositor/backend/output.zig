@@ -251,6 +251,10 @@ pub fn powered(self: *const Self) bool {
     };
 }
 
+pub fn isHeadless(self: *const Self) bool {
+    return self.backend == .headless;
+}
+
 /// Applies a built-in cursor shape when this backend can safely use hardware.
 /// False means the caller must retain software composition.
 pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {

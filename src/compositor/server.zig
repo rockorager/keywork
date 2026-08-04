@@ -147,6 +147,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
 surface_registry: SurfaceRegistry,
+headless_surfaces: std.ArrayList(HeadlessSurfaceEntry),
 control: Control,
 control_initialized: bool,
 appearance_client: AppearanceClient,
@@ -841,6 +842,13 @@ const XwaylandWindow = struct {
     surface_id: Surface.Id,
 };
 
+/// Server-owned Phase 1 presentation state. Global position is fixed at
+/// (0, 0); provider state stays borrowed from SurfaceRegistry at render time.
+const HeadlessSurfaceEntry = struct {
+    id: SurfaceRegistry.Id,
+    size: ?render.Size = null,
+};
+
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
@@ -955,6 +963,7 @@ pub fn createWithVirtualOutput(
         .io = io,
         .display = display,
         .surface_registry = SurfaceRegistry.init(allocator),
+        .headless_surfaces = .empty,
         .control = undefined,
         .control_initialized = false,
         .appearance_client = undefined,
@@ -1080,6 +1089,7 @@ pub fn createWithVirtualOutput(
         .xwayland_display_listener = null,
     };
     errdefer self.surface_registry.deinit();
+    errdefer self.headless_surfaces.deinit(allocator);
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
@@ -1919,6 +1929,8 @@ pub fn destroy(self: *Self) void {
     self.routed_keys.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
+    std.debug.assert(self.headless_surfaces.items.len == 0);
+    self.headless_surfaces.deinit(allocator);
     self.surface_registry.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
     if (self.session_initialized) self.session.deinit();
@@ -3628,6 +3640,59 @@ pub fn terminate(self: *Self) void {
     self.display.terminate();
 }
 
+/// The provider remains live until removal. A mapped provider must keep its
+/// committed logical size and RenderState available until it commits an unmap.
+fn addHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+    std.debug.assert(self.surface_registry.contains(id));
+    std.debug.assert(self.headlessSurfaceIndex(id) == null);
+    try self.headless_surfaces.append(self.allocator, .{ .id = id });
+}
+
+fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size) void {
+    std.debug.assert(self.surface_registry.contains(id));
+    if (size) |mapped| std.debug.assert(mapped.width > 0 and mapped.height > 0);
+    const index = self.headlessSurfaceIndex(id) orelse unreachable;
+    const entry = &self.headless_surfaces.items[index];
+    if (entry.size) |old_size| {
+        self.damageHeadlessSurfaceBounds(.{
+            .x = 0,
+            .y = 0,
+            .width = old_size.width,
+            .height = old_size.height,
+        }, index);
+    }
+    entry.size = size;
+    if (size) |new_size| {
+        self.damageHeadlessSurfaceBounds(.{
+            .x = 0,
+            .y = 0,
+            .width = new_size.width,
+            .height = new_size.height,
+        }, index);
+    }
+}
+
+fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
+    std.debug.assert(self.surface_registry.contains(id));
+    const index = self.headlessSurfaceIndex(id) orelse unreachable;
+    if (self.headless_surfaces.items[index].size) |old_size| {
+        self.damageHeadlessSurfaceBounds(.{
+            .x = 0,
+            .y = 0,
+            .width = old_size.width,
+            .height = old_size.height,
+        }, index);
+    }
+    _ = self.headless_surfaces.orderedRemove(index);
+}
+
+fn headlessSurfaceIndex(self: *const Self, id: SurfaceRegistry.Id) ?usize {
+    for (self.headless_surfaces.items, 0..) |entry, index| {
+        if (std.meta.eql(entry.id, id)) return index;
+    }
+    return null;
+}
+
 noinline fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     log.debug("full repaint requested by 0x{x}", .{@returnAddress()});
@@ -4906,6 +4971,32 @@ fn damageGlobalRect(
                 self.damageFullOutput(render_output);
                 continue;
             };
+            if (render_output.backend.isHeadless()) {
+                const synthetic_blur_changed = self.expandHeadlessSurfaceBlurDamage(
+                    render_output,
+                    output,
+                    &surface_damage,
+                    0,
+                ) catch {
+                    self.damageFullOutput(render_output);
+                    continue;
+                };
+                if (synthetic_blur_changed) {
+                    // Mature blur owners above this layer may sample pixels
+                    // added by the synthetic pass rather than the original
+                    // source damage. A second mature fixed point closes the
+                    // strictly mature -> synthetic -> mature dependency chain.
+                    self.expandBackdropBlurDamage(
+                        render_output,
+                        output,
+                        &surface_damage,
+                        root,
+                    ) catch {
+                        self.damageFullOutput(render_output);
+                        continue;
+                    };
+                }
+            }
             if (Logging.enabled(.debug) and surface_damage.coversRectangle(
                 0,
                 0,
@@ -4950,6 +5041,111 @@ fn damageGlobalRect(
         render_output.requestFrame();
         self.scheduleRepaint(render_output);
     }
+}
+
+fn damageHeadlessSurfaceBounds(
+    self: *Self,
+    rectangle: render.Rect,
+    source_index: usize,
+) void {
+    std.debug.assert(source_index < self.headless_surfaces.items.len);
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (!render_output.backend.isHeadless() or !render_output.backend.powered()) continue;
+        const output = self.outputs.get(render_output.protocol_id).?;
+        const output_rect = output.logicalRect();
+        const intersection = rectangle.intersection(output_rect) orelse continue;
+        const physical = damage_geometry.scaleRect(
+            .{
+                .x = intersection.x -| output_rect.x,
+                .y = intersection.y -| output_rect.y,
+                .width = intersection.width,
+                .height = intersection.height,
+            },
+            render_output.backend.renderScale(),
+            render_output.backend.modeSize(),
+        ) orelse continue;
+
+        var damage = Region.init();
+        defer damage.deinit();
+        damage.setRectangle(physical.x, physical.y, physical.width, physical.height);
+        _ = self.expandHeadlessSurfaceBlurDamage(
+            render_output,
+            output,
+            &damage,
+            source_index + 1,
+        ) catch {
+            self.damageFullOutput(render_output);
+            continue;
+        };
+        // The synthetic source has no libwayland root to compare against
+        // mature blur owners. Treat it as lower than every mature scene node;
+        // unresolved out-of-scene owners conservatively invalidate this output.
+        self.expandBackdropBlurDamage(render_output, output, &damage, null) catch {
+            self.damageFullOutput(render_output);
+            continue;
+        };
+        var rectangles = damage.rectangleIterator();
+        while (rectangles.next()) |damaged| {
+            render_output.damage.add(
+                damaged.x,
+                damaged.y,
+                @intCast(damaged.width),
+                @intCast(damaged.height),
+            ) catch {
+                self.damageFullOutput(render_output);
+                break;
+            };
+        } else {
+            render_output.requestFrame();
+            self.scheduleRepaint(render_output);
+        }
+    }
+}
+
+fn expandHeadlessSurfaceBlurDamage(
+    self: *Self,
+    render_output: *const RenderOutput,
+    output: *const Output,
+    damage: *Region,
+    first_index: usize,
+) (Region.Error || error{UnresolvedBlurSource})!bool {
+    std.debug.assert(first_index <= self.headless_surfaces.items.len);
+    const blur = Scene.background_blur;
+    var any_changed = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (self.headless_surfaces.items[first_index..]) |entry| {
+            const mapped_size = entry.size orelse continue;
+            const render_state = self.surface_registry.renderState(entry.id) orelse
+                return error.UnresolvedBlurSource;
+            std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
+            if (renderStateFullyOpaque(render_state)) continue;
+            const region = render_state.blur_region orelse continue;
+            var rectangles = region.rectangleIterator();
+            while (rectangles.next()) |rectangle| {
+                const local = surfaceEffectRect(rectangle, mapped_size) orelse continue;
+                const affected = backdrop_blur_damage.areaForOutput(
+                    local,
+                    output.logicalRect(),
+                    render_output.backend.renderScale(),
+                    render_output.backend.modeSize(),
+                    blur.radius,
+                    blur.downsample_level,
+                ) orelse continue;
+                const propagated = try backdrop_blur_damage.propagate(
+                    damage,
+                    affected,
+                    render_output.backend.modeSize(),
+                );
+                changed = propagated or changed;
+                any_changed = propagated or any_changed;
+            }
+        }
+    }
+    return any_changed;
 }
 
 noinline fn damageFullOutput(self: *Self, output: *RenderOutput) void {
@@ -8882,6 +9078,7 @@ fn renderDesktopContents(
             try self.renderCommands(frame, &cache_command);
         }
         try self.renderLayerSurfaces(frame, .bottom);
+        try self.renderHeadlessSurfaces(frame);
         if (top_fullscreen != null) try self.renderLayerSurfaces(frame, .top);
     }
     var fullscreen_reached = top_fullscreen == null;
@@ -8954,12 +9151,11 @@ fn fullscreenOccludesLowerLayers(
     window: *const Scene.Window,
     output_rect: render.Rect,
 ) bool {
-    const surfaces = self.compositor.surfaceStore();
-    const buffer = Surface.currentBuffer(surfaces, window.surface_id) orelse return false;
+    const render_state = self.surface_registry.renderState(window.surface_id) orelse return false;
     return window_geometry.fullscreenRootOccludesOutput(
         window,
-        buffer.logical_size,
-        surfaceFullyOpaque(surfaces, window.surface_id, buffer),
+        render_state.logical_size,
+        renderStateFullyOpaque(render_state),
         output_rect,
     );
 }
@@ -9213,6 +9409,58 @@ fn renderLayerSurfaces(
             null,
             capture_id,
         );
+    }
+}
+
+fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error!void {
+    if (!frame.render_output.backend.isHeadless()) return;
+    for (self.headless_surfaces.items) |entry| {
+        const mapped_size = entry.size orelse continue;
+        const render_state = self.surface_registry.renderState(entry.id) orelse continue;
+        std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
+        const surface_rect: render.Rect = .{
+            .x = 0,
+            .y = 0,
+            .width = mapped_size.width,
+            .height = mapped_size.height,
+        };
+        if (surface_rect.intersection(frame.visible_rect) == null) continue;
+
+        const capture_id: ?u32 = if (renderStateBlurBounds(
+            frame,
+            render_state,
+            0,
+            0,
+            null,
+            null,
+        )) |rect| capture: {
+            const blur = Scene.background_blur;
+            const id = try allocateBackdropCaptureId(frame);
+            const command = [_]render.Command{.{ .backdrop_capture = .{
+                .id = id,
+                .rect = rect,
+                .radius = blur.radius,
+                .downsample_level = blur.downsample_level,
+                .finish = blur.finish,
+            } }};
+            try self.renderCommands(frame, &command);
+            break :capture id;
+        } else null;
+        try self.renderSurfaceBackgroundEffect(
+            frame,
+            render_state,
+            0,
+            0,
+            null,
+            null,
+            capture_id,
+        );
+        const command = [_]render.Command{.{ .image = imageFromRenderState(
+            render_state,
+            .{ .position = .{}, .rounded_clip = null, .clip = null },
+            null,
+        ) }};
+        try self.renderCommands(frame, &command);
     }
 }
 
@@ -9709,12 +9957,9 @@ fn renderWindow(
     id: Scene.Id,
     window: *const Scene.Window,
 ) Renderer.Error!void {
-    const root_buffer = Surface.currentBuffer(
-        self.compositor.surfaceStore(),
-        window.surface_id,
-    ) orelse return;
+    const root_render_state = self.surface_registry.renderState(window.surface_id) orelse return;
     const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
-        .size = root_buffer.logical_size,
+        .size = root_render_state.logical_size,
     };
     const content_rect = window_geometry.windowContentRect(window, content_geometry.size) orelse return;
     if (transitionIndex(self, id)) |transition_index| {
@@ -9899,11 +10144,11 @@ fn renderSurfaceTreeContents(
                 capture_id,
             );
             const image_command = [_]render.Command{
-                .{ .image = imageFromRenderState(surface_id, render_state, .{
+                .{ .image = imageFromRenderState(render_state, .{
                     .position = .{ .x = x, .y = y },
                     .rounded_clip = rounded_clip,
                     .clip = clip,
-                }) },
+                }, surfaceSampleTag(surface_id)) },
             };
             try self.renderCommands(frame, &image_command);
         },
@@ -9934,16 +10179,14 @@ fn surfaceTreeBlurBounds(
     while (stack.next()) |entry| switch (entry) {
         .parent => {
             const render_state = self.surface_registry.renderState(surface_id) orelse continue;
-            if (renderStateFullyOpaque(render_state)) continue;
-            const region = render_state.blur_region orelse continue;
-            var rectangles = region.rectangleIterator();
-            while (rectangles.next()) |rectangle| {
-                var effect = (surfaceEffectRect(rectangle, render_state.logical_size) orelse continue).translated(x, y);
-                effect = effect.intersection(frame.visible_rect) orelse continue;
-                if (rounded_clip) |rounded| effect = effect.intersection(rounded.rect) orelse continue;
-                if (clip) |clip_rect| effect = effect.intersection(clip_rect) orelse continue;
-                result = if (result) |old| old.unionWith(effect) else effect;
-            }
+            if (renderStateBlurBounds(
+                frame,
+                render_state,
+                x,
+                y,
+                rounded_clip,
+                clip,
+            )) |rect| result = if (result) |old| old.unionWith(rect) else rect;
         },
         .child => |child| {
             if (self.surfaceTreeBlurBounds(
@@ -9956,6 +10199,29 @@ fn surfaceTreeBlurBounds(
             )) |child_rect| result = if (result) |old| old.unionWith(child_rect) else child_rect;
         },
     };
+    return result;
+}
+
+fn renderStateBlurBounds(
+    frame: *const OutputFrame,
+    render_state: SurfaceRegistry.RenderState,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+) ?render.Rect {
+    if (renderStateFullyOpaque(render_state)) return null;
+    const region = render_state.blur_region orelse return null;
+    var result: ?render.Rect = null;
+    var rectangles = region.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        var effect = (surfaceEffectRect(rectangle, render_state.logical_size) orelse continue)
+            .translated(x, y);
+        effect = effect.intersection(frame.visible_rect) orelse continue;
+        if (rounded_clip) |rounded| effect = effect.intersection(rounded.rect) orelse continue;
+        if (clip) |clip_rect| effect = effect.intersection(clip_rect) orelse continue;
+        result = if (result) |old| old.unionWith(effect) else effect;
+    }
     return result;
 }
 
@@ -10006,16 +10272,16 @@ const ImagePlacement = struct {
 };
 
 fn imageFromRenderState(
-    surface_id: SurfaceRegistry.Id,
     render_state: SurfaceRegistry.RenderState,
     placement: ImagePlacement,
+    sample_tag: ?u64,
 ) render.Image {
     return .{
         .x = placement.position.x,
         .y = placement.position.y,
         .size = render_state.logical_size,
         .buffer = render_state.buffer,
-        .sample_tag = surfaceSampleTag(surface_id),
+        .sample_tag = sample_tag,
         .source = render_state.source,
         .transform = render_state.transform,
         .rounded_clip = placement.rounded_clip,
@@ -10103,10 +10369,6 @@ test "reproducible scene: render-state surface images preserve mature commands a
         }
     };
 
-    const surface_id: SurfaceRegistry.Id = .{
-        .index = 0x1234_5678,
-        .generation = 0x9abc_def0,
-    };
     const sample_tag: u64 = 0x9abc_def0_1234_5678;
     var copied_xrgb_pixels = [_]u32{
         0xff10_2030,
@@ -10144,11 +10406,11 @@ test "reproducible scene: render-state surface images preserve mature commands a
         .rounded_clip = rounded_placement.rounded_clip,
         .clip = rounded_placement.clip,
         .is_opaque = true,
-    }, imageFromRenderState(surface_id, .{
+    }, imageFromRenderState(.{
         .buffer = copied_xrgb,
         .logical_size = .{ .width = 2, .height = 2 },
         .force_opaque = true,
-    }, rounded_placement));
+    }, rounded_placement, sample_tag));
 
     var partial_opaque = Region.init();
     defer partial_opaque.deinit();
@@ -10211,7 +10473,7 @@ test "reproducible scene: render-state surface images preserve mature commands a
     };
     try expectImagesEquivalent(
         transformed_expected,
-        imageFromRenderState(surface_id, transformed_state, clipped_placement),
+        imageFromRenderState(transformed_state, clipped_placement, sample_tag),
     );
 
     var partial_alpha_state = transformed_state;
@@ -10221,7 +10483,7 @@ test "reproducible scene: render-state surface images preserve mature commands a
     partial_alpha_expected.alpha_multiplier = 0x8000_0000;
     try expectImagesEquivalent(
         partial_alpha_expected,
-        imageFromRenderState(surface_id, partial_alpha_state, clipped_placement),
+        imageFromRenderState(partial_alpha_state, clipped_placement, sample_tag),
     );
 
     var full_opaque = Region.init();
@@ -10234,7 +10496,7 @@ test "reproducible scene: render-state surface images preserve mature commands a
     full_opaque_expected.opaque_region = .{};
     try expectImagesEquivalent(
         full_opaque_expected,
-        imageFromRenderState(surface_id, full_opaque_state, clipped_placement),
+        imageFromRenderState(full_opaque_state, clipped_placement, sample_tag),
     );
 
     const dmabuf_size: render.Size = .{ .width = 4, .height = 3 };
@@ -10291,9 +10553,9 @@ test "reproducible scene: render-state surface images preserve mature commands a
         .clip = null,
     };
     const dmabuf_image: render.Image = imageFromRenderState(
-        surface_id,
         dmabuf_state,
         scanout_placement,
+        sample_tag,
     );
     try expectImagesEquivalent(.{
         .x = 0,
@@ -10471,6 +10733,506 @@ fn submitWindowPopups(self: *Self, output: *Output, window_id: Scene.Id) void {
         if (!entry.popup.mapped) continue;
         self.submitSurfaceTree(output, entry.popup.surface_id);
     }
+}
+
+const SyntheticSurfaceProvider = struct {
+    pixel: u32,
+    logical_size: render.Size,
+    available: bool = true,
+    force_opaque: bool = true,
+    blur_region: ?*const Region = null,
+    dmabuf: bool = false,
+    version: u64 = 1,
+    render_calls: usize = 0,
+
+    fn provider(self: *SyntheticSurfaceProvider) SurfaceRegistry.Provider {
+        return .{ .context = self, .render_state = renderState };
+    }
+
+    fn renderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
+        const self: *SyntheticSurfaceProvider = @ptrCast(@alignCast(context));
+        self.render_calls += 1;
+        if (!self.available) return null;
+        const buffer: render.PixelBuffer = if (self.dmabuf) .{
+            .size = self.logical_size,
+            .stride_pixels = self.logical_size.width,
+            .dmabuf = .{
+                .context = self,
+                .format = @intFromEnum(render.DmabufFormat.xrgb8888),
+                .modifier = 0,
+                .planes = .{
+                    .{
+                        .fd = -1,
+                        .stride = self.logical_size.width * @sizeOf(u32),
+                        .required_bytes = @as(u64, self.logical_size.width) *
+                            self.logical_size.height * @sizeOf(u32),
+                    },
+                    .{},
+                    .{},
+                    .{},
+                },
+                .plane_count = 1,
+                .y_inverted = false,
+                .force_opaque = true,
+                .retain = dmabufRetain,
+                .release = dmabufRelease,
+                .begin_cpu_read = dmabufBeginCpuRead,
+                .end_cpu_read = dmabufEndCpuRead,
+                .export_read_fence = dmabufExportReadFence,
+            },
+            .source_cache = .{ .id = @intFromPtr(self), .version = self.version },
+        } else .{
+            .size = .{ .width = 1, .height = 1 },
+            .stride_pixels = 1,
+            .pixels = @as([*]u32, @ptrCast(&self.pixel))[0..1],
+            .source_cache = .{ .id = @intFromPtr(self), .version = self.version },
+        };
+        return .{
+            .buffer = buffer,
+            .logical_size = self.logical_size,
+            .force_opaque = self.force_opaque,
+            .blur_region = self.blur_region,
+        };
+    }
+
+    fn dmabufRetain(_: *anyopaque) void {}
+    fn dmabufRelease(_: *anyopaque) void {}
+    fn dmabufBeginCpuRead(_: *anyopaque) bool {
+        return true;
+    }
+    fn dmabufEndCpuRead(_: *anyopaque) bool {
+        return true;
+    }
+    fn dmabufExportReadFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
+        return null;
+    }
+};
+
+fn resetTestOutputDamage(output: *RenderOutput) void {
+    output.damage.clear();
+    output.repaint_needed = false;
+}
+
+fn captureSinglePixel(server: *Self) Renderer.Error!u32 {
+    var pixel: [1]u32 = undefined;
+    _ = try server.captureOutput(server.primaryRenderOutput().protocol_id, false, .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &pixel,
+    });
+    return pixel[0];
+}
+
+test "headless surfaces preserve mapping damage and ordered replacement" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 8, .height = 8 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    resetTestOutputDamage(output);
+
+    var first: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_0000,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    const first_id = try server.surface_registry.add(first.provider());
+    try server.addHeadlessSurface(first_id);
+    try std.testing.expect(output.damage.isEmpty());
+    try std.testing.expect(!output.repaint_needed);
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.focusedSurface());
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.topWindowSurface());
+    try std.testing.expect(!server.scene.surfaceTracked(first_id));
+    try std.testing.expect(!server.scene.surfaceMapped(first_id));
+    try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
+    try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(first_id));
+
+    server.commitHeadlessSurface(first_id, first.logical_size);
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
+
+    resetTestOutputDamage(output);
+    server.commitHeadlessSurface(first_id, first.logical_size);
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
+
+    resetTestOutputDamage(output);
+    first.logical_size = .{ .width = 4, .height = 1 };
+    first.version += 1;
+    server.commitHeadlessSurface(first_id, first.logical_size);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 1));
+
+    resetTestOutputDamage(output);
+    server.commitHeadlessSurface(first_id, null);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 1));
+
+    var second: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_ff00,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const second_id = try server.surface_registry.add(second.provider());
+    try server.addHeadlessSurface(second_id);
+    server.commitHeadlessSurface(second_id, second.logical_size);
+    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{
+        .{ .id = first_id, .size = null },
+        .{ .id = second_id, .size = second.logical_size },
+    }, server.headless_surfaces.items);
+
+    resetTestOutputDamage(output);
+    server.removeHeadlessSurface(first_id);
+    try std.testing.expect(output.damage.isEmpty());
+    server.surface_registry.remove(first_id);
+
+    var replacement: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_00ff,
+        .logical_size = .{ .width = 3, .height = 2 },
+    };
+    const replacement_id = try server.surface_registry.add(replacement.provider());
+    try server.addHeadlessSurface(replacement_id);
+    server.commitHeadlessSurface(replacement_id, replacement.logical_size);
+    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{
+        .{ .id = second_id, .size = second.logical_size },
+        .{ .id = replacement_id, .size = replacement.logical_size },
+    }, server.headless_surfaces.items);
+
+    resetTestOutputDamage(output);
+    server.removeHeadlessSurface(second_id);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 1, 1));
+    server.surface_registry.remove(second_id);
+    server.removeHeadlessSurface(replacement_id);
+    server.surface_registry.remove(replacement_id);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+}
+
+test "headless surface damage respects output geometry and conservative blur dependencies" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 8, .height = 8 } },
+    );
+    defer server.destroy();
+    const scaled_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 6, .height = 2 },
+        .scale = .{ .numerator = 240 },
+        .position = .{ .x = -1 },
+        .name = "HEADLESS-SCALED",
+        .description = "Keywork scaled test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(scaled_id));
+    const unrelated_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 2, .height = 2 },
+        .position = .{ .x = 20 },
+        .name = "HEADLESS-UNRELATED",
+        .description = "Keywork unrelated test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(unrelated_id));
+    const primary = server.primaryRenderOutput();
+    const scaled = server.render_outputs.get(scaled_id).?.*;
+    const unrelated = server.render_outputs.get(unrelated_id).?.*;
+    resetTestOutputDamage(primary);
+    resetTestOutputDamage(scaled);
+    resetTestOutputDamage(unrelated);
+
+    var blur_region = Region.init();
+    defer blur_region.deinit();
+    try blur_region.add(0, 0, 2, 2);
+    var lower: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var upper: SyntheticSurfaceProvider = .{
+        .pixel = 0x8011_2233,
+        .logical_size = .{ .width = 2, .height = 2 },
+        .force_opaque = false,
+        .blur_region = &blur_region,
+    };
+    const lower_id = try server.surface_registry.add(lower.provider());
+    const upper_id = try server.surface_registry.add(upper.provider());
+    try server.addHeadlessSurface(lower_id);
+    try server.addHeadlessSurface(upper_id);
+    server.commitHeadlessSurface(lower_id, lower.logical_size);
+    server.commitHeadlessSurface(upper_id, upper.logical_size);
+    resetTestOutputDamage(primary);
+    resetTestOutputDamage(scaled);
+    resetTestOutputDamage(unrelated);
+
+    server.commitHeadlessSurface(lower_id, lower.logical_size);
+    try std.testing.expect(primary.damage.coversRectangle(0, 0, 8, 8));
+    try std.testing.expect(scaled.damage.coversRectangle(0, 0, 6, 2));
+    try std.testing.expect(unrelated.damage.isEmpty());
+    try std.testing.expect(!unrelated.repaint_needed);
+
+    resetTestOutputDamage(primary);
+    resetTestOutputDamage(scaled);
+    resetTestOutputDamage(unrelated);
+    // Mature background/bottom commits enter through damageGlobalRect with a
+    // libwayland root and must still invalidate synthetic blur owners above.
+    server.damageGlobalRect(
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        lower_id,
+        null,
+    );
+    try std.testing.expect(primary.damage.coversRectangle(0, 0, 8, 8));
+    try std.testing.expect(scaled.damage.coversRectangle(0, 0, 6, 2));
+    try std.testing.expect(unrelated.damage.isEmpty());
+
+    resetTestOutputDamage(primary);
+    resetTestOutputDamage(scaled);
+    resetTestOutputDamage(unrelated);
+    upper.available = false;
+    server.commitHeadlessSurface(lower_id, lower.logical_size);
+    try std.testing.expect(primary.damage.coversRectangle(0, 0, 8, 8));
+    try std.testing.expect(scaled.damage.coversRectangle(0, 0, 6, 2));
+    try std.testing.expect(unrelated.damage.isEmpty());
+
+    upper.available = true;
+    server.removeHeadlessSurface(lower_id);
+    server.surface_registry.remove(lower_id);
+    server.removeHeadlessSurface(upper_id);
+    server.surface_registry.remove(upper_id);
+}
+
+test "headless surfaces render at global origin with output scale and no sample tag" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+    const scaled_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 6, .height = 2 },
+        .scale = .{ .numerator = 240 },
+        .position = .{ .x = -1 },
+        .name = "HEADLESS-SCALED",
+        .description = "Keywork scaled test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(scaled_id));
+    const scaled = server.render_outputs.get(scaled_id).?.*;
+
+    var provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff31_5273,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const id = try server.surface_registry.add(provider.provider());
+    try server.addHeadlessSurface(id);
+    server.commitHeadlessSurface(id, provider.logical_size);
+    resetTestOutputDamage(scaled);
+    server.commitHeadlessSurface(id, provider.logical_size);
+    try std.testing.expect(scaled.damage.coversRectangle(2, 0, 2, 2));
+    try std.testing.expect(!scaled.damage.coversRectangle(0, 0, 2, 2));
+
+    var pixels: [12]u32 = undefined;
+    _ = try server.captureOutput(scaled.protocol_id, false, .{
+        .size = .{ .width = 6, .height = 2 },
+        .stride_pixels = 6,
+        .pixels = &pixels,
+    });
+    const background = renderColor(server.palette.desktop_background).argb8888();
+    for (0..2) |y| {
+        try std.testing.expectEqual(background, pixels[y * 6]);
+        try std.testing.expectEqual(background, pixels[y * 6 + 1]);
+        try std.testing.expectEqual(provider.pixel, pixels[y * 6 + 2]);
+        try std.testing.expectEqual(provider.pixel, pixels[y * 6 + 3]);
+        try std.testing.expectEqual(background, pixels[y * 6 + 4]);
+        try std.testing.expectEqual(background, pixels[y * 6 + 5]);
+    }
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(id)));
+
+    provider.pixel = 0xffa1_b2c3;
+    provider.version += 1;
+    provider.render_calls = 0;
+    server.commitHeadlessSurface(id, provider.logical_size);
+    try std.testing.expectEqual(provider.pixel, try captureSinglePixel(server));
+    try std.testing.expectEqual(@as(usize, 1), provider.render_calls);
+
+    server.removeHeadlessSurface(id);
+    server.surface_registry.remove(id);
+}
+
+test "headless surface rendering is ordered between bottom and mature scene content" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+
+    var background: SyntheticSurfaceProvider = .{ .pixel = 0xff10_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var bottom: SyntheticSurfaceProvider = .{ .pixel = 0xff20_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var headless: SyntheticSurfaceProvider = .{ .pixel = 0xff30_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var window: SyntheticSurfaceProvider = .{ .pixel = 0xff40_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var shell: SyntheticSurfaceProvider = .{ .pixel = 0xff50_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var top: SyntheticSurfaceProvider = .{ .pixel = 0xff60_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    var overlay: SyntheticSurfaceProvider = .{ .pixel = 0xff70_0000, .logical_size = .{ .width = 1, .height = 1 } };
+    const background_id = try server.surface_registry.add(background.provider());
+    const bottom_id = try server.surface_registry.add(bottom.provider());
+    const headless_id = try server.surface_registry.add(headless.provider());
+    const window_id = try server.surface_registry.add(window.provider());
+    const shell_id = try server.surface_registry.add(shell.provider());
+    const top_id = try server.surface_registry.add(top.provider());
+    const overlay_id = try server.surface_registry.add(overlay.provider());
+
+    const background_scene = try server.scene.addLayerSurface(background_id, .background);
+    const bottom_scene = try server.scene.addLayerSurface(bottom_id, .bottom);
+    const window_scene = try server.scene.addWindow(window_id);
+    const shell_scene = try server.scene.addShellSurface(shell_id);
+    const top_scene = try server.scene.addLayerSurface(top_id, .top);
+    const overlay_scene = try server.scene.addLayerSurface(overlay_id, .overlay);
+    try server.addHeadlessSurface(headless_id);
+    server.commitHeadlessSurface(headless_id, headless.logical_size);
+    server.scene.setContentGeometry(window_scene, .{ .size = window.logical_size });
+    server.scene.setEffects(window_scene, .{});
+    server.scene.setLayerSurfaceMapped(background_scene, true);
+    server.scene.setLayerSurfaceMapped(bottom_scene, true);
+    server.scene.setMapped(window_scene, true);
+    server.scene.setShellSurfaceMapped(shell_scene, true);
+    server.scene.setLayerSurfaceMapped(top_scene, true);
+    server.scene.setLayerSurfaceMapped(overlay_scene, true);
+
+    try std.testing.expectEqual(overlay.pixel, try captureSinglePixel(server));
+    server.scene.setLayerSurfaceMapped(overlay_scene, false);
+    try std.testing.expectEqual(top.pixel, try captureSinglePixel(server));
+    server.scene.setLayerSurfaceMapped(top_scene, false);
+    try std.testing.expectEqual(shell.pixel, try captureSinglePixel(server));
+    server.scene.setShellSurfaceMapped(shell_scene, false);
+    try std.testing.expectEqual(window.pixel, try captureSinglePixel(server));
+    server.scene.setMapped(window_scene, false);
+    try std.testing.expectEqual(headless.pixel, try captureSinglePixel(server));
+    server.commitHeadlessSurface(headless_id, null);
+    try std.testing.expectEqual(bottom.pixel, try captureSinglePixel(server));
+    server.scene.setLayerSurfaceMapped(bottom_scene, false);
+    try std.testing.expectEqual(background.pixel, try captureSinglePixel(server));
+
+    server.scene.removeLayerSurface(overlay_scene);
+    server.scene.removeLayerSurface(top_scene);
+    server.scene.removeShellSurface(shell_scene);
+    server.scene.removeWindow(window_scene);
+    server.scene.removeLayerSurface(bottom_scene);
+    server.scene.removeLayerSurface(background_scene);
+    server.removeHeadlessSurface(headless_id);
+    server.surface_registry.remove(overlay_id);
+    server.surface_registry.remove(top_id);
+    server.surface_registry.remove(shell_id);
+    server.surface_registry.remove(window_id);
+    server.surface_registry.remove(headless_id);
+    server.surface_registry.remove(bottom_id);
+    server.surface_registry.remove(background_id);
+}
+
+test "opaque fullscreen suppresses headless surfaces and preserves direct scanout candidacy" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+    const render_output = server.primaryRenderOutput();
+    const output = server.outputs.get(render_output.protocol_id).?;
+
+    var headless: SyntheticSurfaceProvider = .{
+        .pixel = 0xff12_3456,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const headless_id = try server.surface_registry.add(headless.provider());
+    try server.addHeadlessSurface(headless_id);
+    server.commitHeadlessSurface(headless_id, headless.logical_size);
+
+    var target_pixels = [_]u32{0};
+    try server.renderer.beginFrame(.{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } }, .{}, .{}, null, .{});
+    var capture_id: u32 = 1;
+    var frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .visible_rect = output.logicalRect(),
+        .track_visibility = false,
+        .next_backdrop_capture_id = &capture_id,
+    };
+    try server.renderCommands(&frame, &.{.{ .clear = render.Color.rgba(0, 0, 0, 0) }});
+    const visible = try server.renderDesktopContents(&frame, false, false);
+    try std.testing.expect(!visible.lower_layers_occluded);
+    try std.testing.expectEqual(@as(usize, 1), headless.render_calls);
+    switch (server.renderer.directScanoutCandidate()) {
+        .rejected => |reason| try std.testing.expectEqual(
+            render.DirectScanoutRejection.non_dmabuf,
+            reason,
+        ),
+        .candidate => return error.TestUnexpectedResult,
+    }
+    server.renderer.cancelFrame();
+
+    var fullscreen: SyntheticSurfaceProvider = .{
+        .pixel = 0xffab_cdef,
+        .logical_size = .{ .width = 1, .height = 1 },
+        .dmabuf = true,
+    };
+    const fullscreen_id = try server.surface_registry.add(fullscreen.provider());
+    const fullscreen_scene = try server.scene.addWindow(fullscreen_id);
+    server.scene.setContentGeometry(fullscreen_scene, .{ .size = fullscreen.logical_size });
+    server.scene.setEffects(fullscreen_scene, .{});
+    server.scene.setMapped(fullscreen_scene, true);
+    server.scene.setFullscreen(fullscreen_scene, true);
+    headless.render_calls = 0;
+
+    try server.renderer.beginFrame(.{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } }, .{}, .{}, null, .{});
+    capture_id = 1;
+    frame.next_backdrop_capture_id = &capture_id;
+    try server.renderCommands(&frame, &.{.{ .clear = render.Color.rgba(0, 0, 0, 0) }});
+    const occluded = try server.renderDesktopContents(&frame, false, false);
+    try std.testing.expect(occluded.lower_layers_occluded);
+    try std.testing.expectEqual(@as(usize, 0), headless.render_calls);
+    switch (server.renderer.directScanoutCandidate()) {
+        .candidate => |candidate| try std.testing.expect(std.meta.eql(
+            SyntheticSurfaceProvider.renderState(&fullscreen).?.buffer,
+            candidate,
+        )),
+        .rejected => |reason| {
+            std.debug.print("unexpected direct scanout rejection: {t}\n", .{reason});
+            return error.TestUnexpectedResult;
+        },
+    }
+    server.renderer.cancelFrame();
+
+    server.scene.removeWindow(fullscreen_scene);
+    server.removeHeadlessSurface(headless_id);
+    server.surface_registry.remove(fullscreen_id);
+    server.surface_registry.remove(headless_id);
+}
+
+test "server headless surface list tears down empty" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    server.destroy();
 }
 
 test "server creates and destroys protocol globals" {
