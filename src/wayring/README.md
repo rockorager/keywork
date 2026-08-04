@@ -345,6 +345,32 @@ uses io_uring, and cancellation/short-write tests pass.
 Publish a small example that demonstrates library use without becoming a
 compositor framework.
 
+The checkpoint example is built (but not installed) with:
+
+```sh
+zig build wayring-example
+zig build run-wayring-example -- /tmp/wayring-example.sock
+```
+
+In another shell, an ordinary system client can inspect it using the absolute
+socket path directly:
+
+```sh
+WAYLAND_DISPLAY=/tmp/wayring-example.sock wayland-info
+```
+
+The example exits when its first accepted client becomes terminal or
+disconnects. Any additional connections accepted before shutdown are tracked
+and released during the same drain. It publishes `wl_compositor`; surfaces can
+be created and destroyed, while rendering requests and regions produce a clear
+implementation-fatal error. The host owns the listening socket and `IoUring`,
+fills the submission queue through `prepareNext`, installs bounded external
+completion routes before submitting, retries short submissions before waiting,
+reaps complete CQ batches, and routes each completion back through `complete`.
+On exit it destroys application resources before releasing every connection,
+then prepares shutdown cancellation SQEs until the transport is drained. No
+Keywork event loop or compositor code is involved.
+
 Exit: the example is sufficient API documentation and interoperates with an
 external client.
 

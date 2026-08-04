@@ -110,6 +110,25 @@ pub fn build(b: *std.Build) void {
     const run_core_protocol_check = b.addRunArtifact(b.addTest(.{ .root_module = core_protocol_check }));
     test_wayring_step.dependOn(&run_core_protocol_check.step);
     test_step.dependOn(&run_core_protocol_check.step);
+    const wayring_example = b.addExecutable(.{
+        .name = "wayring-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wayring/example_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    const wayring_example_step = b.step("wayring-example", "Compile the minimal standalone Wayring server example");
+    wayring_example_step.dependOn(&wayring_example.step);
+    test_wayring_step.dependOn(&wayring_example.step);
+    const run_wayring_example = b.addRunArtifact(wayring_example);
+    if (b.args) |args| run_wayring_example.addArgs(args);
+    const run_wayring_example_step = b.step("run-wayring-example", "Run the once-only Wayring server example");
+    run_wayring_example_step.dependOn(&run_wayring_example.step);
     const checkpoint3_test_module = b.createModule(.{
         .root_source_file = b.path("src/wayring/checkpoint3_test.zig"),
         .target = target,
