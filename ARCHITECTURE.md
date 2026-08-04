@@ -22,6 +22,23 @@ The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
 the loop's generic callback and phase contracts.
 
+### Wayring (`src/wayring/`)
+
+Owns the reusable, policy-free Zig implementation of Wayland protocol framing,
+typed protocol code generation, server object state initially, and transport
+adapters. Client object state is a separate later boundary. Its core is
+sans-I/O: applications supply received bytes and file descriptors, drain
+pending output, and decide how readiness or completions are scheduled. A Linux
+io_uring adapter may drive that core without owning the host application's
+event loop or ring.
+
+Wayring must not depend on the Keywork loop, runtime, UI, Lua, compositor,
+shell, or stream components. Those components may consume its public module;
+compositor and application policy remains with the consuming component rather
+than generated bindings or Wayring itself. Server support is the first
+implementation boundary. Client support and any libwayland C ABI facade are
+separate later boundaries.
+
 ### UI (`src/ui/`)
 
 Owns the platform-neutral native UI implementation:
@@ -154,6 +171,12 @@ The native runtime consumes `keywork-ui-engine`, `keywork-ui`, and
 application host; native Zig applications do the same without LuaJIT. The
 shell relies on the deployed `keywork` executable and public Lua API.
 
+Wayring is a lower-level protocol library. The compositor may consume its
+server API and the runtime or stream components may eventually consume its
+client API, but Wayring never depends back on those products. In particular,
+Wayring does not own compositor globals, surface policy, rendering, input
+routing, or Vulkan presentation.
+
 The compositor and runtime have no source-code dependency on each other.
 Session integration between the compositor and shell is a deployed-process
 contract, not permission for source imports between them. Compositor
@@ -210,6 +233,11 @@ Current source module roots are:
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 | `keyworkctl-compositor` | `src/compositor/keyworkctl/root.zig` | `keywork-control`, `varlink` |
 | `keywork-stream` | `src/stream/main.zig` | generated Wayland bindings |
+
+The planned `wayring` module root is `src/wayring/root.zig` with no Keywork
+module dependencies. Generated Wayring protocol modules will depend on that
+public module. It becomes a current module root when its first implementation
+checkpoint is wired into `build.zig`.
 
 The `keyworkctl` executable root is `src/keyworkctl/main.zig`. It imports the
 compositor adapter through the named `keyworkctl-compositor` module and the
