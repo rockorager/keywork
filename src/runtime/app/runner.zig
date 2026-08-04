@@ -1093,8 +1093,8 @@ fn WindowManager(comptime Backend: type) type {
         }
 
         /// Diffs the declared window set against live surfaces: destroys
-        /// closed and dropped windows, creates missing ones. Declarations are
-        /// built into a throwaway arena.
+        /// closed and dropped windows, rebuilds retained windows, and creates
+        /// missing ones. Declarations are built into a throwaway arena.
         fn reconcile(self: *Self) !void {
             self.reconcile_pending = false;
 
@@ -1148,7 +1148,13 @@ fn WindowManager(comptime Backend: type) type {
 
             for (decls) |decl| {
                 if (self.closed_ids.contains(decl.id)) continue;
-                if (self.findManaged(decl.id) != null) continue;
+                if (self.findManaged(decl.id)) |managed| {
+                    // Building the window set also replaces the host's
+                    // captured child for every id. Refresh retained runtimes
+                    // so child changes are not limited to the first frame.
+                    try managed.runtime.invalidate();
+                    continue;
+                }
                 self.createManaged(decl) catch |err| {
                     log.warn("window {s}: creation failed: {}", .{ decl.id, err });
                 };
