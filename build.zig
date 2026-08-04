@@ -55,6 +55,45 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wayring_tests.step);
     const test_wayring_step = b.step("test-wayring", "Run Wayring tests");
     test_wayring_step.dependOn(&run_wayring_tests.step);
+    const wayring_scanner = b.addExecutable(.{
+        .name = "wayring-scanner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wayring/scanner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "wayring", .module = wayring }},
+        }),
+    });
+    const generate_wayring_fixture = b.addRunArtifact(wayring_scanner);
+    generate_wayring_fixture.addFileArg(b.path("src/wayring/checkpoint2.xml"));
+    const generated_wayring_source = generate_wayring_fixture.captureStdOut(.{ .basename = "checkpoint2_generated.zig" });
+    const generated_wayring = b.createModule(.{
+        .root_source_file = generated_wayring_source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
+    const generated_wayring_check = b.addTest(.{ .root_module = generated_wayring });
+    test_wayring_step.dependOn(&b.addRunArtifact(generated_wayring_check).step);
+    const generated_wayring_api = b.createModule(.{
+        .root_source_file = generated_wayring_source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
+    const checkpoint2_test_module = b.createModule(.{
+        .root_source_file = b.path("src/wayring/checkpoint2_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    checkpoint2_test_module.addImport("generated", generated_wayring_api);
+    checkpoint2_test_module.addImport("wayring", wayring);
+    const checkpoint2_tests = b.addTest(.{ .root_module = checkpoint2_test_module });
+    const run_checkpoint2_tests = b.addRunArtifact(checkpoint2_tests);
+    test_wayring_step.dependOn(&run_checkpoint2_tests.step);
+    test_step.dependOn(&run_checkpoint2_tests.step);
+    const scanner_step = b.step("wayring-scanner", "Build the Wayring protocol scanner");
+    scanner_step.dependOn(&wayring_scanner.step);
 
     const lint_step = b.step("lint", "Run all static analysis");
     const check_step = b.step("check", "Run all tests and static analysis");

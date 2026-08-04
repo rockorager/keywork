@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 const header_size = 8;
 pub const max_message_size = std.math.maxInt(u16);
+pub const FileDescriptor = std.posix.fd_t;
 
 pub const Interface = struct {
     name: []const u8,

@@ -1,0 +1,19 @@
+<protocol name="checkpoint2">
+  <interface name="other" version="2">
+    <enum name="state"><entry name="ready" value="1"/></enum>
+  </interface>
+  <interface name="test-object" version="3">
+    <enum name="flags" bitfield="true"><entry name="one" value="1" since="2" deprecated-since="3"/></enum>
+    <request name="destroy" type="destructor" since="2" deprecated-since="3">
+      <arg name="label" type="string" allow-null="true"/>
+      <arg name="peer" type="object" interface="other" allow-null="true"/>
+      <arg name="factory" type="new_id"/>
+      <arg name="child" type="new_id" interface="other"/>
+      <arg name="state" type="uint" enum="other.state"/>
+      <arg name="bytes" type="array"/>
+      <arg name="descriptor" type="fd"/>
+      <arg name="serial" type="uint"/>
+    </request>
+    <event name="done"><arg name="output" type="uint"/><arg name="values" type="uint"/><arg name="text" type="string"/><arg name="data" type="array"/><arg name="descriptor" type="fd"/></event>
+  </interface>
+</protocol>
