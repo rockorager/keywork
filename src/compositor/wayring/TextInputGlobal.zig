@@ -126,7 +126,7 @@ fn createInput(self: *TextInputGlobal, client: *Server.Client, id: u32, inert: b
     input_owned = false;
     errdefer client.destroyResource(input.resource) catch {};
     if (!inert) if (self.seat.keyboardFocus()) |surface| if (surface.resource_alive and surface.client == client) {
-        try generated.zwp_text_input_v3_types.events.enter(&client.connection, input.resource, surface.resource);
+        generated.zwp_text_input_v3_types.events.enter(&client.connection, input.resource, surface.resource) catch return client.postNoMemory();
     };
 }
 fn dispatchInput(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {

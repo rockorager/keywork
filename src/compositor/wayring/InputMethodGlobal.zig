@@ -23,7 +23,6 @@ const Method = struct {
     owner: *InputMethodGlobal,
     client: *Server.Client,
     resource: wayring.ObjectHandle,
-    resource_alive: bool = true,
     available: bool,
     active: bool = false,
     done_serial: u32 = 0,
@@ -70,7 +69,7 @@ fn createMethod(self: *InputMethodGlobal, client: *Server.Client, id: u32, wrong
     errdefer client.destroyResource(method.resource) catch {};
     if (!method.available) return generated.zwp_input_method_v2_types.events.unavailable(&client.connection, method.resource) catch client.postNoMemory();
     self.available = method;
-    try sync(method);
+    sync(method) catch return client.postNoMemory();
 }
 fn dispatchMethod(context: *anyopaque, client: *Server.Client, resource: wayring.ObjectHandle, message: *wayring.Message) !void {
     const method: *Method = @ptrCast(@alignCast(context));
@@ -159,11 +158,16 @@ fn destroyChild(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle)
 }
 fn destroyMethod(context: *anyopaque, _: *Server.Client, _: wayring.ObjectHandle) void {
     const method: *Method = @ptrCast(@alignCast(context));
-    method.resource_alive = false;
     if (method.owner.available == method) method.owner.available = null;
     reset(method);
-    for (method.children.items) |child| child.method = null;
-    method.children.clearRetainingCapacity();
+    while (method.children.items.len != 0) {
+        const child = method.children.items[method.children.items.len - 1];
+        method.client.destroyResource(child.resource) catch {
+            method.client.postNoMemory() catch {};
+            child.method = null;
+            _ = method.children.pop();
+        };
+    }
     finalizeMethod(method);
 }
 fn finalizeMethod(method: *Method) void {
@@ -424,6 +428,8 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     try std.testing.expect(destroyed_surface_deactivated);
 
     // Managers, products, and text inputs have independent protocol lifetimes.
+    const grab = try generated.zwp_input_method_v2_types.requests.grab_keyboard(&ime_peer, method);
+    try transferToServer(&ime_peer, ime);
     try generated.zwp_input_method_manager_v2_types.requests.destroy(&ime_peer, method_manager);
     try generated.zwp_text_input_manager_v3_types.requests.destroy(&app_peer, text_manager);
     try generated.zwp_input_method_v2_types.requests.destroy(&ime_peer, duplicate);
@@ -432,6 +438,7 @@ test "input method relays a focused text input stream and isolates lifetimes" {
     try generated.zwp_text_input_v3_types.requests.destroy(&app_peer, text_input);
     try transferToServer(&ime_peer, ime);
     try transferToServer(&app_peer, app);
+    try std.testing.expectError(error.UnknownResource, ime.resourceContext(grab, &generated.zwp_input_method_keyboard_grab_v2));
     try std.testing.expectEqual(@as(usize, 0), input_methods.methods.items.len);
     try std.testing.expectEqual(@as(usize, 0), text_inputs.inputs.items.len);
 }
