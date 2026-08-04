@@ -16,6 +16,12 @@ const wire = @import("wire.zig");
 const server = @import("server.zig");
 const linux = std.os.linux;
 
+const LinuxCredentials = extern struct {
+    pid: linux.pid_t,
+    uid: linux.uid_t,
+    gid: linux.gid_t,
+};
+
 pub const OperationToken = struct { slot: u32, generation: u32 };
 
 pub const PrepareResult = union(enum) {
@@ -500,9 +506,10 @@ pub const Server = struct {
         };
         const fd: linux.fd_t = @intCast(res);
         errdefer _ = linux.close(fd);
+        const credentials = try peerCredentials(fd);
         const connection = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(connection);
-        const core = try server.CoreClient.create(self.allocator, self.sans_io, .{});
+        const core = try server.CoreClient.create(self.allocator, self.sans_io, .{ .credentials = credentials });
         errdefer core.destroy();
         connection.* = .{ .fd = fd, .core = core };
         try self.connections.append(self.allocator, connection);
@@ -622,6 +629,21 @@ fn completionError(res: i32) ?linux.E {
     return @enumFromInt(@as(u16, @intCast(-@as(i64, res))));
 }
 
+fn peerCredentials(fd: linux.fd_t) !server.Client.Credentials {
+    var credentials: LinuxCredentials = undefined;
+    var size: linux.socklen_t = @sizeOf(LinuxCredentials);
+    const result = linux.getsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.PEERCRED,
+        std.mem.asBytes(&credentials).ptr,
+        &size,
+    );
+    if (linux.errno(result) != .SUCCESS) return error.PeerCredentialsUnavailable;
+    if (size != @sizeOf(LinuxCredentials)) return error.InvalidPeerCredentials;
+    return .{ .pid = credentials.pid, .uid = credentials.uid, .gid = credentials.gid };
+}
+
 fn parseRights(connection: *Connection, control_len: usize, message_flags: u32) !usize {
     var count: usize = 0;
     errdefer closeFds(connection.fd_scratch[0..count]);
@@ -677,6 +699,14 @@ fn encodeRights(control: []u8, fds: []const wire.FileDescriptor) void {
         const start = header_len + index * @sizeOf(wire.FileDescriptor);
         @memcpy(control[start..][0..@sizeOf(wire.FileDescriptor)], std.mem.asBytes(&fd));
     }
+}
+
+fn testPeerSocket() !linux.fd_t {
+    var sockets: [2]linux.fd_t = undefined;
+    const result = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets);
+    if (linux.errno(result) != .SUCCESS) return error.SocketPairFailed;
+    _ = linux.close(sockets[1]);
+    return sockets[0];
 }
 
 test "SCM_RIGHTS encoder emits one ordered descriptor message" {
@@ -749,10 +779,14 @@ test "accepted connection is stable and requires explicit release" {
     defer host.deinit();
     const listener: linux.fd_t = @intCast(linux.dup(0));
     var transport = try Server.init(std.testing.allocator, &host, listener);
-    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const accepted = try testPeerSocket();
     const result = try transport.completeAccept(accepted);
     const connection = result.accepted;
     try std.testing.expect(connection.client() == connection.core.client());
+    const credentials = connection.client().credentials().?;
+    try std.testing.expectEqual(linux.getpid(), credentials.pid);
+    try std.testing.expectEqual(linux.getuid(), credentials.uid);
+    try std.testing.expectEqual(linux.getgid(), credentials.gid);
     try std.testing.expectError(error.ConnectionsLive, transport.deinit());
     const interface: wire.Interface = .{ .name = "test_application", .version = 1 };
     var resource: server.Resource = .init(std.testing.allocator, 2, 1, &interface, &.{}, .client, connection.client().ownerHooks());
@@ -770,7 +804,7 @@ test "recv completion transfers SCM_RIGHTS ownership into the core" {
     defer host.deinit();
     const listener: linux.fd_t = @intCast(linux.dup(0));
     var transport = try Server.init(std.testing.allocator, &host, listener);
-    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const accepted = try testPeerSocket();
     const connection = (try transport.completeAccept(accepted)).accepted;
 
     var received_fd: wire.FileDescriptor = @intCast(linux.dup(0));
@@ -794,7 +828,7 @@ test "retryable send completion reports an earlier peer disconnect" {
     defer host.deinit();
     const listener: linux.fd_t = @intCast(linux.dup(0));
     var transport = try Server.init(std.testing.allocator, &host, listener);
-    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const accepted = try testPeerSocket();
     const connection = (try transport.completeAccept(accepted)).accepted;
 
     try connection.client().receive(&.{
@@ -818,7 +852,7 @@ test "canceled send completion unwinds the wire batch" {
     defer host.deinit();
     const listener: linux.fd_t = @intCast(linux.dup(0));
     var transport = try Server.init(std.testing.allocator, &host, listener);
-    const accepted: linux.fd_t = @intCast(linux.dup(0));
+    const accepted = try testPeerSocket();
     const connection = (try transport.completeAccept(accepted)).accepted;
 
     try connection.client().receive(&.{

@@ -12,7 +12,16 @@ const Resource = @import("Resource.zig");
 const ObjectMap = @import("object_map.zig");
 const Fatal = @import("fatal.zig");
 
-pub const Options = struct { max_objects: usize = 4096 };
+pub const Credentials = struct {
+    pid: std.os.linux.pid_t,
+    uid: std.os.linux.uid_t,
+    gid: std.os.linux.gid_t,
+};
+
+pub const Options = struct {
+    max_objects: usize = 4096,
+    credentials: ?Credentials = null,
+};
 
 const delete_id_descriptor: wire.MessageDescriptor = .{
     .name = "delete_id",
@@ -33,6 +42,7 @@ allocator: std.mem.Allocator,
 input: wire.Input,
 output: wire.Output,
 objects: ObjectMap,
+credentials_value: ?Credentials,
 fatal_state: Fatal = .{},
 dispatching: bool = false,
 active_new_ids: ?[]NewIdExpectation = null,
@@ -43,6 +53,7 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         .input = .init(allocator),
         .output = .init(allocator),
         .objects = .init(allocator, .{ .max_objects = options.max_objects }),
+        .credentials_value = options.credentials,
     };
 }
 
@@ -60,6 +71,12 @@ pub fn fatal(self: *const Client) ?*const Fatal {
 
 pub fn objectCount(self: *const Client) usize {
     return self.objects.count();
+}
+
+/// Returns immutable transport-supplied peer metadata, when available.
+/// Consumers remain responsible for any authorization decision.
+pub fn credentials(self: *const Client) ?Credentials {
+    return self.credentials_value;
 }
 
 /// Records an application-detected protocol violation without allocating and
