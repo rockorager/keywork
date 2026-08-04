@@ -325,9 +325,22 @@ const TestClient = struct {
         registry.setListener(*TestClient, registryEvent, self);
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         const compositor = self.compositor orelse return error.CompositorMissing;
-        _ = self.shm orelse return error.ShmMissing;
-        _ = try compositor.createSurface();
+        const shm = self.shm orelse return error.ShmMissing;
+        const surface = try compositor.createSurface();
+        const pixels = [_]u32{ 0x8011_2233, 0xff44_5566 };
+        const bytes = std.mem.sliceAsBytes(&pixels);
+        const shm_fd = try std.posix.memfd_create("keywork-wayring-host", linux.MFD.CLOEXEC);
+        defer _ = linux.close(shm_fd);
+        if (linux.errno(linux.ftruncate(shm_fd, @intCast(bytes.len))) != .SUCCESS) return error.ShmResizeFailed;
+        if (std.c.write(shm_fd, bytes.ptr, bytes.len) != bytes.len) return error.ShmWriteFailed;
+        const pool = try shm.createPool(shm_fd, @intCast(bytes.len));
+        const buffer = try pool.createBuffer(0, pixels.len, 1, @intCast(bytes.len), .argb8888);
+        surface.attach(buffer, 0, 0);
+        surface.damage(0, 0, pixels.len, 1);
+        surface.commit();
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+        buffer.destroy();
+        pool.destroy();
     }
 
     fn registryEvent(registry: *wayland.client.wl.Registry, event: wayland.client.wl.Registry.Event, self: *TestClient) void {
