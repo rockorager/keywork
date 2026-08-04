@@ -121,6 +121,19 @@ pub fn build(b: *std.Build) void {
     const run_checkpoint3_tests = b.addRunArtifact(checkpoint3_tests);
     test_wayring_step.dependOn(&run_checkpoint3_tests.step);
     test_step.dependOn(&run_checkpoint3_tests.step);
+    const checkpoint4_test_module = b.createModule(.{
+        .root_source_file = b.path("src/wayring/checkpoint4_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    checkpoint4_test_module.addImport("core_protocol", core_protocol);
+    checkpoint4_test_module.addImport("wayring", wayring);
+    checkpoint4_test_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
+    const checkpoint4_tests = b.addTest(.{ .root_module = checkpoint4_test_module });
+    const run_checkpoint4_tests = b.addRunArtifact(checkpoint4_tests);
+    test_wayring_step.dependOn(&run_checkpoint4_tests.step);
+    test_step.dependOn(&run_checkpoint4_tests.step);
     const scanner_step = b.step("wayring-scanner", "Build the Wayring protocol scanner");
     scanner_step.dependOn(&wayring_scanner.step);
 
