@@ -399,6 +399,11 @@ pub const Server = struct {
         return !self.accept_pending;
     }
 
+    /// Reserves operation slots so shutdown cancellation does not allocate.
+    pub fn reserveOperationCapacity(self: *Server, capacity: usize) !void {
+        try self.operations.slots.ensureTotalCapacity(self.allocator, capacity);
+    }
+
     /// Destroys transport/core storage only at an explicit application
     /// boundary. All application resources must already have been destroyed.
     pub fn release(self: *Server, connection: *Connection) !void {
