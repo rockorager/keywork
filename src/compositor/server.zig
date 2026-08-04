@@ -80,6 +80,7 @@ const render = @import("render/types.zig");
 const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
 const Scene = @import("scene.zig");
+const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
@@ -145,6 +146,7 @@ const linux_button_left = 0x110;
 allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
+surface_registry: SurfaceRegistry,
 control: Control,
 control_initialized: bool,
 appearance_client: AppearanceClient,
@@ -952,6 +954,7 @@ pub fn createWithVirtualOutput(
         .allocator = allocator,
         .io = io,
         .display = display,
+        .surface_registry = SurfaceRegistry.init(allocator),
         .control = undefined,
         .control_initialized = false,
         .appearance_client = undefined,
@@ -1076,6 +1079,7 @@ pub fn createWithVirtualOutput(
         .listening = false,
         .xwayland_display_listener = null,
     };
+    errdefer self.surface_registry.deinit();
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
@@ -1112,7 +1116,7 @@ pub fn createWithVirtualOutput(
     errdefer if (output_kind == .drm) self.session.deinit();
     errdefer self.renderer.deinit();
     errdefer if (output_kind == .drm) self.drm_device.deinit();
-    try self.compositor.init(allocator, display);
+    try self.compositor.init(allocator, display, &self.surface_registry);
     errdefer self.compositor.deinit();
     try self.security_context.init(allocator, display);
     errdefer self.security_context.deinit();
@@ -1915,6 +1919,7 @@ pub fn destroy(self: *Self) void {
     self.routed_keys.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
+    self.surface_registry.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
     if (self.session_initialized) self.session.deinit();
     self.renderer.deinit();
@@ -2224,8 +2229,16 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     }
     if (self.layer_shell_initialized) self.layer_shell.outputRemoved(render_output.protocol_id);
     if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
-    Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
-    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), protocol_output);
+    Surface.discardPresentation(
+        self.compositor.surfaceStore(),
+        self.allocator,
+        protocol_output,
+    ) catch self.terminate();
+    Surface.clearFifoBarriersForOutput(
+        self.compositor.surfaceStore(),
+        self.allocator,
+        protocol_output,
+    ) catch self.terminate();
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     self.color_management.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
@@ -3273,6 +3286,11 @@ fn outputStatisticsId(tag: u64) OutputLayout.Id {
 
 fn surfaceSampleTag(id: Surface.Id) u64 {
     return @as(u64, id.generation) << 32 | id.index;
+}
+
+test "surface sample tags preserve canonical index and generation" {
+    const id: Surface.Id = .{ .index = 0x1234_5678, .generation = 0x9abc_def0 };
+    try std.testing.expectEqual(@as(u64, 0x9abc_def0_1234_5678), surfaceSampleTag(id));
 }
 
 fn setControlLogLevel(_: *anyopaque, level: ControlProtocol.LogLevel) void {
@@ -5216,7 +5234,12 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     }
     const protocol_output = self.outputs.get(output.protocol_id).?;
     protocol_output.setRefresh(info);
-    Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
+    Surface.finishPresentation(
+        self.compositor.surfaceStore(),
+        self.allocator,
+        protocol_output,
+        info,
+    ) catch self.terminate();
     output.frame_callback_deadline_nanoseconds = nowNanoseconds(self.io);
     if (protocol_output.hasCallbackOnlyFrameCallbacks()) self.scheduleFrameCallback(output);
     if (output.lock_frame_pending) {
@@ -5233,8 +5256,9 @@ fn outputDiscarded(context: *anyopaque) void {
     output.lock_frame_pending = false;
     Surface.discardPresentation(
         self.compositor.surfaceStore(),
+        self.allocator,
         self.outputs.get(output.protocol_id).?,
-    );
+    ) catch self.terminate();
     requestRepaint(self);
 }
 
@@ -8754,12 +8778,17 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
     const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
-    Surface.sendSubmittedFrameCallbacks(
+    try Surface.sendSubmittedFrameCallbacks(
         self.compositor.surfaceStore(),
+        self.allocator,
         output,
         callback_timestamp.milliseconds(),
     );
-    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
+    try Surface.clearFifoBarriersForOutput(
+        self.compositor.surfaceStore(),
+        self.allocator,
+        output,
+    );
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.captureOutputFrame(
@@ -8995,12 +9024,17 @@ fn presentSessionLockFrame(
         self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
     const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
-    Surface.sendSubmittedFrameCallbacks(
+    try Surface.sendSubmittedFrameCallbacks(
         self.compositor.surfaceStore(),
+        self.allocator,
         frame.output,
         callback_timestamp.milliseconds(),
     );
-    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
+    try Surface.clearFifoBarriersForOutput(
+        self.compositor.surfaceStore(),
+        self.allocator,
+        frame.output,
+    );
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.captureOutputFrame(frame.render_output.protocol_id, capture_source);
@@ -9136,7 +9170,10 @@ fn finishRepaintIfIdle(self: *Self) void {
     }
     self.fractional_scale.refresh();
     self.refreshSurfaceOutputPreferences();
-    Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
+    Surface.discardUnsubmittedFeedback(
+        self.compositor.surfaceStore(),
+        self.allocator,
+    ) catch self.terminate();
 }
 
 fn refreshSurfaceOutputPreferences(self: *Self) void {

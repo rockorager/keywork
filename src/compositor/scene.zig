@@ -8,7 +8,7 @@ const Self = @This();
 const std = @import("std");
 const render = @import("render/types.zig");
 const slot_map = @import("slot_map.zig");
-const Surface = @import("wayland/surface.zig");
+const SurfaceRegistry = @import("SurfaceRegistry.zig");
 
 allocator: std.mem.Allocator,
 windows: Store,
@@ -112,7 +112,7 @@ pub const default_effects: Effects = .{
 };
 
 pub const Window = struct {
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     position: Position = .{},
     mapped: bool = false,
     focused: bool = false,
@@ -132,14 +132,14 @@ pub const DecorationLayer = enum {
 
 pub const Decoration = struct {
     window_id: Id,
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     layer: DecorationLayer,
     offset: Position = .{},
     mapped: bool = false,
 };
 
 pub const ShellSurface = struct {
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     position: Position = .{},
     mapped: bool = false,
 };
@@ -152,7 +152,7 @@ pub const Layer = enum {
 };
 
 pub const LayerSurface = struct {
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     position: Position = .{},
     layer: Layer,
     mapped: bool = false,
@@ -165,7 +165,7 @@ pub const PopupParent = union(enum) {
 };
 
 pub const Popup = struct {
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     parent: PopupParent,
     position: Position = .{},
     mapped: bool = false,
@@ -175,7 +175,7 @@ pub const Popup = struct {
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
-    surface_changed: *const fn (*anyopaque, Surface.Id) void,
+    surface_changed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
     window_changed: *const fn (*anyopaque, Id) void,
     node_damage: *const fn (*anyopaque, DamageNode) void,
     /// Called after a node's mapped state or existence changed, once the new
@@ -473,7 +473,7 @@ pub fn clearRepaintListener(self: *Self) void {
     self.repaint_listener = null;
 }
 
-pub fn addWindow(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!Id {
+pub fn addWindow(self: *Self, surface_id: SurfaceRegistry.Id) error{OutOfMemory}!Id {
     const id = try self.windows.insert(self.allocator, .{ .surface_id = surface_id });
     errdefer _ = self.windows.remove(id);
     try self.stack.append(self.allocator, .{ .window = id });
@@ -506,7 +506,7 @@ pub fn removeWindow(self: *Self, id: Id) void {
 
 pub fn addShellSurface(
     self: *Self,
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
 ) error{OutOfMemory}!ShellSurfaceId {
     const id = try self.shell_surfaces.insert(self.allocator, .{ .surface_id = surface_id });
     errdefer _ = self.shell_surfaces.remove(id);
@@ -553,7 +553,7 @@ pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
 
 pub fn addLayerSurface(
     self: *Self,
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     layer: Layer,
 ) error{OutOfMemory}!LayerSurfaceId {
     const id = try self.layer_surfaces.insert(self.allocator, .{
@@ -622,7 +622,7 @@ pub fn layerSurfaceCommitted(self: *Self, id: LayerSurfaceId) void {
 
 pub fn addPopup(
     self: *Self,
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     parent: PopupParent,
 ) error{ InvalidParent, OutOfMemory }!PopupId {
     switch (parent) {
@@ -689,7 +689,7 @@ pub fn popupCommitted(self: *Self, id: PopupId) void {
 pub fn addDecoration(
     self: *Self,
     window_id: Id,
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     layer: DecorationLayer,
 ) error{ InvalidWindow, OutOfMemory }!DecorationId {
     if (self.windows.get(window_id) == null) return error.InvalidWindow;
@@ -995,7 +995,7 @@ pub fn windowPosition(self: *Self, id: Id) ?Position {
     return window.position;
 }
 
-pub fn windowSurface(self: *Self, id: Id) ?Surface.Id {
+pub fn windowSurface(self: *Self, id: Id) ?SurfaceRegistry.Id {
     const window = self.windows.get(id) orelse return null;
     return window.surface_id;
 }
@@ -1016,7 +1016,7 @@ pub fn popupPosition(self: *Self, id: PopupId) ?Position {
     return self.popupGlobalPosition(id);
 }
 
-pub fn surfacePosition(self: *Self, surface_id: Surface.Id) ?Position {
+pub fn surfacePosition(self: *Self, surface_id: SurfaceRegistry.Id) ?Position {
     var windows = self.windows.iterator();
     while (windows.next()) |entry| {
         if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
@@ -1056,7 +1056,7 @@ pub fn surfacePosition(self: *Self, surface_id: Surface.Id) ?Position {
     return null;
 }
 
-pub fn surfaceMapped(self: *Self, surface_id: Surface.Id) bool {
+pub fn surfaceMapped(self: *Self, surface_id: SurfaceRegistry.Id) bool {
     var windows = self.windows.iterator();
     while (windows.next()) |entry| {
         if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.mapped;
@@ -1085,7 +1085,7 @@ pub fn surfaceMapped(self: *Self, surface_id: Surface.Id) bool {
 /// Returns whether the surface is the root surface of any scene node or
 /// decoration. Surfaces rendered outside the scene (input method popups,
 /// drag icons, session lock surfaces, cursors) are not tracked.
-pub fn surfaceTracked(self: *Self, surface_id: Surface.Id) bool {
+pub fn surfaceTracked(self: *Self, surface_id: SurfaceRegistry.Id) bool {
     var windows = self.windows.iterator();
     while (windows.next()) |entry| {
         if (std.meta.eql(entry.value.surface_id, surface_id)) return true;
@@ -1113,8 +1113,8 @@ pub fn surfaceTracked(self: *Self, surface_id: Surface.Id) bool {
 /// painted above the second. Other surface categories have no node ordering.
 pub fn surfaceNodeAbove(
     self: *Self,
-    surface_id: Surface.Id,
-    other_surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
+    other_surface_id: SurfaceRegistry.Id,
 ) ?bool {
     const index = self.surfaceNodeIndex(surface_id) orelse return null;
     const other_index = self.surfaceNodeIndex(other_surface_id) orelse return null;
@@ -1135,7 +1135,7 @@ pub fn topFullscreen(self: *Self) ?Id {
     return null;
 }
 
-pub fn focusedSurface(self: *Self) ?Surface.Id {
+pub fn focusedSurface(self: *Self) ?SurfaceRegistry.Id {
     var index = self.stack.items.len;
     while (index > 0) {
         index -= 1;
@@ -1149,7 +1149,7 @@ pub fn focusedSurface(self: *Self) ?Surface.Id {
     return null;
 }
 
-pub fn topWindowSurface(self: *Self) ?Surface.Id {
+pub fn topWindowSurface(self: *Self) ?SurfaceRegistry.Id {
     var index = self.stack.items.len;
     while (index > 0) {
         index -= 1;
@@ -1211,7 +1211,7 @@ fn requestStackRepaint(self: *Self, id: NodeId) void {
     }
 }
 
-fn requestSurfaceChanged(self: *Self, surface_id: Surface.Id) void {
+fn requestSurfaceChanged(self: *Self, surface_id: SurfaceRegistry.Id) void {
     if (self.repaint_listener) |listener| {
         listener.surface_changed(listener.context, surface_id);
     }
@@ -1373,7 +1373,7 @@ fn nodeIndex(self: *Self, id: NodeId) ?usize {
     unreachable;
 }
 
-fn surfaceNodeIndex(self: *Self, surface_id: Surface.Id) ?usize {
+fn surfaceNodeIndex(self: *Self, surface_id: SurfaceRegistry.Id) ?usize {
     for (self.stack.items, 0..) |node, index| {
         const node_surface_id = switch (node) {
             .window => |id| (self.windows.get(id) orelse continue).surface_id,
@@ -1409,7 +1409,7 @@ test "scene keeps visual state behind generational handles" {
     scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const surface_id: Surface.Id = .{ .index = 4, .generation = 2 };
+    const surface_id: SurfaceRegistry.Id = .{ .index = 4, .generation = 2 };
     const id = try scene.addWindow(surface_id);
     scene.setPosition(id, .{ .x = 30, .y = 40 });
     scene.setFocused(id, true);
@@ -1468,8 +1468,8 @@ test "scene keeps visual state behind generational handles" {
 
     scene.removeWindow(id);
     try std.testing.expectEqual(@as(?*Window, null), scene.windows.get(id));
-    try std.testing.expectEqual(@as(?Surface.Id, null), scene.focusedSurface());
-    try std.testing.expectEqual(@as(?Surface.Id, null), scene.topWindowSurface());
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), scene.focusedSurface());
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), scene.topWindowSurface());
 }
 
 test "scene reorders windows through handles" {
@@ -1547,7 +1547,7 @@ const RepaintCounter = struct {
         self.count += 1;
     }
 
-    fn surfaceChanged(_: *anyopaque, _: Surface.Id) void {}
+    fn surfaceChanged(_: *anyopaque, _: SurfaceRegistry.Id) void {}
 
     fn windowChanged(context: *anyopaque, id: Id) void {
         const self: *RepaintCounter = @ptrCast(@alignCast(context));
@@ -1607,8 +1607,8 @@ test "scene interleaves shell surfaces and windows through node handles" {
     scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const window_surface: Surface.Id = .{ .index = 1, .generation = 1 };
-    const shell_surface_root: Surface.Id = .{ .index = 2, .generation = 1 };
+    const window_surface: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    const shell_surface_root: SurfaceRegistry.Id = .{ .index = 2, .generation = 1 };
     const window = try scene.addWindow(window_surface);
     const shell_surface = try scene.addShellSurface(shell_surface_root);
     scene.setMapped(window, true);

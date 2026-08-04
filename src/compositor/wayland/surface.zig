@@ -8,7 +8,7 @@ const DrmSyncobj = @import("../drm_syncobj.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
-const slot_map = @import("../slot_map.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const surface_geometry = @import("surface_geometry.zig");
 const WaylandRegion = @import("region.zig");
@@ -20,6 +20,7 @@ const wp = wayland.server.wp;
 const log = std.log.scoped(.surface);
 
 allocator: std.mem.Allocator,
+registry: *SurfaceRegistry,
 store: *Store,
 id: Id,
 resource: *wl.Surface,
@@ -38,8 +39,81 @@ explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
 notifying_commit_listeners: bool,
 
-pub const Store = slot_map.SlotMap(State, enum { surface });
-pub const Id = Store.Id;
+pub const Id = SurfaceRegistry.Id;
+
+pub const Store = struct {
+    const Map = std.AutoHashMapUnmanaged(Id, State);
+
+    states: Map = .empty,
+
+    /// Requires all states to have been removed; this does not deinitialize them.
+    pub fn deinit(self: *Store, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.states.count() == 0);
+        self.states.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn insert(
+        self: *Store,
+        allocator: std.mem.Allocator,
+        id: Id,
+        value: State,
+    ) error{OutOfMemory}!void {
+        try self.states.putNoClobber(allocator, id, value);
+    }
+
+    /// The returned pointer is invalidated by an insertion that reallocates the map.
+    pub fn get(self: *Store, id: Id) ?*State {
+        return self.states.getPtr(id);
+    }
+
+    /// The returned pointer is invalidated by an insertion that reallocates the map.
+    pub fn getConst(self: *const Store, id: Id) ?*const State {
+        return self.states.getPtr(id);
+    }
+
+    pub fn remove(self: *Store, id: Id) ?State {
+        const removed = self.states.fetchRemove(id) orelse return null;
+        return removed.value;
+    }
+
+    pub fn len(self: *const Store) usize {
+        return self.states.count();
+    }
+
+    pub const Entry = struct {
+        id: Id,
+        value: *State,
+    };
+
+    pub const Iterator = struct {
+        inner: Map.Iterator,
+
+        pub fn next(self: *Iterator) ?Entry {
+            const entry = self.inner.next() orelse return null;
+            return .{ .id = entry.key_ptr.*, .value = entry.value_ptr };
+        }
+    };
+
+    pub fn iterator(self: *Store) Iterator {
+        return .{ .inner = self.states.iterator() };
+    }
+
+    fn snapshotIds(
+        self: *Store,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}![]Id {
+        const ids = try allocator.alloc(Id, self.len());
+        var index: usize = 0;
+        var states = self.iterator();
+        while (states.next()) |entry| {
+            ids[index] = entry.id;
+            index += 1;
+        }
+        std.debug.assert(index == ids.len);
+        return ids;
+    }
+};
 
 pub const State = struct {
     resource: *wl.Surface,
@@ -184,6 +258,7 @@ pub const CreateError = error{
 
 pub fn create(
     allocator: std.mem.Allocator,
+    registry: *SurfaceRegistry,
     store: *Store,
     client: *wl.Client,
     version: u32,
@@ -197,12 +272,12 @@ pub fn create(
 
     var surface_state = State.init(resource);
     errdefer surface_state.deinit(allocator);
-    const state_id = store.insert(allocator, surface_state) catch return error.OutOfMemory;
 
     self.* = .{
         .allocator = allocator,
+        .registry = registry,
         .store = store,
-        .id = state_id,
+        .id = undefined,
         .resource = resource,
         .pending_attachment = .{},
         .has_pending_attachment = false,
@@ -219,6 +294,14 @@ pub fn create(
         .commit_listeners = .empty,
         .notifying_commit_listeners = false,
     };
+
+    const state_id = registry.add(.{
+        .context = self,
+        .render_state = providerRenderState,
+    }) catch return error.OutOfMemory;
+    self.id = state_id;
+    errdefer registry.remove(state_id);
+    store.insert(allocator, state_id, surface_state) catch return error.OutOfMemory;
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
     return self;
@@ -238,6 +321,39 @@ pub fn waylandResource(self: *Self) *wl.Surface {
 
 pub fn state(self: *Self) *State {
     return self.store.get(self.id) orelse unreachable;
+}
+
+fn providerRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const surface_state = self.store.get(self.id) orelse return null;
+    const buffer = if (surface_state.current_buffer) |*current| current else return null;
+    return .{
+        .buffer = buffer.pixelBuffer(),
+        .logical_size = buffer.logical_size,
+        .source = buffer.source,
+        .transform = renderTransform(buffer.transform),
+        .force_opaque = buffer.force_opaque,
+        .alpha_multiplier = surface_state.current_alpha_multiplier,
+        .opaque_region = &surface_state.current_opaque,
+        .blur_region = if (surface_state.current_blur_region.isEmpty())
+            null
+        else
+            &surface_state.current_blur_region,
+    };
+}
+
+fn renderTransform(transform: wl.Output.Transform) render_types.BufferTransform {
+    return switch (transform) {
+        .normal => .normal,
+        .@"90" => .rotate_90,
+        .@"180" => .rotate_180,
+        .@"270" => .rotate_270,
+        .flipped => .flipped,
+        .flipped_90 => .flipped_90,
+        .flipped_180 => .flipped_180,
+        .flipped_270 => .flipped_270,
+        else => unreachable,
+    };
 }
 
 pub fn resourceFor(store: *Store, id: Id) ?*wl.Surface {
@@ -584,7 +700,7 @@ pub fn setPendingBlurRegion(self: *Self, region: ?*const Region) Region.Error!vo
 }
 
 /// The returned region is borrowed until the surface's next applied commit or
-/// any store insertion that reallocates its slots.
+/// any store insertion that reallocates its map.
 pub fn currentBlurRegion(store: *Store, id: Id) ?*const Region {
     const surface_state = store.get(id) orelse return null;
     if (surface_state.current_blur_region.isEmpty()) return null;
@@ -878,7 +994,7 @@ pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
 }
 
 /// The returned snapshot is borrowed from the store and is invalidated by a
-/// replacement commit or any store insertion that reallocates its slots.
+/// replacement commit or any store insertion that reallocates its map.
 pub fn currentBuffer(store: *Store, id: Id) ?*BufferSnapshot {
     const surface_state = store.get(id) orelse return null;
     return if (surface_state.current_buffer) |*buffer| buffer else null;
@@ -896,14 +1012,14 @@ pub fn currentOpaqueCoversBuffer(store: *Store, id: Id) bool {
 }
 
 /// The returned region is borrowed until the surface's next applied commit or
-/// any store insertion that reallocates its slots.
+/// any store insertion that reallocates its map.
 pub fn currentOpaque(store: *Store, id: Id) ?*const Region {
     const surface_state = store.get(id) orelse return null;
     return &surface_state.current_opaque;
 }
 
 /// The returned region is borrowed until the surface's next applied commit or
-/// any store insertion that reallocates its slots.
+/// any store insertion that reallocates its map.
 pub fn currentDamage(store: *Store, id: Id) ?*const Region {
     const surface_state = store.get(id) orelse return null;
     return &surface_state.current_damage;
@@ -944,8 +1060,8 @@ pub fn copyCurrentInputRegion(store: *Store, id: Id, destination: *Region) Regio
 }
 
 pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
-    const surface_state = store.get(id) orelse return;
     while (true) {
+        const surface_state = store.get(id) orelse return;
         const callback = for (surface_state.callbacks.items) |candidate| {
             if (candidate.state == .submitted) break candidate;
         } else return;
@@ -963,9 +1079,9 @@ pub fn hasCallbackOnlyFrameCallback(store: *Store, id: Id) bool {
 }
 
 pub fn sendCallbackOnlyFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) bool {
-    const surface_state = store.get(id) orelse return false;
     var sent = false;
     while (true) {
+        const surface_state = store.get(id) orelse return sent;
         const callback = for (surface_state.callbacks.items) |candidate| {
             if (candidate.state == .active or candidate.state == .submitted) break candidate;
         } else return sent;
@@ -1019,10 +1135,15 @@ pub fn hasFifoBarrierForOutput(store: *Store, output_context: *anyopaque) bool {
     return false;
 }
 
-pub fn clearFifoBarriersForOutput(store: *Store, output_context: *anyopaque) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        const surface_state = entry.value;
+pub fn clearFifoBarriersForOutput(
+    store: *Store,
+    allocator: std.mem.Allocator,
+    output_context: *anyopaque,
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        const surface_state = store.get(id) orelse continue;
         if (!surface_state.fifo_barrier or
             surface_state.fifo_barrier_output != output_context) continue;
         surface_state.fifo_barrier = false;
@@ -1031,10 +1152,15 @@ pub fn clearFifoBarriersForOutput(store: *Store, output_context: *anyopaque) voi
     }
 }
 
-pub fn releaseTimedCommits(store: *Store, now_nanoseconds: i96) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        const surface_state = entry.value;
+pub fn releaseTimedCommits(
+    store: *Store,
+    allocator: std.mem.Allocator,
+    now_nanoseconds: i96,
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        const surface_state = store.get(id) orelse continue;
         if (releaseTimedCommitState(surface_state, now_nanoseconds)) {
             applyReadyCached(Self.fromResource(surface_state.resource));
         }
@@ -1076,59 +1202,79 @@ pub fn earliestCommitTimestamp(store: *Store) ?i96 {
     return earliest;
 }
 
-pub fn discardUnsubmittedFeedback(store: *Store) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        if (entry.value.presentation_output == null) {
-            discardCommitFeedbacks(entry.value, .active);
+pub fn discardUnsubmittedFeedback(
+    store: *Store,
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        while (true) {
+            const surface_state = store.get(id) orelse break;
+            if (surface_state.presentation_output != null) break;
+            const feedback = commitFeedbackWithState(surface_state, .active) orelse break;
+            feedback.discarded(feedback.context);
         }
     }
 }
 
 pub fn sendSubmittedFrameCallbacks(
     store: *Store,
+    allocator: std.mem.Allocator,
     output_context: *anyopaque,
     time_milliseconds: u32,
-) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        if (entry.value.presentation_output != output_context) continue;
-        sendFrameDoneFor(store, entry.id, time_milliseconds);
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        const surface_state = store.get(id) orelse continue;
+        if (surface_state.presentation_output != output_context) continue;
+        sendFrameDoneFor(store, id, time_milliseconds);
     }
 }
 
 pub fn finishPresentation(
     store: *Store,
+    allocator: std.mem.Allocator,
     output_context: *anyopaque,
     info: presentation.Info,
-) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        const surface_state = entry.value;
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        const surface_state = store.get(id) orelse continue;
         if (surface_state.presentation_output != output_context) continue;
         surface_state.presentation_output = null;
         surface_state.commit_after_submission = false;
-        while (commitFeedbackWithState(surface_state, .submitted)) |feedback| {
+        while (true) {
+            const current = store.get(id) orelse break;
+            const feedback = commitFeedbackWithState(current, .submitted) orelse break;
             feedback.presented(feedback.context, info);
         }
     }
 }
 
-pub fn discardPresentation(store: *Store, output_context: *anyopaque) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        const surface_state = entry.value;
+pub fn discardPresentation(
+    store: *Store,
+    allocator: std.mem.Allocator,
+    output_context: *anyopaque,
+) error{OutOfMemory}!void {
+    const ids = try store.snapshotIds(allocator);
+    defer allocator.free(ids);
+    for (ids) |id| {
+        const surface_state = store.get(id) orelse continue;
         if (surface_state.presentation_output != output_context) continue;
         surface_state.presentation_output = null;
         for (surface_state.callbacks.items) |callback| {
             if (callback.state == .submitted) callback.state = .active;
         }
-        if (surface_state.commit_after_submission) {
-            discardCommitFeedbacks(surface_state, .submitted);
+        const discard_feedback = surface_state.commit_after_submission;
+        surface_state.commit_after_submission = false;
+        if (discard_feedback) {
+            discardCommitFeedbacksForId(store, id, .submitted);
         } else {
             setCommitFeedbackState(surface_state, .submitted, .active);
         }
-        surface_state.commit_after_submission = false;
     }
 }
 
@@ -1791,14 +1937,11 @@ fn releasePendingAttachment(self: *Self, retained: bool) void {
 }
 
 fn finishBufferReleaseCallbacks(store: *Store, surface_id: Id, generation: ?u64) void {
-    const surface_state = store.get(surface_id) orelse return;
-    var index: usize = 0;
-    while (index < surface_state.release_callbacks.items.len) {
-        const callback = surface_state.release_callbacks.items[index];
-        if (callback.generation != generation) {
-            index += 1;
-            continue;
-        }
+    while (true) {
+        const surface_state = store.get(surface_id) orelse return;
+        const callback = for (surface_state.release_callbacks.items) |candidate| {
+            if (candidate.generation == generation) break candidate;
+        } else return;
         callback.resource.destroySendDone(0);
     }
 }
@@ -1815,6 +1958,18 @@ fn commitFeedbackWithState(
 
 fn discardCommitFeedbacks(surface_state: *State, target_status: CommitFeedback.Status) void {
     while (commitFeedbackWithState(surface_state, target_status)) |feedback| {
+        feedback.discarded(feedback.context);
+    }
+}
+
+fn discardCommitFeedbacksForId(
+    store: *Store,
+    id: Id,
+    target_status: CommitFeedback.Status,
+) void {
+    while (true) {
+        const surface_state = store.get(id) orelse return;
+        const feedback = commitFeedbackWithState(surface_state, target_status) orelse return;
         feedback.discarded(feedback.context);
     }
 }
@@ -1921,6 +2076,7 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
 
     var removed = self.store.remove(self.id) orelse unreachable;
+    self.registry.remove(self.id);
     removed.deinit(self.allocator);
     self.allocator.destroy(self);
 }
@@ -2770,9 +2926,11 @@ test "callback-only commits require precise empty damage" {
 test "detached buffers remain in surface commit history" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     var surface: Self = .{
         .allocator = std.testing.allocator,
+        .registry = undefined,
         .store = &store,
         .id = id,
         .resource = undefined,
@@ -2812,7 +2970,8 @@ test "FIFO waits block only while a relevant barrier is active" {
 test "FIFO barriers attach to one visible output until replaced" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     defer {
         var removed = store.remove(id).?;
         removed.deinit(std.testing.allocator);
@@ -2872,7 +3031,8 @@ fn testCachedCommit(
 test "commit timing finds the earliest pending or cached target" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     defer {
         var removed = store.remove(id).?;
         removed.deinit(std.testing.allocator);
@@ -2900,9 +3060,11 @@ test "commit timing finds the earliest pending or cached target" {
 test "commit timing preserves synchronized and ordered application" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     var surface: Self = .{
         .allocator = std.testing.allocator,
+        .registry = undefined,
         .store = &store,
         .id = id,
         .resource = undefined,
@@ -2949,9 +3111,11 @@ test "commit timing preserves synchronized and ordered application" {
 test "commit timing moves a pending target to exactly one cached commit" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     var surface: Self = .{
         .allocator = std.testing.allocator,
+        .registry = undefined,
         .store = &store,
         .id = id,
         .resource = undefined,
@@ -2993,9 +3157,11 @@ test "commit timing moves a pending target to exactly one cached commit" {
 test "synchronized application ignores FIFO waits while desynchronized application blocks" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
-    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    const id: Id = .{ .index = 1, .generation = 1 };
+    try store.insert(std.testing.allocator, id, State.init(undefined));
     var surface: Self = .{
         .allocator = std.testing.allocator,
+        .registry = undefined,
         .store = &store,
         .id = id,
         .resource = undefined,
@@ -3056,4 +3222,254 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
     try std.testing.expectEqual(@as(usize, 1), surface_state.cached_commits.items.len);
     surface.applyCachedUpTo(std.math.maxInt(u64));
     try std.testing.expectEqual(@as(usize, 0), surface_state.cached_commits.items.len);
+}
+
+const TeardownObserver = struct {
+    surface: *Self,
+    registry: *SurfaceRegistry,
+    store: *Store,
+    id: Id,
+    role_resolved: bool = false,
+    listener_resolved: bool = false,
+    listener: CommitListener = undefined,
+
+    fn beforeCommit(_: *anyopaque, _: CommitInfo) CommitAction {
+        return .apply;
+    }
+
+    fn afterCommit(_: *anyopaque, _: CommitInfo) void {}
+
+    fn roleDestroyed(context: *anyopaque) void {
+        const self: *TeardownObserver = @ptrCast(@alignCast(context));
+        self.role_resolved = self.registry.contains(self.id) and
+            self.registry.renderState(self.id) != null and self.store.get(self.id) != null;
+        self.surface.releaseRole(self);
+    }
+
+    fn listenerApplied(_: *anyopaque) void {}
+
+    fn listenerDestroyed(context: *anyopaque) void {
+        const self: *TeardownObserver = @ptrCast(@alignCast(context));
+        self.listener_resolved = self.role_resolved and self.registry.contains(self.id) and
+            self.registry.renderState(self.id) != null and self.store.get(self.id) != null;
+        self.surface.removeCommitListener(&self.listener);
+    }
+};
+
+test "mature surface provider owns canonical identity through role teardown" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer client.destroy();
+
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const surface = try create(std.testing.allocator, &registry, &store, client, 7, 1);
+    const stale = surface.handle();
+    try std.testing.expect(registry.contains(stale));
+    try std.testing.expect(store.get(stale) != null);
+    try std.testing.expectEqual(@as(?SurfaceRegistry.RenderState, null), registry.renderState(stale));
+
+    const initial_pixels = [_]u32{ 1, 2, 3, 4 };
+    var initial = try CopiedBufferSnapshot.copy(std.testing.allocator, .{
+        .bytes = std.mem.sliceAsBytes(&initial_pixels),
+        .size = .{ .width = 2, .height = 2 },
+        .stride_bytes = 2 * @sizeOf(u32),
+        .format = .argb8888,
+    }, null, null, .{ .id = 44, .version = 1 });
+    defer initial.deinit();
+    var source_damage = Region.init();
+    defer source_damage.deinit();
+    try source_damage.add(1, 0, 1, 2);
+    const updated_pixels = [_]u32{ 10, 20, 30, 40 };
+    const current_copy = try CopiedBufferSnapshot.copy(std.testing.allocator, .{
+        .bytes = std.mem.sliceAsBytes(&updated_pixels),
+        .size = .{ .width = 2, .height = 2 },
+        .stride_bytes = 2 * @sizeOf(u32),
+        .format = .argb8888,
+    }, &initial, &source_damage, .{ .id = 44, .version = 2 });
+
+    const surface_state = surface.state();
+    surface_state.current_buffer = .{
+        .buffer_size = .{ .width = 2, .height = 2 },
+        .logical_size = .{ .width = 5, .height = 7 },
+        .scale = 1,
+        .transform = .flipped_90,
+        .source = .{ .x = 0.25, .y = 0.5, .width = 1, .height = 1.5 },
+        .force_opaque = true,
+        .copied = current_copy,
+        .source_cache = .{ .id = 44, .version = 2 },
+    };
+    surface_state.current_alpha_multiplier = 0x8000_0000;
+    try surface_state.current_opaque.add(0, 0, 2, 3);
+    try surface_state.current_blur_region.add(1, 1, 3, 4);
+
+    const render_state = registry.renderState(stale).?;
+    try std.testing.expectEqual(render_types.Size{ .width = 5, .height = 7 }, render_state.logical_size);
+    try std.testing.expectEqual(render_types.BufferTransform.flipped_90, render_state.transform);
+    try std.testing.expectEqual(surface_state.current_buffer.?.source, render_state.source);
+    try std.testing.expect(render_state.force_opaque);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), render_state.alpha_multiplier);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 20, 3, 40 }, render_state.buffer.pixels);
+    try std.testing.expectEqual(
+        @as(?render_types.SourceCache, .{ .id = 44, .version = 2 }),
+        render_state.buffer.source_cache,
+    );
+    try std.testing.expectEqualSlices(
+        render_types.Rect,
+        &.{.{ .x = 1, .y = 0, .width = 1, .height = 2 }},
+        render_state.buffer.source_damage.?,
+    );
+    try std.testing.expect(render_state.buffer.dmabuf == null);
+    try std.testing.expect(render_state.opaque_region.? == &surface_state.current_opaque);
+    try std.testing.expect(render_state.blur_region.? == &surface_state.current_blur_region);
+
+    var observer: TeardownObserver = .{
+        .surface = surface,
+        .registry = &registry,
+        .store = &store,
+        .id = stale,
+    };
+    observer.listener = .{
+        .context = &observer,
+        .applied = TeardownObserver.listenerApplied,
+        .surface_destroyed = TeardownObserver.listenerDestroyed,
+    };
+    try surface.reserveRole(.xdg_toplevel, .{
+        .context = &observer,
+        .before_commit = TeardownObserver.beforeCommit,
+        .after_commit = TeardownObserver.afterCommit,
+        .surface_destroyed = TeardownObserver.roleDestroyed,
+    });
+    try surface.assignReservedRole(.xdg_toplevel, &observer);
+    try surface.addCommitListener(&observer.listener);
+
+    surface.waylandResource().destroy();
+    try std.testing.expect(observer.role_resolved);
+    try std.testing.expect(observer.listener_resolved);
+    try std.testing.expect(!registry.contains(stale));
+    try std.testing.expect(store.get(stale) == null);
+    try std.testing.expectEqual(@as(?SurfaceRegistry.RenderState, null), registry.renderState(stale));
+
+    const replacement = try create(std.testing.allocator, &registry, &store, client, 7, 2);
+    const current = replacement.handle();
+    try std.testing.expectEqual(stale.index, current.index);
+    try std.testing.expect(stale.generation != current.generation);
+    try std.testing.expect(store.get(stale) == null);
+    replacement.waylandResource().destroy();
+    try std.testing.expectEqual(@as(usize, 0), store.len());
+    try std.testing.expectEqual(@as(usize, 0), registry.len());
+}
+
+test "mature surface creation rolls registry registration back when keyed insertion fails" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer client.destroy();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var registry = SurfaceRegistry.init(failing.allocator());
+    defer registry.deinit();
+    var store: Store = .{};
+    defer store.deinit(failing.allocator());
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        create(failing.allocator(), &registry, &store, client, 7, 1),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), store.len());
+    try std.testing.expectEqual(@as(usize, 0), registry.len());
+}
+
+const MutatingFeedback = struct {
+    store: *Store,
+    id: Id,
+    discarded_count: *usize,
+    feedback: CommitFeedback = undefined,
+
+    fn sampled(_: *anyopaque, _: *anyopaque) void {}
+    fn presented(_: *anyopaque, _: presentation.Info) void {}
+
+    fn discarded(context: *anyopaque) void {
+        const self: *MutatingFeedback = @ptrCast(@alignCast(context));
+        self.discarded_count.* += 1;
+        removeCommitFeedback(self.store, self.id, &self.feedback);
+        var removed = self.store.remove(self.id) orelse unreachable;
+        removed.deinit(std.testing.allocator);
+    }
+};
+
+test "feedback walks snapshot IDs before callbacks mutate the keyed store" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const first_id: Id = .{ .index = 1, .generation = 1 };
+    const second_id: Id = .{ .index = 2, .generation = 1 };
+    try store.insert(std.testing.allocator, first_id, State.init(undefined));
+    errdefer {
+        var removed = store.remove(first_id).?;
+        removed.deinit(std.testing.allocator);
+    }
+    try store.insert(std.testing.allocator, second_id, State.init(undefined));
+    errdefer {
+        var removed = store.remove(second_id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    var discarded_count: usize = 0;
+    var first: MutatingFeedback = .{
+        .store = &store,
+        .id = first_id,
+        .discarded_count = &discarded_count,
+    };
+    first.feedback = .{
+        .context = &first,
+        .sampled = MutatingFeedback.sampled,
+        .presented = MutatingFeedback.presented,
+        .discarded = MutatingFeedback.discarded,
+        .state = .active,
+    };
+    var second: MutatingFeedback = .{
+        .store = &store,
+        .id = second_id,
+        .discarded_count = &discarded_count,
+    };
+    second.feedback = .{
+        .context = &second,
+        .sampled = MutatingFeedback.sampled,
+        .presented = MutatingFeedback.presented,
+        .discarded = MutatingFeedback.discarded,
+        .state = .active,
+    };
+    try store.get(first_id).?.commit_feedbacks.append(std.testing.allocator, &first.feedback);
+    try store.get(second_id).?.commit_feedbacks.append(std.testing.allocator, &second.feedback);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        discardUnsubmittedFeedback(&store, failing.allocator()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), discarded_count);
+    try std.testing.expectEqual(@as(usize, 2), store.len());
+
+    try discardUnsubmittedFeedback(&store, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), discarded_count);
+    try std.testing.expectEqual(@as(usize, 0), store.len());
 }
