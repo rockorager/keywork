@@ -266,10 +266,10 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         surface.current = null;
         return;
     };
+    defer self.clearPendingAttachment(surface, false);
     var access = pending.pin.access() catch |err| {
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
         client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        self.clearPendingAttachment(surface, false);
         return;
     };
     var access_live = true;
@@ -296,7 +296,6 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     ) catch |err| {
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
         if (err == error.OutOfMemory) client.postOutOfMemory(&surface.resource.runtime, "copying wl_shm surface buffer") else client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        self.clearPendingAttachment(surface, false);
         return;
     };
     var candidate_owned = true;
@@ -305,7 +304,6 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         access_live = false;
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
         client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        self.clearPendingAttachment(surface, false);
         return;
     };
     access_live = false;
@@ -313,7 +311,6 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         error.ResourceNotLive, error.NotShmBuffer => {},
         else => return err,
     };
-    self.clearPendingAttachment(surface, false);
     if (surface.current) |*current| current.deinit();
     surface.current = candidate;
     candidate_owned = false;
@@ -592,4 +589,103 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     try send(client, 5, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expectEqual(server.Fatal.Kind.implementation, client.fatal().?.kind);
     try std.testing.expectEqualSlices(u32, &pixels, compositor.currentBuffer(surface_id).?.pixels);
+}
+
+test "scanner-backed release failure cleans pending attachment and preserves current pixels" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host);
+    defer compositor.deinit();
+    var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const managed = try server.CoreClient.create(client_allocator.allocator(), &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try send(client, 2, 0, &core.wl_registry.request_messages[0], &.{
+        .{ .uint = compositor.shm.global.?.name() },
+        .{ .new_id = .{ .generic = .{ .interface = "wl_shm", .version = 1, .id = 4 } } },
+    });
+    const formats = try drain(client);
+    defer std.testing.allocator.free(formats);
+    try send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
+    const surface_id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.findClient(client).?.surfaces.items[0];
+
+    const pixels = [_]u32{
+        0xff11_2233,
+        0xff44_5566,
+        0xffaa_bbcc,
+        0xffdd_eeff,
+    };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try sendWithFds(client, 4, 0, &core.wl_shm.request_messages[0], &.{
+        .{ .new_id = .{ .typed = 6 } }, .{ .fd = fd }, .{ .int = @intCast(@sizeOf(@TypeOf(pixels))) },
+    });
+    try send(client, 6, 0, &core.wl_shm_pool.request_messages[0], &.{
+        .{ .new_id = .{ .typed = 7 } },
+        .{ .int = 0 },
+        .{ .int = 2 },
+        .{ .int = 1 },
+        .{ .int = 2 * @sizeOf(u32) },
+        .{ .uint = @intFromEnum(server.shm.Format.argb8888) },
+    });
+    try send(client, 6, 0, &core.wl_shm_pool.request_messages[0], &.{
+        .{ .new_id = .{ .typed = 8 } },
+        .{ .int = 2 * @sizeOf(u32) },
+        .{ .int = 2 },
+        .{ .int = 1 },
+        .{ .int = 2 * @sizeOf(u32) },
+        .{ .uint = @intFromEnum(server.shm.Format.argb8888) },
+    });
+    try send(client, 5, 1, &core.wl_surface.request_messages[1], &.{
+        .{ .object = 7 }, .{ .int = 0 }, .{ .int = 0 },
+    });
+    try send(client, 5, 6, &core.wl_surface.request_messages[6], &.{});
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+    const old_current = compositor.currentBuffer(surface_id).?;
+    const old_pixels = old_current.pixels.ptr;
+    const old_version = surface.next_source_version;
+    try std.testing.expectEqualSlices(u32, pixels[0..2], old_current.pixels);
+
+    const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    const candidate_resource = client.lookup(8).?;
+    try send(client, 5, 1, &core.wl_surface.request_messages[1], &.{
+        .{ .object = 8 }, .{ .int = 0 }, .{ .int = 0 },
+    });
+    try std.testing.expect(surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment.?.observer != null);
+    try std.testing.expect(compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes > live_before_attachment);
+
+    const commit = try encode(5, 6, &core.wl_surface.request_messages[6], &.{});
+    defer std.testing.allocator.free(commit);
+    try client.receive(commit, &.{});
+    client_allocator.fail_index = client_allocator.alloc_index;
+    try client.dispatch();
+
+    try std.testing.expect(client_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.implementation, client.fatal().?.kind);
+    try std.testing.expect(!surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment == null);
+    try std.testing.expectEqual(live_before_attachment, compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes);
+    const preserved = compositor.currentBuffer(surface_id).?;
+    try std.testing.expectEqual(old_pixels, preserved.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, pixels[0..2], preserved.pixels);
+    try std.testing.expectEqual(old_version, surface.next_source_version);
+
+    const live_before_buffer_destroy = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    candidate_resource.destroy();
+    try std.testing.expectEqual(
+        live_before_buffer_destroy - @sizeOf(server.shm.Buffer),
+        compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
+    );
+    try std.testing.expect(surface.pending_attachment == null);
+    try std.testing.expectEqualSlices(u32, pixels[0..2], compositor.currentBuffer(surface_id).?.pixels);
 }
