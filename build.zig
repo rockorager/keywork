@@ -250,6 +250,8 @@ pub fn build(b: *std.Build) void {
         build_options,
         varlink,
         keywork_control,
+        wayring,
+        core_protocol,
         wayland,
         wayland.wayland_xml,
         wayland.protocols,

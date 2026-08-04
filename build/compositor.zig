@@ -15,6 +15,8 @@ pub fn add(
     build_options: *std.Build.Step.Options,
     varlink: *std.Build.Module,
     control: *std.Build.Module,
+    wayring: *std.Build.Module,
+    wayring_core_protocol: *std.Build.Module,
     wayland_libraries: static_wayland.Output,
     wayland_xml: std.Build.LazyPath,
     wayland_protocols: std.Build.LazyPath,
@@ -168,6 +170,8 @@ pub fn add(
     compositor.addOptions("build-options", build_options);
     compositor.addImport("keywork-control", control);
     compositor.addImport("varlink", varlink);
+    compositor.addImport("wayring", wayring);
+    compositor.addImport("wayring-core-protocol", wayring_core_protocol);
     compositor.addImport("wayland", wayland);
     compositor.addImport("vulkan", vulkan);
     compositor.addAnonymousImport("default-config", .{
