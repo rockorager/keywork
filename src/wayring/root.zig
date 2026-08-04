@@ -6,9 +6,11 @@
 pub const wire = @import("wire.zig");
 pub const protocol = @import("protocol.zig");
 pub const generator = @import("generator.zig");
+pub const server = @import("server.zig");
 
 test {
     _ = wire;
     _ = protocol;
     _ = generator;
+    _ = server;
 }
