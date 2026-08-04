@@ -84,6 +84,21 @@ pub fn postImplementationError(self: *Client, resource: *Resource, detail: []con
     self.record(.implementation, resource.id(), null, resource.interface(), detail);
 }
 
+/// Records malformed input detected by a transport adapter without allocating.
+pub fn transportMalformed(self: *Client) void {
+    self.record(.malformed_wire, 0, null, null, "malformed transport input");
+}
+
+/// Records allocation failure in a transport adapter without allocating.
+pub fn transportOutOfMemory(self: *Client) void {
+    self.record(.out_of_memory, 0, null, null, "transport allocation failed");
+}
+
+/// Records peer closure without producing a terminal protocol frame.
+pub fn peerDisconnected(self: *Client) void {
+    self.record(.peer_disconnect, 0, null, null, "peer disconnected");
+}
+
 pub fn receive(self: *Client, bytes: []const u8, fds: []const wire.FileDescriptor) !void {
     if (self.fatal_state.recorded) return error.ClientFatal;
     self.input.receive(bytes, fds) catch |err| {
@@ -444,6 +459,33 @@ test "Client fatal without display records but has no terminal output" {
     client.record(.implementation, 4, null, null, "no display");
     try std.testing.expectEqual(Fatal.Kind.implementation, client.fatal().?.kind);
     try std.testing.expect((try client.beginSend()) == null);
+}
+
+test "transport fatal entry points allocate nothing and disconnect emits no terminal output" {
+    inline for (.{
+        .{ .kind = Fatal.Kind.malformed_wire, .call = Client.transportMalformed },
+        .{ .kind = Fatal.Kind.out_of_memory, .call = Client.transportOutOfMemory },
+        .{ .kind = Fatal.Kind.peer_disconnect, .call = Client.peerDisconnected },
+    }) |case| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var client: Client = .init(failing.allocator(), .{});
+        var display: Resource = .init(failing.allocator(), 1, 1, &test_display_interface, &.{}, .client, client.ownerHooks());
+        try client.installClientInitial(1, &display);
+        failing.fail_index = failing.alloc_index;
+        case.call(&client);
+        try std.testing.expectEqual(case.kind, client.fatal().?.kind);
+        try std.testing.expect(!failing.has_induced_failure);
+        failing.fail_index = std.math.maxInt(usize);
+        if (case.kind == .peer_disconnect)
+            try std.testing.expect((try client.beginSend()) == null)
+        else {
+            const terminal = (try client.beginSend()).?;
+            try client.completeSend(terminal.token, terminal.bytes.len);
+        }
+        display.destroy();
+        display.deinit();
+        client.deinit();
+    }
 }
 
 test "fragmented frames dispatch twice and recursive client dispatch is rejected" {
