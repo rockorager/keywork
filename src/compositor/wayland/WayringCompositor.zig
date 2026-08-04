@@ -1,4 +1,5 @@
-//! Scanner-backed Wayring ownership slice for wl_compositor and wl_surface.
+//! Scanner-backed Wayring ownership slice for wl_compositor, wl_surface, and
+//! wl_shm.
 //!
 //! This deliberately owns a distinct surface identity namespace. It proves
 //! Keywork can consume native Wayring resources without pretending they are
@@ -14,6 +15,7 @@ const slot_map = @import("../slot_map.zig");
 
 const server = wayring.server;
 const wire = wayring.wire;
+const Shm = server.shm.Protocol(core);
 
 const SurfaceIdentity = struct {
     client: *server.Client,
@@ -41,6 +43,7 @@ const ClientObjects = struct {
 allocator: std.mem.Allocator,
 protocol_server: *server.Server,
 global: *const server.Server.Global,
+shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 surfaces: SurfaceStore = .{},
 
@@ -49,8 +52,11 @@ pub fn init(self: *WayringCompositor, allocator: std.mem.Allocator, protocol_ser
         .allocator = allocator,
         .protocol_server = protocol_server,
         .global = undefined,
+        .shm = .init(allocator),
     };
     self.global = try protocol_server.addGlobal(core.wl_compositor, 1, WayringCompositor, self, bind);
+    errdefer protocol_server.removeGlobal(self.global) catch {};
+    _ = try self.shm.publish(protocol_server, 1);
 }
 
 pub fn deinit(self: *WayringCompositor) void {
@@ -60,6 +66,7 @@ pub fn deinit(self: *WayringCompositor) void {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
     };
+    self.shm.deinit();
     self.surfaces.deinit(self.allocator);
     self.clients.deinit(self.allocator);
     self.* = undefined;
@@ -78,8 +85,9 @@ pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) 
         objects.compositors.deinit(self.allocator);
         self.allocator.destroy(objects);
         _ = self.clients.orderedRemove(index);
-        return;
+        break;
     }
+    self.shm.destroyClientResources(client);
 }
 
 pub fn surfaceCount(self: *const WayringCompositor) usize {

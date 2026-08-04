@@ -299,6 +299,7 @@ const TestClient = struct {
     display_name: []const u8,
     status: std.atomic.Value(u8) = .init(@intFromEnum(Status.running)),
     compositor: ?*wayland.client.wl.Compositor = null,
+    shm: ?*wayland.client.wl.Shm = null,
 
     fn run(self: *TestClient) void {
         self.runFallible() catch {
@@ -324,6 +325,7 @@ const TestClient = struct {
         registry.setListener(*TestClient, registryEvent, self);
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
         const compositor = self.compositor orelse return error.CompositorMissing;
+        _ = self.shm orelse return error.ShmMissing;
         _ = try compositor.createSurface();
         if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
     }
@@ -331,12 +333,20 @@ const TestClient = struct {
     fn registryEvent(registry: *wayland.client.wl.Registry, event: wayland.client.wl.Registry.Event, self: *TestClient) void {
         switch (event) {
             .global => |global| {
-                if (!std.mem.eql(u8, std.mem.span(global.interface), "wl_compositor") or self.compositor != null) return;
-                self.compositor = registry.bind(
-                    global.name,
-                    wayland.client.wl.Compositor,
-                    global.version,
-                ) catch null;
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor") and self.compositor == null) {
+                    self.compositor = registry.bind(
+                        global.name,
+                        wayland.client.wl.Compositor,
+                        global.version,
+                    ) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_shm") and self.shm == null) {
+                    self.shm = registry.bind(
+                        global.name,
+                        wayland.client.wl.Shm,
+                        global.version,
+                    ) catch null;
+                }
             },
             .global_remove => {},
         }
