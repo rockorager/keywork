@@ -197,6 +197,21 @@ if ! command -v ffmpeg >/dev/null || ! command -v node >/dev/null || ! command -
         ffmpeg nodejs npm
 fi
 
+if ! command -v sway >/dev/null \
+    || ! command -v perf >/dev/null \
+    || ! command -v strace >/dev/null \
+    || ! command -v pidstat >/dev/null \
+    || ! command -v hyperfine >/dev/null \
+    || ! command -v wayland-info >/dev/null; then
+    echo "Installing Wayland benchmark tools"
+    sudo apt-get update
+    # Keep perf on the Debian 6.1 line to match the orb kernel family.
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        linux-perf
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
+        hyperfine strace sway sysstat wayland-utils
+fi
+
 if ! command -v zigdoc >/dev/null || ! zigdoc --help >/dev/null 2>&1; then
     echo "Installing zigdoc 0.5.1"
     install_tar_binary \
