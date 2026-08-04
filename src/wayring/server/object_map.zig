@@ -51,6 +51,10 @@ pub fn deinit(self: *ObjectMap) void {
     self.* = undefined;
 }
 
+pub fn count(self: *const ObjectMap) usize {
+    return self.entries.count();
+}
+
 /// Atomically reserves all client-created IDs carried by one request.
 pub fn reserveClientIds(self: *ObjectMap, ids: []const u32) !void {
     var high_water = self.client_high_water;

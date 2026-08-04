@@ -58,6 +58,24 @@ pub fn fatal(self: *const Client) ?*const Fatal {
     return if (self.fatal_state.recorded) &self.fatal_state else null;
 }
 
+pub fn objectCount(self: *const Client) usize {
+    return self.objects.count();
+}
+
+/// Records an application-detected protocol violation without allocating and
+/// prevents any further request dispatch. Emitting the terminal
+/// `wl_display.error` event is intentionally deferred to transport work.
+pub fn postProtocolError(self: *Client, resource: *Resource, code: u32, detail: []const u8) void {
+    self.input.discardAfterFatal();
+    _ = self.fatal_state.record(.{
+        .kind = .protocol,
+        .object_id = resource.id(),
+        .protocol_code = code,
+        .interface = resource.interface(),
+        .detail = detail,
+    });
+}
+
 pub fn receive(self: *Client, bytes: []const u8, fds: []const wire.FileDescriptor) !void {
     if (self.fatal_state.recorded) return error.ClientFatal;
     self.input.receive(bytes, fds) catch |err| {

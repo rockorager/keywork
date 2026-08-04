@@ -92,6 +92,35 @@ pub fn build(b: *std.Build) void {
     const run_checkpoint2_tests = b.addRunArtifact(checkpoint2_tests);
     test_wayring_step.dependOn(&run_checkpoint2_tests.step);
     test_step.dependOn(&run_checkpoint2_tests.step);
+    const generate_core_protocol = b.addRunArtifact(wayring_scanner);
+    generate_core_protocol.addFileArg(b.dependency("wayland_source", .{}).path("protocol/wayland.xml"));
+    const generated_core_source = generate_core_protocol.captureStdOut(.{ .basename = "core_protocol.zig" });
+    const core_protocol = b.createModule(.{
+        .root_source_file = generated_core_source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
+    const core_protocol_check = b.createModule(.{
+        .root_source_file = generated_core_source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
+    const run_core_protocol_check = b.addRunArtifact(b.addTest(.{ .root_module = core_protocol_check }));
+    test_wayring_step.dependOn(&run_core_protocol_check.step);
+    test_step.dependOn(&run_core_protocol_check.step);
+    const checkpoint3_test_module = b.createModule(.{
+        .root_source_file = b.path("src/wayring/checkpoint3_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    checkpoint3_test_module.addImport("core_protocol", core_protocol);
+    checkpoint3_test_module.addImport("wayring", wayring);
+    const checkpoint3_tests = b.addTest(.{ .root_module = checkpoint3_test_module });
+    const run_checkpoint3_tests = b.addRunArtifact(checkpoint3_tests);
+    test_wayring_step.dependOn(&run_checkpoint3_tests.step);
+    test_step.dependOn(&run_checkpoint3_tests.step);
     const scanner_step = b.step("wayring-scanner", "Build the Wayring protocol scanner");
     scanner_step.dependOn(&wayring_scanner.step);
 

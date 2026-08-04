@@ -200,6 +200,21 @@ fn emitInterface(w: *std.Io.Writer, interface: *const protocol.Interface) !void 
     try w.writeAll(".request_messages; _ = ");
     try ident(w, interface.name);
     try w.writeAll(".event_messages; }\n\n");
+    try w.writeAll("test { _ = ");
+    try ident(w, interface.name);
+    try w.writeAll(".Resource; _ = ");
+    try ident(w, interface.name);
+    try w.writeAll(".Request; _ = ");
+    try ident(w, interface.name);
+    try w.writeAll(".decodeRequest;");
+    for (interface.events) |message| {
+        try w.writeAll(" _ = ");
+        try ident(w, interface.name);
+        try w.writeAll(".@\"send:");
+        try w.print("{f}", .{std.zig.fmtString(message.name)});
+        try w.writeAll("\";");
+    }
+    try w.writeAll(" }\n\n");
 }
 
 fn emitDescriptors(w: *std.Io.Writer, prefix: []const u8, messages: []const protocol.Message) !void {
@@ -296,7 +311,7 @@ fn emitSender(w: *std.Io.Writer, message: protocol.Message, opcode: usize) !void
     try w.writeAll(": *Resource");
     for (message.arguments) |arg| {
         try w.writeAll(", ");
-        try ident(w, arg.name);
+        try senderArgIdent(w, arg.name);
         try w.writeAll(": ");
         try typeName(w, arg);
     }
@@ -309,10 +324,10 @@ fn emitSender(w: *std.Io.Writer, message: protocol.Message, opcode: usize) !void
         try w.writeAll(" = ");
         if (arg.type == .new_id) {
             if (arg.interface == null) try w.writeAll(".{ .generic = ") else try w.writeAll(".{ .typed = ");
-            try ident(w, arg.name);
+            try senderArgIdent(w, arg.name);
             try w.writeAll(" }");
         } else {
-            try ident(w, arg.name);
+            try senderArgIdent(w, arg.name);
         }
         try w.writeAll(" },\n");
     }
@@ -327,6 +342,12 @@ fn internalNameSuffix(message: protocol.Message, base: []const u8) usize {
     var suffix: usize = 0;
     while (hasArgumentName(message, base, suffix)) suffix += 1;
     return suffix;
+}
+
+fn senderArgIdent(w: *std.Io.Writer, name: []const u8) !void {
+    try w.writeAll("@\"__wayring_arg_");
+    try w.writeAll(name);
+    try w.writeAll("\"");
 }
 
 fn internalNameSuffixWithReserved(message: protocol.Message, base: []const u8, reserved_base: []const u8, reserved_suffix: usize) usize {

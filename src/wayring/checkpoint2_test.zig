@@ -134,7 +134,7 @@ test "generated typed resource dispatches requests and emits events through owne
         _ = std.c.close(fd);
     };
 
-    try Fixture.@"send:done"(&resource, 7, 8, "done", "data", pipe_fds[1]);
+    try Fixture.@"send:done"(&resource, 7, 8, 0, "done", "data", pipe_fds[1]);
     try std.testing.expectEqual(@as(usize, 1), owner.emitted);
     try std.testing.expect((try owner.output.beginSend()) != null);
 
