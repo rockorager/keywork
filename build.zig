@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const wayring = b.addModule("wayring", .{
+        .root_source_file = b.path("src/wayring/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const keywork_control = b.addModule("keywork-control", .{
         .root_source_file = b.path("src/compositor/control/root.zig"),
         .target = target,
@@ -44,6 +50,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(loop_tests).step);
     const varlink_tests = b.addTest(.{ .root_module = varlink });
     test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
+    const wayring_tests = b.addTest(.{ .root_module = wayring });
+    const run_wayring_tests = b.addRunArtifact(wayring_tests);
+    test_step.dependOn(&run_wayring_tests.step);
+    const test_wayring_step = b.step("test-wayring", "Run Wayring tests");
+    test_wayring_step.dependOn(&run_wayring_tests.step);
 
     const lint_step = b.step("lint", "Run all static analysis");
     const check_step = b.step("check", "Run all tests and static analysis");

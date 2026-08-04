@@ -117,8 +117,8 @@ roles, configure policy, or window management.
 try connection.receive(bytes, received_fds);
 try connection.dispatch();
 
-const batch = connection.nextSendBatch();
-connection.completeSend(batch, bytes_written);
+const batch = try connection.beginSend();
+try connection.completeSend(batch.token, bytes_written);
 ```
 
 The final API must support fragmented input, partial output, backpressure, and
@@ -127,7 +127,10 @@ receive order. A send batch contains both bytes and descriptors. Any positive
 `sendmsg` result transmits the batch's entire ancillary FD payload even when
 only part of its bytes were written, so retries contain the remaining bytes
 without those FDs. It must not expose borrowed slices whose validity changes
-without an explicit operation.
+without an explicit operation. Only one send attempt may be outstanding, and
+completing it invalidates the returned view. Generation-checked batch tokens
+make stale or duplicate completions errors rather than progress on a later
+message.
 
 ### io_uring host
 
