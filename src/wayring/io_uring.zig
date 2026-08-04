@@ -306,9 +306,13 @@ pub const CompleteResult = union(enum) {
 };
 
 pub const Server = struct {
+    const max_auto_socket_number = 31;
+
     allocator: std.mem.Allocator,
     sans_io: *server.Server,
     listener_fd: linux.fd_t,
+    owned_socket_path: ?[:0]u8 = null,
+    owned_socket_name: ?[]const u8 = null,
     operations: OperationTable,
     connections: std.ArrayList(*Connection) = .empty,
     accept_pending: bool = false,
@@ -328,13 +332,50 @@ pub const Server = struct {
         };
     }
 
+    /// Creates and owns the first available `wayland-N` listener in an
+    /// explicit runtime directory. Existing paths are never removed.
+    pub fn listenAuto(allocator: std.mem.Allocator, sans_io: *server.Server, runtime_directory: []const u8) !Server {
+        if (!std.fs.path.isAbsolute(runtime_directory)) return error.InvalidRuntimeDirectory;
+        var name_buffer: ["wayland-".len + 10]u8 = undefined;
+        for (0..max_auto_socket_number + 1) |number| {
+            const name = std.fmt.bufPrint(&name_buffer, "wayland-{d}", .{number}) catch unreachable;
+            const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ runtime_directory, name }, 0);
+            const listener_fd = openListener(path) catch |err| {
+                allocator.free(path);
+                if (err == error.AddressInUse) continue;
+                return err;
+            };
+            return .{
+                .allocator = allocator,
+                .sans_io = sans_io,
+                .listener_fd = listener_fd,
+                .owned_socket_path = path,
+                .owned_socket_name = path[path.len - name.len ..],
+                .operations = .init(allocator),
+            };
+        }
+        return error.NoAvailableSocketName;
+    }
+
+    pub fn socketName(self: *const Server) ?[]const u8 {
+        return self.owned_socket_name;
+    }
+
     pub fn deinit(self: *Server) !void {
         if (self.operations.live_count != 0 or self.operations.prepared != null) return error.OperationsInFlight;
         if (self.connections.items.len != 0) return error.ConnectionsLive;
         _ = linux.close(self.listener_fd);
+        var socket_cleanup_failed = false;
+        if (self.owned_socket_path) |path| {
+            removeSocketPath(path) catch {
+                socket_cleanup_failed = true;
+            };
+            self.allocator.free(path);
+        }
         self.connections.deinit(self.allocator);
         self.operations.deinit();
         self.* = undefined;
+        if (socket_cleanup_failed) return error.SocketCleanupFailed;
     }
 
     /// Stops new transport work. Kernel-owned operation storage remains alive
@@ -629,6 +670,44 @@ fn completionError(res: i32) ?linux.E {
     return @enumFromInt(@as(u16, @intCast(-@as(i64, res))));
 }
 
+fn socketAddress(path: []const u8) !struct { linux.sockaddr.un, linux.socklen_t } {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    if (path.len == 0 or path.len >= address.path.len) return error.InvalidSocketPath;
+    @memcpy(address.path[0..path.len], path);
+    return .{ address, @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1) };
+}
+
+fn openListener(path: [:0]const u8) !linux.fd_t {
+    const address, const address_len = try socketAddress(path);
+    const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(raw_fd);
+    errdefer _ = linux.close(fd);
+    const bind_result = linux.bind(fd, @ptrCast(&address), address_len);
+    switch (linux.errno(bind_result)) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.BindFailed,
+    }
+    errdefer _ = linux.unlink(path.ptr);
+    if (linux.errno(linux.listen(fd, linux.SOMAXCONN)) != .SUCCESS) return error.ListenFailed;
+    return fd;
+}
+
+fn removeSocketPath(path: [:0]const u8) !void {
+    var status: linux.Statx = undefined;
+    const stat_result = linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &status);
+    switch (linux.errno(stat_result)) {
+        .NOENT => return,
+        .SUCCESS => if (status.mode & linux.S.IFMT != linux.S.IFSOCK) return error.SocketPathOccupied,
+        else => return error.SocketPathInspectionFailed,
+    }
+    switch (linux.errno(linux.unlink(path.ptr))) {
+        .SUCCESS, .NOENT => {},
+        else => return error.UnlinkFailed,
+    }
+}
+
 fn peerCredentials(fd: linux.fd_t) !server.Client.Credentials {
     var credentials: LinuxCredentials = undefined;
     var size: linux.socklen_t = @sizeOf(LinuxCredentials);
@@ -707,6 +786,39 @@ fn testPeerSocket() !linux.fd_t {
     if (linux.errno(result) != .SUCCESS) return error.SocketPairFailed;
     _ = linux.close(sockets[1]);
     return sockets[0];
+}
+
+test "automatic listener chooses the next name and removes owned socket paths" {
+    var unique_marker: u8 = 0;
+    const directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&unique_marker) },
+        0,
+    );
+    defer std.testing.allocator.free(directory);
+    if (linux.errno(linux.mkdir(directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(directory.ptr);
+
+    const occupied = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wayland-0", .{directory}, 0);
+    defer std.testing.allocator.free(occupied);
+    const occupied_fd = try openListener(occupied);
+    defer {
+        _ = linux.close(occupied_fd);
+        _ = linux.unlink(occupied.ptr);
+    }
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var transport = try Server.listenAuto(std.testing.allocator, &host, directory);
+    try std.testing.expectEqualStrings("wayland-1", transport.socketName().?);
+    const owned_path = try std.testing.allocator.dupeZ(u8, transport.owned_socket_path.?);
+    defer std.testing.allocator.free(owned_path);
+    try transport.deinit();
+
+    var status: linux.Statx = undefined;
+    const stat_result = linux.statx(linux.AT.FDCWD, owned_path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &status);
+    try std.testing.expectEqual(linux.E.NOENT, linux.errno(stat_result));
 }
 
 test "SCM_RIGHTS encoder emits one ordered descriptor message" {

@@ -137,6 +137,11 @@ message.
 ```zig
 var transport = try wayring.io_uring.Server.init(allocator, &server, listener_fd);
 
+// Alternatively, let the transport own the first available wayland-N socket.
+// Existing paths are never replaced, and deinit removes the selected path:
+// var transport = try wayring.io_uring.Server.listenAuto(allocator, &server, runtime_directory);
+// const display_name = transport.socketName().?;
+
 const external = try host_tokens.reserve();
 switch (try transport.prepareNext(&host_ring, external)) {
     .prepared => |token| host_tokens.installWayring(external, token),
