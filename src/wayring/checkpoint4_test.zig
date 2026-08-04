@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("wayland-client.h");
 });
 
-const ClientStatus = enum(u8) { running, success, connect_failed, registry_failed, roundtrip_failed };
+const ClientStatus = enum(u8) { running, success, connect_failed, registry_failed, shm_failed, roundtrip_failed };
 const no_wake_fd: i32 = -1;
 const shutdown_requested: i32 = -2;
 
@@ -16,11 +16,16 @@ const ClientContext = struct {
     status: std.atomic.Value(u8) = .init(@intFromEnum(ClientStatus.running)),
     wake_fd: std.atomic.Value(i32) = .init(no_wake_fd),
     saw_compositor: bool = false,
+    shm: ?*c.wl_shm = null,
+    saw_argb8888: bool = false,
+    saw_xrgb8888: bool = false,
 };
 
-fn registryGlobal(data: ?*anyopaque, _: ?*c.wl_registry, _: u32, interface: [*c]const u8, _: u32) callconv(.c) void {
+fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*c]const u8, _: u32) callconv(.c) void {
     const context: *ClientContext = @ptrCast(@alignCast(data.?));
     if (std.mem.eql(u8, std.mem.span(interface), "wl_compositor")) context.saw_compositor = true;
+    if (std.mem.eql(u8, std.mem.span(interface), "wl_shm"))
+        context.shm = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_shm_interface, 1));
 }
 
 fn registryRemove(_: ?*anyopaque, _: ?*c.wl_registry, _: u32) callconv(.c) void {}
@@ -29,6 +34,14 @@ const registry_listener: c.wl_registry_listener = .{
     .global = registryGlobal,
     .global_remove = registryRemove,
 };
+
+fn shmFormat(data: ?*anyopaque, _: ?*c.wl_shm, format: u32) callconv(.c) void {
+    const context: *ClientContext = @ptrCast(@alignCast(data.?));
+    if (format == c.WL_SHM_FORMAT_ARGB8888) context.saw_argb8888 = true;
+    if (format == c.WL_SHM_FORMAT_XRGB8888) context.saw_xrgb8888 = true;
+}
+
+const shm_listener: c.wl_shm_listener = .{ .format = shmFormat };
 
 fn clientMain(context: *ClientContext) void {
     const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
@@ -57,7 +70,30 @@ fn clientMain(context: *ClientContext) void {
     if (c.wl_registry_add_listener(registry, &registry_listener, context) != 0)
         return finish(context, .registry_failed);
     if (c.wl_display_roundtrip(display) < 0) return finish(context, .roundtrip_failed);
-    finish(context, if (context.saw_compositor) .success else .registry_failed);
+    const shm = context.shm orelse return finish(context, .registry_failed);
+    defer c.wl_shm_destroy(shm);
+    if (c.wl_shm_add_listener(shm, &shm_listener, context) != 0) return finish(context, .shm_failed);
+    if (c.wl_display_roundtrip(display) < 0) return finish(context, .roundtrip_failed);
+    if (!context.saw_compositor or !context.saw_argb8888 or !context.saw_xrgb8888)
+        return finish(context, .registry_failed);
+
+    const shm_fd = std.posix.memfd_create("wayring-libwayland-shm", std.os.linux.MFD.CLOEXEC) catch
+        return finish(context, .shm_failed);
+    defer _ = linux.close(shm_fd);
+    if (linux.errno(linux.ftruncate(shm_fd, 64)) != .SUCCESS) return finish(context, .shm_failed);
+    const pool = c.wl_shm_create_pool(shm, shm_fd, 64) orelse return finish(context, .shm_failed);
+    const buffer = c.wl_shm_pool_create_buffer(pool, 0, 2, 2, 8, c.WL_SHM_FORMAT_ARGB8888) orelse {
+        c.wl_shm_pool_destroy(pool);
+        return finish(context, .shm_failed);
+    };
+    c.wl_shm_pool_destroy(pool);
+    if (c.wl_display_roundtrip(display) < 0) {
+        c.wl_buffer_destroy(buffer);
+        return finish(context, .roundtrip_failed);
+    }
+    c.wl_buffer_destroy(buffer);
+    if (c.wl_display_roundtrip(display) < 0) return finish(context, .roundtrip_failed);
+    finish(context, .success);
 }
 
 fn finish(context: *ClientContext, status: ClientStatus) void {
@@ -96,11 +132,14 @@ fn shortSleep() void {
     _ = linux.nanosleep(&duration, null);
 }
 
-test "system libwayland completes registry roundtrip through caller-owned io_uring" {
+test "system libwayland creates and destroys shared memory through caller-owned io_uring" {
     var host: wayring.server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var binder_context: u8 = 0;
     _ = try host.addGlobal(core.wl_compositor, 1, u8, &binder_context, compositorBind);
+    var shm: wayring.server.shm.Protocol(core) = .init(std.testing.allocator);
+    defer shm.deinit();
+    _ = try shm.publish(&host, core.wl_shm.interface.version);
 
     const address = socketAddress();
     const address_len = addressLength();
@@ -193,6 +232,7 @@ test "system libwayland completes registry roundtrip through caller-owned io_uri
             if (!timed_out) try std.testing.expectEqual(ClientStatus.success, status);
         }
         if (joined and accepted != null and (disconnected or timed_out)) {
+            shm.destroyClientResources(accepted.?.client());
             var released = true;
             transport.release(accepted.?) catch |err| switch (err) {
                 error.OperationInFlight => released = false,

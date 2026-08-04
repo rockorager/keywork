@@ -361,15 +361,16 @@ WAYLAND_DISPLAY=/tmp/wayring-example.sock wayland-info
 
 The example exits when its first accepted client becomes terminal or
 disconnects. Any additional connections accepted before shutdown are tracked
-and released during the same drain. It publishes `wl_compositor`; surfaces can
-be created and destroyed, while rendering requests and regions produce a clear
+and released during the same drain. It publishes `wl_compositor` and the
+optional `wl_shm` helper; surfaces and shared-memory buffers can be created and
+destroyed, while rendering requests and regions produce a clear
 implementation-fatal error. The host owns the listening socket and `IoUring`,
 fills the submission queue through `prepareNext`, installs bounded external
 completion routes before submitting, retries short submissions before waiting,
 reaps complete CQ batches, and routes each completion back through `complete`.
-On exit it destroys application resources before releasing every connection,
-then prepares shutdown cancellation SQEs until the transport is drained. No
-Keywork event loop or compositor code is involved.
+On exit it destroys application and shared-memory resources before releasing
+every connection, then prepares shutdown cancellation SQEs until the transport
+is drained. No Keywork event loop or compositor code is involved.
 
 Exit: the example is sufficient API documentation and interoperates with an
 external client.

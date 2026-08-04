@@ -4,6 +4,7 @@ const std = @import("std");
 const core = @import("core_protocol");
 const wayring = @import("wayring");
 const linux = std.os.linux;
+const Shm = wayring.server.shm.Protocol(core);
 
 const submission_capacity = 32;
 // Every original operation may need a separately routed cancellation CQE.
@@ -91,6 +92,7 @@ const ManagedClient = struct {
 
 const Manager = struct {
     allocator: std.mem.Allocator,
+    shm: *Shm,
     clients: std.ArrayList(*ManagedClient) = .empty,
 
     fn add(self: *Manager, connection: *wayring.io_uring.Connection) !void {
@@ -125,6 +127,7 @@ const Manager = struct {
             }
             if (managed.app_live) {
                 managed.app.deinit();
+                self.shm.destroyClientResources(managed.connection.client());
                 managed.app_live = false;
             }
             transport.release(managed.connection) catch |err| switch (err) {
@@ -210,7 +213,10 @@ pub fn main(init: std.process.Init) !void {
 
     var protocol_server: wayring.server.Server = .init(allocator);
     defer protocol_server.deinit();
-    var manager: Manager = .{ .allocator = allocator };
+    var shm: Shm = .init(allocator);
+    defer shm.deinit();
+    _ = try shm.publish(&protocol_server, core.wl_shm.interface.version);
+    var manager: Manager = .{ .allocator = allocator, .shm = &shm };
     defer manager.deinit();
     _ = try protocol_server.addGlobal(core.wl_compositor, core.wl_compositor.interface.version, Manager, &manager, App.bind);
 
