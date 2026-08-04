@@ -562,7 +562,7 @@ test "input method parent teardown keeps children valid when deferral allocation
     try std.testing.expectEqual(Server.ClientState.protocol_error, client.state);
     try std.testing.expectEqual(@as(usize, 0), owner.methods.items.len);
     try std.testing.expect(child.method == null);
-    try std.testing.expect((try client.resourceContext(child.resource, &generated.zwp_input_method_keyboard_grab_v2)) == child);
+    try std.testing.expect((try client.resourceContext(child.resource, &generated.zwp_input_method_keyboard_grab_v2)) == @as(*anyopaque, @ptrCast(child)));
 
     try server.destroyClient(client);
     client_owned = false;
