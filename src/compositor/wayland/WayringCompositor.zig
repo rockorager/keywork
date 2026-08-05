@@ -14,6 +14,7 @@ const wayring = @import("wayring");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const Region = @import("../region.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
+const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
 const render = @import("../render/types.zig");
 
 const server = wayring.server;
@@ -27,10 +28,7 @@ pub const SurfaceId = SurfaceRegistry.Id;
 /// Resource. Callers must retain the canonical SurfaceId supplied with this
 /// value and must not invoke it after compositor deinit; removed or reused IDs
 /// are harmless no-ops.
-pub const FrameCompletion = struct {
-    context: *anyopaque,
-    complete: *const fn (*anyopaque, SurfaceId, u32) void,
-};
+pub const FrameCompletion = SurfaceFrameCompletion;
 
 /// Presentation lifecycle copied by init. The context remains borrowed until
 /// compositor deinit; callbacks never receive Wayland resources or policy and

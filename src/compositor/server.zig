@@ -82,6 +82,7 @@ const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
+const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
 const Surface = @import("wayland/surface.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const Viewporter = @import("wayland/viewporter.zig");
@@ -3299,6 +3300,11 @@ fn surfaceSampleTag(id: Surface.Id) u64 {
 test "surface sample tags preserve canonical index and generation" {
     const id: Surface.Id = .{ .index = 0x1234_5678, .generation = 0x9abc_def0 };
     try std.testing.expectEqual(@as(u64, 0x9abc_def0_1234_5678), surfaceSampleTag(id));
+
+    const other_index: Surface.Id = .{ .index = id.index + 1, .generation = id.generation };
+    const other_generation: Surface.Id = .{ .index = id.index, .generation = id.generation + 1 };
+    try std.testing.expect(surfaceSampleTag(id) != surfaceSampleTag(other_index));
+    try std.testing.expect(surfaceSampleTag(id) != surfaceSampleTag(other_generation));
 }
 
 fn setControlLogLevel(_: *anyopaque, level: ControlProtocol.LogLevel) void {
@@ -3659,12 +3665,21 @@ pub fn terminate(self: *Self) void {
 
 /// The provider remains live until removal. A mapped provider must keep its
 /// committed logical size and RenderState available until it commits an unmap.
-fn addHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+fn addHeadlessSurface(
+    self: *Self,
+    id: SurfaceRegistry.Id,
+    frame_completion: ?SurfaceFrameCompletion,
+) error{OutOfMemory}!void {
     std.debug.assert(self.surface_registry.contains(id));
-    try self.headless_surface_forest.addRoot(id);
+    try self.headless_surface_forest.addRoot(id, frame_completion);
 }
 
-fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size) void {
+fn commitHeadlessSurface(
+    self: *Self,
+    id: SurfaceRegistry.Id,
+    size: ?render.Size,
+    callbacks_committed: bool,
+) void {
     std.debug.assert(self.surface_registry.contains(id));
     if (size) |mapped| std.debug.assert(mapped.width > 0 and mapped.height > 0);
     const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
@@ -3676,7 +3691,7 @@ fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size
             .height = old_size.height,
         }, index);
     }
-    self.headless_surface_forest.applyRoot(id, size);
+    self.headless_surface_forest.applyRoot(id, size, callbacks_committed);
     if (size) |new_size| {
         self.damageHeadlessSurfaceBounds(.{
             .x = 0,
@@ -3704,19 +3719,19 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
 fn wayringSurfaceAdded(
     context: *anyopaque,
     id: SurfaceRegistry.Id,
-    _: WayringCompositor.FrameCompletion,
+    frame_completion: WayringCompositor.FrameCompletion,
 ) error{OutOfMemory}!void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(self.surface_registry.contains(id));
     std.debug.assert(self.surface_registry.renderState(id) == null);
-    try self.addHeadlessSurface(id);
+    try self.addHeadlessSurface(id, frame_completion);
 }
 
 fn wayringSurfaceCommitted(
     context: *anyopaque,
     id: SurfaceRegistry.Id,
     size: ?render.Size,
-    _: bool,
+    callbacks_committed: bool,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const render_state = self.surface_registry.renderState(id);
@@ -3726,7 +3741,7 @@ fn wayringSurfaceCommitted(
     } else {
         std.debug.assert(render_state == null);
     }
-    self.commitHeadlessSurface(id, size);
+    self.commitHeadlessSurface(id, size, callbacks_committed);
 }
 
 fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
@@ -5238,6 +5253,24 @@ fn rememberSampledSurfaces(self: *Self, output: *RenderOutput) void {
         }
     }
     output.sampled_surfaces_valid = true;
+}
+
+/// Completes only demand whose tagged image survived this accepted output
+/// frame. Taking the thunk clears demand before frontend code can run.
+fn completeSampledHeadlessFrames(self: *Self) void {
+    var callback_timestamp_ms: ?u32 = null;
+    var index: usize = 0;
+    while (index < self.headless_surface_forest.len()) : (index += 1) {
+        const root = self.headless_surface_forest.roots()[index];
+        if (!root.frame_demand or !self.renderer.wasSampled(surfaceSampleTag(root.id))) continue;
+        const completion = self.headless_surface_forest.takeFrameCompletion(root.id) orelse unreachable;
+        const timestamp_ms = callback_timestamp_ms orelse timestamp: {
+            const value = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
+            callback_timestamp_ms = value;
+            break :timestamp value;
+        };
+        completion.complete(completion.context, root.id, timestamp_ms);
+    }
 }
 
 fn outputDamageRectangles(
@@ -8972,6 +9005,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
         );
     }
     self.rememberSampledSurfaces(render_output);
+    self.completeSampledHeadlessFrames();
     output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
@@ -9258,6 +9292,7 @@ fn presentSessionLockFrame(
     );
     frame.render_output.lock_frame_pending = true;
     self.rememberSampledSurfaces(frame.render_output);
+    self.completeSampledHeadlessFrames();
     frame.output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
@@ -9505,7 +9540,7 @@ fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error
         const command = [_]render.Command{.{ .image = imageFromRenderState(
             render_state,
             .{ .position = .{}, .rounded_clip = null, .clip = null },
-            null,
+            surfaceSampleTag(entry.id),
         ) }};
         try self.renderCommands(frame, &command);
     }
@@ -10870,6 +10905,272 @@ fn captureSinglePixel(server: *Self) Renderer.Error!u32 {
     return pixel[0];
 }
 
+const TestFrameCompletion = struct {
+    count: usize = 0,
+    ids: [8]SurfaceRegistry.Id = undefined,
+    timestamps_ms: [8]u32 = undefined,
+    forest: ?*HeadlessSurfaceForest = null,
+    demand_cleared_before_call: bool = true,
+
+    fn frameCompletion(self: *TestFrameCompletion) SurfaceFrameCompletion {
+        return .{ .context = self, .complete = complete };
+    }
+
+    fn complete(context: *anyopaque, id: SurfaceRegistry.Id, timestamp_ms: u32) void {
+        const self: *TestFrameCompletion = @ptrCast(@alignCast(context));
+        std.debug.assert(self.count < self.ids.len);
+        if (self.forest) |forest| {
+            const index = forest.rootIndex(id) orelse unreachable;
+            self.demand_cleared_before_call = self.demand_cleared_before_call and
+                !forest.roots()[index].frame_demand;
+        }
+        self.ids[self.count] = id;
+        self.timestamps_ms[self.count] = timestamp_ms;
+        self.count += 1;
+    }
+};
+
+fn renderPendingTestOutput(server: *Self, output: *RenderOutput) Renderer.Error!void {
+    std.debug.assert(output.repaint_needed);
+    std.debug.assert(!output.damage.isEmpty());
+    output.render_scheduled = false;
+    output.repaint_needed = false;
+    try server.renderFrame(output);
+}
+
+test "sampled accepted headless frame completes callback-only demand once" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff12_3456,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const id = try server.surface_registry.add(provider.provider());
+    try server.addHeadlessSurface(id, completion.frameCompletion());
+    server.commitHeadlessSurface(id, provider.logical_size, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+
+    server.commitHeadlessSurface(id, provider.logical_size, true);
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.render_scheduled);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    try std.testing.expectEqual(provider.pixel, try captureSinglePixel(server));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(id)));
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    try server.renderer.beginFrame(.{ .offscreen = .{
+        .id = 1,
+        .size = .{ .width = 1, .height = 1 },
+    } }, .{}, .{}, null, .{});
+    try server.renderer.append(&.{.{ .image = imageFromRenderState(
+        server.surface_registry.renderState(id).?,
+        .{ .position = .{}, .rounded_clip = null, .clip = null },
+        surfaceSampleTag(id),
+    ) }});
+    try std.testing.expectError(error.InvalidTarget, server.renderer.finishFrame());
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    var target_pixels: [1]u32 = undefined;
+    try server.renderer.beginFrame(.{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } }, .{}, .{}, null, .{});
+    var capture_id: u32 = 1;
+    const frame: OutputFrame = .{
+        .render_output = output,
+        .output = server.outputs.get(output.protocol_id).?,
+        .visible_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .track_visibility = false,
+        .next_backdrop_capture_id = &capture_id,
+    };
+    try server.renderCommands(&frame, &.{.{ .clear = render.Color.rgba(0, 0, 0, 0) }});
+    _ = try server.renderDesktopContents(&frame, false, false);
+    server.renderer.cancelFrame();
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(id)));
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 1), completion.count);
+    try std.testing.expect(std.meta.eql(id, completion.ids[0]));
+    try std.testing.expect(completion.demand_cleared_before_call);
+    try std.testing.expect(!server.headless_surface_forest.roots()[0].frame_demand);
+
+    server.commitHeadlessSurface(id, provider.logical_size, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 1), completion.count);
+
+    server.commitHeadlessSurface(id, null, true);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 1), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    server.commitHeadlessSurface(id, provider.logical_size, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 2), completion.count);
+    try std.testing.expect(std.meta.eql(id, completion.ids[1]));
+    try std.testing.expect(!server.headless_surface_forest.roots()[0].frame_demand);
+
+    server.removeHeadlessSurface(id);
+    server.surface_registry.remove(id);
+}
+
+test "headless completion follows exact opaque pruning and partial visibility" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 2, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var lower: SyntheticSurfaceProvider = .{
+        .pixel = 0xff12_3456,
+        .logical_size = .{ .width = 2, .height = 1 },
+    };
+    var upper: SyntheticSurfaceProvider = .{
+        .pixel = 0xffab_cdef,
+        .logical_size = .{ .width = 2, .height = 1 },
+    };
+    const lower_id = try server.surface_registry.add(lower.provider());
+    const upper_id = try server.surface_registry.add(upper.provider());
+    try server.addHeadlessSurface(lower_id, completion.frameCompletion());
+    try server.addHeadlessSurface(upper_id, null);
+    server.commitHeadlessSurface(lower_id, lower.logical_size, true);
+    server.commitHeadlessSurface(upper_id, upper.logical_size, false);
+
+    try renderPendingTestOutput(server, output);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(lower_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(upper_id)));
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
+    upper.logical_size = .{ .width = 1, .height = 1 };
+    upper.version += 1;
+    server.commitHeadlessSurface(upper_id, upper.logical_size, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(lower_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(upper_id)));
+    try std.testing.expectEqual(@as(usize, 1), completion.count);
+    try std.testing.expect(std.meta.eql(lower_id, completion.ids[0]));
+
+    server.removeHeadlessSurface(upper_id);
+    server.surface_registry.remove(upper_id);
+    server.removeHeadlessSurface(lower_id);
+    server.surface_registry.remove(lower_id);
+}
+
+test "first sampled headless output wins and shares one timestamp batch" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+    const second_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 1, .height = 1 },
+        .name = "HEADLESS-SECOND",
+        .description = "Keywork second completion test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(second_id));
+    const first_output = server.primaryRenderOutput();
+    const second_output = server.render_outputs.get(second_id).?.*;
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var first: SyntheticSurfaceProvider = .{
+        .pixel = 0x8012_3456,
+        .logical_size = .{ .width = 1, .height = 1 },
+        .force_opaque = false,
+    };
+    var second: SyntheticSurfaceProvider = .{
+        .pixel = 0x80ab_cdef,
+        .logical_size = .{ .width = 1, .height = 1 },
+        .force_opaque = false,
+    };
+    const first_id = try server.surface_registry.add(first.provider());
+    const second_surface_id = try server.surface_registry.add(second.provider());
+    try server.addHeadlessSurface(first_id, completion.frameCompletion());
+    try server.addHeadlessSurface(second_surface_id, completion.frameCompletion());
+    server.commitHeadlessSurface(first_id, first.logical_size, true);
+    server.commitHeadlessSurface(second_surface_id, second.logical_size, true);
+
+    try renderPendingTestOutput(server, first_output);
+    try std.testing.expectEqual(@as(usize, 2), completion.count);
+    try std.testing.expect(surfaceSampleTag(first_id) != surfaceSampleTag(second_surface_id));
+    try std.testing.expectEqual(completion.timestamps_ms[0], completion.timestamps_ms[1]);
+    try std.testing.expect(completion.demand_cleared_before_call);
+
+    try renderPendingTestOutput(server, second_output);
+    try std.testing.expectEqual(@as(usize, 2), completion.count);
+
+    server.removeHeadlessSurface(second_surface_id);
+    server.surface_registry.remove(second_surface_id);
+    server.removeHeadlessSurface(first_id);
+    server.surface_registry.remove(first_id);
+}
+
+test "removing demanded headless root cannot call stale completion" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var stale_completion: TestFrameCompletion = .{};
+    var stale: SyntheticSurfaceProvider = .{
+        .pixel = 0xff12_3456,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const stale_id = try server.surface_registry.add(stale.provider());
+    try server.addHeadlessSurface(stale_id, stale_completion.frameCompletion());
+    server.commitHeadlessSurface(stale_id, stale.logical_size, true);
+    server.removeHeadlessSurface(stale_id);
+    server.surface_registry.remove(stale_id);
+
+    var replacement: SyntheticSurfaceProvider = .{
+        .pixel = 0xffab_cdef,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const replacement_id = try server.surface_registry.add(replacement.provider());
+    try std.testing.expectEqual(stale_id.index, replacement_id.index);
+    try std.testing.expect(stale_id.generation != replacement_id.generation);
+    try server.addHeadlessSurface(replacement_id, null);
+    server.commitHeadlessSurface(replacement_id, replacement.logical_size, false);
+    try renderPendingTestOutput(server, output);
+
+    try std.testing.expectEqual(@as(usize, 0), stale_completion.count);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(stale_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(replacement_id)));
+
+    server.removeHeadlessSurface(replacement_id);
+    server.surface_registry.remove(replacement_id);
+}
+
 test "headless surfaces preserve mapping damage and ordered replacement" {
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
@@ -10888,7 +11189,7 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
         .logical_size = .{ .width = 2, .height = 2 },
     };
     const first_id = try server.surface_registry.add(first.provider());
-    try server.addHeadlessSurface(first_id);
+    try server.addHeadlessSurface(first_id, null);
     try std.testing.expect(output.damage.isEmpty());
     try std.testing.expect(!output.repaint_needed);
     try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.focusedSurface());
@@ -10898,24 +11199,24 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
     try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(first_id));
 
-    server.commitHeadlessSurface(first_id, first.logical_size);
+    server.commitHeadlessSurface(first_id, first.logical_size, false);
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
 
     resetTestOutputDamage(output);
-    server.commitHeadlessSurface(first_id, first.logical_size);
+    server.commitHeadlessSurface(first_id, first.logical_size, false);
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
 
     resetTestOutputDamage(output);
     first.logical_size = .{ .width = 4, .height = 1 };
     first.version += 1;
-    server.commitHeadlessSurface(first_id, first.logical_size);
+    server.commitHeadlessSurface(first_id, first.logical_size, false);
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 2));
     try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 1));
 
     resetTestOutputDamage(output);
-    server.commitHeadlessSurface(first_id, null);
+    server.commitHeadlessSurface(first_id, null, false);
     try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 1));
 
     var second: SyntheticSurfaceProvider = .{
@@ -10923,8 +11224,8 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
         .logical_size = .{ .width = 1, .height = 1 },
     };
     const second_id = try server.surface_registry.add(second.provider());
-    try server.addHeadlessSurface(second_id);
-    server.commitHeadlessSurface(second_id, second.logical_size);
+    try server.addHeadlessSurface(second_id, null);
+    server.commitHeadlessSurface(second_id, second.logical_size, false);
     try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
         .{ .id = first_id, .mapped_size = null },
         .{ .id = second_id, .mapped_size = second.logical_size },
@@ -10940,8 +11241,8 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
         .logical_size = .{ .width = 3, .height = 2 },
     };
     const replacement_id = try server.surface_registry.add(replacement.provider());
-    try server.addHeadlessSurface(replacement_id);
-    server.commitHeadlessSurface(replacement_id, replacement.logical_size);
+    try server.addHeadlessSurface(replacement_id, null);
+    server.commitHeadlessSurface(replacement_id, replacement.logical_size, false);
     try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
         .{ .id = second_id, .mapped_size = second.logical_size },
         .{ .id = replacement_id, .mapped_size = replacement.logical_size },
@@ -11007,15 +11308,15 @@ test "headless surface damage respects output geometry and conservative blur dep
     };
     const lower_id = try server.surface_registry.add(lower.provider());
     const upper_id = try server.surface_registry.add(upper.provider());
-    try server.addHeadlessSurface(lower_id);
-    try server.addHeadlessSurface(upper_id);
-    server.commitHeadlessSurface(lower_id, lower.logical_size);
-    server.commitHeadlessSurface(upper_id, upper.logical_size);
+    try server.addHeadlessSurface(lower_id, null);
+    try server.addHeadlessSurface(upper_id, null);
+    server.commitHeadlessSurface(lower_id, lower.logical_size, false);
+    server.commitHeadlessSurface(upper_id, upper.logical_size, false);
     resetTestOutputDamage(primary);
     resetTestOutputDamage(scaled);
     resetTestOutputDamage(unrelated);
 
-    server.commitHeadlessSurface(lower_id, lower.logical_size);
+    server.commitHeadlessSurface(lower_id, lower.logical_size, false);
     try std.testing.expect(primary.damage.coversRectangle(0, 0, 8, 8));
     try std.testing.expect(scaled.damage.coversRectangle(0, 0, 6, 2));
     try std.testing.expect(unrelated.damage.isEmpty());
@@ -11039,7 +11340,7 @@ test "headless surface damage respects output geometry and conservative blur dep
     resetTestOutputDamage(scaled);
     resetTestOutputDamage(unrelated);
     upper.available = false;
-    server.commitHeadlessSurface(lower_id, lower.logical_size);
+    server.commitHeadlessSurface(lower_id, lower.logical_size, false);
     try std.testing.expect(primary.damage.coversRectangle(0, 0, 8, 8));
     try std.testing.expect(scaled.damage.coversRectangle(0, 0, 6, 2));
     try std.testing.expect(unrelated.damage.isEmpty());
@@ -11051,7 +11352,7 @@ test "headless surface damage respects output geometry and conservative blur dep
     server.surface_registry.remove(upper_id);
 }
 
-test "headless surfaces render at global origin with output scale and no sample tag" {
+test "headless surfaces render at global origin with output scale and canonical sample tag" {
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
         std.testing.io,
@@ -11078,10 +11379,10 @@ test "headless surfaces render at global origin with output scale and no sample 
         .logical_size = .{ .width = 1, .height = 1 },
     };
     const id = try server.surface_registry.add(provider.provider());
-    try server.addHeadlessSurface(id);
-    server.commitHeadlessSurface(id, provider.logical_size);
+    try server.addHeadlessSurface(id, null);
+    server.commitHeadlessSurface(id, provider.logical_size, false);
     resetTestOutputDamage(scaled);
-    server.commitHeadlessSurface(id, provider.logical_size);
+    server.commitHeadlessSurface(id, provider.logical_size, false);
     try std.testing.expect(scaled.damage.coversRectangle(2, 0, 2, 2));
     try std.testing.expect(!scaled.damage.coversRectangle(0, 0, 2, 2));
 
@@ -11100,12 +11401,12 @@ test "headless surfaces render at global origin with output scale and no sample 
         try std.testing.expectEqual(background, pixels[y * 6 + 4]);
         try std.testing.expectEqual(background, pixels[y * 6 + 5]);
     }
-    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(id)));
 
     provider.pixel = 0xffa1_b2c3;
     provider.version += 1;
     provider.render_calls = 0;
-    server.commitHeadlessSurface(id, provider.logical_size);
+    server.commitHeadlessSurface(id, provider.logical_size, false);
     try std.testing.expectEqual(provider.pixel, try captureSinglePixel(server));
     try std.testing.expectEqual(@as(usize, 1), provider.render_calls);
 
@@ -11145,8 +11446,8 @@ test "headless surface rendering is ordered between bottom and mature scene cont
     const shell_scene = try server.scene.addShellSurface(shell_id);
     const top_scene = try server.scene.addLayerSurface(top_id, .top);
     const overlay_scene = try server.scene.addLayerSurface(overlay_id, .overlay);
-    try server.addHeadlessSurface(headless_id);
-    server.commitHeadlessSurface(headless_id, headless.logical_size);
+    try server.addHeadlessSurface(headless_id, null);
+    server.commitHeadlessSurface(headless_id, headless.logical_size, false);
     server.scene.setContentGeometry(window_scene, .{ .size = window.logical_size });
     server.scene.setEffects(window_scene, .{});
     server.scene.setLayerSurfaceMapped(background_scene, true);
@@ -11165,7 +11466,7 @@ test "headless surface rendering is ordered between bottom and mature scene cont
     try std.testing.expectEqual(window.pixel, try captureSinglePixel(server));
     server.scene.setMapped(window_scene, false);
     try std.testing.expectEqual(headless.pixel, try captureSinglePixel(server));
-    server.commitHeadlessSurface(headless_id, null);
+    server.commitHeadlessSurface(headless_id, null, false);
     try std.testing.expectEqual(bottom.pixel, try captureSinglePixel(server));
     server.scene.setLayerSurfaceMapped(bottom_scene, false);
     try std.testing.expectEqual(background.pixel, try captureSinglePixel(server));
@@ -11198,14 +11499,15 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
     defer server.destroy();
     const render_output = server.primaryRenderOutput();
     const output = server.outputs.get(render_output.protocol_id).?;
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
 
     var headless: SyntheticSurfaceProvider = .{
         .pixel = 0xff12_3456,
         .logical_size = .{ .width = 1, .height = 1 },
     };
     const headless_id = try server.surface_registry.add(headless.provider());
-    try server.addHeadlessSurface(headless_id);
-    server.commitHeadlessSurface(headless_id, headless.logical_size);
+    try server.addHeadlessSurface(headless_id, completion.frameCompletion());
+    server.commitHeadlessSurface(headless_id, headless.logical_size, true);
 
     var target_pixels = [_]u32{0};
     try server.renderer.beginFrame(.{ .pixels = .{
@@ -11233,6 +11535,8 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
         .candidate => return error.TestUnexpectedResult,
     }
     server.renderer.cancelFrame();
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
 
     var fullscreen: SyntheticSurfaceProvider = .{
         .pixel = 0xffab_cdef,
@@ -11269,8 +11573,13 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
         },
     }
     server.renderer.cancelFrame();
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
 
     server.scene.removeWindow(fullscreen_scene);
+    server.commitHeadlessSurface(headless_id, headless.logical_size, false);
+    try renderPendingTestOutput(server, render_output);
+    try std.testing.expectEqual(@as(usize, 1), completion.count);
     server.removeHeadlessSurface(headless_id);
     server.surface_registry.remove(fullscreen_id);
     server.surface_registry.remove(headless_id);
@@ -11305,11 +11614,15 @@ test "Wayring listener rollback removes an unpublished headless entry" {
         }
     };
 
-    try listener.added(listener.context, id, .{
+    const completion: WayringCompositor.FrameCompletion = .{
         .context = &completion_owner,
         .complete = Completion.complete,
-    });
-    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{.{ .id = id }}, server.headless_surface_forest.roots());
+    };
+    try listener.added(listener.context, id, completion);
+    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{.{
+        .id = id,
+        .frame_completion = completion,
+    }}, server.headless_surface_forest.roots());
     listener.removing(listener.context, id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     server.surface_registry.remove(id);
@@ -11325,9 +11638,15 @@ const WayringHeadlessClient = struct {
     const Stage = enum(u8) {
         starting,
         initial_released,
+        initial_done,
         replacement_released,
+        callback_only_committed,
+        callback_only_done,
         unmapped,
+        unmapped_no_done,
         remapped_released,
+        remapped_done,
+        outstanding_callback,
         disconnected,
         failed,
     };
@@ -11341,6 +11660,8 @@ const WayringHeadlessClient = struct {
     compositor: ?*wayland.client.wl.Compositor = null,
     shm: ?*wayland.client.wl.Shm = null,
     release_count: std.atomic.Value(u8) = .init(0),
+    frame_done_count: std.atomic.Value(u8) = .init(0),
+    last_frame_timestamp_ms: std.atomic.Value(u32) = .init(0),
 
     fn run(self: *WayringHeadlessClient) void {
         self.runFallible() catch |err| {
@@ -11386,7 +11707,8 @@ const WayringHeadlessClient = struct {
         const surface = try compositor.createSurface();
         defer surface.destroy();
         const region = try compositor.createRegion();
-        region.add(0, 0, 1, 1);
+        region.add(0, 0, 2, 1);
+        region.subtract(1, 0, 1, 1);
         surface.setOpaqueRegion(region);
         surface.setInputRegion(region);
         region.destroy();
@@ -11402,24 +11724,66 @@ const WayringHeadlessClient = struct {
         defer buffer.destroy();
         buffer.setListener(*WayringHeadlessClient, bufferEvent, self);
 
+        try self.requestFrame(surface);
         try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0011_2233, 0x0044_5566 }, 1);
+        if (self.frame_done_count.load(.acquire) != 0) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.initial_released), .release);
+        try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 1) return error.MissingFrameDone;
+        self.stage.store(@intFromEnum(Stage.initial_done), .release);
         try waitForWayringCommand(self.command_fd);
 
         try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0066_7788, 0x0099_aabb }, 2);
         self.stage.store(@intFromEnum(Stage.replacement_released), .release);
         try waitForWayringCommand(self.command_fd);
 
+        try self.requestFrame(surface);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 1) return error.UnexpectedFrameDone;
+        self.stage.store(@intFromEnum(Stage.callback_only_committed), .release);
+        try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 2) return error.MissingFrameDone;
+        self.stage.store(@intFromEnum(Stage.callback_only_done), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.requestFrame(surface);
         surface.attach(null, 0, 0);
         surface.commit();
         try expectClientRoundtrip(display);
         if (self.release_count.load(.acquire) != 2) return error.UnexpectedBufferRelease;
+        if (self.frame_done_count.load(.acquire) != 2) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.unmapped), .release);
+        try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 2) return error.UnexpectedFrameDone;
+        self.stage.store(@intFromEnum(Stage.unmapped_no_done), .release);
         try waitForWayringCommand(self.command_fd);
 
         try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 3);
         self.stage.store(@intFromEnum(Stage.remapped_released), .release);
         try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 3) return error.MissingFrameDone;
+        self.stage.store(@intFromEnum(Stage.remapped_done), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.requestFrame(surface);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 3) return error.UnexpectedFrameDone;
+        self.stage.store(@intFromEnum(Stage.outstanding_callback), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn requestFrame(
+        self: *WayringHeadlessClient,
+        surface: *wayland.client.wl.Surface,
+    ) !void {
+        const callback = try surface.frame();
+        callback.setListener(*WayringHeadlessClient, frameEvent, self);
     }
 
     fn commitBuffer(
@@ -11477,6 +11841,20 @@ const WayringHeadlessClient = struct {
     ) void {
         switch (event) {
             .release => _ = self.release_count.fetchAdd(1, .acq_rel),
+        }
+    }
+
+    fn frameEvent(
+        callback: *wayland.client.wl.Callback,
+        event: wayland.client.wl.Callback.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .done => |done| {
+                self.last_frame_timestamp_ms.store(done.callback_data, .release);
+                _ = self.frame_done_count.fetchAdd(1, .acq_rel);
+                callback.destroy();
+            },
         }
     }
 
@@ -11608,7 +11986,7 @@ fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64)
     return error.WayringFrameTimedOut;
 }
 
-test "Wayring libwayland SHM reaches persistent headless pixels and repairs lifecycle damage" {
+test "Wayring wl_compositor v1 reaches accepted headless frame callbacks end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -11701,6 +12079,11 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
     try expectWayringSnapshot(server, .{ 0x0011_2233, 0x0044_5566 }, 1);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x0011_2233, 0x0044_5566 });
+    try std.testing.expectEqual(@as(u8, 0), client.frame_done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .initial_done);
+    try std.testing.expectEqual(@as(u8, 1), client.frame_done_count.load(.acquire));
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
@@ -11712,11 +12095,33 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .callback_only_committed);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 1), client.frame_done_count.load(.acquire));
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.render_scheduled);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x0066_7788, 0x0099_aabb });
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .callback_only_done);
+    try std.testing.expectEqual(@as(u8, 2), client.frame_done_count.load(.acquire));
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .unmapped);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 2), client.frame_done_count.load(.acquire));
     try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id) == null);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .unmapped_no_done);
+    try std.testing.expectEqual(@as(u8, 2), client.frame_done_count.load(.acquire));
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
@@ -11726,13 +12131,24 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x00cc_ddee, 0x0001_0203 });
 
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .remapped_done);
+    try std.testing.expectEqual(@as(u8, 3), client.frame_done_count.load(.acquire));
+
     previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .outstanding_callback);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 3), client.frame_done_count.load(.acquire));
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .disconnected);
     thread.join();
     joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 3), client.frame_done_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
