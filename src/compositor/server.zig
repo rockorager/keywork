@@ -3814,18 +3814,24 @@ pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationL
         .detached = wayringSurfaceDetached,
         .applied = wayringSurfaceApplied,
         .removing = wayringSurfaceRemoving,
-        .cursor_role = wayringSurfaceCursorRole,
+        .presentation_class = wayringSurfacePresentationClass,
     };
 }
 
-fn wayringSurfaceCursorRole(context: *anyopaque, id: SurfaceRegistry.Id) void {
+fn wayringSurfacePresentationClass(
+    context: *anyopaque,
+    id: SurfaceRegistry.Id,
+    class: WayringCompositor.PresentationClass,
+) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    _ = self.headless_surface_forest.state(id) orelse return;
     self.cancelGeneratedTouchesInSubtree(id);
     self.damageHeadlessCompound(id);
     self.damageActiveGeneratedCursor();
-    self.headless_surface_forest.markCursorRole(id);
+    std.debug.assert(self.headless_surface_forest.setRootPresentationClass(id, class));
     self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
+    self.damageHeadlessCompound(id);
     self.damageActiveGeneratedCursor();
 }
 
@@ -11948,7 +11954,7 @@ test "generated cursor subtree paints stack and completes callbacks only while s
     server.seat.setPointerAvailable(true);
     pointerMotion(output, 1, 1, 0);
     try std.testing.expectEqual(child_id, server.seat.pointerFocus().?.surface_id);
-    server.headless_surface_forest.markCursorRole(root_id);
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(root_id, .cursor));
     try std.testing.expectEqual(SeatDelivery.CursorRequestResult.accepted, server.seat.setGeneratedCursor(.{
         .client = generated_client,
         .resource_generation = 1,
@@ -13635,6 +13641,50 @@ test "Wayring listener rollback removes an unpublished headless entry" {
     listener.removing(listener.context, id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     server.surface_registry.remove(id);
+}
+
+test "Wayring listener applies XDG presentation progression without detaching managed roots" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
+    defer server.destroy();
+    var provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 1, .height = 1 },
+        .available = false,
+    };
+    const id = try server.surface_registry.add(provider.provider());
+    defer server.surface_registry.remove(id);
+    const listener = server.wayringPresentationListener().?;
+    const Completion = struct {
+        fn complete(_: *anyopaque, _: SurfaceRegistry.Id, _: u32) void {}
+    };
+    var completion_context: u8 = 0;
+    try listener.added(listener.context, id, .{
+        .context = &completion_context,
+        .complete = Completion.complete,
+    });
+    defer listener.removing(listener.context, id);
+    const changed = listener.presentation_class.?;
+
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.background,
+        server.headless_surface_forest.presentationClass(id).?,
+    );
+    changed(listener.context, id, .xdg_reserved);
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.xdg_reserved,
+        server.headless_surface_forest.presentationClass(id).?,
+    );
+    changed(listener.context, id, .background);
+    changed(listener.context, id, .xdg_reserved);
+    changed(listener.context, id, .managed);
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.managed,
+        server.headless_surface_forest.presentationClass(id).?,
+    );
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.Placement.root,
+        server.headless_surface_forest.state(id).?.placement,
+    );
 }
 
 test "Wayring presentation policy excludes DRM and nested sidecars" {

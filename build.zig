@@ -114,6 +114,12 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_source", .{}).path("protocol/wayland.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/xdg-shell/xdg-shell.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
+    const xdg_protocol = b.createModule(.{
+        .root_source_file = generated_xdg_source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
     const xdg_protocol_check = b.createModule(.{
         .root_source_file = generated_xdg_source,
         .target = target,
@@ -251,7 +257,7 @@ pub fn build(b: *std.Build) void {
         varlink,
         keywork_control,
         wayring,
-        core_protocol,
+        xdg_protocol,
         wayland,
         wayland.wayland_xml,
         wayland.protocols,

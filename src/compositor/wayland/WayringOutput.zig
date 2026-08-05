@@ -7,7 +7,7 @@
 const WayringOutput = @This();
 
 const std = @import("std");
-const core = @import("wayring-core-protocol");
+const core = @import("wayring-protocol");
 const wayland = @import("wayland");
 const wayring = @import("wayring");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
