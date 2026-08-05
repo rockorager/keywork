@@ -81,6 +81,7 @@ const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
+const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const Surface = @import("wayland/surface.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const Viewporter = @import("wayland/viewporter.zig");
@@ -148,7 +149,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
 surface_registry: SurfaceRegistry,
-headless_surfaces: std.ArrayList(HeadlessSurfaceEntry),
+headless_surface_forest: HeadlessSurfaceForest,
 control: Control,
 control_initialized: bool,
 appearance_client: AppearanceClient,
@@ -843,13 +844,6 @@ const XwaylandWindow = struct {
     surface_id: Surface.Id,
 };
 
-/// Server-owned Phase 1 presentation state. Global position is fixed at
-/// (0, 0); provider state stays borrowed from SurfaceRegistry at render time.
-const HeadlessSurfaceEntry = struct {
-    id: SurfaceRegistry.Id,
-    size: ?render.Size = null,
-};
-
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
@@ -964,7 +958,7 @@ pub fn createWithVirtualOutput(
         .io = io,
         .display = display,
         .surface_registry = SurfaceRegistry.init(allocator),
-        .headless_surfaces = .empty,
+        .headless_surface_forest = HeadlessSurfaceForest.init(allocator),
         .control = undefined,
         .control_initialized = false,
         .appearance_client = undefined,
@@ -1090,7 +1084,7 @@ pub fn createWithVirtualOutput(
         .xwayland_display_listener = null,
     };
     errdefer self.surface_registry.deinit();
-    errdefer self.headless_surfaces.deinit(allocator);
+    errdefer self.headless_surface_forest.deinit();
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
@@ -1930,8 +1924,8 @@ pub fn destroy(self: *Self) void {
     self.routed_keys.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
-    std.debug.assert(self.headless_surfaces.items.len == 0);
-    self.headless_surfaces.deinit(allocator);
+    std.debug.assert(self.headless_surface_forest.len() == 0);
+    self.headless_surface_forest.deinit();
     std.debug.assert(self.surface_registry.len() == 0);
     self.surface_registry.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
@@ -3667,16 +3661,14 @@ pub fn terminate(self: *Self) void {
 /// committed logical size and RenderState available until it commits an unmap.
 fn addHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
     std.debug.assert(self.surface_registry.contains(id));
-    std.debug.assert(self.headlessSurfaceIndex(id) == null);
-    try self.headless_surfaces.append(self.allocator, .{ .id = id });
+    try self.headless_surface_forest.addRoot(id);
 }
 
 fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size) void {
     std.debug.assert(self.surface_registry.contains(id));
     if (size) |mapped| std.debug.assert(mapped.width > 0 and mapped.height > 0);
-    const index = self.headlessSurfaceIndex(id) orelse unreachable;
-    const entry = &self.headless_surfaces.items[index];
-    if (entry.size) |old_size| {
+    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
+    if (self.headless_surface_forest.roots()[index].mapped_size) |old_size| {
         self.damageHeadlessSurfaceBounds(.{
             .x = 0,
             .y = 0,
@@ -3684,7 +3676,7 @@ fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size
             .height = old_size.height,
         }, index);
     }
-    entry.size = size;
+    self.headless_surface_forest.applyRoot(id, size);
     if (size) |new_size| {
         self.damageHeadlessSurfaceBounds(.{
             .x = 0,
@@ -3697,8 +3689,8 @@ fn commitHeadlessSurface(self: *Self, id: SurfaceRegistry.Id, size: ?render.Size
 
 fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
-    const index = self.headlessSurfaceIndex(id) orelse unreachable;
-    if (self.headless_surfaces.items[index].size) |old_size| {
+    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
+    if (self.headless_surface_forest.roots()[index].mapped_size) |old_size| {
         self.damageHeadlessSurfaceBounds(.{
             .x = 0,
             .y = 0,
@@ -3706,7 +3698,7 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
             .height = old_size.height,
         }, index);
     }
-    _ = self.headless_surfaces.orderedRemove(index);
+    self.headless_surface_forest.removeRoot(id);
 }
 
 fn wayringSurfaceAdded(context: *anyopaque, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
@@ -3730,19 +3722,12 @@ fn wayringSurfaceCommitted(context: *anyopaque, id: SurfaceRegistry.Id, size: ?r
 
 fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const index = self.headlessSurfaceIndex(id) orelse unreachable;
-    if (self.headless_surfaces.items[index].size) |mapped_size| {
+    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
+    if (self.headless_surface_forest.roots()[index].mapped_size) |mapped_size| {
         const render_state = self.surface_registry.renderState(id) orelse unreachable;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
     }
     self.removeHeadlessSurface(id);
-}
-
-fn headlessSurfaceIndex(self: *const Self, id: SurfaceRegistry.Id) ?usize {
-    for (self.headless_surfaces.items, 0..) |entry, index| {
-        if (std.meta.eql(entry.id, id)) return index;
-    }
-    return null;
 }
 
 noinline fn requestRepaint(context: *anyopaque) void {
@@ -5100,7 +5085,7 @@ fn damageHeadlessSurfaceBounds(
     rectangle: render.Rect,
     source_index: usize,
 ) void {
-    std.debug.assert(source_index < self.headless_surfaces.items.len);
+    std.debug.assert(source_index < self.headless_surface_forest.len());
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -5163,14 +5148,15 @@ fn expandHeadlessSurfaceBlurDamage(
     damage: *Region,
     first_index: usize,
 ) (Region.Error || error{UnresolvedBlurSource})!bool {
-    std.debug.assert(first_index <= self.headless_surfaces.items.len);
+    const roots = self.headless_surface_forest.roots();
+    std.debug.assert(first_index <= roots.len);
     const blur = Scene.background_blur;
     var any_changed = false;
     var changed = true;
     while (changed) {
         changed = false;
-        for (self.headless_surfaces.items[first_index..]) |entry| {
-            const mapped_size = entry.size orelse continue;
+        for (roots[first_index..]) |entry| {
+            const mapped_size = entry.mapped_size orelse continue;
             const render_state = self.surface_registry.renderState(entry.id) orelse
                 return error.UnresolvedBlurSource;
             std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
@@ -9466,8 +9452,8 @@ fn renderLayerSurfaces(
 
 fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error!void {
     if (!frame.render_output.backend.isHeadless()) return;
-    for (self.headless_surfaces.items) |entry| {
-        const mapped_size = entry.size orelse continue;
+    for (self.headless_surface_forest.roots()) |entry| {
+        const mapped_size = entry.mapped_size orelse continue;
         const render_state = self.surface_registry.renderState(entry.id) orelse continue;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
         const surface_rect: render.Rect = .{
@@ -10930,10 +10916,10 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     const second_id = try server.surface_registry.add(second.provider());
     try server.addHeadlessSurface(second_id);
     server.commitHeadlessSurface(second_id, second.logical_size);
-    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{
-        .{ .id = first_id, .size = null },
-        .{ .id = second_id, .size = second.logical_size },
-    }, server.headless_surfaces.items);
+    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
+        .{ .id = first_id, .mapped_size = null },
+        .{ .id = second_id, .mapped_size = second.logical_size },
+    }, server.headless_surface_forest.roots());
 
     resetTestOutputDamage(output);
     server.removeHeadlessSurface(first_id);
@@ -10947,10 +10933,10 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     const replacement_id = try server.surface_registry.add(replacement.provider());
     try server.addHeadlessSurface(replacement_id);
     server.commitHeadlessSurface(replacement_id, replacement.logical_size);
-    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{
-        .{ .id = second_id, .size = second.logical_size },
-        .{ .id = replacement_id, .size = replacement.logical_size },
-    }, server.headless_surfaces.items);
+    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
+        .{ .id = second_id, .mapped_size = second.logical_size },
+        .{ .id = replacement_id, .mapped_size = replacement.logical_size },
+    }, server.headless_surface_forest.roots());
 
     resetTestOutputDamage(output);
     server.removeHeadlessSurface(second_id);
@@ -10958,7 +10944,7 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     server.surface_registry.remove(second_id);
     server.removeHeadlessSurface(replacement_id);
     server.surface_registry.remove(replacement_id);
-    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
 }
 
 test "headless surface damage respects output geometry and conservative blur dependencies" {
@@ -11283,7 +11269,7 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
 
 test "server headless surface list tears down empty" {
     const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
-    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     server.destroy();
 }
 
@@ -11299,9 +11285,9 @@ test "Wayring listener rollback removes an unpublished headless entry" {
     const listener = server.wayringPresentationListener().?;
 
     try listener.added(listener.context, id);
-    try std.testing.expectEqualSlices(HeadlessSurfaceEntry, &.{.{ .id = id }}, server.headless_surfaces.items);
+    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{.{ .id = id }}, server.headless_surface_forest.roots());
     listener.removing(listener.context, id);
-    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     server.surface_registry.remove(id);
 }
 
@@ -11544,7 +11530,7 @@ fn waitForWayringClientStage(
 fn waitForWayringDisconnect(server: *Self, host: anytype, compositor: *WayringCompositor) !void {
     for (0..1_000) |_| {
         if (host.connectionCount() == 0 and compositor.surfaceCount() == 0 and
-            server.headless_surfaces.items.len == 0) return;
+            server.headless_surface_forest.len() == 0) return;
         try server.eventLoop().dispatch(1);
         if (host.failure()) |err| return err;
     }
@@ -11556,8 +11542,8 @@ fn expectWayringSnapshot(
     expected_pixels: [2]u32,
     expected_version: u64,
 ) !void {
-    try std.testing.expectEqual(@as(usize, 1), server.headless_surfaces.items.len);
-    const state = server.surface_registry.renderState(server.headless_surfaces.items[0].id).?;
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
+    const state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
     try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, state.logical_size);
     try std.testing.expectEqual(expected_version, state.buffer.source_cache.?.version);
     const normalized = [2]u32{
@@ -11695,7 +11681,7 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .unmapped);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expect(server.surface_registry.renderState(server.headless_surfaces.items[0].id) == null);
+    try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id) == null);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
 
@@ -11730,7 +11716,7 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
     compositor_live = false;
     protocol_server.deinit();
     protocol_server_live = false;
-    try std.testing.expectEqual(@as(usize, 0), server.headless_surfaces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     server.destroy();
     server_live = false;
