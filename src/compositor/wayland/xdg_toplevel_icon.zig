@@ -4,26 +4,30 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+core: *XdgShell,
 icons: std.ArrayList(*Icon),
 
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
-    xdg_shell: *XdgShell,
+    xdg_shell: *MatureXdgShell,
+    core: *XdgShell,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
         .xdg_shell = xdg_shell,
+        .core = core,
         .icons = .empty,
     };
     errdefer self.icons.deinit(allocator);
@@ -108,7 +112,7 @@ fn setIcon(
             },
         };
     }
-    self.xdg_shell.setPendingToplevelIcon(toplevel.window_id, snapshot);
+    self.core.setPendingToplevelIcon(toplevel.window_id, snapshot);
 }
 
 const Icon = struct {

@@ -4,18 +4,21 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
 
 global: *wl.Global,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+core: *XdgShell,
 
-pub fn init(self: *Self, display: *wl.Server, xdg_shell: *XdgShell) !void {
+pub fn init(self: *Self, display: *wl.Server, xdg_shell: *MatureXdgShell, core: *XdgShell) !void {
     self.* = .{
         .global = undefined,
         .xdg_shell = xdg_shell,
+        .core = core,
     };
     self.global = try wl.Global.create(
         display,
@@ -83,6 +86,6 @@ fn setMetadata(
         client.postImplementationError("toplevel tag metadata is not valid UTF-8");
         return;
     }
-    self.xdg_shell.setToplevelTag(toplevel.window_id, field, value) catch
+    self.core.setToplevelTag(toplevel.window_id, field, value) catch
         manager_resource.postNoMemory();
 }

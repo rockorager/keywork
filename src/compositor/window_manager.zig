@@ -12,7 +12,7 @@ const Scene = @import("scene.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const Surface = @import("wayland/surface.zig");
 const Seat = @import("wayland/seat.zig");
-const XdgShell = @import("wayland/xdg_shell.zig");
+const XdgShell = @import("XdgShell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const WorkspaceProtocol = @import("wayland/workspace.zig");
 const Xwm = @import("xwayland/xwm.zig");
@@ -222,7 +222,7 @@ const Window = struct {
     floating_restore_size: ?types.Size = null,
     floating_position: ?Scene.Position = null,
     tags: workspace_mod.TagSet = .{},
-    serial: ?u32 = null,
+    serial: ?XdgShell.ConfigureToken = null,
     placement: ?types.LayoutPlan = null,
     published_rect: ?types.Rect = null,
     published_fullscreen: bool = false,
@@ -2654,7 +2654,7 @@ fn windowReady(context: *anyopaque, id: XdgShell.WindowId) bool {
     self.relayout();
     return true;
 }
-fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) bool {
+fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?XdgShell.ConfigureToken) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     const managed = self.findXdg(id) orelse return false;
     const window = self.windows.get(managed) orelse return false;
@@ -2662,7 +2662,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     const pending_activation = window.pending_activation;
     window.pending_activation = false;
     if (self.isFloating(window)) self.relayout();
-    if (serial != null and window.serial == serial) {
+    if (serial != null and window.serial != null and std.meta.eql(window.serial.?, serial.?)) {
         window.serial = null;
         const complete = self.transaction.configured();
         // A gated commit may arrive after the configure barrier timed out.
@@ -2695,7 +2695,8 @@ fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.W
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.windows.get(self.findXdg(id) orelse return) orelse return;
     switch (request) {
-        .activate => {
+        .activate => |action| {
+            if (!action.granted) return;
             if (self.layer_focus == .exclusive) return;
             window.minimized = false;
             _ = self.layer_shell.relinquishNonExclusiveFocus();
@@ -2708,10 +2709,10 @@ fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.W
         .minimize => window.minimized = true,
         .maximize => window.maximized = true,
         .unmaximize => window.maximized = false,
-        .fullscreen => |fullscreen| self.setFullscreen(window, if (fullscreen) |resource|
-            if (self.outputs.findResource(resource)) |entry| entry.id else self.workspaces.items[window.workspace].output
-        else
-            self.workspaces.items[window.workspace].output),
+        .fullscreen => |output| self.setFullscreen(
+            window,
+            output orelse self.workspaces.items[window.workspace].output,
+        ),
         .exit_fullscreen => self.setFullscreen(window, null),
         else => {},
     }

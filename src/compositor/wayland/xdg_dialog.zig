@@ -4,7 +4,8 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -12,6 +13,7 @@ const xdg = wayland.server.xdg;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 xdg_shell: *XdgShell,
+wire_xdg_shell: *MatureXdgShell,
 dialogs: std.ArrayList(*Dialog),
 
 pub fn init(
@@ -19,11 +21,13 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     xdg_shell: *XdgShell,
+    wire_xdg_shell: *MatureXdgShell,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
         .xdg_shell = xdg_shell,
+        .wire_xdg_shell = wire_xdg_shell,
         .dialogs = .empty,
     };
     errdefer self.dialogs.deinit(allocator);
@@ -91,7 +95,7 @@ const Dialog = struct {
             );
             return;
         }
-        const toplevel = manager.xdg_shell.toplevelFromResource(toplevel_resource) orelse {
+        const toplevel = manager.wire_xdg_shell.toplevelFromResource(toplevel_resource) orelse {
             resource.destroy();
             manager_resource.getClient().postImplementationError("invalid xdg_toplevel resource");
             return;

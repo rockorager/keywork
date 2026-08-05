@@ -11,7 +11,8 @@ const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
@@ -23,7 +24,8 @@ outputs: *OutputLayout,
 default_output_id: OutputLayout.Id,
 scene: *Scene,
 seat: *Seat,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+xdg_core: *XdgShell,
 surfaces: *Surface.Store,
 global: *wl.Global,
 states: Store = .{},
@@ -74,7 +76,7 @@ const State = struct {
 };
 const Adapter = struct { shell: *Self, id: Id, resource: ?*zwlr.LayerSurfaceV1, surface: ?*Surface };
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outputs: *OutputLayout, output_id: OutputLayout.Id, scene: *Scene, seat: *Seat, xdg_shell: *XdgShell, surfaces: *Surface.Store) !void {
+pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outputs: *OutputLayout, output_id: OutputLayout.Id, scene: *Scene, seat: *Seat, xdg_shell: *MatureXdgShell, xdg_core: *XdgShell, surfaces: *Surface.Store) !void {
     const output = outputs.get(output_id) orelse unreachable;
     const bounds = outputBounds(output);
     self.* = .{
@@ -85,6 +87,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outp
         .scene = scene,
         .seat = seat,
         .xdg_shell = xdg_shell,
+        .xdg_core = xdg_core,
         .surfaces = surfaces,
         .global = try wl.Global.create(display, zwlr.LayerShellV1, 5, *Self, self, bind),
         .usable_area = bounds,
@@ -211,14 +214,14 @@ fn regularKeyboardFocus(self: *Self) ?Surface.Id {
 pub fn keyboardFocus(self: *Self, popup_focus: ?Surface.Id) ?Surface.Id {
     if (self.exclusiveKeyboardFocus()) |exclusive| {
         if (popup_focus) |popup| {
-            const root = self.xdg_shell.popupRootLayerSurface(popup);
+            const root = self.xdg_core.popupRootLayerSurface(popup);
             const state = if (root) |id| self.findScene(id) else null;
             if (state != null and std.meta.eql(state.?.surface_id, exclusive)) return popup;
         }
         return exclusive;
     }
     if (popup_focus) |popup| {
-        const root = self.xdg_shell.popupRootLayerSurface(popup) orelse return popup;
+        const root = self.xdg_core.popupRootLayerSurface(popup) orelse return popup;
         const state = self.findScene(root) orelse return self.regularKeyboardFocus();
         if (state.current.keyboard != .none) return popup;
     }
@@ -230,7 +233,7 @@ pub fn pointerPressed(self: *Self, id: ?Surface.Id) void {
     defer self.notifyPolicy();
     const surface_id = id orelse return;
     const state = self.findSurface(surface_id) orelse popup: {
-        const scene_id = self.xdg_shell.popupRootLayerSurface(surface_id) orelse return;
+        const scene_id = self.xdg_core.popupRootLayerSurface(surface_id) orelse return;
         break :popup self.findScene(scene_id) orelse return;
     };
     if (state.mapped and (state.current.keyboard == .on_demand or
@@ -388,7 +391,7 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
     const self = adapter.shell;
     const state = self.states.get(adapter.id) orelse return;
     if (!info.has_buffer and state.mapped) {
-        self.xdg_shell.dismissLayerSurfacePopups(state.scene_id);
+        self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
         state.mapped = false;
         state.configured = false;
         state.acked = false;
@@ -505,7 +508,7 @@ fn remove(self: *Self, id: Id) void {
 }
 fn removeState(self: *Self, id: Id) bool {
     var state = self.states.remove(id) orelse return false;
-    self.xdg_shell.dismissLayerSurfacePopups(state.scene_id);
+    self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
     self.scene.removeLayerSurface(state.scene_id);
     self.invalidateFocus(state.surface_id);
     if (state.adapter.surface) |surface| surface.releaseRole(state.adapter);

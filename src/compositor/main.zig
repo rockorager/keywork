@@ -726,7 +726,8 @@ test {
     _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/gtk_shell.zig");
-    _ = @import("wayland/xdg_popup_placement.zig");
+    _ = @import("xdg_popup_placement.zig");
+    _ = @import("XdgShell.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
     _ = @import("control.zig");

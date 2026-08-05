@@ -4,12 +4,13 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const MatureClients = @import("MatureClients.zig");
 const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
 const Xwm = @import("../xwayland/xwm.zig");
 
 const wl = wayland.server.wl;
@@ -20,6 +21,7 @@ allocator: std.mem.Allocator,
 ext_global: *wl.Global,
 wlr_global: *wl.Global,
 security_context: *SecurityContext,
+mature_clients: *MatureClients,
 xdg_shell: *XdgShell,
 xwayland: XwaylandController,
 outputs: *OutputLayout,
@@ -284,15 +286,22 @@ const WlrHandle = struct {
                 .unset_maximized => self.owner.xdg_shell.requestWindow(window_id, .unmaximize),
                 .set_minimized => self.owner.xdg_shell.requestWindow(window_id, .minimize),
                 .unset_minimized => self.owner.xdg_shell.requestWindow(window_id, .unminimize),
-                .activate => |activate| self.owner.xdg_shell.requestWindow(
+                .activate => self.owner.xdg_shell.requestWindow(
                     window_id,
-                    .{ .activate = Seat.fromResource(activate.seat) },
+                    .{ .activate = .{
+                        .client = self.owner.mature_clients.id(resource.getClient()) orelse return,
+                        .serial = null,
+                        .granted = true,
+                    } },
                 ),
                 .close => self.owner.xdg_shell.closeWindow(window_id),
                 .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
                 .set_fullscreen => |fullscreen| self.owner.xdg_shell.requestWindow(
                     window_id,
-                    .{ .fullscreen = fullscreen.output },
+                    .{ .fullscreen = if (fullscreen.output) |output|
+                        if (self.owner.outputs.findResource(output)) |entry| entry.id else null
+                    else
+                        null },
                 ),
                 .unset_fullscreen => self.owner.xdg_shell.requestWindow(window_id, .exit_fullscreen),
             },
@@ -435,6 +444,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     security_context: *SecurityContext,
+    mature_clients: *MatureClients,
     xdg_shell: *XdgShell,
     xwayland: XwaylandController,
     outputs: *OutputLayout,
@@ -444,6 +454,7 @@ pub fn init(
         .ext_global = undefined,
         .wlr_global = undefined,
         .security_context = security_context,
+        .mature_clients = mature_clients,
         .xdg_shell = xdg_shell,
         .xwayland = xwayland,
         .outputs = outputs,
