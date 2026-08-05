@@ -31,6 +31,7 @@ const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
 const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
+const SeatDelivery = @import("SeatDelivery.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const XdgToplevelDrag = @import("wayland/xdg_toplevel_drag.zig");
 const XdgToplevelIcon = @import("wayland/xdg_toplevel_icon.zig");
@@ -81,6 +82,7 @@ const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const ClientRegistry = @import("ClientRegistry.zig");
+const FocusArbiter = @import("FocusArbiter.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
@@ -156,6 +158,7 @@ client_registry: ClientRegistry,
 mature_clients: MatureClients,
 surface_registry: SurfaceRegistry,
 headless_surface_forest: HeadlessSurfaceForest,
+focus_arbiter: FocusArbiter,
 control: Control,
 control_initialized: bool,
 appearance_client: AppearanceClient,
@@ -840,6 +843,14 @@ const RoutedTouch = struct {
 const PointerRoute = struct {
     focus: ?Seat.PointerFocus,
     root: ?Surface.Id,
+    generated: ?GeneratedPointerFocus = null,
+};
+
+const GeneratedPointerFocus = struct {
+    surface_id: SurfaceRegistry.Id,
+    root: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
 };
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
@@ -965,6 +976,7 @@ pub fn createWithVirtualOutput(
         .mature_clients = undefined,
         .surface_registry = SurfaceRegistry.init(allocator),
         .headless_surface_forest = HeadlessSurfaceForest.init(allocator),
+        .focus_arbiter = undefined,
         .control = undefined,
         .control_initialized = false,
         .appearance_client = undefined,
@@ -1094,6 +1106,8 @@ pub fn createWithVirtualOutput(
     errdefer self.mature_clients.deinit();
     errdefer self.surface_registry.deinit();
     errdefer self.headless_surface_forest.deinit();
+    try self.focus_arbiter.init(&self.client_registry, &self.surface_registry);
+    errdefer self.focus_arbiter.deinit();
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
@@ -1952,6 +1966,7 @@ pub fn destroy(self: *Self) void {
     self.routed_keys.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
+    self.focus_arbiter.deinit();
     std.debug.assert(self.headless_surface_forest.len() == 0);
     self.headless_surface_forest.deinit();
     std.debug.assert(self.surface_registry.len() == 0);
@@ -3669,6 +3684,17 @@ pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
     return &self.surface_registry;
 }
 
+/// Installs the single resource-free generated frontend query/delivery sink.
+/// Wave 2 uses only ownership and input-region queries; event callbacks remain
+/// intentionally inert in the generated adapter.
+pub fn setGeneratedSeatDeliverySink(self: *Self, sink: SeatDelivery.Sink) void {
+    self.seat.setDeliverySink(sink);
+}
+
+pub fn clearGeneratedSeatDeliverySink(self: *Self, context: *anyopaque) void {
+    self.seat.clearDeliverySink(context);
+}
+
 /// Phase 1 presentation policy is deliberately limited to the headless
 /// backend. Other experimental sidecars share registry identity and buffer
 /// lifetime without becoming visible.
@@ -3733,18 +3759,43 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.remove(id);
+    self.repairGeneratedFocus();
 }
 
 fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.detach(id);
+    self.repairGeneratedFocus();
 }
 
 fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
     self.damageHeadlessBatch(batch);
     self.headless_surface_forest.apply(batch);
+    self.repairGeneratedFocus();
     self.damageHeadlessBatch(batch);
+}
+
+fn repairGeneratedFocus(self: *Self) void {
+    const target = self.focus_arbiter.target() orelse return;
+    if (target.frontend != .generated) return;
+    const root = self.headless_surface_forest.compoundRoot(target.root) orelse {
+        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        return;
+    };
+    const state = self.headless_surface_forest.state(root) orelse {
+        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        return;
+    };
+    if (state.mapped_size == null) {
+        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        return;
+    }
+    const client = self.seat.generatedSurfaceOwner(root) orelse {
+        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        return;
+    };
+    _ = self.focus_arbiter.repairGenerated(target.root, root, client);
 }
 
 fn damageHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
@@ -5403,6 +5454,7 @@ fn xdgActivationRequested(
 
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    _ = self.focus_arbiter.focusMature(null, null);
     if (self.window_manager_initialized) self.window_manager.setSessionLocked(locked);
     if (locked) {
         finishAllWindowTransitions(self);
@@ -6191,7 +6243,9 @@ fn routeTouchDown(
     }) catch return self.terminate();
 
     const point = output.globalPoint(x, y);
-    const focus = self.pointerFocus(point.x, point.y);
+    const route = self.pointerRoute(point.x, point.y);
+    const focus = route.focus;
+    const first_touch = !seat.touchSequenceActive();
     if (self.session_lock.isLocked()) {
         if (focus) |target| {
             self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
@@ -6199,8 +6253,14 @@ fn routeTouchDown(
     } else if (seat == &self.seat) {
         if (focus) |target| {
             const root = self.subcompositor.rootSurface(target.surface_id);
+            _ = self.focus_arbiter.clearGenerated();
             self.window_manager.pointerButton(root, .pressed);
             self.layer_shell.pointerPressed(root);
+            requestRepaint(self);
+        } else if (route.generated) |generated| {
+            self.window_manager.pointerButton(null, .pressed);
+            self.layer_shell.pointerPressed(null);
+            if (first_touch) _ = self.focusGeneratedSurface(generated.root);
             requestRepaint(self);
         } else {
             self.window_manager.pointerButton(null, .pressed);
@@ -6771,15 +6831,17 @@ fn pointerButtonForSeat(
         }
         return;
     }
-    const root = if (seat.implicitPointerGrabActive())
-        if (seat.pointerFocusedSurface()) |surface_id|
+    const route: PointerRoute = if (seat.implicitPointerGrabActive()) .{
+        .focus = null,
+        .root = if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
         else
-            null
-    else if (seat.pointerPosition()) |position|
-        self.pointerRoute(position.x, position.y).root
+            null,
+    } else if (seat.pointerPosition()) |position|
+        self.pointerRoute(position.x, position.y)
     else
-        null;
+        .{ .focus = null, .root = null };
+    const root = route.root;
     if (seat == &self.seat and button == linux_button_left and state == .pressed and
         !seat.hasPressedPointerButtons() and !self.xdg_shell.hasPopupGrab())
     {
@@ -6803,6 +6865,8 @@ fn pointerButtonForSeat(
             }
         }
     }
+    if (seat == &self.seat and state == .pressed and route.generated == null and root != null)
+        _ = self.focus_arbiter.clearGenerated();
     self.window_manager.pointerButton(root, state);
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
@@ -6810,6 +6874,11 @@ fn pointerButtonForSeat(
         else
             null;
         if (seat == &self.seat) self.layer_shell.pointerPressed(focused);
+        if (seat == &self.seat and button == linux_button_left and
+            !seat.hasPressedPointerButtons())
+        {
+            if (route.generated) |generated| _ = self.focusGeneratedSurface(generated.root);
+        }
         requestRepaint(self);
     }
     if (seat == &self.seat and state == .pressed and self.xdg_shell.hasPopupGrab() and
@@ -6998,7 +7067,9 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     }
     self.idle_notify.notifyActivity(&self.seat);
     const point = output.globalPoint(x, y);
-    const focus = self.pointerFocus(point.x, point.y);
+    const route = self.pointerRoute(point.x, point.y);
+    const focus = route.focus;
+    const first_touch = !self.seat.touchSequenceActive();
     if (self.session_lock.isLocked()) {
         if (focus) |target| {
             self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
@@ -7011,8 +7082,14 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     }
     if (focus) |target| {
         const root = self.subcompositor.rootSurface(target.surface_id);
+        _ = self.focus_arbiter.clearGenerated();
         self.window_manager.pointerButton(root, .pressed);
         self.layer_shell.pointerPressed(root);
+        requestRepaint(self);
+    } else if (route.generated) |generated| {
+        self.window_manager.pointerButton(null, .pressed);
+        self.layer_shell.pointerPressed(null);
+        if (first_touch) _ = self.focusGeneratedSurface(generated.root);
         requestRepaint(self);
     } else {
         self.window_manager.pointerButton(null, .pressed);
@@ -7068,24 +7145,7 @@ fn pointerFocusExcluding(
     y: f64,
     excluded_window: ?Scene.Id,
 ) ?Seat.PointerFocus {
-    if (self.session_lock.isLocked()) {
-        var outputs = self.outputs.iterator();
-        while (outputs.next()) |entry| {
-            if (!window_geometry.pointInRect(x, y, entry.output.logicalRect())) continue;
-            const info = self.session_lock.surfaceForOutput(entry.id) orelse return null;
-            return self.hitTestSurface(info.surface_id, .{
-                .x = info.position.x,
-                .y = info.position.y,
-            }, x, y);
-        }
-        return null;
-    }
-    const focus = self.scenePointerFocus(x, y, excluded_window);
-    if (focus) |candidate| {
-        if (self.xdg_shell.hasPopupGrab() and
-            !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id)) return null;
-    }
-    return focus;
+    return self.pointerRouteExcluding(x, y, excluded_window).focus;
 }
 
 fn pointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
@@ -7102,15 +7162,55 @@ fn pointerRouteExcluding(
     y: f64,
     excluded_window: ?Scene.Id,
 ) PointerRoute {
-    const focus = self.pointerFocusExcluding(x, y, excluded_window);
+    if (self.session_lock.isLocked()) {
+        var outputs = self.outputs.iterator();
+        while (outputs.next()) |entry| {
+            if (!window_geometry.pointInRect(x, y, entry.output.logicalRect())) continue;
+            const info = self.session_lock.surfaceForOutput(entry.id) orelse return .{
+                .focus = null,
+                .root = null,
+            };
+            const focus = self.hitTestSurface(info.surface_id, .{
+                .x = info.position.x,
+                .y = info.position.y,
+            }, x, y);
+            return if (focus) |value| self.maturePointerRoute(value) else .{
+                .focus = null,
+                .root = null,
+            };
+        }
+        return .{ .focus = null, .root = null };
+    }
+    var route = self.scenePointerRoute(x, y, excluded_window) orelse PointerRoute{
+        .focus = null,
+        .root = null,
+    };
+    if (route.focus) |candidate| {
+        if (self.xdg_shell.hasPopupGrab() and
+            !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id))
+        {
+            route.focus = null;
+            route.root = null;
+        }
+    } else if (route.generated != null and self.xdg_shell.hasPopupGrab()) {
+        route.generated = null;
+    } else if (route.generated != null) {
+        // Mature window chrome paints above the headless plane and keeps its
+        // existing resize/move policy even where generated content overlaps.
+        if (self.borderRoot(x, y, excluded_window)) |root| {
+            route.generated = null;
+            route.root = root;
+        }
+    }
+    if (route.focus == null and route.generated == null)
+        route.root = self.borderRoot(x, y, excluded_window);
+    return route;
+}
+
+fn maturePointerRoute(self: *Self, focus: Seat.PointerFocus) PointerRoute {
     return .{
         .focus = focus,
-        .root = if (focus) |value|
-            self.subcompositor.rootSurface(value.surface_id)
-        else if (self.session_lock.isLocked())
-            null
-        else
-            self.borderRoot(x, y, excluded_window),
+        .root = self.subcompositor.rootSurface(focus.surface_id),
     };
 }
 
@@ -7152,12 +7252,12 @@ fn borderRoot(self: *Self, x: f64, y: f64, excluded_window: ?Scene.Id) ?Surface.
     return null;
 }
 
-fn scenePointerFocus(
+fn scenePointerRoute(
     self: *Self,
     x: f64,
     y: f64,
     excluded_window: ?Scene.Id,
-) ?Seat.PointerFocus {
+) ?PointerRoute {
     var input_popups = self.input_method.reversePopupIterator();
     while (input_popups.next()) |popup| {
         if (self.hitTestSurface(
@@ -7165,13 +7265,13 @@ fn scenePointerFocus(
             .{ .x = popup.position.x, .y = popup.position.y },
             x,
             y,
-        )) |focus| return focus;
+        )) |focus| return self.maturePointerRoute(focus);
     }
-    if (self.hitTestLayerPopups(x, y)) |focus| return focus;
-    if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
+    if (self.hitTestLayerPopups(x, y)) |focus| return self.maturePointerRoute(focus);
+    if (self.hitTestLayer(.overlay, x, y)) |focus| return self.maturePointerRoute(focus);
     const fullscreen = excludeScene(self.topFullscreenAtPoint(x, y), excluded_window);
     if (fullscreen == null) {
-        if (self.hitTestLayer(.top, x, y)) |focus| return focus;
+        if (self.hitTestLayer(.top, x, y)) |focus| return self.maturePointerRoute(focus);
     }
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -7181,9 +7281,12 @@ fn scenePointerFocus(
             }
             if (fullscreen) |fullscreen_id| {
                 if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
-                return self.hitTestWindow(window_entry.id, window_entry.window, x, y);
+                const focus = self.hitTestWindow(window_entry.id, window_entry.window, x, y) orelse
+                    return null;
+                return self.maturePointerRoute(focus);
             }
-            if (self.hitTestWindow(window_entry.id, window_entry.window, x, y)) |focus| return focus;
+            if (self.hitTestWindow(window_entry.id, window_entry.window, x, y)) |focus|
+                return self.maturePointerRoute(focus);
         },
         .shell_surface => |shell_entry| {
             const shell_surface = shell_entry.shell_surface;
@@ -7193,13 +7296,42 @@ fn scenePointerFocus(
                 shell_surface.position,
                 x,
                 y,
-            )) |focus| return focus;
+            )) |focus| return self.maturePointerRoute(focus);
         },
     };
     if (fullscreen != null) return null;
-    if (self.hitTestLayer(.bottom, x, y)) |focus| return focus;
-    if (self.hitTestLayer(.background, x, y)) |focus| return focus;
+    if (self.headlessPointerFocus(x, y)) |focus| return .{
+        .focus = null,
+        .root = null,
+        .generated = focus,
+    };
+    if (self.hitTestLayer(.bottom, x, y)) |focus| return self.maturePointerRoute(focus);
+    if (self.hitTestLayer(.background, x, y)) |focus| return self.maturePointerRoute(focus);
     return null;
+}
+
+fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
+    const hit = self.headless_surface_forest.inputHit(x, y, .{
+        .context = self,
+        .accepts = generatedSurfaceAcceptsInput,
+    }) orelse return null;
+    const root = self.headless_surface_forest.compoundRoot(hit.id) orelse return null;
+    return .{
+        .surface_id = hit.id,
+        .root = root,
+        .x = hit.x,
+        .y = hit.y,
+    };
+}
+
+fn generatedSurfaceAcceptsInput(
+    context: *anyopaque,
+    surface: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.generatedSurfaceAcceptsInput(surface, x, y);
 }
 
 fn excludeScene(candidate: ?Scene.Id, excluded: ?Scene.Id) ?Scene.Id {
@@ -9394,17 +9526,83 @@ fn renderSessionLockContents(
 fn refreshKeyboardFocus(self: *Self) void {
     if (self.session_lock.isLocked()) {
         const focus = self.session_lock.keyboardFocus();
-        self.seat.setKeyboardFocus(focus);
+        self.applyMatureKeyboardFocus(focus);
         self.syncXwaylandFocus(null);
         return;
     }
-    const default_focus = self.layer_shell.keyboardFocus(
+    const default_focus = self.maturePolicyKeyboardFocus();
+    if (self.focus_arbiter.retainGenerated(default_focus) != null and
+        generatedFocusPolicyAllows(
+            false,
+            self.xdg_shell.hasPopupGrab(),
+            self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
+            self.xwayland_override_redirect_focus != null,
+        ))
+    {
+        self.seat.setKeyboardFocus(null);
+        self.syncXwaylandFocus(null);
+        return;
+    }
+    self.applyMatureKeyboardFocus(default_focus);
+    self.syncXwaylandFocus(default_focus);
+}
+
+fn maturePolicyKeyboardFocus(self: *Self) ?Surface.Id {
+    return self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
     ) orelse
         self.xwayland_override_redirect_focus orelse
         self.window_manager.focusedSurface() orelse self.scene.focusedSurface();
-    self.seat.setKeyboardFocus(default_focus);
-    self.syncXwaylandFocus(default_focus);
+}
+
+fn applyMatureKeyboardFocus(self: *Self, requested: ?Surface.Id) void {
+    const focus = requested orelse {
+        _ = self.focus_arbiter.focusMature(null, null);
+        self.seat.setKeyboardFocus(null);
+        return;
+    };
+    const client = self.seat.matureSurfaceOwner(focus) orelse {
+        _ = self.focus_arbiter.focusMature(null, null);
+        self.seat.setKeyboardFocus(null);
+        return;
+    };
+    _ = self.focus_arbiter.focusMature(focus, client);
+    self.seat.setKeyboardFocus(focus);
+}
+
+fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
+    if (!generatedFocusPolicyAllows(
+        self.session_lock.isLocked(),
+        self.xdg_shell.hasPopupGrab(),
+        self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
+        self.xwayland_override_redirect_focus != null,
+    )) return false;
+    const root = self.headless_surface_forest.compoundRoot(requested_root) orelse return false;
+    const state = self.headless_surface_forest.state(root) orelse return false;
+    if (state.mapped_size == null) return false;
+    const client = self.seat.generatedSurfaceOwner(root) orelse return false;
+    return self.focus_arbiter.focusGenerated(
+        root,
+        client,
+        self.maturePolicyKeyboardFocus(),
+    );
+}
+
+fn generatedFocusPolicyAllows(
+    locked: bool,
+    popup_grab: bool,
+    layer_focus: bool,
+    override_redirect_focus: bool,
+) bool {
+    return !locked and !popup_grab and !layer_focus and !override_redirect_focus;
+}
+
+test "generated focus cannot bypass mature shell and security policy" {
+    try std.testing.expect(generatedFocusPolicyAllows(false, false, false, false));
+    try std.testing.expect(!generatedFocusPolicyAllows(true, false, false, false));
+    try std.testing.expect(!generatedFocusPolicyAllows(false, true, false, false));
+    try std.testing.expect(!generatedFocusPolicyAllows(false, false, true, false));
+    try std.testing.expect(!generatedFocusPolicyAllows(false, false, false, true));
 }
 
 fn renderSeatCursor(
@@ -10946,6 +11144,87 @@ const SyntheticSurfaceProvider = struct {
     }
 };
 
+const TestGeneratedSeatSink = struct {
+    clients: *ClientRegistry,
+    client: ClientRegistry.Id,
+    event_count: usize = 0,
+
+    fn sink(self: *TestGeneratedSeatSink) SeatDelivery.Sink {
+        return .{
+            .context = self,
+            .owner_for_surface = ownerForSurface,
+            .surface_accepts_input = surfaceAcceptsInput,
+            .issue_serial = issueSerial,
+            .touch_target = touchTarget,
+            .capabilities = capabilities,
+            .keyboard_state = keyboardState,
+            .keyboard = keyboard,
+            .pointer = pointer,
+            .touch = touch,
+        };
+    }
+
+    fn ownerForSurface(
+        context: *anyopaque,
+        _: SurfaceRegistry.Id,
+    ) ?ClientRegistry.Id {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        return if (self.clients.domainOf(self.client) == .wayring_server)
+            self.client
+        else
+            null;
+    }
+
+    fn surfaceAcceptsInput(
+        _: *anyopaque,
+        _: SurfaceRegistry.Id,
+        _: f64,
+        _: f64,
+    ) bool {
+        return true;
+    }
+
+    fn issueSerial(_: *anyopaque, _: ClientRegistry.Id) ?ClientRegistry.Serial {
+        return null;
+    }
+
+    fn touchTarget(_: *anyopaque, _: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
+        return null;
+    }
+
+    fn capabilities(_: *anyopaque, _: SeatDelivery.CapabilitySnapshot) void {}
+    fn keyboardState(_: *anyopaque, _: SeatDelivery.KeyboardStateEvent) void {}
+
+    fn keyboard(
+        context: *anyopaque,
+        _: ClientRegistry.Id,
+        _: SurfaceRegistry.Id,
+        _: SeatDelivery.KeyboardEvent,
+    ) void {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        self.event_count += 1;
+    }
+
+    fn pointer(
+        context: *anyopaque,
+        _: ClientRegistry.Id,
+        _: SurfaceRegistry.Id,
+        _: SeatDelivery.PointerEvent,
+    ) void {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        self.event_count += 1;
+    }
+
+    fn touch(
+        context: *anyopaque,
+        _: ClientRegistry.Id,
+        _: SeatDelivery.TouchEvent,
+    ) void {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        self.event_count += 1;
+    }
+};
+
 fn resetTestOutputDamage(output: *RenderOutput) void {
     output.damage.clear();
     output.repaint_needed = false;
@@ -11611,6 +11890,140 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     server.removeHeadlessSurface(replacement_id);
     server.surface_registry.remove(replacement_id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
+}
+
+test "headless click and first touch focus compound root with synchronous repair" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 4, .height = 4 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+
+    var root_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 4, .height = 4 },
+    };
+    var child_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff44_5566,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    var top_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff77_8899,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const root = try server.surface_registry.add(root_provider.provider());
+    const child = try server.surface_registry.add(child_provider.provider());
+    const top = try server.surface_registry.add(top_provider.provider());
+    var root_live = true;
+    var child_live = true;
+    var top_live = true;
+    try server.addHeadlessSurface(root, null);
+    try server.addHeadlessSurface(child, null);
+    try server.addHeadlessSurface(top, null);
+    defer {
+        if (top_live) {
+            server.removeHeadlessSurface(top);
+            server.surface_registry.remove(top);
+        }
+        if (root_live) {
+            server.removeHeadlessSurface(root);
+            server.surface_registry.remove(root);
+        }
+        if (child_live) {
+            server.removeHeadlessSurface(child);
+            server.surface_registry.remove(child);
+        }
+    }
+
+    const root_stack = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = 1, .y = 1 } } },
+    };
+    const mapped = [_]WayringCompositor.AppliedSurfaceState{
+        .{ .id = root, .mapped_size = root_provider.logical_size, .callbacks_committed = false },
+        .{ .id = child, .mapped_size = child_provider.logical_size, .callbacks_committed = false },
+        .{ .id = top, .mapped_size = top_provider.logical_size, .callbacks_committed = false },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &mapped,
+        .parents = &.{.{ .id = root, .stack = &root_stack }},
+    });
+
+    var generated_client = try server.client_registry.register(.wayring_server);
+    var generated_client_live = true;
+    defer if (generated_client_live) server.client_registry.unregister(generated_client);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = generated_client,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+    server.seat.setPointerAvailable(true);
+    server.seat.setTouchAvailable(true);
+    defer {
+        server.seat.setTouchAvailable(false);
+        server.seat.setPointerAvailable(false);
+    }
+
+    const child_route = server.pointerRoute(2, 2);
+    try std.testing.expectEqual(child, child_route.generated.?.surface_id);
+    try std.testing.expectEqual(root, child_route.generated.?.root);
+    pointerMotion(output, 1, 2, 2);
+    pointerButton(output, 2, linux_button_left, .pressed);
+    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
+    try std.testing.expectEqual(FocusArbiter.Frontend.generated, server.focus_arbiter.target().?.frontend);
+    pointerButton(output, 3, linux_button_left, .released);
+
+    _ = server.focus_arbiter.focusMature(null, null);
+    touchDown(output, 4, 10, 2, 2);
+    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
+    touchDown(output, 5, 11, 0.5, 0.5);
+    try std.testing.expectEqual(top, server.pointerRoute(0.5, 0.5).generated.?.root);
+    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
+    touchUp(output, 6, 11);
+    touchUp(output, 7, 10);
+    try std.testing.expectEqual(@as(usize, 0), sink.event_count);
+
+    server.commitHeadlessSurface(root, null, false);
+    try std.testing.expect(server.focus_arbiter.target() == null);
+    server.commitHeadlessSurface(root, root_provider.logical_size, false);
+    try std.testing.expect(server.focusGeneratedSurface(root));
+
+    const top_stack = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = root, .position = .{} } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = top, .stack = &top_stack }},
+    });
+    try std.testing.expectEqual(top, server.focus_arbiter.target().?.root);
+
+    server.client_registry.unregister(generated_client);
+    generated_client_live = false;
+    try std.testing.expect(server.focus_arbiter.target() == null);
+    generated_client = try server.client_registry.register(.wayring_server);
+    generated_client_live = true;
+    sink.client = generated_client;
+    try std.testing.expect(server.focusGeneratedSurface(top));
+
+    server.removeHeadlessSurface(top);
+    server.surface_registry.remove(top);
+    top_live = false;
+    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.detached, server.headless_surface_forest.state(root).?.placement);
+
+    server.removeHeadlessSurface(root);
+    server.surface_registry.remove(root);
+    root_live = false;
+    server.removeHeadlessSurface(child);
+    server.surface_registry.remove(child);
+    child_live = false;
 }
 
 test "headless surface damage respects output geometry and conservative blur dependencies" {

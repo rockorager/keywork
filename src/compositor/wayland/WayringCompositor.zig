@@ -11,11 +11,13 @@ const builtin = @import("builtin");
 const std = @import("std");
 const core = @import("wayring-core-protocol");
 const wayring = @import("wayring");
+const ClientRegistry = @import("../ClientRegistry.zig");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const HeadlessSurfaceForest = @import("../HeadlessSurfaceForest.zig");
 const Region = @import("../region.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
+const WayringClients = @import("WayringClients.zig");
 const render = @import("../render/types.zig");
 
 const server = wayring.server;
@@ -442,6 +444,42 @@ pub fn surfaceEndpoint(self: *WayringCompositor, id: SurfaceId) ?SurfaceEndpoint
     if (surface.destroying or surface.resource.runtime.state() != .live) return null;
     const client = self.clientForResource(&surface.resource.runtime) orelse return null;
     return .{ .client = client, .resource = &surface.resource };
+}
+
+/// Resolves a live canonical surface to a current neutral client identity.
+/// Raw generated pointers remain inside this frontend-local adapter boundary.
+pub fn ownerForSurface(
+    self: *WayringCompositor,
+    clients: *const WayringClients,
+    id: SurfaceId,
+) ?ClientRegistry.Id {
+    if (!self.surface_registry.contains(id)) return null;
+    const endpoint = self.surfaceEndpoint(id) orelse return null;
+    const client = clients.id(endpoint.client) orelse return null;
+    return if (clients.contains(client)) client else null;
+}
+
+/// Applies the generated surface's committed input region synchronously. This
+/// is resource-free and does not expose the frontend-owned region.
+pub fn surfaceAcceptsInput(
+    self: *const WayringCompositor,
+    id: SurfaceId,
+    x: f64,
+    y: f64,
+) bool {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return false;
+    const surface = self.surfaceForId(id) orelse return false;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return false;
+    const size = surface.current_logical_size orelse return false;
+    if (x < 0 or y < 0 or
+        x >= @as(f64, @floatFromInt(size.width)) or
+        y >= @as(f64, @floatFromInt(size.height))) return false;
+    if (surface.current_input.infinite) return true;
+    if (x > std.math.maxInt(i32) or y > std.math.maxInt(i32)) return false;
+    return surface.current_input.value.contains(
+        @intFromFloat(@floor(x)),
+        @intFromFloat(@floor(y)),
+    );
 }
 
 pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, object_id: u32) ?SurfaceId {
@@ -3879,6 +3917,49 @@ test "scanner-backed surfaces use canonical registry IDs without Wayring lookup 
     try send(second.client(), 4, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(second.client().fatal() == null);
     try std.testing.expectEqual(@as(?*CopiedBufferSnapshot, null), compositor.currentBuffer(second_id));
+}
+
+test "surface owner is allocation-free and rejects disconnected generations" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var client_registry = ClientRegistry.init(std.testing.allocator);
+    defer client_registry.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var clients: WayringClients = undefined;
+    clients.init(failing.allocator(), &client_registry);
+    defer clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var mapping_live = false;
+    defer {
+        compositor.destroyClientResources(managed.client());
+        if (mapping_live) clients.unregister(managed.client());
+        managed.destroy();
+    }
+
+    const stale_client = try clients.register(managed.client());
+    mapping_live = true;
+    try bindCompositor(managed.client(), 3);
+    try createSurfaceResource(managed.client(), 3, 4);
+    const stale_surface = compositor.surfaceId(managed.client(), 4).?;
+    try std.testing.expectEqual(stale_client, compositor.ownerForSurface(&clients, stale_surface).?);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqual(stale_client, compositor.ownerForSurface(&clients, stale_surface).?);
+    try std.testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+
+    compositor.destroyClientResources(managed.client());
+    clients.unregister(managed.client());
+    mapping_live = false;
+    try std.testing.expect(compositor.ownerForSurface(&clients, stale_surface) == null);
+    const retired = try drain(managed.client());
+    defer std.testing.allocator.free(retired);
+    try std.testing.expect(!clients.contains(stale_client));
 }
 
 test "surface creation OOM before registration leaves no provider or listener entry" {

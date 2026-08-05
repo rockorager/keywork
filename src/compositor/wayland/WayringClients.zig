@@ -63,7 +63,21 @@ pub fn id(
     client: *const wayring.server.Client,
 ) ?ClientRegistry.Id {
     std.debug.assert(self.initialized);
-    return (self.clients.get(@intFromPtr(client)) orelse return null).id;
+    const client_id = (self.clients.get(@intFromPtr(client)) orelse return null).id;
+    if (self.registry.domainOf(client_id) != .wayring_server) return null;
+    return client_id;
+}
+
+/// Allocation-free generational registration check used by generated
+/// adapters before issuing serials for a retained neutral identity.
+pub fn contains(self: *const WayringClients, client: ClientRegistry.Id) bool {
+    std.debug.assert(self.initialized);
+    if (self.registry.domainOf(client) != .wayring_server) return false;
+    var iterator = self.clients.valueIterator();
+    while (iterator.next()) |state| {
+        if (std.meta.eql(state.*.id, client)) return true;
+    }
+    return false;
 }
 
 /// Requires every generated application resource for `client` to be gone.
@@ -96,6 +110,8 @@ test "raw address reuse receives a new generated-server generation" {
     try std.testing.expectEqual(stale.index, current.index);
     try std.testing.expect(stale.generation != current.generation);
     try std.testing.expect(!registry.contains(stale));
+    try std.testing.expect(!clients.contains(stale));
+    try std.testing.expect(clients.contains(current));
     clients.unregister(raw);
 }
 

@@ -396,6 +396,38 @@ pub fn deliverySnapshot(self: *const Self) SeatDelivery.Snapshot {
     };
 }
 
+/// Neutral generated endpoint ownership query. No frontend pointer or seat
+/// authority escapes this synchronous boundary.
+pub fn generatedSurfaceOwner(
+    self: *const Self,
+    surface: SurfaceRegistry.Id,
+) ?ClientRegistry.Id {
+    return self.delivery.ownerForSurface(surface);
+}
+
+pub fn generatedSurfaceAcceptsInput(
+    self: *const Self,
+    surface: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
+) bool {
+    return self.delivery.surfaceAcceptsInput(surface, x, y);
+}
+
+pub fn matureSurfaceOwner(
+    self: *const Self,
+    surface_id: SurfaceRegistry.Id,
+) ?ClientRegistry.Id {
+    const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return null;
+    return self.matureClient(surface.getClient());
+}
+
+/// Canonical contact state used only to gate first-touch focus policy. It does
+/// not expose touch targets or permit a frontend to mutate the sequence.
+pub fn touchSequenceActive(self: *const Self) bool {
+    return self.touch_points.items.len != 0;
+}
+
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }

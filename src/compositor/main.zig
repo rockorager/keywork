@@ -15,6 +15,7 @@ const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
+const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const wayring = @import("wayring");
 
 pub const std_options: std.Options = .{
@@ -180,6 +181,8 @@ pub fn main(init: std.process.Init) !void {
     var wayring_compositor_initialized = false;
     var wayring_outputs: WayringOutput = undefined;
     var wayring_outputs_initialized = false;
+    var wayring_seat_adapter: WayringSeatAdapter = undefined;
+    var wayring_seat_adapter_initialized = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -203,6 +206,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_seat_adapter_initialized) {
+            server.clearGeneratedSeatDeliverySink(&wayring_seat_adapter);
+            wayring_seat_adapter_initialized = false;
+        }
         if (wayring_clients_initialized) wayring_clients.deinit();
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_compositor_initialized) wayring_compositor.deinit();
@@ -222,6 +229,13 @@ pub fn main(init: std.process.Init) !void {
             server.wayringPresentationListener(),
         );
         wayring_compositor_initialized = true;
+        wayring_seat_adapter = .init(
+            &wayring_protocol_server.?,
+            &wayring_clients,
+            &wayring_compositor,
+        );
+        server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
+        wayring_seat_adapter_initialized = true;
         if (server.wayringOutputLayout()) |output_layout| {
             try wayring_outputs.init(
                 init.gpa,
@@ -624,6 +638,7 @@ test {
     _ = @import("wayland/WayringClients.zig");
     _ = @import("wayland/WayringHost.zig");
     _ = @import("wayland/WayringOutput.zig");
+    _ = @import("wayland/WayringSeatAdapter.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");
@@ -632,6 +647,7 @@ test {
     _ = @import("wayland/PressedKeyState.zig");
     _ = @import("wayland/mature_serials.zig");
     _ = @import("ClientRegistry.zig");
+    _ = @import("FocusArbiter.zig");
     _ = @import("wayland/MatureClients.zig");
     _ = @import("SeatAuthority.zig");
     _ = @import("SeatDelivery.zig");
