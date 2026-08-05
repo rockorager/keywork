@@ -3701,14 +3701,23 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     self.headless_surface_forest.removeRoot(id);
 }
 
-fn wayringSurfaceAdded(context: *anyopaque, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+fn wayringSurfaceAdded(
+    context: *anyopaque,
+    id: SurfaceRegistry.Id,
+    _: WayringCompositor.FrameCompletion,
+) error{OutOfMemory}!void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(self.surface_registry.contains(id));
     std.debug.assert(self.surface_registry.renderState(id) == null);
     try self.addHeadlessSurface(id);
 }
 
-fn wayringSurfaceCommitted(context: *anyopaque, id: SurfaceRegistry.Id, size: ?render.Size) void {
+fn wayringSurfaceCommitted(
+    context: *anyopaque,
+    id: SurfaceRegistry.Id,
+    size: ?render.Size,
+    _: bool,
+) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const render_state = self.surface_registry.renderState(id);
     if (size) |mapped_size| {
@@ -11283,8 +11292,23 @@ test "Wayring listener rollback removes an unpublished headless entry" {
     };
     const id = try server.surface_registry.add(provider.provider());
     const listener = server.wayringPresentationListener().?;
+    const wayring = @import("wayring");
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var completion_owner: WayringCompositor = undefined;
+    try completion_owner.init(std.testing.allocator, &protocol_server, &server.surface_registry, null);
+    defer completion_owner.deinit();
+    const Completion = struct {
+        fn complete(context: *anyopaque, surface_id: SurfaceRegistry.Id, timestamp_ms: u32) void {
+            const compositor: *WayringCompositor = @ptrCast(@alignCast(context));
+            compositor.completeFrame(surface_id, timestamp_ms);
+        }
+    };
 
-    try listener.added(listener.context, id);
+    try listener.added(listener.context, id, .{
+        .context = &completion_owner,
+        .complete = Completion.complete,
+    });
     try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{.{ .id = id }}, server.headless_surface_forest.roots());
     listener.removing(listener.context, id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
