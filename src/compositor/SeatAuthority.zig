@@ -27,6 +27,7 @@ surfaces: *const SurfaceRegistry,
 latest_action: ?Grant = null,
 selections: [selection_capacity]?Grant = [_]?Grant{null} ** selection_capacity,
 selection_next: usize = 0,
+latest_keyboard_enter: ?Grant = null,
 latest_enter: ?Grant = null,
 presses: std.ArrayList(Press) = .empty,
 order: Order = 0,
@@ -42,6 +43,7 @@ pub fn init(
 pub fn deinit(self: *SeatAuthority) void {
     std.debug.assert(self.latest_action == null);
     for (self.selections) |grant| std.debug.assert(grant == null);
+    std.debug.assert(self.latest_keyboard_enter == null);
     std.debug.assert(self.latest_enter == null);
     std.debug.assert(self.presses.items.len == 0);
     self.presses.deinit(self.allocator);
@@ -77,6 +79,25 @@ pub fn recordSelection(self: *SeatAuthority, client: ClientRegistry.Id, serial: 
     return true;
 }
 
+pub fn recordKeyboardEnter(self: *SeatAuthority, client: ClientRegistry.Id, serial: ClientRegistry.Serial) bool {
+    const grant = self.issue(client, serial) orelse return false;
+    self.pushSelection(grant);
+    self.latest_keyboard_enter = grant;
+    return true;
+}
+
+pub fn clearKeyboardEnter(self: *SeatAuthority) void {
+    self.latest_keyboard_enter = null;
+}
+
+/// Returns the retained generated keyboard-enter serial only to its exact
+/// client. This is a read-only late-resource seam, not a new authority grant.
+pub fn latestKeyboardEnterSerial(self: *const SeatAuthority, client: ClientRegistry.Id) ?ClientRegistry.Serial {
+    const grant = self.latest_keyboard_enter orelse return null;
+    if (!std.meta.eql(grant.client, client) or !self.valid(client, grant.serial)) return null;
+    return grant.serial;
+}
+
 fn pushSelection(self: *SeatAuthority, grant: Grant) void {
     self.selections[self.selection_next] = grant;
     self.selection_next = (self.selection_next + 1) % selection_capacity;
@@ -105,6 +126,7 @@ pub fn discardGrants(self: *SeatAuthority) void {
     std.debug.assert(self.presses.items.len == 0);
     self.latest_action = null;
     for (&self.selections) |*entry| entry.* = null;
+    self.latest_keyboard_enter = null;
     self.latest_enter = null;
 }
 
@@ -178,6 +200,9 @@ pub fn selectionOrder(self: *const SeatAuthority, client: ClientRegistry.Id, ser
     for (self.selections) |entry| if (entry) |grant| {
         if (same(grant, client, serial) and (newest == null or grant.order > newest.?)) newest = grant.order;
     };
+    if (self.latest_keyboard_enter) |grant| {
+        if (same(grant, client, serial) and (newest == null or grant.order > newest.?)) newest = grant.order;
+    }
     return newest;
 }
 
@@ -208,6 +233,9 @@ pub fn clientDisconnected(self: *SeatAuthority, client: ClientRegistry.Id) bool 
         if (entry.*) |grant| {
             if (std.meta.eql(grant.client, client)) entry.* = null;
         }
+    }
+    if (self.latest_keyboard_enter) |grant| {
+        if (std.meta.eql(grant.client, client)) self.latest_keyboard_enter = null;
     }
     if (self.latest_enter) |grant| {
         if (std.meta.eql(grant.client, client)) self.latest_enter = null;
@@ -272,6 +300,34 @@ test "selection, action, domain, capacity, and issuance order are independent" {
     _ = authority.clientDisconnected(mature);
     clients.unregister(wayring);
     _ = authority.clientDisconnected(wayring);
+}
+
+test "generated keyboard enter remains one retained selection grant for late resources" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    const client = try clients.register(.wayring_server);
+    const enter: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 7 };
+
+    try std.testing.expect(authority.recordKeyboardEnter(client, enter));
+    const enter_order = authority.selectionOrder(client, enter).?;
+    for (0..selection_capacity) |offset| {
+        try std.testing.expect(authority.recordSelection(client, .{
+            .domain = .wayring_server,
+            .value = @intCast(100 + offset),
+        }));
+    }
+    try std.testing.expectEqual(enter_order, authority.selectionOrder(client, enter).?);
+    try std.testing.expectEqual(enter, authority.latestKeyboardEnterSerial(client).?);
+    authority.clearKeyboardEnter();
+    try std.testing.expect(authority.selectionOrder(client, enter) == null);
+    try std.testing.expect(authority.latestKeyboardEnterSerial(client) == null);
+
+    clients.unregister(client);
+    _ = authority.clientDisconnected(client);
 }
 
 test "activation accepts selection or latest enter and disconnect purges stale reuse" {

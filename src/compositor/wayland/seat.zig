@@ -46,6 +46,7 @@ repaint_listener: ?RepaintListener,
 keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener),
 parent_focused: bool,
 focus: ?Surface.Id,
+generated_keyboard_focus: ?GeneratedKeyboardFocus,
 pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
 touch_points: std.ArrayList(TouchPoint),
@@ -188,6 +189,16 @@ pub const GeneratedPointerTarget = struct {
     client: ClientRegistry.Id,
 };
 
+pub const GeneratedKeyboardFocus = struct {
+    surface: SurfaceRegistry.Id,
+    client: ClientRegistry.Id,
+};
+
+const KeyboardDeliveryTarget = union(enum) {
+    mature: *wl.Surface,
+    generated: GeneratedKeyboardFocus,
+};
+
 pub const PointerHandle = struct {
     resource: *wl.Pointer,
     generation: u64,
@@ -307,6 +318,7 @@ pub fn init(
         .keyboard_focus_listeners = .empty,
         .parent_focused = false,
         .focus = null,
+        .generated_keyboard_focus = null,
         .pointer_focus = null,
         .pointer_position = null,
         .touch_points = .empty,
@@ -419,6 +431,35 @@ pub fn generatedPointerEnterSnapshot(
         .serial = serial,
         .x = pointerFixed(focus.x),
         .y = pointerFixed(focus.y),
+    };
+}
+
+pub fn generatedKeyboardResourceSnapshot(
+    self: *const Self,
+    client: ClientRegistry.Id,
+    capability_generation: SeatDelivery.ResourceGeneration,
+) ?SeatDelivery.KeyboardResourceSnapshot {
+    if (!self.delivery.capability(.keyboard).resourceActive(capability_generation) or
+        self.clients.domainOf(client) != .wayring_server) return null;
+    const keymap = self.deliveryKeymapSnapshot() orelse return null;
+    const focus: ?SeatDelivery.KeyboardFocusSnapshot = focus: {
+        if (!self.parent_focused) break :focus null;
+        if (self.keyboard_grab) |grab| if (grab.surface != null) break :focus null;
+        const target = self.generated_keyboard_focus orelse break :focus null;
+        if (!std.meta.eql(target.client, client) or
+            !self.surface_registry.contains(target.surface)) break :focus null;
+        const serial = self.authority.latestKeyboardEnterSerial(client) orelse break :focus null;
+        break :focus .{
+            .surface = target.surface,
+            .serial = serial,
+            .pressed_keys = self.pressed_keys.keys(),
+            .modifiers = self.modifier_state.current,
+        };
+    };
+    return .{
+        .keymap = keymap,
+        .repeat_info = self.repeat_info,
+        .focus = focus,
     };
 }
 
@@ -613,14 +654,29 @@ pub fn clearKeyboardGrab(self: *Self, context: *anyopaque, restore_focus: bool) 
         if (self.parent_focused and self.keymap != null) self.sendEnter();
         return;
     }
-    const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
-    const serial = MatureSerials.issueWire(self.display);
-    for (self.keyboard_resources.items) |entry| {
-        if (!self.keyboardResourceActive(entry)) continue;
-        if (entry.resource.getClient() == surface.getClient()) {
-            self.sendModifiers(entry.resource, serial);
-        }
+    const modifiers = self.modifier_state.current;
+    const target = self.keyboardDeliveryTarget() orelse return;
+    switch (target) {
+        .mature => |surface| {
+            const serial = MatureSerials.issueWire(self.display);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                if (entry.resource.getClient() == surface.getClient()) {
+                    self.sendModifiers(entry.resource, serial);
+                }
+            }
+        },
+        .generated => |generated| {
+            const serial = self.delivery.issueSerial(generated.client) orelse {
+                self.retireGeneratedClient(generated.client);
+                return;
+            };
+            self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .modifiers = .{
+                .serial = serial.value,
+                .state = modifiers,
+            } });
+        },
     }
 }
 
@@ -651,6 +707,16 @@ pub fn recordSelectionForClient(
     serial: ClientRegistry.Serial,
 ) bool {
     return self.authority.recordSelection(client, serial);
+}
+
+/// Records the authority purpose produced by a key press without exposing
+/// mutable authority state to frontend adapters.
+pub fn recordActionForClient(
+    self: *Self,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    return self.authority.recordAction(client, serial);
 }
 
 /// Records the authority purpose produced by pointer enter.
@@ -772,6 +838,9 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.clients.contains(client));
     if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
+    if (self.generated_keyboard_focus) |focus| {
+        if (std.meta.eql(focus.client, client)) self.generated_keyboard_focus = null;
+    }
     if (self.pointer_focus) |focus| if (focus.generated) |generated| {
         if (std.meta.eql(generated.client, client)) {
             self.pointer_focus = null;
@@ -1028,7 +1097,8 @@ pub fn setKeymap(
     fd: std.posix.fd_t,
     size: u32,
 ) void {
-    const old_focus = self.keyboardFocusedClient();
+    const had_focused_target = self.parent_focused and self.hasKeyboardCapability() and
+        self.keyboardDeliveryTarget() != null;
     const old_capability = self.hasKeyboardCapability();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keymap = .{
@@ -1048,7 +1118,9 @@ pub fn setKeymap(
     if (self.keyboard_grab) |grab| {
         if (grab.surface == null) grab.keymap(grab.context, format, fd, size);
     }
-    if (old_focus == null and self.keyboardFocusedClient() != null) {
+    if (!had_focused_target and self.parent_focused and self.hasKeyboardCapability() and
+        self.keyboardDeliveryTarget() != null)
+    {
         self.notifyKeyboardFocus();
         self.sendEnter();
     }
@@ -1067,13 +1139,41 @@ pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
 }
 
 pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
-    if (std.meta.eql(self.focus, focus)) return;
+    if (self.generated_keyboard_focus == null and std.meta.eql(self.focus, focus)) return;
     if (self.keyboard_grab) |grab| if (grab.surface != null) {
         self.focus = focus;
+        self.generated_keyboard_focus = null;
+        self.authority.clearKeyboardEnter();
         return;
     };
     if (self.parent_focused) self.sendLeave();
     self.focus = focus;
+    self.generated_keyboard_focus = null;
+    self.authority.clearKeyboardEnter();
+    if (self.parent_focused) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
+    }
+}
+
+/// Mirrors the FocusArbiter's selected generated target into the canonical
+/// seat delivery stream. The target remains resource-free and generational.
+pub fn setGeneratedKeyboardFocus(self: *Self, focus: ?GeneratedKeyboardFocus) void {
+    if (focus) |target| {
+        std.debug.assert(self.clients.domainOf(target.client) == .wayring_server);
+        std.debug.assert(self.surface_registry.contains(target.surface));
+    }
+    if (std.meta.eql(self.generated_keyboard_focus, focus) and self.focus == null) return;
+    if (self.keyboard_grab) |grab| if (grab.surface != null) {
+        self.focus = null;
+        self.generated_keyboard_focus = focus;
+        self.authority.clearKeyboardEnter();
+        return;
+    };
+    if (self.parent_focused) self.sendLeave();
+    self.focus = null;
+    self.generated_keyboard_focus = focus;
+    self.authority.clearKeyboardEnter();
     if (self.parent_focused) {
         self.notifyKeyboardFocus();
         self.sendEnter();
@@ -1207,23 +1307,53 @@ fn keyWithGrab(
         );
         return;
     }
-    const surface = self.focusedSurface() orelse return;
-    const serial = MatureSerials.issue(self.display);
-    if (state == .pressed)
-        self.recordAction(surface.getClient(), serial)
-    else
-        self.recordSelection(surface.getClient(), serial);
-    for (self.keyboard_resources.items) |entry| {
-        if (!self.keyboardResourceActive(entry)) continue;
-        const resource = entry.resource;
-        if (resource.getClient() != surface.getClient()) continue;
-        if (!keyboardKeyEventEligible(
-            state,
-            self.pressed_keys.contains(key_code),
-            self.repeat_info.rate,
-            resource.getVersion(),
-        )) continue;
-        resource.sendKey(serial.value, time, key_code, state);
+    const target = self.keyboardDeliveryTarget() orelse return;
+    switch (target) {
+        .mature => |surface| {
+            const serial = MatureSerials.issue(self.display);
+            if (state == .pressed)
+                self.recordAction(surface.getClient(), serial)
+            else
+                self.recordSelection(surface.getClient(), serial);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                const resource = entry.resource;
+                if (resource.getClient() != surface.getClient()) continue;
+                if (!keyboardKeyEventEligible(
+                    state,
+                    self.pressed_keys.contains(key_code),
+                    self.repeat_info.rate,
+                    resource.getVersion(),
+                )) continue;
+                resource.sendKey(serial.value, time, key_code, state);
+            }
+        },
+        .generated => |generated| {
+            if (!keyboardKeyEventEligible(
+                state,
+                self.pressed_keys.contains(key_code),
+                self.repeat_info.rate,
+                10,
+            )) return;
+            const serial = self.delivery.issueSerial(generated.client) orelse {
+                self.retireGeneratedClient(generated.client);
+                return;
+            };
+            const recorded = if (state == .pressed)
+                self.recordActionForClient(generated.client, serial)
+            else
+                self.recordSelectionForClient(generated.client, serial);
+            if (!recorded) {
+                self.retireGeneratedClient(generated.client);
+                return;
+            }
+            self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .key = .{
+                .serial = serial,
+                .time = time,
+                .key = key_code,
+                .state = @enumFromInt(@intFromEnum(state)),
+            } });
+        },
     }
 }
 
@@ -1301,14 +1431,28 @@ fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
             return;
         }
     }
-    const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
-    const serial = MatureSerials.issueWire(self.display);
-    for (self.keyboard_resources.items) |entry| {
-        if (!self.keyboardResourceActive(entry)) continue;
-        if (entry.resource.getClient() == surface.getClient()) {
-            self.sendModifiers(entry.resource, serial);
-        }
+    const target = self.keyboardDeliveryTarget() orelse return;
+    switch (target) {
+        .mature => |surface| {
+            const serial = MatureSerials.issueWire(self.display);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                if (entry.resource.getClient() == surface.getClient()) {
+                    self.sendModifiers(entry.resource, serial);
+                }
+            }
+        },
+        .generated => |generated| {
+            const serial = self.delivery.issueSerial(generated.client) orelse {
+                self.retireGeneratedClient(generated.client);
+                return;
+            };
+            self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .modifiers = .{
+                .serial = serial.value,
+                .state = modifiers,
+            } });
+        },
     }
 }
 
@@ -2032,6 +2176,20 @@ fn keyboardDeliverySurface(self: *Self) ?*wl.Surface {
     );
 }
 
+fn keyboardDeliveryTarget(self: *Self) ?KeyboardDeliveryTarget {
+    if (self.keyboard_grab) |grab| if (grab.surface) |surface_id| {
+        const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return null;
+        return .{ .mature = surface };
+    };
+    if (self.generated_keyboard_focus) |generated| {
+        if (self.clients.domainOf(generated.client) != .wayring_server or
+            !self.surface_registry.contains(generated.surface)) return null;
+        return .{ .generated = generated };
+    }
+    const surface = self.focusedSurface() orelse return null;
+    return .{ .mature = surface };
+}
+
 fn keyboardCapabilityAvailable(self: *const Self) bool {
     return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
 }
@@ -2197,15 +2355,34 @@ fn keyboardKeyEventEligible(
 
 fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
-    const surface = self.keyboardDeliverySurface() orelse return;
-    const serial = MatureSerials.issue(self.display);
-    self.recordSelection(surface.getClient(), serial);
-    for (self.keyboard_resources.items) |entry| {
-        if (!self.keyboardResourceActive(entry)) continue;
-        const resource = entry.resource;
-        if (resource.getClient() == surface.getClient()) {
-            self.sendEnterTo(resource, surface, serial);
-        }
+    const target = self.keyboardDeliveryTarget() orelse return;
+    switch (target) {
+        .mature => |surface| {
+            const serial = MatureSerials.issue(self.display);
+            self.recordSelection(surface.getClient(), serial);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                const resource = entry.resource;
+                if (resource.getClient() == surface.getClient()) {
+                    self.sendEnterTo(resource, surface, serial);
+                }
+            }
+        },
+        .generated => |generated| {
+            const serial = self.delivery.issueSerial(generated.client) orelse {
+                self.retireGeneratedClient(generated.client);
+                return;
+            };
+            if (!self.authority.recordKeyboardEnter(generated.client, serial)) {
+                self.retireGeneratedClient(generated.client);
+                return;
+            }
+            self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .enter = .{
+                .serial = serial,
+                .pressed_keys = self.pressed_keys.keys(),
+                .modifiers = self.modifier_state.current,
+            } });
+        },
     }
 }
 
@@ -2221,12 +2398,26 @@ fn sendEnterTo(
 }
 
 fn sendLeave(self: *Self) void {
-    const surface = self.keyboardDeliverySurface() orelse return;
-    const serial = MatureSerials.issueWire(self.display);
-    for (self.keyboard_resources.items) |entry| {
-        if (!self.keyboardResourceActive(entry)) continue;
-        const resource = entry.resource;
-        if (resource.getClient() == surface.getClient()) resource.sendLeave(serial, surface);
+    const target = self.keyboardDeliveryTarget() orelse return;
+    switch (target) {
+        .mature => |surface| {
+            const serial = MatureSerials.issueWire(self.display);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                const resource = entry.resource;
+                if (resource.getClient() == surface.getClient()) resource.sendLeave(serial, surface);
+            }
+        },
+        .generated => |generated| {
+            defer self.authority.clearKeyboardEnter();
+            const serial = self.delivery.issueSerial(generated.client) orelse {
+                self.retireGeneratedClient(generated.client);
+                return;
+            };
+            self.delivery.deliverKeyboard(generated.client, generated.surface, .{
+                .leave = .{ .serial = serial.value },
+            });
+        },
     }
 }
 
@@ -2690,6 +2881,12 @@ fn samePointerEndpoint(a: PointerFocus, b: PointerFocus) bool {
 }
 
 pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
+    if (self.generated_keyboard_focus) |focus| {
+        if (std.meta.eql(focus.client, client)) {
+            self.generated_keyboard_focus = null;
+            self.authority.clearKeyboardEnter();
+        }
+    }
     if (self.pointer_focus) |focus| if (focus.generated) |target| {
         if (std.meta.eql(target.client, client)) {
             self.pointer_focus = null;
@@ -2922,9 +3119,10 @@ test "generated implicit grab cannot alias a mature endpoint with the same surfa
 
 test "generated focus cannot prove mature focus for an equal surface id" {
     const surface_id: Surface.Id = .{ .index = 1, .generation = 2 };
+    const client: ClientRegistry.Id = .{ .index = 3, .generation = 4 };
     const generated: GeneratedPointerTarget = .{
         .root = surface_id,
-        .client = .{ .index = 3, .generation = 4 },
+        .client = client,
     };
     var seat: Self = undefined;
     seat.pointer_focus = .{
@@ -2934,10 +3132,13 @@ test "generated focus cannot prove mature focus for an equal surface id" {
         .generated = generated,
     };
     seat.focus = null;
+    seat.generated_keyboard_focus = .{ .surface = surface_id, .client = client };
+    seat.keyboard_grab = null;
     seat.touch_points = .empty;
 
     try std.testing.expectEqual(surface_id, seat.pointerFocus().?.surface_id);
     try std.testing.expect(seat.maturePointerFocus() == null);
+    try std.testing.expect(seat.keyboardDeliverySurfaceId() == null);
     try std.testing.expect(!seat.activationSurfaceFocused(surface_id));
     try std.testing.expect(seat.warpPointer(surface_id, 1, 2) == null);
     const unused_handle: PointerHandle = .{ .resource = undefined, .generation = 1 };
