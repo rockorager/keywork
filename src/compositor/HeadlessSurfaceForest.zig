@@ -56,12 +56,24 @@ pub const Placement = union(enum) {
     },
 };
 
+/// Presentation ownership for an attached compound root. This is independent
+/// from wl_surface role and child topology. Managed and cursor are permanent;
+/// an unpublished XDG reservation may return to background until a concrete
+/// role is assigned.
+pub const PresentationClass = enum {
+    background,
+    xdg_reserved,
+    managed,
+    cursor,
+};
+
 pub const NodeState = struct {
     id: SurfaceRegistry.Id,
     mapped_size: ?render.Size,
     frame_completion: ?SurfaceFrameCompletion,
     frame_demand: bool,
     placement: Placement,
+    presentation_class: PresentationClass,
 };
 
 pub const RenderEntry = struct {
@@ -100,7 +112,7 @@ const Node = struct {
     mapped_size: ?render.Size = null,
     frame_completion: ?SurfaceFrameCompletion = null,
     frame_demand: bool = false,
-    cursor_role: bool = false,
+    presentation_class: PresentationClass = .background,
 
     placement: PlacementTag = .detached,
     parent: ?SurfaceRegistry.Id = null,
@@ -235,7 +247,8 @@ pub fn apply(self: *HeadlessSurfaceForest, batch: AppliedBatch) void {
 /// Immediately hides a whole compound subtree while preserving every node's
 /// content, frame demand, relative placement value, and direct-child stack.
 pub fn detach(self: *HeadlessSurfaceForest, id: SurfaceRegistry.Id) void {
-    std.debug.assert(self.node(id) != null);
+    const target = self.node(id) orelse unreachable;
+    std.debug.assert(target.presentation_class == .background);
     self.detachPlacement(id);
     self.validateAfterMutation();
 }
@@ -267,15 +280,38 @@ pub fn takeFrameCompletion(
     return completion;
 }
 
-/// Permanently marks the root as cursor-role presentation content.
-pub fn markCursorRole(self: *HeadlessSurfaceForest, id: SurfaceRegistry.Id) void {
-    const target = self.node(id) orelse return;
-    target.cursor_role = true;
+/// Applies one allocation-free root presentation transition. Detached and
+/// child nodes are rejected. Managed and cursor roots cannot regress.
+pub fn setRootPresentationClass(
+    self: *HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+    class: PresentationClass,
+) bool {
+    const target = self.node(id) orelse return false;
+    if (target.placement != .root) return false;
+    const allowed = switch (target.presentation_class) {
+        .background => true,
+        .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed,
+        .managed => class == .managed,
+        .cursor => class == .cursor,
+    };
+    if (!allowed) return false;
+    target.presentation_class = class;
+    self.validateAfterMutation();
+    return true;
+}
+
+/// Resolves the effective class through the current compound root.
+pub fn presentationClass(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) ?PresentationClass {
+    const root = self.compoundRoot(id) orelse return null;
+    return self.nodeConst(root).?.presentation_class;
 }
 
 pub fn isCursorRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
-    const root = self.compoundRoot(id) orelse return false;
-    return self.nodeConst(root).?.cursor_role;
+    return self.presentationClass(id) == .cursor;
 }
 
 pub fn state(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) ?NodeState {
@@ -336,7 +372,7 @@ pub fn presentedInCompound(
 ) bool {
     if (self.exactGeometry(id) == null) return false;
     const current_root = self.compoundRoot(id) orelse return false;
-    if (self.nodeConst(current_root).?.cursor_role) return false;
+    if (self.nodeConst(current_root).?.presentation_class != .background) return false;
     return sameId(current_root, root);
 }
 
@@ -381,6 +417,8 @@ pub const RenderIterator = struct {
                 const root = self.next_root orelse return null;
                 const root_node = self.forest.nodeConst(root) orelse return null;
                 self.next_root = root_node.root_next;
+                if (root_node.presentation_class == .xdg_reserved or
+                    root_node.presentation_class == .managed) continue;
                 self.owner = root;
                 self.entry = root_node.stack_head;
             }
@@ -511,6 +549,9 @@ pub fn compoundBounds(
     self: *const HeadlessSurfaceForest,
     id: SurfaceRegistry.Id,
 ) CompoundBounds {
+    const root = self.compoundRoot(id) orelse return .hidden;
+    const class = self.nodeConst(root).?.presentation_class;
+    if (class == .xdg_reserved or class == .managed) return .hidden;
     if (self.exactGeometry(id) == null) return .hidden;
     var has_bounds = false;
     var left: i64 = 0;
@@ -573,6 +614,8 @@ pub fn validate(self: *const HeadlessSurfaceForest) void {
         if (target.mapped_size) |size|
             std.debug.assert(size.width > 0 and size.height > 0);
         std.debug.assert(!target.frame_demand or target.frame_completion != null);
+        if (target.presentation_class != .background)
+            std.debug.assert(target.placement == .root);
 
         switch (target.placement) {
             .root => {
@@ -697,6 +740,7 @@ fn nodeState(target: *const Node) NodeState {
         .mapped_size = target.mapped_size,
         .frame_completion = target.frame_completion,
         .frame_demand = target.frame_demand,
+        .presentation_class = target.presentation_class,
         .placement = switch (target.placement) {
             .detached => .detached,
             .root => .root,
@@ -957,6 +1001,47 @@ test "root parity and stale generations use canonical indexed slots" {
     try std.testing.expect(forest.state(current) != null);
     forest.remove(second);
     forest.remove(current);
+}
+
+test "root presentation progression hides reservations and keeps managed and cursor permanent" {
+    var forest = HeadlessSurfaceForest.init(std.testing.allocator);
+    defer forest.deinit();
+    const managed: SurfaceRegistry.Id = .{ .index = 0, .generation = 1 };
+    const cursor: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    try forest.addRoot(managed, null);
+    try forest.addRoot(cursor, null);
+    applyOne(&forest, managed, .{ .width = 2, .height = 1 }, false);
+    applyOne(&forest, cursor, .{ .width = 1, .height = 1 }, false);
+    try std.testing.expectEqual(PresentationClass.background, forest.presentationClass(managed).?);
+
+    try std.testing.expect(forest.setRootPresentationClass(managed, .xdg_reserved));
+    try std.testing.expectEqual(PresentationClass.xdg_reserved, forest.presentationClass(managed).?);
+    try std.testing.expectEqual(CompoundBounds.hidden, forest.compoundBounds(managed));
+    var reserved_subtree = forest.subtreeRenderIterator(managed);
+    try std.testing.expectEqual(managed, reserved_subtree.next().?.id);
+    try std.testing.expect(reserved_subtree.next() == null);
+
+    try std.testing.expect(forest.setRootPresentationClass(managed, .background));
+    try std.testing.expect(forest.setRootPresentationClass(managed, .xdg_reserved));
+    try std.testing.expect(forest.setRootPresentationClass(managed, .managed));
+    inline for (.{ PresentationClass.background, .xdg_reserved, .cursor }) |invalid|
+        try std.testing.expect(!forest.setRootPresentationClass(managed, invalid));
+    try std.testing.expectEqual(Placement.root, forest.state(managed).?.placement);
+    try std.testing.expectEqual(CompoundBounds.hidden, forest.compoundBounds(managed));
+    var managed_subtree = forest.subtreeRenderIterator(managed);
+    try std.testing.expectEqual(managed, managed_subtree.next().?.id);
+
+    try std.testing.expect(forest.setRootPresentationClass(cursor, .cursor));
+    inline for (.{ PresentationClass.background, .xdg_reserved, .managed }) |invalid|
+        try std.testing.expect(!forest.setRootPresentationClass(cursor, invalid));
+    try std.testing.expect(forest.isCursorRole(cursor));
+    try std.testing.expect(!forest.presentedInCompound(cursor, cursor));
+
+    var global = forest.renderIterator();
+    try std.testing.expectEqual(cursor, global.next().?.id);
+    try std.testing.expect(global.next() == null);
+    forest.remove(managed);
+    forest.remove(cursor);
 }
 
 test "compound roots reject stale removed detached and changed topology" {

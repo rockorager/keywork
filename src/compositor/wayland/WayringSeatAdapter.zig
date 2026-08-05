@@ -8,7 +8,7 @@
 const WayringSeatAdapter = @This();
 
 const std = @import("std");
-const core = @import("wayring-core-protocol");
+const core = @import("wayring-protocol");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const SeatDelivery = @import("../SeatDelivery.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
