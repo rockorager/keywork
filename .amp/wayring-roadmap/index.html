@@ -97,12 +97,12 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>f570c5ea</code> on <code>wayring</code> · Updated 2026-08-05 · Honest v1 gate passed; later waves remain provisional.</p>
+    <p class="meta">Current migration implementation: <code>d0ec01da</code> on <code>wayring</code> · Updated 2026-08-05 · Honest v1 gate passed; later waves remain provisional.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
     <div class="metric"><strong>2</strong><span>active phase</span></div>
-    <div class="metric"><strong>7</strong><span>Phase 2 waves integrated</span></div>
+    <div class="metric"><strong>8</strong><span>Phase 2 waves integrated</span></div>
     <div class="metric"><strong>PASS</strong><span>honest v1 gate</span></div>
     <div class="metric"><strong>Debug</strong><span>validation profile</span></div>
   </section>
@@ -119,7 +119,7 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:65%"></span></div>
+    <div class="bar"><span style="width:71%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 2 — Honest core surfaces and subsurfaces</h2><p class="detail">Complete core compositor semantics, then add synchronized topology without migrating mature subsurfaces.</p></div>
       <span class="status active">In progress</span>
@@ -129,7 +129,8 @@
     <div class="wave"><span class="wave-label">Wave 2A</span><div><h3>Adapter-owned frame callbacks</h3><p class="detail">Stable callback resources, exact commit-prefix transfer, no-done teardown, resource-free completion contract.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 2B</span><div><h3>Exact sampled-frame completion</h3><p class="detail">Canonical renderer tags, accepted-present drain, callback-only scheduling, multi-output and real-client coverage.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">v1 gate</span><div><h3>Independent honesty review</h3><p class="detail">All advertised v1 requests, commit atomicity, lifecycle, sampling timing, and test evidence passed independent high-mode review.</p></div><span class="status done">Passed</span></div>
-    <div class="wave"><span class="wave-label">Wave 3A–3E</span><div><h3>Version staircase</h3><p class="detail">Active order: transform v2, scale v3, damage_buffer v4, offset/versioned attach v5, fixed default preferences v6. Each advertisement follows implementation and review. Defer v7 explicit release.</p></div><span class="status active">Starting</span></div>
+    <div class="wave"><span class="wave-label">Wave 3A</span><div><h3>Buffer transform v2</h3><p class="detail">All eight transforms, pending/current atomicity, conservative geometry damage, rotated real-client sampling, and honest v2 advertisement.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 3B–3E</span><div><h3>Continue version staircase</h3><p class="detail">Next: scale v3, damage_buffer v4, offset/versioned attach v5, then fixed default preferences v6. Each advertisement follows implementation and review. Defer v7 explicit release.</p></div><span class="status active">Next</span></div>
     <div class="wave"><span class="wave-label">Wave 4</span><div><h3>Wayring-only subsurface adapter</h3><p class="detail">Permanent roles and lifecycle; exact synchronized commit queues and parent fences; neutral forest topology/render/damage; real-client equivalence gate.</p></div><span class="status proposed">Proposed</span></div>
   </section>
 
