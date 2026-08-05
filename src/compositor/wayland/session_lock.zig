@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Surface = @import("surface.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
@@ -452,7 +453,7 @@ const LockSurface = struct {
         const logical_size = output.logicalSize();
         const size = [2]u32{ logical_size.width, logical_size.height };
         if (std.meta.eql(self.last_configured_size, size)) return;
-        const serial = self.lock.manager.display.nextSerial();
+        const serial = MatureSerials.issueWire(self.lock.manager.display);
         try self.configurations.append(self.lock.manager.allocator, .{
             .serial = serial,
             .size = size,

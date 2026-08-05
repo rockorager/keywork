@@ -611,6 +611,7 @@ test {
     _ = @import("wayland/subcompositor.zig");
     _ = @import("wayland/seat.zig");
     _ = @import("wayland/PressedKeyState.zig");
+    _ = @import("wayland/mature_serials.zig");
     _ = @import("ClientRegistry.zig");
     _ = @import("wayland/MatureClients.zig");
     _ = @import("SeatAuthority.zig");

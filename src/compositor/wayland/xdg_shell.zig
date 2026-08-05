@@ -14,6 +14,7 @@ const OutputLayout = @import("output_layout.zig");
 const GtkShell = @import("gtk_shell.zig");
 const XdgPositioner = @import("XdgPositioner.zig");
 const popup_placement = @import("xdg_popup_placement.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -747,7 +748,7 @@ pub fn configureWindowState(
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse
         return error.InvalidWindow;
     const toplevel = state.toplevel_resource orelse return error.InvalidWindow;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     state.configures.append(self.allocator, .{ .serial = serial }) catch
         return error.OutOfMemory;
 
@@ -1322,7 +1323,7 @@ fn sendPopupConfigure(
     const placement = try self.popupPlacement(popup, rules);
     const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse
         return error.InvalidParent;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     try xdg_surface.configures.append(self.allocator, .{
         .serial = serial,
         .popup = .{ .rules = rules, .placement = placement },

@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const Seat = @import("seat.zig");
 const SelectionSource = @import("SelectionSource.zig");
 const Surface = @import("surface.zig");
+const MatureSerials = @import("mature_serials.zig");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const SeatAuthority = @import("../SeatAuthority.zig");
 const slot_map = @import("../slot_map.zig");
@@ -966,7 +967,7 @@ fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
     const client = surface.getClient();
     if (drag.source == null and client != drag.source_client.?) return;
 
-    const serial = matureSerial(self.display.nextSerial());
+    const serial = MatureSerials.issue(self.display);
     self.drag.?.target = .{
         .surface_id = next.surface_id,
         .client = client,
@@ -1219,7 +1220,7 @@ fn acceptOffer(
 ) void {
     const offer = self.offers.get(offer_id) orelse return;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return;
-    if (offer.active and !std.meta.eql(matureSerial(serial), offer.enter_serial)) return;
+    if (offer.active and !std.meta.eql(MatureSerials.fromWire(serial), offer.enter_serial)) return;
     const source = offerDragSource(offer) orelse return;
     if (!self.dragSourceAvailable(source)) return;
     const accepted = if (mime_type) |value| self.dragSourceHasMime(source, value) else false;
@@ -1562,7 +1563,7 @@ fn sendSelectionToDevice(
         null,
         .selection,
         0,
-        matureSerial(0),
+        MatureSerials.fromWire(0),
     );
     device.resource.sendDataOffer(offer);
     for (self.selectionMimeTypes()) |mime_type| offer.sendOffer(mime_type.ptr);
@@ -1667,10 +1668,6 @@ fn action(kind: DndActionKind) wl.DataDeviceManager.DndAction {
 
 fn actionBits(value: wl.DataDeviceManager.DndAction) u32 {
     return @bitCast(value);
-}
-
-fn matureSerial(value: u32) ClientRegistry.Serial {
-    return .{ .domain = .mature_display, .value = value };
 }
 
 fn sourceActions(source: *const SourceState) wl.DataDeviceManager.DndAction {
