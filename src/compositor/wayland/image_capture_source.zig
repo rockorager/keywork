@@ -7,7 +7,7 @@ const wayland = @import("wayland");
 const ForeignToplevelList = @import("foreign_toplevel_list.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;

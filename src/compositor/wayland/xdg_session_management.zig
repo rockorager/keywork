@@ -5,7 +5,8 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const WindowManager = @import("../window_manager.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -15,7 +16,8 @@ const maximum_state_file_size = 1024 * 1024;
 allocator: std.mem.Allocator,
 io: std.Io,
 global: *wl.Global,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+core: *XdgShell,
 window_manager: *WindowManager,
 sessions: std.StringHashMapUnmanaged(*StoredSession),
 session_resources: std.ArrayList(*SessionResource),
@@ -160,7 +162,8 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
-    xdg_shell: *XdgShell,
+    xdg_shell: *MatureXdgShell,
+    core: *XdgShell,
     window_manager: *WindowManager,
 ) !void {
     self.* = .{
@@ -168,6 +171,7 @@ pub fn init(
         .io = io,
         .global = undefined,
         .xdg_shell = xdg_shell,
+        .core = core,
         .window_manager = window_manager,
         .sessions = .empty,
         .session_resources = .empty,
@@ -181,7 +185,7 @@ pub fn init(
     errdefer self.associations.deinit(allocator);
     self.global = try wl.Global.create(display, xdg.SessionManagerV1, 1, *Self, self, bind);
     errdefer self.global.destroy();
-    try xdg_shell.addWindowObserver(.{
+    try core.addWindowObserver(.{
         .context = self,
         .committed = windowCommitted,
         .unmapped = windowUnmapped,
@@ -189,7 +193,7 @@ pub fn init(
         .metadata_changed = windowMetadataChanged,
         .state_changed = windowStateChanged,
     });
-    errdefer xdg_shell.removeWindowObserver(self);
+    errdefer core.removeWindowObserver(self);
     window_manager.setSessionListener(.{
         .context = self,
         .state_for_remap = windowStateForRemap,
@@ -204,7 +208,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.associations.items.len == 0);
     self.save() catch |err| log.warn("failed to save XDG sessions: {t}", .{err});
     self.window_manager.clearSessionListener();
-    self.xdg_shell.removeWindowObserver(self);
+    self.core.removeWindowObserver(self);
     self.global.destroy();
     self.clearStoredSessions();
     self.sessions.deinit(self.allocator);
@@ -577,7 +581,7 @@ const SessionResource = struct {
             return;
         };
         if (restore) {
-            const info = self.manager.xdg_shell.windowInfo(toplevel.window_id) orelse {
+            const info = self.manager.core.windowInfo(toplevel.window_id) orelse {
                 self.manager.createInertToplevel(
                     self.resource.getClient(),
                     self.resource.getVersion(),

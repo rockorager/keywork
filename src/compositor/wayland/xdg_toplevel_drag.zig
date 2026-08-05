@@ -7,7 +7,8 @@ const wayland = @import("wayland");
 const DataDevice = @import("data_device.zig");
 const Scene = @import("../scene.zig");
 const Seat = @import("seat.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -15,7 +16,8 @@ const xdg = wayland.server.xdg;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 data_device: *DataDevice,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+core: *XdgShell,
 seat: *Seat,
 listener: Listener,
 drags: std.ArrayList(*Drag),
@@ -32,7 +34,8 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     data_device: *DataDevice,
-    xdg_shell: *XdgShell,
+    xdg_shell: *MatureXdgShell,
+    core: *XdgShell,
     seat: *Seat,
     listener: Listener,
 ) !void {
@@ -41,6 +44,7 @@ pub fn init(
         .global = undefined,
         .data_device = data_device,
         .xdg_shell = xdg_shell,
+        .core = core,
         .seat = seat,
         .listener = listener,
         .drags = .empty,
@@ -48,7 +52,7 @@ pub fn init(
     errdefer self.drags.deinit(allocator);
     self.global = try wl.Global.create(display, xdg.ToplevelDragManagerV1, 1, *Self, self, bind);
     errdefer self.global.destroy();
-    try xdg_shell.addWindowObserver(.{
+    try core.addWindowObserver(.{
         .context = self,
         .committed = windowCommitted,
         .unmapped = windowUnmapped,
@@ -60,7 +64,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.drags.items.len == 0);
-    self.xdg_shell.removeWindowObserver(self);
+    self.core.removeWindowObserver(self);
     self.global.destroy();
     self.drags.deinit(self.allocator);
     self.* = undefined;
@@ -78,7 +82,7 @@ pub fn attachedScene(self: *Self) ?Scene.Id {
     for (self.drags.items) |drag| {
         if (!drag.active) continue;
         const window_id = drag.attached_window orelse continue;
-        const info = self.xdg_shell.windowInfo(window_id) orelse continue;
+        const info = self.core.windowInfo(window_id) orelse continue;
         if (info.mapped) return info.scene_id;
     }
     return null;
@@ -208,7 +212,7 @@ const Drag = struct {
         }
         if (toplevel_resource.getClient() != resource.getClient()) return;
         const toplevel = self.manager.xdg_shell.toplevelFromResource(toplevel_resource) orelse return;
-        const info = self.manager.xdg_shell.windowInfo(toplevel.window_id) orelse return;
+        const info = self.manager.core.windowInfo(toplevel.window_id) orelse return;
         self.attached_window = toplevel.window_id;
         self.x_offset = x_offset;
         self.y_offset = y_offset;
@@ -224,7 +228,7 @@ const Drag = struct {
     fn tryBeginAt(self: *Drag, x: f64, y: f64) void {
         if (!self.active or self.moving) return;
         const window_id = self.attached_window orelse return;
-        const info = self.manager.xdg_shell.windowInfo(window_id) orelse return;
+        const info = self.manager.core.windowInfo(window_id) orelse return;
         if (!info.mapped) return;
         self.moving = self.manager.listener.begin(
             self.manager.listener.context,

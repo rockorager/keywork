@@ -5,7 +5,8 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Surface = @import("surface.zig");
-const XdgShell = @import("xdg_shell.zig");
+const XdgShell = @import("../XdgShell.zig");
+const MatureXdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -17,7 +18,8 @@ allocator: std.mem.Allocator,
 io: std.Io,
 exporter_global: *wl.Global,
 importer_global: *wl.Global,
-xdg_shell: *XdgShell,
+xdg_shell: *MatureXdgShell,
+core: *XdgShell,
 exports: std.ArrayList(*Exported),
 imports: std.ArrayList(*Imported),
 
@@ -26,7 +28,8 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
-    xdg_shell: *XdgShell,
+    xdg_shell: *MatureXdgShell,
+    core: *XdgShell,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -41,6 +44,7 @@ pub fn init(
         ),
         .importer_global = undefined,
         .xdg_shell = xdg_shell,
+        .core = core,
         .exports = .empty,
         .imports = .empty,
     };
@@ -169,7 +173,7 @@ const Exported = struct {
         manager: *Self,
         manager_resource: *zxdg.ExporterV2,
         id: u32,
-        toplevel: XdgShell.ToplevelInfo,
+        toplevel: MatureXdgShell.ToplevelInfo,
     ) !void {
         const resource = try zxdg.ExportedV2.create(
             manager_resource.getClient(),
@@ -312,7 +316,7 @@ const Imported = struct {
             self.invalidate();
             return;
         };
-        self.manager.xdg_shell.setForeignParent(
+        self.manager.core.setForeignParent(
             child_surface_id,
             parent_id,
             self,
@@ -331,12 +335,12 @@ const Imported = struct {
     fn invalidate(self: *Imported) void {
         if (self.exported == null) return;
         self.exported = null;
-        self.manager.xdg_shell.clearForeignParents(self);
+        self.manager.core.clearForeignParents(self);
         self.resource.sendDestroyed();
     }
 
     fn handleDestroy(_: *zxdg.ImportedV2, self: *Imported) void {
-        self.manager.xdg_shell.clearForeignParents(self);
+        self.manager.core.clearForeignParents(self);
         for (self.manager.imports.items, 0..) |imported, index| {
             if (imported != self) continue;
             _ = self.manager.imports.orderedRemove(index);

@@ -10,6 +10,7 @@ const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
+const NeutralXdgShell = @import("XdgShell.zig");
 const GtkShell = @import("wayland/gtk_shell.zig");
 const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
@@ -211,6 +212,7 @@ idle_notify_initialized: bool,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
+xdg_shell_core: NeutralXdgShell,
 xdg_shell: XdgShell,
 gtk_shell: GtkShell,
 xdg_foreign: XdgForeign,
@@ -1029,6 +1031,7 @@ pub fn createWithVirtualOutput(
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
+        .xdg_shell_core = undefined,
         .xdg_shell = undefined,
         .gtk_shell = undefined,
         .xdg_foreign = undefined,
@@ -1436,19 +1439,30 @@ pub fn createWithVirtualOutput(
     }
     try self.gtk_shell.init(allocator, display, &self.seat);
     errdefer self.gtk_shell.deinit();
+    self.xdg_shell_core = NeutralXdgShell.init(
+        allocator,
+        &self.scene,
+        .{
+            .context = self,
+            .subtree_geometry = xdgSubtreeGeometry,
+            .surface_size = xdgSurfaceSize,
+            .popup_output_bounds = xdgPopupOutputBounds,
+        },
+        render_output.protocol_id,
+    );
+    errdefer self.xdg_shell_core.deinit();
     try self.xdg_shell.init(
         allocator,
         display,
+        &self.xdg_shell_core,
+        &self.mature_clients,
         self.compositor.surfaceStore(),
-        &self.subcompositor,
-        &self.scene,
         &self.seat,
         &self.outputs,
-        render_output.protocol_id,
         &self.gtk_shell,
     );
     errdefer self.xdg_shell.deinit();
-    try self.xdg_foreign.init(allocator, io, display, &self.xdg_shell);
+    try self.xdg_foreign.init(allocator, io, display, &self.xdg_shell, &self.xdg_shell_core);
     errdefer self.xdg_foreign.deinit();
     try self.layer_shell.init(
         allocator,
@@ -1458,6 +1472,7 @@ pub fn createWithVirtualOutput(
         &self.scene,
         &self.seat,
         &self.xdg_shell,
+        &self.xdg_shell_core,
         self.compositor.surfaceStore(),
     );
     self.layer_shell_initialized = true;
@@ -1546,7 +1561,7 @@ pub fn createWithVirtualOutput(
         &self.seat,
         render_output.protocol_id,
         &self.scene,
-        &self.xdg_shell,
+        &self.xdg_shell_core,
         .{
             .context = self,
             .window_info = xwaylandWindowInfo,
@@ -1588,6 +1603,7 @@ pub fn createWithVirtualOutput(
         display,
         &self.data_device,
         &self.xdg_shell,
+        &self.xdg_shell_core,
         &self.seat,
         .{
             .context = self,
@@ -1597,19 +1613,20 @@ pub fn createWithVirtualOutput(
         },
     );
     errdefer self.xdg_toplevel_drag.deinit();
-    try self.xdg_toplevel_icon.init(allocator, display, &self.xdg_shell);
+    try self.xdg_toplevel_icon.init(allocator, display, &self.xdg_shell, &self.xdg_shell_core);
     errdefer self.xdg_toplevel_icon.deinit();
-    try self.xdg_dialog.init(allocator, display, &self.xdg_shell);
+    try self.xdg_dialog.init(allocator, display, &self.xdg_shell_core, &self.xdg_shell);
     errdefer self.xdg_dialog.deinit();
     try self.xdg_system_bell.init(display);
     errdefer self.xdg_system_bell.deinit();
-    try self.xdg_toplevel_tag.init(display, &self.xdg_shell);
+    try self.xdg_toplevel_tag.init(display, &self.xdg_shell, &self.xdg_shell_core);
     errdefer self.xdg_toplevel_tag.deinit();
     try self.xdg_session_management.init(
         allocator,
         io,
         display,
         &self.xdg_shell,
+        &self.xdg_shell_core,
         &self.window_manager,
     );
     errdefer self.xdg_session_management.deinit();
@@ -1622,7 +1639,8 @@ pub fn createWithVirtualOutput(
         allocator,
         display,
         &self.security_context,
-        &self.xdg_shell,
+        &self.mature_clients,
+        &self.xdg_shell_core,
         .{
             .context = self,
             .window_info = xwaylandWindowInfo,
@@ -1645,7 +1663,7 @@ pub fn createWithVirtualOutput(
         &self.security_context,
         &self.outputs,
         &self.foreign_toplevel_list,
-        &self.xdg_shell,
+        &self.xdg_shell_core,
     );
     self.image_capture_source_initialized = true;
     errdefer {
@@ -1919,6 +1937,7 @@ pub fn destroy(self: *Self) void {
     self.layer_shell_initialized = false;
     self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
+    self.xdg_shell_core.deinit();
     self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
@@ -2377,6 +2396,48 @@ fn findProtocolRenderOutput(self: *Self, output_id: OutputLayout.Id) ?*RenderOut
     return null;
 }
 
+fn xdgSubtreeGeometry(context: *anyopaque, id: SurfaceRegistry.Id) ?NeutralXdgShell.Geometry {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const bounds = self.subcompositor.treeBounds(id) orelse return null;
+    return .{
+        .x = bounds.x,
+        .y = bounds.y,
+        .width = @intCast(bounds.width),
+        .height = @intCast(bounds.height),
+    };
+}
+
+fn xdgSurfaceSize(context: *anyopaque, id: SurfaceRegistry.Id) ?render.Size {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return (self.surface_registry.renderState(id) orelse return null).logical_size;
+}
+
+fn xdgPopupOutputBounds(
+    context: *anyopaque,
+    parent_position: Scene.Position,
+    parent_size: render.Size,
+    default_output: OutputLayout.Id,
+) ?render.Rect {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const parent_rect: render.Rect = .{
+        .x = parent_position.x,
+        .y = parent_position.y,
+        .width = parent_size.width,
+        .height = parent_size.height,
+    };
+    var selected = (self.outputs.get(default_output) orelse return null).logicalRect();
+    var selected_area: u64 = 0;
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const intersection = parent_rect.intersection(entry.output.logicalRect()) orelse continue;
+        const area = @as(u64, intersection.width) * intersection.height;
+        if (area <= selected_area) continue;
+        selected = entry.output.logicalRect();
+        selected_area = area;
+    }
+    return selected;
+}
+
 fn outputPowerState(context: *anyopaque, output_id: OutputLayout.Id) ?bool {
     const self: *Self = @ptrCast(@alignCast(context));
     const render_output = self.findProtocolRenderOutput(output_id) orelse return null;
@@ -2591,7 +2652,7 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
         self.primary_render_output = entry.id;
         const replacement = entry.value.*;
         self.fractional_scale.setDefaultOutput(replacement.protocol_id);
-        self.xdg_shell.setDefaultOutput(replacement.protocol_id);
+        self.xdg_shell_core.setDefaultOutput(replacement.protocol_id);
         self.layer_shell.setDefaultOutput(replacement.protocol_id);
         self.window_manager.setDefaultOutput(replacement.protocol_id);
         self.native_input.retarget(replacement.backend.size(), nativeInputListener(replacement));
@@ -4847,7 +4908,7 @@ fn workspaceTransitionPublished(context: *anyopaque, output_id: OutputLayout.Id)
 
 fn geometryTransitionPrepare(context: *anyopaque, transition: WindowManager.GeometryTransition) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.reduced_motion or self.xdg_shell.hasPopupGrab()) return;
+    if (self.reduced_motion or self.xdg_shell_core.hasPopupGrab()) return;
     if (self.window_transitions.items.len == maximum_window_transitions and
         transitionIndex(self, transition.scene_id) == null) return;
     const current_buffer = Surface.currentBuffer(
@@ -5072,7 +5133,7 @@ fn geometryTransitionAppeared(
     appearance: WindowManager.GeometryAppearance,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) return;
+    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell_core.hasPopupGrab()) return;
     if (transitionIndex(self, appearance.scene_id)) |index| destroyWindowTransition(self, index);
     if (self.window_transitions.items.len == maximum_window_transitions) return;
     const target_rect = animationRect(appearance.target_rect);
@@ -5119,7 +5180,7 @@ fn geometryTransitionClosing(
     closure: WindowManager.GeometryAppearance,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell.hasPopupGrab()) return;
+    if (self.reduced_motion or self.session_lock.isLocked() or self.xdg_shell_core.hasPopupGrab()) return;
     if (windowTransitionHasPopup(self, closure.scene_id)) return;
     const window = self.sceneWindow(closure.scene_id) orelse return;
     if (transitionIndex(self, closure.scene_id)) |index| destroyWindowTransition(self, index);
@@ -5692,7 +5753,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     self.tablet.cancelFocus();
     self.cancelSeatTouches(&self.seat);
     self.seat.suppressPointerFocus(true);
-    self.xdg_shell.dismissPopupGrab();
+    self.xdg_shell_core.dismissPopupGrab();
     if (locked) {
         self.virtual_keyboard.setInhibited(true);
         self.input_method.setInhibited(true);
@@ -6492,7 +6553,7 @@ fn routeTouchDown(
             requestRepaint(self);
         } else {
             self.window_manager.pointerButton(null, .pressed);
-            if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
+            if (self.xdg_shell_core.hasPopupGrab()) self.xdg_shell_core.dismissPopupGrab();
         }
     }
     seat.touchDown(time, protocol_id, point.x, point.y, focus) catch {
@@ -6668,7 +6729,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     }
     self.seat.pointerEnter(point.x, point.y, route.focus);
     if (self.seat.implicitPointerGrabActive()) return;
-    if (!self.xdg_shell.hasPopupGrab()) {
+    if (!self.xdg_shell_core.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, point.x, point.y);
     } else {
@@ -6765,7 +6826,7 @@ fn pointerMotionGlobalForSeat(
         route.focus,
     );
     if (seat.implicitPointerGrabActive()) return;
-    if (!self.xdg_shell.hasPopupGrab()) {
+    if (!self.xdg_shell_core.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, motion.point.x, motion.point.y);
     } else {
@@ -7071,7 +7132,7 @@ fn pointerButtonForSeat(
         .{ .focus = null, .root = null };
     const root = route.root;
     if (seat == &self.seat and button == linux_button_left and state == .pressed and
-        !seat.hasPressedPointerButtons() and !self.xdg_shell.hasPopupGrab())
+        !seat.hasPressedPointerButtons() and !self.xdg_shell_core.hasPopupGrab())
     {
         if (seat.pointerPosition()) |position| {
             const modifier_move = seat.effectiveModifiers() & Config.super != 0 and
@@ -7110,10 +7171,10 @@ fn pointerButtonForSeat(
         }
         requestRepaint(self);
     }
-    if (seat == &self.seat and state == .pressed and self.xdg_shell.hasPopupGrab() and
+    if (seat == &self.seat and state == .pressed and self.xdg_shell_core.hasPopupGrab() and
         seat.pointerFocusedSurface() == null)
     {
-        self.xdg_shell.dismissPopupGrab();
+        self.xdg_shell_core.dismissPopupGrab();
         return;
     }
     const grab_ended = seat.pointerButton(time, button, state) catch {
@@ -7158,7 +7219,7 @@ fn updateResizeCursor(self: *Self, root: ?Surface.Id, x: f64, y: f64) void {
 
 fn xdgToplevelDragBegin(
     context: *anyopaque,
-    window_id: XdgShell.WindowId,
+    window_id: NeutralXdgShell.WindowId,
     pointer_x: f64,
     pointer_y: f64,
     x_offset: i32,
@@ -7202,7 +7263,7 @@ fn restoreSeatPointerFocus(self: *Self, seat: *Seat) void {
         if (seat == &self.seat) route.focus else maturePointerFocus(route.focus),
     );
     if (seat != &self.seat or self.session_lock.isLocked()) return;
-    if (!self.xdg_shell.hasPopupGrab()) {
+    if (!self.xdg_shell_core.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, position.x, position.y);
     }
@@ -7328,7 +7389,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         requestRepaint(self);
     } else {
         self.window_manager.pointerButton(null, .pressed);
-        if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
+        if (self.xdg_shell_core.hasPopupGrab()) self.xdg_shell_core.dismissPopupGrab();
     }
     self.seat.touchDown(time, id, point.x, point.y, focus) catch {
         log.err("failed to store touch point", .{});
@@ -7427,13 +7488,17 @@ fn pointerRouteExcluding(
     };
     if (route.focus != null and route.focus.?.generated == null) {
         const candidate = route.focus.?;
-        if (self.xdg_shell.hasPopupGrab() and
-            !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id))
+        const candidate_client = if (Surface.resourceFor(
+            self.compositor.surfaceStore(),
+            candidate.surface_id,
+        )) |surface| self.mature_clients.id(surface.getClient()) else null;
+        if (self.xdg_shell_core.hasPopupGrab() and
+            !self.xdg_shell_core.popupGrabOwnsClient(candidate_client))
         {
             route.focus = null;
             route.root = null;
         }
-    } else if (route.generated != null and self.xdg_shell.hasPopupGrab()) {
+    } else if (route.generated != null and self.xdg_shell_core.hasPopupGrab()) {
         route.generated = null;
         route.focus = null;
     } else if (route.generated != null) {
@@ -8895,7 +8960,7 @@ const ToplevelCaptureError = Renderer.Error || error{Stopped};
 
 fn captureToplevel(
     self: *Self,
-    window_id: XdgShell.WindowId,
+    window_id: NeutralXdgShell.WindowId,
     pixel_buffer: render.PixelBuffer,
 ) ToplevelCaptureError!?std.posix.fd_t {
     const completion = try self.captureToplevelTarget(window_id, .{ .pixels = pixel_buffer });
@@ -8904,12 +8969,12 @@ fn captureToplevel(
 
 fn captureToplevelTarget(
     self: *Self,
-    window_id: XdgShell.WindowId,
+    window_id: NeutralXdgShell.WindowId,
     render_target: render.Target,
 ) ToplevelCaptureError!Renderer.FrameCompletion {
-    const info = self.xdg_shell.windowInfo(window_id) orelse return error.Stopped;
+    const info = self.xdg_shell_core.windowInfo(window_id) orelse return error.Stopped;
     if (!info.mapped) return error.Stopped;
-    const surface_id = self.xdg_shell.windowSurface(window_id) orelse return error.Stopped;
+    const surface_id = self.xdg_shell_core.windowSurface(window_id) orelse return error.Stopped;
     const position = self.scene.surfacePosition(surface_id) orelse return error.Stopped;
     const bounds = self.toplevelCaptureBounds(window_id) orelse return error.Stopped;
     if (!std.meta.eql(render_target.size(), render.Size{
@@ -8964,10 +9029,10 @@ fn firstRenderOutput(self: *Self) ?*RenderOutput {
     return entry.value.*;
 }
 
-fn toplevelCaptureBounds(self: *Self, window_id: XdgShell.WindowId) ?render.Rect {
-    const info = self.xdg_shell.windowInfo(window_id) orelse return null;
+fn toplevelCaptureBounds(self: *Self, window_id: NeutralXdgShell.WindowId) ?render.Rect {
+    const info = self.xdg_shell_core.windowInfo(window_id) orelse return null;
     if (!info.mapped) return null;
-    const surface_id = self.xdg_shell.windowSurface(window_id) orelse return null;
+    const surface_id = self.xdg_shell_core.windowSurface(window_id) orelse return null;
     const position = self.scene.surfacePosition(surface_id) orelse return null;
     var bounds: ?render.Rect = null;
     self.addSurfaceTreeBounds(surface_id, position.x, position.y, &bounds) catch return null;
@@ -9113,7 +9178,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     const render_start_nanoseconds = nowNanoseconds(self.io);
     self.animation_now = render_start_nanoseconds;
     if (self.reduced_motion or self.session_lock.isLocked() or
-        self.xdg_shell.hasPopupGrab() or self.window_manager.directManipulationActive())
+        self.xdg_shell_core.hasPopupGrab() or self.window_manager.directManipulationActive())
     {
         finishAllWindowTransitions(self);
         finishAllWorkspaceTransitions(self);
@@ -9795,8 +9860,8 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
     if (retain_generated and self.seat.retainGeneratedKeyboardFocus(default_focus) != null) {
         if (generatedFocusPolicyAllows(
             false,
-            self.xdg_shell.hasPopupGrab(),
-            self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
+            self.xdg_shell_core.hasPopupGrab(),
+            self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
             self.xwayland_override_redirect_focus != null,
         )) {
             self.syncXwaylandFocus(null);
@@ -9809,7 +9874,7 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
 
 fn maturePolicyKeyboardFocus(self: *Self) ?Surface.Id {
     return self.layer_shell.keyboardFocus(
-        self.xdg_shell.popupKeyboardFocus(),
+        self.xdg_shell_core.popupKeyboardFocus(),
     ) orelse
         self.xwayland_override_redirect_focus orelse
         self.window_manager.focusedSurface() orelse self.scene.focusedSurface();
@@ -9823,8 +9888,8 @@ fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return false;
     if (!generatedFocusPolicyAllows(
         self.session_lock.isLocked(),
-        self.xdg_shell.hasPopupGrab(),
-        self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
+        self.xdg_shell_core.hasPopupGrab(),
+        self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
         self.xwayland_override_redirect_focus != null,
     )) return false;
     const root = self.headless_surface_forest.compoundRoot(requested_root) orelse return false;

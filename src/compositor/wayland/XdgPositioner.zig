@@ -4,13 +4,14 @@ const XdgPositioner = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const popup_placement = @import("xdg_popup_placement.zig");
+const popup_placement = @import("../xdg_popup_placement.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
 
 allocator: std.mem.Allocator,
 rules: popup_placement.Rules,
+parent_configure: ?u32 = null,
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -61,14 +62,14 @@ fn handleRequest(
                 resource.postError(.invalid_input, "invalid positioner anchor");
                 return;
             }
-            positioner.rules.anchor = set.anchor;
+            positioner.rules.anchor = @enumFromInt(@intFromEnum(set.anchor));
         },
         .set_gravity => |set| {
             if (!validGravity(set.gravity)) {
                 resource.postError(.invalid_input, "invalid positioner gravity");
                 return;
             }
-            positioner.rules.gravity = set.gravity;
+            positioner.rules.gravity = @enumFromInt(@intFromEnum(set.gravity));
         },
         .set_constraint_adjustment => |set| {
             const adjustment: u32 = @bitCast(set.constraint_adjustment);
@@ -76,11 +77,11 @@ fn handleRequest(
                 resource.postError(.invalid_input, "invalid constraint adjustment");
                 return;
             }
-            positioner.rules.adjustment = set.constraint_adjustment;
+            positioner.rules.adjustment = @bitCast(set.constraint_adjustment);
         },
         .set_offset => |set| positioner.rules.offset = .{ .x = set.x, .y = set.y },
         .set_reactive => positioner.rules.reactive = true,
-        .set_parent_configure => |set| positioner.rules.parent_configure = set.serial,
+        .set_parent_configure => |set| positioner.parent_configure = set.serial,
         .set_parent_size => |set| {
             if (set.parent_width <= 0 or set.parent_height <= 0) {
                 resource.postError(.invalid_input, "parent size must be positive");

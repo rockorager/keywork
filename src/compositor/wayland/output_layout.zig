@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const slot_map = @import("../slot_map.zig");
+const NeutralOutputLayout = @import("../output_layout.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Output = @import("output.zig");
 const Surface = @import("surface.zig");
@@ -19,8 +20,8 @@ outputs: Store,
 listener: ?Listener,
 notifying_listener: bool,
 
-const Store = slot_map.SlotMap(*Output, enum { output });
-pub const Id = Store.Id;
+const Store = slot_map.SlotMap(*Output, NeutralOutputLayout.IdentityTag);
+pub const Id = NeutralOutputLayout.Id;
 
 pub const Config = Output.Config;
 

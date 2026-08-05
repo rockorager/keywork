@@ -1,11 +1,32 @@
-//! Pure xdg-positioner popup placement and constraint adjustment policy.
+//! Protocol-neutral XDG popup placement and constraint adjustment policy.
 
 const std = @import("std");
-const wayland = @import("wayland");
-const render = @import("../render/types.zig");
-const Scene = @import("../scene.zig");
+const render = @import("render/types.zig");
+const Scene = @import("scene.zig");
 
-const xdg = wayland.server.xdg;
+pub const Anchor = enum {
+    none,
+    top,
+    bottom,
+    left,
+    right,
+    top_left,
+    bottom_left,
+    top_right,
+    bottom_right,
+};
+
+pub const Gravity = Anchor;
+
+pub const ConstraintAdjustment = packed struct(u32) {
+    slide_x: bool = false,
+    slide_y: bool = false,
+    flip_x: bool = false,
+    flip_y: bool = false,
+    resize_x: bool = false,
+    resize_y: bool = false,
+    _padding: u26 = 0,
+};
 
 pub const Size = struct {
     width: i32,
@@ -22,13 +43,12 @@ pub const AnchorRect = struct {
 pub const Rules = struct {
     size: ?Size = null,
     anchor_rect: ?AnchorRect = null,
-    anchor: xdg.Positioner.Anchor = .none,
-    gravity: xdg.Positioner.Gravity = .none,
-    adjustment: xdg.Positioner.ConstraintAdjustment = .{},
+    anchor: Anchor = .none,
+    gravity: Gravity = .none,
+    adjustment: ConstraintAdjustment = .{},
     offset: Scene.Position = .{},
     reactive: bool = false,
     parent_size: ?Size = null,
-    parent_configure: ?u32 = null,
 
     pub fn complete(self: Rules) bool {
         const size = self.size orelse return false;
@@ -147,10 +167,10 @@ fn popupPosition(rules: Rules, flip_x: bool, flip_y: bool) Position64 {
 }
 
 fn flipAnchor(
-    anchor: xdg.Positioner.Anchor,
+    anchor: Anchor,
     flip_x: bool,
     flip_y: bool,
-) xdg.Positioner.Anchor {
+) Anchor {
     var result = anchor;
     if (flip_x) result = switch (result) {
         .left => .right,
@@ -174,10 +194,10 @@ fn flipAnchor(
 }
 
 fn flipGravity(
-    gravity: xdg.Positioner.Gravity,
+    gravity: Gravity,
     flip_x: bool,
     flip_y: bool,
-) xdg.Positioner.Gravity {
+) Gravity {
     var result = gravity;
     if (flip_x) result = switch (result) {
         .left => .right,
