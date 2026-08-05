@@ -20,7 +20,9 @@ const render = @import("../render/types.zig");
 const server = wayring.server;
 const wire = wayring.wire;
 const Shm = server.shm.Protocol(core);
-const compositor_version = 5;
+const compositor_version = 6;
+const preferred_buffer_scale_event_opcode = 2;
+const preferred_buffer_transform_event_opcode = 3;
 
 pub const SurfaceId = SurfaceRegistry.Id;
 
@@ -404,6 +406,42 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
     // materialization only replaces that reservation and cannot allocate.
     client.materialize(&surface.resource.runtime) catch unreachable;
     objects.surfaces.appendAssumeCapacity(surface);
+    sendInitialSurfacePreferences(client, surface);
+}
+
+fn sendInitialSurfacePreferences(
+    client: *server.Client,
+    surface: *Surface,
+) void {
+    const scale_event = core.wl_surface.event_messages[preferred_buffer_scale_event_opcode];
+    const transform_event = core.wl_surface.event_messages[preferred_buffer_transform_event_opcode];
+    std.debug.assert(scale_event.since == compositor_version);
+    std.debug.assert(transform_event.since == compositor_version);
+    if (surface.resource.version() < scale_event.since) return;
+
+    // The object is already materialized and published in the per-client list.
+    // A queue failure terminalizes the client while preserving that ownership;
+    // normal client teardown then removes the listener, provider, and resource.
+    core.wl_surface.@"send:preferred_buffer_scale"(&surface.resource, 1) catch |err| {
+        classifyPreferenceEventFailure(client, &surface.resource.runtime, err);
+        return;
+    };
+    core.wl_surface.@"send:preferred_buffer_transform"(
+        &surface.resource,
+        @intCast(core.wl_output.transform.normal),
+    ) catch |err| classifyPreferenceEventFailure(client, &surface.resource.runtime, err);
+}
+
+fn classifyPreferenceEventFailure(
+    client: *server.Client,
+    resource: *server.Resource,
+    err: anyerror,
+) void {
+    switch (err) {
+        error.OutOfMemory, error.WriteFailed => client.postOutOfMemory(resource, "queueing initial wl_surface preferences"),
+        error.OutputSealed, error.ClientFatal => {},
+        else => client.postImplementationError(resource, "queueing initial wl_surface preferences"),
+    }
 }
 
 fn createRegion(self: *WayringCompositor, compositor: *core.wl_compositor.Resource, object_id: u32) !void {
@@ -1063,6 +1101,24 @@ fn expectDeleteIds(bytes: []const u8, ids: []const u32) !void {
     }
 }
 
+fn expectInitialSurfacePreferences(bytes: []const u8, surface_id: u32) !void {
+    try std.testing.expectEqual(@as(usize, 24), bytes.len);
+    try std.testing.expectEqual(surface_id, word(bytes, 0));
+    try std.testing.expectEqual(
+        @as(u16, preferred_buffer_scale_event_opcode),
+        @as(u16, @truncate(word(bytes, 4))),
+    );
+    try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(bytes, 4) >> 16)));
+    try std.testing.expectEqual(@as(u32, 1), word(bytes, 8));
+    try std.testing.expectEqual(surface_id, word(bytes, 12));
+    try std.testing.expectEqual(
+        @as(u16, preferred_buffer_transform_event_opcode),
+        @as(u16, @truncate(word(bytes, 16))),
+    );
+    try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(bytes, 16) >> 16)));
+    try std.testing.expectEqual(@as(u32, @intCast(core.wl_output.transform.normal)), word(bytes, 20));
+}
+
 fn bindCompositor(client: *server.Client, compositor_id: u32) !void {
     try bindCompositorVersion(client, compositor_id, 1);
 }
@@ -1371,7 +1427,25 @@ const TestPresentationListener = struct {
     }
 };
 
-test "production wl_compositor advertises v5 and bound children inherit v5" {
+test "generated preferred buffer event descriptors preserve core wire metadata" {
+    const scale = core.wl_surface.event_messages[preferred_buffer_scale_event_opcode];
+    try std.testing.expectEqualStrings("preferred_buffer_scale", scale.name);
+    try std.testing.expectEqual(@as(u32, 6), scale.since);
+    try std.testing.expect(!scale.destructor);
+    try std.testing.expectEqual(@as(usize, 1), scale.arguments.len);
+    try std.testing.expectEqualStrings("factor", scale.arguments[0].name);
+    try std.testing.expectEqual(.int, std.meta.activeTag(scale.arguments[0].kind));
+
+    const transform = core.wl_surface.event_messages[preferred_buffer_transform_event_opcode];
+    try std.testing.expectEqualStrings("preferred_buffer_transform", transform.name);
+    try std.testing.expectEqual(@as(u32, 6), transform.since);
+    try std.testing.expect(!transform.destructor);
+    try std.testing.expectEqual(@as(usize, 1), transform.arguments.len);
+    try std.testing.expectEqualStrings("transform", transform.arguments[0].name);
+    try std.testing.expectEqual(.uint, std.meta.activeTag(transform.arguments[0].kind));
+}
+
+test "production wl_compositor advertises exactly v6 and bound children inherit v6" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var surface_registry = SurfaceRegistry.init(std.testing.allocator);
@@ -1379,7 +1453,7 @@ test "production wl_compositor advertises v5 and bound children inherit v5" {
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &surface_registry, null);
     defer compositor.deinit();
-    try std.testing.expectEqual(@as(u32, 5), compositor.global.version());
+    try std.testing.expectEqual(@as(u32, 6), compositor.global.version());
     try std.testing.expectEqualStrings("wl_compositor", compositor.global.interface().name);
 
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
@@ -1388,15 +1462,184 @@ test "production wl_compositor advertises v5 and bound children inherit v5" {
         compositor.destroyClientResources(client);
         managed.destroy();
     }
-    try bindCompositorVersion(client, 3, 5);
+    try bindCompositorVersion(client, 3, 6);
     try createSurfaceResource(client, 3, 4);
     try createRegionResource(client, 3, 5);
 
     const objects = compositor.findClient(client).?;
-    try std.testing.expectEqual(@as(u32, 5), objects.compositors.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 5), objects.surfaces.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 5), objects.regions.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 6), objects.compositors.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 6), objects.surfaces.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 6), objects.regions.items[0].resource.version());
+    const preferences = try drain(client);
+    defer std.testing.allocator.free(preferences);
+    try expectInitialSurfacePreferences(preferences, 4);
     try std.testing.expect(client.fatal() == null);
+}
+
+test "only v6 surfaces receive one ordered fixed preference pair" {
+    const Case = struct {
+        fn run(version: u32) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+            defer compositor.deinit();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositorVersion(client, 3, version);
+            try createSurfaceResource(client, 3, 4);
+            try createRegionResource(client, 3, 5);
+            const objects = compositor.findClient(client).?;
+            try std.testing.expectEqual(version, objects.compositors.items[0].resource.version());
+            try std.testing.expectEqual(version, objects.surfaces.items[0].resource.version());
+            try std.testing.expectEqual(version, objects.regions.items[0].resource.version());
+
+            const events = try drain(client);
+            defer std.testing.allocator.free(events);
+            if (version < compositor_version) {
+                try std.testing.expectEqual(@as(usize, 0), events.len);
+            } else {
+                try expectInitialSurfacePreferences(events, 4);
+            }
+            try std.testing.expect(client.fatal() == null);
+        }
+    };
+
+    for (1..compositor_version + 1) |version| try Case.run(@intCast(version));
+}
+
+test "initial preference enqueue failures preserve live new id until terminal cleanup" {
+    const Outcome = enum { unrelated, scale_enqueue, transform_enqueue };
+    const Case = struct {
+        fn run(fail_offset: usize) !Outcome {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const managed = try server.CoreClient.create(client_allocator.allocator(), &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositorVersion(client, 3, compositor_version);
+            const create = try encode(
+                3,
+                0,
+                &core.wl_compositor.request_messages[0],
+                &.{.{ .new_id = .{ .typed = 4 } }},
+            );
+            defer std.testing.allocator.free(create);
+            try client.receive(create, &.{});
+            client_allocator.fail_index = client_allocator.alloc_index + fail_offset;
+            try client.dispatch();
+
+            const fatal = client.fatal() orelse return .unrelated;
+            if (!std.mem.eql(u8, fatal.detail(), "queueing initial wl_surface preferences"))
+                return .unrelated;
+            try std.testing.expect(client_allocator.has_induced_failure);
+            try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, fatal.kind);
+            try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
+            try std.testing.expectEqual(@as(usize, 1), surface_registry.len());
+            try std.testing.expectEqual(@as(usize, 1), listener_state.added_count);
+            try std.testing.expectEqual(@as(usize, 0), listener_state.removing_count);
+            try std.testing.expect(client.lookup(4) != null);
+            try std.testing.expect(compositor.surfaceId(client, 4) != null);
+
+            const output = try drain(client);
+            defer std.testing.allocator.free(output);
+            const outcome: Outcome = if (word(output, 0) == 4) .transform_enqueue else .scale_enqueue;
+            switch (outcome) {
+                .scale_enqueue => try std.testing.expectEqual(@as(u32, 1), word(output, 0)),
+                .transform_enqueue => {
+                    try std.testing.expect(output.len > 12);
+                    try std.testing.expectEqual(
+                        @as(u16, preferred_buffer_scale_event_opcode),
+                        @as(u16, @truncate(word(output, 4))),
+                    );
+                    try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(output, 4) >> 16)));
+                    try std.testing.expectEqual(@as(u32, 1), word(output, 8));
+                    try std.testing.expectEqual(@as(u32, 1), word(output, 12));
+                },
+                .unrelated => unreachable,
+            }
+
+            compositor.destroyClientResources(client);
+            try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+            try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
+            try std.testing.expectEqual(@as(usize, 1), listener_state.removing_count);
+            try std.testing.expect(client.lookup(4) == null);
+            return outcome;
+        }
+    };
+
+    var found_scale_failure = false;
+    var found_transform_failure = false;
+    for (0..32) |fail_offset| {
+        switch (try Case.run(fail_offset)) {
+            .unrelated => {},
+            .scale_enqueue => found_scale_failure = true,
+            .transform_enqueue => found_transform_failure = true,
+        }
+        if (found_scale_failure and found_transform_failure) break;
+    }
+    try std.testing.expect(found_scale_failure);
+    try std.testing.expect(found_transform_failure);
+}
+
+test "v6 explicit and disconnect teardown emit no duplicate preferences" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, compositor_version);
+    try createSurfaceResource(client, 3, 4);
+    try createRegionResource(client, 3, 5);
+    const preferences = try drain(client);
+    defer std.testing.allocator.free(preferences);
+    try expectInitialSurfacePreferences(preferences, 4);
+
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    const explicit_teardown = try drain(client);
+    defer std.testing.allocator.free(explicit_teardown);
+    try expectDeleteIds(explicit_teardown, &.{4});
+    try std.testing.expectEqual(@as(usize, 1), listener_state.removing_count);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 1), compositor.regionCount());
+
+    compositor.destroyClientResources(client);
+    const disconnect_teardown = try drain(client);
+    defer std.testing.allocator.free(disconnect_teardown);
+    try expectDeleteIds(disconnect_teardown, &.{ 5, 3 });
+    try std.testing.expectEqual(@as(usize, 1), listener_state.removing_count);
+    try std.testing.expectEqual(@as(usize, 0), compositor.regionCount());
+    try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
 }
 
 test "v1 runtime since gate rejects set_buffer_transform before adapter mutation" {
