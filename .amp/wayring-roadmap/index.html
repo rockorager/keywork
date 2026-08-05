@@ -97,12 +97,12 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>e9587592</code> on <code>wayring</code> · Updated 2026-08-05 · Exact Content Update engine integrated; subsurface protocol remains unadvertised.</p>
+    <p class="meta">Current migration implementation: <code>37cf14f9</code> on <code>wayring</code> · Updated 2026-08-05 · Complete direct subsurface semantics integrated; production <code>wl_subcompositor</code> remains unadvertised pending real-client acceptance.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
     <div class="metric"><strong>2</strong><span>active phase</span></div>
-    <div class="metric"><strong>14</strong><span>Phase 2 waves integrated</span></div>
+    <div class="metric"><strong>15</strong><span>Phase 2 waves integrated</span></div>
     <div class="metric"><strong>PASS</strong><span>honest v1 gate</span></div>
     <div class="metric"><strong>Debug</strong><span>validation profile</span></div>
   </section>
@@ -119,7 +119,7 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:88%"></span></div>
+    <div class="bar"><span style="width:94%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 2 — Honest core surfaces and subsurfaces</h2><p class="detail">Complete core compositor semantics, then add synchronized topology without migrating mature subsurfaces.</p></div>
       <span class="status active">In progress</span>
@@ -136,8 +136,8 @@
     <div class="wave"><span class="wave-label">Wave 3E</span><div><h3>Fixed default preferences v6</h3><p class="detail">Ordered initial preferred scale 1 and normal-transform events, negotiated-version isolation, enqueue-failure teardown, and real-client proof. v7 explicit release remains deferred.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 4A</span><div><h3>Neutral applied topology</h3><p class="detail">Canonical compound trees, allocation-free applied batches, iterative render traversal, conservative old/new damage, and exact per-node sampled completion. No new protocol global.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 4B</span><div><h3>Wayland 1.26 Content Update engine</h3><p class="detail">Exact queued SCU/DCU dependencies, single-owner child-tail claims, projected queued state, callback association, rollback, and one atomic closure batch while roots remain immediate.</p></div><span class="status done">Integrated</span></div>
-    <div class="wave"><span class="wave-label">Wave 4C</span><div><h3>Generated subsurface adapter semantics</h3><p class="detail">In progress: complete roles, resources, synchronization, positioning, stacking, validation, destruction, and direct scanner fault coverage without production advertisement.</p></div><span class="status active">In progress</span></div>
-    <div class="wave"><span class="wave-label">Wave 4D</span><div><h3>Real-client acceptance and v1 advertisement</h3><p class="detail">Nested libwayland E2E and final <code>wl_subcompositor</code> v1 global publication. Canonical <code>WAYLAND_DISPLAY</code> remains mature libwayland.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">Wave 4C</span><div><h3>Generated subsurface adapter semantics</h3><p class="detail">Heap-stable v1 resources, permanent and active role lifecycles, exact generated request errors, transactional stacking and synchronization, stale-association filtering, teardown, and direct scanner fault coverage without production advertisement.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 4D</span><div><h3>Real-client acceptance and v1 advertisement</h3><p class="detail">In progress: nested libwayland E2E and final <code>wl_subcompositor</code> v1 global publication. Canonical <code>WAYLAND_DISPLAY</code> remains mature libwayland.</p></div><span class="status active">In progress</span></div>
   </section>
 
   <section class="phase">
