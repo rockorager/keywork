@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keywork Wayring migration</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #151b23;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --amber: #d29922;
+      --gray: #6e7681;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1040px, calc(100% - 32px)); margin: 48px auto 80px; }
+    header { margin-bottom: 32px; }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 5vw, 44px); line-height: 1.1; }
+    h2 { margin: 0; font-size: 20px; }
+    h3 { margin: 0; font-size: 16px; }
+    p { margin: 8px 0 0; }
+    code { color: #79c0ff; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .lede, .meta, .detail { color: var(--muted); }
+    .meta { margin-top: 12px; font-size: 13px; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin: 28px 0 36px;
+    }
+    .metric, .phase {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .metric { padding: 16px; }
+    .metric strong { display: block; font-size: 24px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .phase { margin: 16px 0; overflow: hidden; }
+    .phase-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .phase-copy { padding: 0 20px; }
+    .wave {
+      display: grid;
+      grid-template-columns: 116px 1fr auto;
+      gap: 16px;
+      align-items: start;
+      padding: 16px 20px;
+      border-top: 1px solid var(--border);
+    }
+    .phase-copy + .wave { margin-top: 16px; }
+    .wave-label { color: var(--muted); font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--gray); }
+    .done::before { background: var(--green); }
+    .active::before { background: var(--blue); box-shadow: 0 0 0 4px rgb(88 166 255 / 12%); }
+    .proposed::before { background: var(--amber); }
+    .bar { height: 4px; background: #21262d; }
+    .bar > span { display: block; height: 100%; background: var(--green); }
+    .notes { margin-top: 32px; padding: 20px; border-left: 3px solid var(--blue); background: var(--panel); }
+    ul { margin: 10px 0 0; padding-left: 20px; }
+    a { color: var(--blue); }
+    @media (max-width: 720px) {
+      main { margin-top: 28px; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      .wave { grid-template-columns: 1fr; gap: 5px; }
+      .phase-head { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Keywork → Wayring</h1>
+    <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
+    <p class="meta">Current shared branch: <code>wayring</code> at <code>f570c5ea</code> · Updated 2026-08-05 · Plans after the v1 gate are intentionally provisional.</p>
+  </header>
+
+  <section class="summary" aria-label="Migration summary">
+    <div class="metric"><strong>2</strong><span>active phase</span></div>
+    <div class="metric"><strong>8</strong><span>integrated waves</span></div>
+    <div class="metric"><strong>1</strong><span>gate in review</span></div>
+    <div class="metric"><strong>Debug</strong><span>validation profile</span></div>
+  </section>
+
+  <section class="phase">
+    <div class="bar"><span style="width:100%"></span></div>
+    <div class="phase-head">
+      <div><h2>Phase 1 — Safe headless presentation path</h2><p class="detail">Establish identity, ownership, copied SHM, and production wiring before widening protocol behavior.</p></div>
+      <span class="status done">Complete</span>
+    </div>
+    <div class="wave"><span class="wave-label">Foundation</span><div><h3>Wayring host and SHM lifecycle</h3><p class="detail">Total-or-fatal host teardown, transaction-safe release, scanner/io_uring lifecycle.</p></div><span class="status done">Done</span></div>
+    <div class="wave"><span class="wave-label">Identity</span><div><h3>Canonical SurfaceRegistry IDs</h3><p class="detail">Shared generational identity and borrowed render-state provider boundary for mature and Wayring surfaces.</p></div><span class="status done">Done</span></div>
+    <div class="wave"><span class="wave-label">Presentation</span><div><h3>Headless surface layer and real-client proof</h3><p class="detail">Server-owned ordered presentation, persistent copied pixels, renderer integration, lifecycle repair.</p></div><span class="status done">Done</span></div>
+  </section>
+
+  <section class="phase">
+    <div class="bar"><span style="width:58%"></span></div>
+    <div class="phase-head">
+      <div><h2>Phase 2 — Honest core surfaces and subsurfaces</h2><p class="detail">Complete core compositor semantics, then add synchronized topology without migrating mature subsurfaces.</p></div>
+      <span class="status active">In progress</span>
+    </div>
+    <div class="wave"><span class="wave-label">Wave 0A–0D</span><div><h3>Neutral seams and corrected attach behavior</h3><p class="detail">Neutral transforms, applied forest, versioned attach offsets, and architecture documentation.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 1</span><div><h3>Atomic v1 region and surface state</h3><p class="detail">Regions, opaque/input state, full copied snapshots, and one allocation-free PreparedCommit publication seam.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 2A</span><div><h3>Adapter-owned frame callbacks</h3><p class="detail">Stable callback resources, exact commit-prefix transfer, no-done teardown, resource-free completion contract.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 2B</span><div><h3>Exact sampled-frame completion</h3><p class="detail">Canonical renderer tags, accepted-present drain, callback-only scheduling, multi-output and real-client coverage.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">v1 gate</span><div><h3>Independent honesty review</h3><p class="detail">Audit every advertised v1 request, commit atomicity, lifecycle, sampling timing, and test evidence.</p></div><span class="status active">Reviewing</span></div>
+    <div class="wave"><span class="wave-label">Wave 3</span><div><h3>Version staircase</h3><p class="detail">Proposed order: transform v2, scale v3, damage_buffer v4, offset/versioned attach v5, fixed default preferences v6. Defer v7 explicit release.</p></div><span class="status proposed">Proposed</span></div>
+    <div class="wave"><span class="wave-label">Wave 4</span><div><h3>Wayring-only subsurface adapter</h3><p class="detail">Permanent roles and lifecycle; exact synchronized commit queues and parent fences; neutral forest topology/render/damage; real-client equivalence gate.</p></div><span class="status proposed">Proposed</span></div>
+  </section>
+
+  <section class="phase">
+    <div class="bar"><span style="width:0%"></span></div>
+    <div class="phase-head">
+      <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Scope will be fixed after core surface/subsurface semantics pass their gate.</p></div>
+      <span class="status proposed">Tentative</span>
+    </div>
+    <div class="wave"><span class="wave-label">Candidate work</span><div><h3>Remaining server protocol families</h3><p class="detail">Inventory and migrate globals in dependency order while preserving the canonical libwayland socket until parity is demonstrated.</p></div><span class="status proposed">Unscoped</span></div>
+    <div class="wave"><span class="wave-label">Cutover gate</span><div><h3>Canonical WAYLAND_DISPLAY decision</h3><p class="detail">Only after lifecycle, behavior, compatibility, and real-client equivalence are independently verified.</p></div><span class="status proposed">Unscoped</span></div>
+  </section>
+
+  <section class="phase">
+    <div class="bar"><span style="width:0%"></span></div>
+    <div class="phase-head">
+      <div><h2>Phase 4 — Retire libwayland-server</h2><p class="detail">Remove the mature server dependency only after the Wayring path is canonical and rollback risk is closed.</p></div>
+      <span class="status proposed">Tentative</span>
+    </div>
+  </section>
+
+  <aside class="notes">
+    <h2>Standing constraints</h2>
+    <ul>
+      <li>Wayring stays reusable, policy-free, scanner-generated, and sans-I/O; Keywork owns event-loop, scene, render, and shell policy.</li>
+      <li>No fake libwayland surfaces, Scene frontend unions, or mature subsurface migration during Phase 2.</li>
+      <li>Debug validation only: formatting, aggregate tests, renderer checks, Wayring tests, Oracle review, then an independent gate.</li>
+      <li>Wayring client support and removal of <code>libwayland-client</code> are a separate track.</li>
+    </ul>
+  </aside>
+</main>
+</body>
+</html>

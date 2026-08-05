@@ -1,4 +1,9 @@
 services:
+  wayring-roadmap:
+    command: python3 -m http.server "$PORT" --bind 0.0.0.0 --directory .amp/wayring-roadmap
+    portal:
+      title: Wayring Migration Roadmap
+      description: Live phase, wave, validation, and gate status for the compositor migration.
   keywork-stream:
     command: scripts/run-stream-demo
     portal:
