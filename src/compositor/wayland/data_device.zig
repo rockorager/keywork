@@ -7,6 +7,8 @@ const wayland = @import("wayland");
 const Seat = @import("seat.zig");
 const SelectionSource = @import("SelectionSource.zig");
 const Surface = @import("surface.zig");
+const ClientRegistry = @import("../ClientRegistry.zig");
+const SeatAuthority = @import("../SeatAuthority.zig");
 const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;
@@ -24,7 +26,7 @@ device_adapters: std.AutoHashMapUnmanaged(DeviceId, *DeviceResource),
 offers: OfferStore,
 offer_adapters: std.AutoHashMapUnmanaged(OfferId, *OfferResource),
 selection: ?Selection,
-selection_serial: u32,
+selection_order: SeatAuthority.Order,
 selection_generation: u64,
 selection_listeners: std.ArrayList(SelectionListener),
 drag_selection_listeners: std.ArrayList(SelectionListener),
@@ -98,7 +100,7 @@ const OfferState = struct {
     external_drag_source: ?*const ExternalDragSource = null,
     kind: Kind,
     drag_generation: u64 = 0,
-    enter_serial: u32 = 0,
+    enter_serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 0 },
     active: bool = false,
     accepted: bool = false,
     destination_actions: wl.DataDeviceManager.DndAction = .{},
@@ -124,7 +126,7 @@ const DragState = struct {
     const Target = struct {
         surface_id: Surface.Id,
         client: *wl.Client,
-        enter_serial: u32,
+        enter_serial: ClientRegistry.Serial,
         x: f64,
         y: f64,
     };
@@ -250,7 +252,7 @@ pub fn init(
         .offers = .{},
         .offer_adapters = .empty,
         .selection = null,
-        .selection_serial = 0,
+        .selection_order = 0,
         .selection_generation = 0,
         .selection_listeners = .empty,
         .drag_selection_listeners = .empty,
@@ -529,7 +531,10 @@ const DeviceResource = struct {
         source_resource: ?*wl.DataSource,
         serial: u32,
     ) void {
-        if (!self.manager.seat.acceptsSelectionSerial(resource.getClient(), serial)) return;
+        const order = self.manager.seat.selectionOrder(
+            resource.getClient(),
+            serial,
+        ) orelse return;
         const source_id = if (source_resource) |source| source: {
             const data = source.getUserData() orelse return;
             const adapter: *SourceResource = @ptrCast(@alignCast(data));
@@ -551,7 +556,7 @@ const DeviceResource = struct {
             break :source adapter.id;
         } else null;
 
-        self.manager.setSelection(source_id, serial);
+        self.manager.setSelection(source_id, order);
     }
 
     fn handleDestroy(_: *wl.DataDevice, self: *DeviceResource) void {
@@ -961,7 +966,7 @@ fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
     const client = surface.getClient();
     if (drag.source == null and client != drag.source_client.?) return;
 
-    const serial = self.display.nextSerial();
+    const serial = matureSerial(self.display.nextSerial());
     self.drag.?.target = .{
         .surface_id = next.surface_id,
         .client = client,
@@ -1034,7 +1039,7 @@ fn sendCurrentDragToDevice(
         break :offer resource;
     } else null;
     device.resource.sendEnter(
-        target.enter_serial,
+        target.enter_serial.value,
         surface,
         fixed(target.x),
         fixed(target.y),
@@ -1121,7 +1126,7 @@ const OfferResource = struct {
         external_drag_source: ?*const ExternalDragSource,
         kind: OfferState.Kind,
         drag_generation: u64,
-        enter_serial: u32,
+        enter_serial: ClientRegistry.Serial,
     ) error{ OutOfMemory, ResourceCreateFailed }!*wl.DataOffer {
         const resource = try wl.DataOffer.create(client, version, 0);
         errdefer resource.destroy();
@@ -1214,7 +1219,7 @@ fn acceptOffer(
 ) void {
     const offer = self.offers.get(offer_id) orelse return;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return;
-    if (offer.active and serial != offer.enter_serial) return;
+    if (offer.active and !std.meta.eql(matureSerial(serial), offer.enter_serial)) return;
     const source = offerDragSource(offer) orelse return;
     if (!self.dragSourceAvailable(source)) return;
     const accepted = if (mime_type) |value| self.dragSourceHasMime(source, value) else false;
@@ -1415,26 +1420,26 @@ fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
     if (client) |focused| self.sendSelectionToClient(focused);
 }
 
-fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
-    if (self.selection != null and Seat.serialIsOlder(serial, self.selection_serial)) return;
+fn setSelection(self: *Self, source_id: ?SourceId, order: SeatAuthority.Order) void {
+    if (order < self.selection_order) return;
     const selection: ?Selection = if (source_id) |id| .{ .local = id } else null;
     if (std.meta.eql(self.selection, selection)) {
-        self.selection_serial = serial;
+        self.selection_order = order;
         return;
     }
-    self.replaceSelection(selection, serial, true);
+    self.replaceSelection(selection, order, true);
 }
 
 fn replaceSelection(
     self: *Self,
     selection: ?Selection,
-    serial: u32,
+    order: SeatAuthority.Order,
     cancel_old: bool,
 ) void {
     const old_source = self.selection;
     std.debug.assert(!std.meta.eql(old_source, selection));
     self.selection = selection;
-    self.selection_serial = serial;
+    self.selection_order = order;
     self.selection_generation +%= 1;
     self.invalidateOffers();
     if (self.focused_client) |client| self.sendSelectionToClient(client);
@@ -1461,7 +1466,7 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
     if (self.selection) |selection| {
         switch (selection) {
             .local => |selection_id| if (std.meta.eql(selection_id, id)) {
-                self.replaceSelection(null, self.display.nextSerial(), false);
+                self.replaceSelection(null, self.seat.nextSelectionOrder(), false);
             },
             .external => {},
         }
@@ -1557,7 +1562,7 @@ fn sendSelectionToDevice(
         null,
         .selection,
         0,
-        0,
+        matureSerial(0),
     );
     device.resource.sendDataOffer(offer);
     for (self.selectionMimeTypes()) |mime_type| offer.sendOffer(mime_type.ptr);
@@ -1618,8 +1623,12 @@ pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) 
 /// `externalSourceDestroyed`.
 pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     const selection: ?Selection = if (source) |value| .{ .external = value } else null;
-    if (std.meta.eql(self.selection, selection)) return;
-    self.replaceSelection(selection, self.display.nextSerial(), true);
+    const order = self.seat.nextSelectionOrder();
+    if (std.meta.eql(self.selection, selection)) {
+        self.selection_order = order;
+        return;
+    }
+    self.replaceSelection(selection, order, true);
 }
 
 pub fn externalSelectionIs(self: *const Self, source: *const SelectionSource) bool {
@@ -1635,7 +1644,7 @@ pub fn externalSourceDestroyed(self: *Self, source: *const SelectionSource) void
     switch (selection) {
         .local => {},
         .external => |current| if (current == source) {
-            self.replaceSelection(null, self.display.nextSerial(), false);
+            self.replaceSelection(null, self.seat.nextSelectionOrder(), false);
         },
     }
 }
@@ -1658,6 +1667,10 @@ fn action(kind: DndActionKind) wl.DataDeviceManager.DndAction {
 
 fn actionBits(value: wl.DataDeviceManager.DndAction) u32 {
     return @bitCast(value);
+}
+
+fn matureSerial(value: u32) ClientRegistry.Serial {
+    return .{ .domain = .mature_display, .value = value };
 }
 
 fn sourceActions(source: *const SourceState) wl.DataDeviceManager.DndAction {

@@ -7,6 +7,9 @@ const wayland = @import("wayland");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
+const ClientRegistry = @import("../ClientRegistry.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
+const MatureClients = @import("MatureClients.zig");
 
 const ext = wayland.server.ext;
 const wl = wayland.server.wl;
@@ -15,6 +18,9 @@ allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
 surface_store: *Surface.Store,
+clients: *ClientRegistry,
+mature_clients: *MatureClients,
+surface_registry: *SurfaceRegistry,
 security_context: *SecurityContext,
 global: *wl.Global,
 seats: std.ArrayList(*TransientSeat),
@@ -32,6 +38,9 @@ pub fn init(
     io: std.Io,
     display: *wl.Server,
     surface_store: *Surface.Store,
+    clients: *ClientRegistry,
+    mature_clients: *MatureClients,
+    surface_registry: *SurfaceRegistry,
     security_context: *SecurityContext,
 ) !void {
     self.* = .{
@@ -39,6 +48,9 @@ pub fn init(
         .io = io,
         .display = display,
         .surface_store = surface_store,
+        .clients = clients,
+        .mature_clients = mature_clients,
+        .surface_registry = surface_registry,
         .security_context = security_context,
         .global = try wl.Global.create(
             display,
@@ -173,6 +185,9 @@ const TransientSeat = struct {
             manager.display,
             name,
             manager.surface_store,
+            manager.clients,
+            manager.mature_clients,
+            manager.surface_registry,
         );
         errdefer self.seat.deinit();
         self.seat.setSeatResourceListener(.{
@@ -216,6 +231,7 @@ const TransientSeat = struct {
         if (self.resource != null or self.resources != 0 or self.references != 0) return;
         std.debug.assert(!self.active);
         self.seat.clearSeatResourceListener();
+        self.seat.discardAuthorityGrants();
         self.seat.deinit();
         for (self.manager.seats.items, 0..) |transient, index| {
             if (transient != self) continue;

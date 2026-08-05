@@ -7,7 +7,10 @@ const wayland = @import("wayland");
 const render = @import("../render/types.zig");
 const PressedKeyState = @import("PressedKeyState.zig");
 const Surface = @import("surface.zig");
-const UserActionSerials = @import("UserActionSerials.zig");
+const ClientRegistry = @import("../ClientRegistry.zig");
+const SeatAuthority = @import("../SeatAuthority.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
+const MatureClients = @import("MatureClients.zig");
 
 const wl = wayland.server.wl;
 
@@ -18,6 +21,10 @@ global: *wl.Global,
 global_removed: bool,
 name_value: [:0]const u8,
 surface_store: *Surface.Store,
+clients: *ClientRegistry,
+mature_clients: *MatureClients,
+surface_registry: *SurfaceRegistry,
+authority: SeatAuthority,
 seat_resources: std.ArrayList(*wl.Seat),
 seat_resource_listener: ?SeatResourceListener,
 keyboard_resources: std.ArrayList(KeyboardResource),
@@ -48,19 +55,16 @@ pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
 touch_points: std.ArrayList(TouchPoint),
 touch_frame_resources: std.ArrayList(*wl.Touch),
-latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
 compositor_cursor: ?CursorImage,
 default_cursor: ?CursorImage,
 cursor_controller: ?CursorController,
-drag_cursor_client: ?*wl.Client,
+drag_cursor_client: ?ClientRegistry.Id,
 cursor_surface_count: usize,
 pointer_grab: ?PointerGrab,
-pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
 pressed_keys: PressedKeyState,
 grabbed_keys: std.ArrayList(GrabbedKey),
 modifier_state: ModifierState,
-user_action_serials: UserActionSerials,
 
 const Keymap = struct {
     format: wl.Keyboard.KeymapFormat,
@@ -109,11 +113,6 @@ const GrabbedKey = struct {
     token: u64,
 };
 
-const UserAction = struct {
-    client: *wl.Client,
-    serial: u32,
-};
-
 const PointerPosition = struct {
     x: f64,
     y: f64,
@@ -152,14 +151,7 @@ const PointerResource = struct {
     resource: *wl.Pointer,
     generation: u64,
     capability_generation: u64,
-    enter_serial: ?u32,
-};
-
-const PressedPointerButton = struct {
-    button: u32,
-    client: *wl.Client,
-    surface_id: Surface.Id,
-    serial: u32,
+    enter_serial: ?ClientRegistry.Serial,
 };
 
 const PointerGrab = struct {
@@ -175,11 +167,16 @@ const SurfaceCursor = struct {
 
 const ActiveCursor = union(enum) {
     surface: SurfaceCursor,
-    shape: ShapeCursor,
+    shape: OwnedShapeCursor,
+};
+
+const OwnedShapeCursor = struct {
+    client: ClientRegistry.Id,
+    image: ShapeCursor,
 };
 
 const CursorController = struct {
-    client: *wl.Client,
+    client: ClientRegistry.Id,
     cursor: ?ActiveCursor,
     configured: bool,
 };
@@ -269,6 +266,9 @@ pub fn init(
     display: *wl.Server,
     seat_name: [:0]const u8,
     surface_store: *Surface.Store,
+    clients: *ClientRegistry,
+    mature_clients: *MatureClients,
+    surface_registry: *SurfaceRegistry,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -278,6 +278,10 @@ pub fn init(
         .global_removed = false,
         .name_value = seat_name,
         .surface_store = surface_store,
+        .clients = clients,
+        .mature_clients = mature_clients,
+        .surface_registry = surface_registry,
+        .authority = SeatAuthority.init(allocator, clients, surface_registry),
         .seat_resources = .empty,
         .seat_resource_listener = null,
         .keyboard_resources = .empty,
@@ -307,7 +311,6 @@ pub fn init(
         .pointer_position = null,
         .touch_points = .empty,
         .touch_frame_resources = .empty,
-        .latest_pointer_enter = null,
         .active_cursor = null,
         .compositor_cursor = null,
         .default_cursor = null,
@@ -315,11 +318,9 @@ pub fn init(
         .drag_cursor_client = null,
         .cursor_surface_count = 0,
         .pointer_grab = null,
-        .pressed_pointer_buttons = .empty,
         .pressed_keys = .init(allocator),
         .grabbed_keys = .empty,
         .modifier_state = .{},
-        .user_action_serials = .{},
     };
     errdefer self.seat_resources.deinit(allocator);
     errdefer self.keyboard_resources.deinit(allocator);
@@ -327,10 +328,12 @@ pub fn init(
     errdefer self.touch_resources.deinit(allocator);
     errdefer self.touch_points.deinit(allocator);
     errdefer self.touch_frame_resources.deinit(allocator);
-    errdefer self.pressed_pointer_buttons.deinit(allocator);
     errdefer self.pressed_keys.deinit();
     errdefer self.grabbed_keys.deinit(allocator);
     errdefer self.keyboard_focus_listeners.deinit(allocator);
+    try clients.addDisconnectListener(.{ .context = self, .notify = clientDisconnected });
+    errdefer clients.removeDisconnectListener(self);
+    errdefer self.authority.deinit();
     self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
 }
 
@@ -346,12 +349,16 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
     std.debug.assert(self.seat_resource_listener == null);
+    std.debug.assert(self.pointer_grab == null);
+    std.debug.assert(self.cursor_controller == null);
+    std.debug.assert(self.drag_cursor_client == null);
+    self.clients.removeDisconnectListener(self);
+    self.authority.deinit();
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
     self.pressed_keys.deinit();
-    self.pressed_pointer_buttons.deinit(self.allocator);
     self.touch_frame_resources.deinit(self.allocator);
     self.touch_points.deinit(self.allocator);
     self.touch_resources.deinit(self.allocator);
@@ -371,6 +378,16 @@ pub fn removeGlobal(self: *Self) void {
     std.debug.assert(!self.global_removed);
     self.global.remove();
     self.global_removed = true;
+}
+
+/// Retires weak grants before a transient seat is deinitialized while other
+/// clients may remain connected to the shared client registry.
+pub fn discardAuthorityGrants(self: *Self) void {
+    std.debug.assert(self.seat_resources.items.len == 0);
+    std.debug.assert(self.keyboard_resources.items.len == 0);
+    std.debug.assert(self.pointer_resources.items.len == 0);
+    std.debug.assert(self.touch_resources.items.len == 0);
+    self.authority.discardGrants();
 }
 
 pub fn name(self: *const Self) [:0]const u8 {
@@ -437,7 +454,8 @@ pub fn acceptsPointerEnterSerial(
         if (entry.resource != handle.resource or entry.generation != handle.generation) continue;
         if (!self.pointerResourceActive(entry)) return false;
         if (entry.resource.getClient() != surface.getClient()) return false;
-        return entry.enter_serial == serial;
+        const typed: ClientRegistry.Serial = .{ .domain = .mature_display, .value = serial };
+        return if (entry.enter_serial) |recorded| std.meta.eql(recorded, typed) else false;
     }
     return false;
 }
@@ -544,7 +562,16 @@ pub fn acceptsUserActionSerial(
 }
 
 pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool {
-    return self.user_action_serials.acceptsSelection(client, serial);
+    return self.selectionOrder(client, serial) != null;
+}
+
+pub fn selectionOrder(self: *const Self, client: *wl.Client, serial: u32) ?SeatAuthority.Order {
+    const client_id = self.matureClient(client) orelse return null;
+    return self.authority.selectionOrder(client_id, matureSerial(serial));
+}
+
+pub fn nextSelectionOrder(self: *Self) SeatAuthority.Order {
+    return self.authority.nextOrder();
 }
 
 pub fn acceptsActivationSerial(
@@ -554,9 +581,8 @@ pub fn acceptsActivationSerial(
     serial: u32,
 ) bool {
     if (!self.ownsResource(resource)) return false;
-    if (self.acceptsSelectionSerial(client, serial)) return true;
-    const pointer_enter = self.latest_pointer_enter orelse return false;
-    return pointer_enter.client == client and pointer_enter.serial == serial;
+    const client_id = self.matureClient(client) orelse return false;
+    return self.authority.acceptsActivation(client_id, matureSerial(serial));
 }
 
 pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool {
@@ -574,7 +600,8 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
 }
 
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
-    return self.user_action_serials.acceptsAction(client, serial);
+    const client_id = self.matureClient(client) orelse return false;
+    return self.authority.acceptsAction(client_id, matureSerial(serial));
 }
 
 pub fn acceptsPointerGrabSerial(
@@ -583,22 +610,16 @@ pub fn acceptsPointerGrabSerial(
     surface_id: Surface.Id,
     serial: u32,
 ) bool {
-    for (self.pressed_pointer_buttons.items) |press| {
-        if (press.client == client and press.serial == serial and
-            std.meta.eql(press.surface_id, surface_id)) return true;
-    }
-    return false;
+    const client_id = self.matureClient(client) orelse return false;
+    return self.authority.acceptsPointerGrab(client_id, matureSerial(serial), surface_id);
 }
 
 pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
-    for (self.pressed_pointer_buttons.items) |press| {
-        if (press.button == button) return true;
-    }
-    return false;
+    return self.authority.hasPointerButton(button);
 }
 
 pub fn hasPressedPointerButtons(self: *const Self) bool {
-    return self.pressed_pointer_buttons.items.len != 0;
+    return self.authority.hasPointerButtons();
 }
 
 pub fn implicitPointerGrabActive(self: *const Self) bool {
@@ -610,23 +631,57 @@ pub fn hasPressedPointerButtonForSurface(
     button: u32,
     surface_id: Surface.Id,
 ) bool {
-    for (self.pressed_pointer_buttons.items) |press| {
-        if (press.button == button and std.meta.eql(press.surface_id, surface_id)) return true;
-    }
-    return false;
+    return self.authority.hasPointerButtonForSurface(button, surface_id);
 }
 
 pub fn forgetPressedPointerButton(self: *Self, button: u32) void {
-    for (self.pressed_pointer_buttons.items, 0..) |press, index| {
-        if (press.button != button) continue;
-        _ = self.pressed_pointer_buttons.orderedRemove(index);
-        if (self.pressed_pointer_buttons.items.len == 0) self.pointer_grab = null;
-        return;
-    }
+    if (self.authority.forgetPointerPress(button) and !self.authority.hasPointerButtons())
+        self.pointer_grab = null;
 }
 
-pub fn serialIsOlder(candidate: u32, current: u32) bool {
-    return candidate -% current > std.math.maxInt(u32) / 2;
+fn matureSerial(value: u32) ClientRegistry.Serial {
+    return .{ .domain = .mature_display, .value = value };
+}
+
+fn matureClient(self: *const Self, client: *wl.Client) ?ClientRegistry.Id {
+    const id = self.mature_clients.id(client) orelse return null;
+    if (self.clients.domainOf(id) != .mature_display) return null;
+    return id;
+}
+
+fn recordAction(self: *Self, client: *wl.Client, serial: u32) void {
+    const id = self.matureClient(client) orelse unreachable;
+    const recorded = self.authority.recordAction(id, matureSerial(serial));
+    std.debug.assert(recorded);
+}
+
+fn recordSelection(self: *Self, client: *wl.Client, serial: u32) void {
+    const id = self.matureClient(client) orelse unreachable;
+    const recorded = self.authority.recordSelection(id, matureSerial(serial));
+    std.debug.assert(recorded);
+}
+
+fn recordPointerEnter(self: *Self, client: *wl.Client, serial: u32) void {
+    const id = self.matureClient(client) orelse unreachable;
+    const recorded = self.authority.recordPointerEnter(id, matureSerial(serial));
+    std.debug.assert(recorded);
+}
+
+fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(!self.clients.contains(client));
+    if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
+    const clear_active_shape = if (self.active_cursor) |cursor| switch (cursor) {
+        .surface => false,
+        .shape => |shape| std.meta.eql(shape.client, client),
+    } else false;
+    if (self.cursor_controller) |controller| {
+        if (std.meta.eql(controller.client, client)) self.cursor_controller = null;
+    }
+    if (self.drag_cursor_client) |controller| {
+        if (std.meta.eql(controller, client)) self.drag_cursor_client = null;
+    }
+    if (clear_active_shape) self.clearCursor();
 }
 
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
@@ -661,20 +716,22 @@ pub fn effectiveModifiers(self: *const Self) u32 {
 /// Set the client allowed to own the cursor while pointer focus is absent.
 /// This is also the generic ownership query point for cursor-shape protocols.
 pub fn setUnfocusedCursorController(self: *Self, client: ?*wl.Client) void {
-    if (client == null) {
+    const client_id = if (client) |raw| self.matureClient(raw) else null;
+    if (client_id == null) {
         self.cursor_controller = null;
-    } else if (self.cursor_controller == null or self.cursor_controller.?.client != client.?) {
-        self.cursor_controller = .{ .client = client.?, .cursor = null, .configured = false };
+    } else if (self.cursor_controller == null or !std.meta.eql(self.cursor_controller.?.client, client_id.?)) {
+        self.cursor_controller = .{ .client = client_id.?, .cursor = null, .configured = false };
     }
     if (self.pointer_focus == null) self.restoreControllerCursor();
 }
 
 pub fn isUnfocusedCursorController(self: *const Self, client: *wl.Client) bool {
-    return if (self.cursor_controller) |controller| controller.client == client else false;
+    const client_id = self.matureClient(client) orelse return false;
+    return if (self.cursor_controller) |controller| self.clients.contains(controller.client) and std.meta.eql(controller.client, client_id) else false;
 }
 
 pub fn setDragCursorController(self: *Self, client: ?*wl.Client) void {
-    self.drag_cursor_client = client;
+    self.drag_cursor_client = if (client) |raw| self.matureClient(raw) else null;
     if (client == null) self.restoreControllerCursor();
 }
 
@@ -732,9 +789,9 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
             .y = cursorCoordinate(position.y, surface.hotspot_y),
         } },
         .shape => |shape| .{ .shape = .{
-            .buffer = shape.buffer,
-            .x = cursorCoordinate(position.x, shape.hotspot_x),
-            .y = cursorCoordinate(position.y, shape.hotspot_y),
+            .buffer = shape.image.buffer,
+            .x = cursorCoordinate(position.x, shape.image.hotspot_x),
+            .y = cursorCoordinate(position.y, shape.image.hotspot_y),
         } },
     };
 }
@@ -807,7 +864,7 @@ pub fn setPointerAvailable(self: *Self, available: bool) void {
     const new_capability = self.hasPointerCapability();
     if (old_capability and !new_capability) {
         self.pointerLeave();
-        self.pressed_pointer_buttons.clearRetainingCapacity();
+        self.authority.clearPointerPresses();
     }
     if (!old_capability and new_capability) {
         beginCapabilityGeneration(
@@ -836,7 +893,7 @@ pub fn removeVirtualPointer(self: *Self) void {
     self.virtual_pointer_count -= 1;
     if (old_capability == self.hasPointerCapability()) return;
     self.pointerLeave();
-    self.pressed_pointer_buttons.clearRetainingCapacity();
+    self.authority.clearPointerPresses();
     self.broadcastCapabilities();
 }
 
@@ -1018,9 +1075,9 @@ fn keyWithGrab(
             const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
             const serial = self.display.nextSerial();
             if (state == .pressed)
-                self.user_action_serials.recordAction(surface.getClient(), serial)
+                self.recordAction(surface.getClient(), serial)
             else
-                self.user_action_serials.recordSelection(surface.getClient(), serial);
+                self.recordSelection(surface.getClient(), serial);
             for (self.keyboard_resources.items) |entry| {
                 if (!self.keyboardResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -1037,9 +1094,9 @@ fn keyWithGrab(
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
     if (state == .pressed)
-        self.user_action_serials.recordAction(surface.getClient(), serial)
+        self.recordAction(surface.getClient(), serial)
     else
-        self.user_action_serials.recordSelection(surface.getClient(), serial);
+        self.recordSelection(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1186,9 +1243,9 @@ pub fn pointerLeave(self: *Self) void {
     self.sendPointerLeave();
     self.pointer_focus = null;
     self.pointer_position = null;
-    self.latest_pointer_enter = null;
+    self.authority.clearPointerEnter();
     self.pointer_grab = null;
-    self.pressed_pointer_buttons.clearRetainingCapacity();
+    self.authority.clearPointerPresses();
     if (fallback_visible) self.notifyCursorChanged(old_cursor);
 }
 
@@ -1200,22 +1257,24 @@ pub fn pointerButton(
 ) error{OutOfMemory}!bool {
     switch (state) {
         .pressed => {
-            for (self.pressed_pointer_buttons.items) |press| {
-                if (press.button == button) return false;
-            }
+            if (self.authority.hasPointerButton(button)) return false;
             const surface = self.pointerSurface() orelse return false;
+            const client_id = self.matureClient(surface.getClient()) orelse return false;
             const serial = self.display.nextSerial();
-            const starts_grab = self.pressed_pointer_buttons.items.len == 0;
-            try self.pressed_pointer_buttons.append(self.allocator, .{
-                .button = button,
-                .client = surface.getClient(),
-                .surface_id = self.pointer_focus.?.surface_id,
-                .serial = serial,
-            });
+            const typed = matureSerial(serial);
+            const starts_grab = !self.authority.hasPointerButtons();
+            const added = try self.authority.addPointerPress(
+                client_id,
+                typed,
+                button,
+                self.pointer_focus.?.surface_id,
+            );
+            std.debug.assert(added);
             if (starts_grab) {
                 self.pointer_grab = .{ .surface_id = self.pointer_focus.?.surface_id };
             }
-            self.user_action_serials.recordAction(surface.getClient(), serial);
+            const recorded = self.authority.recordAction(client_id, typed);
+            std.debug.assert(recorded);
             for (self.pointer_resources.items) |entry| {
                 if (!self.pointerResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -1226,20 +1285,18 @@ pub fn pointerButton(
             return false;
         },
         .released => {
-            for (self.pressed_pointer_buttons.items, 0..) |press, index| {
-                if (press.button != button) continue;
-                _ = self.pressed_pointer_buttons.orderedRemove(index);
-                break;
-            } else return false;
+            if (!self.authority.forgetPointerPress(button)) return false;
         },
         else => return false,
     }
 
-    const grab_ended = self.pressed_pointer_buttons.items.len == 0;
+    const grab_ended = !self.authority.hasPointerButtons();
     if (grab_ended) self.pointer_grab = null;
     const surface = self.pointerSurface() orelse return grab_ended;
+    const client_id = self.matureClient(surface.getClient()) orelse return grab_ended;
     const serial = self.display.nextSerial();
-    self.user_action_serials.recordSelection(surface.getClient(), serial);
+    const recorded = self.authority.recordSelection(client_id, matureSerial(serial));
+    std.debug.assert(recorded);
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1372,7 +1429,7 @@ pub fn touchDown(
     const destination = target orelse return;
     const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
     const serial = self.display.nextSerial();
-    self.user_action_serials.recordAction(destination.client, serial);
+    self.recordAction(destination.client, serial);
     for (self.touch_resources.items) |entry| {
         if (!self.touchResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1398,7 +1455,7 @@ pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
     const point = self.touch_points.items[index];
     if (point.target) |target| {
         const serial = self.display.nextSerial();
-        self.user_action_serials.recordSelection(target.client, serial);
+        self.recordSelection(target.client, serial);
         for (self.touch_resources.items) |entry| {
             if (!self.touchResourceActive(entry)) continue;
             const resource = entry.resource;
@@ -1605,7 +1662,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     const surface = self.keyboardDeliverySurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
-        self.user_action_serials.recordSelection(surface.getClient(), serial);
+        self.recordSelection(surface.getClient(), serial);
         self.sendEnterTo(resource, surface, serial);
     }
 }
@@ -1635,10 +1692,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
-        self.latest_pointer_enter = .{
-            .client = surface.getClient(),
-            .serial = serial,
-        };
+        self.recordPointerEnter(surface.getClient(), serial);
         self.sendPointerEnterTo(stored, surface, serial);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
     }
@@ -1895,7 +1949,7 @@ fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
     const surface = self.keyboardDeliverySurface() orelse return;
     const serial = self.display.nextSerial();
-    self.user_action_serials.recordSelection(surface.getClient(), serial);
+    self.recordSelection(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1941,7 +1995,7 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
         self.clearCursor();
         self.sendPointerLeave();
         self.pointer_focus = focus;
-        self.latest_pointer_enter = null;
+        self.authority.clearPointerEnter();
         self.sendPointerEnter();
         if (focus == null) self.restoreControllerCursor();
         return;
@@ -1967,10 +2021,7 @@ fn pointerSurface(self: *Self) ?*wl.Surface {
 fn sendPointerEnter(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
-    self.latest_pointer_enter = .{
-        .client = surface.getClient(),
-        .serial = serial,
-    };
+    self.recordPointerEnter(surface.getClient(), serial);
     for (self.pointer_resources.items) |*entry| {
         if (!self.pointerResourceActive(entry.*)) continue;
         const resource = entry.resource;
@@ -1987,7 +2038,7 @@ fn sendPointerEnterTo(
     serial: u32,
 ) void {
     const position = self.pointer_focus orelse return;
-    entry.enter_serial = serial;
+    entry.enter_serial = matureSerial(serial);
     const resource = entry.resource;
     resource.sendEnter(serial, surface, fixed(position.x), fixed(position.y));
 }
@@ -2021,13 +2072,14 @@ fn setCursor(
     hotspot_y: i32,
 ) void {
     const manager_controller = self.isUnfocusedCursorController(pointer.getClient());
-    const drag_controller = if (self.drag_cursor_client) |client|
-        client == pointer.getClient()
+    const pointer_client = self.matureClient(pointer.getClient());
+    const drag_controller = if (self.drag_cursor_client) |client_id|
+        self.clients.contains(client_id) and pointer_client != null and std.meta.eql(client_id, pointer_client.?)
     else
         false;
     const controller = manager_controller or drag_controller;
-    const enter = self.latest_pointer_enter;
-    if (!controller and (enter == null or enter.?.client != pointer.getClient() or enter.?.serial != serial)) return;
+    if (!controller and (pointer_client == null or
+        !self.authority.acceptsPointerEnter(pointer_client.?, matureSerial(serial)))) return;
     const focused_client = if (self.pointerSurface()) |surface|
         surface.getClient() == pointer.getClient()
     else
@@ -2082,20 +2134,21 @@ pub fn setCursorShape(
 ) void {
     std.debug.assert(shape.client == client);
     const manager_controller = self.isUnfocusedCursorController(client);
+    const client_id = self.matureClient(client);
     const drag_controller = if (self.drag_cursor_client) |drag_client|
-        drag_client == client
+        self.clients.contains(drag_client) and client_id != null and std.meta.eql(drag_client, client_id.?)
     else
         false;
     const controller = manager_controller or drag_controller;
-    const enter = self.latest_pointer_enter;
-    if (!controller and (enter == null or enter.?.client != client or enter.?.serial != serial)) return;
+    if (client_id == null) return;
+    if (!controller and (!self.authority.acceptsPointerEnter(client_id.?, matureSerial(serial)))) return;
     const focused_client = if (self.pointerSurface()) |surface|
         surface.getClient() == client
     else
         false;
     if (!controller and !focused_client and !self.activeCursorOwnedBy(client)) return;
 
-    const requested: ActiveCursor = .{ .shape = shape };
+    const requested: ActiveCursor = .{ .shape = .{ .client = client_id.?, .image = shape } };
     const old_cursor = self.cursorInfo();
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
@@ -2131,7 +2184,10 @@ fn activeCursorOwnedBy(self: *Self, client: *wl.Client) bool {
             resource.getClient() == client
         else
             false,
-        .shape => |shape| shape.client == client,
+        .shape => |shape| if (self.matureClient(client)) |client_id|
+            self.clients.contains(shape.client) and std.meta.eql(shape.client, client_id)
+        else
+            false,
     };
 }
 
@@ -2296,14 +2352,6 @@ test "cursor position accounts for hotspot and fractional motion" {
         std.math.minInt(i32),
         cursorCoordinate(-0.25, std.math.maxInt(i32)),
     );
-}
-
-test "protocol serial ordering handles wraparound" {
-    try std.testing.expect(!serialIsOlder(10, 10));
-    try std.testing.expect(!serialIsOlder(11, 10));
-    try std.testing.expect(serialIsOlder(9, 10));
-    try std.testing.expect(!serialIsOlder(1, std.math.maxInt(u32)));
-    try std.testing.expect(serialIsOlder(std.math.maxInt(u32), 1));
 }
 
 test "virtual modifier teardown restores only the superseded physical state" {

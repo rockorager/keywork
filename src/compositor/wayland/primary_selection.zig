@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
 const SelectionSource = @import("SelectionSource.zig");
+const SeatAuthority = @import("../SeatAuthority.zig");
 const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;
@@ -19,7 +20,7 @@ sources: SourceStore,
 devices: DeviceStore,
 offers: OfferStore,
 selection: ?Selection,
-selection_serial: u32,
+selection_order: SeatAuthority.Order,
 selection_generation: u64,
 selection_listeners: std.ArrayList(SelectionListener),
 focused_client: ?*wl.Client,
@@ -78,7 +79,7 @@ pub fn init(
         .devices = .{},
         .offers = .{},
         .selection = null,
-        .selection_serial = 0,
+        .selection_order = 0,
         .selection_generation = 0,
         .selection_listeners = .empty,
         .focused_client = null,
@@ -327,8 +328,11 @@ const DeviceResource = struct {
             break :source adapter.id;
         } else null;
 
-        if (!self.manager.seat.acceptsSelectionSerial(resource.getClient(), serial)) return;
-        self.manager.setSelection(source_id, serial);
+        const order = self.manager.seat.selectionOrder(
+            resource.getClient(),
+            serial,
+        ) orelse return;
+        self.manager.setSelection(source_id, order);
     }
 
     fn handleDestroy(_: *zwp.PrimarySelectionDeviceV1, self: *DeviceResource) void {
@@ -418,26 +422,26 @@ fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
     if (client) |focused| self.sendSelectionToClient(focused);
 }
 
-fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
-    if (self.selection != null and Seat.serialIsOlder(serial, self.selection_serial)) return;
+fn setSelection(self: *Self, source_id: ?SourceId, order: SeatAuthority.Order) void {
+    if (order < self.selection_order) return;
     const selection: ?Selection = if (source_id) |id| .{ .local = id } else null;
     if (std.meta.eql(self.selection, selection)) {
-        self.selection_serial = serial;
+        self.selection_order = order;
         return;
     }
-    self.replaceSelection(selection, serial, true);
+    self.replaceSelection(selection, order, true);
 }
 
 fn replaceSelection(
     self: *Self,
     selection: ?Selection,
-    serial: u32,
+    order: SeatAuthority.Order,
     cancel_old: bool,
 ) void {
     const old_source = self.selection;
     std.debug.assert(!std.meta.eql(old_source, selection));
     self.selection = selection;
-    self.selection_serial = serial;
+    self.selection_order = order;
     self.selection_generation +%= 1;
     self.invalidateOffers();
     if (self.focused_client) |client| self.sendSelectionToClient(client);
@@ -461,7 +465,7 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
     if (self.selection) |selection| {
         switch (selection) {
             .local => |selection_id| if (std.meta.eql(selection_id, id)) {
-                self.replaceSelection(null, self.display.nextSerial(), false);
+                self.replaceSelection(null, self.seat.nextSelectionOrder(), false);
             },
             .external => {},
         }
@@ -581,8 +585,12 @@ pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) 
 /// `externalSourceDestroyed`.
 pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     const selection: ?Selection = if (source) |value| .{ .external = value } else null;
-    if (std.meta.eql(self.selection, selection)) return;
-    self.replaceSelection(selection, self.display.nextSerial(), true);
+    const order = self.seat.nextSelectionOrder();
+    if (std.meta.eql(self.selection, selection)) {
+        self.selection_order = order;
+        return;
+    }
+    self.replaceSelection(selection, order, true);
 }
 
 pub fn externalSelectionIs(self: *const Self, source: *const SelectionSource) bool {
@@ -598,7 +606,7 @@ pub fn externalSourceDestroyed(self: *Self, source: *const SelectionSource) void
     switch (selection) {
         .local => {},
         .external => |current| if (current == source) {
-            self.replaceSelection(null, self.display.nextSerial(), false);
+            self.replaceSelection(null, self.seat.nextSelectionOrder(), false);
         },
     }
 }

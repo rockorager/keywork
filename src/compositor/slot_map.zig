@@ -150,6 +150,23 @@ test "removed handles remain stale after slot reuse" {
     try std.testing.expectEqual(@as(u32, 20), store.remove(second).?);
 }
 
+test "generation exhaustion retires a slot instead of reviving stale handles" {
+    const Store = SlotMap(u32, enum { test_value });
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+
+    var exhausted = try store.insert(std.testing.allocator, 10);
+    store.slots.items[exhausted.index].generation = std.math.maxInt(u32);
+    exhausted.generation = std.math.maxInt(u32);
+    try std.testing.expectEqual(@as(u32, 10), store.remove(exhausted).?);
+    try std.testing.expectEqual(@as(?u32, null), store.free_head);
+
+    const current = try store.insert(std.testing.allocator, 20);
+    try std.testing.expect(current.index != exhausted.index);
+    try std.testing.expectEqual(@as(?*const u32, null), store.getConst(exhausted));
+    try std.testing.expectEqual(@as(u32, 20), store.remove(current).?);
+}
+
 test "handle types are distinct between stores" {
     const SurfaceStore = SlotMap(u8, enum { surface });
     const WindowStore = SlotMap(u8, enum { window });

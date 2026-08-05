@@ -80,10 +80,12 @@ const render = @import("render/types.zig");
 const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
 const Scene = @import("scene.zig");
+const ClientRegistry = @import("ClientRegistry.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
 const Surface = @import("wayland/surface.zig");
+const MatureClients = @import("wayland/MatureClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const Viewporter = @import("wayland/viewporter.zig");
@@ -150,6 +152,8 @@ const linux_button_left = 0x110;
 allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
+client_registry: ClientRegistry,
+mature_clients: MatureClients,
 surface_registry: SurfaceRegistry,
 headless_surface_forest: HeadlessSurfaceForest,
 control: Control,
@@ -952,13 +956,13 @@ pub fn createWithVirtualOutput(
 
     const display = try wl.Server.create();
     errdefer display.destroy();
-    display.addProtocolLogger(*wl.Server, logProtocolError, display);
-    try display.initShm();
 
     self.* = .{
         .allocator = allocator,
         .io = io,
         .display = display,
+        .client_registry = ClientRegistry.init(allocator),
+        .mature_clients = undefined,
         .surface_registry = SurfaceRegistry.init(allocator),
         .headless_surface_forest = HeadlessSurfaceForest.init(allocator),
         .control = undefined,
@@ -1085,6 +1089,9 @@ pub fn createWithVirtualOutput(
         .listening = false,
         .xwayland_display_listener = null,
     };
+    errdefer self.client_registry.deinit();
+    self.mature_clients.init(allocator, display, &self.client_registry);
+    errdefer self.mature_clients.deinit();
     errdefer self.surface_registry.deinit();
     errdefer self.headless_surface_forest.deinit();
     errdefer self.routed_touches.deinit(allocator);
@@ -1096,6 +1103,8 @@ pub fn createWithVirtualOutput(
     errdefer self.xwayland_client_stack.deinit(allocator);
     errdefer self.window_transitions.deinit(allocator);
     errdefer self.workspace_transitions.deinit(allocator);
+    display.addProtocolLogger(*wl.Server, logProtocolError, display);
+    try display.initShm();
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
         self.session_initialized = true;
@@ -1145,7 +1154,16 @@ pub fn createWithVirtualOutput(
     errdefer self.color_representation.deinit();
     try self.alpha_modifier.init(allocator, display);
     errdefer self.alpha_modifier.deinit();
-    try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
+    try self.seat.init(
+        allocator,
+        io,
+        display,
+        "default",
+        self.compositor.surfaceStore(),
+        &self.client_registry,
+        &self.mature_clients,
+        &self.surface_registry,
+    );
     errdefer self.seat.deinit();
     // Headless outputs have no parent window that can deliver keyboard enter.
     if (output_kind == .headless) self.seat.ensureParentKeyboardEnter();
@@ -1154,6 +1172,9 @@ pub fn createWithVirtualOutput(
         io,
         display,
         self.compositor.surfaceStore(),
+        &self.client_registry,
+        &self.mature_clients,
+        &self.surface_registry,
         &self.security_context,
     );
     errdefer self.transient_seat.deinit();
@@ -1938,6 +1959,8 @@ pub fn destroy(self: *Self) void {
     if (self.drm_device_initialized) self.drm_device.deinit();
     if (self.session_initialized) self.session.deinit();
     self.renderer.deinit();
+    self.mature_clients.deinit();
+    self.client_registry.deinit();
     self.display.destroy();
     allocator.destroy(self);
 }
