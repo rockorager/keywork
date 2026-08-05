@@ -1990,6 +1990,7 @@ pub fn touchCancel(self: *Self) void {
             )) continue;
             if (!self.touchResourceMatchesClient(entry.*, target.client)) continue;
             entry.resource.sendCancel();
+            entry.frame_pending = false;
             break;
         }
     }
@@ -2017,7 +2018,11 @@ pub fn touchCancel(self: *Self) void {
         }
     }
     self.touch_points.clearRetainingCapacity();
-    for (self.touch_resources.items) |*entry| entry.frame_pending = false;
+    for (self.touch_resources.items) |*entry| {
+        if (self.touchResourceActive(entry.*) and takeTouchFrame(entry))
+            entry.resource.sendFrame();
+    }
+    self.delivery.deliverTouchFrame();
 }
 
 /// Cancels the client-visible stream containing `id` and forgets that point.
@@ -2033,13 +2038,15 @@ pub fn touchCancelPoint(self: *Self, id: i32) void {
     }
     for (self.touch_resources.items) |*entry| {
         if (!self.touchResourceActive(entry.*) or
-            entry.generation > cancellation.max_resource_generation or
             !self.touchResourceMatchesClient(entry.*, cancellation.client)) continue;
-        entry.resource.sendCancel();
-    }
-    for (self.touch_resources.items) |*entry| {
-        if (self.touchResourceMatchesClient(entry.*, cancellation.client)) {
+        if (SeatDelivery.resourceInSequence(
+            entry.generation,
+            cancellation.max_resource_generation,
+        )) {
+            entry.resource.sendCancel();
             entry.frame_pending = false;
+        } else if (takeTouchFrame(entry)) {
+            entry.resource.sendFrame();
         }
     }
 }

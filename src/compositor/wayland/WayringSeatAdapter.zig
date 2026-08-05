@@ -617,6 +617,8 @@ fn touchTarget(context: *anyopaque, surface: SurfaceRegistry.Id) ?SeatDelivery.T
 
 fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (self.snapshot.touch.available and !snapshot.touch.available)
+        self.flushPendingTouchFrames(null);
     self.snapshot = snapshot;
     if (!snapshot.keyboard.available) {
         for (self.keyboards.items) |keyboard_resource| keyboard_resource.focused_surface = null;
@@ -626,9 +628,6 @@ fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) 
             pointer_resource.last_enter_serial = null;
             pointer_resource.frame_pending = false;
         }
-    }
-    if (!snapshot.touch.available) {
-        for (self.touches.items) |touch_resource| touch_resource.frame_pending = false;
     }
     for (self.seats.items) |seat| sendCapabilities(seat) catch |err| self.eventFailure(seat.client, &seat.resource.runtime, err);
 }
@@ -866,17 +865,23 @@ fn touch(context: *anyopaque, client_id: ClientRegistry.Id, event: SeatDelivery.
         };
         result catch |err| self.eventFailure(client, &touch_resource.resource.runtime, err);
     }
-    if (event == .cancel) {
-        for (self.touches.items) |touch_resource| {
-            if (touch_resource.client == client) touch_resource.frame_pending = false;
-        }
-    }
+    if (event == .cancel) self.flushPendingTouchFrames(client);
 }
 
 fn touchFrame(context: *anyopaque) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
     if (!self.snapshot.touch.available) return;
+    self.flushPendingTouchFrames(null);
+}
+
+fn flushPendingTouchFrames(
+    self: *WayringSeatAdapter,
+    client: ?*wayring.server.Client,
+) void {
     for (self.touches.items) |touch_resource| {
+        if (client) |expected| {
+            if (touch_resource.client != expected) continue;
+        }
         if (touch_resource.client.fatal() != null or
             !self.snapshot.touch.resourceActive(touch_resource.generation) or
             !touch_resource.frame_pending) continue;
@@ -2009,6 +2014,219 @@ test "scanner touch preserves cutoff ordering version gates batching and cancell
     client_live = false;
     setup.protocol_server.removeGlobal(seat_global) catch unreachable;
     try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
+}
+
+test "scanner touch cancel frames excluded completed events without crossing clients" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.touch.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed_a = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const client_id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const client_id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+    var log: TestTouchLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestTouchLog, &log, TestTouchLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    inline for (.{ client_a, client_b }) |client| {
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+        try testCreateSurface(client, 3, 4);
+        try testBindGlobal(client, seat_global, 6, 5);
+    }
+    try testGetTouch(client_a, 5, 6);
+    try testGetTouch(client_b, 5, 6);
+    const surface_a = setup.compositor.surfaceId(client_a, 4).?;
+    const surface_b = setup.compositor.surfaceId(client_b, 4).?;
+    const contact_a_target = touchTarget(&setup.adapter, surface_a).?;
+    try std.testing.expectEqual(
+        @as(SeatDelivery.ResourceGeneration, 1),
+        contact_a_target.max_resource_generation,
+    );
+    const client_b_target = touchTarget(&setup.adapter, surface_b).?;
+    try std.testing.expectEqual(
+        @as(SeatDelivery.ResourceGeneration, 2),
+        client_b_target.max_resource_generation,
+    );
+
+    try testDrain(client_a);
+    try testDrain(client_b);
+    log.clear();
+    touch(&setup.adapter, client_id_a, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 51 },
+        .time = 20,
+        .surface = surface_a,
+        .id = 1,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = contact_a_target.max_resource_generation,
+    } });
+
+    // This second resource is too new for contact 1, but it participates in
+    // the completed contact 2 batch that is still awaiting a physical frame.
+    try testGetTouch(client_a, 5, 7);
+    const contact_b_target = touchTarget(&setup.adapter, surface_a).?;
+    try std.testing.expectEqual(
+        @as(SeatDelivery.ResourceGeneration, 3),
+        contact_b_target.max_resource_generation,
+    );
+    touch(&setup.adapter, client_id_a, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 52 },
+        .time = 21,
+        .surface = surface_a,
+        .id = 2,
+        .x = 64,
+        .y = 128,
+        .max_resource_generation = contact_b_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id_a, .{ .up = .{
+        .serial = .{ .domain = .wayring_server, .value = 53 },
+        .time = 22,
+        .id = 2,
+        .max_resource_generation = contact_b_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id_b, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 54 },
+        .time = 23,
+        .surface = surface_b,
+        .id = 3,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = client_b_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id_b, .{ .up = .{
+        .serial = .{ .domain = .wayring_server, .value = 55 },
+        .time = 24,
+        .id = 3,
+        .max_resource_generation = client_b_target.max_resource_generation,
+    } });
+
+    touch(&setup.adapter, client_id_a, .{ .cancel = .{
+        .max_resource_generation = contact_a_target.max_resource_generation,
+    } });
+
+    var names_buffer: [16][]const u8 = undefined;
+    try expectEventNames(
+        &.{ "down", "down", "up", "cancel" },
+        log.namesFor(client_a, 6, &names_buffer),
+    );
+    try expectEventNames(
+        &.{ "down", "up", "frame" },
+        log.namesFor(client_a, 7, &names_buffer),
+    );
+    try expectEventNames(
+        &.{ "down", "up" },
+        log.namesFor(client_b, 6, &names_buffer),
+    );
+
+    // The later physical frame closes only the unrelated pending client; the
+    // excluded resource framed during cancel must not receive a duplicate.
+    touchFrame(&setup.adapter);
+    try expectEventNames(
+        &.{ "down", "up", "frame" },
+        log.namesFor(client_a, 7, &names_buffer),
+    );
+    try expectEventNames(
+        &.{ "down", "up", "frame" },
+        log.namesFor(client_b, 6, &names_buffer),
+    );
+
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
+}
+
+test "scanner touch capability removal closes pending final up exactly once" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.touch.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client = managed.client();
+    const client_id = try setup.registerClient(client);
+    var client_live = true;
+    defer if (client_live) setup.destroyClient(managed);
+    var log: TestTouchLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestTouchLog, &log, TestTouchLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+    try testCreateSurface(client, 3, 4);
+    try testBindGlobal(client, seat_global, 6, 5);
+    try testGetTouch(client, 5, 6);
+    const surface = setup.compositor.surfaceId(client, 4).?;
+    const target = touchTarget(&setup.adapter, surface).?;
+    try testDrain(client);
+    log.clear();
+
+    touch(&setup.adapter, client_id, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 61 },
+        .time = 30,
+        .surface = surface,
+        .id = 1,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id, .{ .up = .{
+        .serial = .{ .domain = .wayring_server, .value = 62 },
+        .time = 31,
+        .id = 1,
+        .max_resource_generation = target.max_resource_generation,
+    } });
+
+    try std.testing.expect(snapshot.touch.setAvailable(false));
+    capabilities(&setup.adapter, snapshot);
+    var names_buffer: [8][]const u8 = undefined;
+    try expectEventNames(
+        &.{ "down", "up", "frame" },
+        log.namesFor(client, 6, &names_buffer),
+    );
+
+    touchFrame(&setup.adapter);
+    try std.testing.expect(snapshot.touch.setAvailable(true));
+    capabilities(&setup.adapter, snapshot);
+    touchFrame(&setup.adapter);
+    try expectEventNames(
+        &.{ "down", "up", "frame" },
+        log.namesFor(client, 6, &names_buffer),
+    );
+
+    setup.destroyClient(managed);
+    client_live = false;
 }
 
 test "late pointer bind joins canonical focus with enter before later delivery" {
